@@ -1,0 +1,18 @@
+[package]
+name         = "spg-cli"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "SPG command-line client — speaks the self-built wire protocol."
+
+[[bin]]
+name = "spg"
+path = "src/main.rs"
+
+[dependencies]
+spg-wire = { path = "../spg-wire" }
+
+[lints]
+workspace = true

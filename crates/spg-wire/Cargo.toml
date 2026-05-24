@@ -1,0 +1,11 @@
+[package]
+name         = "spg-wire"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "Self-built wire-frame protocol for SPG. no_std + alloc."
+
+[lints]
+workspace = true
