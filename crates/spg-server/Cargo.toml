@@ -1,0 +1,18 @@
+[package]
+name         = "spg-server"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "SPG daemon — listens for self-built wire-frame connections."
+
+[[bin]]
+name = "spg-server"
+path = "src/main.rs"
+
+[dependencies]
+spg-wire = { path = "../spg-wire" }
+
+[lints]
+workspace = true

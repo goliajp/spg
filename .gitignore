@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.swp
+*.swo
+
+# Local dev sandboxes / scratch
+/scratch
+/.claude/handoff.md
