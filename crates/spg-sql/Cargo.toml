@@ -1,0 +1,11 @@
+[package]
+name         = "spg-sql"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "Self-built SQL front-end for SPG: PG-dialect lexer + parser. no_std + alloc."
+
+[lints]
+workspace = true
