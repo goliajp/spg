@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/spg-wire",
+    "crates/spg-sql",
     "crates/spg-server",
     "crates/spg-cli",
 ]
