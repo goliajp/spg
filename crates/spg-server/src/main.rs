@@ -117,7 +117,8 @@ fn run(
             Engine::new()
         }
         None => Engine::new(),
-    };
+    }
+    .with_clock(wall_clock_micros);
 
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {
@@ -509,6 +510,14 @@ fn append_audit(state: &ServerState, sql: &str) -> std::io::Result<()> {
 
 /// Write `data` to `path` atomically: write to a sibling tmp file then
 /// `rename` over the target. `rename` is atomic on POSIX.
+/// Wall clock impl injected into the engine. Microseconds since the
+/// Unix epoch; clamps to `i64::MAX` for far-future system clocks.
+fn wall_clock_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
+
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let pid = process::id();

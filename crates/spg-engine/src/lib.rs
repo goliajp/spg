@@ -92,6 +92,13 @@ impl From<EvalError> for EngineError {
 /// The execution engine. Holds the catalog and (later) other server-scope
 /// state. `Engine::new()` is intentionally cheap so callers can construct one
 /// per database, per test.
+/// Function pointer that returns "now" as microseconds since Unix
+/// epoch. The engine is `no_std`, so it can't reach for `std::time`
+/// itself — callers (`spg-server`, the sqllogictest runner) inject a
+/// concrete implementation. `None` means `NOW()` / `CURRENT_*` raise
+/// `Unsupported`.
+pub type ClockFn = fn() -> i64;
+
 #[derive(Debug, Default)]
 pub struct Engine {
     /// Committed catalog — what survives `Engine::snapshot()` and what
@@ -106,6 +113,9 @@ pub struct Engine {
     /// fired; `ROLLBACK TO <name>` restores from the entry and pops
     /// every savepoint after it. Empty outside a TX.
     savepoints: Vec<(String, Catalog)>,
+    /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
+    /// / `CURRENT_DATE`. Set by the host environment.
+    clock: Option<ClockFn>,
 }
 
 impl Engine {
@@ -114,6 +124,7 @@ impl Engine {
             catalog: Catalog::new(),
             tx_catalog: None,
             savepoints: Vec::new(),
+            clock: None,
         }
     }
 
@@ -124,7 +135,16 @@ impl Engine {
             catalog,
             tx_catalog: None,
             savepoints: Vec::new(),
+            clock: None,
         }
+    }
+
+    /// Builder: attach a wall clock so `NOW()` / `CURRENT_TIMESTAMP` /
+    /// `CURRENT_DATE` evaluate to a real value instead of erroring out.
+    #[must_use]
+    pub const fn with_clock(mut self, clock: ClockFn) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// The *committed* catalog. Note: during a transaction this returns the
@@ -158,7 +178,14 @@ impl Engine {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
-        let stmt = parser::parse_statement(sql)?;
+        let mut stmt = parser::parse_statement(sql)?;
+        // Replace `NOW()` / `CURRENT_TIMESTAMP()` / `CURRENT_DATE()`
+        // function calls with the engine's clock reading, rewritten
+        // as `<literal int>::TIMESTAMP` / `::DATE`. The rewrite reads
+        // the clock once per statement so every reference observes the
+        // same instant.
+        let now_micros = self.clock.map(|f| f());
+        rewrite_clock_calls(&mut stmt, now_micros);
         match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::CreateIndex(s) => self.exec_create_index(s),
@@ -1318,6 +1345,103 @@ const fn pow10_i128_const(p: u8) -> i128 {
 
 fn pow10_i128(p: u8) -> i128 {
     pow10_i128_const(p)
+}
+
+/// Walk a parsed `Statement`, swapping any `NOW()` /
+/// `CURRENT_TIMESTAMP()` / `CURRENT_DATE()` function calls for a
+/// literal cast that wraps the engine's per-statement clock reading.
+/// When `now_micros` is `None`, calls stay as-is and surface as
+/// `unknown function` at eval time — keeps the error path explicit.
+fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>) {
+    let Some(now) = now_micros else {
+        return;
+    };
+    match stmt {
+        Statement::Select(s) => rewrite_select_clock(s, now),
+        Statement::Insert(ins) => {
+            for row in &mut ins.rows {
+                for e in row {
+                    rewrite_expr_clock(e, now);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_select_clock(s: &mut SelectStatement, now: i64) {
+    for item in &mut s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            rewrite_expr_clock(expr, now);
+        }
+    }
+    if let Some(w) = &mut s.where_ {
+        rewrite_expr_clock(w, now);
+    }
+    if let Some(gs) = &mut s.group_by {
+        for g in gs {
+            rewrite_expr_clock(g, now);
+        }
+    }
+    if let Some(h) = &mut s.having {
+        rewrite_expr_clock(h, now);
+    }
+    if let Some(o) = &mut s.order_by {
+        rewrite_expr_clock(o, now);
+    }
+    for (_, peer) in &mut s.unions {
+        rewrite_select_clock(peer, now);
+    }
+}
+
+fn rewrite_expr_clock(e: &mut Expr, now: i64) {
+    if let Expr::FunctionCall { name, args } = e
+        && args.is_empty()
+    {
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "now" | "current_timestamp" => {
+                *e = Expr::Cast {
+                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
+                        now,
+                    ))),
+                    target: spg_sql::ast::CastTarget::Timestamp,
+                };
+                return;
+            }
+            "current_date" => {
+                let days = now.div_euclid(86_400_000_000);
+                *e = Expr::Cast {
+                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
+                        days,
+                    ))),
+                    target: spg_sql::ast::CastTarget::Date,
+                };
+                return;
+            }
+            _ => {}
+        }
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_expr_clock(lhs, now);
+            rewrite_expr_clock(rhs, now);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_expr_clock(expr, now)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                rewrite_expr_clock(a, now);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            rewrite_expr_clock(expr, now);
+            rewrite_expr_clock(pattern, now);
+        }
+        Expr::Extract { source, .. } => rewrite_expr_clock(source, now),
+        Expr::Literal(_) | Expr::Column(_) => {}
+    }
 }
 
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {

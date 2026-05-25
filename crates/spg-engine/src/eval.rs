@@ -377,6 +377,16 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
 fn cast_to_date(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::Date(d) => Ok(Value::Date(d)),
+        // Integer literals carry days since the Unix epoch — used by
+        // the `CURRENT_DATE` AST rewrite to inject the wall clock.
+        Value::Int(n) => Ok(Value::Date(n)),
+        Value::BigInt(n) => {
+            i32::try_from(n)
+                .map(Value::Date)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: "bigint days-since-epoch out of DATE range".into(),
+                })
+        }
         // Timestamp truncates to its day boundary.
         Value::Timestamp(t) => {
             let days = t.div_euclid(86_400_000_000);
@@ -400,6 +410,11 @@ fn cast_to_date(v: Value) -> Result<Value, EvalError> {
 fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::Timestamp(t) => Ok(Value::Timestamp(t)),
+        // Int / BigInt carry microseconds since the Unix epoch — used
+        // by the `NOW()` / `CURRENT_TIMESTAMP` AST rewrite to inject
+        // the wall clock as a plain integer literal.
+        Value::Int(n) => Ok(Value::Timestamp(i64::from(n))),
+        Value::BigInt(n) => Ok(Value::Timestamp(n)),
         // DATE → TIMESTAMP picks midnight on the date.
         Value::Date(d) => Ok(Value::Timestamp(i64::from(d) * 86_400_000_000)),
         Value::Text(s) => {
@@ -835,6 +850,16 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
     if matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }) {
         return apply_binary_numeric(op, l, r);
     }
+    // Date / Timestamp arithmetic. PG semantics:
+    //   * date + int      → date  (int is days)
+    //   * int + date      → date
+    //   * date - int      → date
+    //   * date - date     → int   (days, signed)
+    //   * timestamp - timestamp → bigint (microseconds, signed)
+    // Other date/time math (`timestamp + int`, INTERVAL) lands later.
+    if let Some(result) = apply_binary_calendar(op, &l, &r)? {
+        return Ok(result);
+    }
     match op {
         BinOp::Add => arith(l, r, i64::checked_add, |a, b| a + b, "+"),
         BinOp::Sub => arith(l, r, i64::checked_sub, |a, b| a - b, "-"),
@@ -849,6 +874,66 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         }
         BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
+}
+
+/// Calendar arithmetic. Returns `Some(value)` when the operand pair
+/// is a date/time combo this function understands, `None` to let the
+/// caller fall through to the regular numeric / text paths.
+fn apply_binary_calendar(op: BinOp, l: &Value, r: &Value) -> Result<Option<Value>, EvalError> {
+    let int_value = |v: &Value| -> Option<i64> {
+        match v {
+            Value::SmallInt(n) => Some(i64::from(*n)),
+            Value::Int(n) => Some(i64::from(*n)),
+            Value::BigInt(n) => Some(*n),
+            _ => None,
+        }
+    };
+    // Most-specific cases first — DATE-DATE / TS-TS subtraction before
+    // DATE-integer subtraction, otherwise the latter swallows the
+    // former with an `int_value(Date) = None` no-op fall-through.
+    match (l, r) {
+        (Value::Date(a), Value::Date(b)) if op == BinOp::Sub => {
+            return Ok(Some(Value::BigInt(i64::from(*a) - i64::from(*b))));
+        }
+        (Value::Timestamp(a), Value::Timestamp(b)) if op == BinOp::Sub => {
+            let delta = a.checked_sub(*b).ok_or(EvalError::TypeMismatch {
+                detail: "TIMESTAMP - TIMESTAMP overflows i64 microseconds".into(),
+            })?;
+            return Ok(Some(Value::BigInt(delta)));
+        }
+        _ => {}
+    }
+    match (l, r) {
+        (Value::Date(d), other) if op == BinOp::Add => {
+            if let Some(n) = int_value(other) {
+                let days = i64::from(*d).saturating_add(n);
+                let days32 = i32::try_from(days).map_err(|_| EvalError::TypeMismatch {
+                    detail: "DATE + integer overflows DATE range".into(),
+                })?;
+                return Ok(Some(Value::Date(days32)));
+            }
+        }
+        (other, Value::Date(d)) if op == BinOp::Add => {
+            if let Some(n) = int_value(other) {
+                let days = i64::from(*d).saturating_add(n);
+                let days32 = i32::try_from(days).map_err(|_| EvalError::TypeMismatch {
+                    detail: "integer + DATE overflows DATE range".into(),
+                })?;
+                return Ok(Some(Value::Date(days32)));
+            }
+        }
+        (Value::Date(d), other) if op == BinOp::Sub => {
+            if let Some(n) = int_value(other) {
+                let days = i64::from(*d).saturating_sub(n);
+                let days32 = i32::try_from(days).map_err(|_| EvalError::TypeMismatch {
+                    detail: "DATE - integer overflows DATE range".into(),
+                })?;
+                return Ok(Some(Value::Date(days32)));
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
 }
 
 /// Dispatch for any binary op when at least one operand is NUMERIC.

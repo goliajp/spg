@@ -49,7 +49,11 @@ impl Default for Runner {
 impl Runner {
     pub fn new() -> Self {
         Self {
-            engine: Engine::new(),
+            // Inject a deterministic clock so corpus tests that touch
+            // `NOW()` / `CURRENT_DATE` get a stable value across runs.
+            // The fixed value is 2025-06-15T12:00:00.000000Z =
+            // 1_749_988_800_000_000 microseconds since epoch.
+            engine: Engine::new().with_clock(fixed_test_clock),
         }
     }
 
@@ -154,6 +158,16 @@ fn render_rows(rows: &[spg_storage::Row], type_string: &str, sort: SortMode) -> 
     }
 
     rendered_rows.into_iter().flatten().collect()
+}
+
+/// Deterministic clock used by the corpus runner so anything that
+/// references `NOW()` / `CURRENT_TIMESTAMP` / `CURRENT_DATE` returns
+/// the same instant on every test run.
+/// Fixed at 2025-06-15T12:00:00.000000Z.
+const TEST_CLOCK_MICROS: i64 = 1_749_988_800_000_000;
+
+fn fixed_test_clock() -> i64 {
+    TEST_CLOCK_MICROS
 }
 
 fn render_cell(v: &Value, ty: char) -> String {
