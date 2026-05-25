@@ -17,8 +17,8 @@ use core::fmt;
 use core::mem;
 
 use crate::ast::{
-    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateTableStatement, Expr, InsertStatement,
-    Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp,
+    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement, Expr,
+    InsertStatement, Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -112,10 +112,22 @@ impl Parser {
     fn parse_one_statement(&mut self) -> Result<Statement, ParseError> {
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
-            Token::Create => self.parse_create_table_stmt(),
+            Token::Create => self.parse_create_stmt(),
             Token::Insert => self.parse_insert_stmt(),
             other => Err(self.err(format!(
                 "expected SELECT / CREATE / INSERT at start of statement, got {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_create_stmt(&mut self) -> Result<Statement, ParseError> {
+        debug_assert!(matches!(self.peek(), Token::Create));
+        self.advance();
+        match self.peek() {
+            Token::Table => self.parse_create_table_stmt_after_create(),
+            Token::Index => self.parse_create_index_stmt_after_create(),
+            other => Err(self.err(format!(
+                "expected TABLE or INDEX after CREATE, got {other:?}"
             ))),
         }
     }
@@ -144,15 +156,9 @@ impl Parser {
         }))
     }
 
-    fn parse_create_table_stmt(&mut self) -> Result<Statement, ParseError> {
-        debug_assert!(matches!(self.peek(), Token::Create));
-        self.advance();
-        if !matches!(self.peek(), Token::Table) {
-            return Err(self.err(format!(
-                "expected TABLE after CREATE, got {:?}",
-                self.peek()
-            )));
-        }
+    fn parse_create_table_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
+        // Caller already consumed CREATE; we're sitting on TABLE.
+        debug_assert!(matches!(self.peek(), Token::Table));
         self.advance();
         let name = self.expect_ident_like()?;
         if !matches!(self.peek(), Token::LParen) {
@@ -186,6 +192,41 @@ impl Parser {
         Ok(Statement::CreateTable(CreateTableStatement {
             name,
             columns,
+        }))
+    }
+
+    fn parse_create_index_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
+        // Caller consumed CREATE; we're on INDEX.
+        debug_assert!(matches!(self.peek(), Token::Index));
+        self.advance();
+        let name = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(format!(
+                "expected ON after CREATE INDEX <name>, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "expected '(' before indexed column, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let column = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' after indexed column, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(Statement::CreateIndex(CreateIndexStatement {
+            name,
+            table,
+            column,
         }))
     }
 
@@ -783,5 +824,35 @@ mod tests {
     fn unknown_keyword_at_statement_start_errors() {
         let err = parse_statement("UPDATE foo SET x = 1").unwrap_err();
         assert!(err.message.contains("expected SELECT"));
+    }
+
+    // --- v0.8 CREATE INDEX --------------------------------------------------
+
+    #[test]
+    fn create_index_basic() {
+        let s = parse("CREATE INDEX idx_id ON users (id)");
+        let Statement::CreateIndex(c) = s else {
+            panic!("expected CreateIndex")
+        };
+        assert_eq!(c.name, "idx_id");
+        assert_eq!(c.table, "users");
+        assert_eq!(c.column, "id");
+    }
+
+    #[test]
+    fn create_index_missing_on_errors() {
+        assert!(parse_statement("CREATE INDEX foo users (id)").is_err());
+    }
+
+    #[test]
+    fn create_index_missing_paren_errors() {
+        assert!(parse_statement("CREATE INDEX foo ON users id").is_err());
+    }
+
+    #[test]
+    fn create_index_round_trip() {
+        let original = parse("CREATE INDEX by_name ON users (name)");
+        let again = parse_statement(&original.to_string()).unwrap();
+        assert_eq!(original, again);
     }
 }

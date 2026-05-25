@@ -13,11 +13,13 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use spg_sql::ast::{
-    ColumnDef, ColumnName, ColumnTypeName, CreateTableStatement, Expr, InsertStatement, Literal,
-    SelectItem, SelectStatement, Statement, UnOp,
+    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement, Expr,
+    InsertStatement, Literal, SelectItem, SelectStatement, Statement, UnOp,
 };
 use spg_sql::parser::{self, ParseError};
-use spg_storage::{Catalog, ColumnSchema, DataType, Row, StorageError, TableSchema, Value};
+use spg_storage::{
+    Catalog, ColumnSchema, DataType, IndexKey, Row, StorageError, Table, TableSchema, Value,
+};
 
 use crate::eval::{EvalContext, EvalError};
 
@@ -105,9 +107,23 @@ impl Engine {
         let stmt = parser::parse_statement(sql)?;
         match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
+            Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Select(s) => self.exec_select(&s),
         }
+    }
+
+    fn exec_create_index(
+        &mut self,
+        stmt: CreateIndexStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let table = self.catalog.get_mut(&stmt.table).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: stmt.table.clone(),
+            })
+        })?;
+        table.add_index(stmt.name, &stmt.column)?;
+        Ok(QueryResult::CommandOk { affected: 0 })
     }
 
     fn exec_create_table(
@@ -166,8 +182,18 @@ impl Engine {
 
         let projection = build_projection(&stmt.items, schema_cols, alias)?;
 
+        // Index seek: if WHERE is `col = literal` (or commuted) and the
+        // referenced column has an index, iterate only the matching row
+        // indices. Otherwise fall back to a full scan.
+        let candidate_rows: Vec<usize> = stmt
+            .where_
+            .as_ref()
+            .and_then(|w| try_index_seek(w, schema_cols, table, alias))
+            .unwrap_or_else(|| (0..table.row_count()).collect());
+
         let mut output_rows = Vec::new();
-        for row in table.rows() {
+        for &i in &candidate_rows {
+            let row = &table.rows()[i];
             if let Some(where_expr) = &stmt.where_ {
                 let cond = eval::eval_expr(where_expr, row, &ctx)?;
                 // SQL: only explicit TRUE rows pass; FALSE and NULL are filtered.
@@ -202,6 +228,67 @@ struct ProjectedItem {
     output_name: String,
     ty: DataType,
     nullable: bool,
+}
+
+/// Try to plan a WHERE clause as an equality lookup against an existing
+/// index. Returns the candidate row indices on success; `None` means the
+/// caller should fall back to a full scan.
+///
+/// v0.8 recognises a single top-level `col = literal` (in either operand
+/// order). AND chains and range scans land in later milestones.
+fn try_index_seek(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &Table,
+    table_alias: &str,
+) -> Option<Vec<usize>> {
+    let Expr::Binary {
+        lhs,
+        op: BinOp::Eq,
+        rhs,
+    } = where_expr
+    else {
+        return None;
+    };
+    let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
+        .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
+    let idx = table.index_on(col_pos)?;
+    let key = IndexKey::from_value(&value)?;
+    Some(idx.lookup_eq(&key).to_vec())
+}
+
+fn resolve_col_literal_pair(
+    col_side: &Expr,
+    lit_side: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<(usize, Value)> {
+    let Expr::Column(c) = col_side else {
+        return None;
+    };
+    if let Some(q) = &c.qualifier
+        && q != table_alias
+    {
+        return None;
+    }
+    let pos = schema_cols.iter().position(|s| s.name == c.name)?;
+    let Expr::Literal(l) = lit_side else {
+        return None;
+    };
+    let v = match l {
+        Literal::Integer(n) => {
+            if let Ok(small) = i32::try_from(*n) {
+                Value::Int(small)
+            } else {
+                Value::BigInt(*n)
+            }
+        }
+        Literal::Float(x) => Value::Float(*x),
+        Literal::String(s) => Value::Text(s.clone()),
+        Literal::Bool(b) => Value::Bool(*b),
+        Literal::Null => Value::Null,
+    };
+    Some((pos, v))
 }
 
 fn build_projection(
@@ -613,5 +700,65 @@ mod tests {
         let mut e = Engine::new();
         let err = e.execute("UPDATE foo SET x = 1").unwrap_err();
         assert!(matches!(err, EngineError::Parse(_)));
+    }
+
+    // --- v0.8 CREATE INDEX + index seek ------------------------------------
+
+    #[test]
+    fn create_index_registers_on_table() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        e.execute("CREATE INDEX by_name ON users (name)").unwrap();
+        let t = e.catalog().get("users").unwrap();
+        assert_eq!(t.indices().len(), 1);
+        assert_eq!(t.indices()[0].name, "by_name");
+    }
+
+    #[test]
+    fn create_index_on_unknown_table_errors() {
+        let mut e = Engine::new();
+        let err = e.execute("CREATE INDEX i ON ghost (a)").unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Storage(StorageError::TableNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn create_index_on_unknown_column_errors() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        let err = e.execute("CREATE INDEX i ON users (ghost)").unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Storage(StorageError::ColumnNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn select_eq_uses_index_returns_same_rows_as_scan() {
+        // Build two engines: one with an index, one without. Same query →
+        // same row set (index is a planner optimisation, not a semantic
+        // change).
+        let mut without = Engine::new();
+        make_three_row_users(&mut without);
+        let mut with = Engine::new();
+        make_three_row_users(&mut with);
+        with.execute("CREATE INDEX by_id ON users (id)").unwrap();
+
+        let q = "SELECT * FROM users WHERE id = 2";
+        let (_, no_idx_rows) = unwrap_rows(without.execute(q).unwrap());
+        let (_, idx_rows) = unwrap_rows(with.execute(q).unwrap());
+        assert_eq!(no_idx_rows, idx_rows);
+        assert_eq!(idx_rows.len(), 1);
+    }
+
+    #[test]
+    fn select_eq_with_no_matching_index_value_returns_empty() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        e.execute("CREATE INDEX by_id ON users (id)").unwrap();
+        let (_, rows) = unwrap_rows(e.execute("SELECT * FROM users WHERE id = 999").unwrap());
+        assert_eq!(rows.len(), 0);
     }
 }
