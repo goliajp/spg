@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 spg-wire = { path = "../spg-wire" }
+# Backup / restore subcommands talk directly to the on-disk format,
+# never via the wire protocol — the server can be down or absent.
+spg-storage = { path = "../spg-storage" }
 
 [lints]
 workspace = true
