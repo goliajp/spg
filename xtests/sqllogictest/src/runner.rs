@@ -159,6 +159,7 @@ fn render_rows(rows: &[spg_storage::Row], type_string: &str, sort: SortMode) -> 
 fn render_cell(v: &Value, ty: char) -> String {
     match v {
         Value::Null => "NULL".into(),
+        Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => match ty {

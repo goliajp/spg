@@ -223,7 +223,7 @@ impl Engine {
             .columns
             .into_iter()
             .map(column_def_to_schema)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         self.active_catalog_mut()
             .create_table(TableSchema::new(stmt.name, cols))?;
         Ok(QueryResult::CommandOk {
@@ -265,10 +265,11 @@ impl Engine {
                     }
                     map[idx] = Some(j);
                 }
-                // Omitted NOT NULL columns can't silently become NULL —
-                // raise before any storage write so the WAL stays clean.
+                // Omitted columns must either be nullable or carry a
+                // DEFAULT. Catch NOT NULL omissions up front so the WAL
+                // stays clean.
                 for (i, col) in schema.columns.iter().enumerate() {
-                    if map[i].is_none() && !col.nullable {
+                    if map[i].is_none() && !col.nullable && col.default.is_none() {
                         return Err(EngineError::Storage(StorageError::NullInNotNull {
                             column: col.name.clone(),
                         }));
@@ -295,7 +296,9 @@ impl Engine {
             for (i, col) in schema.columns.iter().enumerate() {
                 let raw = match tuple_pos[i] {
                     Some(j) => raw_tuple[j].clone(),
-                    None => Value::Null,
+                    // Omitted column: prefer the column's stored DEFAULT;
+                    // fall back to NULL for unbound nullable columns.
+                    None => col.default.clone().unwrap_or(Value::Null),
                 };
                 values.push(coerce_value(raw, col.ty, &col.name, i)?);
             }
@@ -693,6 +696,7 @@ fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
 fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
     match v {
         Value::Null => Ok(f64::INFINITY),
+        Value::SmallInt(n) => Ok(f64::from(*n)),
         Value::Int(n) => Ok(f64::from(*n)),
         #[allow(clippy::cast_precision_loss)]
         Value::BigInt(n) => Ok(*n as f64),
@@ -883,16 +887,29 @@ fn build_projection(
     Ok(out)
 }
 
-fn column_def_to_schema(c: ColumnDef) -> ColumnSchema {
-    ColumnSchema::new(c.name, column_type_to_data_type(c.ty), c.nullable)
+fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
+    let ty = column_type_to_data_type(c.ty);
+    let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
+    if let Some(default_expr) = c.default {
+        // DEFAULT must be a literal expression — evaluated at CREATE TABLE
+        // time against an empty row context. Any column ref / aggregate
+        // surfaces as the corresponding eval error.
+        let raw = literal_expr_to_value(default_expr)?;
+        let coerced = coerce_value(raw, ty, &c.name, 0)?;
+        schema = schema.with_default(coerced);
+    }
+    Ok(schema)
 }
 
 const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
     match t {
+        ColumnTypeName::SmallInt => DataType::SmallInt,
         ColumnTypeName::Int => DataType::Int,
         ColumnTypeName::BigInt => DataType::BigInt,
         ColumnTypeName::Float => DataType::Float,
         ColumnTypeName::Text => DataType::Text,
+        ColumnTypeName::Varchar(n) => DataType::Varchar(n),
+        ColumnTypeName::Char(n) => DataType::Char(n),
         ColumnTypeName::Bool => DataType::Bool,
         ColumnTypeName::Vector(n) => DataType::Vector(n),
     }
@@ -974,9 +991,45 @@ fn coerce_value(
     let coerced = match (v, expected) {
         (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
         (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
+        (Value::Int(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
+        (Value::SmallInt(n), DataType::Int) => Some(Value::Int(i32::from(n))),
+        (Value::SmallInt(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
+        (Value::SmallInt(n), DataType::Float) => Some(Value::Float(f64::from(n))),
         (Value::BigInt(n), DataType::Int) => i32::try_from(n).ok().map(Value::Int),
+        (Value::BigInt(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
         #[allow(clippy::cast_precision_loss)]
         (Value::BigInt(n), DataType::Float) => Some(Value::Float(n as f64)),
+        // VARCHAR(n) enforces an upper bound on character count.
+        (Value::Text(s), DataType::Varchar(max)) => {
+            if u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
+                Some(Value::Text(s))
+            } else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "value for VARCHAR({max}) column `{col_name}` exceeds length: \
+                     {} chars",
+                    s.chars().count()
+                )));
+            }
+        }
+        // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
+        // is already longer we reject (PG truncates trailing-space-only;
+        // staying strict for v1).
+        (Value::Text(s), DataType::Char(size)) => {
+            let len = u32::try_from(s.chars().count()).unwrap_or(u32::MAX);
+            if len > size {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "value for CHAR({size}) column `{col_name}` exceeds length: \
+                     {len} chars"
+                )));
+            }
+            let need = (size - len) as usize;
+            let mut padded = s;
+            padded.reserve(need);
+            for _ in 0..need {
+                padded.push(' ');
+            }
+            Some(Value::Text(padded))
+        }
         _ => None,
     };
     coerced.ok_or(EngineError::Storage(StorageError::TypeMismatch {

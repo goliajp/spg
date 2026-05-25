@@ -474,6 +474,11 @@ fn encode_key(vals: &[Value]) -> String {
     for v in vals {
         match v {
             Value::Null => out.push_str("N|"),
+            Value::SmallInt(n) => {
+                out.push('s');
+                out.push_str(&n.to_string());
+                out.push('|');
+            }
             Value::Int(n) => {
                 out.push('I');
                 out.push_str(&n.to_string());

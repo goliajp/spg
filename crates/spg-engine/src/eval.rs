@@ -262,6 +262,7 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
 
 fn value_to_text(v: &Value) -> String {
     match v {
+        Value::SmallInt(n) => format!("{n}"),
         Value::Int(n) => format!("{n}"),
         Value::BigInt(n) => format!("{n}"),
         Value::Float(x) => format!("{x}"),
