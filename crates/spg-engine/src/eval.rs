@@ -414,6 +414,14 @@ fn literal_to_value(l: &Literal) -> Value {
 
 fn resolve_column(c: &ColumnName, row: &Row, ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
     if let Some(q) = &c.qualifier {
+        // Multi-table evaluation (joins): the synthesised schema uses
+        // composite column names "alias.column" so we look that up
+        // directly. Falls back to the single-table case below if the
+        // composite isn't present.
+        let composite = alloc::format!("{q}.{name}", name = c.name);
+        if let Some(pos) = ctx.columns.iter().position(|s| s.name == composite) {
+            return Ok(row.values[pos].clone());
+        }
         let expected = ctx.table_alias.ok_or_else(|| EvalError::UnknownQualifier {
             qualifier: q.clone(),
         })?;
@@ -423,14 +431,28 @@ fn resolve_column(c: &ColumnName, row: &Row, ctx: &EvalContext<'_>) -> Result<Va
             });
         }
     }
-    let pos = ctx
+    if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
+        return Ok(row.values[pos].clone());
+    }
+    // Bare-name fallback for joined schemas: match any single composite
+    // column ending in ".<name>"; ambiguity is an error.
+    let suffix = alloc::format!(".{name}", name = c.name);
+    let mut matches = ctx
         .columns
         .iter()
-        .position(|s| s.name == c.name)
-        .ok_or_else(|| EvalError::ColumnNotFound {
+        .enumerate()
+        .filter(|(_, s)| s.name.ends_with(&suffix));
+    let first = matches.next();
+    let extra = matches.next();
+    match (first, extra) {
+        (Some((pos, _)), None) => Ok(row.values[pos].clone()),
+        (Some(_), Some(_)) => Err(EvalError::TypeMismatch {
+            detail: alloc::format!("ambiguous column reference: {}", c.name),
+        }),
+        _ => Err(EvalError::ColumnNotFound {
             name: c.name.clone(),
-        })?;
-    Ok(row.values[pos].clone())
+        }),
+    }
 }
 
 fn apply_unary(op: UnOp, v: Value) -> Result<Value, EvalError> {

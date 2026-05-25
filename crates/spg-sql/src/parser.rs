@@ -18,8 +18,8 @@ use core::mem;
 
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreateTableStatement, Expr, InsertStatement, Literal, SelectItem, SelectStatement, Statement,
-    TableRef, UnOp, UnionKind,
+    CreateTableStatement, Expr, FromClause, FromJoin, InsertStatement, JoinKind, Literal,
+    SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -217,7 +217,7 @@ impl Parser {
         let items = self.parse_select_list()?;
         let from = if matches!(self.peek(), Token::From) {
             self.advance();
-            Some(self.parse_table_ref()?)
+            Some(self.parse_from_clause()?)
         } else {
             None
         };
@@ -519,6 +519,85 @@ impl Parser {
         let name = self.expect_ident_like()?;
         let alias = self.parse_optional_alias();
         Ok(TableRef { name, alias })
+    }
+
+    /// FROM-clause: a primary table reference plus zero-or-more joined
+    /// peers expressed via either `, <table>` (cross-product, no ON) or
+    /// `[INNER|LEFT [OUTER]|CROSS] JOIN <table> [ON expr]`. v1.10 keeps
+    /// the join list flat (left-associative nested-loop semantics).
+    fn parse_from_clause(&mut self) -> Result<FromClause, ParseError> {
+        let primary = self.parse_table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            // `, <table>` — cross-product with no ON.
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                let table = self.parse_table_ref()?;
+                joins.push(FromJoin {
+                    kind: JoinKind::Cross,
+                    table,
+                    on: None,
+                });
+                continue;
+            }
+            // Explicit JOIN syntax. Accept INNER JOIN, LEFT [OUTER] JOIN,
+            // CROSS JOIN, and bare JOIN (defaults to INNER).
+            let kind =
+                match self.peek() {
+                    Token::Inner => {
+                        self.advance();
+                        if !matches!(self.peek(), Token::Join) {
+                            return Err(self
+                                .err(format!("expected JOIN after INNER, got {:?}", self.peek())));
+                        }
+                        self.advance();
+                        JoinKind::Inner
+                    }
+                    Token::Left => {
+                        self.advance();
+                        if matches!(self.peek(), Token::Outer) {
+                            self.advance();
+                        }
+                        if !matches!(self.peek(), Token::Join) {
+                            return Err(self.err(format!(
+                                "expected JOIN after LEFT [OUTER], got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        JoinKind::Left
+                    }
+                    Token::Cross => {
+                        self.advance();
+                        if !matches!(self.peek(), Token::Join) {
+                            return Err(self
+                                .err(format!("expected JOIN after CROSS, got {:?}", self.peek())));
+                        }
+                        self.advance();
+                        JoinKind::Cross
+                    }
+                    Token::Join => {
+                        self.advance();
+                        JoinKind::Inner
+                    }
+                    _ => break,
+                };
+            let table = self.parse_table_ref()?;
+            let on = if matches!(self.peek(), Token::On) {
+                self.advance();
+                Some(self.parse_expr(0)?)
+            } else if kind == JoinKind::Cross {
+                None
+            } else {
+                return Err(self.err(format!(
+                    "expected ON after {:?} JOIN, got {:?}",
+                    kind,
+                    self.peek()
+                )));
+            };
+            joins.push(FromJoin { kind, table, on });
+        }
+        Ok(FromClause { primary, joins })
     }
 
     /// Optional alias after an expression or table:
@@ -986,7 +1065,7 @@ mod tests {
             panic!("expected SELECT")
         };
         assert!(matches!(s.items[..], [SelectItem::Wildcard]));
-        assert_eq!(s.from.as_ref().unwrap().name, "users");
+        assert_eq!(s.from.as_ref().unwrap().primary.name, "users");
     }
 
     #[test]
@@ -995,7 +1074,7 @@ mod tests {
         let Statement::Select(s) = s else {
             panic!("expected SELECT")
         };
-        let t = s.from.as_ref().unwrap();
+        let t = &s.from.as_ref().unwrap().primary;
         assert_eq!(t.name, "users");
         assert_eq!(t.alias.as_deref(), Some("u"));
     }

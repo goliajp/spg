@@ -90,6 +90,11 @@ pub enum Token {
     Distinct,
     Union,
     All,
+    Join,
+    Inner,
+    Left,
+    Cross,
+    Outer,
 
     Eof,
 }
@@ -317,6 +322,11 @@ fn keyword_or_ident(lower: String) -> Token {
         "distinct" => Token::Distinct,
         "union" => Token::Union,
         "all" => Token::All,
+        "join" => Token::Join,
+        "inner" => Token::Inner,
+        "left" => Token::Left,
+        "cross" => Token::Cross,
+        "outer" => Token::Outer,
         _ => Token::Ident(lower),
     }
 }
