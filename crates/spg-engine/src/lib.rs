@@ -15,8 +15,8 @@ use core::fmt;
 
 use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement, Expr,
-    FromClause, InsertStatement, JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp,
-    UnionKind,
+    FromClause, IndexMethod, InsertStatement, JoinKind, Literal, SelectItem, SelectStatement,
+    Statement, UnOp, UnionKind,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -286,7 +286,12 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
-        table.add_index(stmt.name, &stmt.column)?;
+        match stmt.method {
+            IndexMethod::BTree => table.add_index(stmt.name, &stmt.column)?,
+            IndexMethod::Hnsw => {
+                table.add_nsw_index(stmt.name, &stmt.column, spg_storage::NSW_DEFAULT_M)?;
+            }
+        }
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
@@ -485,6 +490,14 @@ impl Engine {
         // bare table name.
         let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
         let ctx = EvalContext::new(schema_cols, Some(alias));
+
+        // NSW kNN planner: `ORDER BY col <-> literal LIMIT k` with no
+        // WHERE and an NSW index on `col` skips the full scan. The
+        // walk returns rows already in ascending-distance order, so
+        // ORDER BY / LIMIT are honoured implicitly.
+        if let Some(nsw_rows) = try_nsw_knn(stmt, table, schema_cols, alias) {
+            return materialise_in_order(stmt, table, schema_cols, alias, &nsw_rows);
+        }
 
         // Index seek: if WHERE is `col = literal` (or commuted) and the
         // referenced column has an index, iterate only the matching row
@@ -816,6 +829,93 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
 ///
 /// v0.8 recognises a single top-level `col = literal` (in either operand
 /// order). AND chains and range scans land in later milestones.
+/// Look for `ORDER BY col <-> literal LIMIT k` (no WHERE) against an
+/// NSW-indexed vector column. Returns the row indices in ascending-
+/// distance order when the plan applies, `None` otherwise — the caller
+/// then materialises one row per index in that order and skips ORDER BY.
+fn try_nsw_knn(
+    stmt: &SelectStatement,
+    table: &Table,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<Vec<usize>> {
+    if stmt.where_.is_some() || stmt.distinct {
+        return None;
+    }
+    let limit = usize::try_from(stmt.limit?).ok()?;
+    if limit == 0 {
+        return None;
+    }
+    let order = stmt.order_by.as_ref()?;
+    let Expr::Binary {
+        lhs,
+        op: BinOp::L2Distance,
+        rhs,
+    } = order
+    else {
+        return None;
+    };
+    // Accept both `col <-> literal` and `literal <-> col`.
+    let ((Expr::Column(col), literal) | (literal, Expr::Column(col))) =
+        (lhs.as_ref(), rhs.as_ref())
+    else {
+        return None;
+    };
+    if let Some(q) = &col.qualifier
+        && q != table_alias
+    {
+        return None;
+    }
+    let col_pos = schema_cols.iter().position(|s| s.name == col.name)?;
+    let query = literal_to_vector(literal)?;
+    let idx = spg_storage::nsw_index_on(table, col_pos)?;
+    Some(spg_storage::nsw_query(table, &idx.name, &query, limit))
+}
+
+/// Pull a `Vec<f32>` out of a literal-or-cast expression. Returns
+/// `None` for anything we can't fold at plan time.
+fn literal_to_vector(e: &Expr) -> Option<Vec<f32>> {
+    match e {
+        Expr::Literal(Literal::Vector(v)) => Some(v.clone()),
+        Expr::Cast { expr, .. } => literal_to_vector(expr),
+        _ => None,
+    }
+}
+
+/// Materialise rows in a planner-supplied order (used by the NSW path)
+/// without re-running ORDER BY. The projection + LIMIT slot mirror the
+/// equivalent block in `exec_bare_select`.
+fn materialise_in_order(
+    stmt: &SelectStatement,
+    table: &Table,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+    ordered_rows: &[usize],
+) -> Result<QueryResult, EngineError> {
+    let ctx = EvalContext::new(schema_cols, Some(table_alias));
+    let projection = build_projection(&stmt.items, schema_cols, table_alias)?;
+    let mut output_rows: Vec<Row> = Vec::with_capacity(ordered_rows.len());
+    for &i in ordered_rows {
+        let row = &table.rows()[i];
+        let mut values = Vec::with_capacity(projection.len());
+        for p in &projection {
+            values.push(eval::eval_expr(&p.expr, row, &ctx)?);
+        }
+        output_rows.push(Row::new(values));
+    }
+    if let Some(n) = stmt.limit {
+        output_rows.truncate(n as usize);
+    }
+    let columns: Vec<ColumnSchema> = projection
+        .into_iter()
+        .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+        .collect();
+    Ok(QueryResult::Rows {
+        columns,
+        rows: output_rows,
+    })
+}
+
 fn try_index_seek(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],

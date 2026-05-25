@@ -193,29 +193,85 @@ impl IndexKey {
     }
 }
 
-/// A single-column secondary index. Wraps `alloc::collections::BTreeMap`
-/// (which is Rust's standard B-tree — counts as the official core library
-/// per the v1 constraint).
+/// A single-column secondary index. v2.0 carries either a B-tree map
+/// (the default — used for equality / range lookups on scalar columns)
+/// or a navigable-small-world graph (used for kNN over vector
+/// columns).
 #[derive(Debug, Clone)]
 pub struct Index {
     pub name: String,
     pub column_position: usize,
-    map: BTreeMap<IndexKey, Vec<usize>>,
+    pub kind: IndexKind,
+}
+
+/// Default neighbor degree (M) for the NSW graph. Picked at construction
+/// time and persisted with the index.
+pub const NSW_DEFAULT_M: usize = 16;
+
+#[derive(Debug, Clone)]
+pub enum IndexKind {
+    /// B-tree over `IndexKey` (the legacy equality-lookup index).
+    BTree(BTreeMap<IndexKey, Vec<usize>>),
+    /// Navigable-small-world graph for vector kNN search.
+    Nsw(NswGraph),
+}
+
+/// Single-layer NSW graph (v2.0). Each node tracks up to `m` undirected
+/// neighbors; search walks greedily from `entry`. v2.x will layer this.
+#[derive(Debug, Clone)]
+pub struct NswGraph {
+    pub m: usize,
+    pub entry: Option<usize>,
+    /// `neighbors[i]` are row indices connected to row `i`. Rows whose
+    /// value at the index's column is NULL / non-Vector are absent from
+    /// the graph (their `Vec` stays empty).
+    pub neighbors: Vec<Vec<usize>>,
+}
+
+impl NswGraph {
+    fn new(m: usize) -> Self {
+        Self {
+            m,
+            entry: None,
+            neighbors: Vec::new(),
+        }
+    }
 }
 
 impl Index {
-    fn new(name: String, column_position: usize) -> Self {
+    fn new_btree(name: String, column_position: usize) -> Self {
         Self {
             name,
             column_position,
-            map: BTreeMap::new(),
+            kind: IndexKind::BTree(BTreeMap::new()),
         }
     }
 
-    /// Look up the row indices stored under `key`. Returns an empty slice
-    /// when the key is absent — callers can treat both cases uniformly.
+    fn new_nsw(name: String, column_position: usize, m: usize) -> Self {
+        Self {
+            name,
+            column_position,
+            kind: IndexKind::Nsw(NswGraph::new(m)),
+        }
+    }
+
+    /// Look up the row indices stored under `key` (B-tree only). Returns
+    /// an empty slice when the key is absent or the index is an NSW
+    /// graph — callers can treat both cases uniformly.
     pub fn lookup_eq(&self, key: &IndexKey) -> &[usize] {
-        self.map.get(key).map_or(&[][..], Vec::as_slice)
+        match &self.kind {
+            IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
+            IndexKind::Nsw(_) => &[][..],
+        }
+    }
+
+    /// Borrow the NSW graph (if this is an NSW index). Callers that need
+    /// the graph for a kNN search go through here.
+    pub const fn nsw(&self) -> Option<&NswGraph> {
+        match &self.kind {
+            IndexKind::Nsw(g) => Some(g),
+            IndexKind::BTree(_) => None,
+        }
     }
 }
 
@@ -317,19 +373,40 @@ impl Table {
         }
         let new_row_idx = self.rows.len();
         // Pre-validate before mutating: ensure indices receive an IndexKey.
+        // For NSW we defer the graph update to *after* the row is pushed
+        // so the kNN search can see it in `self.rows`.
         for idx in &mut self.indices {
-            if let Some(key) = IndexKey::from_value(&row.values[idx.column_position]) {
-                idx.map.entry(key).or_default().push(new_row_idx);
+            if let IndexKind::BTree(map) = &mut idx.kind
+                && let Some(key) = IndexKey::from_value(&row.values[idx.column_position])
+            {
+                map.entry(key).or_default().push(new_row_idx);
             }
-            // NULL / Float just doesn't get indexed — `index_on` callers still
-            // need to fall back to full scan when the WHERE literal is NULL.
         }
         self.rows.push(row);
+        // NSW updates after the push so the new row is visible to the
+        // greedy search used during connect.
+        let new_row_idx = self.rows.len() - 1;
+        let nsw_targets: Vec<usize> = self
+            .indices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, idx)| {
+                if matches!(idx.kind, IndexKind::Nsw(_)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for idx_pos in nsw_targets {
+            nsw_insert_at(self, idx_pos, new_row_idx);
+        }
         Ok(())
     }
 
-    /// Build a new index over the named column. Rebuilds from existing rows.
-    /// Errors if `column_name` doesn't exist or the index name is taken.
+    /// Build a new B-tree index over the named column. Rebuilds from
+    /// existing rows. Errors if `column_name` doesn't exist or the index
+    /// name is taken.
     pub fn add_index(&mut self, name: String, column_name: &str) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
@@ -339,15 +416,230 @@ impl Table {
                 column: column_name.into(),
             }
         })?;
-        let mut idx = Index::new(name, column_position);
-        for (i, row) in self.rows.iter().enumerate() {
-            if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
-                idx.map.entry(key).or_default().push(i);
+        let mut idx = Index::new_btree(name, column_position);
+        if let IndexKind::BTree(map) = &mut idx.kind {
+            for (i, row) in self.rows.iter().enumerate() {
+                if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
+                    map.entry(key).or_default().push(i);
+                }
             }
         }
         self.indices.push(idx);
         Ok(())
     }
+
+    /// Build a new NSW (HNSW-flavoured) index over the named column.
+    /// Required for `ORDER BY col <-> literal LIMIT k` to plan as a
+    /// graph traversal instead of a full scan. Column must be a Vector
+    /// type. `m` is the maximum number of neighbours per node.
+    pub fn add_nsw_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        m: usize,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        if !matches!(self.schema.columns[column_position].ty, DataType::Vector(_)) {
+            return Err(StorageError::TypeMismatch {
+                column: column_name.into(),
+                expected: DataType::Vector(0),
+                actual: self.schema.columns[column_position].ty,
+                position: column_position,
+            });
+        }
+        let idx = Index::new_nsw(name, column_position, m);
+        self.indices.push(idx);
+        let idx_pos = self.indices.len() - 1;
+        // Bulk-build by walking the existing rows in order — each insert
+        // sees the partial graph and links into it.
+        let row_indices: Vec<usize> = (0..self.rows.len()).collect();
+        for row_idx in row_indices {
+            nsw_insert_at(self, idx_pos, row_idx);
+        }
+        Ok(())
+    }
+}
+
+/// Insert one row into the NSW graph held by index slot `idx_pos`.
+/// No-op when the row's value at the indexed column isn't a Vector.
+fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
+    let col_pos = table.indices[idx_pos].column_position;
+    let dim = match &table.rows[new_row_idx].values[col_pos] {
+        Value::Vector(v) => v.len(),
+        _ => return,
+    };
+    if dim == 0 {
+        return;
+    }
+    let m = match &table.indices[idx_pos].kind {
+        IndexKind::Nsw(g) => g.m,
+        IndexKind::BTree(_) => unreachable!("nsw_insert_at on a BTree index"),
+    };
+    let entry = match &table.indices[idx_pos].kind {
+        IndexKind::Nsw(g) => g.entry,
+        IndexKind::BTree(_) => unreachable!(),
+    };
+    // First node ever — declare it the entry and call it done.
+    if entry.is_none() {
+        if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
+            // Make sure neighbours vector is big enough.
+            while g.neighbors.len() <= new_row_idx {
+                g.neighbors.push(Vec::new());
+            }
+            g.entry = Some(new_row_idx);
+        }
+        return;
+    }
+    // Find the M nearest existing nodes via greedy walk.
+    let query = match &table.rows[new_row_idx].values[col_pos] {
+        Value::Vector(v) => v.clone(),
+        _ => return,
+    };
+    let nearest = nsw_search(table, idx_pos, &query, m, m * 2);
+    // Connect bidirectionally. Trim each endpoint to M to keep degree bounded.
+    let new_neighbors: Vec<usize> = nearest
+        .iter()
+        .filter(|(_, idx)| *idx != new_row_idx)
+        .map(|(_, idx)| *idx)
+        .collect();
+    let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind else {
+        unreachable!()
+    };
+    while g.neighbors.len() <= new_row_idx {
+        g.neighbors.push(Vec::new());
+    }
+    g.neighbors[new_row_idx].clone_from(&new_neighbors);
+    for n in new_neighbors {
+        // Ensure target row's adjacency vector is reachable.
+        while g.neighbors.len() <= n {
+            g.neighbors.push(Vec::new());
+        }
+        if !g.neighbors[n].contains(&new_row_idx) {
+            g.neighbors[n].push(new_row_idx);
+            if g.neighbors[n].len() > g.m {
+                // Drop one (the most distant). We trim by recomputing
+                // distances on demand — degree stays bounded.
+                let host = n;
+                let Value::Vector(host_vec) = table.rows[host].values[col_pos].clone() else {
+                    continue;
+                };
+                let mut tagged: Vec<(f32, usize)> = g.neighbors[host]
+                    .iter()
+                    .map(|&peer| {
+                        let Value::Vector(pv) = &table.rows[peer].values[col_pos] else {
+                            return (f32::INFINITY, peer);
+                        };
+                        (l2_distance_sq(&host_vec, pv), peer)
+                    })
+                    .collect();
+                tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+                tagged.truncate(g.m);
+                g.neighbors[host] = tagged.into_iter().map(|(_, peer)| peer).collect();
+            }
+        }
+    }
+}
+
+/// Greedy NSW kNN search: walk from the graph entry node, maintaining
+/// an `ef`-sized candidate pool, return the top `k` results.
+fn nsw_search(
+    table: &Table,
+    idx_pos: usize,
+    query: &[f32],
+    k: usize,
+    ef: usize,
+) -> Vec<(f32, usize)> {
+    let g = match &table.indices[idx_pos].kind {
+        IndexKind::Nsw(g) => g,
+        IndexKind::BTree(_) => return Vec::new(),
+    };
+    let Some(entry) = g.entry else {
+        return Vec::new();
+    };
+    let col_pos = table.indices[idx_pos].column_position;
+    let ef = ef.max(k);
+    let mut visited: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
+    visited.insert(entry);
+    let d0 = match &table.rows[entry].values[col_pos] {
+        Value::Vector(v) => l2_distance_sq(v, query),
+        _ => return Vec::new(),
+    };
+    // `candidates` is the open frontier (min-distance first).
+    // `results` is the working top-`ef` (max-distance last).
+    let mut candidates: Vec<(f32, usize)> = alloc::vec![(d0, entry)];
+    let mut results: Vec<(f32, usize)> = alloc::vec![(d0, entry)];
+    while let Some(&(d_cur, idx)) = candidates.first() {
+        candidates.remove(0);
+        let worst = results.last().map_or(f32::INFINITY, |&(d, _)| d);
+        if d_cur > worst && results.len() >= ef {
+            break;
+        }
+        let neighbors: Vec<usize> = g.neighbors.get(idx).cloned().unwrap_or_default();
+        for n in neighbors {
+            if !visited.insert(n) {
+                continue;
+            }
+            let Value::Vector(nv) = &table.rows[n].values[col_pos] else {
+                continue;
+            };
+            if nv.len() != query.len() {
+                continue;
+            }
+            let dn = l2_distance_sq(nv, query);
+            let worst = results.last().map_or(f32::INFINITY, |&(d, _)| d);
+            if results.len() < ef || dn < worst {
+                let pos = results.partition_point(|&(d, _)| d <= dn);
+                results.insert(pos, (dn, n));
+                if results.len() > ef {
+                    results.truncate(ef);
+                }
+                let pos = candidates.partition_point(|&(d, _)| d <= dn);
+                candidates.insert(pos, (dn, n));
+            }
+        }
+    }
+    results.truncate(k);
+    results
+}
+
+/// Squared Euclidean distance — used for ordering inside NSW (the sqrt
+/// preserves the order). Caller takes sqrt before reporting back to SQL.
+fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum: f32 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = *x - *y;
+        sum += d * d;
+    }
+    sum
+}
+
+/// Public wrapper: run an NSW kNN search and return the top-k row
+/// indices ordered by ascending L2 distance.
+pub fn nsw_query(table: &Table, idx_name: &str, query: &[f32], k: usize) -> Vec<usize> {
+    let Some(idx_pos) = table.indices.iter().position(|i| i.name == idx_name) else {
+        return Vec::new();
+    };
+    let ef = (k * 2).max(NSW_DEFAULT_M);
+    let mut hits = nsw_search(table, idx_pos, query, k, ef);
+    hits.truncate(k);
+    hits.into_iter().map(|(_, idx)| idx).collect()
+}
+
+/// Find any NSW index on a column. Used by the planner to decide
+/// whether an `ORDER BY col <-> literal LIMIT k` query can skip the
+/// brute-force scan.
+pub fn nsw_index_on(table: &Table, column_position: usize) -> Option<&Index> {
+    table
+        .indices
+        .iter()
+        .find(|i| i.column_position == column_position && matches!(i.kind, IndexKind::Nsw(_)))
 }
 
 /// Flat catalog. `Vec` is intentional — std `HashMap` is unavailable in
@@ -553,8 +845,12 @@ impl Catalog {
                     write_value(&mut out, v);
                 }
             }
-            // Index definitions (v0.8). Only the name + column position are
-            // persisted; the BTreeMap data is rebuilt on deserialize.
+            // Index definitions (v0.8 + v2.0). Per-index payload:
+            //   [name][col_pos u16][kind u8]
+            //     kind 0 = B-tree    (no params)
+            //     kind 1 = NSW graph (u16 M)
+            // The actual graph / map is rebuilt by walking the restored
+            // rows.
             write_u16(
                 &mut out,
                 u16::try_from(t.indices.len()).expect("≤ 65k indices/table"),
@@ -565,6 +861,13 @@ impl Catalog {
                     &mut out,
                     u16::try_from(idx.column_position).expect("≤ 65k columns/table"),
                 );
+                match &idx.kind {
+                    IndexKind::BTree(_) => out.push(0),
+                    IndexKind::Nsw(g) => {
+                        out.push(1);
+                        write_u16(&mut out, u16::try_from(g.m).expect("≤ 65k NSW neighbours"));
+                    }
+                }
             }
         }
         out
@@ -644,8 +947,22 @@ impl Catalog {
                     })?
                     .name
                     .clone();
+                let kind_tag = cur.read_u8()?;
                 let t = cat.get_mut(&name).expect("just inserted");
-                t.add_index(idx_name, &column_name)?;
+                match kind_tag {
+                    0 => {
+                        t.add_index(idx_name, &column_name)?;
+                    }
+                    1 => {
+                        let m = cur.read_u16()? as usize;
+                        t.add_nsw_index(idx_name, &column_name, m)?;
+                    }
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown index kind tag: {other}"
+                        )));
+                    }
+                }
             }
         }
         if cur.pos < buf.len() {
