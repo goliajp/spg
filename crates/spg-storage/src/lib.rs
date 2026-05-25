@@ -257,26 +257,77 @@ pub enum IndexKind {
     Nsw(NswGraph),
 }
 
-/// Single-layer NSW graph (v2.0). Each node tracks up to `m` undirected
-/// neighbors; search walks greedily from `entry`. v2.x will layer this.
+/// Multi-layer HNSW graph (v2.13). Each node is assigned a `top_level`;
+/// it appears in layers `0..=top_level`. Higher layers are sparser, so
+/// search starts from the entry at the top layer, greedy-descends to
+/// layer 0, and beam-searches there. Layer 0 keeps a larger neighbour
+/// budget (`m_max_0 = 2 * m` per the HNSW paper); upper layers cap at
+/// `m`. The struct name stays `NswGraph` so external users / on-disk
+/// callers don't have to track a rename — the algorithm changed, the
+/// data slot didn't.
 #[derive(Debug, Clone)]
 pub struct NswGraph {
+    /// Max neighbours per node on layers ≥ 1.
     pub m: usize,
+    /// Max neighbours on layer 0 (the dense bottom layer). HNSW
+    /// convention: `m_max_0 = 2 * m`.
+    pub m_max_0: usize,
+    /// Entry point — the node that sits on the topmost layer. Search
+    /// always starts here.
     pub entry: Option<usize>,
-    /// `neighbors[i]` are row indices connected to row `i`. Rows whose
-    /// value at the index's column is NULL / non-Vector are absent from
-    /// the graph (their `Vec` stays empty).
-    pub neighbors: Vec<Vec<usize>>,
+    /// Top layer of the entry node (== `layers.len() - 1` when populated).
+    pub entry_level: u8,
+    /// `levels[i]` = top layer of node `i`. Nodes whose vector cell is
+    /// NULL / non-Vector have `levels[i] = 0` and no neighbour entries.
+    pub levels: Vec<u8>,
+    /// `layers[l][i]` = neighbours of node `i` at layer `l`. Inner vec
+    /// is empty when node `i` doesn't reach layer `l`.
+    pub layers: Vec<Vec<Vec<usize>>>,
 }
 
 impl NswGraph {
     fn new(m: usize) -> Self {
         Self {
             m,
+            m_max_0: m.saturating_mul(2),
             entry: None,
-            neighbors: Vec::new(),
+            entry_level: 0,
+            levels: Vec::new(),
+            layers: alloc::vec![Vec::new()],
         }
     }
+
+    /// Max-neighbour budget for layer `l`.
+    pub const fn cap_for_layer(&self, layer: u8) -> usize {
+        if layer == 0 { self.m_max_0 } else { self.m }
+    }
+}
+
+/// Deterministic level assignment, seeded on the row index so the same
+/// insert order reproduces the same topology. Distribution is roughly
+/// HNSW-flavoured with `mL ≈ 1/ln(M) ≈ 0.36` for M=16: each 4-bit
+/// chunk that comes up zero promotes the node one layer (so P(level ≥
+/// L) ≈ (1/16)^L).
+#[allow(clippy::verbose_bit_mask)] // clippy suggests trailing_zeros(); we need an explicit MAX cap and a stable distribution shape.
+pub fn nsw_assign_level(row_idx: usize) -> u8 {
+    const MAX_LEVEL: u8 = 7; // 7 ⇒ ~16^7 ≈ 2.7e8 expected nodes between promotions; ample.
+    // SplitMix-style mixer — cheap and seedable.
+    let mut x = (row_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    // Count contiguous low-end zero nibbles (4-bit chunks). Each zero
+    // nibble has probability 1/16, mirroring HNSW's `mL ≈ 1/ln(M)` for
+    // M=16. `trailing_zeros / 4` would lose the ordering when x = 0, so
+    // a plain loop with a cap is clearer.
+    let mut level: u8 = 0;
+    while x & 0xF == 0 && level < MAX_LEVEL {
+        level += 1;
+        x >>= 4;
+    }
+    level
 }
 
 impl Index {
@@ -569,115 +620,162 @@ impl Table {
     }
 }
 
-/// Insert one row into the NSW graph held by index slot `idx_pos`.
+/// Insert one row into the HNSW graph held by index slot `idx_pos`.
 /// No-op when the row's value at the indexed column isn't a Vector.
 fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     let col_pos = table.indices[idx_pos].column_position;
-    let dim = match &table.rows[new_row_idx].values[col_pos] {
-        Value::Vector(v) => v.len(),
-        _ => return,
+    let Value::Vector(v) = &table.rows[new_row_idx].values[col_pos] else {
+        // Even non-vector rows occupy a level slot so per-node Vec
+        // lengths stay aligned with `table.rows.len()`.
+        ensure_node_slot(table, idx_pos, new_row_idx, 0);
+        return;
     };
-    if dim == 0 {
+    if v.is_empty() {
+        ensure_node_slot(table, idx_pos, new_row_idx, 0);
         return;
     }
-    let m = match &table.indices[idx_pos].kind {
-        IndexKind::Nsw(g) => g.m,
+    let level = nsw_assign_level(new_row_idx);
+    ensure_node_slot(table, idx_pos, new_row_idx, level);
+    let (entry, entry_level, m) = match &table.indices[idx_pos].kind {
+        IndexKind::Nsw(g) => (g.entry, g.entry_level, g.m),
         IndexKind::BTree(_) => unreachable!("nsw_insert_at on a BTree index"),
     };
-    let entry = match &table.indices[idx_pos].kind {
-        IndexKind::Nsw(g) => g.entry,
-        IndexKind::BTree(_) => unreachable!(),
-    };
-    // First node ever — declare it the entry and call it done.
+    // First node ever — declare it the entry (it gets its own level).
     if entry.is_none() {
         if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
-            // Make sure neighbours vector is big enough.
-            while g.neighbors.len() <= new_row_idx {
-                g.neighbors.push(Vec::new());
-            }
             g.entry = Some(new_row_idx);
+            g.entry_level = level;
+            g.levels[new_row_idx] = level;
         }
         return;
     }
-    // Find the M nearest existing nodes via greedy walk.
+    // Set the node's recorded level.
+    if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
+        g.levels[new_row_idx] = level;
+    }
     let query = match &table.rows[new_row_idx].values[col_pos] {
         Value::Vector(v) => v.clone(),
         _ => return,
     };
-    // The graph topology is always built with L2 — querying under a
-    // different metric still reuses the same edges (graph topology is
-    // approximate by design).
-    let nearest = nsw_search(table, idx_pos, &query, m, m * 2, NswMetric::L2);
-    // Connect bidirectionally. Trim each endpoint to M to keep degree bounded.
-    let new_neighbors: Vec<usize> = nearest
-        .iter()
-        .filter(|(_, idx)| *idx != new_row_idx)
-        .map(|(_, idx)| *idx)
-        .collect();
+    // Phase 1: greedy descend from `entry` down to `level + 1`, keeping
+    // exactly one current best so the next layer starts from it.
+    let mut current = entry.expect("entry was Some above");
+    let mut current_d = vec_l2_sq(table, col_pos, current, &query);
+    if entry_level > level {
+        for layer in (level + 1..=entry_level).rev() {
+            (current, current_d) =
+                greedy_layer_walk(table, idx_pos, layer, current, current_d, &query);
+        }
+    }
+    // Phase 2: from `min(level, entry_level)` down to 0, beam-search
+    // `ef_construction` candidates and connect to the M closest.
+    let top = level.min(entry_level);
+    let ef = (m * 2).max(8);
+    for layer in (0..=top).rev() {
+        let cap = if layer == 0 { m * 2 } else { m };
+        let mut candidates = layer_beam_search(
+            table,
+            idx_pos,
+            layer,
+            current,
+            current_d,
+            &query,
+            ef,
+            NswMetric::L2,
+        );
+        candidates.retain(|&(_, n)| n != new_row_idx);
+        candidates.truncate(cap);
+        // Take the closest as the entry for the next layer down.
+        if let Some(&(d, n)) = candidates.first() {
+            current = n;
+            current_d = d;
+        }
+        let peers: Vec<usize> = candidates.iter().map(|&(_, n)| n).collect();
+        connect_at_layer(table, idx_pos, layer, new_row_idx, &peers);
+    }
+    // Phase 3: if the new node climbed above the current entry, take
+    // over as entry so future inserts/searches start from the new top.
+    if level > entry_level
+        && let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind
+    {
+        g.entry = Some(new_row_idx);
+        g.entry_level = level;
+    }
+}
+
+/// Make sure `layers[*][new_row_idx]` and `levels[new_row_idx]` exist,
+/// padding with empty/zero entries as needed. Also grows `layers` to
+/// accommodate the node's top `level`.
+fn ensure_node_slot(table: &mut Table, idx_pos: usize, new_row_idx: usize, level: u8) {
     let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind else {
-        unreachable!()
+        unreachable!("ensure_node_slot on a BTree index");
     };
-    while g.neighbors.len() <= new_row_idx {
-        g.neighbors.push(Vec::new());
+    while g.layers.len() <= level as usize {
+        g.layers.push(Vec::new());
     }
-    g.neighbors[new_row_idx].clone_from(&new_neighbors);
-    for n in new_neighbors {
-        // Ensure target row's adjacency vector is reachable.
-        while g.neighbors.len() <= n {
-            g.neighbors.push(Vec::new());
-        }
-        if !g.neighbors[n].contains(&new_row_idx) {
-            g.neighbors[n].push(new_row_idx);
-            if g.neighbors[n].len() > g.m {
-                // Drop one (the most distant). We trim by recomputing
-                // distances on demand — degree stays bounded.
-                let host = n;
-                let Value::Vector(host_vec) = table.rows[host].values[col_pos].clone() else {
-                    continue;
-                };
-                let mut tagged: Vec<(f32, usize)> = g.neighbors[host]
-                    .iter()
-                    .map(|&peer| {
-                        let Value::Vector(pv) = &table.rows[peer].values[col_pos] else {
-                            return (f32::INFINITY, peer);
-                        };
-                        (l2_distance_sq(&host_vec, pv), peer)
-                    })
-                    .collect();
-                tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
-                tagged.truncate(g.m);
-                g.neighbors[host] = tagged.into_iter().map(|(_, peer)| peer).collect();
-            }
+    while g.levels.len() <= new_row_idx {
+        g.levels.push(0);
+    }
+    for layer_vec in &mut g.layers {
+        while layer_vec.len() <= new_row_idx {
+            layer_vec.push(Vec::new());
         }
     }
 }
 
-/// Distance metric used at NSW search time. The graph topology is
-/// always built with `L2`; querying with `InnerProduct` / `Cosine`
-/// reuses the same edges but ranks candidates by the chosen metric.
-/// For the corpus-sized graphs this loses negligible recall vs
-/// building separate per-metric graphs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NswMetric {
-    /// Squared Euclidean — ranks "smaller = closer" (the sqrt is
-    /// monotonic so we skip it for ordering).
-    L2,
-    /// Negated dot product, matching pgvector `<#>` convention so
-    /// "smaller = more similar" holds across all three metrics.
-    InnerProduct,
-    /// Cosine distance `1 - cos(a, b)`. Zero-norm operand yields
-    /// `f32::INFINITY` so it sorts last.
-    Cosine,
-}
-
-/// Greedy NSW kNN search: walk from the graph entry node, maintaining
-/// an `ef`-sized candidate pool, return the top `k` results under the
-/// caller-chosen metric.
-fn nsw_search(
+/// Single-step greedy walk on one layer: from `current` (with cached
+/// distance `current_d`), inspect that node's neighbours at `layer` and
+/// hop to the closest if it beats `current_d`. Repeat until no move
+/// improves the distance. Cheap variant of beam-search used for the
+/// "descend" phase that only needs one survivor per layer.
+fn greedy_layer_walk(
     table: &Table,
     idx_pos: usize,
+    layer: u8,
+    mut current: usize,
+    mut current_d: f32,
     query: &[f32],
-    k: usize,
+) -> (usize, f32) {
+    let g = match &table.indices[idx_pos].kind {
+        IndexKind::Nsw(g) => g,
+        IndexKind::BTree(_) => return (current, current_d),
+    };
+    let col_pos = table.indices[idx_pos].column_position;
+    loop {
+        let neighbours: &[usize] = g
+            .layers
+            .get(layer as usize)
+            .and_then(|layer_v| layer_v.get(current))
+            .map_or(&[][..], Vec::as_slice);
+        let mut best = current;
+        let mut best_d = current_d;
+        for &n in neighbours {
+            let d = vec_l2_sq(table, col_pos, n, query);
+            if d < best_d {
+                best = n;
+                best_d = d;
+            }
+        }
+        if best == current {
+            return (current, current_d);
+        }
+        current = best;
+        current_d = best_d;
+    }
+}
+
+/// Beam search on one layer starting from `entry_node` with cached
+/// `entry_d`. Returns the top `ef` candidates in ascending-distance
+/// order. Caller picks the closest as the next layer's entry and / or
+/// trims to M for connection.
+#[allow(clippy::too_many_arguments)] // Beam search threads layer, entry, query, ef, metric — each is intrinsic. Bundling them into a config struct hides the call sites.
+fn layer_beam_search(
+    table: &Table,
+    idx_pos: usize,
+    layer: u8,
+    entry_node: usize,
+    entry_d: f32,
+    query: &[f32],
     ef: usize,
     metric: NswMetric,
 ) -> Vec<(f32, usize)> {
@@ -685,29 +783,31 @@ fn nsw_search(
         IndexKind::Nsw(g) => g,
         IndexKind::BTree(_) => return Vec::new(),
     };
-    let Some(entry) = g.entry else {
-        return Vec::new();
-    };
     let col_pos = table.indices[idx_pos].column_position;
-    let ef = ef.max(k);
-    let mut visited: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
-    visited.insert(entry);
-    let d0 = match &table.rows[entry].values[col_pos] {
-        Value::Vector(v) => metric_distance(metric, v, query),
-        _ => return Vec::new(),
+    let d0 = if matches!(metric, NswMetric::L2) {
+        entry_d
+    } else {
+        match &table.rows[entry_node].values[col_pos] {
+            Value::Vector(v) => metric_distance(metric, v, query),
+            _ => return Vec::new(),
+        }
     };
-    // `candidates` is the open frontier (min-distance first).
-    // `results` is the working top-`ef` (max-distance last).
-    let mut candidates: Vec<(f32, usize)> = alloc::vec![(d0, entry)];
-    let mut results: Vec<(f32, usize)> = alloc::vec![(d0, entry)];
+    let mut visited: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
+    visited.insert(entry_node);
+    let mut candidates: Vec<(f32, usize)> = alloc::vec![(d0, entry_node)];
+    let mut results: Vec<(f32, usize)> = alloc::vec![(d0, entry_node)];
     while let Some(&(d_cur, idx)) = candidates.first() {
         candidates.remove(0);
         let worst = results.last().map_or(f32::INFINITY, |&(d, _)| d);
         if d_cur > worst && results.len() >= ef {
             break;
         }
-        let neighbors: Vec<usize> = g.neighbors.get(idx).cloned().unwrap_or_default();
-        for n in neighbors {
+        let neighbours: &[usize] = g
+            .layers
+            .get(layer as usize)
+            .and_then(|layer_v| layer_v.get(idx))
+            .map_or(&[][..], Vec::as_slice);
+        for &n in neighbours {
             if !visited.insert(n) {
                 continue;
             }
@@ -730,6 +830,116 @@ fn nsw_search(
             }
         }
     }
+    results
+}
+
+/// Bidirectionally connect `new_row_idx` to each of `peers` at `layer`,
+/// trimming each endpoint's adjacency to that layer's degree cap by
+/// keeping only the closest neighbours.
+fn connect_at_layer(
+    table: &mut Table,
+    idx_pos: usize,
+    layer: u8,
+    new_row_idx: usize,
+    peers: &[usize],
+) {
+    let col_pos = table.indices[idx_pos].column_position;
+    let cap = match &table.indices[idx_pos].kind {
+        IndexKind::Nsw(g) => g.cap_for_layer(layer),
+        IndexKind::BTree(_) => return,
+    };
+    if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
+        let layer_v = &mut g.layers[layer as usize];
+        layer_v[new_row_idx] = peers.to_vec();
+    }
+    for &peer in peers {
+        let host_vec = match &table.rows[peer].values[col_pos] {
+            Value::Vector(v) => v.clone(),
+            _ => continue,
+        };
+        if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
+            let layer_v = &mut g.layers[layer as usize];
+            if !layer_v[peer].contains(&new_row_idx) {
+                layer_v[peer].push(new_row_idx);
+            }
+            if layer_v[peer].len() > cap {
+                let host = peer;
+                let mut tagged: Vec<(f32, usize)> = layer_v[host]
+                    .iter()
+                    .map(|&p| {
+                        let Value::Vector(pv) = &table.rows[p].values[col_pos] else {
+                            return (f32::INFINITY, p);
+                        };
+                        (l2_distance_sq(&host_vec, pv), p)
+                    })
+                    .collect();
+                tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+                tagged.truncate(cap);
+                layer_v[host] = tagged.into_iter().map(|(_, p)| p).collect();
+            }
+        }
+    }
+}
+
+/// Squared L2 distance from `query` to the vector at `(row, col_pos)`.
+/// Returns `f32::INFINITY` when the cell isn't a Vector (so the caller
+/// can compare uniformly without an Option ladder).
+fn vec_l2_sq(table: &Table, col_pos: usize, row: usize, query: &[f32]) -> f32 {
+    match table.rows.get(row).and_then(|r| r.values.get(col_pos)) {
+        Some(Value::Vector(v)) if v.len() == query.len() => l2_distance_sq(v, query),
+        _ => f32::INFINITY,
+    }
+}
+
+/// Distance metric used at NSW search time. The graph topology is
+/// always built with `L2`; querying with `InnerProduct` / `Cosine`
+/// reuses the same edges but ranks candidates by the chosen metric.
+/// For the corpus-sized graphs this loses negligible recall vs
+/// building separate per-metric graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NswMetric {
+    /// Squared Euclidean — ranks "smaller = closer" (the sqrt is
+    /// monotonic so we skip it for ordering).
+    L2,
+    /// Negated dot product, matching pgvector `<#>` convention so
+    /// "smaller = more similar" holds across all three metrics.
+    InnerProduct,
+    /// Cosine distance `1 - cos(a, b)`. Zero-norm operand yields
+    /// `f32::INFINITY` so it sorts last.
+    Cosine,
+}
+
+/// Multi-layer HNSW kNN search: greedy-descend from the entry to layer 0,
+/// then beam-search there with the requested `ef` to return the top `k`
+/// results under the caller-chosen metric. Topology was built with L2 —
+/// upper-layer descent uses L2 as a coarse heuristic; final beam search
+/// runs in the requested metric so rankings are correct for `<#>` / `<=>`.
+fn nsw_search(
+    table: &Table,
+    idx_pos: usize,
+    query: &[f32],
+    k: usize,
+    ef: usize,
+    metric: NswMetric,
+) -> Vec<(f32, usize)> {
+    let (entry, entry_level) = match &table.indices[idx_pos].kind {
+        IndexKind::Nsw(g) => (g.entry, g.entry_level),
+        IndexKind::BTree(_) => return Vec::new(),
+    };
+    let Some(entry) = entry else {
+        return Vec::new();
+    };
+    let col_pos = table.indices[idx_pos].column_position;
+    let ef = ef.max(k);
+    // Descend by L2 (the topology metric) so layers prune consistently.
+    let entry_d = vec_l2_sq(table, col_pos, entry, query);
+    let mut current = entry;
+    let mut current_d = entry_d;
+    for layer in (1..=entry_level).rev() {
+        (current, current_d) = greedy_layer_walk(table, idx_pos, layer, current, current_d, query);
+    }
+    // Final beam search on layer 0 under the caller's metric.
+    let mut results = layer_beam_search(table, idx_pos, 0, current, current_d, query, ef, metric);
     results.truncate(k);
     results
 }
@@ -995,11 +1205,12 @@ impl TableSchema {
 // Bumped to version 3 when NUMERIC was added; to version 4 when
 // AUTO_INCREMENT (per-column flag) + NSW index `kind` byte landed;
 // to version 5 when DATE / TIMESTAMP were added; to version 6 when
-// NSW graph topology started travelling on disk (v2.7).
+// NSW graph topology started travelling on disk (v2.7); to version 7
+// when the NSW topology became multi-layer HNSW (v2.13).
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 6;
+const FILE_VERSION: u8 = 7;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -1178,30 +1389,53 @@ impl Catalog {
 
 /// Write a `DataType` as a tag byte + optional payload (Vector carries its
 /// `u32` dimension). Inverse: [`read_data_type`].
-/// Serialize an NSW graph after the `[kind=1][u16 M]` header.
+/// Serialize an HNSW graph after the `[kind=1][u16 M]` header (v7).
 /// Layout:
+/// - `[u16 m_max_0]`
 /// - `[entry u32]` — `u32::MAX` means `None`, else the entry node index
+/// - `[u8 entry_level]`
 /// - `[node_count u32]`
-/// - for each node: `[neighbor_count u16] [neighbor u32]*`
+/// - for each node: `[u8 level]`  (top layer for this node)
+/// - `[layer_count u8]`
+/// - for each layer `0..layer_count`:
+///     - `[u32 layer_node_count]` (== `node_count`; per-layer slot)
+///     - for each node: `[u16 neighbor_count] [u32 neighbor]*`
 fn write_nsw_graph(out: &mut Vec<u8>, g: &NswGraph) {
     let entry = g.entry.map_or(u32::MAX, |e| {
         u32::try_from(e).expect("NSW entry fits in u32")
     });
+    write_u16(
+        out,
+        u16::try_from(g.m_max_0).expect("HNSW m_max_0 fits in u16"),
+    );
     out.extend_from_slice(&entry.to_le_bytes());
+    out.push(g.entry_level);
+    let node_count = g.levels.len();
     write_u32(
         out,
-        u32::try_from(g.neighbors.len()).expect("NSW node count fits in u32"),
+        u32::try_from(node_count).expect("HNSW node count fits in u32"),
     );
-    for neighbors in &g.neighbors {
-        write_u16(
+    for &lvl in &g.levels {
+        out.push(lvl);
+    }
+    let layer_count = u8::try_from(g.layers.len()).expect("HNSW layer count ≤ 255");
+    out.push(layer_count);
+    for layer in &g.layers {
+        write_u32(
             out,
-            u16::try_from(neighbors.len()).expect("NSW neighbour list fits in u16"),
+            u32::try_from(layer.len()).expect("HNSW per-layer node count fits in u32"),
         );
-        for &peer in neighbors {
-            write_u32(
+        for neighbors in layer {
+            write_u16(
                 out,
-                u32::try_from(peer).expect("NSW neighbour index fits in u32"),
+                u16::try_from(neighbors.len()).expect("HNSW neighbour list fits in u16"),
             );
+            for &peer in neighbors {
+                write_u32(
+                    out,
+                    u32::try_from(peer).expect("HNSW neighbour index fits in u32"),
+                );
+            }
         }
     }
 }
@@ -1438,26 +1672,41 @@ impl<'a> Cursor<'a> {
     /// is passed in because it was already consumed from the per-
     /// index header. Returns the reconstituted `NswGraph`.
     fn read_nsw_graph(&mut self, m: usize) -> Result<NswGraph, StorageError> {
+        let m_max_0 = self.read_u16()? as usize;
         let entry_raw = self.read_u32()?;
         let entry = if entry_raw == u32::MAX {
             None
         } else {
             Some(entry_raw as usize)
         };
+        let entry_level = self.read_u8()?;
         let node_count = self.read_u32()? as usize;
-        let mut neighbors: Vec<Vec<usize>> = Vec::with_capacity(node_count);
+        let mut levels: Vec<u8> = Vec::with_capacity(node_count);
         for _ in 0..node_count {
-            let cnt = self.read_u16()? as usize;
-            let mut row = Vec::with_capacity(cnt);
-            for _ in 0..cnt {
-                row.push(self.read_u32()? as usize);
+            levels.push(self.read_u8()?);
+        }
+        let layer_count = self.read_u8()? as usize;
+        let mut layers: Vec<Vec<Vec<usize>>> = Vec::with_capacity(layer_count);
+        for _ in 0..layer_count {
+            let n = self.read_u32()? as usize;
+            let mut per_layer: Vec<Vec<usize>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let cnt = self.read_u16()? as usize;
+                let mut row = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
+                    row.push(self.read_u32()? as usize);
+                }
+                per_layer.push(row);
             }
-            neighbors.push(row);
+            layers.push(per_layer);
         }
         Ok(NswGraph {
             m,
+            m_max_0,
             entry,
-            neighbors,
+            entry_level,
+            levels,
+            layers,
         })
     }
 }
@@ -1708,8 +1957,92 @@ mod tests {
             IndexKind::BTree(_) => panic!("expected NSW"),
         };
         assert_eq!(restored_graph.m, original.m);
+        assert_eq!(restored_graph.m_max_0, original.m_max_0);
         assert_eq!(restored_graph.entry, original.entry);
-        assert_eq!(restored_graph.neighbors, original.neighbors);
+        assert_eq!(restored_graph.entry_level, original.entry_level);
+        assert_eq!(restored_graph.levels, original.levels);
+        assert_eq!(restored_graph.layers, original.layers);
+    }
+
+    #[test]
+    fn hnsw_level_assignment_is_deterministic() {
+        // Same row index always produces the same level — the topology
+        // must be reproducible (matters for serialize round-trip).
+        for i in 0..32usize {
+            assert_eq!(nsw_assign_level(i), nsw_assign_level(i));
+        }
+    }
+
+    #[test]
+    fn hnsw_layer_0_dominates_population() {
+        // Sanity: out of N inserts, the vast majority should land on
+        // layer 0. The 4-bit-clear promotion rule gives roughly 1/16
+        // promotion to layer ≥ 1, so under 50 nodes we expect ~3 on
+        // layer ≥ 1 and the rest on layer 0.
+        let on_zero = (0..200usize).filter(|&i| nsw_assign_level(i) == 0).count();
+        assert!(on_zero > 150, "level-0 nodes too few: {on_zero}");
+    }
+
+    #[test]
+    fn hnsw_search_matches_brute_force_for_l2_top1() {
+        // Build a small dataset, query it, and confirm the top result
+        // matches the brute-force nearest by L2. Topology variability
+        // shouldn't break recall at k=1 for well-separated vectors.
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "vecs",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new("v", DataType::Vector(3), true),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("vecs").unwrap();
+        let dataset: alloc::vec::Vec<(i32, [f32; 3])> = alloc::vec![
+            (1, [0.0, 0.0, 0.0]),
+            (2, [1.0, 0.0, 0.0]),
+            (3, [0.0, 1.0, 0.0]),
+            (4, [0.0, 0.0, 1.0]),
+            (5, [1.0, 1.0, 0.0]),
+            (6, [1.0, 0.0, 1.0]),
+            (7, [0.0, 1.0, 1.0]),
+            (8, [1.0, 1.0, 1.0]),
+            (9, [0.5, 0.5, 0.5]),
+            (10, [0.2, 0.8, 0.5]),
+        ];
+        for &(id, v) in &dataset {
+            t.insert(Row::new(alloc::vec![
+                Value::Int(id),
+                Value::Vector(alloc::vec![v[0], v[1], v[2]]),
+            ]))
+            .unwrap();
+        }
+        t.add_nsw_index("v_idx".into(), "v", NSW_DEFAULT_M).unwrap();
+        let idx_pos = cat
+            .get("vecs")
+            .unwrap()
+            .indices()
+            .iter()
+            .position(|i| i.name == "v_idx")
+            .unwrap();
+        for query in [[0.4, 0.4, 0.4], [0.9, 0.1, 0.0], [0.0, 0.9, 0.9]] {
+            let table = cat.get("vecs").unwrap();
+            let hnsw_top = nsw_search(table, idx_pos, &query, 1, 16, NswMetric::L2);
+            let mut brute: alloc::vec::Vec<(f32, usize)> = (0..table.rows.len())
+                .map(|i| {
+                    let Value::Vector(v) = &table.rows[i].values[1] else {
+                        return (f32::INFINITY, i);
+                    };
+                    (l2_distance_sq(v, &query), i)
+                })
+                .collect();
+            brute.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+            assert!(!hnsw_top.is_empty(), "HNSW returned no results");
+            assert_eq!(
+                hnsw_top[0].1, brute[0].1,
+                "HNSW top-1 != brute-force top-1 for {query:?}"
+            );
+        }
     }
 
     #[test]
