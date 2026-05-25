@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -111,12 +112,61 @@ impl TableSchema {
     }
 }
 
-/// In-memory table: schema + a flat row vector. Row order is insertion order;
-/// v0.3 makes no ordering guarantees beyond that.
+/// Key type accepted by secondary indices. Float / NULL values can't
+/// participate in an index because `f64` is only `PartialOrd` and `NULL`
+/// has SQL-three-valued semantics that don't fit B-tree ordering. v0.8
+/// makes index lookups on those columns fall back to full scan.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IndexKey {
+    Int(i64),
+    Text(String),
+    Bool(bool),
+}
+
+impl IndexKey {
+    pub fn from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::Int(n) => Some(Self::Int(i64::from(*n))),
+            Value::BigInt(n) => Some(Self::Int(*n)),
+            Value::Text(s) => Some(Self::Text(s.clone())),
+            Value::Bool(b) => Some(Self::Bool(*b)),
+            Value::Null | Value::Float(_) => None,
+        }
+    }
+}
+
+/// A single-column secondary index. Wraps `alloc::collections::BTreeMap`
+/// (which is Rust's standard B-tree — counts as the official core library
+/// per the v1 constraint).
+#[derive(Debug, Clone)]
+pub struct Index {
+    pub name: String,
+    pub column_position: usize,
+    map: BTreeMap<IndexKey, Vec<usize>>,
+}
+
+impl Index {
+    fn new(name: String, column_position: usize) -> Self {
+        Self {
+            name,
+            column_position,
+            map: BTreeMap::new(),
+        }
+    }
+
+    /// Look up the row indices stored under `key`. Returns an empty slice
+    /// when the key is absent — callers can treat both cases uniformly.
+    pub fn lookup_eq(&self, key: &IndexKey) -> &[usize] {
+        self.map.get(key).map_or(&[][..], Vec::as_slice)
+    }
+}
+
+/// In-memory table: schema + a flat row vector + secondary indices.
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
     rows: Vec<Row>,
+    indices: Vec<Index>,
 }
 
 impl Table {
@@ -124,6 +174,7 @@ impl Table {
         Self {
             schema,
             rows: Vec::new(),
+            indices: Vec::new(),
         }
     }
 
@@ -139,8 +190,22 @@ impl Table {
         self.rows.len()
     }
 
+    pub fn indices(&self) -> &[Index] {
+        &self.indices
+    }
+
+    /// Return the first index defined over `column_position`, if any.
+    /// (`v0.8` supports at most one index per column logically; the search
+    /// just picks the first match.)
+    pub fn index_on(&self, column_position: usize) -> Option<&Index> {
+        self.indices
+            .iter()
+            .find(|i| i.column_position == column_position)
+    }
+
     /// Insert one row after validating it matches the schema (length + type).
     /// Returns `StorageError` on mismatch — the table is left unchanged.
+    /// Updates every defined index with the new row's key.
     pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         if row.len() != self.schema.columns.len() {
             return Err(StorageError::ArityMismatch {
@@ -167,7 +232,37 @@ impl Table {
                 });
             }
         }
+        let new_row_idx = self.rows.len();
+        // Pre-validate before mutating: ensure indices receive an IndexKey.
+        for idx in &mut self.indices {
+            if let Some(key) = IndexKey::from_value(&row.values[idx.column_position]) {
+                idx.map.entry(key).or_default().push(new_row_idx);
+            }
+            // NULL / Float just doesn't get indexed — `index_on` callers still
+            // need to fall back to full scan when the WHERE literal is NULL.
+        }
         self.rows.push(row);
+        Ok(())
+    }
+
+    /// Build a new index over the named column. Rebuilds from existing rows.
+    /// Errors if `column_name` doesn't exist or the index name is taken.
+    pub fn add_index(&mut self, name: String, column_name: &str) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        let mut idx = Index::new(name, column_position);
+        for (i, row) in self.rows.iter().enumerate() {
+            if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
+                idx.map.entry(key).or_default().push(i);
+            }
+        }
+        self.indices.push(idx);
         Ok(())
     }
 }
@@ -228,6 +323,14 @@ pub enum StorageError {
     NullInNotNull {
         column: String,
     },
+    /// Index with this name already exists on the table.
+    DuplicateIndex {
+        name: String,
+    },
+    /// Column referenced by an index doesn't exist on the table.
+    ColumnNotFound {
+        column: String,
+    },
     /// On-disk format failed to parse — corrupted file, wrong magic, truncated
     /// payload, or unknown tag bytes.
     Corrupt(String),
@@ -254,6 +357,8 @@ impl fmt::Display for StorageError {
             Self::NullInNotNull { column } => {
                 write!(f, "NULL value in NOT NULL column {column:?}")
             }
+            Self::DuplicateIndex { name } => write!(f, "index already exists: {name}"),
+            Self::ColumnNotFound { column } => write!(f, "column not found: {column}"),
             Self::Corrupt(detail) => write!(f, "corrupt on-disk format: {detail}"),
         }
     }
@@ -336,6 +441,19 @@ impl Catalog {
                     write_value(&mut out, v);
                 }
             }
+            // Index definitions (v0.8). Only the name + column position are
+            // persisted; the BTreeMap data is rebuilt on deserialize.
+            write_u16(
+                &mut out,
+                u16::try_from(t.indices.len()).expect("≤ 65k indices/table"),
+            );
+            for idx in &t.indices {
+                write_str(&mut out, &idx.name);
+                write_u16(
+                    &mut out,
+                    u16::try_from(idx.column_position).expect("≤ 65k columns/table"),
+                );
+            }
         }
         out
     }
@@ -382,6 +500,30 @@ impl Catalog {
                 }
                 let t = cat.get_mut(&name).expect("just inserted");
                 t.rows.push(Row { values });
+            }
+            // v0.8 index definitions — rebuild data from the rows we just
+            // restored. (Older files without this section will fail at
+            // `read_u16` with `Truncated`; not a concern for this branch
+            // because all on-disk dumps are written by the current code.)
+            let index_count = cur.read_u16()? as usize;
+            for _ in 0..index_count {
+                let idx_name = cur.read_str()?;
+                let col_pos = cur.read_u16()? as usize;
+                let column_name = cat
+                    .get(&name)
+                    .expect("just inserted")
+                    .schema
+                    .columns
+                    .get(col_pos)
+                    .ok_or_else(|| {
+                        StorageError::Corrupt(format!(
+                            "index {idx_name:?} points at non-existent column position {col_pos}"
+                        ))
+                    })?
+                    .name
+                    .clone();
+                let t = cat.get_mut(&name).expect("just inserted");
+                t.add_index(idx_name, &column_name)?;
             }
         }
         if cur.pos < buf.len() {
@@ -815,5 +957,107 @@ mod tests {
             Catalog::deserialize(&bytes),
             Err(StorageError::Corrupt(ref s)) if s.contains("trailing")
         ));
+    }
+
+    // --- v0.8 indices ------------------------------------------------------
+
+    fn populated_users() -> Catalog {
+        let mut cat = Catalog::new();
+        cat.create_table(make_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for (id, name, score) in [
+            (1, "alice", Some(90.0)),
+            (2, "bob", None),
+            (3, "alice", Some(70.0)), // duplicate name → maps to two row idxs
+        ] {
+            t.insert(Row::new(vec![
+                Value::Int(id),
+                Value::Text(name.into()),
+                score.map_or(Value::Null, Value::Float),
+            ]))
+            .unwrap();
+        }
+        cat
+    }
+
+    #[test]
+    fn add_index_builds_from_existing_rows() {
+        let mut cat = populated_users();
+        cat.get_mut("users")
+            .unwrap()
+            .add_index("by_id".into(), "id")
+            .unwrap();
+        let t = cat.get("users").unwrap();
+        let idx = t.index_on(0).expect("index_on(0)");
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(2)), &[1]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(99)), &[] as &[usize]);
+    }
+
+    #[test]
+    fn add_index_dup_name_rejected() {
+        let mut cat = populated_users();
+        let t = cat.get_mut("users").unwrap();
+        t.add_index("ix".into(), "id").unwrap();
+        let err = t.add_index("ix".into(), "name").unwrap_err();
+        assert!(matches!(err, StorageError::DuplicateIndex { ref name } if name == "ix"));
+    }
+
+    #[test]
+    fn add_index_unknown_column_rejected() {
+        let mut cat = populated_users();
+        let err = cat
+            .get_mut("users")
+            .unwrap()
+            .add_index("ix".into(), "ghost")
+            .unwrap_err();
+        assert!(matches!(err, StorageError::ColumnNotFound { ref column } if column == "ghost"));
+    }
+
+    #[test]
+    fn insert_after_create_index_updates_it() {
+        let mut cat = populated_users();
+        let t = cat.get_mut("users").unwrap();
+        t.add_index("by_name".into(), "name").unwrap();
+        t.insert(Row::new(vec![
+            Value::Int(4),
+            Value::Text("dave".into()),
+            Value::Null,
+        ]))
+        .unwrap();
+        let idx = t.index_on(1).unwrap();
+        assert_eq!(idx.lookup_eq(&IndexKey::Text("dave".into())), &[3]);
+        // Pre-existing duplicates remain mapped to the two original row idxs.
+        assert_eq!(idx.lookup_eq(&IndexKey::Text("alice".into())), &[0, 2]);
+    }
+
+    #[test]
+    fn null_or_float_values_are_not_indexed() {
+        let mut cat = populated_users();
+        let t = cat.get_mut("users").unwrap();
+        t.add_index("by_score".into(), "score").unwrap();
+        let idx = t.index_on(2).unwrap();
+        // bob's score is NULL → no entry for bob.
+        // Score is Float → the spec says we don't index NaN-prone columns,
+        // so even the present scores are absent. Lookups via IndexKey::Int(90)
+        // mis-match the column type and trivially find nothing.
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(90)), &[] as &[usize]);
+    }
+
+    #[test]
+    fn index_survives_serialize_deserialize_round_trip() {
+        let mut cat = populated_users();
+        cat.get_mut("users")
+            .unwrap()
+            .add_index("by_name".into(), "name")
+            .unwrap();
+        let restored = Catalog::deserialize(&cat.serialize()).unwrap();
+        let idx = restored
+            .get("users")
+            .unwrap()
+            .index_on(1)
+            .expect("index_on(1) after restore");
+        assert_eq!(idx.name, "by_name");
+        // Data was rebuilt from rows, not deserialized directly.
+        assert_eq!(idx.lookup_eq(&IndexKey::Text("alice".into())), &[0, 2]);
     }
 }

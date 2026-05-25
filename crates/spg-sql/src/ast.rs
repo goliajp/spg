@@ -15,7 +15,15 @@ use core::fmt;
 pub enum Statement {
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
+    CreateIndex(CreateIndexStatement),
     Insert(InsertStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIndexStatement {
+    pub name: String,
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,8 +152,21 @@ impl fmt::Display for Statement {
         match self {
             Self::Select(s) => s.fmt(f),
             Self::CreateTable(s) => s.fmt(f),
+            Self::CreateIndex(s) => s.fmt(f),
             Self::Insert(s) => s.fmt(f),
         }
+    }
+}
+
+impl fmt::Display for CreateIndexStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CREATE INDEX {} ON {} ({})",
+            quote_ident(&self.name),
+            quote_ident(&self.table),
+            quote_ident(&self.column),
+        )
     }
 }
 
@@ -351,6 +372,8 @@ fn is_keyword(s: &str) -> bool {
             | "insert"
             | "into"
             | "values"
+            | "index"
+            | "on"
     )
 }
 

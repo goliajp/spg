@@ -30,6 +30,8 @@ pub enum Token {
     Insert,
     Into,
     Values,
+    Index,
+    On,
 
     // Identifiers
     Ident(String),       // ASCII case-folded
@@ -250,6 +252,8 @@ fn keyword_or_ident(lower: String) -> Token {
         "insert" => Token::Insert,
         "into" => Token::Into,
         "values" => Token::Values,
+        "index" => Token::Index,
+        "on" => Token::On,
         _ => Token::Ident(lower),
     }
 }
