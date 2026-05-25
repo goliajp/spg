@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `duckdb` | 112 | 14 | 0 | 88.9% |
+| `duckdb` | 114 | 12 | 0 | 90.5% |
 | `pg_regress` | 25 | 8 | 0 | 75.8% |
 | `pgvector` | 42 | 0 | 0 | 100.0% |
 
@@ -12,9 +12,8 @@ Per-corpus pass / fail / skip:
 
 | count | pattern |
 |---|---|
-| 4 | `record 5: parse: parse error at` |
+| 3 | `record 5: parse: parse error at` |
 | 2 | `record 1: parse: parse error at` |
-| 2 | `record 6: parse: parse error at` |
 | 2 | `record 7: parse: parse error at` |
 | 1 | `record 0: parse: parse error at` |
 | 1 | `record 2: parse: parse error at` |
@@ -22,6 +21,7 @@ Per-corpus pass / fail / skip:
 | 1 | `record 3: parse: parse error at` |
 | 1 | `record 4: eval: column not found:` |
 | 1 | `record 6: eval: type mismatch: unknown` |
+| 1 | `record 6: parse: parse error at` |
 | 1 | `record 7: eval: type mismatch: unknown` |
 | 1 | `record 7: row mismatch | expected:` |
 | 1 | `record 8: parse: parse error at` |
@@ -44,7 +44,7 @@ Per-corpus pass / fail / skip:
 | `10_is_null_predicates.test` | 6 | 0 | 0 |
 | `11_column_list_insert.test` | 1 | 2 | 0 |
 | `12_string_concat.test` | 3 | 0 | 0 |
-| `13_between_in_like.test` | 5 | 3 | 0 |
+| `13_between_in_like.test` | 7 | 1 | 0 |
 | `14_aggregates.test` | 5 | 4 | 0 |
 | `15_joins.test` | 7 | 2 | 0 |
 | `16_distinct_union.test` | 4 | 3 | 0 |
@@ -59,8 +59,6 @@ Per-corpus pass / fail / skip:
 
 <details><summary>`13_between_in_like.test` fail snippets</summary>
 
-- record 5: parse: parse error at token #6: expected end of input, got Ident("between")
-- record 6: parse: parse error at token #6: expected end of input, got Ident("in")
 - record 7: parse: parse error at token #6: expected end of input, got Ident("like")
 </details>
 

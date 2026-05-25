@@ -490,6 +490,8 @@ fn is_keyword(s: &str) -> bool {
             | "commit"
             | "rollback"
             | "is"
+            | "between"
+            | "in"
     )
 }
 

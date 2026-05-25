@@ -83,6 +83,8 @@ pub enum Token {
     Concat,
     /// `IS` keyword — postfix `IS NULL` / `IS NOT NULL` predicates.
     Is,
+    Between,
+    In,
 
     Eof,
 }
@@ -303,6 +305,8 @@ fn keyword_or_ident(lower: String) -> Token {
         "by" => Token::By,
         "limit" => Token::Limit,
         "is" => Token::Is,
+        "between" => Token::Between,
+        "in" => Token::In,
         _ => Token::Ident(lower),
     }
 }

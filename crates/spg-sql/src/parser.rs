@@ -588,8 +588,112 @@ impl Parser {
                 };
                 continue;
             }
+            // `x [NOT] BETWEEN a AND b` / `x [NOT] IN (...)`. We look one
+            // token ahead so a stray `NOT` not followed by BETWEEN/IN flows
+            // through to the early return below untouched.
+            let negated = if matches!(self.peek(), Token::Not) {
+                let next = self.tokens.get(self.pos + 1);
+                matches!(next, Some(Token::Between | Token::In))
+            } else {
+                false
+            };
+            if negated {
+                self.advance();
+            }
+            if matches!(self.peek(), Token::Between) {
+                expr = self.parse_between_tail(expr, negated)?;
+                continue;
+            }
+            if matches!(self.peek(), Token::In) {
+                expr = self.parse_in_tail(expr, negated)?;
+                continue;
+            }
             return Ok(expr);
         }
+    }
+
+    /// `x BETWEEN low AND high`  →  `(x >= low) AND (x <= high)`, wrapped in
+    /// `NOT` when `negated`. Bounds parse at precedence 5 so the trailing
+    /// `AND` is not swallowed.
+    fn parse_between_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
+        self.advance(); // BETWEEN
+        let low = self.parse_expr(5)?;
+        if !matches!(self.peek(), Token::And) {
+            return Err(self.err(format!(
+                "expected AND after BETWEEN low bound, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let high = self.parse_expr(5)?;
+        let target = Box::new(expr);
+        let combined = Expr::Binary {
+            lhs: Box::new(Expr::Binary {
+                lhs: target.clone(),
+                op: BinOp::GtEq,
+                rhs: Box::new(low),
+            }),
+            op: BinOp::And,
+            rhs: Box::new(Expr::Binary {
+                lhs: target,
+                op: BinOp::LtEq,
+                rhs: Box::new(high),
+            }),
+        };
+        Ok(maybe_not(combined, negated))
+    }
+
+    /// `x IN (a, b, c)`  →  chained OR of equalities. Empty list collapses
+    /// to FALSE (TRUE under NOT IN), matching standard SQL semantics.
+    fn parse_in_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
+        self.advance(); // IN
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("expected '(' after IN, got {:?}", self.peek())));
+        }
+        self.advance();
+        let mut elements = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            loop {
+                elements.push(self.parse_expr(0)?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => break,
+                    other => {
+                        return Err(
+                            self.err(format!("expected ',' or ')' in IN list, got {other:?}"))
+                        );
+                    }
+                }
+            }
+        }
+        self.advance(); // ')'
+        let target = Box::new(expr);
+        let combined = if elements.is_empty() {
+            Expr::Literal(Literal::Bool(false))
+        } else {
+            let mut iter = elements.into_iter();
+            let first = iter.next().unwrap();
+            let mut acc = Expr::Binary {
+                lhs: target.clone(),
+                op: BinOp::Eq,
+                rhs: Box::new(first),
+            };
+            for elt in iter {
+                acc = Expr::Binary {
+                    lhs: Box::new(acc),
+                    op: BinOp::Or,
+                    rhs: Box::new(Expr::Binary {
+                        lhs: target.clone(),
+                        op: BinOp::Eq,
+                        rhs: Box::new(elt),
+                    }),
+                };
+            }
+            acc
+        };
+        Ok(maybe_not(combined, negated))
     }
 
     /// Parse a pgvector array literal `[ x1, x2, ... ]`. The opening `[` is
@@ -663,6 +767,17 @@ impl Parser {
             qualifier: None,
             name: first,
         }))
+    }
+}
+
+fn maybe_not(expr: Expr, negated: bool) -> Expr {
+    if negated {
+        Expr::Unary {
+            op: UnOp::Not,
+            expr: Box::new(expr),
+        }
+    } else {
+        expr
     }
 }
 
