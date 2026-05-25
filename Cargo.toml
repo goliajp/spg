@@ -20,6 +20,13 @@ authors      = ["lihao <lihao@golia.jp>"]
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/lihao/spg"
 
+# Shared workspace dev-dependencies. Each crate's bench harness pulls
+# criterion from here so the version is locked across stones; that
+# matters because criterion's stats / sample analysis can shift
+# percentages between minor releases.
+[workspace.dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
 [workspace.lints.rust]
 unsafe_code            = "forbid"
 unused_must_use        = "deny"

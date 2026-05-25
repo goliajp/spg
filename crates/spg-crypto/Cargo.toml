@@ -9,3 +9,10 @@ description  = "Self-built cryptographic primitives for SPG: BLAKE3 hash."
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name    = "hash"
+harness = false
