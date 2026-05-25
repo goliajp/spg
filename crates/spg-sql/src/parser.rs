@@ -355,6 +355,10 @@ impl Parser {
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
             "char" => ColumnTypeName::Char(self.parse_paren_size("CHAR")?),
             "vector" => ColumnTypeName::Vector(self.parse_paren_size("VECTOR")?),
+            "numeric" => {
+                let (precision, scale) = self.parse_optional_numeric_params()?;
+                ColumnTypeName::Numeric(precision, scale)
+            }
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),
@@ -400,6 +404,56 @@ impl Parser {
             nullable,
             default,
         })
+    }
+
+    /// `NUMERIC` may appear without parameters, with one (precision
+    /// only, scale=0), or with both. Returns `(precision, scale)` with
+    /// 0 = unspecified for the bare form.
+    fn parse_optional_numeric_params(&mut self) -> Result<(u8, u8), ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            // Bare `NUMERIC` — PG treats this as "unlimited precision";
+            // we surface it as precision=0 to mean "unconstrained" so
+            // the engine doesn't need a separate variant.
+            return Ok((0, 0));
+        }
+        self.advance();
+        let precision = match self.advance() {
+            Token::Integer(n) if (1..=38).contains(&n) => u8::try_from(n).expect("range-checked"),
+            other => {
+                return Err(ParseError {
+                    message: format!(
+                        "NUMERIC precision must be an integer in 1..=38, got {other:?}"
+                    ),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
+        };
+        let scale = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            match self.advance() {
+                Token::Integer(n) if (0..=i64::from(precision)).contains(&n) => {
+                    u8::try_from(n).expect("range-checked")
+                }
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "NUMERIC scale must be a non-negative integer ≤ precision, got {other:?}"
+                        ),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            }
+        } else {
+            0
+        };
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' to close NUMERIC params, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok((precision, scale))
     }
 
     /// Parse `(N)` where `N` is a positive integer literal — used by the
@@ -1345,7 +1399,8 @@ mod tests {
 
     #[test]
     fn create_table_unknown_type_errors() {
-        let err = parse_statement("CREATE TABLE x (a NUMERIC)").unwrap_err();
+        // NUMERIC is now a real type (v1.12); pick another unsupported keyword.
+        let err = parse_statement("CREATE TABLE x (a json)").unwrap_err();
         assert!(err.message.contains("unsupported column type"));
     }
 

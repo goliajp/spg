@@ -62,6 +62,9 @@ pub enum ColumnTypeName {
     Bool,
     /// pgvector fixed-dimension `VECTOR(N)`.
     Vector(u32),
+    /// `NUMERIC` / `NUMERIC(p)` / `NUMERIC(p, s)` — exact decimal.
+    /// Bare `NUMERIC` and `NUMERIC(p)` both surface with `scale=0`.
+    Numeric(u8, u8),
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -76,6 +79,13 @@ impl fmt::Display for ColumnTypeName {
             Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
             Self::Vector(n) => write!(f, "VECTOR({n})"),
+            Self::Numeric(p, s) => {
+                if *s == 0 {
+                    write!(f, "NUMERIC({p})")
+                } else {
+                    write!(f, "NUMERIC({p}, {s})")
+                }
+            }
         }
     }
 }

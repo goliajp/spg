@@ -35,6 +35,15 @@ pub enum DataType {
     Bool,
     /// pgvector-style fixed-dimension float32 vector.
     Vector(u32),
+    /// `NUMERIC(precision, scale)` — exact fixed-point decimal stored as
+    /// a scaled `i128`. `precision` caps total decimal digits, `scale`
+    /// fixes digits after the decimal point. v1.12 supports up to
+    /// precision 38 (the i128-safe ceiling). `NUMERIC` and `NUMERIC(p)`
+    /// surface as `Numeric { precision: p, scale: 0 }`.
+    Numeric {
+        precision: u8,
+        scale: u8,
+    },
 }
 
 impl fmt::Display for DataType {
@@ -49,6 +58,13 @@ impl fmt::Display for DataType {
             Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
             Self::Vector(n) => write!(f, "VECTOR({n})"),
+            Self::Numeric { precision, scale } => {
+                if *scale == 0 {
+                    write!(f, "NUMERIC({precision})")
+                } else {
+                    write!(f, "NUMERIC({precision}, {scale})")
+                }
+            }
         }
     }
 }
@@ -65,6 +81,13 @@ pub enum Value {
     Text(String),
     Bool(bool),
     Vector(Vec<f32>),
+    /// Exact fixed-point decimal. `scaled` holds the value as
+    /// `actual * 10^scale` so the storage type is always integral —
+    /// arithmetic never falls back to floating-point.
+    Numeric {
+        scaled: i128,
+        scale: u8,
+    },
     Null,
 }
 
@@ -83,6 +106,14 @@ impl Value {
             Self::Vector(v) => Some(DataType::Vector(
                 u32::try_from(v.len()).expect("vector dim ≤ u32"),
             )),
+            // `Value::Numeric` doesn't carry its precision (the column
+            // schema does); we surface precision=0 as "unknown" and let
+            // the engine reconcile against the column type at coercion
+            // time.
+            Self::Numeric { scale, .. } => Some(DataType::Numeric {
+                precision: 0,
+                scale: *scale,
+            }),
             Self::Null => None,
         }
     }
@@ -155,7 +186,9 @@ impl IndexKey {
             Value::BigInt(n) => Some(Self::Int(*n)),
             Value::Text(s) => Some(Self::Text(s.clone())),
             Value::Bool(b) => Some(Self::Bool(*b)),
-            Value::Null | Value::Float(_) | Value::Vector(_) => None,
+            // Numeric isn't (yet) indexable — exact-decimal index keys
+            // would need a stable scale-normalised representation.
+            Value::Null | Value::Float(_) | Value::Vector(_) | Value::Numeric { .. } => None,
         }
     }
 }
@@ -255,10 +288,23 @@ impl Table {
             // VARCHAR(n) / CHAR(n) are storage-equivalent to TEXT — the
             // length / padding contract is enforced upstream by
             // `coerce_value`. Accept a `Text` value into either.
+            //
+            // NUMERIC's `Value::Numeric` carries its actual scale but the
+            // column declares the *expected* scale (a scale-rescaled
+            // Value::Numeric is produced upstream by `coerce_value`); the
+            // structural check here only verifies "value is Numeric and
+            // its scale equals the column scale".
             let compatible = actual == col.ty
                 || matches!(
                     (actual, col.ty),
                     (DataType::Text, DataType::Varchar(_) | DataType::Char(_))
+                )
+                || matches!(
+                    (actual, col.ty),
+                    (
+                        DataType::Numeric { scale: a, .. },
+                        DataType::Numeric { scale: b, .. },
+                    ) if a == b
                 );
             if !compatible {
                 return Err(StorageError::TypeMismatch {
@@ -448,6 +494,7 @@ impl TableSchema {
 //               7=SmallInt
 //               8=Varchar(u32 max)
 //               9=Char(u32 size)
+//               10=Numeric(u8 precision, u8 scale)
 //           [nullable u8]   0/1
 //           [default_tag u8] 0=none 1=value (followed by [value_tag u8] + bytes)
 //       [row_count u32]
@@ -460,12 +507,13 @@ impl TableSchema {
 //           tag 5 (Bool)     → u8 0/1
 //           tag 6 (Vector)   → u32 LE dim + dim×f32 LE
 //           tag 7 (SmallInt) → i16 LE
+//           tag 8 (Numeric)  → i128 LE (16 bytes) + u8 scale
 //
-// Bumped to version 2 when SmallInt/Varchar/Char/DEFAULT were added.
+// Bumped to version 3 when NUMERIC was added.
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 2;
+const FILE_VERSION: u8 = 3;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -634,6 +682,11 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             out.push(9);
             out.extend_from_slice(&size.to_le_bytes());
         }
+        DataType::Numeric { precision, scale } => {
+            out.push(10);
+            out.push(precision);
+            out.push(scale);
+        }
     }
 }
 
@@ -650,6 +703,11 @@ impl Cursor<'_> {
             7 => Ok(DataType::SmallInt),
             8 => Ok(DataType::Varchar(self.read_u32()?)),
             9 => Ok(DataType::Char(self.read_u32()?)),
+            10 => {
+                let precision = self.read_u8()?;
+                let scale = self.read_u8()?;
+                Ok(DataType::Numeric { precision, scale })
+            }
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -691,6 +749,11 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             for x in v {
                 out.extend_from_slice(&x.to_le_bytes());
             }
+        }
+        Value::Numeric { scaled, scale } => {
+            out.push(8);
+            out.extend_from_slice(&scaled.to_le_bytes());
+            out.push(*scale);
         }
     }
 }
@@ -786,6 +849,13 @@ impl<'a> Cursor<'a> {
             7 => {
                 let s = self.take(2)?;
                 Ok(Value::SmallInt(i16::from_le_bytes([s[0], s[1]])))
+            }
+            8 => {
+                let s = self.take(16)?;
+                let arr: [u8; 16] = s.try_into().expect("checked");
+                let scaled = i128::from_le_bytes(arr);
+                let scale = self.read_u8()?;
+                Ok(Value::Numeric { scaled, scale })
             }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }

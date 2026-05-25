@@ -16,7 +16,7 @@
 //! concatenation, IS NULL / IS NOT NULL, BETWEEN, IN, etc. Those come later.
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use spg_sql::ast::{BinOp, CastTarget, ColumnName, Expr, Literal, UnOp};
@@ -272,8 +272,41 @@ fn value_to_text(v: &Value) -> String {
             let cells: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
             format!("[{}]", cells.join(", "))
         }
+        Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
         Value::Null => "NULL".into(),
     }
+}
+
+/// Render a `Numeric { scaled, scale }` as its decimal text form.
+/// Negative `scaled` prepends `-` to the absolute value's digits; the
+/// integer / fractional split is by character count, padding the
+/// fractional side with leading zeros to exactly `scale` chars.
+pub fn format_numeric(scaled: i128, scale: u8) -> String {
+    if scale == 0 {
+        return format!("{scaled}");
+    }
+    let negative = scaled < 0;
+    let mag_str = scaled.unsigned_abs().to_string();
+    let mag_bytes = mag_str.as_bytes();
+    let scale_u = scale as usize;
+    let mut out = String::with_capacity(mag_str.len() + 3);
+    if negative {
+        out.push('-');
+    }
+    if mag_bytes.len() <= scale_u {
+        out.push('0');
+        out.push('.');
+        for _ in mag_bytes.len()..scale_u {
+            out.push('0');
+        }
+        out.push_str(&mag_str);
+    } else {
+        let split = mag_bytes.len() - scale_u;
+        out.push_str(&mag_str[..split]);
+        out.push('.');
+        out.push_str(&mag_str[split..]);
+    }
+    out
 }
 
 fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
@@ -497,6 +530,11 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
     }
+    // NUMERIC arithmetic and comparisons run in fixed-point; promote
+    // integers to a common NUMERIC scale and stay in i128 throughout.
+    if matches!(l, Value::Numeric { .. }) || matches!(r, Value::Numeric { .. }) {
+        return apply_binary_numeric(op, l, r);
+    }
     match op {
         BinOp::Add => arith(l, r, i64::checked_add, |a, b| a + b, "+"),
         BinOp::Sub => arith(l, r, i64::checked_sub, |a, b| a - b, "-"),
@@ -510,6 +548,176 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
             compare(op, &l, &r)
         }
         BinOp::And | BinOp::Or => unreachable!("handled above"),
+    }
+}
+
+/// Dispatch for any binary op when at least one operand is NUMERIC.
+/// Other-side integers / floats are promoted to a NUMERIC at a common
+/// scale; all add / sub / mul / div / compare paths stay in i128.
+#[allow(clippy::needless_pass_by_value)] // mirrors `apply_binary`'s by-value calling convention
+fn apply_binary_numeric(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
+    // Float still wins — Numeric + Float coerces both to f64 and runs
+    // through the float path. PG demotes Numeric to float in this mix
+    // too (the documented behaviour for `numeric + double precision`).
+    let float_path = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
+    if float_path {
+        let af = as_f64(&l)?;
+        let bf = as_f64(&r)?;
+        return match op {
+            BinOp::Add => Ok(Value::Float(af + bf)),
+            BinOp::Sub => Ok(Value::Float(af - bf)),
+            BinOp::Mul => Ok(Value::Float(af * bf)),
+            BinOp::Div => {
+                if bf == 0.0 {
+                    Err(EvalError::DivisionByZero)
+                } else {
+                    Ok(Value::Float(af / bf))
+                }
+            }
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                let ord = af.partial_cmp(&bf).ok_or(EvalError::TypeMismatch {
+                    detail: "NaN in NUMERIC/Float comparison".into(),
+                })?;
+                Ok(Value::Bool(cmp_to_bool(op, ord)))
+            }
+            BinOp::Concat => Ok(text_concat(&l, &r)),
+            other => Err(EvalError::TypeMismatch {
+                detail: format!("operator {other:?} not defined for NUMERIC and Float"),
+            }),
+        };
+    }
+    // Promote integer ↔ numeric to a shared scale (max of both sides).
+    let (a, sa) = numeric_or_widen(&l).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("NUMERIC op against non-numeric {:?}", l.data_type()),
+    })?;
+    let (b, sb) = numeric_or_widen(&r).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("NUMERIC op against non-numeric {:?}", r.data_type()),
+    })?;
+    match op {
+        BinOp::Add | BinOp::Sub => {
+            let target_scale = sa.max(sb);
+            let lhs = rescale(a, sa, target_scale).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            let rhs = rescale(b, sb, target_scale).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            let r = match op {
+                BinOp::Add => lhs.checked_add(rhs),
+                BinOp::Sub => lhs.checked_sub(rhs),
+                _ => unreachable!(),
+            }
+            .ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on +/-".into(),
+            })?;
+            Ok(Value::Numeric {
+                scaled: r,
+                scale: target_scale,
+            })
+        }
+        BinOp::Mul => {
+            let scaled = a.checked_mul(b).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on *".into(),
+            })?;
+            Ok(Value::Numeric {
+                scaled,
+                scale: sa.saturating_add(sb),
+            })
+        }
+        BinOp::Div => {
+            if b == 0 {
+                return Err(EvalError::DivisionByZero);
+            }
+            // Result scale: keep the wider operand's scale. Pre-scale
+            // the numerator so the integer division retains that many
+            // fractional digits. Round half-away-from-zero.
+            let target_scale = sa.max(sb);
+            // Numerator effective scale becomes sa + target_scale; we
+            // bring it up to (target_scale + sb) so the divisor's scale
+            // cancels cleanly.
+            let bump = pow10_i128(target_scale.saturating_add(sb).saturating_sub(sa));
+            let num = a.checked_mul(bump).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on / scaling".into(),
+            })?;
+            let half = if b >= 0 { b / 2 } else { -(b / 2) };
+            let adj = if (num >= 0) == (b >= 0) {
+                num + half
+            } else {
+                num - half
+            };
+            Ok(Value::Numeric {
+                scaled: adj / b,
+                scale: target_scale,
+            })
+        }
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+            let target_scale = sa.max(sb);
+            let lhs = rescale(a, sa, target_scale).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            let rhs = rescale(b, sb, target_scale).ok_or(EvalError::TypeMismatch {
+                detail: "NUMERIC overflow on rescale".into(),
+            })?;
+            Ok(Value::Bool(cmp_to_bool(op, lhs.cmp(&rhs))))
+        }
+        BinOp::Concat => Ok(text_concat(&l, &r)),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("operator {other:?} not defined for NUMERIC"),
+        }),
+    }
+}
+
+/// Express `v` as a `(scaled_i128, scale)` pair. Plain integers come
+/// back with `scale=0`; NUMERIC keeps its own scale. Anything else
+/// returns `None` and the caller raises a type error.
+fn numeric_or_widen(v: &Value) -> Option<(i128, u8)> {
+    match v {
+        Value::Numeric { scaled, scale } => Some((*scaled, *scale)),
+        Value::Int(n) => Some((i128::from(*n), 0)),
+        Value::SmallInt(n) => Some((i128::from(*n), 0)),
+        Value::BigInt(n) => Some((i128::from(*n), 0)),
+        _ => None,
+    }
+}
+
+fn rescale(scaled: i128, src: u8, dst: u8) -> Option<i128> {
+    if src == dst {
+        return Some(scaled);
+    }
+    if dst > src {
+        scaled.checked_mul(pow10_i128(dst - src))
+    } else {
+        let drop = pow10_i128(src - dst);
+        let half = drop / 2;
+        let r = if scaled >= 0 {
+            scaled + half
+        } else {
+            scaled - half
+        };
+        Some(r / drop)
+    }
+}
+
+const fn pow10_i128(p: u8) -> i128 {
+    let mut acc: i128 = 1;
+    let mut i = 0;
+    while i < p {
+        acc *= 10;
+        i += 1;
+    }
+    acc
+}
+
+const fn cmp_to_bool(op: BinOp, ord: core::cmp::Ordering) -> bool {
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    match op {
+        BinOp::Eq => matches!(ord, Equal),
+        BinOp::NotEq => !matches!(ord, Equal),
+        BinOp::Lt => matches!(ord, Less),
+        BinOp::LtEq => matches!(ord, Less | Equal),
+        BinOp::Gt => matches!(ord, Greater),
+        BinOp::GtEq => matches!(ord, Greater | Equal),
+        _ => false,
     }
 }
 
@@ -702,10 +910,19 @@ fn div_op(l: Value, r: Value) -> Result<Value, EvalError> {
 
 fn as_f64(v: &Value) -> Result<f64, EvalError> {
     match v {
+        Value::SmallInt(n) => Ok(f64::from(*n)),
         Value::Int(n) => Ok(f64::from(*n)),
         #[allow(clippy::cast_precision_loss)]
         Value::BigInt(n) => Ok(*n as f64),
         Value::Float(x) => Ok(*x),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Numeric { scaled, scale } => {
+            let mut div = 1.0_f64;
+            for _ in 0..*scale {
+                div *= 10.0;
+            }
+            Ok((*scaled as f64) / div)
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot convert {:?} to FLOAT", other.data_type()),
         }),

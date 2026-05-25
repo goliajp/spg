@@ -699,6 +699,19 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::SmallInt(n) => Ok(f64::from(*n)),
         Value::Int(n) => Ok(f64::from(*n)),
         #[allow(clippy::cast_precision_loss)]
+        Value::Numeric { scaled, scale } => {
+            // Scaled integer / 10^scale, computed via f64 for sort
+            // ordering only. Precision losses here only matter for
+            // ORDER BY tie-breaks well past 15 significant digits.
+            // `f64::powi` lives in std; we hand-roll the loop so the
+            // no_std engine crate doesn't need it.
+            let mut divisor = 1.0_f64;
+            for _ in 0..*scale {
+                divisor *= 10.0;
+            }
+            Ok((*scaled as f64) / divisor)
+        }
+        #[allow(clippy::cast_precision_loss)]
         Value::BigInt(n) => Ok(*n as f64),
         Value::Float(x) => Ok(*x),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
@@ -887,6 +900,137 @@ fn build_projection(
     Ok(out)
 }
 
+/// Promote an integer to a NUMERIC value at the requested scale.
+/// Rejects values that, after scaling, would overflow the column's
+/// precision budget.
+fn numeric_from_integer(
+    n: i128,
+    precision: u8,
+    scale: u8,
+    col_name: &str,
+) -> Result<Value, EngineError> {
+    let factor = pow10_i128(scale);
+    let scaled = n.checked_mul(factor).ok_or_else(|| {
+        EngineError::Unsupported(alloc::format!(
+            "integer overflow scaling value for column `{col_name}` to scale {scale}"
+        ))
+    })?;
+    check_precision(scaled, precision, col_name)?;
+    Ok(Value::Numeric { scaled, scale })
+}
+
+/// Float → NUMERIC. Uses round-half-away-from-zero on `x * 10^scale`,
+/// then verifies the result fits the column's precision.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn numeric_from_float(
+    x: f64,
+    precision: u8,
+    scale: u8,
+    col_name: &str,
+) -> Result<Value, EngineError> {
+    if !x.is_finite() {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "cannot store non-finite float in NUMERIC column `{col_name}`"
+        )));
+    }
+    let mut factor = 1.0_f64;
+    for _ in 0..scale {
+        factor *= 10.0;
+    }
+    // Round half-away-from-zero by biasing then casting (`as i128`
+    // truncates toward zero, so the bias + truncation gives the
+    // desired rounding). `f64::floor` / `ceil` live in std; we don't
+    // need them — the cast handles the truncation step.
+    let shifted = x * factor;
+    let biased = if shifted >= 0.0 {
+        shifted + 0.5
+    } else {
+        shifted - 0.5
+    };
+    // Range-check before casting back to i128 — the cast itself is
+    // saturating in Rust, which would silently truncate huge inputs.
+    if !(-1e38..=1e38).contains(&biased) {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "value {x} overflows NUMERIC range for column `{col_name}`"
+        )));
+    }
+    let scaled = biased as i128;
+    check_precision(scaled, precision, col_name)?;
+    Ok(Value::Numeric { scaled, scale })
+}
+
+/// Move a Numeric value from `src_scale` to `dst_scale`. Going up
+/// multiplies by 10; going down rounds half-away-from-zero.
+fn numeric_rescale(
+    scaled: i128,
+    src_scale: u8,
+    precision: u8,
+    dst_scale: u8,
+    col_name: &str,
+) -> Result<Value, EngineError> {
+    let new_scaled = if dst_scale >= src_scale {
+        let bump = pow10_i128(dst_scale - src_scale);
+        scaled.checked_mul(bump).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!(
+                "overflow rescaling NUMERIC for column `{col_name}`"
+            ))
+        })?
+    } else {
+        let drop = pow10_i128(src_scale - dst_scale);
+        let half = drop / 2;
+        if scaled >= 0 {
+            (scaled + half) / drop
+        } else {
+            (scaled - half) / drop
+        }
+    };
+    check_precision(new_scaled, precision, col_name)?;
+    Ok(Value::Numeric {
+        scaled: new_scaled,
+        scale: dst_scale,
+    })
+}
+
+/// Drop the fractional part of a scaled integer, returning the integer
+/// portion (toward zero). Used for NUMERIC → INT casts.
+const fn numeric_truncate_to_integer(scaled: i128, scale: u8) -> i128 {
+    if scale == 0 {
+        return scaled;
+    }
+    let factor = pow10_i128_const(scale);
+    scaled / factor
+}
+
+/// Verify a scaled NUMERIC value fits the column's declared precision.
+/// `precision == 0` is the "unconstrained" form (bare `NUMERIC`); we
+/// skip the check there.
+fn check_precision(scaled: i128, precision: u8, col_name: &str) -> Result<(), EngineError> {
+    if precision == 0 {
+        return Ok(());
+    }
+    let limit = pow10_i128(precision);
+    if scaled.unsigned_abs() >= limit.unsigned_abs() {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "NUMERIC value exceeds precision {precision} for column `{col_name}`"
+        )));
+    }
+    Ok(())
+}
+
+const fn pow10_i128_const(p: u8) -> i128 {
+    let mut acc: i128 = 1;
+    let mut i = 0;
+    while i < p {
+        acc *= 10;
+        i += 1;
+    }
+    acc
+}
+
+fn pow10_i128(p: u8) -> i128 {
+    pow10_i128_const(p)
+}
+
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
@@ -912,6 +1056,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Char(n) => DataType::Char(n),
         ColumnTypeName::Bool => DataType::Bool,
         ColumnTypeName::Vector(n) => DataType::Vector(n),
+        ColumnTypeName::Numeric(precision, scale) => DataType::Numeric { precision, scale },
     }
 }
 
@@ -988,50 +1133,95 @@ fn coerce_value(
     if actual == expected {
         return Ok(v);
     }
-    let coerced = match (v, expected) {
-        (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
-        (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
-        (Value::Int(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
-        (Value::SmallInt(n), DataType::Int) => Some(Value::Int(i32::from(n))),
-        (Value::SmallInt(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
-        (Value::SmallInt(n), DataType::Float) => Some(Value::Float(f64::from(n))),
-        (Value::BigInt(n), DataType::Int) => i32::try_from(n).ok().map(Value::Int),
-        (Value::BigInt(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
-        #[allow(clippy::cast_precision_loss)]
-        (Value::BigInt(n), DataType::Float) => Some(Value::Float(n as f64)),
-        // VARCHAR(n) enforces an upper bound on character count.
-        (Value::Text(s), DataType::Varchar(max)) => {
-            if u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
-                Some(Value::Text(s))
-            } else {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "value for VARCHAR({max}) column `{col_name}` exceeds length: \
+    let coerced =
+        match (v, expected) {
+            (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
+            (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
+            (Value::Int(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
+            (Value::Int(n), DataType::Numeric { precision, scale }) => Some(numeric_from_integer(
+                i128::from(n),
+                precision,
+                scale,
+                col_name,
+            )?),
+            (Value::SmallInt(n), DataType::Int) => Some(Value::Int(i32::from(n))),
+            (Value::SmallInt(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
+            (Value::SmallInt(n), DataType::Float) => Some(Value::Float(f64::from(n))),
+            (Value::SmallInt(n), DataType::Numeric { precision, scale }) => Some(
+                numeric_from_integer(i128::from(n), precision, scale, col_name)?,
+            ),
+            (Value::BigInt(n), DataType::Int) => i32::try_from(n).ok().map(Value::Int),
+            (Value::BigInt(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
+            #[allow(clippy::cast_precision_loss)]
+            (Value::BigInt(n), DataType::Float) => Some(Value::Float(n as f64)),
+            (Value::BigInt(n), DataType::Numeric { precision, scale }) => Some(
+                numeric_from_integer(i128::from(n), precision, scale, col_name)?,
+            ),
+            (Value::Float(x), DataType::Numeric { precision, scale }) => {
+                Some(numeric_from_float(x, precision, scale, col_name)?)
+            }
+            (
+                Value::Numeric {
+                    scaled,
+                    scale: src_scale,
+                },
+                DataType::Numeric { precision, scale },
+            ) => Some(numeric_rescale(
+                scaled, src_scale, precision, scale, col_name,
+            )?),
+            #[allow(clippy::cast_precision_loss)]
+            (Value::Numeric { scaled, scale }, DataType::Float) => {
+                let mut div = 1.0_f64;
+                for _ in 0..scale {
+                    div *= 10.0;
+                }
+                Some(Value::Float((scaled as f64) / div))
+            }
+            (Value::Numeric { scaled, scale }, DataType::Int) => {
+                let truncated = numeric_truncate_to_integer(scaled, scale);
+                i32::try_from(truncated).ok().map(Value::Int)
+            }
+            (Value::Numeric { scaled, scale }, DataType::BigInt) => {
+                let truncated = numeric_truncate_to_integer(scaled, scale);
+                i64::try_from(truncated).ok().map(Value::BigInt)
+            }
+            (Value::Numeric { scaled, scale }, DataType::SmallInt) => {
+                let truncated = numeric_truncate_to_integer(scaled, scale);
+                i16::try_from(truncated).ok().map(Value::SmallInt)
+            }
+            // VARCHAR(n) enforces an upper bound on character count.
+            (Value::Text(s), DataType::Varchar(max)) => {
+                if u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
+                    Some(Value::Text(s))
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "value for VARCHAR({max}) column `{col_name}` exceeds length: \
                      {} chars",
-                    s.chars().count()
-                )));
+                        s.chars().count()
+                    )));
+                }
             }
-        }
-        // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
-        // is already longer we reject (PG truncates trailing-space-only;
-        // staying strict for v1).
-        (Value::Text(s), DataType::Char(size)) => {
-            let len = u32::try_from(s.chars().count()).unwrap_or(u32::MAX);
-            if len > size {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "value for CHAR({size}) column `{col_name}` exceeds length: \
+            // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
+            // is already longer we reject (PG truncates trailing-space-only;
+            // staying strict for v1).
+            (Value::Text(s), DataType::Char(size)) => {
+                let len = u32::try_from(s.chars().count()).unwrap_or(u32::MAX);
+                if len > size {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "value for CHAR({size}) column `{col_name}` exceeds length: \
                      {len} chars"
-                )));
+                    )));
+                }
+                let need = (size - len) as usize;
+                let mut padded = s;
+                padded.reserve(need);
+                for _ in 0..need {
+                    padded.push(' ');
+                }
+                Some(Value::Text(padded))
             }
-            let need = (size - len) as usize;
-            let mut padded = s;
-            padded.reserve(need);
-            for _ in 0..need {
-                padded.push(' ');
-            }
-            Some(Value::Text(padded))
-        }
-        _ => None,
-    };
+            _ => None,
+        };
     coerced.ok_or(EngineError::Storage(StorageError::TypeMismatch {
         column: col_name.into(),
         expected,

@@ -178,6 +178,7 @@ fn render_cell(v: &Value, ty: char) -> String {
             let cells: Vec<String> = v.iter().map(|x| format_real(f64::from(*x))).collect();
             format!("[{}]", cells.join(", "))
         }
+        Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
     }
 }
 
