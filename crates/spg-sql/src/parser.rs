@@ -932,6 +932,7 @@ impl Parser {
             }
             Token::LBracket => self.parse_vector_literal_body(),
             Token::Extract => self.parse_extract_atom(),
+            Token::Interval => self.parse_interval_atom(),
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
@@ -1169,6 +1170,33 @@ impl Parser {
         })
     }
 
+    /// `INTERVAL '<n> <unit> [<n> <unit> ...]'` — the `INTERVAL` keyword
+    /// is already consumed; we expect a single string literal next and
+    /// resolve it into `Literal::Interval` at parse time so the engine
+    /// never has to re-tokenise inside the string.
+    fn parse_interval_atom(&mut self) -> Result<Expr, ParseError> {
+        let tok = self.advance();
+        let Token::String(text) = tok else {
+            return Err(self.err(format!(
+                "expected string literal after INTERVAL, got {tok:?}"
+            )));
+        };
+        let (months, micros) = parse_interval_text(&text).ok_or_else(|| ParseError {
+            message: format!(
+                "cannot parse INTERVAL {text:?}; \
+                     expected `<n> <unit> [<n> <unit> ...]` with units \
+                     microsecond[s], millisecond[s], second[s], minute[s], \
+                     hour[s], day[s], week[s], month[s], year[s]"
+            ),
+            token_pos: self.pos.saturating_sub(1),
+        })?;
+        Ok(Expr::Literal(Literal::Interval {
+            months,
+            micros,
+            text,
+        }))
+    }
+
     fn parse_vector_literal_body(&mut self) -> Result<Expr, ParseError> {
         let mut elems = Vec::new();
         if matches!(self.peek(), Token::RBracket) {
@@ -1309,6 +1337,48 @@ fn extract_numeric_literal(e: &Expr) -> Option<f32> {
         } => extract_numeric_literal(expr).map(|x| -x),
         _ => None,
     }
+}
+
+/// Parse the text inside `INTERVAL '...'` into `(months, micros)`. Accepts
+/// one or more `<n> <unit>` pairs separated by whitespace. `<n>` may be
+/// negative. Returns `None` if any pair fails to parse or no pair is found.
+///
+/// Recognised units (case-insensitive, optional trailing `s`):
+/// `microsecond`, `millisecond`, `second`, `minute`, `hour`, `day`, `week`,
+/// `month`, `year`. `week` widens to 7 days; `year` widens to 12 months.
+pub fn parse_interval_text(s: &str) -> Option<(i32, i64)> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() || !parts.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut months: i32 = 0;
+    let mut micros: i64 = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        let n: i64 = parts[i].parse().ok()?;
+        let unit = parts[i + 1].to_ascii_lowercase();
+        let unit_stripped = unit.strip_suffix('s').unwrap_or(&unit);
+        match unit_stripped {
+            "microsecond" => micros = micros.checked_add(n)?,
+            "millisecond" => micros = micros.checked_add(n.checked_mul(1_000)?)?,
+            "second" => micros = micros.checked_add(n.checked_mul(1_000_000)?)?,
+            "minute" => micros = micros.checked_add(n.checked_mul(60_000_000)?)?,
+            "hour" => micros = micros.checked_add(n.checked_mul(3_600_000_000)?)?,
+            "day" => micros = micros.checked_add(n.checked_mul(86_400_000_000)?)?,
+            "week" => micros = micros.checked_add(n.checked_mul(604_800_000_000)?)?,
+            "month" => {
+                let n32 = i32::try_from(n).ok()?;
+                months = months.checked_add(n32)?;
+            }
+            "year" => {
+                let n32 = i32::try_from(n).ok()?;
+                months = months.checked_add(n32.checked_mul(12)?)?;
+            }
+            _ => return None,
+        }
+        i += 2;
+    }
+    Some((months, micros))
 }
 
 #[cfg(test)]
@@ -1772,5 +1842,38 @@ mod tests {
             let again = parse_statement(&original.to_string()).unwrap();
             assert_eq!(original, again);
         }
+    }
+
+    #[test]
+    fn interval_text_parsing_units() {
+        // Single unit.
+        assert_eq!(parse_interval_text("1 day"), Some((0, 86_400_000_000)));
+        assert_eq!(parse_interval_text("1 second"), Some((0, 1_000_000)));
+        assert_eq!(parse_interval_text("1 month"), Some((1, 0)));
+        assert_eq!(parse_interval_text("2 years"), Some((24, 0)));
+        // Compound spans accumulate.
+        assert_eq!(parse_interval_text("1 year 6 months"), Some((18, 0)));
+        assert_eq!(
+            parse_interval_text("1 day 2 hours"),
+            Some((0, 86_400_000_000 + 7_200_000_000))
+        );
+        // Negative numbers carry through.
+        assert_eq!(parse_interval_text("-1 day"), Some((0, -86_400_000_000)));
+        // Bad shapes return None.
+        assert_eq!(parse_interval_text(""), None);
+        assert_eq!(parse_interval_text("garbage"), None);
+        assert_eq!(parse_interval_text("1 fortnight"), None);
+        assert_eq!(parse_interval_text("1"), None);
+    }
+
+    #[test]
+    fn interval_literal_roundtrips_via_display() {
+        let parsed = parse("SELECT INTERVAL '1 day 2 hours'");
+        let s = parsed.to_string();
+        // Display preserves the original text verbatim.
+        assert!(s.contains("INTERVAL '1 day 2 hours'"), "got: {s}");
+        // And re-parsing yields a structurally equal statement.
+        let again = parse_statement(&s).unwrap();
+        assert_eq!(parsed, again);
     }
 }

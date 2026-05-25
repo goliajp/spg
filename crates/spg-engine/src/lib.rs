@@ -924,6 +924,11 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Vector(_) => Err(EngineError::Unsupported(
             "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
         )),
+        Value::Interval { .. } => Err(EngineError::Unsupported(
+            "ORDER BY of an INTERVAL is not supported in v2.11 \
+             (months vs micros has no single canonical ordering)"
+                .into(),
+        )),
     }
 }
 
@@ -1107,9 +1112,9 @@ fn resolve_col_literal_pair(
         Literal::String(s) => Value::Text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
-        // Vector literals can't be used as B-tree index keys (Vec<f32> isn't
-        // Ord). Tell the planner to fall back to full-scan.
-        Literal::Vector(_) => return None,
+        // Vector and Interval literals can't be used as B-tree index keys.
+        // Tell the planner to fall back to full-scan.
+        Literal::Vector(_) | Literal::Interval { .. } => return None,
     };
     Some((pos, v))
 }
@@ -1606,6 +1611,7 @@ fn literal_to_value(l: Literal) -> Value {
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,
         Literal::Vector(v) => Value::Vector(v),
+        Literal::Interval { months, micros, .. } => Value::Interval { months, micros },
     }
 }
 

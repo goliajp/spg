@@ -560,6 +560,13 @@ fn encode_key(vals: &[Value]) -> String {
                 out.push_str(&t.to_string());
                 out.push('|');
             }
+            Value::Interval { months, micros } => {
+                out.push('i');
+                out.push_str(&months.to_string());
+                out.push('m');
+                out.push_str(&micros.to_string());
+                out.push('|');
+            }
         }
     }
     out

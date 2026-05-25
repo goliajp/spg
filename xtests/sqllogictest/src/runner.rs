@@ -195,6 +195,7 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
+        Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
     }
 }
 

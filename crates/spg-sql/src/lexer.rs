@@ -105,6 +105,9 @@ pub enum Token {
     Offset,
     Asc,
     Desc,
+    /// `INTERVAL` — followed by a string literal carrying the span text
+    /// (e.g. `INTERVAL '1 day 2 hours'`).
+    Interval,
 
     Eof,
 }
@@ -355,6 +358,7 @@ fn keyword_or_ident(lower: String) -> Token {
         "offset" => Token::Offset,
         "asc" => Token::Asc,
         "desc" => Token::Desc,
+        "interval" => Token::Interval,
         _ => Token::Ident(lower),
     }
 }

@@ -585,7 +585,8 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Char(_)
         | DataType::Numeric { .. }
         | DataType::Date
-        | DataType::Timestamp => WireType::Text,
+        | DataType::Timestamp
+        | DataType::Interval => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -616,6 +617,9 @@ fn value_to_wire(v: &Value) -> WireValue {
         }
         Value::Date(d) => WireValue::Text(spg_engine::eval::format_date(*d)),
         Value::Timestamp(t) => WireValue::Text(spg_engine::eval::format_timestamp(*t)),
+        Value::Interval { months, micros } => {
+            WireValue::Text(spg_engine::eval::format_interval(*months, *micros))
+        }
     }
 }
 
