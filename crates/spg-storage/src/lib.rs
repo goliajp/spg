@@ -13,7 +13,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-/// Runtime type tags, matching the PG types SPG accepts in v0.3.
+/// Runtime type tags. `Vector(dim)` is parameterised; the dimension travels
+/// with both the column schema and the on-wire serialised representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Int,    // 32-bit signed
@@ -21,23 +22,20 @@ pub enum DataType {
     Float,  // f64 (PG double precision)
     Text,
     Bool,
-}
-
-impl DataType {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Int => "INT",
-            Self::BigInt => "BIGINT",
-            Self::Float => "FLOAT",
-            Self::Text => "TEXT",
-            Self::Bool => "BOOL",
-        }
-    }
+    /// pgvector-style fixed-dimension float32 vector.
+    Vector(u32),
 }
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        match self {
+            Self::Int => f.write_str("INT"),
+            Self::BigInt => f.write_str("BIGINT"),
+            Self::Float => f.write_str("FLOAT"),
+            Self::Text => f.write_str("TEXT"),
+            Self::Bool => f.write_str("BOOL"),
+            Self::Vector(n) => write!(f, "VECTOR({n})"),
+        }
     }
 }
 
@@ -51,18 +49,22 @@ pub enum Value {
     Float(f64),
     Text(String),
     Bool(bool),
+    Vector(Vec<f32>),
     Null,
 }
 
 impl Value {
     /// Type tag, or `None` for `NULL` (unknown at value level).
-    pub const fn data_type(&self) -> Option<DataType> {
+    pub fn data_type(&self) -> Option<DataType> {
         match self {
             Self::Int(_) => Some(DataType::Int),
             Self::BigInt(_) => Some(DataType::BigInt),
             Self::Float(_) => Some(DataType::Float),
             Self::Text(_) => Some(DataType::Text),
             Self::Bool(_) => Some(DataType::Bool),
+            Self::Vector(v) => Some(DataType::Vector(
+                u32::try_from(v.len()).expect("vector dim ≤ u32"),
+            )),
             Self::Null => None,
         }
     }
@@ -112,10 +114,10 @@ impl TableSchema {
     }
 }
 
-/// Key type accepted by secondary indices. Float / NULL values can't
-/// participate in an index because `f64` is only `PartialOrd` and `NULL`
-/// has SQL-three-valued semantics that don't fit B-tree ordering. v0.8
-/// makes index lookups on those columns fall back to full scan.
+/// Key type accepted by secondary indices. Float / NULL / Vector values
+/// can't participate in a B-tree index — `f64` is only `PartialOrd`, NULL
+/// has SQL-three-valued semantics, and Vector belongs to the (future) HNSW
+/// path. Index lookups on those columns fall back to full scan.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IndexKey {
     Int(i64),
@@ -130,7 +132,7 @@ impl IndexKey {
             Value::BigInt(n) => Some(Self::Int(*n)),
             Value::Text(s) => Some(Self::Text(s.clone())),
             Value::Bool(b) => Some(Self::Bool(*b)),
-            Value::Null | Value::Float(_) => None,
+            Value::Null | Value::Float(_) | Value::Vector(_) => None,
         }
     }
 }
@@ -223,6 +225,12 @@ impl Table {
                 continue;
             }
             let actual = val.data_type().expect("non-null");
+            // Vector columns require both that the value's variant be Vector
+            // *and* its dimension match. `actual == col.ty` already encodes
+            // both because DataType::Vector carries the dim — but we surface
+            // a nicer error path for the dim-mismatch case via the same
+            // TypeMismatch (the position + names tell the operator what's
+            // wrong).
             if actual != col.ty {
                 return Err(StorageError::TypeMismatch {
                     column: col.name.clone(),
@@ -429,7 +437,7 @@ impl Catalog {
             );
             for c in &t.schema.columns {
                 write_str(&mut out, &c.name);
-                out.push(data_type_tag(c.ty));
+                write_data_type(&mut out, c.ty);
                 out.push(u8::from(c.nullable));
             }
             write_u32(
@@ -482,7 +490,7 @@ impl Catalog {
             let mut cols = Vec::with_capacity(col_count);
             for _ in 0..col_count {
                 let c_name = cur.read_str()?;
-                let ty = data_type_from_tag(cur.read_u8()?)?;
+                let ty = cur.read_data_type()?;
                 let nullable = cur.read_u8()? != 0;
                 cols.push(ColumnSchema {
                     name: c_name,
@@ -538,26 +546,36 @@ impl Catalog {
 
 // --- low-level binary helpers ---------------------------------------------
 
-const fn data_type_tag(t: DataType) -> u8 {
+/// Write a `DataType` as a tag byte + optional payload (Vector carries its
+/// `u32` dimension). Inverse: [`read_data_type`].
+fn write_data_type(out: &mut Vec<u8>, t: DataType) {
     match t {
-        DataType::Int => 1,
-        DataType::BigInt => 2,
-        DataType::Float => 3,
-        DataType::Text => 4,
-        DataType::Bool => 5,
+        DataType::Int => out.push(1),
+        DataType::BigInt => out.push(2),
+        DataType::Float => out.push(3),
+        DataType::Text => out.push(4),
+        DataType::Bool => out.push(5),
+        DataType::Vector(dim) => {
+            out.push(6);
+            out.extend_from_slice(&dim.to_le_bytes());
+        }
     }
 }
 
-fn data_type_from_tag(tag: u8) -> Result<DataType, StorageError> {
-    match tag {
-        1 => Ok(DataType::Int),
-        2 => Ok(DataType::BigInt),
-        3 => Ok(DataType::Float),
-        4 => Ok(DataType::Text),
-        5 => Ok(DataType::Bool),
-        other => Err(StorageError::Corrupt(format!(
-            "unknown data type tag: {other}"
-        ))),
+impl Cursor<'_> {
+    fn read_data_type(&mut self) -> Result<DataType, StorageError> {
+        let tag = self.read_u8()?;
+        match tag {
+            1 => Ok(DataType::Int),
+            2 => Ok(DataType::BigInt),
+            3 => Ok(DataType::Float),
+            4 => Ok(DataType::Text),
+            5 => Ok(DataType::Bool),
+            6 => Ok(DataType::Vector(self.read_u32()?)),
+            other => Err(StorageError::Corrupt(format!(
+                "unknown data type tag: {other}"
+            ))),
+        }
     }
 }
 
@@ -583,6 +601,14 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         Value::Bool(b) => {
             out.push(5);
             out.push(u8::from(*b));
+        }
+        Value::Vector(v) => {
+            out.push(6);
+            let dim = u32::try_from(v.len()).expect("vector dim fits in u32");
+            out.extend_from_slice(&dim.to_le_bytes());
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
         }
     }
 }
@@ -666,6 +692,15 @@ impl<'a> Cursor<'a> {
             3 => Ok(Value::Float(self.read_f64()?)),
             4 => Ok(Value::Text(self.read_str()?)),
             5 => Ok(Value::Bool(self.read_u8()? != 0)),
+            6 => {
+                let dim = self.read_u32()? as usize;
+                let mut v = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    let bytes: [u8; 4] = self.take(4)?.try_into().expect("checked");
+                    v.push(f32::from_le_bytes(bytes));
+                }
+                Ok(Value::Vector(v))
+            }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }
@@ -1041,6 +1076,71 @@ mod tests {
         // so even the present scores are absent. Lookups via IndexKey::Int(90)
         // mis-match the column type and trivially find nothing.
         assert_eq!(idx.lookup_eq(&IndexKey::Int(90)), &[] as &[usize]);
+    }
+
+    // --- v0.11 vector type -------------------------------------------------
+
+    #[test]
+    fn vector_value_data_type_carries_dim() {
+        let v = Value::Vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(v.data_type(), Some(DataType::Vector(3)));
+    }
+
+    #[test]
+    fn vector_column_insert_matching_dim_ok() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "emb",
+            vec![ColumnSchema::new("v", DataType::Vector(3), false)],
+        ))
+        .unwrap();
+        cat.get_mut("emb")
+            .unwrap()
+            .insert(Row::new(vec![Value::Vector(vec![1.0, 2.0, 3.0])]))
+            .unwrap();
+    }
+
+    #[test]
+    fn vector_column_insert_dim_mismatch_rejected() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "emb",
+            vec![ColumnSchema::new("v", DataType::Vector(3), false)],
+        ))
+        .unwrap();
+        let err = cat
+            .get_mut("emb")
+            .unwrap()
+            .insert(Row::new(vec![Value::Vector(vec![1.0, 2.0])]))
+            .unwrap_err();
+        assert!(matches!(err, StorageError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn vector_value_survives_catalog_round_trip() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "emb",
+            vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new("v", DataType::Vector(4), false),
+            ],
+        ))
+        .unwrap();
+        cat.get_mut("emb")
+            .unwrap()
+            .insert(Row::new(vec![
+                Value::Int(1),
+                Value::Vector(vec![0.5, -1.25, 3.0, 7.0]),
+            ]))
+            .unwrap();
+        let restored = Catalog::deserialize(&cat.serialize()).expect("round-trip");
+        let table = restored.get("emb").unwrap();
+        assert_eq!(table.schema().columns[1].ty, DataType::Vector(4));
+        assert_eq!(
+            table.rows()[0].values[1],
+            Value::Vector(vec![0.5, -1.25, 3.0, 7.0])
+        );
     }
 
     #[test]

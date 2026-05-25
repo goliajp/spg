@@ -287,12 +287,13 @@ impl Engine {
             .and_then(|w| try_index_seek(w, schema_cols, table, alias))
             .unwrap_or_else(|| (0..table.row_count()).collect());
 
-        let mut output_rows = Vec::new();
+        // Materialise the filter pass into `(order_key, projected_row)`
+        // tuples. The order key is `None` when there's no ORDER BY clause.
+        let mut tagged: Vec<(Option<f64>, Row)> = Vec::new();
         for &i in &candidate_rows {
             let row = &table.rows()[i];
             if let Some(where_expr) = &stmt.where_ {
                 let cond = eval::eval_expr(where_expr, row, &ctx)?;
-                // SQL: only explicit TRUE rows pass; FALSE and NULL are filtered.
                 if !matches!(cond, Value::Bool(true)) {
                     continue;
                 }
@@ -301,7 +302,26 @@ impl Engine {
             for p in &projection {
                 values.push(eval::eval_expr(&p.expr, row, &ctx)?);
             }
-            output_rows.push(Row::new(values));
+            let order_key = if let Some(order_expr) = &stmt.order_by {
+                let key = eval::eval_expr(order_expr, row, &ctx)?;
+                Some(value_to_order_key(&key)?)
+            } else {
+                None
+            };
+            tagged.push((order_key, Row::new(values)));
+        }
+
+        if stmt.order_by.is_some() {
+            tagged.sort_by(|a, b| {
+                let ka = a.0.unwrap_or(f64::INFINITY);
+                let kb = b.0.unwrap_or(f64::INFINITY);
+                ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal)
+            });
+        }
+
+        let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+        if let Some(n) = stmt.limit {
+            output_rows.truncate(n as usize);
         }
 
         let columns: Vec<ColumnSchema> = projection
@@ -324,6 +344,34 @@ struct ProjectedItem {
     output_name: String,
     ty: DataType,
     nullable: bool,
+}
+
+/// Coerce a `Value` to an `f64` sort key for ORDER BY. Numbers map directly;
+/// NULL sorts last (treated as `+∞`); booleans are 0.0 / 1.0; text uses lex
+/// order via the byte values; vectors are not sortable.
+fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
+    match v {
+        Value::Null => Ok(f64::INFINITY),
+        Value::Int(n) => Ok(f64::from(*n)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(n) => Ok(*n as f64),
+        Value::Float(x) => Ok(*x),
+        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        Value::Text(s) => {
+            // Lex order by codepoints — good enough for ORDER BY name.
+            // Map first 8 bytes packed into u64 as a coarse key; ties fall to
+            // partial_cmp Equal. v1.x can swap in a real string comparator.
+            let mut key: u64 = 0;
+            for &b in s.as_bytes().iter().take(8) {
+                key = (key << 8) | u64::from(b);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            Ok(key as f64)
+        }
+        Value::Vector(_) => Err(EngineError::Unsupported(
+            "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
+        )),
+    }
 }
 
 /// Try to plan a WHERE clause as an equality lookup against an existing
@@ -383,6 +431,9 @@ fn resolve_col_literal_pair(
         Literal::String(s) => Value::Text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
+        // Vector literals can't be used as B-tree index keys (Vec<f32> isn't
+        // Ord). Tell the planner to fall back to full-scan.
+        Literal::Vector(_) => return None,
     };
     Some((pos, v))
 }
@@ -451,6 +502,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Float => DataType::Float,
         ColumnTypeName::Text => DataType::Text,
         ColumnTypeName::Bool => DataType::Bool,
+        ColumnTypeName::Vector(n) => DataType::Vector(n),
     }
 }
 
@@ -490,6 +542,7 @@ fn literal_to_value(l: Literal) -> Value {
         Literal::String(s) => Value::Text(s),
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,
+        Literal::Vector(v) => Value::Vector(v),
     }
 }
 

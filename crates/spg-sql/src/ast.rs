@@ -51,23 +51,20 @@ pub enum ColumnTypeName {
     Float,
     Text,
     Bool,
-}
-
-impl ColumnTypeName {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Int => "INT",
-            Self::BigInt => "BIGINT",
-            Self::Float => "FLOAT",
-            Self::Text => "TEXT",
-            Self::Bool => "BOOL",
-        }
-    }
+    /// pgvector fixed-dimension `VECTOR(N)`.
+    Vector(u32),
 }
 
 impl fmt::Display for ColumnTypeName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        match self {
+            Self::Int => f.write_str("INT"),
+            Self::BigInt => f.write_str("BIGINT"),
+            Self::Float => f.write_str("FLOAT"),
+            Self::Text => f.write_str("TEXT"),
+            Self::Bool => f.write_str("BOOL"),
+            Self::Vector(n) => write!(f, "VECTOR({n})"),
+        }
     }
 }
 
@@ -82,6 +79,8 @@ pub struct SelectStatement {
     pub items: Vec<SelectItem>,
     pub from: Option<TableRef>,
     pub where_: Option<Expr>,
+    pub order_by: Option<Expr>,
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +117,8 @@ pub enum Literal {
     String(String),
     Bool(bool),
     Null,
+    /// pgvector-style array literal, e.g. `[1, 2.5, -3]`.
+    Vector(Vec<f32>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +141,9 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// pgvector L2 (Euclidean) distance `<->`. Defined for two vector
+    /// operands of equal dimension; engine returns `Value::Float(d)`.
+    L2Distance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +231,12 @@ impl fmt::Display for SelectStatement {
         if let Some(e) = &self.where_ {
             write!(f, " WHERE {e}")?;
         }
+        if let Some(e) = &self.order_by {
+            write!(f, " ORDER BY {e}")?;
+        }
+        if let Some(n) = &self.limit {
+            write!(f, " LIMIT {n}")?;
+        }
         Ok(())
     }
 }
@@ -307,6 +317,23 @@ impl fmt::Display for Literal {
             }
             Self::Bool(b) => f.write_str(if *b { "TRUE" } else { "FALSE" }),
             Self::Null => f.write_str("NULL"),
+            Self::Vector(v) => {
+                f.write_str("[")?;
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    let s = format!("{x}");
+                    // Mirror Float Display: force a dot so re-parse stays
+                    // numerically literal.
+                    if s.contains('.') || s.contains('e') || s.contains('E') {
+                        f.write_str(&s)?;
+                    } else {
+                        write!(f, "{s}.0")?;
+                    }
+                }
+                f.write_str("]")
+            }
         }
     }
 }
@@ -326,6 +353,7 @@ impl fmt::Display for BinOp {
             Self::Sub => "-",
             Self::Mul => "*",
             Self::Div => "/",
+            Self::L2Distance => "<->",
         })
     }
 }
@@ -434,6 +462,8 @@ mod tests {
                 alias: None,
             }),
             where_: None,
+            order_by: None,
+            limit: None,
         };
         assert_eq!(s.to_string(), "SELECT * FROM users");
     }

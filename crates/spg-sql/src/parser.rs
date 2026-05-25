@@ -162,10 +162,42 @@ impl Parser {
         } else {
             None
         };
+        let order_by = if matches!(self.peek(), Token::Order) {
+            self.advance();
+            if !matches!(self.peek(), Token::By) {
+                return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
+            }
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        let limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            let n = match self.advance() {
+                Token::Integer(n) if n >= 0 => u32::try_from(n).map_err(|_| ParseError {
+                    message: format!("LIMIT value too large: {n}"),
+                    token_pos: self.pos.saturating_sub(1),
+                })?,
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "expected non-negative integer after LIMIT, got {other:?}"
+                        ),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            };
+            Some(n)
+        } else {
+            None
+        };
         Ok(Statement::Select(SelectStatement {
             items,
             from,
             where_,
+            order_by,
+            limit,
         }))
     }
 
@@ -262,6 +294,34 @@ impl Parser {
             "float" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
             "bool" => ColumnTypeName::Bool,
+            "vector" => {
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(
+                        self.err(format!("VECTOR type requires (dim), got {:?}", self.peek()))
+                    );
+                }
+                self.advance();
+                let dim = match self.advance() {
+                    Token::Integer(n) if n > 0 => u32::try_from(n).map_err(|_| ParseError {
+                        message: format!("VECTOR dim too large: {n}"),
+                        token_pos: self.pos.saturating_sub(1),
+                    })?,
+                    other => {
+                        return Err(ParseError {
+                            message: format!("expected positive integer VECTOR dim, got {other:?}"),
+                            token_pos: self.pos.saturating_sub(1),
+                        });
+                    }
+                };
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' after VECTOR dim, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                ColumnTypeName::Vector(dim)
+            }
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),
@@ -412,8 +472,9 @@ impl Parser {
             }
             Token::Minus => {
                 self.advance();
-                // Unary minus binds tighter than `*`/`/`.
-                let e = self.parse_expr(7)?;
+                // Unary minus binds tighter than `*`/`/` (now at prec 7 after
+                // `<->` slotted into 5 and arithmetic shifted up).
+                let e = self.parse_expr(8)?;
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
                     expr: Box::new(e),
@@ -442,12 +503,46 @@ impl Parser {
                     }),
                 }
             }
+            Token::LBracket => self.parse_vector_literal_body(),
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_column(s),
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
                 token_pos: tok_pos,
             }),
         }
+    }
+
+    /// Parse a pgvector array literal `[ x1, x2, ... ]`. The opening `[` is
+    /// already consumed by the caller. Elements must be numeric literals
+    /// (with optional unary `-`); any compound expression is rejected at
+    /// parse time so the runtime never needs to evaluate inside a vector.
+    fn parse_vector_literal_body(&mut self) -> Result<Expr, ParseError> {
+        let mut elems = Vec::new();
+        if matches!(self.peek(), Token::RBracket) {
+            self.advance();
+            return Ok(Expr::Literal(Literal::Vector(elems)));
+        }
+        loop {
+            let e = self.parse_expr(0)?;
+            let x = extract_numeric_literal(&e).ok_or_else(|| ParseError {
+                message: format!("vector element must be a numeric literal, got {e:?}"),
+                token_pos: self.pos,
+            })?;
+            elems.push(x);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RBracket => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(self.err(format!("expected ',' or ']' in vector, got {other:?}")));
+                }
+            }
+        }
+        Ok(Expr::Literal(Literal::Vector(elems)))
     }
 
     fn finish_column(&mut self, first: String) -> Result<Expr, ParseError> {
@@ -477,13 +572,33 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::LtEq => (BinOp::LtEq, 4),
         Token::Gt => (BinOp::Gt, 4),
         Token::GtEq => (BinOp::GtEq, 4),
-        Token::Plus => (BinOp::Add, 5),
-        Token::Minus => (BinOp::Sub, 5),
-        Token::Star => (BinOp::Mul, 6),
-        Token::Slash => (BinOp::Div, 6),
+        // `<->` binds tighter than comparisons so `col <-> v < threshold`
+        // parses as `(col <-> v) < threshold`.
+        Token::L2Distance => (BinOp::L2Distance, 5),
+        Token::Plus => (BinOp::Add, 6),
+        Token::Minus => (BinOp::Sub, 6),
+        Token::Star => (BinOp::Mul, 7),
+        Token::Slash => (BinOp::Div, 7),
         _ => return None,
     };
     Some(pair)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+// `as f32` here is intentional: vector elements widen / narrow into f32 on
+// purpose. i64 → f32 loses precision past 2^24, f64 → f32 loses precision
+// past ~15 decimal digits — both are acceptable for a fixed-precision
+// pgvector column.
+fn extract_numeric_literal(e: &Expr) -> Option<f32> {
+    match e {
+        Expr::Literal(Literal::Integer(n)) => Some(*n as f32),
+        Expr::Literal(Literal::Float(x)) => Some(*x as f32),
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => extract_numeric_literal(expr).map(|x| -x),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
