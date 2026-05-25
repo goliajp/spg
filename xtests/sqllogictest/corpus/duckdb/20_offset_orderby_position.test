@@ -1,0 +1,49 @@
+# OFFSET + ORDER BY column position (v2.9).
+
+statement ok
+CREATE TABLE items (id INT NOT NULL, label TEXT NOT NULL)
+
+statement ok
+INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')
+
+# LIMIT + OFFSET: rows 3 and 4 (after ordering by id).
+query IT nosort
+SELECT id, label FROM items ORDER BY id LIMIT 2 OFFSET 2
+----
+3
+c
+4
+d
+
+# OFFSET past the end yields zero rows.
+query IT nosort
+SELECT id, label FROM items ORDER BY id LIMIT 10 OFFSET 99
+----
+
+# OFFSET without LIMIT keeps the tail.
+query IT nosort
+SELECT id, label FROM items ORDER BY id OFFSET 3
+----
+4
+d
+5
+e
+
+# ORDER BY <integer> references the N-th select item (1-based).
+query IT nosort
+SELECT id, label FROM items ORDER BY 2 LIMIT 3
+----
+1
+a
+2
+b
+3
+c
+
+# ORDER BY 1 with LIMIT/OFFSET combination — skips first 1 of 5,
+# takes the next 2 in ascending order.
+query I nosort
+SELECT id FROM items ORDER BY 1 LIMIT 2 OFFSET 1
+----
+2
+3

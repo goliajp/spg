@@ -168,6 +168,9 @@ pub struct SelectStatement {
     pub unions: Vec<(UnionKind, SelectStatement)>,
     pub order_by: Option<Expr>,
     pub limit: Option<u32>,
+    /// `OFFSET <n>` — drop the first `n` rows after ORDER BY but
+    /// before LIMIT (so `LIMIT 10 OFFSET 5` keeps rows 6..=15).
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +487,9 @@ impl fmt::Display for SelectStatement {
         if let Some(n) = &self.limit {
             write!(f, " LIMIT {n}")?;
         }
+        if let Some(o) = &self.offset {
+            write!(f, " OFFSET {o}")?;
+        }
         Ok(())
     }
 }
@@ -764,6 +770,7 @@ fn is_keyword(s: &str) -> bool {
             | "having"
             | "show"
             | "extract"
+            | "offset"
     )
 }
 
@@ -823,6 +830,7 @@ mod tests {
             unions: vec![],
             order_by: None,
             limit: None,
+            offset: None,
             distinct: false,
         };
         assert_eq!(s.to_string(), "SELECT * FROM users");

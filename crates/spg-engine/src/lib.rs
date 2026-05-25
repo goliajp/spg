@@ -186,6 +186,12 @@ impl Engine {
         // same instant.
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
+        // `ORDER BY <n>` (1-based select-list position) gets resolved
+        // to the matching SELECT item expression here so the executor
+        // can treat it uniformly with all the other order_by forms.
+        if let Statement::Select(s) = &mut stmt {
+            resolve_order_by_position(s);
+        }
         match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::CreateIndex(s) => self.exec_create_index(s),
@@ -546,9 +552,7 @@ impl Engine {
             tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
             rows = tagged.into_iter().map(|(_, r)| r).collect();
         }
-        if let Some(n) = stmt.limit {
-            rows.truncate(n as usize);
-        }
+        apply_offset_and_limit(&mut rows, stmt.offset, stmt.limit);
         Ok(QueryResult::Rows { columns, rows })
     }
 
@@ -626,9 +630,7 @@ impl Engine {
                 filtered.push(row);
             }
             let mut agg = aggregate::run(stmt, &filtered, schema_cols, Some(alias))?;
-            if let Some(n) = stmt.limit {
-                agg.rows.truncate(n as usize);
-            }
+            apply_offset_and_limit(&mut agg.rows, stmt.offset, stmt.limit);
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
                 rows: agg.rows,
@@ -673,9 +675,7 @@ impl Engine {
         if stmt.distinct {
             output_rows = dedup_rows(output_rows);
         }
-        if let Some(n) = stmt.limit {
-            output_rows.truncate(n as usize);
-        }
+        apply_offset_and_limit(&mut output_rows, stmt.offset, stmt.limit);
 
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
@@ -810,9 +810,7 @@ impl Engine {
         if aggregate::uses_aggregate(stmt) {
             let refs: Vec<&Row> = filtered.iter().collect();
             let mut agg = aggregate::run(stmt, &refs, &combined_schema, None)?;
-            if let Some(n) = stmt.limit {
-                agg.rows.truncate(n as usize);
-            }
+            apply_offset_and_limit(&mut agg.rows, stmt.offset, stmt.limit);
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
                 rows: agg.rows,
@@ -845,9 +843,7 @@ impl Engine {
         if stmt.distinct {
             output_rows = dedup_rows(output_rows);
         }
-        if let Some(n) = stmt.limit {
-            output_rows.truncate(n as usize);
-        }
+        apply_offset_and_limit(&mut output_rows, stmt.offset, stmt.limit);
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
             .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
@@ -1041,9 +1037,7 @@ fn materialise_in_order(
         }
         output_rows.push(Row::new(values));
     }
-    if let Some(n) = stmt.limit {
-        output_rows.truncate(n as usize);
-    }
+    apply_offset_and_limit(&mut output_rows, stmt.offset, stmt.limit);
     let columns: Vec<ColumnSchema> = projection
         .into_iter()
         .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
@@ -1458,7 +1452,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             rewrite_expr_clock(rhs, now);
         }
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            rewrite_expr_clock(expr, now)
+            rewrite_expr_clock(expr, now);
         }
         Expr::FunctionCall { args, .. } => {
             for a in args {
@@ -1471,6 +1465,44 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         }
         Expr::Extract { source, .. } => rewrite_expr_clock(source, now),
         Expr::Literal(_) | Expr::Column(_) => {}
+    }
+}
+
+/// `ORDER BY <integer>` references the N-th SELECT item (1-based).
+/// Swap the integer literal for the matching item's expression so the
+/// executor doesn't need a special-case branch. Recurses into UNION
+/// peers because each peer keeps its own SELECT list.
+fn resolve_order_by_position(s: &mut SelectStatement) {
+    if let Some(Expr::Literal(Literal::Integer(n))) = &s.order_by
+        && *n >= 1
+        && let Ok(idx_one_based) = usize::try_from(*n)
+    {
+        let idx = idx_one_based - 1;
+        if idx < s.items.len()
+            && let SelectItem::Expr { expr, .. } = &s.items[idx]
+        {
+            s.order_by = Some(expr.clone());
+        }
+    }
+    for (_, peer) in &mut s.unions {
+        resolve_order_by_position(peer);
+    }
+}
+
+/// Drop the first `offset` rows then truncate to `limit`. PG / `MySQL`
+/// agree: OFFSET applies *after* ORDER BY but *before* LIMIT (so
+/// `LIMIT 10 OFFSET 5` keeps rows 6..=15).
+fn apply_offset_and_limit(rows: &mut Vec<Row>, offset: Option<u32>, limit: Option<u32>) {
+    if let Some(off) = offset {
+        let off = off as usize;
+        if off >= rows.len() {
+            rows.clear();
+        } else {
+            rows.drain(..off);
+        }
+    }
+    if let Some(n) = limit {
+        rows.truncate(n as usize);
     }
 }
 
