@@ -1,0 +1,66 @@
+# ORDER BY ASC / DESC (v2.10).
+
+statement ok
+CREATE TABLE items (id INT NOT NULL, label TEXT NOT NULL)
+
+statement ok
+INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')
+
+# Bare ORDER BY defaults to ASC.
+query I nosort
+SELECT id FROM items ORDER BY id
+----
+1
+2
+3
+4
+5
+
+# Explicit ASC is a no-op.
+query I nosort
+SELECT id FROM items ORDER BY id ASC
+----
+1
+2
+3
+4
+5
+
+# DESC reverses the sort.
+query I nosort
+SELECT id FROM items ORDER BY id DESC
+----
+5
+4
+3
+2
+1
+
+# DESC combines with LIMIT and OFFSET — top-3 starting at row 2.
+query IT nosort
+SELECT id, label FROM items ORDER BY id DESC LIMIT 3 OFFSET 1
+----
+4
+d
+3
+c
+2
+b
+
+# ORDER BY position + DESC.
+query I nosort
+SELECT id FROM items ORDER BY 1 DESC LIMIT 2
+----
+5
+4
+
+# Aggregate path honours DESC.
+query TI nosort
+SELECT label, COUNT(*) FROM items GROUP BY label ORDER BY label DESC LIMIT 3
+----
+e
+1
+d
+1
+c
+1

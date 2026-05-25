@@ -103,6 +103,8 @@ pub enum Token {
     Show,
     Extract,
     Offset,
+    Asc,
+    Desc,
 
     Eof,
 }
@@ -351,6 +353,8 @@ fn keyword_or_ident(lower: String) -> Token {
         "show" => Token::Show,
         "extract" => Token::Extract,
         "offset" => Token::Offset,
+        "asc" => Token::Asc,
+        "desc" => Token::Desc,
         _ => Token::Ident(lower),
     }
 }

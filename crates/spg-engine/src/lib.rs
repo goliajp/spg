@@ -542,14 +542,14 @@ impl Engine {
         }
         // ORDER BY at the top of a UNION applies to the combined result.
         // Eval against the projected schema (NOT the source table).
-        if let Some(order_expr) = &stmt.order_by {
+        if let Some(order) = &stmt.order_by {
             let synth_ctx = EvalContext::new(&columns, None);
             let mut tagged: Vec<(f64, Row)> = Vec::with_capacity(rows.len());
             for r in rows {
-                let key = eval::eval_expr(order_expr, &r, &synth_ctx)?;
+                let key = eval::eval_expr(&order.expr, &r, &synth_ctx)?;
                 tagged.push((value_to_order_key(&key)?, r));
             }
-            tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+            sort_by_key_with_direction(&mut tagged, order.desc);
             rows = tagged.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_and_limit(&mut rows, stmt.offset, stmt.limit);
@@ -654,8 +654,8 @@ impl Engine {
             for p in &projection {
                 values.push(eval::eval_expr(&p.expr, row, &ctx)?);
             }
-            let order_key = if let Some(order_expr) = &stmt.order_by {
-                let key = eval::eval_expr(order_expr, row, &ctx)?;
+            let order_key = if let Some(order) = &stmt.order_by {
+                let key = eval::eval_expr(&order.expr, row, &ctx)?;
                 Some(value_to_order_key(&key)?)
             } else {
                 None
@@ -663,11 +663,12 @@ impl Engine {
             tagged.push((order_key, Row::new(values)));
         }
 
-        if stmt.order_by.is_some() {
+        if let Some(order) = &stmt.order_by {
             tagged.sort_by(|a, b| {
                 let ka = a.0.unwrap_or(f64::INFINITY);
                 let kb = b.0.unwrap_or(f64::INFINITY);
-                ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal)
+                let cmp = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
+                if order.desc { cmp.reverse() } else { cmp }
             });
         }
 
@@ -824,19 +825,20 @@ impl Engine {
             for p in &projection {
                 values.push(eval::eval_expr(&p.expr, row, &ctx)?);
             }
-            let order_key = if let Some(order_expr) = &stmt.order_by {
-                let key = eval::eval_expr(order_expr, row, &ctx)?;
+            let order_key = if let Some(order) = &stmt.order_by {
+                let key = eval::eval_expr(&order.expr, row, &ctx)?;
                 Some(value_to_order_key(&key)?)
             } else {
                 None
             };
             tagged.push((order_key, Row::new(values)));
         }
-        if stmt.order_by.is_some() {
+        if let Some(order) = &stmt.order_by {
             tagged.sort_by(|a, b| {
                 let ka = a.0.unwrap_or(f64::INFINITY);
                 let kb = b.0.unwrap_or(f64::INFINITY);
-                ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal)
+                let cmp = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
+                if order.desc { cmp.reverse() } else { cmp }
             });
         }
         let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
@@ -952,7 +954,13 @@ fn try_nsw_knn(
         return None;
     }
     let order = stmt.order_by.as_ref()?;
-    let Expr::Binary { lhs, op, rhs } = order else {
+    // NSW kNN returns rows ascending by distance — DESC inverts the
+    // natural order, so the planner can't handle it without a sort
+    // pass. Fall back to the generic ORDER BY path.
+    if order.desc {
+        return None;
+    }
+    let Expr::Binary { lhs, op, rhs } = &order.expr else {
         return None;
     };
     let metric = match op {
@@ -1381,7 +1389,7 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: i64) {
         rewrite_expr_clock(h, now);
     }
     if let Some(o) = &mut s.order_by {
-        rewrite_expr_clock(o, now);
+        rewrite_expr_clock(&mut o.expr, now);
     }
     for (_, peer) in &mut s.unions {
         rewrite_select_clock(peer, now);
@@ -1473,7 +1481,8 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
 /// executor doesn't need a special-case branch. Recurses into UNION
 /// peers because each peer keeps its own SELECT list.
 fn resolve_order_by_position(s: &mut SelectStatement) {
-    if let Some(Expr::Literal(Literal::Integer(n))) = &s.order_by
+    if let Some(order) = &mut s.order_by
+        && let Expr::Literal(Literal::Integer(n)) = &order.expr
         && *n >= 1
         && let Ok(idx_one_based) = usize::try_from(*n)
     {
@@ -1481,12 +1490,22 @@ fn resolve_order_by_position(s: &mut SelectStatement) {
         if idx < s.items.len()
             && let SelectItem::Expr { expr, .. } = &s.items[idx]
         {
-            s.order_by = Some(expr.clone());
+            order.expr = expr.clone();
         }
     }
     for (_, peer) in &mut s.unions {
         resolve_order_by_position(peer);
     }
+}
+
+/// Sort `tagged` by `f64` key, reversing the comparator under DESC.
+/// Used by the UNION ORDER BY path; per-block paths inline the same
+/// comparator because they already hold `&OrderBy` directly.
+fn sort_by_key_with_direction(tagged: &mut [(f64, Row)], desc: bool) {
+    tagged.sort_by(|a, b| {
+        let cmp = a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal);
+        if desc { cmp.reverse() } else { cmp }
+    });
 }
 
 /// Drop the first `offset` rows then truncate to `limit`. PG / `MySQL`

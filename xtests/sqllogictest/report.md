@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `duckdb` | 140 | 0 | 0 | 100.0% |
+| `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 17 | 0 | 0 | 100.0% |
 | `pg_regress` | 93 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
@@ -35,6 +35,7 @@ Per-corpus pass / fail / skip:
 | `18_cast_expr.test` | 5 | 0 | 0 |
 | `19_having_and_show.test` | 7 | 0 | 0 |
 | `20_offset_orderby_position.test` | 7 | 0 | 0 |
+| `21_order_by_desc.test` | 8 | 0 | 0 |
 
 ### `mysql/`
 
