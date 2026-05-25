@@ -334,6 +334,15 @@ pub enum Literal {
     Null,
     /// pgvector-style array literal, e.g. `[1, 2.5, -3]`.
     Vector(Vec<f32>),
+    /// `INTERVAL '<n> <unit> [<n> <unit> ...]'` — calendar-aware span.
+    /// Split into a months part (because a month is not a fixed number of
+    /// days) and a microseconds part (everything sub-month). `text` keeps
+    /// the original spelling so Display round-trips byte-for-byte.
+    Interval {
+        months: i32,
+        micros: i64,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,6 +689,17 @@ impl fmt::Display for Literal {
                 }
                 f.write_str("]")
             }
+            Self::Interval { text, .. } => {
+                f.write_str("INTERVAL '")?;
+                for c in text.chars() {
+                    if c == '\'' {
+                        f.write_str("''")?;
+                    } else {
+                        write!(f, "{c}")?;
+                    }
+                }
+                f.write_str("'")
+            }
         }
     }
 }
@@ -783,6 +803,7 @@ fn is_keyword(s: &str) -> bool {
             | "offset"
             | "asc"
             | "desc"
+            | "interval"
     )
 }
 

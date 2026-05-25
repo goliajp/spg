@@ -50,6 +50,11 @@ pub enum DataType {
     /// `TIMESTAMP` (a.k.a. `MySQL` `DATETIME`) — instant with microsecond
     /// precision, stored as `i64` microseconds since the Unix epoch.
     Timestamp,
+    /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
+    /// supports INTERVAL only as a runtime intermediate (literals,
+    /// arithmetic results); on-disk encoding is rejected so this branch
+    /// can't appear in a `ColumnSchema`.
+    Interval,
 }
 
 impl fmt::Display for DataType {
@@ -73,6 +78,7 @@ impl fmt::Display for DataType {
             }
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
+            Self::Interval => f.write_str("INTERVAL"),
         }
     }
 }
@@ -100,6 +106,12 @@ pub enum Value {
     Date(i32),
     /// Microseconds since the Unix epoch (1970-01-01T00:00:00Z).
     Timestamp(i64),
+    /// Calendar span: `months` (variable-length) + `micros` (fixed-length).
+    /// Runtime-only — cannot appear in a stored row in v2.11.
+    Interval {
+        months: i32,
+        micros: i64,
+    },
     Null,
 }
 
@@ -128,6 +140,7 @@ impl Value {
             }),
             Self::Date(_) => Some(DataType::Date),
             Self::Timestamp(_) => Some(DataType::Timestamp),
+            Self::Interval { .. } => Some(DataType::Interval),
             Self::Null => None,
         }
     }
@@ -210,7 +223,13 @@ impl IndexKey {
             Value::Timestamp(t) => Some(Self::Int(*t)),
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
-            Value::Null | Value::Float(_) | Value::Vector(_) | Value::Numeric { .. } => None,
+            // Interval isn't index-eligible either (and can't reach this
+            // path through column storage anyway).
+            Value::Null
+            | Value::Float(_)
+            | Value::Vector(_)
+            | Value::Numeric { .. }
+            | Value::Interval { .. } => None,
         }
     }
 }
@@ -1214,6 +1233,13 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         }
         DataType::Date => out.push(11),
         DataType::Timestamp => out.push(12),
+        // INTERVAL is runtime-only — CREATE TABLE never produces a
+        // column with this type, so write_data_type must not be called
+        // on it. (Disk-format codepoint reserved for a future v3 where
+        // INTERVAL becomes storable.)
+        DataType::Interval => {
+            unreachable!("DataType::Interval has no on-disk encoding in v2.11")
+        }
     }
 }
 
@@ -1291,6 +1317,14 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         Value::Timestamp(t) => {
             out.push(10);
             out.extend_from_slice(&t.to_le_bytes());
+        }
+        // Interval is a runtime-only value (no on-disk representation in
+        // v2.11). CREATE TABLE rejects `DataType::Interval` columns, so a
+        // Value::Interval here would mean the engine bypassed that gate.
+        Value::Interval { .. } => {
+            unreachable!(
+                "Value::Interval has no on-disk encoding; engine must reject it before write"
+            )
         }
     }
 }
