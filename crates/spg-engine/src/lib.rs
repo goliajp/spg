@@ -286,6 +286,13 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
+        // `IF NOT EXISTS` reduces DuplicateIndex to a no-op CommandOk.
+        if stmt.if_not_exists && table.indices().iter().any(|i| i.name == stmt.name) {
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
+        }
         match stmt.method {
             IndexMethod::BTree => table.add_index(stmt.name, &stmt.column)?,
             IndexMethod::Hnsw => {
@@ -302,6 +309,12 @@ impl Engine {
         &mut self,
         stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
+        if stmt.if_not_exists && self.active_catalog().get(&stmt.name).is_some() {
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
+        }
         let cols = stmt
             .columns
             .into_iter()
@@ -348,11 +361,15 @@ impl Engine {
                     }
                     map[idx] = Some(j);
                 }
-                // Omitted columns must either be nullable or carry a
-                // DEFAULT. Catch NOT NULL omissions up front so the WAL
-                // stays clean.
+                // Omitted columns must either be nullable, carry a
+                // DEFAULT, or be AUTO_INCREMENT. Catch NOT NULL
+                // omissions up front so the WAL stays clean.
                 for (i, col) in schema.columns.iter().enumerate() {
-                    if map[i].is_none() && !col.nullable && col.default.is_none() {
+                    if map[i].is_none()
+                        && !col.nullable
+                        && col.default.is_none()
+                        && !col.auto_increment
+                    {
                         return Err(EngineError::Storage(StorageError::NullInNotNull {
                             column: col.name.clone(),
                         }));
@@ -377,12 +394,26 @@ impl Engine {
                 .collect::<Result<_, _>>()?;
             let mut values = Vec::with_capacity(schema.columns.len());
             for (i, col) in schema.columns.iter().enumerate() {
-                let raw = match tuple_pos[i] {
+                let mut raw = match tuple_pos[i] {
                     Some(j) => raw_tuple[j].clone(),
                     // Omitted column: prefer the column's stored DEFAULT;
                     // fall back to NULL for unbound nullable columns.
                     None => col.default.clone().unwrap_or(Value::Null),
                 };
+                // AUTO_INCREMENT fires when the slot would be NULL —
+                // either because the column wasn't named in a column-
+                // list INSERT or because the user explicitly wrote
+                // NULL. The next value is computed against the table's
+                // current contents.
+                if col.auto_increment && raw.is_null() {
+                    let next = table.next_auto_value(i).ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                            col.name
+                        ))
+                    })?;
+                    raw = Value::BigInt(next);
+                }
                 values.push(coerce_value(raw, col.ty, &col.name, i)?);
             }
             table.insert(Row::new(values))?;
@@ -1219,6 +1250,15 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
         let raw = literal_expr_to_value(default_expr)?;
         let coerced = coerce_value(raw, ty, &c.name, 0)?;
         schema = schema.with_default(coerced);
+    }
+    if c.auto_increment {
+        // AUTO_INCREMENT only makes sense on integer-shaped columns.
+        if !matches!(ty, DataType::SmallInt | DataType::Int | DataType::BigInt) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "AUTO_INCREMENT requires an integer column type, got {ty:?}"
+            )));
+        }
+        schema = schema.with_auto_increment();
     }
     Ok(schema)
 }

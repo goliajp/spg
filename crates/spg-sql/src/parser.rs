@@ -289,6 +289,7 @@ impl Parser {
         // Caller already consumed CREATE; we're sitting on TABLE.
         debug_assert!(matches!(self.peek(), Token::Table));
         self.advance();
+        let if_not_exists = self.consume_if_not_exists();
         let name = self.expect_ident_like()?;
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!(
@@ -321,13 +322,42 @@ impl Parser {
         Ok(Statement::CreateTable(CreateTableStatement {
             name,
             columns,
+            if_not_exists,
         }))
+    }
+
+    /// Recognise the optional `IF NOT EXISTS` prefix shared by `CREATE
+    /// TABLE` and `CREATE INDEX`. Returns `true` if consumed.
+    fn consume_if_not_exists(&mut self) -> bool {
+        // `IF` arrives as a bare Ident (we don't reserve it because it
+        // also appears mid-expression in PG, though we don't support
+        // those forms yet).
+        let looks_like_if = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if"));
+        if !looks_like_if {
+            return false;
+        }
+        // Peek one ahead before committing: only consume IF when it's
+        // actually `IF NOT EXISTS`.
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token::Not)) {
+            return false;
+        }
+        if !matches!(
+            self.tokens.get(self.pos + 2),
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("exists")
+        ) {
+            return false;
+        }
+        self.advance(); // IF
+        self.advance(); // NOT
+        self.advance(); // EXISTS
+        true
     }
 
     fn parse_create_index_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
         // Caller consumed CREATE; we're on INDEX.
         debug_assert!(matches!(self.peek(), Token::Index));
         self.advance();
+        let if_not_exists = self.consume_if_not_exists();
         let name = self.expect_ident_like()?;
         if !matches!(self.peek(), Token::On) {
             return Err(self.err(format!(
@@ -376,6 +406,7 @@ impl Parser {
             table,
             column,
             method,
+            if_not_exists,
         }))
     }
 
@@ -413,11 +444,13 @@ impl Parser {
                 });
             }
         };
-        // Column constraints: `DEFAULT <expr>` and `NOT NULL` may appear
-        // in either order. Each may appear at most once.
+        // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
+        // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
+        // each at most once.
         let mut default: Option<Expr> = None;
         let mut nullable = true;
         let mut nullability_seen = false;
+        let mut auto_increment = false;
         loop {
             if matches!(self.peek(), Token::Default) {
                 if default.is_some() {
@@ -443,6 +476,19 @@ impl Parser {
                 nullability_seen = true;
                 continue;
             }
+            // `AUTO_INCREMENT` or its abbreviated form `AUTOINCREMENT`
+            // arrives as a bare Ident. Match either, case-insensitive.
+            if let Token::Ident(s) = self.peek()
+                && (s.eq_ignore_ascii_case("auto_increment")
+                    || s.eq_ignore_ascii_case("autoincrement"))
+            {
+                if auto_increment {
+                    return Err(self.err("AUTO_INCREMENT specified twice".into()));
+                }
+                self.advance();
+                auto_increment = true;
+                continue;
+            }
             break;
         }
         Ok(ColumnDef {
@@ -450,6 +496,7 @@ impl Parser {
             ty,
             nullable,
             default,
+            auto_increment,
         })
     }
 

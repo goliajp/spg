@@ -39,6 +39,11 @@
         { "file": "18_cast_expr.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
+    { "name": "mysql", "pass": 12, "fail": 0, "skip": 0,
+      "files": [
+        { "file": "01_dialect.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] }
+      ] },
     { "name": "pg_regress", "pass": 53, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,

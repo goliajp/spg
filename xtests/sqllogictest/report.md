@@ -5,6 +5,7 @@ Per-corpus pass / fail / skip:
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
 | `duckdb` | 126 | 0 | 0 | 100.0% |
+| `mysql` | 12 | 0 | 0 | 100.0% |
 | `pg_regress` | 53 | 0 | 0 | 100.0% |
 | `pgvector` | 53 | 0 | 0 | 100.0% |
 
@@ -32,6 +33,12 @@ Per-corpus pass / fail / skip:
 | `16_distinct_union.test` | 7 | 0 | 0 |
 | `17_functions.test` | 7 | 0 | 0 |
 | `18_cast_expr.test` | 5 | 0 | 0 |
+
+### `mysql/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
+| `01_dialect.test` | 12 | 0 | 0 |
 
 ### `pg_regress/`
 
