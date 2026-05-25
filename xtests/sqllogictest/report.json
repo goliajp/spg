@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "duckdb", "pass": 114, "fail": 12, "skip": 0,
+    { "name": "duckdb", "pass": 115, "fail": 11, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -26,8 +26,8 @@
           "fail_reasons": ["record 1: parse: parse error at token #3: expected VALUES after table name, got LParen", "record 2: row mismatch |   expected: [\"NULL\"] |   actual:   []"] },
         { "file": "12_string_concat.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "13_between_in_like.test", "pass": 7, "fail": 1, "skip": 0,
-          "fail_reasons": ["record 7: parse: parse error at token #6: expected end of input, got Ident(\"like\")"] },
+        { "file": "13_between_in_like.test", "pass": 8, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
         { "file": "14_aggregates.test", "pass": 5, "fail": 4, "skip": 0,
           "fail_reasons": ["record 5: parse: parse error at token #3: unexpected token Star in expression", "record 6: eval: type mismatch: unknown function `sum`", "record 7: eval: type mismatch: unknown function `max`"] },
         { "file": "15_joins.test", "pass": 7, "fail": 2, "skip": 0,

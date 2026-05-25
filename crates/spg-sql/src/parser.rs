@@ -588,12 +588,12 @@ impl Parser {
                 };
                 continue;
             }
-            // `x [NOT] BETWEEN a AND b` / `x [NOT] IN (...)`. We look one
-            // token ahead so a stray `NOT` not followed by BETWEEN/IN flows
-            // through to the early return below untouched.
+            // `x [NOT] BETWEEN a AND b`, `x [NOT] IN (...)`, `x [NOT] LIKE p`.
+            // Look one token ahead so a stray `NOT` not followed by any of
+            // these flows through to the early return below untouched.
             let negated = if matches!(self.peek(), Token::Not) {
                 let next = self.tokens.get(self.pos + 1);
-                matches!(next, Some(Token::Between | Token::In))
+                matches!(next, Some(Token::Between | Token::In | Token::Like))
             } else {
                 false
             };
@@ -606,6 +606,18 @@ impl Parser {
             }
             if matches!(self.peek(), Token::In) {
                 expr = self.parse_in_tail(expr, negated)?;
+                continue;
+            }
+            if matches!(self.peek(), Token::Like) {
+                self.advance();
+                // Pattern at the same precedence as other comparison RHSes —
+                // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
+                let pattern = self.parse_expr(5)?;
+                expr = Expr::Like {
+                    expr: Box::new(expr),
+                    pattern: Box::new(pattern),
+                    negated,
+                };
                 continue;
             }
             return Ok(expr);
