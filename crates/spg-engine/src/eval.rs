@@ -311,11 +311,236 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             Ok(Value::Null)
         }
         "date_trunc" => date_trunc(args),
+        "date_part" => date_part(args),
+        "age" => age(args),
+        "to_char" => to_char(args),
         other => Err(EvalError::TypeMismatch {
             detail: format!("unknown function `{other}`"),
         }),
     }
 }
+
+/// `date_part(field_text, source)` — function form of `EXTRACT(field FROM
+/// source)`. Same component dispatch (DATE / TIMESTAMP / INTERVAL) and
+/// same `BigInt` return shape; PG returns double precision but we keep the
+/// integer convention so the runner's `query I` shape works unchanged.
+fn date_part(args: &[Value]) -> Result<Value, EvalError> {
+    use spg_sql::ast::ExtractField as F;
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("date_part() takes 2 args, got {}", args.len()),
+        });
+    }
+    if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(field_name) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "date_part() needs a text field, got {:?}",
+                args[0].data_type()
+            ),
+        });
+    };
+    let field = match field_name.to_ascii_lowercase().as_str() {
+        "year" => F::Year,
+        "month" => F::Month,
+        "day" => F::Day,
+        "hour" => F::Hour,
+        "minute" => F::Minute,
+        "second" => F::Second,
+        "microsecond" | "microseconds" => F::Microsecond,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "unknown date_part field {other:?}; \
+                     supported: year, month, day, hour, minute, second, microsecond"
+                ),
+            });
+        }
+    };
+    extract_field(field, &args[1])
+}
+
+/// `age(t1, t2)` — return `t1 - t2` as an INTERVAL. v2.12 produces a
+/// micros-only interval (no months normalisation) because PG's
+/// month-justification rule is sensitive to the day-of-month walk and
+/// adds material complexity for marginal corpus value.
+///
+/// `age(t)` (single-arg form) is intentionally unsupported in v2.12:
+/// the dispatcher errors instead of guessing a clock source. Callers
+/// who want PG's `age(t)` semantics should write `age(CURRENT_DATE, t)`
+/// explicitly so the clock reference is visible at the SQL layer.
+fn age(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("age() takes 1 or 2 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    // Coerce to TIMESTAMP micros — DATE lifts to midnight; TIMESTAMP
+    // stays as-is; anything else errors.
+    let to_micros = |v: &Value| -> Result<i64, EvalError> {
+        match v {
+            Value::Timestamp(t) => Ok(*t),
+            Value::Date(d) => Ok(i64::from(*d) * 86_400_000_000),
+            other => Err(EvalError::TypeMismatch {
+                detail: format!("age() needs DATE or TIMESTAMP, got {:?}", other.data_type()),
+            }),
+        }
+    };
+    if args.len() == 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: "single-arg age() is unsupported in v2.12 \
+                     (use age(CURRENT_DATE, t) explicitly)"
+                .into(),
+        });
+    }
+    let a = to_micros(&args[0])?;
+    let b = to_micros(&args[1])?;
+    let delta = a.checked_sub(b).ok_or(EvalError::TypeMismatch {
+        detail: "age() subtraction overflows i64 microseconds".into(),
+    })?;
+    Ok(Value::Interval {
+        months: 0,
+        micros: delta,
+    })
+}
+
+/// `to_char(value, format)` — render a DATE / TIMESTAMP through a PG
+/// format template. Supports the high-traffic placeholders:
+///   YYYY YY MM Mon Month DD HH24 HH12 MI SS MS US AM PM
+/// Unrecognised characters pass through literally so the template's
+/// punctuation ('-', ':', ' ', '/') needs no escape mechanism.
+fn to_char(args: &[Value]) -> Result<Value, EvalError> {
+    use core::fmt::Write as _;
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("to_char() takes 2 args, got {}", args.len()),
+        });
+    }
+    if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(fmt) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "to_char() needs a text format, got {:?}",
+                args[1].data_type()
+            ),
+        });
+    };
+    let (days, day_micros) = match &args[0] {
+        Value::Date(d) => (*d, 0_i64),
+        Value::Timestamp(t) => {
+            let days = t.div_euclid(86_400_000_000);
+            (
+                i32::try_from(days).unwrap_or(i32::MAX),
+                t.rem_euclid(86_400_000_000),
+            )
+        }
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "to_char() needs DATE or TIMESTAMP, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let (y, mo, d) = civil_from_days(days);
+    let secs = day_micros / 1_000_000;
+    let frac = day_micros % 1_000_000;
+    // div_euclid keeps every value non-negative — the casts below are
+    // sign-safe by construction. `secs ∈ [0, 86400)`, `frac ∈ [0,
+    // 1_000_000)`, so all three quantities fit in u32.
+    let hh24 = u32::try_from(secs / 3600).unwrap_or(0);
+    let mi = u32::try_from((secs / 60) % 60).unwrap_or(0);
+    let ss = u32::try_from(secs % 60).unwrap_or(0);
+    let hh12 = match hh24 % 12 {
+        0 => 12,
+        x => x,
+    };
+    let ampm = if hh24 < 12 { "AM" } else { "PM" };
+    let ms = u32::try_from(frac / 1_000).unwrap_or(0); // millisecond
+    let us = u32::try_from(frac).unwrap_or(0); // microsecond (0..1_000_000)
+
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    // write! against a String never fails — discard the Result.
+    while i < bytes.len() {
+        // Try the longest prefixes first so "YYYY" wins over "YY".
+        let rest = &bytes[i..];
+        if rest.starts_with(b"YYYY") {
+            let _ = write!(out, "{y:04}");
+            i += 4;
+        } else if rest.starts_with(b"YY") {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let yy = (y.rem_euclid(100)) as u32;
+            let _ = write!(out, "{yy:02}");
+            i += 2;
+        } else if rest.starts_with(b"Month") {
+            out.push_str(MONTH_FULL[(mo - 1) as usize]);
+            i += 5;
+        } else if rest.starts_with(b"Mon") {
+            out.push_str(MONTH_ABBR[(mo - 1) as usize]);
+            i += 3;
+        } else if rest.starts_with(b"MM") {
+            let _ = write!(out, "{mo:02}");
+            i += 2;
+        } else if rest.starts_with(b"DD") {
+            let _ = write!(out, "{d:02}");
+            i += 2;
+        } else if rest.starts_with(b"HH24") {
+            let _ = write!(out, "{hh24:02}");
+            i += 4;
+        } else if rest.starts_with(b"HH12") {
+            let _ = write!(out, "{hh12:02}");
+            i += 4;
+        } else if rest.starts_with(b"MI") {
+            let _ = write!(out, "{mi:02}");
+            i += 2;
+        } else if rest.starts_with(b"SS") {
+            let _ = write!(out, "{ss:02}");
+            i += 2;
+        } else if rest.starts_with(b"MS") {
+            let _ = write!(out, "{ms:03}");
+            i += 2;
+        } else if rest.starts_with(b"US") {
+            let _ = write!(out, "{us:06}");
+            i += 2;
+        } else if rest.starts_with(b"AM") || rest.starts_with(b"PM") {
+            out.push_str(ampm);
+            i += 2;
+        } else {
+            // Pass any non-placeholder byte through verbatim.
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+const MONTH_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+const MONTH_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// `date_trunc(unit, timestamp)` — round a `TIMESTAMP` down to the
 /// requested calendar boundary (year / month / day / hour / minute /
