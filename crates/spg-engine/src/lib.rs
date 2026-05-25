@@ -85,8 +85,20 @@ impl Engine {
         }
     }
 
+    /// Construct an engine restored from a previously-snapshotted catalog
+    /// (see `snapshot()`).
+    pub const fn restore(catalog: Catalog) -> Self {
+        Self { catalog }
+    }
+
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Serialize the catalog to bytes that `Engine::restore(Catalog::deserialize(..))`
+    /// can reload. v0.6 snapshots the full state; v0.x will add WAL.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.catalog.serialize()
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
