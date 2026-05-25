@@ -908,17 +908,20 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
 ///
 /// v0.8 recognises a single top-level `col = literal` (in either operand
 /// order). AND chains and range scans land in later milestones.
-/// Look for `ORDER BY col <-> literal LIMIT k` (no WHERE) against an
-/// NSW-indexed vector column. Returns the row indices in ascending-
-/// distance order when the plan applies, `None` otherwise — the caller
-/// then materialises one row per index in that order and skips ORDER BY.
+/// Look for `ORDER BY col <dist-op> literal LIMIT k` against an
+/// NSW-indexed vector column. Recognised distance ops: `<->` (L2),
+/// `<#>` (inner product), `<=>` (cosine). When a WHERE clause is
+/// present, the planner does an "over-fetch and filter" pass — it
+/// asks the graph for `k * over_fetch` candidates, evaluates WHERE
+/// against each, and trims back to `k`. Returns the row indices in
+/// ascending-distance order when the plan applies.
 fn try_nsw_knn(
     stmt: &SelectStatement,
     table: &Table,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
 ) -> Option<Vec<usize>> {
-    if stmt.where_.is_some() || stmt.distinct {
+    if stmt.distinct {
         return None;
     }
     let limit = usize::try_from(stmt.limit?).ok()?;
@@ -926,15 +929,16 @@ fn try_nsw_knn(
         return None;
     }
     let order = stmt.order_by.as_ref()?;
-    let Expr::Binary {
-        lhs,
-        op: BinOp::L2Distance,
-        rhs,
-    } = order
-    else {
+    let Expr::Binary { lhs, op, rhs } = order else {
         return None;
     };
-    // Accept both `col <-> literal` and `literal <-> col`.
+    let metric = match op {
+        BinOp::L2Distance => spg_storage::NswMetric::L2,
+        BinOp::InnerProduct => spg_storage::NswMetric::InnerProduct,
+        BinOp::CosineDistance => spg_storage::NswMetric::Cosine,
+        _ => return None,
+    };
+    // Accept both `col <op> literal` and `literal <op> col`.
     let ((Expr::Column(col), literal) | (literal, Expr::Column(col))) =
         (lhs.as_ref(), rhs.as_ref())
     else {
@@ -948,8 +952,36 @@ fn try_nsw_knn(
     let col_pos = schema_cols.iter().position(|s| s.name == col.name)?;
     let query = literal_to_vector(literal)?;
     let idx = spg_storage::nsw_index_on(table, col_pos)?;
-    Some(spg_storage::nsw_query(table, &idx.name, &query, limit))
+    if let Some(where_expr) = &stmt.where_ {
+        // Over-fetch and filter. The factor (10×) is a heuristic that
+        // covers typical selectivity for the corpus tests; v2.x will
+        // make it configurable.
+        let over_fetch = limit.saturating_mul(10).max(NSW_OVER_FETCH_FLOOR);
+        let candidates = spg_storage::nsw_query(table, &idx.name, &query, over_fetch, metric);
+        let ctx = EvalContext::new(schema_cols, Some(table_alias));
+        let mut kept: Vec<usize> = Vec::with_capacity(limit);
+        for i in candidates {
+            let row = &table.rows()[i];
+            let cond = eval::eval_expr(where_expr, row, &ctx).ok()?;
+            if matches!(cond, Value::Bool(true)) {
+                kept.push(i);
+                if kept.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Some(kept)
+    } else {
+        Some(spg_storage::nsw_query(
+            table, &idx.name, &query, limit, metric,
+        ))
+    }
 }
+
+/// Lower bound on the over-fetch pool when WHERE is present — even
+/// for tiny `LIMIT 1` queries we keep enough candidates to absorb a
+/// few WHERE rejections.
+const NSW_OVER_FETCH_FLOOR: usize = 32;
 
 /// Pull a `Vec<f32>` out of a literal-or-cast expression. Returns
 /// `None` for anything we can't fold at plan time.

@@ -554,7 +554,10 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
         Value::Vector(v) => v.clone(),
         _ => return,
     };
-    let nearest = nsw_search(table, idx_pos, &query, m, m * 2);
+    // The graph topology is always built with L2 — querying under a
+    // different metric still reuses the same edges (graph topology is
+    // approximate by design).
+    let nearest = nsw_search(table, idx_pos, &query, m, m * 2, NswMetric::L2);
     // Connect bidirectionally. Trim each endpoint to M to keep degree bounded.
     let new_neighbors: Vec<usize> = nearest
         .iter()
@@ -599,14 +602,34 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     }
 }
 
+/// Distance metric used at NSW search time. The graph topology is
+/// always built with `L2`; querying with `InnerProduct` / `Cosine`
+/// reuses the same edges but ranks candidates by the chosen metric.
+/// For the corpus-sized graphs this loses negligible recall vs
+/// building separate per-metric graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NswMetric {
+    /// Squared Euclidean — ranks "smaller = closer" (the sqrt is
+    /// monotonic so we skip it for ordering).
+    L2,
+    /// Negated dot product, matching pgvector `<#>` convention so
+    /// "smaller = more similar" holds across all three metrics.
+    InnerProduct,
+    /// Cosine distance `1 - cos(a, b)`. Zero-norm operand yields
+    /// `f32::INFINITY` so it sorts last.
+    Cosine,
+}
+
 /// Greedy NSW kNN search: walk from the graph entry node, maintaining
-/// an `ef`-sized candidate pool, return the top `k` results.
+/// an `ef`-sized candidate pool, return the top `k` results under the
+/// caller-chosen metric.
 fn nsw_search(
     table: &Table,
     idx_pos: usize,
     query: &[f32],
     k: usize,
     ef: usize,
+    metric: NswMetric,
 ) -> Vec<(f32, usize)> {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
@@ -620,7 +643,7 @@ fn nsw_search(
     let mut visited: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
     visited.insert(entry);
     let d0 = match &table.rows[entry].values[col_pos] {
-        Value::Vector(v) => l2_distance_sq(v, query),
+        Value::Vector(v) => metric_distance(metric, v, query),
         _ => return Vec::new(),
     };
     // `candidates` is the open frontier (min-distance first).
@@ -644,7 +667,7 @@ fn nsw_search(
             if nv.len() != query.len() {
                 continue;
             }
-            let dn = l2_distance_sq(nv, query);
+            let dn = metric_distance(metric, nv, query);
             let worst = results.last().map_or(f32::INFINITY, |&(d, _)| d);
             if results.len() < ef || dn < worst {
                 let pos = results.partition_point(|&(d, _)| d <= dn);
@@ -661,6 +684,47 @@ fn nsw_search(
     results
 }
 
+fn metric_distance(metric: NswMetric, a: &[f32], b: &[f32]) -> f32 {
+    match metric {
+        NswMetric::L2 => l2_distance_sq(a, b),
+        NswMetric::InnerProduct => {
+            let mut dot: f32 = 0.0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                dot += x * y;
+            }
+            -dot
+        }
+        NswMetric::Cosine => {
+            let mut dot: f32 = 0.0;
+            let mut na: f32 = 0.0;
+            let mut nb: f32 = 0.0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            if na == 0.0 || nb == 0.0 {
+                return f32::INFINITY;
+            }
+            // `f32::sqrt` lives in std, so hand-roll Newton-Raphson on
+            // f64 — same trick the L2 binary op already uses.
+            let denom = sqrt_newton_f32(na) * sqrt_newton_f32(nb);
+            1.0 - dot / denom
+        }
+    }
+}
+
+fn sqrt_newton_f32(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut g = x;
+    for _ in 0..10 {
+        g = 0.5 * (g + x / g);
+    }
+    g
+}
+
 /// Squared Euclidean distance — used for ordering inside NSW (the sqrt
 /// preserves the order). Caller takes sqrt before reporting back to SQL.
 fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
@@ -673,13 +737,19 @@ fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Public wrapper: run an NSW kNN search and return the top-k row
-/// indices ordered by ascending L2 distance.
-pub fn nsw_query(table: &Table, idx_name: &str, query: &[f32], k: usize) -> Vec<usize> {
+/// indices ordered by ascending distance under the given metric.
+pub fn nsw_query(
+    table: &Table,
+    idx_name: &str,
+    query: &[f32],
+    k: usize,
+    metric: NswMetric,
+) -> Vec<usize> {
     let Some(idx_pos) = table.indices.iter().position(|i| i.name == idx_name) else {
         return Vec::new();
     };
     let ef = (k * 2).max(NSW_DEFAULT_M);
-    let mut hits = nsw_search(table, idx_pos, query, k, ef);
+    let mut hits = nsw_search(table, idx_pos, query, k, ef, metric);
     hits.truncate(k);
     hits.into_iter().map(|(_, idx)| idx).collect()
 }

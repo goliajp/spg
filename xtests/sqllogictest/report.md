@@ -7,7 +7,7 @@ Per-corpus pass / fail / skip:
 | `duckdb` | 133 | 0 | 0 | 100.0% |
 | `mysql` | 12 | 0 | 0 | 100.0% |
 | `pg_regress` | 66 | 0 | 0 | 100.0% |
-| `pgvector` | 53 | 0 | 0 | 100.0% |
+| `pgvector` | 63 | 0 | 0 | 100.0% |
 
 ## Per-file detail
 
@@ -64,3 +64,4 @@ Per-corpus pass / fail / skip:
 | `06_distance_variants.test` | 6 | 0 | 0 |
 | `07_cast_vector_literal.test` | 3 | 0 | 0 |
 | `08_hnsw_knn.test` | 11 | 0 | 0 |
+| `09_hnsw_metrics_and_filter.test` | 10 | 0 | 0 |
