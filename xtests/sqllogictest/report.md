@@ -5,16 +5,13 @@ Per-corpus pass / fail / skip:
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
 | `duckdb` | 126 | 0 | 0 | 100.0% |
-| `pg_regress` | 26 | 8 | 0 | 76.5% |
+| `pg_regress` | 44 | 3 | 0 | 93.6% |
 | `pgvector` | 42 | 0 | 0 | 100.0% |
 
 ## Top fail patterns
 
 | count | pattern |
 |---|---|
-| 1 | `record 0: parse: parse error at` |
-| 1 | `record 1: parse: parse error at` |
-| 1 | `record 2: parse: parse error at` |
 | 1 | `record 3: parse: parse error at` |
 | 1 | `record 5: parse: parse error at` |
 | 1 | `record 7: row mismatch | expected:` |
@@ -51,15 +48,8 @@ Per-corpus pass / fail / skip:
 | `01_create_table_shapes.test` | 6 | 0 | 0 |
 | `02_insert_shapes.test` | 9 | 0 | 0 |
 | `03_dml_v2_unsupported.test` | 6 | 0 | 0 |
-| `04_pg_types.test` | 0 | 5 | 0 |
+| `04_pg_types.test` | 18 | 0 | 0 |
 | `05_savepoints.test` | 5 | 3 | 0 |
-
-<details><summary>`04_pg_types.test` fail snippets</summary>
-
-- record 0: parse: parse error at token #5: unsupported column type "smallint"
-- record 1: parse: parse error at token #5: unsupported column type "numeric"
-- record 2: parse: parse error at token #5: unsupported column type "varchar"
-</details>
 
 <details><summary>`05_savepoints.test` fail snippets</summary>
 

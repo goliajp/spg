@@ -346,39 +346,15 @@ impl Parser {
             }
         };
         let ty = match ty_ident.as_str() {
+            "smallint" => ColumnTypeName::SmallInt,
             "int" => ColumnTypeName::Int,
             "bigint" => ColumnTypeName::BigInt,
             "float" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
             "bool" => ColumnTypeName::Bool,
-            "vector" => {
-                if !matches!(self.peek(), Token::LParen) {
-                    return Err(
-                        self.err(format!("VECTOR type requires (dim), got {:?}", self.peek()))
-                    );
-                }
-                self.advance();
-                let dim = match self.advance() {
-                    Token::Integer(n) if n > 0 => u32::try_from(n).map_err(|_| ParseError {
-                        message: format!("VECTOR dim too large: {n}"),
-                        token_pos: self.pos.saturating_sub(1),
-                    })?,
-                    other => {
-                        return Err(ParseError {
-                            message: format!("expected positive integer VECTOR dim, got {other:?}"),
-                            token_pos: self.pos.saturating_sub(1),
-                        });
-                    }
-                };
-                if !matches!(self.peek(), Token::RParen) {
-                    return Err(self.err(format!(
-                        "expected ')' after VECTOR dim, got {:?}",
-                        self.peek()
-                    )));
-                }
-                self.advance();
-                ColumnTypeName::Vector(dim)
-            }
+            "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
+            "char" => ColumnTypeName::Char(self.parse_paren_size("CHAR")?),
+            "vector" => ColumnTypeName::Vector(self.parse_paren_size("VECTOR")?),
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),
@@ -386,21 +362,74 @@ impl Parser {
                 });
             }
         };
-        // Optional NOT NULL.
-        let nullable = if matches!(self.peek(), Token::Not) {
-            self.advance();
-            if !matches!(self.peek(), Token::Null) {
-                return Err(self.err(format!(
-                    "expected NULL after NOT in column def, got {:?}",
-                    self.peek()
-                )));
+        // Column constraints: `DEFAULT <expr>` and `NOT NULL` may appear
+        // in either order. Each may appear at most once.
+        let mut default: Option<Expr> = None;
+        let mut nullable = true;
+        let mut nullability_seen = false;
+        loop {
+            if matches!(self.peek(), Token::Default) {
+                if default.is_some() {
+                    return Err(self.err("DEFAULT specified twice".into()));
+                }
+                self.advance();
+                default = Some(self.parse_expr(0)?);
+                continue;
             }
-            self.advance();
-            false
-        } else {
-            true
+            if matches!(self.peek(), Token::Not) {
+                if nullability_seen {
+                    return Err(self.err("NOT NULL specified twice".into()));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::Null) {
+                    return Err(self.err(format!(
+                        "expected NULL after NOT in column def, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                nullable = false;
+                nullability_seen = true;
+                continue;
+            }
+            break;
+        }
+        Ok(ColumnDef {
+            name,
+            ty,
+            nullable,
+            default,
+        })
+    }
+
+    /// Parse `(N)` where `N` is a positive integer literal — used by the
+    /// `VARCHAR`/`CHAR`/`VECTOR` column types. `label` is the type name
+    /// for the error message.
+    fn parse_paren_size(&mut self, label: &str) -> Result<u32, ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("{label} type requires (N), got {:?}", self.peek())));
+        }
+        self.advance();
+        let n = match self.advance() {
+            Token::Integer(n) if n > 0 => u32::try_from(n).map_err(|_| ParseError {
+                message: format!("{label} size too large: {n}"),
+                token_pos: self.pos.saturating_sub(1),
+            })?,
+            other => {
+                return Err(ParseError {
+                    message: format!("expected positive integer {label} size, got {other:?}"),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
         };
-        Ok(ColumnDef { name, ty, nullable })
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' after {label} size, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(n)
     }
 
     fn parse_insert_stmt(&mut self) -> Result<Statement, ParseError> {

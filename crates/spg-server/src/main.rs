@@ -506,10 +506,15 @@ fn column_schema_to_desc(c: &ColumnSchema) -> ColumnDesc {
 
 const fn data_type_to_wire(t: DataType) -> WireType {
     match t {
-        DataType::Int => WireType::Int,
+        // v1.11 surfaces SMALLINT as INT on the wire — the wire layer
+        // doesn't (yet) carry a separate 16-bit tag, and PG drivers
+        // happily render an i32 for any narrower integer column.
+        DataType::SmallInt | DataType::Int => WireType::Int,
         DataType::BigInt => WireType::BigInt,
         DataType::Float => WireType::Float,
-        DataType::Text => WireType::Text,
+        // VARCHAR / CHAR collapse to TEXT on the wire — only the schema
+        // tracks the bound; values are plain UTF-8.
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -524,6 +529,8 @@ fn row_to_wire(r: &Row) -> Vec<WireValue> {
 fn value_to_wire(v: &Value) -> WireValue {
     match v {
         Value::Null => WireValue::Null,
+        // SMALLINT widens to wire INT — drivers see a plain i32.
+        Value::SmallInt(n) => WireValue::Int(i32::from(*n)),
         Value::Int(n) => WireValue::Int(*n),
         Value::BigInt(n) => WireValue::BigInt(*n),
         Value::Float(x) => WireValue::Float(*x),

@@ -13,14 +13,25 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-/// Runtime type tags. `Vector(dim)` is parameterised; the dimension travels
-/// with both the column schema and the on-wire serialised representation.
+/// Runtime type tags. `Vector(dim)` / `Varchar(max)` / `Char(size)` are
+/// parameterised; the parameter travels with both the column schema and
+/// the on-wire serialised representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
+    /// 16-bit signed. Backed by `Value::SmallInt(i16)`; arithmetic that
+    /// would overflow surfaces as a type error at INSERT time.
+    SmallInt,
     Int,    // 32-bit signed
     BigInt, // 64-bit signed
     Float,  // f64 (PG double precision)
     Text,
+    /// `VARCHAR(n)` — same byte representation as `Text`, but INSERT
+    /// rejects values longer than `n` Unicode characters.
+    Varchar(u32),
+    /// `CHAR(n)` — same representation as `Text`, but INSERT right-pads
+    /// with U+0020 to exactly `n` Unicode characters (or rejects when
+    /// the input is already longer).
+    Char(u32),
     Bool,
     /// pgvector-style fixed-dimension float32 vector.
     Vector(u32),
@@ -29,10 +40,13 @@ pub enum DataType {
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SmallInt => f.write_str("SMALLINT"),
             Self::Int => f.write_str("INT"),
             Self::BigInt => f.write_str("BIGINT"),
             Self::Float => f.write_str("FLOAT"),
             Self::Text => f.write_str("TEXT"),
+            Self::Varchar(n) => write!(f, "VARCHAR({n})"),
+            Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
             Self::Vector(n) => write!(f, "VECTOR({n})"),
         }
@@ -44,6 +58,7 @@ impl fmt::Display for DataType {
 /// must opt into NaN-aware comparison if they need stronger guarantees.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    SmallInt(i16),
     Int(i32),
     BigInt(i64),
     Float(f64),
@@ -57,9 +72,12 @@ impl Value {
     /// Type tag, or `None` for `NULL` (unknown at value level).
     pub fn data_type(&self) -> Option<DataType> {
         match self {
+            Self::SmallInt(_) => Some(DataType::SmallInt),
             Self::Int(_) => Some(DataType::Int),
             Self::BigInt(_) => Some(DataType::BigInt),
             Self::Float(_) => Some(DataType::Float),
+            // `Text` covers both unbounded TEXT and bounded VARCHAR/CHAR
+            // — the constraint lives on the column schema, not the value.
             Self::Text(_) => Some(DataType::Text),
             Self::Bool(_) => Some(DataType::Bool),
             Self::Vector(v) => Some(DataType::Vector(
@@ -95,14 +113,18 @@ impl Row {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnSchema {
     pub name: String,
     pub ty: DataType,
     pub nullable: bool,
+    /// Optional `DEFAULT` value, frozen at CREATE TABLE time. `None`
+    /// means "no default" (so omitted columns become NULL, or error
+    /// out when the column is NOT NULL).
+    pub default: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnSchema>,
@@ -128,6 +150,7 @@ pub enum IndexKey {
 impl IndexKey {
     pub fn from_value(v: &Value) -> Option<Self> {
         match v {
+            Value::SmallInt(n) => Some(Self::Int(i64::from(*n))),
             Value::Int(n) => Some(Self::Int(i64::from(*n))),
             Value::BigInt(n) => Some(Self::Int(*n)),
             Value::Text(s) => Some(Self::Text(s.clone())),
@@ -227,11 +250,17 @@ impl Table {
             let actual = val.data_type().expect("non-null");
             // Vector columns require both that the value's variant be Vector
             // *and* its dimension match. `actual == col.ty` already encodes
-            // both because DataType::Vector carries the dim — but we surface
-            // a nicer error path for the dim-mismatch case via the same
-            // TypeMismatch (the position + names tell the operator what's
-            // wrong).
-            if actual != col.ty {
+            // both because DataType::Vector carries the dim.
+            //
+            // VARCHAR(n) / CHAR(n) are storage-equivalent to TEXT — the
+            // length / padding contract is enforced upstream by
+            // `coerce_value`. Accept a `Text` value into either.
+            let compatible = actual == col.ty
+                || matches!(
+                    (actual, col.ty),
+                    (DataType::Text, DataType::Varchar(_) | DataType::Char(_))
+                );
+            if !compatible {
                 return Err(StorageError::TypeMismatch {
                     column: col.name.clone(),
                     expected: col.ty,
@@ -378,7 +407,17 @@ impl ColumnSchema {
             name: name.into(),
             ty,
             nullable,
+            default: None,
         }
+    }
+
+    /// Builder-style helper to attach a default value to an otherwise
+    /// plain column schema. Used by the engine when CREATE TABLE
+    /// specifies `column TYPE DEFAULT <expr>`.
+    #[must_use]
+    pub fn with_default(mut self, default: Value) -> Self {
+        self.default = Some(default);
+        self
     }
 }
 
@@ -392,7 +431,7 @@ impl TableSchema {
 }
 
 // =========================================================================
-// Persistent binary format for the catalog (v0.6).
+// Persistent binary format for the catalog.
 //
 // Layout (little-endian throughout):
 //
@@ -403,20 +442,30 @@ impl TableSchema {
 //       [col_count u16]
 //       for each col:
 //           [name_len u16][name bytes]
-//           [type_tag u8]   1=Int 2=BigInt 3=Float 4=Text 5=Bool
+//           [type_tag u8 + optional payload]
+//               1=Int 2=BigInt 3=Float 4=Text 5=Bool
+//               6=Vector(u32 dim)
+//               7=SmallInt
+//               8=Varchar(u32 max)
+//               9=Char(u32 size)
 //           [nullable u8]   0/1
+//           [default_tag u8] 0=none 1=value (followed by [value_tag u8] + bytes)
 //       [row_count u32]
 //       for each row, for each col, one [value_tag u8] + value bytes:
-//           tag 0 (Null)   → no body
-//           tag 1 (Int)    → i32 LE
-//           tag 2 (BigInt) → i64 LE
-//           tag 3 (Float)  → f64 LE
-//           tag 4 (Text)   → u16 LE len + UTF-8 bytes
-//           tag 5 (Bool)   → u8 0/1
+//           tag 0 (Null)     → no body
+//           tag 1 (Int)      → i32 LE
+//           tag 2 (BigInt)   → i64 LE
+//           tag 3 (Float)    → f64 LE
+//           tag 4 (Text)     → u16 LE len + UTF-8 bytes
+//           tag 5 (Bool)     → u8 0/1
+//           tag 6 (Vector)   → u32 LE dim + dim×f32 LE
+//           tag 7 (SmallInt) → i16 LE
+//
+// Bumped to version 2 when SmallInt/Varchar/Char/DEFAULT were added.
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 1;
+const FILE_VERSION: u8 = 2;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -439,6 +488,13 @@ impl Catalog {
                 write_str(&mut out, &c.name);
                 write_data_type(&mut out, c.ty);
                 out.push(u8::from(c.nullable));
+                match &c.default {
+                    None => out.push(0),
+                    Some(v) => {
+                        out.push(1);
+                        write_value(&mut out, v);
+                    }
+                }
             }
             write_u32(
                 &mut out,
@@ -492,10 +548,20 @@ impl Catalog {
                 let c_name = cur.read_str()?;
                 let ty = cur.read_data_type()?;
                 let nullable = cur.read_u8()? != 0;
+                let default = match cur.read_u8()? {
+                    0 => None,
+                    1 => Some(cur.read_value()?),
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown default tag: {other}"
+                        )));
+                    }
+                };
                 cols.push(ColumnSchema {
                     name: c_name,
                     ty,
                     nullable,
+                    default,
                 });
             }
             cat.create_table(TableSchema::new(name.clone(), cols))?;
@@ -559,6 +625,15 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             out.push(6);
             out.extend_from_slice(&dim.to_le_bytes());
         }
+        DataType::SmallInt => out.push(7),
+        DataType::Varchar(max) => {
+            out.push(8);
+            out.extend_from_slice(&max.to_le_bytes());
+        }
+        DataType::Char(size) => {
+            out.push(9);
+            out.extend_from_slice(&size.to_le_bytes());
+        }
     }
 }
 
@@ -572,6 +647,9 @@ impl Cursor<'_> {
             4 => Ok(DataType::Text),
             5 => Ok(DataType::Bool),
             6 => Ok(DataType::Vector(self.read_u32()?)),
+            7 => Ok(DataType::SmallInt),
+            8 => Ok(DataType::Varchar(self.read_u32()?)),
+            9 => Ok(DataType::Char(self.read_u32()?)),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -582,6 +660,10 @@ impl Cursor<'_> {
 fn write_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => out.push(0),
+        Value::SmallInt(n) => {
+            out.push(7);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
         Value::Int(n) => {
             out.push(1);
             out.extend_from_slice(&n.to_le_bytes());
@@ -700,6 +782,10 @@ impl<'a> Cursor<'a> {
                     v.push(f32::from_le_bytes(bytes));
                 }
                 Ok(Value::Vector(v))
+            }
+            7 => {
+                let s = self.take(2)?;
+                Ok(Value::SmallInt(i16::from_le_bytes([s[0], s[1]])))
             }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }

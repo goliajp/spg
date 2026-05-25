@@ -29,27 +29,36 @@ pub struct CreateIndexStatement {
     pub column: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableStatement {
     pub name: String,
     pub columns: Vec<ColumnDef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnTypeName,
     pub nullable: bool,
+    /// `DEFAULT <expr>` literal supplied at CREATE TABLE. Engine
+    /// evaluates this once (with an empty row) and caches the resulting
+    /// `Value` on the column schema.
+    pub default: Option<Expr>,
 }
 
 /// SQL-level type names. The mapping to the storage runtime's `DataType`
 /// happens in `spg-engine` — keeping `spg-sql` free of storage deps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnTypeName {
+    SmallInt,
     Int,
     BigInt,
     Float,
     Text,
+    /// `VARCHAR(N)` — TEXT capped at N Unicode characters.
+    Varchar(u32),
+    /// `CHAR(N)` — TEXT right-padded with spaces to exactly N characters.
+    Char(u32),
     Bool,
     /// pgvector fixed-dimension `VECTOR(N)`.
     Vector(u32),
@@ -58,10 +67,13 @@ pub enum ColumnTypeName {
 impl fmt::Display for ColumnTypeName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SmallInt => f.write_str("SMALLINT"),
             Self::Int => f.write_str("INT"),
             Self::BigInt => f.write_str("BIGINT"),
             Self::Float => f.write_str("FLOAT"),
             Self::Text => f.write_str("TEXT"),
+            Self::Varchar(n) => write!(f, "VARCHAR({n})"),
+            Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
             Self::Vector(n) => write!(f, "VECTOR({n})"),
         }
@@ -298,6 +310,9 @@ impl fmt::Display for CreateTableStatement {
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", quote_ident(&self.name), self.ty)?;
+        if let Some(d) = &self.default {
+            write!(f, " DEFAULT {d}")?;
+        }
         if !self.nullable {
             f.write_str(" NOT NULL")?;
         }
@@ -621,6 +636,7 @@ fn is_keyword(s: &str) -> bool {
             | "left"
             | "cross"
             | "outer"
+            | "default"
     )
 }
 

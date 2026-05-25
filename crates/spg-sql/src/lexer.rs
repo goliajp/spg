@@ -95,6 +95,7 @@ pub enum Token {
     Left,
     Cross,
     Outer,
+    Default,
 
     Eof,
 }
@@ -327,6 +328,7 @@ fn keyword_or_ident(lower: String) -> Token {
         "left" => Token::Left,
         "cross" => Token::Cross,
         "outer" => Token::Outer,
+        "default" => Token::Default,
         _ => Token::Ident(lower),
     }
 }
