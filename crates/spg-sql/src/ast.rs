@@ -71,7 +71,9 @@ impl fmt::Display for ColumnTypeName {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
     pub table: String,
-    pub values: Vec<Expr>,
+    /// One or more `(expr, expr, ...)` tuples — the multi-row VALUES form.
+    /// v1.3+ accepts `INSERT INTO t VALUES (a), (b)`.
+    pub rows: Vec<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,11 +110,40 @@ pub enum Expr {
         op: UnOp,
         expr: Box<Expr>,
     },
-    /// PG-style `expr::vector` cast. v1.2 supports `::vector` only; the
-    /// engine parses the inner text-literal `'[1,2,3]'` into a Vector value
-    /// at evaluation time (or, when nested in INSERT VALUES, at planning
-    /// time). Other type casts are reserved for v1.x.
-    VectorCast(Box<Expr>),
+    /// PG-style `expr::TYPE` cast. v1.3 supports VECTOR, INT, BIGINT, FLOAT,
+    /// TEXT, BOOL targets; engine coerces at evaluation time.
+    Cast {
+        expr: Box<Expr>,
+        target: CastTarget,
+    },
+    /// Postfix `IS NULL` / `IS NOT NULL`. Returns BOOL.
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastTarget {
+    Int,
+    BigInt,
+    Float,
+    Text,
+    Bool,
+    Vector,
+}
+
+impl fmt::Display for CastTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Int => "int",
+            Self::BigInt => "bigint",
+            Self::Float => "float",
+            Self::Text => "text",
+            Self::Bool => "bool",
+            Self::Vector => "vector",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +185,8 @@ pub enum BinOp {
     InnerProduct,
     /// pgvector cosine distance `<=>` — `1 - (a·b)/(|a| |b|)`.
     CosineDistance,
+    /// SQL string concatenation `||`. NULL propagates.
+    Concat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,14 +248,21 @@ impl fmt::Display for ColumnDef {
 
 impl fmt::Display for InsertStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "INSERT INTO {} VALUES (", quote_ident(&self.table))?;
-        for (i, v) in self.values.iter().enumerate() {
-            if i > 0 {
+        write!(f, "INSERT INTO {} VALUES ", quote_ident(&self.table))?;
+        for (ri, row) in self.rows.iter().enumerate() {
+            if ri > 0 {
                 f.write_str(", ")?;
             }
-            write!(f, "{v}")?;
+            f.write_str("(")?;
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{v}")?;
+            }
+            f.write_str(")")?;
         }
-        f.write_str(")")
+        Ok(())
     }
 }
 
@@ -296,7 +336,14 @@ impl fmt::Display for Expr {
                 UnOp::Not => write!(f, "(NOT {expr})"),
                 UnOp::Neg => write!(f, "(-{expr})"),
             },
-            Self::VectorCast(inner) => write!(f, "({inner}::vector)"),
+            Self::Cast { expr, target } => write!(f, "({expr}::{target})"),
+            Self::IsNull { expr, negated } => {
+                if *negated {
+                    write!(f, "({expr} IS NOT NULL)")
+                } else {
+                    write!(f, "({expr} IS NULL)")
+                }
+            }
         }
     }
 }
@@ -367,6 +414,7 @@ impl fmt::Display for BinOp {
             Self::L2Distance => "<->",
             Self::InnerProduct => "<#>",
             Self::CosineDistance => "<=>",
+            Self::Concat => "||",
         })
     }
 }
@@ -424,6 +472,7 @@ fn is_keyword(s: &str) -> bool {
             | "begin"
             | "commit"
             | "rollback"
+            | "is"
     )
 }
 

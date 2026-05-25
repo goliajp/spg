@@ -1,13 +1,19 @@
-# Multi-VALUES INSERT — v1 SPG only accepts a single row per INSERT.
+# Multi-VALUES INSERT — `INSERT INTO t VALUES (a), (b), (c)`.
 
 statement ok
 CREATE TABLE t (a INT NOT NULL)
 
-# This is the PG/DuckDB shape: `INSERT INTO t VALUES (1), (2), (3)`. SPG v1
-# rejects it (the parser only takes one parenthesised tuple after VALUES).
-statement error
+# PG / DuckDB shape. SPG v1.3+ accepts this.
+statement ok
 INSERT INTO t VALUES (1), (2), (3)
 
-# But the single-row form is fine.
+query I nosort
+SELECT a FROM t ORDER BY a
+----
+1
+2
+3
+
+# Single-row form still fine.
 statement ok
-INSERT INTO t VALUES (1)
+INSERT INTO t VALUES (4)

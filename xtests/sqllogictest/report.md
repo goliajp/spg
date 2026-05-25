@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `duckdb` | 101 | 23 | 0 | 81.5% |
+| `duckdb` | 106 | 20 | 0 | 84.1% |
 | `pg_regress` | 25 | 8 | 0 | 75.8% |
 | `pgvector` | 42 | 0 | 0 | 100.0% |
 
@@ -12,16 +12,17 @@ Per-corpus pass / fail / skip:
 
 | count | pattern |
 |---|---|
-| 4 | `record 2: parse: parse error at` |
 | 4 | `record 5: parse: parse error at` |
-| 3 | `record 3: parse: parse error at` |
 | 3 | `record 6: parse: parse error at` |
 | 3 | `record 7: parse: parse error at` |
 | 2 | `record 1: parse: parse error at` |
-| 2 | `record 4: parse: parse error at` |
+| 2 | `record 2: parse: parse error at` |
+| 2 | `record 3: parse: parse error at` |
 | 1 | `record 0: parse: parse error at` |
 | 1 | `record 2: row mismatch | expected:` |
 | 1 | `record 4: eval: column not found:` |
+| 1 | `record 4: parse: parse error at` |
+| 1 | `record 4: unsupported: SELECT without FROM` |
 | 1 | `record 7: row mismatch | expected:` |
 | 1 | `record 8: parse: parse error at` |
 
@@ -39,26 +40,21 @@ Per-corpus pass / fail / skip:
 | `06_aliases.test` | 6 | 0 | 0 |
 | `07_transactions.test` | 14 | 0 | 0 |
 | `08_create_index_seek.test` | 9 | 0 | 0 |
-| `09_multi_value_insert.test` | 3 | 0 | 0 |
-| `10_is_null_predicates.test` | 5 | 0 | 0 |
+| `09_multi_value_insert.test` | 4 | 0 | 0 |
+| `10_is_null_predicates.test` | 6 | 0 | 0 |
 | `11_column_list_insert.test` | 1 | 2 | 0 |
-| `12_string_concat.test` | 2 | 1 | 0 |
+| `12_string_concat.test` | 3 | 0 | 0 |
 | `13_between_in_like.test` | 5 | 3 | 0 |
 | `14_aggregates.test` | 5 | 4 | 0 |
 | `15_joins.test` | 7 | 2 | 0 |
 | `16_distinct_union.test` | 4 | 3 | 0 |
 | `17_functions.test` | 2 | 5 | 0 |
-| `18_cast_expr.test` | 2 | 3 | 0 |
+| `18_cast_expr.test` | 4 | 1 | 0 |
 
 <details><summary>`11_column_list_insert.test` fail snippets</summary>
 
 - record 1: parse: parse error at token #3: expected VALUES after table name, got LParen
 - record 2: row mismatch |   expected: ["NULL"] |   actual:   []
-</details>
-
-<details><summary>`12_string_concat.test` fail snippets</summary>
-
-- record 2: parse: parse error at token #0: lex: unknown char '|' at byte 9
 </details>
 
 <details><summary>`13_between_in_like.test` fail snippets</summary>
@@ -97,9 +93,7 @@ Per-corpus pass / fail / skip:
 
 <details><summary>`18_cast_expr.test` fail snippets</summary>
 
-- record 2: parse: parse error at token #3: only `::vector` cast is supported in v1.2 (got `::text`)
-- record 3: parse: parse error at token #3: only `::vector` cast is supported in v1.2 (got `::float`)
-- record 4: parse: parse error at token #3: only `::vector` cast is supported in v1.2 (got `::int`)
+- record 4: unsupported: SELECT without FROM not supported yet
 </details>
 
 ### `pg_regress/`
