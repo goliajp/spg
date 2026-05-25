@@ -355,6 +355,31 @@ impl Parser {
         }
         self.advance();
         let table = self.expect_ident_like()?;
+        // Optional column list — `INSERT INTO t (a, b) VALUES ...`.
+        let columns = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident_like()?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in INSERT column list, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            Some(names)
+        } else {
+            None
+        };
         if !matches!(self.peek(), Token::Values) {
             return Err(self.err(format!(
                 "expected VALUES after table name, got {:?}",
@@ -404,7 +429,11 @@ impl Parser {
                 break;
             }
         }
-        Ok(Statement::Insert(InsertStatement { table, rows }))
+        Ok(Statement::Insert(InsertStatement {
+            table,
+            columns,
+            rows,
+        }))
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParseError> {

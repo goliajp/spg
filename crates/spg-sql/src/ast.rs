@@ -71,6 +71,11 @@ impl fmt::Display for ColumnTypeName {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
     pub table: String,
+    /// Optional column list — `INSERT INTO t (a, b) VALUES (...)`. When
+    /// `None`, every tuple is positional and must match the table arity.
+    /// When `Some`, the engine maps each tuple slot to the named column and
+    /// fills the rest with NULL (must be nullable).
+    pub columns: Option<Vec<String>>,
     /// One or more `(expr, expr, ...)` tuples — the multi-row VALUES form.
     /// v1.3+ accepts `INSERT INTO t VALUES (a), (b)`.
     pub rows: Vec<Vec<Expr>>,
@@ -263,7 +268,18 @@ impl fmt::Display for ColumnDef {
 
 impl fmt::Display for InsertStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "INSERT INTO {} VALUES ", quote_ident(&self.table))?;
+        write!(f, "INSERT INTO {}", quote_ident(&self.table))?;
+        if let Some(cols) = &self.columns {
+            f.write_str(" (")?;
+            for (i, c) in cols.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(&quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        f.write_str(" VALUES ")?;
         for (ri, row) in self.rows.iter().enumerate() {
             if ri > 0 {
                 f.write_str(", ")?;
