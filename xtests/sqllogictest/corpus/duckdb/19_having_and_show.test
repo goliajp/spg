@@ -1,0 +1,43 @@
+# HAVING + SHOW TABLES / SHOW COLUMNS — v2.2 fills two gaps.
+
+statement ok
+CREATE TABLE sales (region TEXT NOT NULL, amount INT NOT NULL)
+
+statement ok
+INSERT INTO sales VALUES ('north', 10), ('north', 20), ('south', 30), ('east', 40)
+
+# HAVING filters groups after aggregation. Threshold 35 keeps only
+# east(40); north(30) and south(30) are filtered out.
+query TI nosort
+SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 35 ORDER BY region
+----
+east
+40
+
+# HAVING without GROUP BY: applies to the single implicit group.
+query I nosort
+SELECT COUNT(*) FROM sales HAVING COUNT(*) > 0
+----
+4
+
+# HAVING that filters everything out yields zero rows.
+query I nosort
+SELECT COUNT(*) FROM sales HAVING COUNT(*) > 100
+----
+
+# SHOW TABLES enumerates the catalog.
+query T nosort
+SHOW TABLES
+----
+sales
+
+# SHOW COLUMNS prints name / type / nullability per column.
+query TTI nosort
+SHOW COLUMNS FROM sales
+----
+region
+TEXT
+0
+amount
+INT
+0

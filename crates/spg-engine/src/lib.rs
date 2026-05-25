@@ -170,7 +170,52 @@ impl Engine {
             Statement::Savepoint(name) => self.exec_savepoint(name),
             Statement::RollbackToSavepoint(name) => self.exec_rollback_to_savepoint(&name),
             Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(&name),
+            Statement::ShowTables => Ok(self.exec_show_tables()),
+            Statement::ShowColumns(table) => self.exec_show_columns(&table),
         }
+    }
+
+    /// `SHOW TABLES` — one row per table in the active catalog.
+    /// Column name is `name` so result-set consumers can downstream
+    /// `SELECT name FROM ...` style logic if needed.
+    fn exec_show_tables(&self) -> QueryResult {
+        let columns = alloc::vec![ColumnSchema::new("name", DataType::Text, false)];
+        let rows: Vec<Row> = self
+            .active_catalog()
+            .table_names()
+            .into_iter()
+            .map(|n| Row::new(alloc::vec![Value::Text(n)]))
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// `SHOW COLUMNS FROM <table>` — one row per column with the
+    /// declared name, SQL type rendering, and nullability flag.
+    fn exec_show_columns(&self, table_name: &str) -> Result<QueryResult, EngineError> {
+        let table =
+            self.active_catalog()
+                .get(table_name)
+                .ok_or_else(|| StorageError::TableNotFound {
+                    name: table_name.into(),
+                })?;
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("type", DataType::Text, false),
+            ColumnSchema::new("nullable", DataType::Bool, false),
+        ];
+        let rows: Vec<Row> = table
+            .schema()
+            .columns
+            .iter()
+            .map(|c| {
+                Row::new(alloc::vec![
+                    Value::Text(c.name.clone()),
+                    Value::Text(alloc::format!("{}", c.ty)),
+                    Value::Bool(c.nullable),
+                ])
+            })
+            .collect();
+        Ok(QueryResult::Rows { columns, rows })
     }
 
     fn exec_begin(&mut self) -> Result<QueryResult, EngineError> {

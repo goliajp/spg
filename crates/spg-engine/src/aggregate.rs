@@ -33,7 +33,7 @@ use crate::eval::{self, EvalContext, EvalError};
 
 /// True if this statement should go through the aggregate path.
 pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
-    if stmt.group_by.is_some() {
+    if stmt.group_by.is_some() || stmt.having.is_some() {
         return true;
     }
     for item in &stmt.items {
@@ -45,6 +45,11 @@ pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
     }
     if let Some(o) = &stmt.order_by
         && contains_aggregate(o)
+    {
+        return true;
+    }
+    if let Some(h) = &stmt.having
+        && contains_aggregate(h)
     {
         return true;
     }
@@ -118,6 +123,9 @@ pub fn run(
     }
     if let Some(o) = &stmt.order_by {
         collect_aggregates(o, &mut agg_specs);
+    }
+    if let Some(h) = &stmt.having {
+        collect_aggregates(h, &mut agg_specs);
     }
 
     // Map group key (vec of values, encoded as canonical string) -> group state.
@@ -211,17 +219,32 @@ pub fn run(
         })
         .collect::<Result<_, _>>()?;
 
-    // Project per synthetic row.
+    // Project per synthetic row. HAVING filters out groups *before*
+    // we keep the projected row — same semantics as PG: HAVING runs
+    // against the aggregated row (so `HAVING count(*) > 1` works) and
+    // sees only group-by'd columns plus aggregate values.
     let synth_ctx = EvalContext::new(&synth_schema, None);
+    let having_rewritten = stmt
+        .having
+        .as_ref()
+        .map(|h| rewrite_expr(h, &group_exprs, &agg_specs));
+    let mut kept_synth: Vec<Row> = Vec::new();
     let mut out_rows: Vec<Row> = Vec::new();
-    for srow in &synth_rows {
+    for srow in synth_rows {
+        if let Some(h) = &having_rewritten {
+            let cond = eval::eval_expr(h, &srow, &synth_ctx)?;
+            if !matches!(cond, Value::Bool(true)) {
+                continue;
+            }
+        }
         let mut values: Vec<Value> = Vec::with_capacity(columns.len());
         for item in &stmt.items {
             if let SelectItem::Expr { expr, .. } = item {
                 let rewritten = rewrite_expr(expr, &group_exprs, &agg_specs);
-                values.push(eval::eval_expr(&rewritten, srow, &synth_ctx)?);
+                values.push(eval::eval_expr(&rewritten, &srow, &synth_ctx)?);
             }
         }
+        kept_synth.push(srow);
         out_rows.push(Row::new(values));
     }
 
@@ -229,7 +252,7 @@ pub fn run(
     // sort, then drop the keys. Limit is applied by the caller.
     if let Some(order_expr) = &stmt.order_by {
         let rewritten = rewrite_expr(order_expr, &group_exprs, &agg_specs);
-        let mut tagged: Vec<(Value, Row)> = synth_rows
+        let mut tagged: Vec<(Value, Row)> = kept_synth
             .into_iter()
             .zip(out_rows)
             .map(|(s, o)| {

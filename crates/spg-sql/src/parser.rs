@@ -154,9 +154,32 @@ impl Parser {
                 let name = self.expect_ident_like()?;
                 Ok(Statement::ReleaseSavepoint(name))
             }
+            Token::Show => {
+                self.advance();
+                // `SHOW TABLES` and `SHOW COLUMNS FROM <table>`. Both
+                // keywords (TABLES / COLUMNS) arrive as bare idents.
+                let what = self.expect_ident_like()?;
+                match what.to_ascii_lowercase().as_str() {
+                    "tables" => Ok(Statement::ShowTables),
+                    "columns" => {
+                        if !matches!(self.peek(), Token::From) {
+                            return Err(self.err(format!(
+                                "expected FROM after SHOW COLUMNS, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let table = self.expect_ident_like()?;
+                        Ok(Statement::ShowColumns(table))
+                    }
+                    other => Err(self.err(format!(
+                        "unknown SHOW target {other:?}; supported: TABLES, COLUMNS"
+                    ))),
+                }
+            }
             other => Err(self.err(format!(
                 "expected SELECT / CREATE / INSERT / BEGIN / COMMIT / ROLLBACK / \
-                 SAVEPOINT / RELEASE at start of statement, got {other:?}"
+                 SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
             ))),
         }
     }
@@ -273,12 +296,19 @@ impl Parser {
         } else {
             None
         };
+        let having = if matches!(self.peek(), Token::Having) {
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
         Ok(SelectStatement {
             distinct,
             items,
             from,
             where_,
             group_by,
+            having,
             unions: Vec::new(),
             order_by: None,
             limit: None,

@@ -709,6 +709,13 @@ impl Catalog {
     pub fn table_count(&self) -> usize {
         self.tables.len()
     }
+
+    /// Borrow-free copy of every table's name in catalog order. Used
+    /// by `SHOW TABLES` so the engine can build a result set without
+    /// holding a reference into the catalog past the row build.
+    pub fn table_names(&self) -> Vec<String> {
+        self.tables.iter().map(|t| t.schema.name.clone()).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
