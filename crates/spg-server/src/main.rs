@@ -428,6 +428,9 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         DataType::Float => WireType::Float,
         DataType::Text => WireType::Text,
         DataType::Bool => WireType::Bool,
+        // RowDescription drops the dimension; DataRow's WireValue::Vector
+        // carries the actual element count back to the client.
+        DataType::Vector(_) => WireType::Vector,
     }
 }
 
@@ -443,6 +446,7 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Float(x) => WireValue::Float(*x),
         Value::Text(s) => WireValue::Text(s.clone()),
         Value::Bool(b) => WireValue::Bool(*b),
+        Value::Vector(v) => WireValue::Vector(v.clone()),
     }
 }
 

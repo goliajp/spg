@@ -190,6 +190,7 @@ pub enum WireType {
     Float = 0x03,  // f64 LE
     Text = 0x04,   // u32 LE length + bytes (UTF-8)
     Bool = 0x05,   // single byte, 0 or 1
+    Vector = 0x06, // u32 LE dim + dim * f32 LE  (pgvector-style)
 }
 
 impl WireType {
@@ -201,6 +202,7 @@ impl WireType {
             0x03 => Ok(Self::Float),
             0x04 => Ok(Self::Text),
             0x05 => Ok(Self::Bool),
+            0x06 => Ok(Self::Vector),
             other => Err(FrameError::UnknownWireType(other)),
         }
     }
@@ -216,6 +218,7 @@ pub enum WireValue {
     Float(f64),
     Text(alloc::string::String),
     Bool(bool),
+    Vector(Vec<f32>),
 }
 
 impl WireValue {
@@ -227,6 +230,7 @@ impl WireValue {
             Self::Float(_) => WireType::Float,
             Self::Text(_) => WireType::Text,
             Self::Bool(_) => WireType::Bool,
+            Self::Vector(_) => WireType::Vector,
         }
     }
 
@@ -243,6 +247,13 @@ impl WireValue {
                 out.extend_from_slice(s.as_bytes());
             }
             Self::Bool(b) => out.push(u8::from(*b)),
+            Self::Vector(v) => {
+                let dim = u32::try_from(v.len()).map_err(|_| FrameError::FieldTooLarge)?;
+                out.extend_from_slice(&dim.to_le_bytes());
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
         }
         Ok(())
     }
@@ -282,6 +293,21 @@ impl WireValue {
             WireType::Bool => {
                 let (b, off) = read_u8(buf, off)?;
                 Ok((Self::Bool(b != 0), off))
+            }
+            WireType::Vector => {
+                let (dim, mut off) = read_u32(buf, off)?;
+                let dim = dim as usize;
+                let mut v = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    let end = off + 4;
+                    if buf.len() < end {
+                        return Err(FrameError::TruncatedPayload);
+                    }
+                    let arr: [u8; 4] = buf[off..end].try_into().expect("checked");
+                    v.push(f32::from_le_bytes(arr));
+                    off = end;
+                }
+                Ok((Self::Vector(v), off))
             }
         }
     }

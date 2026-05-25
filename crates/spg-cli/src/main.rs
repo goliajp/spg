@@ -214,5 +214,17 @@ fn format_value(v: &WireValue) -> String {
         WireValue::Float(x) => format!("{x}"),
         WireValue::Text(s) => s.clone(),
         WireValue::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).into(),
+        WireValue::Vector(v) => {
+            use core::fmt::Write as _;
+            let mut s = String::from("[");
+            for (i, x) in v.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                write!(s, "{x}").expect("format to String");
+            }
+            s.push(']');
+            s
+        }
     }
 }

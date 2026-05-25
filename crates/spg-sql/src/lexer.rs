@@ -35,6 +35,9 @@ pub enum Token {
     Begin,
     Commit,
     Rollback,
+    Order,
+    By,
+    Limit,
 
     // Identifiers
     Ident(String),       // ASCII case-folded
@@ -60,9 +63,14 @@ pub enum Token {
     // Punctuation
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     Semicolon,
     Dot,
+    /// pgvector L2 distance operator `<->`. Lexed as one token so the
+    /// parser can give it its own precedence rung.
+    L2Distance,
 
     Eof,
 }
@@ -183,6 +191,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             b'/' => single(&mut out, Token::Slash, &mut i),
             b'(' => single(&mut out, Token::LParen, &mut i),
             b')' => single(&mut out, Token::RParen, &mut i),
+            b'[' => single(&mut out, Token::LBracket, &mut i),
+            b']' => single(&mut out, Token::RBracket, &mut i),
             b',' => single(&mut out, Token::Comma, &mut i),
             b';' => single(&mut out, Token::Semicolon, &mut i),
             b'.' => single(&mut out, Token::Dot, &mut i),
@@ -194,6 +204,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 } else if peek_eq(bytes, i + 1, b'>') {
                     out.push(Token::NotEq);
                     i += 2;
+                } else if peek_eq(bytes, i + 1, b'-') && peek_eq(bytes, i + 2, b'>') {
+                    out.push(Token::L2Distance);
+                    i += 3;
                 } else {
                     out.push(Token::Lt);
                     i += 1;
@@ -260,6 +273,9 @@ fn keyword_or_ident(lower: String) -> Token {
         "begin" => Token::Begin,
         "commit" => Token::Commit,
         "rollback" => Token::Rollback,
+        "order" => Token::Order,
+        "by" => Token::By,
+        "limit" => Token::Limit,
         _ => Token::Ident(lower),
     }
 }
@@ -525,6 +541,48 @@ mod tests {
                 Token::Ident("col".into()),
                 Token::Eof,
             ]
+        );
+    }
+
+    // --- v0.11 brackets + distance op + vector keyword --------------------
+
+    #[test]
+    fn brackets_are_distinct_tokens() {
+        assert_eq!(
+            lex("[ ]"),
+            vec![Token::LBracket, Token::RBracket, Token::Eof]
+        );
+    }
+
+    #[test]
+    fn l2_distance_is_three_char_token() {
+        assert_eq!(
+            lex("a <-> b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::L2Distance,
+                Token::Ident("b".into()),
+                Token::Eof,
+            ]
+        );
+        // Bare `<-` should NOT match L2Distance.
+        assert_eq!(
+            lex("a <- b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::Lt,
+                Token::Minus,
+                Token::Ident("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_limit_are_keywords() {
+        assert_eq!(
+            lex("ORDER BY LIMIT"),
+            vec![Token::Order, Token::By, Token::Limit, Token::Eof]
         );
     }
 }

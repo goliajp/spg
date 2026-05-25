@@ -87,6 +87,7 @@ fn literal_to_value(l: &Literal) -> Value {
         }
         Literal::Float(x) => Value::Float(*x),
         Literal::String(s) => Value::Text(s.clone()),
+        Literal::Vector(v) => Value::Vector(v.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
     }
@@ -159,6 +160,7 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::Sub => arith(l, r, i64::checked_sub, |a, b| a - b, "-"),
         BinOp::Mul => arith(l, r, i64::checked_mul, |a, b| a * b, "*"),
         BinOp::Div => div_op(l, r),
+        BinOp::L2Distance => l2_distance(l, r),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
@@ -215,6 +217,53 @@ fn arith(
             ),
         }),
     }
+}
+
+/// L2 (Euclidean) distance between two vectors of equal dimension.
+/// Returned as `Value::Float(d)` so it composes with the existing
+/// comparison / sort plumbing. Mismatched dims or non-vector operands
+/// raise `TypeMismatch`.
+#[allow(clippy::many_single_char_names)] // l, r, a, b, d are the natural names
+fn l2_distance(l: Value, r: Value) -> Result<Value, EvalError> {
+    match (l, r) {
+        (Value::Vector(a), Value::Vector(b)) => {
+            if a.len() != b.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("vector dim mismatch in <->: {} vs {}", a.len(), b.len()),
+                });
+            }
+            let mut sum: f64 = 0.0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let d = f64::from(*x) - f64::from(*y);
+                sum += d * d;
+            }
+            Ok(Value::Float(sqrt_newton(sum)))
+        }
+        (a, b) => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "<-> requires two vectors, got {:?} and {:?}",
+                a.data_type(),
+                b.data_type()
+            ),
+        }),
+    }
+}
+
+/// Self-built `sqrt` for `f64` — `std::f64::sqrt` lives in `std`, which the
+/// engine's `no_std` constraint disallows. Newton-Raphson with a few rounds
+/// reaches IEEE-754 precision for the inputs we'll see (sum of squares of
+/// f32-derived distances, always non-negative, never NaN).
+fn sqrt_newton(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut g = x;
+    // 10 iterations is conservative; 6 already converges to ulp for typical
+    // distances.
+    for _ in 0..10 {
+        g = 0.5 * (g + x / g);
+    }
+    g
 }
 
 fn div_op(l: Value, r: Value) -> Result<Value, EvalError> {
@@ -292,7 +341,13 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         BinOp::LtEq => ord.is_le(),
         BinOp::Gt => ord.is_gt(),
         BinOp::GtEq => ord.is_ge(),
-        BinOp::And | BinOp::Or | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+        BinOp::And
+        | BinOp::Or
+        | BinOp::Add
+        | BinOp::Sub
+        | BinOp::Mul
+        | BinOp::Div
+        | BinOp::L2Distance => {
             unreachable!("compare() only called with comparison ops")
         }
     };
