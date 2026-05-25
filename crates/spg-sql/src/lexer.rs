@@ -86,6 +86,7 @@ pub enum Token {
     Between,
     In,
     Like,
+    Group,
 
     Eof,
 }
@@ -309,6 +310,7 @@ fn keyword_or_ident(lower: String) -> Token {
         "between" => Token::Between,
         "in" => Token::In,
         "like" => Token::Like,
+        "group" => Token::Group,
         _ => Token::Ident(lower),
     }
 }

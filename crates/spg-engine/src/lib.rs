@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod aggregate;
 pub mod eval;
 
 use alloc::string::{String, ToString};
@@ -341,8 +342,6 @@ impl Engine {
         let alias = from.alias.as_deref().unwrap_or(from.name.as_str());
         let ctx = EvalContext::new(schema_cols, Some(alias));
 
-        let projection = build_projection(&stmt.items, schema_cols, alias)?;
-
         // Index seek: if WHERE is `col = literal` (or commuted) and the
         // referenced column has an index, iterate only the matching row
         // indices. Otherwise fall back to a full scan.
@@ -351,6 +350,32 @@ impl Engine {
             .as_ref()
             .and_then(|w| try_index_seek(w, schema_cols, table, alias))
             .unwrap_or_else(|| (0..table.row_count()).collect());
+
+        // Aggregate path: filter rows first, then hand off to the
+        // aggregate executor which does its own projection + ORDER BY.
+        if aggregate::uses_aggregate(stmt) {
+            let mut filtered: Vec<&Row> = Vec::new();
+            for &i in &candidate_rows {
+                let row = &table.rows()[i];
+                if let Some(where_expr) = &stmt.where_ {
+                    let cond = eval::eval_expr(where_expr, row, &ctx)?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                filtered.push(row);
+            }
+            let mut agg = aggregate::run(stmt, &filtered, schema_cols, Some(alias))?;
+            if let Some(n) = stmt.limit {
+                agg.rows.truncate(n as usize);
+            }
+            return Ok(QueryResult::Rows {
+                columns: agg.columns,
+                rows: agg.rows,
+            });
+        }
+
+        let projection = build_projection(&stmt.items, schema_cols, alias)?;
 
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.

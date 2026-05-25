@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "duckdb", "pass": 117, "fail": 9, "skip": 0,
+    { "name": "duckdb", "pass": 121, "fail": 5, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -28,8 +28,8 @@
           "fail_reasons": [] },
         { "file": "13_between_in_like.test", "pass": 8, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "14_aggregates.test", "pass": 5, "fail": 4, "skip": 0,
-          "fail_reasons": ["record 5: parse: parse error at token #3: unexpected token Star in expression", "record 6: eval: type mismatch: unknown function `sum`", "record 7: eval: type mismatch: unknown function `max`"] },
+        { "file": "14_aggregates.test", "pass": 9, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
         { "file": "15_joins.test", "pass": 7, "fail": 2, "skip": 0,
           "fail_reasons": ["record 7: parse: parse error at token #10: expected end of input, got Comma", "record 8: parse: parse error at token #11: expected end of input, got Ident(\"join\")"] },
         { "file": "16_distinct_union.test", "pass": 4, "fail": 3, "skip": 0,

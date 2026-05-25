@@ -163,6 +163,25 @@ impl Parser {
         } else {
             None
         };
+        let group_by = if matches!(self.peek(), Token::Group) {
+            self.advance();
+            if !matches!(self.peek(), Token::By) {
+                return Err(self.err(format!("expected BY after GROUP, got {:?}", self.peek())));
+            }
+            self.advance();
+            let mut groups = Vec::new();
+            loop {
+                groups.push(self.parse_expr(0)?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            Some(groups)
+        } else {
+            None
+        };
         let order_by = if matches!(self.peek(), Token::Order) {
             self.advance();
             if !matches!(self.peek(), Token::By) {
@@ -197,6 +216,7 @@ impl Parser {
             items,
             from,
             where_,
+            group_by,
             order_by,
             limit,
         }))
@@ -783,6 +803,23 @@ impl Parser {
         }
         if matches!(self.peek(), Token::LParen) {
             self.advance();
+            // `COUNT(*)` — special-cased here because `*` isn't a normal
+            // expression token. Lower-case match on `first` since the lexer
+            // folds identifiers.
+            if first.eq_ignore_ascii_case("count") && matches!(self.peek(), Token::Star) {
+                self.advance();
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' after COUNT(*), got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                return Ok(Expr::FunctionCall {
+                    name: "count_star".into(),
+                    args: Vec::new(),
+                });
+            }
             // Function call. PG-style: zero-or-more comma-separated args.
             let mut args = Vec::new();
             if !matches!(self.peek(), Token::RParen) {
