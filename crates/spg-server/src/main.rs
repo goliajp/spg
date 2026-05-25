@@ -35,7 +35,8 @@ use spg_engine::{Engine, EngineError, QueryResult};
 use spg_storage::{Catalog, ColumnSchema, DataType, Row, Value};
 use spg_wire::{
     ColumnDesc, Frame, FrameError, Op, WireType, WireValue, build_command_complete, build_data_row,
-    build_error_response, build_row_description, build_stats_response, decode, encode, parse_query,
+    build_error_response, build_row_description, build_stats_response, decode, encode, parse_auth,
+    parse_query,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
@@ -50,6 +51,10 @@ struct ServerState {
     /// Kept so the path can be reported in error messages; runtime appends go
     /// through `wal` directly.
     wal_path: Option<PathBuf>,
+    /// Optional single password — Redis/Valkey style. `Some` means the
+    /// server demands `AUTH <password>` before any non-Ping frame; `None`
+    /// means open access (the default).
+    password: Option<String>,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
@@ -75,7 +80,11 @@ fn main() {
     let db_path = resolve_path(args.next(), "SPG_DB");
     let audit_path = resolve_path(args.next(), "SPG_AUDIT");
     let wal_path = resolve_path(args.next(), "SPG_WAL");
-    if let Err(e) = run(&addr, db_path, audit_path, wal_path) {
+    // No CLI slot for the password — it lives in env only so it doesn't
+    // leak into shell history / process listings (`ps`). Matches the
+    // Valkey/Redis convention.
+    let password = env::var("SPG_PASSWORD").ok().filter(|s| !s.is_empty());
+    if let Err(e) = run(&addr, db_path, audit_path, wal_path, password) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
     }
@@ -86,6 +95,7 @@ fn run(
     db_path: Option<PathBuf>,
     audit_path: Option<PathBuf>,
     wal_path: Option<PathBuf>,
+    password: Option<String>,
 ) -> std::io::Result<()> {
     let mut engine = match &db_path {
         Some(p) if p.exists() => {
@@ -167,6 +177,11 @@ fn run(
         None => None,
     };
 
+    let auth_msg = if password.is_some() {
+        " (AUTH required)"
+    } else {
+        ""
+    };
     let state = Arc::new(ServerState {
         engine: Mutex::new(engine),
         db_path,
@@ -174,11 +189,12 @@ fn run(
         audit_path,
         wal,
         wal_path,
+        password,
     });
 
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    eprintln!("spg-server: listening on {local}");
+    eprintln!("spg-server: listening on {local}{auth_msg}");
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -196,6 +212,10 @@ fn run(
 fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
     let mut chunk = [0u8; READ_CHUNK];
+    // When the server is open, every connection starts authenticated.
+    // When the server has a password configured, the connection must
+    // send a successful `Auth` frame before any non-Ping op is honoured.
+    let mut authenticated = state.password.is_none();
 
     loop {
         let n = stream.read(&mut chunk)?;
@@ -208,7 +228,7 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
             match decode(&buf) {
                 Ok((frame, consumed)) => {
                     buf.drain(..consumed);
-                    dispatch(&mut stream, &frame, state)?;
+                    dispatch(&mut stream, &frame, state, &mut authenticated)?;
                 }
                 Err(FrameError::ShortHeader | FrameError::ShortPayload) => break,
                 Err(e) => {
@@ -220,9 +240,45 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     }
 }
 
-fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::io::Result<()> {
+fn dispatch(
+    stream: &mut TcpStream,
+    frame: &Frame,
+    state: &ServerState,
+    authenticated: &mut bool,
+) -> std::io::Result<()> {
+    // Gate every non-Ping / non-Auth op until the connection has
+    // authenticated. Ping stays accessible so health probes still work
+    // (matches Valkey/Redis policy).
+    if !*authenticated && !matches!(frame.op, Op::Ping | Op::Auth) {
+        return write_frame(
+            stream,
+            &build_error_response("authentication required: send AUTH first"),
+        );
+    }
     match frame.op {
         Op::Ping => write_frame(stream, &Frame::pong()),
+        Op::Auth => {
+            let candidate = match parse_auth(frame) {
+                Ok(s) => s,
+                Err(e) => return write_frame(stream, &build_error_response(&e.to_string())),
+            };
+            // Constant-time compare is overkill for a local Docker
+            // sidecar — a `==` here is fine in our threat model. If the
+            // server has no password configured we still accept AUTH
+            // gracefully (Redis-like): any password matches "no
+            // password" with a 'no-op' Pong, so clients written for
+            // the auth flow keep working against open instances.
+            let ok = match &state.password {
+                Some(pw) => candidate == pw,
+                None => true,
+            };
+            if ok {
+                *authenticated = true;
+                write_frame(stream, &Frame::pong())
+            } else {
+                write_frame(stream, &build_error_response("AUTH: wrong password"))
+            }
+        }
         Op::Stats => {
             let body = render_stats(state)?;
             write_frame(stream, &build_stats_response(&body))
