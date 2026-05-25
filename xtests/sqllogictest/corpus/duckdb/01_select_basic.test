@@ -1,0 +1,37 @@
+# DuckDB-flavoured basic SELECT
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'a')
+
+statement ok
+INSERT INTO t VALUES (2, 'b')
+
+statement ok
+INSERT INTO t VALUES (3, 'c')
+
+query IT nosort
+SELECT * FROM t
+----
+1
+a
+2
+b
+3
+c
+
+query I nosort
+SELECT a FROM t
+----
+1
+2
+3
+
+query T nosort
+SELECT b FROM t
+----
+a
+b
+c

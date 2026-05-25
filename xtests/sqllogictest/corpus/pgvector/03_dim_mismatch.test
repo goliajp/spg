@@ -1,0 +1,13 @@
+# pgvector: insert with wrong dim must error
+
+statement ok
+CREATE TABLE emb (v VECTOR(3) NOT NULL)
+
+statement error
+INSERT INTO emb VALUES ([1.0, 2.0])
+
+statement error
+INSERT INTO emb VALUES ([1.0, 2.0, 3.0, 4.0])
+
+statement ok
+INSERT INTO emb VALUES ([0.5, 0.5, 0.5])

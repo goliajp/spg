@@ -1,0 +1,33 @@
+# BETWEEN / IN / LIKE — standard predicates everywhere PG-flavoured.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 'alice')
+
+statement ok
+INSERT INTO t VALUES (2, 'bob')
+
+statement ok
+INSERT INTO t VALUES (3, 'cara')
+
+statement ok
+INSERT INTO t VALUES (4, 'dave')
+
+query I nosort
+SELECT id FROM t WHERE id BETWEEN 2 AND 3
+----
+2
+3
+
+query T nosort
+SELECT name FROM t WHERE id IN (1, 4)
+----
+alice
+dave
+
+query T nosort
+SELECT name FROM t WHERE name LIKE 'a%'
+----
+alice

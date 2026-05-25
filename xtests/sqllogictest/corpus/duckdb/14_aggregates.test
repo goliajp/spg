@@ -1,0 +1,39 @@
+# Aggregates: COUNT / SUM / AVG / MIN / MAX, and GROUP BY.
+
+statement ok
+CREATE TABLE sales (region TEXT NOT NULL, amount INT NOT NULL)
+
+statement ok
+INSERT INTO sales VALUES ('north', 10)
+
+statement ok
+INSERT INTO sales VALUES ('north', 20)
+
+statement ok
+INSERT INTO sales VALUES ('south', 30)
+
+statement ok
+INSERT INTO sales VALUES ('south', 40)
+
+query I nosort
+SELECT COUNT(*) FROM sales
+----
+4
+
+query I nosort
+SELECT SUM(amount) FROM sales
+----
+100
+
+query I nosort
+SELECT MAX(amount) FROM sales
+----
+40
+
+query TI nosort
+SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY region
+----
+north
+30
+south
+70

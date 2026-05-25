@@ -1,0 +1,33 @@
+# DISTINCT and UNION — standard SQL set semantics.
+
+statement ok
+CREATE TABLE t (v INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (2)
+
+query I nosort
+SELECT DISTINCT v FROM t ORDER BY v
+----
+1
+2
+
+# UNION (dedup'd)
+query I nosort
+SELECT 1 UNION SELECT 2 UNION SELECT 1
+----
+1
+2
+
+# UNION ALL (no dedup)
+query I nosort
+SELECT 1 UNION ALL SELECT 1
+----
+1
+1

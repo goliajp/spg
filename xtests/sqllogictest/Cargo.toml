@@ -1,0 +1,20 @@
+[package]
+name         = "sqllogictest"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "Self-built sqllogictest runner — SPG conformance baseline."
+publish      = false
+
+[[bin]]
+name = "sqllogictest"
+path = "src/main.rs"
+
+[dependencies]
+spg-engine  = { path = "../../crates/spg-engine" }
+spg-storage = { path = "../../crates/spg-storage" }
+
+[lints]
+workspace = true

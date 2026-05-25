@@ -1,0 +1,29 @@
+# pgvector also has `<#>` (inner product) and `<=>` (cosine distance) —
+# v1 SPG only ships `<->` (L2). These should fail.
+
+statement ok
+CREATE TABLE emb (id INT NOT NULL, v VECTOR(3) NOT NULL)
+
+statement ok
+INSERT INTO emb VALUES (1, [1.0, 2.0, 3.0])
+
+statement ok
+INSERT INTO emb VALUES (2, [2.0, 3.0, 4.0])
+
+# L2 — already in v1 SPG.
+query I nosort
+SELECT id FROM emb ORDER BY v <-> [1.0, 2.0, 3.0] LIMIT 1
+----
+1
+
+# Inner product (pgvector `<#>`).
+query I nosort
+SELECT id FROM emb ORDER BY v <#> [1.0, 2.0, 3.0] LIMIT 1
+----
+1
+
+# Cosine distance (pgvector `<=>`).
+query I nosort
+SELECT id FROM emb ORDER BY v <=> [1.0, 2.0, 3.0] LIMIT 1
+----
+1

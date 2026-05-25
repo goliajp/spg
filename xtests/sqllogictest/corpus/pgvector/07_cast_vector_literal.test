@@ -1,0 +1,14 @@
+# pgvector standard literal form is `'[1,2,3]'::vector` (text cast). SPG v1
+# accepts bare `[1,2,3]` array literals but doesn't handle the cast form.
+
+statement ok
+CREATE TABLE emb (v VECTOR(3) NOT NULL)
+
+# Cast form (PG canonical).
+statement ok
+INSERT INTO emb VALUES ('[1,2,3]'::vector)
+
+query T nosort
+SELECT v FROM emb
+----
+[1.000, 2.000, 3.000]

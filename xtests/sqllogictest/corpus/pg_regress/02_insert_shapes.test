@@ -1,0 +1,32 @@
+# INSERT INTO with various value shapes
+
+statement ok
+CREATE TABLE t (a INT NOT NULL, b TEXT, c FLOAT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 1.5)
+
+statement ok
+INSERT INTO t VALUES (2, NULL, NULL)
+
+statement ok
+INSERT INTO t VALUES (-3, 'with negatives', -2.5)
+
+# Arity mismatch.
+statement error
+INSERT INTO t VALUES (1)
+
+# Type mismatch.
+statement error
+INSERT INTO t VALUES ('not an int', 'x', 1.0)
+
+# INSERT INTO ... (col1, col2) VALUES (...) — column-list form, v1 unsupported.
+statement error
+INSERT INTO t (a, b) VALUES (10, 'y')
+
+query I nosort
+SELECT a FROM t ORDER BY a
+----
+-3
+1
+2

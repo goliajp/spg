@@ -1,0 +1,33 @@
+# Function calls: length(), upper(), lower(), abs(), coalesce().
+# Standard across PG / DuckDB / MySQL.
+
+statement ok
+CREATE TABLE t (name TEXT NOT NULL, n INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('Alice', -5)
+
+query I nosort
+SELECT length(name) FROM t
+----
+5
+
+query T nosort
+SELECT lower(name) FROM t
+----
+alice
+
+query T nosort
+SELECT upper(name) FROM t
+----
+ALICE
+
+query I nosort
+SELECT abs(n) FROM t
+----
+5
+
+query I nosort
+SELECT coalesce(NULL, NULL, 42)
+----
+42
