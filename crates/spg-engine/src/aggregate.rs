@@ -66,6 +66,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
             contains_aggregate(expr)
         }
         Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
+        Expr::Extract { source, .. } => contains_aggregate(source),
         Expr::Literal(_) | Expr::Column(_) => false,
     }
 }
@@ -306,6 +307,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(expr, out);
             collect_aggregates(pattern, out);
         }
+        Expr::Extract { source, .. } => collect_aggregates(source, out),
         Expr::Literal(_) | Expr::Column(_) => {}
     }
 }
@@ -486,6 +488,10 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
             pattern: Box::new(rewrite_expr(pattern, group_exprs, aggs)),
             negated: *negated,
+        },
+        Expr::Extract { field, source } => Expr::Extract {
+            field: *field,
+            source: Box::new(rewrite_expr(source, group_exprs, aggs)),
         },
         Expr::Literal(_) | Expr::Column(_) => e.clone(),
     }

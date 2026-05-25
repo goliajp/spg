@@ -18,8 +18,8 @@ use core::mem;
 
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreateTableStatement, Expr, FromClause, FromJoin, IndexMethod, InsertStatement, JoinKind,
-    Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
+    CreateTableStatement, Expr, ExtractField, FromClause, FromJoin, IndexMethod, InsertStatement,
+    JoinKind, Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -897,6 +897,7 @@ impl Parser {
                 }
             }
             Token::LBracket => self.parse_vector_literal_body(),
+            Token::Extract => self.parse_extract_atom(),
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
@@ -1089,6 +1090,51 @@ impl Parser {
     /// already consumed by the caller. Elements must be numeric literals
     /// (with optional unary `-`); any compound expression is rejected at
     /// parse time so the runtime never needs to evaluate inside a vector.
+    /// `EXTRACT(<field> FROM <source>)`. The dispatching `parse_atom`
+    /// has already consumed the `EXTRACT` token before calling us —
+    /// we pick up at the opening `(`.
+    fn parse_extract_atom(&mut self) -> Result<Expr, ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("expected '(' after EXTRACT, got {:?}", self.peek())));
+        }
+        self.advance();
+        let field_name = self.expect_ident_like()?;
+        let field = match field_name.to_ascii_lowercase().as_str() {
+            "year" => ExtractField::Year,
+            "month" => ExtractField::Month,
+            "day" => ExtractField::Day,
+            "hour" => ExtractField::Hour,
+            "minute" => ExtractField::Minute,
+            "second" => ExtractField::Second,
+            "microsecond" | "microseconds" => ExtractField::Microsecond,
+            other => {
+                return Err(self.err(format!(
+                    "unknown EXTRACT field {other:?}; \
+                     supported: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MICROSECOND"
+                )));
+            }
+        };
+        if !matches!(self.peek(), Token::From) {
+            return Err(self.err(format!(
+                "expected FROM after EXTRACT field, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let source = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' to close EXTRACT, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(Expr::Extract {
+            field,
+            source: Box::new(source),
+        })
+    }
+
     fn parse_vector_literal_body(&mut self) -> Result<Expr, ParseError> {
         let mut elems = Vec::new();
         if matches!(self.peek(), Token::RBracket) {
