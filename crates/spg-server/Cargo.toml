@@ -12,7 +12,9 @@ name = "spg-server"
 path = "src/main.rs"
 
 [dependencies]
-spg-wire = { path = "../spg-wire" }
+spg-wire    = { path = "../spg-wire" }
+spg-engine  = { path = "../spg-engine" }
+spg-storage = { path = "../spg-storage" }
 
 [lints]
 workspace = true
