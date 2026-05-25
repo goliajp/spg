@@ -253,6 +253,39 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// `EXTRACT(<field> FROM <source>)` — pull an integer component
+    /// out of a `DATE` or `TIMESTAMP`. Parsed as its own AST node
+    /// because the `FROM` keyword is what separates the two halves,
+    /// not a comma.
+    Extract {
+        field: ExtractField,
+        source: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Microsecond,
+}
+
+impl fmt::Display for ExtractField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Year => "YEAR",
+            Self::Month => "MONTH",
+            Self::Day => "DAY",
+            Self::Hour => "HOUR",
+            Self::Minute => "MINUTE",
+            Self::Second => "SECOND",
+            Self::Microsecond => "MICROSECOND",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,6 +615,7 @@ impl fmt::Display for Expr {
                     write!(f, "({expr} LIKE {pattern})")
                 }
             }
+            Self::Extract { field, source } => write!(f, "EXTRACT({field} FROM {source})"),
         }
     }
 }
@@ -729,6 +763,7 @@ fn is_keyword(s: &str) -> bool {
             | "to"
             | "having"
             | "show"
+            | "extract"
     )
 }
 

@@ -101,6 +101,7 @@ pub enum Token {
     To,
     Having,
     Show,
+    Extract,
 
     Eof,
 }
@@ -347,6 +348,7 @@ fn keyword_or_ident(lower: String) -> Token {
         "to" => Token::To,
         "having" => Token::Having,
         "show" => Token::Show,
+        "extract" => Token::Extract,
         _ => Token::Ident(lower),
     }
 }

@@ -108,7 +108,59 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             let m = like_match(&text, &pat);
             Ok(Value::Bool(if *negated { !m } else { m }))
         }
+        Expr::Extract { field, source } => {
+            let v = eval_expr(source, row, ctx)?;
+            extract_field(*field, &v)
+        }
     }
+}
+
+/// Pull an integer component (year / month / ... / microsecond) out
+/// of a `DATE` or `TIMESTAMP`. Returns NULL on a NULL source, errors
+/// when the source isn't a calendar type.
+fn extract_field(field: spg_sql::ast::ExtractField, v: &Value) -> Result<Value, EvalError> {
+    use spg_sql::ast::ExtractField as F;
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (days, day_micros) = match *v {
+        Value::Date(d) => (d, 0_i64),
+        Value::Timestamp(t) => {
+            let days = t.div_euclid(86_400_000_000);
+            let day_micros = t.rem_euclid(86_400_000_000);
+            (i32::try_from(days).unwrap_or(i32::MAX), day_micros)
+        }
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "EXTRACT requires DATE or TIMESTAMP, got {:?}",
+                    v.data_type()
+                ),
+            });
+        }
+    };
+    let (y, m, d) = civil_components(days);
+    let secs = day_micros / 1_000_000;
+    let hh = secs / 3600;
+    let mm = (secs / 60) % 60;
+    let ss = secs % 60;
+    let frac = day_micros % 1_000_000;
+    let result = match field {
+        F::Year => i64::from(y),
+        F::Month => i64::from(m),
+        F::Day => i64::from(d),
+        F::Hour => hh,
+        F::Minute => mm,
+        F::Second => ss,
+        F::Microsecond => ss * 1_000_000 + frac,
+    };
+    Ok(Value::BigInt(result))
+}
+
+/// Internal wrapper around the file-private `civil_from_days` so the
+/// public surface area doesn't change. Returns `(year, month, day)`.
+fn civil_components(days: i32) -> (i32, u32, u32) {
+    civil_from_days(days)
 }
 
 /// SQL `LIKE` matcher. Wildcards are `%` (any run, possibly empty) and `_`
@@ -239,10 +291,70 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Null)
         }
+        "date_trunc" => date_trunc(args),
         other => Err(EvalError::TypeMismatch {
             detail: format!("unknown function `{other}`"),
         }),
     }
+}
+
+/// `date_trunc(unit, timestamp)` — round a `TIMESTAMP` down to the
+/// requested calendar boundary (year / month / day / hour / minute /
+/// second). Returns the truncated `TIMESTAMP`. NULL on either side
+/// propagates to NULL.
+fn date_trunc(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("date_trunc() takes 2 args, got {}", args.len()),
+        });
+    }
+    if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(unit) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "date_trunc() needs a text unit, got {:?}",
+                args[0].data_type()
+            ),
+        });
+    };
+    // Both DATE and TIMESTAMP sources are accepted. DATE lifts to
+    // midnight first; the result is always TIMESTAMP.
+    let micros = match &args[1] {
+        Value::Timestamp(t) => *t,
+        Value::Date(d) => i64::from(*d) * 86_400_000_000,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "date_trunc() needs DATE or TIMESTAMP, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let unit_lc = unit.to_ascii_lowercase();
+    let days = micros.div_euclid(86_400_000_000);
+    let day_micros = micros.rem_euclid(86_400_000_000);
+    let day_i32 = i32::try_from(days).unwrap_or(i32::MAX);
+    let (y, m, _) = civil_from_days(day_i32);
+    let truncated = match unit_lc.as_str() {
+        "year" => i64::from(days_from_civil(y, 1, 1)) * 86_400_000_000,
+        "month" => i64::from(days_from_civil(y, m, 1)) * 86_400_000_000,
+        "day" => days * 86_400_000_000,
+        "hour" => days * 86_400_000_000 + (day_micros / 3_600_000_000) * 3_600_000_000,
+        "minute" => days * 86_400_000_000 + (day_micros / 60_000_000) * 60_000_000,
+        "second" => days * 86_400_000_000 + (day_micros / 1_000_000) * 1_000_000,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "unknown date_trunc unit {other:?}; \
+                     supported: year, month, day, hour, minute, second"
+                ),
+            });
+        }
+    };
+    Ok(Value::Timestamp(truncated))
 }
 
 /// PG-style `expr::TYPE` coercion. NULL always casts as NULL.
