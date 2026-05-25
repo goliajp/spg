@@ -101,22 +101,29 @@ pub struct Engine {
     /// it into `catalog`; `ROLLBACK` drops it. SELECTs during a TX read the
     /// shadow so they see uncommitted changes (own-write visibility).
     tx_catalog: Option<Catalog>,
+    /// Named savepoints captured during the active transaction. Each
+    /// entry holds the catalog snapshot at the moment `SAVEPOINT <name>`
+    /// fired; `ROLLBACK TO <name>` restores from the entry and pops
+    /// every savepoint after it. Empty outside a TX.
+    savepoints: Vec<(String, Catalog)>,
 }
 
 impl Engine {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             catalog: Catalog::new(),
             tx_catalog: None,
+            savepoints: Vec::new(),
         }
     }
 
     /// Construct an engine restored from a previously-snapshotted catalog
     /// (see `snapshot()`).
-    pub const fn restore(catalog: Catalog) -> Self {
+    pub fn restore(catalog: Catalog) -> Self {
         Self {
             catalog,
             tx_catalog: None,
+            savepoints: Vec::new(),
         }
     }
 
@@ -160,6 +167,9 @@ impl Engine {
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
+            Statement::Savepoint(name) => self.exec_savepoint(name),
+            Statement::RollbackToSavepoint(name) => self.exec_rollback_to_savepoint(&name),
+            Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(&name),
         }
     }
 
@@ -168,6 +178,7 @@ impl Engine {
             return Err(EngineError::TransactionAlreadyOpen);
         }
         self.tx_catalog = Some(self.catalog.clone());
+        self.savepoints.clear();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -180,6 +191,9 @@ impl Engine {
             .take()
             .ok_or(EngineError::NoActiveTransaction)?;
         self.catalog = shadow;
+        // All savepoints become permanent at COMMIT and the stack
+        // resets for the next TX.
+        self.savepoints.clear();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: true,
@@ -190,6 +204,70 @@ impl Engine {
         if self.tx_catalog.take().is_none() {
             return Err(EngineError::NoActiveTransaction);
         }
+        self.savepoints.clear();
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
+
+    fn exec_savepoint(&mut self, name: String) -> Result<QueryResult, EngineError> {
+        if self.tx_catalog.is_none() {
+            return Err(EngineError::NoActiveTransaction);
+        }
+        // PG re-uses an existing savepoint name by dropping the older
+        // entry and pushing a fresh one — match that behaviour so
+        // application code can `SAVEPOINT sp; ...; SAVEPOINT sp` freely.
+        self.savepoints.retain(|(n, _)| n != &name);
+        let snapshot = self
+            .tx_catalog
+            .as_ref()
+            .expect("tx_catalog checked above")
+            .clone();
+        self.savepoints.push((name, snapshot));
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
+
+    fn exec_rollback_to_savepoint(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        if self.tx_catalog.is_none() {
+            return Err(EngineError::NoActiveTransaction);
+        }
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!("savepoint not found: {name}"))
+            })?;
+        // The savepoint stays on the stack (PG semantics): a later
+        // `RELEASE` or further `ROLLBACK TO` is still allowed. Everything
+        // after it is discarded.
+        let snapshot = self.savepoints[pos].1.clone();
+        self.savepoints.truncate(pos + 1);
+        self.tx_catalog = Some(snapshot);
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
+
+    fn exec_release_savepoint(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        if self.tx_catalog.is_none() {
+            return Err(EngineError::NoActiveTransaction);
+        }
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!("savepoint not found: {name}"))
+            })?;
+        // RELEASE keeps the work since the savepoint, just discards the
+        // bookmark plus everything nested under it.
+        self.savepoints.truncate(pos);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
