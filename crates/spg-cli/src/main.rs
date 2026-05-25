@@ -11,8 +11,8 @@ use std::process;
 use std::time::Duration;
 
 use spg_wire::{
-    ColumnDesc, Frame, FrameError, Op, WireValue, build_query, build_stats_request, encode,
-    parse_command_complete, parse_data_row, parse_error_response, parse_row_description,
+    ColumnDesc, Frame, FrameError, Op, WireValue, build_auth, build_query, build_stats_request,
+    encode, parse_command_complete, parse_data_row, parse_error_response, parse_row_description,
     parse_stats_response,
 };
 
@@ -56,11 +56,42 @@ fn main() {
     }
 }
 
+/// Pull the password from `SPG_PASSWORD` (empty string treated as
+/// "no password"). Returns `Ok(None)` when nothing is configured.
+fn env_password() -> Option<String> {
+    env::var("SPG_PASSWORD").ok().filter(|s| !s.is_empty())
+}
+
+/// Send `AUTH <password>` and consume the reply. No-op when no
+/// password is configured — keeps the open-instance code path branchless
+/// at every call site.
+fn maybe_authenticate(stream: &mut TcpStream) -> Result<(), String> {
+    let Some(pw) = env_password() else {
+        return Ok(());
+    };
+    let mut out = Vec::new();
+    encode(&build_auth(&pw), &mut out).map_err(|e| format!("encode AUTH: {e}"))?;
+    stream
+        .write_all(&out)
+        .map_err(|e| format!("write AUTH: {e}"))?;
+    let frame = read_one_frame(stream)?;
+    match frame.op {
+        Op::Pong => Ok(()),
+        Op::ErrorResponse | Op::Error => {
+            let msg =
+                parse_error_response(&frame).map_or_else(|_| "<undecodable>".into(), str::to_owned);
+            Err(format!("AUTH rejected: {msg}"))
+        }
+        other => Err(format!("unexpected AUTH reply op {other:?}")),
+    }
+}
+
 fn stats(addr: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
+    maybe_authenticate(&mut stream)?;
     let mut out = Vec::new();
     encode(&build_stats_request(), &mut out).map_err(|e| format!("encode: {e}"))?;
     stream.write_all(&out).map_err(|e| format!("write: {e}"))?;
@@ -88,7 +119,8 @@ fn ping(addr: &str) -> Result<(), String> {
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
-
+    // Ping itself is always allowed unauthenticated; skip the AUTH
+    // round-trip to keep `spg ping` a true low-overhead health check.
     let mut out = Vec::new();
     encode(&Frame::ping(), &mut out).map_err(|e| format!("encode: {e}"))?;
     stream.write_all(&out).map_err(|e| format!("write: {e}"))?;
@@ -114,7 +146,7 @@ fn query(addr: &str, sql: &str) -> Result<(), String> {
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
-
+    maybe_authenticate(&mut stream)?;
     let mut out = Vec::new();
     encode(&build_query(sql), &mut out).map_err(|e| format!("encode: {e}"))?;
     stream.write_all(&out).map_err(|e| format!("write: {e}"))?;

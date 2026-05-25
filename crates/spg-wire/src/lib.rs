@@ -35,6 +35,12 @@ pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 pub enum Op {
     Ping = 0x00,
     Pong = 0x01,
+    /// v1.14 client → server. Payload is the candidate password
+    /// (UTF-8 bytes). When the server is configured with a password,
+    /// the connection stays unauthenticated and refuses every other
+    /// opcode until `Auth` succeeds. A matching password gets a `Pong`
+    /// reply; a wrong one gets `ErrorResponse`.
+    Auth = 0x02,
     // Query / result opcodes (v0.5).
     Query = 0x10,           // client → server: SQL text payload
     RowDescription = 0x11,  // server → client: column metadata
@@ -52,6 +58,7 @@ impl Op {
         match b {
             0x00 => Ok(Self::Ping),
             0x01 => Ok(Self::Pong),
+            0x02 => Ok(Self::Auth),
             0x10 => Ok(Self::Query),
             0x11 => Ok(Self::RowDescription),
             0x12 => Ok(Self::DataRow),
@@ -332,6 +339,18 @@ pub fn build_query(sql: &str) -> Frame {
 
 pub fn parse_query(frame: &Frame) -> Result<&str, FrameError> {
     debug_assert!(matches!(frame.op, Op::Query));
+    core::str::from_utf8(&frame.payload).map_err(|_| FrameError::InvalidUtf8)
+}
+
+/// Build an `Auth` frame carrying the candidate password.
+pub fn build_auth(password: &str) -> Frame {
+    Frame::new(Op::Auth, password.as_bytes().to_vec())
+}
+
+/// Read the candidate password out of an `Auth` frame. The bytes must
+/// be valid UTF-8; non-UTF-8 inputs surface as a clear protocol error.
+pub fn parse_auth(frame: &Frame) -> Result<&str, FrameError> {
+    debug_assert!(matches!(frame.op, Op::Auth));
     core::str::from_utf8(&frame.payload).map_err(|_| FrameError::InvalidUtf8)
 }
 
