@@ -104,6 +104,11 @@ pub enum ColumnTypeName {
     /// `NUMERIC` / `NUMERIC(p)` / `NUMERIC(p, s)` — exact decimal.
     /// Bare `NUMERIC` and `NUMERIC(p)` both surface with `scale=0`.
     Numeric(u8, u8),
+    /// `DATE` — calendar day, no time-of-day component.
+    Date,
+    /// `TIMESTAMP` / `MySQL` `DATETIME` — instant with microsecond
+    /// precision.
+    Timestamp,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -125,6 +130,8 @@ impl fmt::Display for ColumnTypeName {
                     write!(f, "NUMERIC({p}, {s})")
                 }
             }
+            Self::Date => f.write_str("DATE"),
+            Self::Timestamp => f.write_str("TIMESTAMP"),
         }
     }
 }
@@ -256,6 +263,8 @@ pub enum CastTarget {
     Text,
     Bool,
     Vector,
+    Date,
+    Timestamp,
 }
 
 impl fmt::Display for CastTarget {
@@ -267,6 +276,8 @@ impl fmt::Display for CastTarget {
             Self::Text => "text",
             Self::Bool => "bool",
             Self::Vector => "vector",
+            Self::Date => "date",
+            Self::Timestamp => "timestamp",
         })
     }
 }

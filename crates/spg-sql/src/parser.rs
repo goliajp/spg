@@ -467,6 +467,10 @@ impl Parser {
                 let (precision, scale) = self.parse_optional_numeric_params()?;
                 ColumnTypeName::Numeric(precision, scale)
             }
+            "date" => ColumnTypeName::Date,
+            // MySQL's `DATETIME` is the same domain as standard
+            // `TIMESTAMP` — accept both spellings.
+            "timestamp" | "datetime" => ColumnTypeName::Timestamp,
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),
@@ -917,6 +921,8 @@ impl Parser {
                         "text" => CastTarget::Text,
                         "bool" => CastTarget::Bool,
                         "vector" => CastTarget::Vector,
+                        "date" => CastTarget::Date,
+                        "timestamp" | "datetime" => CastTarget::Timestamp,
                         other => {
                             return Err(ParseError {
                                 message: format!("unsupported cast target `::{other}`"),

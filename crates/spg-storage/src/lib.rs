@@ -44,6 +44,12 @@ pub enum DataType {
         precision: u8,
         scale: u8,
     },
+    /// `DATE` — calendar date with day precision, stored as `i32` days
+    /// since the Unix epoch (1970-01-01).
+    Date,
+    /// `TIMESTAMP` (a.k.a. `MySQL` `DATETIME`) — instant with microsecond
+    /// precision, stored as `i64` microseconds since the Unix epoch.
+    Timestamp,
 }
 
 impl fmt::Display for DataType {
@@ -65,6 +71,8 @@ impl fmt::Display for DataType {
                     write!(f, "NUMERIC({precision}, {scale})")
                 }
             }
+            Self::Date => f.write_str("DATE"),
+            Self::Timestamp => f.write_str("TIMESTAMP"),
         }
     }
 }
@@ -88,6 +96,10 @@ pub enum Value {
         scaled: i128,
         scale: u8,
     },
+    /// Days since the Unix epoch (1970-01-01). Negative for earlier dates.
+    Date(i32),
+    /// Microseconds since the Unix epoch (1970-01-01T00:00:00Z).
+    Timestamp(i64),
     Null,
 }
 
@@ -114,6 +126,8 @@ impl Value {
                 precision: 0,
                 scale: *scale,
             }),
+            Self::Date(_) => Some(DataType::Date),
+            Self::Timestamp(_) => Some(DataType::Timestamp),
             Self::Null => None,
         }
     }
@@ -190,6 +204,10 @@ impl IndexKey {
             Value::BigInt(n) => Some(Self::Int(*n)),
             Value::Text(s) => Some(Self::Text(s.clone())),
             Value::Bool(b) => Some(Self::Bool(*b)),
+            // Date/Timestamp use their integer storage repr as the
+            // index key — same order semantics, same comparison.
+            Value::Date(d) => Some(Self::Int(i64::from(*d))),
+            Value::Timestamp(t) => Some(Self::Int(*t)),
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             Value::Null | Value::Float(_) | Value::Vector(_) | Value::Numeric { .. } => None,
@@ -836,6 +854,8 @@ impl TableSchema {
 //               8=Varchar(u32 max)
 //               9=Char(u32 size)
 //               10=Numeric(u8 precision, u8 scale)
+//               11=Date
+//               12=Timestamp
 //           [nullable u8]   0/1
 //           [default_tag u8] 0=none 1=value (followed by [value_tag u8] + bytes)
 //       [row_count u32]
@@ -849,13 +869,16 @@ impl TableSchema {
 //           tag 6 (Vector)   → u32 LE dim + dim×f32 LE
 //           tag 7 (SmallInt) → i16 LE
 //           tag 8 (Numeric)  → i128 LE (16 bytes) + u8 scale
+//           tag 9 (Date)     → i32 LE (days since Unix epoch)
+//           tag 10 (Timestamp) → i64 LE (microseconds since Unix epoch)
 //
 // Bumped to version 3 when NUMERIC was added; to version 4 when
-// AUTO_INCREMENT (per-column flag) + NSW index `kind` byte landed.
+// AUTO_INCREMENT (per-column flag) + NSW index `kind` byte landed;
+// to version 5 when DATE / TIMESTAMP were added.
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 4;
+const FILE_VERSION: u8 = 5;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -1057,6 +1080,8 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             out.push(precision);
             out.push(scale);
         }
+        DataType::Date => out.push(11),
+        DataType::Timestamp => out.push(12),
     }
 }
 
@@ -1078,6 +1103,8 @@ impl Cursor<'_> {
                 let scale = self.read_u8()?;
                 Ok(DataType::Numeric { precision, scale })
             }
+            11 => Ok(DataType::Date),
+            12 => Ok(DataType::Timestamp),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -1124,6 +1151,14 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.push(8);
             out.extend_from_slice(&scaled.to_le_bytes());
             out.push(*scale);
+        }
+        Value::Date(d) => {
+            out.push(9);
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            out.push(10);
+            out.extend_from_slice(&t.to_le_bytes());
         }
     }
 }
@@ -1227,6 +1262,8 @@ impl<'a> Cursor<'a> {
                 let scale = self.read_u8()?;
                 Ok(Value::Numeric { scaled, scale })
             }
+            9 => Ok(Value::Date(self.read_i32()?)),
+            10 => Ok(Value::Timestamp(self.read_i64()?)),
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }

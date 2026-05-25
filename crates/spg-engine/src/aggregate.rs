@@ -541,6 +541,16 @@ fn encode_key(vals: &[Value]) -> String {
                 out.push_str(&scale.to_string());
                 out.push('|');
             }
+            Value::Date(d) => {
+                out.push('d');
+                out.push_str(&d.to_string());
+                out.push('|');
+            }
+            Value::Timestamp(t) => {
+                out.push('t');
+                out.push_str(&t.to_string());
+                out.push('|');
+            }
         }
     }
     out
