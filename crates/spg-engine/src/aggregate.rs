@@ -44,7 +44,7 @@ pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
         }
     }
     if let Some(o) = &stmt.order_by
-        && contains_aggregate(o)
+        && contains_aggregate(&o.expr)
     {
         return true;
     }
@@ -123,7 +123,7 @@ pub fn run(
         }
     }
     if let Some(o) = &stmt.order_by {
-        collect_aggregates(o, &mut agg_specs);
+        collect_aggregates(&o.expr, &mut agg_specs);
     }
     if let Some(h) = &stmt.having {
         collect_aggregates(h, &mut agg_specs);
@@ -251,8 +251,8 @@ pub fn run(
 
     // ORDER BY: evaluate the rewritten order_by against each synth row,
     // sort, then drop the keys. Limit is applied by the caller.
-    if let Some(order_expr) = &stmt.order_by {
-        let rewritten = rewrite_expr(order_expr, &group_exprs, &agg_specs);
+    if let Some(order) = &stmt.order_by {
+        let rewritten = rewrite_expr(&order.expr, &group_exprs, &agg_specs);
         let mut tagged: Vec<(Value, Row)> = kept_synth
             .into_iter()
             .zip(out_rows)
@@ -261,7 +261,10 @@ pub fn run(
                 Ok::<_, EvalError>((key, o))
             })
             .collect::<Result<_, _>>()?;
-        tagged.sort_by(|a, b| value_cmp(&a.0, &b.0));
+        tagged.sort_by(|a, b| {
+            let cmp = value_cmp(&a.0, &b.0);
+            if order.desc { cmp.reverse() } else { cmp }
+        });
         out_rows = tagged.into_iter().map(|(_, o)| o).collect();
     }
 

@@ -19,7 +19,7 @@ use core::mem;
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
     CreateTableStatement, Expr, ExtractField, FromClause, FromJoin, IndexMethod, InsertStatement,
-    JoinKind, Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
+    JoinKind, Literal, OrderBy, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -219,7 +219,19 @@ impl Parser {
                 return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
             }
             self.advance();
-            Some(self.parse_expr(0)?)
+            let expr = self.parse_expr(0)?;
+            // ASC is the default; either keyword may follow the
+            // order_by expression.
+            let desc = if matches!(self.peek(), Token::Desc) {
+                self.advance();
+                true
+            } else if matches!(self.peek(), Token::Asc) {
+                self.advance();
+                false
+            } else {
+                false
+            };
+            Some(OrderBy { expr, desc })
         } else {
             None
         };

@@ -166,11 +166,18 @@ pub struct SelectStatement {
     /// None` (the parser enforces that — ORDER BY / LIMIT belong to the
     /// top of the chain).
     pub unions: Vec<(UnionKind, SelectStatement)>,
-    pub order_by: Option<Expr>,
+    pub order_by: Option<OrderBy>,
     pub limit: Option<u32>,
     /// `OFFSET <n>` — drop the first `n` rows after ORDER BY but
     /// before LIMIT (so `LIMIT 10 OFFSET 5` keeps rows 6..=15).
     pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderBy {
+    pub expr: Expr,
+    /// `false` = ASC (default), `true` = DESC.
+    pub desc: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,8 +488,11 @@ impl fmt::Display for SelectStatement {
             })?;
             write_bare_select(peer, f)?;
         }
-        if let Some(e) = &self.order_by {
-            write!(f, " ORDER BY {e}")?;
+        if let Some(o) = &self.order_by {
+            write!(f, " ORDER BY {}", o.expr)?;
+            if o.desc {
+                f.write_str(" DESC")?;
+            }
         }
         if let Some(n) = &self.limit {
             write!(f, " LIMIT {n}")?;
@@ -771,6 +781,8 @@ fn is_keyword(s: &str) -> bool {
             | "show"
             | "extract"
             | "offset"
+            | "asc"
+            | "desc"
     )
 }
 
