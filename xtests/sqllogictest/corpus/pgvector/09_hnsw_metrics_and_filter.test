@@ -1,0 +1,49 @@
+# HNSW kNN under inner-product / cosine + WHERE-filtered kNN.
+# v2.4 finishes the HNSW story across the three pgvector distance ops
+# and adds an over-fetch-and-filter plan for `ORDER BY <op> LIMIT k`
+# queries that also carry a WHERE clause.
+
+statement ok
+CREATE TABLE docs (id INT NOT NULL, embedding VECTOR(3), kind TEXT NOT NULL)
+
+statement ok
+INSERT INTO docs VALUES (1, '[1.0, 0.0, 0.0]'::vector, 'article')
+
+statement ok
+INSERT INTO docs VALUES (2, '[0.9, 0.1, 0.0]'::vector, 'tweet')
+
+statement ok
+INSERT INTO docs VALUES (3, '[0.0, 1.0, 0.0]'::vector, 'article')
+
+statement ok
+INSERT INTO docs VALUES (4, '[0.0, 0.9, 0.1]'::vector, 'tweet')
+
+statement ok
+INSERT INTO docs VALUES (5, '[0.0, 0.0, 1.0]'::vector, 'article')
+
+statement ok
+CREATE INDEX docs_emb_hnsw ON docs USING hnsw (embedding)
+
+# `<#>` inner-product NSW path. With unit vectors, `[1,0,0]`-aligned
+# rows come first.
+query I nosort
+SELECT id FROM docs ORDER BY embedding <#> '[1.0, 0.0, 0.0]'::vector LIMIT 2
+----
+1
+2
+
+# `<=>` cosine NSW path. Same alignment ordering — but cosine
+# distance is what's being minimised here.
+query I nosort
+SELECT id FROM docs ORDER BY embedding <=> '[1.0, 0.0, 0.0]'::vector LIMIT 2
+----
+1
+2
+
+# WHERE-filtered kNN via over-fetch + post-filter. Same query,
+# limited to rows where kind='article'.
+query I nosort
+SELECT id FROM docs WHERE kind = 'article' ORDER BY embedding <-> '[1.0, 0.0, 0.0]'::vector LIMIT 2
+----
+1
+3

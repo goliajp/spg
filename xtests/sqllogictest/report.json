@@ -61,7 +61,7 @@
         { "file": "06_date_time.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pgvector", "pass": 53, "fail": 0, "skip": 0,
+    { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_vector_column.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -78,6 +78,8 @@
         { "file": "07_cast_vector_literal.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "08_hnsw_knn.test", "pass": 11, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "09_hnsw_metrics_and_filter.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] }
   ]
