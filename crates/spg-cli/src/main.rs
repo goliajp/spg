@@ -1,15 +1,22 @@
 //! SPG CLI.
 //!
 //! Subcommands:
-//! - `spg ping [addr]`               — sanity check the daemon is reachable.
-//! - `spg query <sql> [addr]`        — send SQL, print the result or error.
+//! - `spg ping [addr]`                  — sanity check the daemon is reachable.
+//! - `spg query <sql> [addr]`           — send SQL, print the result or error.
+//! - `spg stats [addr]`                 — fetch server stats.
+//! - `spg backup <src> <dst>`           — copy a `.spgdb` file with validation.
+//! - `spg restore <src> <dst>`          — alias of backup (file-level symmetry).
+//! - `spg version`                      — print CLI version.
 
 use std::env;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process;
 use std::time::Duration;
 
+use spg_storage::Catalog;
 use spg_wire::{
     ColumnDesc, Frame, FrameError, Op, WireValue, build_auth, build_query, build_stats_request,
     encode, parse_command_complete, parse_data_row, parse_error_response, parse_row_description,
@@ -51,9 +58,55 @@ fn main() {
         Some("version") => {
             println!("spg {}", env!("CARGO_PKG_VERSION"));
         }
+        Some(verb @ ("backup" | "restore")) => {
+            let Some(src) = args.next() else {
+                die(&format!("usage: spg {verb} <src> <dst>"), 2);
+                return;
+            };
+            let Some(dst) = args.next() else {
+                die(&format!("usage: spg {verb} <src> <dst>"), 2);
+                return;
+            };
+            match backup(&src, &dst) {
+                Ok(tables) => println!("spg {verb}: validated {tables} table(s); wrote {dst}"),
+                Err(e) => die(&format!("{verb} failed: {e}"), 1),
+            }
+        }
         Some(other) => die(&format!("unknown command: {other}"), 2),
-        None => die("usage: spg <ping|query|stats|version> ...", 2),
+        None => die(
+            "usage: spg <ping|query|stats|backup|restore|version> ...",
+            2,
+        ),
     }
+}
+
+/// Read a `.spgdb` catalog file, validate by round-tripping through the
+/// Catalog deserialize → serialize path, write the validated bytes to
+/// `dst`. Returns the number of tables in the catalog on success. Used
+/// for both `spg backup` and `spg restore` — the file-level operation
+/// is symmetric, the verb is just operator-facing context.
+///
+/// Both paths reject the operation on read / parse / write failure, so
+/// a successful return is a hard guarantee that `dst` holds a parseable
+/// catalog of the current file-format version.
+///
+/// Same path for both verbs because the operation is the same: read,
+/// validate, re-serialize, write. The verb only changes how the human
+/// describes intent ("save a copy" vs "load a copy back"). Splitting
+/// them into two functions would just be ceremony.
+fn backup(src: &str, dst: &str) -> Result<usize, String> {
+    let src_path = Path::new(src);
+    let dst_path = Path::new(dst);
+    if src_path == dst_path {
+        return Err("src and dst must not be the same path".into());
+    }
+    let bytes = fs::read(src_path).map_err(|e| format!("read {src}: {e}"))?;
+    let catalog =
+        Catalog::deserialize(&bytes).map_err(|e| format!("parse {src} as catalog: {e}"))?;
+    let table_count = catalog.table_count();
+    let out = catalog.serialize();
+    fs::write(dst_path, out).map_err(|e| format!("write {dst}: {e}"))?;
+    Ok(table_count)
 }
 
 /// Pull the password from `SPG_PASSWORD` (empty string treated as
@@ -291,5 +344,83 @@ fn format_value(v: &WireValue) -> String {
             s.push(']');
             s
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spg_storage::{ColumnSchema, DataType, Row, TableSchema, Value};
+    use std::env::temp_dir;
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        // Mix in the process id + nanosecond clock so parallel test
+        // runs don't collide on the same path. No external test crate.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut p = temp_dir();
+        p.push(format!(
+            "spg-cli-{}-{}-{nanos}.spgdb",
+            std::process::id(),
+            name
+        ));
+        p
+    }
+
+    #[test]
+    fn backup_roundtrip_preserves_data() {
+        let src = tmp_path("backup-src");
+        let dst = tmp_path("backup-dst");
+        // Build a small catalog and write it out.
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "users",
+            vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new("name", DataType::Text, false),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.insert(Row::new(vec![Value::Int(1), Value::Text("alice".into())]))
+            .unwrap();
+        t.insert(Row::new(vec![Value::Int(2), Value::Text("bob".into())]))
+            .unwrap();
+        fs::write(&src, cat.serialize()).unwrap();
+        // Run the backup path.
+        let count = backup(src.to_str().unwrap(), dst.to_str().unwrap()).unwrap();
+        assert_eq!(count, 1);
+        // Validate dst matches src exactly.
+        let bytes_src = fs::read(&src).unwrap();
+        let bytes_dst = fs::read(&dst).unwrap();
+        assert_eq!(bytes_src, bytes_dst);
+        // And dst parses cleanly.
+        let round = Catalog::deserialize(&bytes_dst).unwrap();
+        assert_eq!(round.table_count(), 1);
+        // Cleanup.
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn backup_rejects_garbage_file() {
+        let src = tmp_path("garbage-src");
+        let dst = tmp_path("garbage-dst");
+        fs::write(&src, b"not a real spgdb file at all").unwrap();
+        let err = backup(src.to_str().unwrap(), dst.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("parse"), "expected parse error, got: {err}");
+        // dst must not exist on failure.
+        assert!(!dst.exists(), "dst should not be written when src is bad");
+        let _ = fs::remove_file(&src);
+    }
+
+    #[test]
+    fn backup_refuses_same_path() {
+        let p = tmp_path("same");
+        fs::write(&p, b"placeholder").unwrap();
+        let err = backup(p.to_str().unwrap(), p.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("same path"));
+        let _ = fs::remove_file(&p);
     }
 }

@@ -13,6 +13,7 @@ dependencies = [
 name = "spg-cli"
 version = "1.0.0"
 dependencies = [
+ "spg-storage",
  "spg-wire",
 ]
 
