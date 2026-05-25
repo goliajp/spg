@@ -6,16 +6,20 @@
 
 extern crate alloc;
 
+pub mod eval;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
 use spg_sql::ast::{
-    ColumnDef, ColumnTypeName, CreateTableStatement, Expr, InsertStatement, Literal,
-    SelectStatement, Statement, UnOp,
+    ColumnDef, ColumnName, ColumnTypeName, CreateTableStatement, Expr, InsertStatement, Literal,
+    SelectItem, SelectStatement, Statement, UnOp,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{Catalog, ColumnSchema, DataType, Row, StorageError, TableSchema, Value};
+
+use crate::eval::{EvalContext, EvalError};
 
 /// Result of executing one statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,7 +38,8 @@ pub enum QueryResult {
 pub enum EngineError {
     Parse(ParseError),
     Storage(StorageError),
-    /// Front-end accepted a construct that the v0.3 executor doesn't support.
+    Eval(EvalError),
+    /// Front-end accepted a construct that the v0.x executor doesn't support.
     Unsupported(String),
 }
 
@@ -43,6 +48,7 @@ impl fmt::Display for EngineError {
         match self {
             Self::Parse(e) => write!(f, "parse: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
+            Self::Eval(e) => write!(f, "eval: {e}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
         }
     }
@@ -56,6 +62,11 @@ impl From<ParseError> for EngineError {
 impl From<StorageError> for EngineError {
     fn from(e: StorageError) -> Self {
         Self::Storage(e)
+    }
+}
+impl From<EvalError> for EngineError {
+    fn from(e: EvalError) -> Self {
+        Self::Eval(e)
     }
 }
 
@@ -124,43 +135,114 @@ impl Engine {
     }
 
     fn exec_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
-        // v0.3 only supports `SELECT * FROM <table>` — no WHERE, no projection.
-        if stmt.where_.is_some() {
-            return Err(EngineError::Unsupported(
-                "WHERE clause not supported until v0.4".into(),
-            ));
-        }
         let Some(from) = &stmt.from else {
             return Err(EngineError::Unsupported(
-                "SELECT without FROM not supported in v0.3".into(),
+                "SELECT without FROM not supported yet".into(),
             ));
         };
-        if from.alias.is_some() {
-            return Err(EngineError::Unsupported(
-                "table aliases not supported until v0.4".into(),
-            ));
-        }
-        if !is_wildcard_only(stmt) {
-            return Err(EngineError::Unsupported(
-                "only `SELECT *` is supported in v0.3".into(),
-            ));
-        }
         let table = self
             .catalog
             .get(&from.name)
             .ok_or_else(|| StorageError::TableNotFound {
                 name: from.name.clone(),
             })?;
+        let schema_cols = &table.schema().columns;
+        // The qualifier accepted on column refs is the alias (if any) else the
+        // bare table name.
+        let alias = from.alias.as_deref().unwrap_or(from.name.as_str());
+        let ctx = EvalContext::new(schema_cols, Some(alias));
+
+        let projection = build_projection(&stmt.items, schema_cols, alias)?;
+
+        let mut output_rows = Vec::new();
+        for row in table.rows() {
+            if let Some(where_expr) = &stmt.where_ {
+                let cond = eval::eval_expr(where_expr, row, &ctx)?;
+                // SQL: only explicit TRUE rows pass; FALSE and NULL are filtered.
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            let mut values = Vec::with_capacity(projection.len());
+            for p in &projection {
+                values.push(eval::eval_expr(&p.expr, row, &ctx)?);
+            }
+            output_rows.push(Row::new(values));
+        }
+
+        let columns: Vec<ColumnSchema> = projection
+            .into_iter()
+            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .collect();
+
         Ok(QueryResult::Rows {
-            columns: table.schema().columns.clone(),
-            rows: table.rows().to_vec(),
+            columns,
+            rows: output_rows,
         })
     }
 }
 
-fn is_wildcard_only(stmt: &SelectStatement) -> bool {
-    use spg_sql::ast::SelectItem;
-    stmt.items.len() == 1 && matches!(stmt.items[0], SelectItem::Wildcard)
+/// One row-producing projection: an expression to evaluate, the resulting
+/// column's user-visible name, its inferred type, and nullability.
+#[derive(Debug, Clone)]
+struct ProjectedItem {
+    expr: Expr,
+    output_name: String,
+    ty: DataType,
+    nullable: bool,
+}
+
+fn build_projection(
+    items: &[SelectItem],
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Result<Vec<ProjectedItem>, EngineError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard => {
+                for col in schema_cols {
+                    out.push(ProjectedItem {
+                        expr: Expr::Column(ColumnName {
+                            qualifier: None,
+                            name: col.name.clone(),
+                        }),
+                        output_name: col.name.clone(),
+                        ty: col.ty,
+                        nullable: col.nullable,
+                    });
+                }
+            }
+            SelectItem::Expr { expr, alias } => {
+                let Expr::Column(c) = expr else {
+                    return Err(EngineError::Unsupported(
+                        "non-column SELECT expressions not supported until v0.5".into(),
+                    ));
+                };
+                if let Some(q) = &c.qualifier
+                    && q != table_alias
+                {
+                    return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                        qualifier: q.clone(),
+                    }));
+                }
+                let sch = schema_cols
+                    .iter()
+                    .find(|s| s.name == c.name)
+                    .ok_or_else(|| EvalError::ColumnNotFound {
+                        name: c.name.clone(),
+                    })?;
+                let output_name = alias.clone().unwrap_or_else(|| sch.name.clone());
+                out.push(ProjectedItem {
+                    expr: expr.clone(),
+                    output_name,
+                    ty: sch.ty,
+                    nullable: sch.nullable,
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn column_def_to_schema(c: ColumnDef) -> ColumnSchema {
@@ -377,19 +459,130 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_with_where_marked_unsupported() {
-        let mut e = Engine::new();
-        e.execute("CREATE TABLE foo (a INT)").unwrap();
-        let err = e.execute("SELECT * FROM foo WHERE a = 1").unwrap_err();
-        assert!(matches!(err, EngineError::Unsupported(_)));
+    // --- v0.4: WHERE + projection ------------------------------------------
+
+    fn make_three_row_users(e: &mut Engine) {
+        e.execute("CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL, score INT)")
+            .unwrap();
+        e.execute("INSERT INTO users VALUES (1, 'alice', 90)")
+            .unwrap();
+        e.execute("INSERT INTO users VALUES (2, 'bob', NULL)")
+            .unwrap();
+        e.execute("INSERT INTO users VALUES (3, 'cara', 70)")
+            .unwrap();
+    }
+
+    fn unwrap_rows(r: QueryResult) -> (Vec<ColumnSchema>, Vec<Row>) {
+        match r {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            QueryResult::CommandOk { .. } => panic!("expected Rows"),
+        }
     }
 
     #[test]
-    fn select_non_wildcard_unsupported() {
+    fn where_filter_passes_only_true_rows() {
         let mut e = Engine::new();
-        e.execute("CREATE TABLE foo (a INT)").unwrap();
-        let err = e.execute("SELECT a FROM foo").unwrap_err();
+        make_three_row_users(&mut e);
+        let r = e.execute("SELECT * FROM users WHERE id > 1").unwrap();
+        let (_, rows) = unwrap_rows(r);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], Value::Int(2));
+        assert_eq!(rows[1].values[0], Value::Int(3));
+    }
+
+    #[test]
+    fn where_with_null_result_filters_out_row() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        // score is NULL for bob → score > 80 is NULL → row excluded
+        let r = e.execute("SELECT * FROM users WHERE score > 80").unwrap();
+        let (_, rows) = unwrap_rows(r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[1], Value::Text("alice".into()));
+    }
+
+    #[test]
+    fn projection_named_columns() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        let r = e.execute("SELECT name, score FROM users").unwrap();
+        let (cols, rows) = unwrap_rows(r);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "name");
+        assert_eq!(cols[1].name, "score");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values,
+            vec![Value::Text("alice".into()), Value::Int(90)]
+        );
+    }
+
+    #[test]
+    fn projection_with_column_alias() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        let r = e
+            .execute("SELECT name AS who FROM users WHERE id = 1")
+            .unwrap();
+        let (cols, rows) = unwrap_rows(r);
+        assert_eq!(cols[0].name, "who");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Text("alice".into()));
+    }
+
+    #[test]
+    fn qualified_column_with_table_alias_resolves() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        let r = e
+            .execute("SELECT u.id, u.name FROM users AS u WHERE u.id < 3")
+            .unwrap();
+        let (cols, rows) = unwrap_rows(r);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn qualified_column_with_wrong_alias_errors() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        let err = e.execute("SELECT x.id FROM users AS u").unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Eval(EvalError::UnknownQualifier { ref qualifier }) if qualifier == "x"
+        ));
+    }
+
+    #[test]
+    fn select_unknown_column_errors_in_projection() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        let err = e.execute("SELECT ghost FROM users").unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Eval(EvalError::ColumnNotFound { ref name }) if name == "ghost"
+        ));
+    }
+
+    #[test]
+    fn where_unknown_column_errors() {
+        let mut e = Engine::new();
+        make_three_row_users(&mut e);
+        let err = e
+            .execute("SELECT * FROM users WHERE ghost = 1")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Eval(EvalError::ColumnNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn expression_projection_still_unsupported() {
+        // `1 + 2` as a select item — out of scope until v0.5.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (a INT)").unwrap();
+        let err = e.execute("SELECT 1 + 2 FROM t").unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)));
     }
 
