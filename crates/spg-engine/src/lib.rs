@@ -1422,6 +1422,36 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             _ => {}
         }
     }
+    // Bare-identifier forms: PG accepts `CURRENT_TIMESTAMP` /
+    // `CURRENT_DATE` without parens. They parse here as unqualified
+    // column refs; intercept and rewrite to the same literal cast.
+    if let Expr::Column(c) = e
+        && c.qualifier.is_none()
+    {
+        let lower = c.name.to_ascii_lowercase();
+        match lower.as_str() {
+            "current_timestamp" => {
+                *e = Expr::Cast {
+                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
+                        now,
+                    ))),
+                    target: spg_sql::ast::CastTarget::Timestamp,
+                };
+                return;
+            }
+            "current_date" => {
+                let days = now.div_euclid(86_400_000_000);
+                *e = Expr::Cast {
+                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
+                        days,
+                    ))),
+                    target: spg_sql::ast::CastTarget::Date,
+                };
+                return;
+            }
+            _ => {}
+        }
+    }
     match e {
         Expr::Binary { lhs, rhs, .. } => {
             rewrite_expr_clock(lhs, now);

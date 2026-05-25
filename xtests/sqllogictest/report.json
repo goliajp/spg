@@ -41,12 +41,14 @@
         { "file": "19_having_and_show.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "mysql", "pass": 12, "fail": 0, "skip": 0,
+    { "name": "mysql", "pass": 17, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_dialect.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "02_int_types.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 89, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 93, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -63,6 +65,8 @@
         { "file": "07_date_functions.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "08_now_and_date_arith.test", "pass": 10, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "09_bare_current.test", "pass": 4, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,

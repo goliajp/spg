@@ -1,0 +1,53 @@
+# MySQL-flavoured integer / numeric type aliases (v2.8). Each maps to
+# the closest SPG type; UNSIGNED is parsed and dropped (no semantic
+# effect — SPG holds the value in the signed twin).
+
+statement ok
+CREATE TABLE mixed (
+  tiny_v TINYINT NOT NULL,
+  mid_v MEDIUMINT NOT NULL,
+  int_v INTEGER NOT NULL,
+  big_v BIGINT UNSIGNED NOT NULL,
+  d_v DOUBLE,
+  r_v REAL,
+  flag BOOLEAN
+)
+
+# SHOW COLUMNS surfaces the storage type after the alias rewrite.
+query TTI nosort
+SHOW COLUMNS FROM mixed
+----
+tiny_v
+SMALLINT
+0
+mid_v
+INT
+0
+int_v
+INT
+0
+big_v
+BIGINT
+0
+d_v
+FLOAT
+1
+r_v
+FLOAT
+1
+flag
+BOOL
+1
+
+statement ok
+INSERT INTO mixed VALUES (12, 1000, 100000, 9999999999, 3.14, 2.71, TRUE)
+
+query I nosort
+SELECT tiny_v + mid_v FROM mixed
+----
+1012
+
+# TINYINT enforces its (signed) i16 range — value 200 fits TINYINT but
+# we widen to SMALLINT, so 200 is fine.
+statement ok
+INSERT INTO mixed VALUES (100, 0, 0, 0, NULL, NULL, NULL)

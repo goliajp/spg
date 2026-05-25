@@ -5,8 +5,8 @@ Per-corpus pass / fail / skip:
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
 | `duckdb` | 133 | 0 | 0 | 100.0% |
-| `mysql` | 12 | 0 | 0 | 100.0% |
-| `pg_regress` | 89 | 0 | 0 | 100.0% |
+| `mysql` | 17 | 0 | 0 | 100.0% |
+| `pg_regress` | 93 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 
 ## Per-file detail
@@ -40,6 +40,7 @@ Per-corpus pass / fail / skip:
 | file | pass | fail | skip |
 |---|---|---|---|
 | `01_dialect.test` | 12 | 0 | 0 |
+| `02_int_types.test` | 5 | 0 | 0 |
 
 ### `pg_regress/`
 
@@ -53,6 +54,7 @@ Per-corpus pass / fail / skip:
 | `06_date_time.test` | 13 | 0 | 0 |
 | `07_date_functions.test` | 13 | 0 | 0 |
 | `08_now_and_date_arith.test` | 10 | 0 | 0 |
+| `09_bare_current.test` | 4 | 0 | 0 |
 
 ### `pgvector/`
 
