@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "duckdb", "pass": 126, "fail": 0, "skip": 0,
+    { "name": "duckdb", "pass": 133, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -37,6 +37,8 @@
         { "file": "17_functions.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "18_cast_expr.test", "pass": 5, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "19_having_and_show.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "mysql", "pass": 12, "fail": 0, "skip": 0,

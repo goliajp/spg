@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
@@ -31,6 +32,11 @@ pub enum Statement {
     /// `RELEASE [SAVEPOINT] <name>` — discard a savepoint without
     /// rolling back. Keeps the work done since then.
     ReleaseSavepoint(String),
+    /// `SHOW TABLES` — return the list of tables in the catalog.
+    ShowTables,
+    /// `SHOW COLUMNS FROM <table>` — return one row per column with
+    /// its declared name / type / nullability.
+    ShowColumns(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +149,11 @@ pub struct SelectStatement {
     pub from: Option<FromClause>,
     pub where_: Option<Expr>,
     pub group_by: Option<Vec<Expr>>,
+    /// `HAVING <expr>` — filter applied *after* `GROUP BY` aggregation.
+    /// Supports aggregate calls (e.g. `HAVING count(*) > 1`); the
+    /// aggregate executor resolves them through the same synthetic
+    /// schema used for the SELECT items.
+    pub having: Option<Expr>,
     /// UNION / UNION ALL chain. Empty for a plain SELECT. Each peer is
     /// itself a `SelectStatement` with `order_by = None` and `limit =
     /// None` (the parser enforces that — ORDER BY / LIMIT belong to the
@@ -324,6 +335,8 @@ impl fmt::Display for Statement {
             Self::Savepoint(n) => write!(f, "SAVEPOINT {}", quote_ident(n)),
             Self::RollbackToSavepoint(n) => write!(f, "ROLLBACK TO SAVEPOINT {}", quote_ident(n)),
             Self::ReleaseSavepoint(n) => write!(f, "RELEASE SAVEPOINT {}", quote_ident(n)),
+            Self::ShowTables => f.write_str("SHOW TABLES"),
+            Self::ShowColumns(t) => write!(f, "SHOW COLUMNS FROM {}", quote_ident(t)),
         }
     }
 }
@@ -460,6 +473,9 @@ fn write_bare_select_body(s: &SelectStatement, f: &mut fmt::Formatter<'_>) -> fm
             }
             write!(f, "{g}")?;
         }
+    }
+    if let Some(h) = &s.having {
+        write!(f, " HAVING {h}")?;
     }
     Ok(())
 }
@@ -700,6 +716,8 @@ fn is_keyword(s: &str) -> bool {
             | "savepoint"
             | "release"
             | "to"
+            | "having"
+            | "show"
     )
 }
 
@@ -755,6 +773,7 @@ mod tests {
             }),
             where_: None,
             group_by: None,
+            having: None,
             unions: vec![],
             order_by: None,
             limit: None,

@@ -99,6 +99,8 @@ pub enum Token {
     Savepoint,
     Release,
     To,
+    Having,
+    Show,
 
     Eof,
 }
@@ -343,6 +345,8 @@ fn keyword_or_ident(lower: String) -> Token {
         "savepoint" => Token::Savepoint,
         "release" => Token::Release,
         "to" => Token::To,
+        "having" => Token::Having,
+        "show" => Token::Show,
         _ => Token::Ident(lower),
     }
 }
