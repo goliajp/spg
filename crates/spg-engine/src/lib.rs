@@ -15,7 +15,7 @@ use core::fmt;
 
 use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement, Expr,
-    InsertStatement, Literal, SelectItem, SelectStatement, Statement, UnOp,
+    InsertStatement, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -308,6 +308,61 @@ impl Engine {
     }
 
     fn exec_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
+        // Single-block SELECT (no UNION peers) takes the fast path —
+        // ORDER BY and LIMIT live on this same statement.
+        if stmt.unions.is_empty() {
+            return self.exec_bare_select(stmt);
+        }
+        // UNION path: clone-strip the head into a bare block (its own
+        // DISTINCT and any inner ORDER BY are dropped by parser rule —
+        // the wrapper SelectStatement carries them), execute, then chain
+        // peers with left-associative dedup semantics.
+        let mut head = stmt.clone();
+        head.unions = Vec::new();
+        head.order_by = None;
+        head.limit = None;
+        let QueryResult::Rows { columns, mut rows } = self.exec_bare_select(&head)? else {
+            unreachable!("bare SELECT cannot return CommandOk")
+        };
+        for (kind, peer) in &stmt.unions {
+            let QueryResult::Rows {
+                columns: peer_cols,
+                rows: peer_rows,
+            } = self.exec_bare_select(peer)?
+            else {
+                unreachable!("bare SELECT cannot return CommandOk")
+            };
+            if peer_cols.len() != columns.len() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "UNION arity mismatch: head has {} columns, peer has {}",
+                    columns.len(),
+                    peer_cols.len()
+                )));
+            }
+            rows.extend(peer_rows);
+            if matches!(kind, UnionKind::Distinct) {
+                rows = dedup_rows(rows);
+            }
+        }
+        // ORDER BY at the top of a UNION applies to the combined result.
+        // Eval against the projected schema (NOT the source table).
+        if let Some(order_expr) = &stmt.order_by {
+            let synth_ctx = EvalContext::new(&columns, None);
+            let mut tagged: Vec<(f64, Row)> = Vec::with_capacity(rows.len());
+            for r in rows {
+                let key = eval::eval_expr(order_expr, &r, &synth_ctx)?;
+                tagged.push((value_to_order_key(&key)?, r));
+            }
+            tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+            rows = tagged.into_iter().map(|(_, r)| r).collect();
+        }
+        if let Some(n) = stmt.limit {
+            rows.truncate(n as usize);
+        }
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
+    fn exec_bare_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
         // Constant SELECT (no FROM) — evaluate each item once against an
         // empty dummy row. Useful for `SELECT 1`, `SELECT coalesce(...)`,
         // `SELECT '7'::INT`. Column references will surface as
@@ -410,6 +465,9 @@ impl Engine {
         }
 
         let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+        if stmt.distinct {
+            output_rows = dedup_rows(output_rows);
+        }
         if let Some(n) = stmt.limit {
             output_rows.truncate(n as usize);
         }
@@ -434,6 +492,21 @@ struct ProjectedItem {
     output_name: String,
     ty: DataType,
     nullable: bool,
+}
+
+/// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
+/// structural (`Vec<Value>` ⇒ pairwise `Value` equality), which gives SQL
+/// `NULL = NULL → TRUE` and `NaN = NaN → FALSE`. The first agrees with
+/// the spec's "two NULLs are not distinct"; the second is a tolerated
+/// quirk for v1 (no NaN literals are reachable from the SQL surface).
+fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
+    let mut out: Vec<Row> = Vec::with_capacity(rows.len());
+    for r in rows {
+        if !out.iter().any(|seen| seen == &r) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// Coerce a `Value` to an `f64` sort key for ORDER BY. Numbers map directly;

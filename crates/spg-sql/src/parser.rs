@@ -19,7 +19,7 @@ use core::mem;
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
     CreateTableStatement, Expr, InsertStatement, Literal, SelectItem, SelectStatement, Statement,
-    TableRef, UnOp,
+    TableRef, UnOp, UnionKind,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -147,9 +147,73 @@ impl Parser {
     }
 
     fn parse_select_stmt(&mut self) -> Result<Statement, ParseError> {
-        // Caller dispatches on Token::Select; assert and advance.
-        debug_assert!(matches!(self.peek(), Token::Select));
+        // Caller dispatches on Token::Select; the inner helper handles
+        // the rest. ORDER BY / LIMIT bind at this top level; UNION peers
+        // get a fresh bare-select parse and may not have their own ORDER
+        // BY / LIMIT.
+        let mut head = self.parse_bare_select()?;
+        while matches!(self.peek(), Token::Union) {
+            self.advance();
+            let kind = if matches!(self.peek(), Token::All) {
+                self.advance();
+                UnionKind::All
+            } else {
+                UnionKind::Distinct
+            };
+            let peer = self.parse_bare_select()?;
+            head.unions.push((kind, peer));
+        }
+        head.order_by = if matches!(self.peek(), Token::Order) {
+            self.advance();
+            if !matches!(self.peek(), Token::By) {
+                return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
+            }
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        head.limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            let n = match self.advance() {
+                Token::Integer(n) if n >= 0 => u32::try_from(n).map_err(|_| ParseError {
+                    message: format!("LIMIT value too large: {n}"),
+                    token_pos: self.pos.saturating_sub(1),
+                })?,
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "expected non-negative integer after LIMIT, got {other:?}"
+                        ),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            };
+            Some(n)
+        } else {
+            None
+        };
+        Ok(Statement::Select(head))
+    }
+
+    /// Parse one SELECT block without ORDER BY / LIMIT / UNION chaining —
+    /// just `[DISTINCT] items [FROM] [WHERE] [GROUP BY]`. Returned with
+    /// `unions` empty and `order_by` / `limit` `None`; the top-level
+    /// `parse_select_stmt` is responsible for filling those in.
+    fn parse_bare_select(&mut self) -> Result<SelectStatement, ParseError> {
+        if !matches!(self.peek(), Token::Select) {
+            return Err(self.err(format!(
+                "expected SELECT to start a query block, got {:?}",
+                self.peek()
+            )));
+        }
         self.advance();
+        let distinct = if matches!(self.peek(), Token::Distinct) {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let items = self.parse_select_list()?;
         let from = if matches!(self.peek(), Token::From) {
             self.advance();
@@ -182,44 +246,16 @@ impl Parser {
         } else {
             None
         };
-        let order_by = if matches!(self.peek(), Token::Order) {
-            self.advance();
-            if !matches!(self.peek(), Token::By) {
-                return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
-            }
-            self.advance();
-            Some(self.parse_expr(0)?)
-        } else {
-            None
-        };
-        let limit = if matches!(self.peek(), Token::Limit) {
-            self.advance();
-            let n = match self.advance() {
-                Token::Integer(n) if n >= 0 => u32::try_from(n).map_err(|_| ParseError {
-                    message: format!("LIMIT value too large: {n}"),
-                    token_pos: self.pos.saturating_sub(1),
-                })?,
-                other => {
-                    return Err(ParseError {
-                        message: format!(
-                            "expected non-negative integer after LIMIT, got {other:?}"
-                        ),
-                        token_pos: self.pos.saturating_sub(1),
-                    });
-                }
-            };
-            Some(n)
-        } else {
-            None
-        };
-        Ok(Statement::Select(SelectStatement {
+        Ok(SelectStatement {
+            distinct,
             items,
             from,
             where_,
             group_by,
-            order_by,
-            limit,
-        }))
+            unions: Vec::new(),
+            order_by: None,
+            limit: None,
+        })
     }
 
     fn parse_create_table_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
