@@ -96,6 +96,9 @@ pub enum Token {
     Cross,
     Outer,
     Default,
+    Savepoint,
+    Release,
+    To,
 
     Eof,
 }
@@ -329,6 +332,9 @@ fn keyword_or_ident(lower: String) -> Token {
         "cross" => Token::Cross,
         "outer" => Token::Outer,
         "default" => Token::Default,
+        "savepoint" => Token::Savepoint,
+        "release" => Token::Release,
+        "to" => Token::To,
         _ => Token::Ident(lower),
     }
 }

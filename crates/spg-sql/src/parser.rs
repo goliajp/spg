@@ -125,11 +125,38 @@ impl Parser {
             }
             Token::Rollback => {
                 self.advance();
-                Ok(Statement::Rollback)
+                // `ROLLBACK TO [SAVEPOINT] <name>` returns to that
+                // savepoint without ending the transaction. Bare
+                // `ROLLBACK` drops the whole TX.
+                if matches!(self.peek(), Token::To) {
+                    self.advance();
+                    if matches!(self.peek(), Token::Savepoint) {
+                        self.advance();
+                    }
+                    let name = self.expect_ident_like()?;
+                    Ok(Statement::RollbackToSavepoint(name))
+                } else {
+                    Ok(Statement::Rollback)
+                }
+            }
+            Token::Savepoint => {
+                self.advance();
+                let name = self.expect_ident_like()?;
+                Ok(Statement::Savepoint(name))
+            }
+            Token::Release => {
+                self.advance();
+                // `RELEASE [SAVEPOINT] <name>` — the `SAVEPOINT` keyword
+                // is optional in standard SQL.
+                if matches!(self.peek(), Token::Savepoint) {
+                    self.advance();
+                }
+                let name = self.expect_ident_like()?;
+                Ok(Statement::ReleaseSavepoint(name))
             }
             other => Err(self.err(format!(
-                "expected SELECT / CREATE / INSERT / BEGIN / COMMIT / ROLLBACK \
-                 at start of statement, got {other:?}"
+                "expected SELECT / CREATE / INSERT / BEGIN / COMMIT / ROLLBACK / \
+                 SAVEPOINT / RELEASE at start of statement, got {other:?}"
             ))),
         }
     }

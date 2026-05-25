@@ -20,6 +20,17 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// `SAVEPOINT <name>` — push a named savepoint onto the active TX's
+    /// stack so a later `ROLLBACK TO <name>` can undo just the work
+    /// since this point.
+    Savepoint(String),
+    /// `ROLLBACK TO [SAVEPOINT] <name>` — restore catalog state to the
+    /// named savepoint and discard later savepoints. Does not end the
+    /// transaction.
+    RollbackToSavepoint(String),
+    /// `RELEASE [SAVEPOINT] <name>` — discard a savepoint without
+    /// rolling back. Keeps the work done since then.
+    ReleaseSavepoint(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +299,9 @@ impl fmt::Display for Statement {
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
+            Self::Savepoint(n) => write!(f, "SAVEPOINT {}", quote_ident(n)),
+            Self::RollbackToSavepoint(n) => write!(f, "ROLLBACK TO SAVEPOINT {}", quote_ident(n)),
+            Self::ReleaseSavepoint(n) => write!(f, "RELEASE SAVEPOINT {}", quote_ident(n)),
         }
     }
 }
@@ -647,6 +661,9 @@ fn is_keyword(s: &str) -> bool {
             | "cross"
             | "outer"
             | "default"
+            | "savepoint"
+            | "release"
+            | "to"
     )
 }
 

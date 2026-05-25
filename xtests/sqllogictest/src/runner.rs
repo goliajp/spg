@@ -47,7 +47,7 @@ impl Default for Runner {
 }
 
 impl Runner {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             engine: Engine::new(),
         }

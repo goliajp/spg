@@ -5,16 +5,8 @@ Per-corpus pass / fail / skip:
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
 | `duckdb` | 126 | 0 | 0 | 100.0% |
-| `pg_regress` | 50 | 3 | 0 | 94.3% |
+| `pg_regress` | 53 | 0 | 0 | 100.0% |
 | `pgvector` | 42 | 0 | 0 | 100.0% |
-
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 3: parse: parse error at` |
-| 1 | `record 5: parse: parse error at` |
-| 1 | `record 7: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -49,14 +41,7 @@ Per-corpus pass / fail / skip:
 | `02_insert_shapes.test` | 9 | 0 | 0 |
 | `03_dml_v2_unsupported.test` | 6 | 0 | 0 |
 | `04_pg_types.test` | 24 | 0 | 0 |
-| `05_savepoints.test` | 5 | 3 | 0 |
-
-<details><summary>`05_savepoints.test` fail snippets</summary>
-
-- record 3: parse: parse error at token #0: expected SELECT / CREATE / INSERT / BEGIN / COMMIT / ROLLBACK at start of statement, got Ident("savepoint")
-- record 5: parse: parse error at token #1: expected end of input, got Ident("to")
-- record 7: row mismatch |   expected: ["1"] |   actual:   ["1", "2"]
-</details>
+| `05_savepoints.test` | 8 | 0 | 0 |
 
 ### `pgvector/`
 
