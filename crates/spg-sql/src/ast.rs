@@ -128,6 +128,14 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// SQL `LIKE` predicate. `pattern` evaluates to text at runtime;
+    /// wildcards are `%` (any run) and `_` (one char), backslash escapes
+    /// the next char (so `\%` matches a literal `%`).
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +369,17 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(")")
             }
+            Self::Like {
+                expr,
+                pattern,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "({expr} NOT LIKE {pattern})")
+                } else {
+                    write!(f, "({expr} LIKE {pattern})")
+                }
+            }
         }
     }
 }
@@ -492,6 +511,7 @@ fn is_keyword(s: &str) -> bool {
             | "is"
             | "between"
             | "in"
+            | "like"
     )
 }
 

@@ -88,7 +88,82 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                 args.iter().map(|a| eval_expr(a, row, ctx)).collect();
             apply_function(name, &evaluated?)
         }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let v = eval_expr(expr, row, ctx)?;
+            let p = eval_expr(pattern, row, ctx)?;
+            // NULL on either side propagates to NULL — same as PG.
+            let (text, pat) = match (v, p) {
+                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                (Value::Text(a), Value::Text(b)) => (a, b),
+                (Value::Text(_), other) | (other, _) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("LIKE requires text operands, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            let m = like_match(&text, &pat);
+            Ok(Value::Bool(if *negated { !m } else { m }))
+        }
     }
+}
+
+/// SQL `LIKE` matcher. Wildcards are `%` (any run, possibly empty) and `_`
+/// (exactly one char). `\` escapes the next pattern char so `\%` matches a
+/// literal `%`. Matches the whole input — no implicit anchoring needed
+/// since SQL `LIKE` is always full-string.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    like_match_inner(&text, 0, &pat, 0)
+}
+
+fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -> bool {
+    while pi < pat.len() {
+        match pat[pi] {
+            '%' => {
+                // Collapse consecutive `%` and try every possible split.
+                while pi < pat.len() && pat[pi] == '%' {
+                    pi += 1;
+                }
+                if pi == pat.len() {
+                    return true;
+                }
+                for k in ti..=text.len() {
+                    if like_match_inner(text, k, pat, pi) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            '_' => {
+                if ti >= text.len() {
+                    return false;
+                }
+                ti += 1;
+                pi += 1;
+            }
+            '\\' if pi + 1 < pat.len() => {
+                let want = pat[pi + 1];
+                if ti >= text.len() || text[ti] != want {
+                    return false;
+                }
+                ti += 1;
+                pi += 2;
+            }
+            c => {
+                if ti >= text.len() || text[ti] != c {
+                    return false;
+                }
+                ti += 1;
+                pi += 1;
+            }
+        }
+    }
+    ti == text.len()
 }
 
 /// Dispatch on lowercased function name. v1.4 implements only a handful of
