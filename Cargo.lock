@@ -4,25 +4,25 @@ version = 4
 
 [[package]]
 name = "spg-audit"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "spg-crypto",
 ]
 
 [[package]]
 name = "spg-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "spg-wire",
 ]
 
 [[package]]
 name = "spg-crypto"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "spg-engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "spg-sql",
  "spg-storage",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "spg-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "spg-audit",
  "spg-engine",
@@ -40,12 +40,12 @@ dependencies = [
 
 [[package]]
 name = "spg-sql"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "spg-storage"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "spg-wire"
-version = "0.1.0"
+version = "1.0.0"
