@@ -8,7 +8,7 @@ extern crate alloc;
 
 pub mod eval;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -240,20 +240,24 @@ impl Engine {
                 })
             })?;
         let schema = table.schema().clone();
-        if stmt.values.len() != schema.columns.len() {
-            return Err(EngineError::Storage(StorageError::ArityMismatch {
-                expected: schema.columns.len(),
-                actual: stmt.values.len(),
-            }));
+        let mut affected = 0usize;
+        for tuple in stmt.rows {
+            if tuple.len() != schema.columns.len() {
+                return Err(EngineError::Storage(StorageError::ArityMismatch {
+                    expected: schema.columns.len(),
+                    actual: tuple.len(),
+                }));
+            }
+            let mut values = Vec::with_capacity(tuple.len());
+            for (i, (expr, col)) in tuple.into_iter().zip(&schema.columns).enumerate() {
+                let raw = literal_expr_to_value(expr)?;
+                values.push(coerce_value(raw, col.ty, &col.name, i)?);
+            }
+            table.insert(Row::new(values))?;
+            affected += 1;
         }
-        let mut values = Vec::with_capacity(stmt.values.len());
-        for (i, (expr, col)) in stmt.values.into_iter().zip(&schema.columns).enumerate() {
-            let raw = literal_expr_to_value(expr)?;
-            values.push(coerce_value(raw, col.ty, &col.name, i)?);
-        }
-        table.insert(Row::new(values))?;
         Ok(QueryResult::CommandOk {
-            affected: 1,
+            affected,
             modified_catalog: !self.in_transaction(),
         })
     }
@@ -460,31 +464,40 @@ fn build_projection(
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                let Expr::Column(c) = expr else {
-                    return Err(EngineError::Unsupported(
-                        "non-column SELECT expressions not supported until v0.5".into(),
-                    ));
-                };
-                if let Some(q) = &c.qualifier
-                    && q != table_alias
-                {
-                    return Err(EngineError::Eval(EvalError::UnknownQualifier {
-                        qualifier: q.clone(),
-                    }));
+                // Plain column ref keeps full schema info (real type +
+                // nullability). Compound expressions evaluate fine but have
+                // no static type — surface them as nullable TEXT, which is
+                // what most clients render anyway.
+                if let Expr::Column(c) = expr {
+                    if let Some(q) = &c.qualifier
+                        && q != table_alias
+                    {
+                        return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                            qualifier: q.clone(),
+                        }));
+                    }
+                    let sch = schema_cols
+                        .iter()
+                        .find(|s| s.name == c.name)
+                        .ok_or_else(|| EvalError::ColumnNotFound {
+                            name: c.name.clone(),
+                        })?;
+                    let output_name = alias.clone().unwrap_or_else(|| sch.name.clone());
+                    out.push(ProjectedItem {
+                        expr: expr.clone(),
+                        output_name,
+                        ty: sch.ty,
+                        nullable: sch.nullable,
+                    });
+                } else {
+                    let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
+                    out.push(ProjectedItem {
+                        expr: expr.clone(),
+                        output_name,
+                        ty: DataType::Text,
+                        nullable: true,
+                    });
                 }
-                let sch = schema_cols
-                    .iter()
-                    .find(|s| s.name == c.name)
-                    .ok_or_else(|| EvalError::ColumnNotFound {
-                        name: c.name.clone(),
-                    })?;
-                let output_name = alias.clone().unwrap_or_else(|| sch.name.clone());
-                out.push(ProjectedItem {
-                    expr: expr.clone(),
-                    output_name,
-                    ty: sch.ty,
-                    nullable: sch.nullable,
-                });
             }
         }
     }
@@ -512,9 +525,9 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
 fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
     match expr {
         Expr::Literal(l) => Ok(literal_to_value(l)),
-        Expr::VectorCast(inner) => {
-            let inner_value = literal_expr_to_value(*inner)?;
-            crate::eval::cast_to_vector(inner_value).map_err(EngineError::Eval)
+        Expr::Cast { expr, target } => {
+            let inner_value = literal_expr_to_value(*expr)?;
+            crate::eval::cast_value(inner_value, target).map_err(EngineError::Eval)
         }
         Expr::Unary {
             op: UnOp::Neg,
@@ -830,12 +843,17 @@ mod tests {
     }
 
     #[test]
-    fn expression_projection_still_unsupported() {
-        // `1 + 2` as a select item — out of scope until v0.5.
+    fn expression_projection_evaluates_and_renders() {
+        // Compound expressions in the SELECT list are evaluated per row;
+        // the output column is typed TEXT, name defaults to the expression.
         let mut e = Engine::new();
-        e.execute("CREATE TABLE t (a INT)").unwrap();
-        let err = e.execute("SELECT 1 + 2 FROM t").unwrap_err();
-        assert!(matches!(err, EngineError::Unsupported(_)));
+        e.execute("CREATE TABLE t (a INT NOT NULL)").unwrap();
+        e.execute("INSERT INTO t VALUES (3)").unwrap();
+        let (_, rows) = unwrap_rows(e.execute("SELECT 1 + 2 FROM t").unwrap());
+        assert_eq!(rows.len(), 1);
+        // The expression evaluates to integer 3; rendered as the cell value
+        // (storage::Value::Int(3) since arithmetic kept ints).
+        assert_eq!(rows[0].values[0], Value::Int(3));
     }
 
     #[test]

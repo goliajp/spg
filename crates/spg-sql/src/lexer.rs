@@ -79,6 +79,10 @@ pub enum Token {
     /// PG-style cast `expr::type` — single token because we want it to bind
     /// at postfix precedence.
     DoubleColon,
+    /// Standard SQL string concatenation `||`.
+    Concat,
+    /// `IS` keyword — postfix `IS NULL` / `IS NOT NULL` predicates.
+    Is,
 
     Eof,
 }
@@ -230,6 +234,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 out.push(Token::DoubleColon);
                 i += 2;
             }
+            b'|' if peek_eq(bytes, i + 1, b'|') => {
+                out.push(Token::Concat);
+                i += 2;
+            }
             b'>' => {
                 if peek_eq(bytes, i + 1, b'=') {
                     out.push(Token::GtEq);
@@ -294,6 +302,7 @@ fn keyword_or_ident(lower: String) -> Token {
         "order" => Token::Order,
         "by" => Token::By,
         "limit" => Token::Limit,
+        "is" => Token::Is,
         _ => Token::Ident(lower),
     }
 }

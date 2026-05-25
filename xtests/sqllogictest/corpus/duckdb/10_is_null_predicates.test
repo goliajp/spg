@@ -1,4 +1,4 @@
-# `IS NULL` / `IS NOT NULL` — v1 SPG doesn't implement; expect errors.
+# `IS NULL` / `IS NOT NULL` postfix predicates — SPG v1.3+.
 
 statement ok
 CREATE TABLE u (id INT NOT NULL, name TEXT)
@@ -9,9 +9,16 @@ INSERT INTO u VALUES (1, 'alice')
 statement ok
 INSERT INTO u VALUES (2, NULL)
 
-# WHERE col IS NULL — should parse fail in v1.
-statement error
-SELECT id FROM u WHERE name IS NULL
+statement ok
+INSERT INTO u VALUES (3, 'cara')
 
-statement error
+query I rowsort
+SELECT id FROM u WHERE name IS NULL
+----
+2
+
+query I rowsort
 SELECT id FROM u WHERE name IS NOT NULL
+----
+1
+3

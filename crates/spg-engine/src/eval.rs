@@ -19,7 +19,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use spg_sql::ast::{BinOp, ColumnName, Expr, Literal, UnOp};
+use spg_sql::ast::{BinOp, CastTarget, ColumnName, Expr, Literal, UnOp};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 /// Resolution context for evaluating a single row. `table_alias` is the alias
@@ -74,10 +74,132 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             let r = eval_expr(rhs, row, ctx)?;
             apply_binary(*op, l, r)
         }
-        Expr::VectorCast(inner) => {
-            let v = eval_expr(inner, row, ctx)?;
-            cast_to_vector(v)
+        Expr::Cast { expr, target } => {
+            let v = eval_expr(expr, row, ctx)?;
+            cast_value(v, *target)
         }
+        Expr::IsNull { expr, negated } => {
+            let v = eval_expr(expr, row, ctx)?;
+            let is_null = matches!(v, Value::Null);
+            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+        }
+    }
+}
+
+/// PG-style `expr::TYPE` coercion. NULL always casts as NULL.
+pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match target {
+        CastTarget::Vector => cast_to_vector(v),
+        CastTarget::Text => Ok(Value::Text(value_to_text(&v))),
+        CastTarget::Int => cast_numeric_to_int(v),
+        CastTarget::BigInt => cast_numeric_to_bigint(v),
+        CastTarget::Float => cast_numeric_to_float(v),
+        CastTarget::Bool => cast_to_bool(v),
+    }
+}
+
+fn value_to_text(v: &Value) -> String {
+    match v {
+        Value::Int(n) => format!("{n}"),
+        Value::BigInt(n) => format!("{n}"),
+        Value::Float(x) => format!("{x}"),
+        Value::Text(s) => s.clone(),
+        Value::Bool(b) => (if *b { "true" } else { "false" }).into(),
+        Value::Vector(v) => {
+            let cells: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+            format!("[{}]", cells.join(", "))
+        }
+        Value::Null => "NULL".into(),
+    }
+}
+
+fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Int(n) => Ok(Value::Int(n)),
+        Value::BigInt(n) => i32::try_from(n)
+            .map(Value::Int)
+            .map_err(|_| EvalError::TypeMismatch {
+                detail: format!("bigint {n} does not fit in int"),
+            }),
+        #[allow(clippy::cast_possible_truncation)]
+        Value::Float(x) => Ok(Value::Int(x as i32)),
+        Value::Text(s) => {
+            s.trim()
+                .parse::<i32>()
+                .map(Value::Int)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: format!("cannot parse {s:?} as int"),
+                })
+        }
+        Value::Bool(b) => Ok(Value::Int(i32::from(b))),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("cannot cast {:?} to int", other.data_type()),
+        }),
+    }
+}
+
+fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Int(n) => Ok(Value::BigInt(i64::from(n))),
+        Value::BigInt(n) => Ok(Value::BigInt(n)),
+        #[allow(clippy::cast_possible_truncation)]
+        Value::Float(x) => Ok(Value::BigInt(x as i64)),
+        Value::Text(s) => {
+            s.trim()
+                .parse::<i64>()
+                .map(Value::BigInt)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: format!("cannot parse {s:?} as bigint"),
+                })
+        }
+        Value::Bool(b) => Ok(Value::BigInt(i64::from(b))),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("cannot cast {:?} to bigint", other.data_type()),
+        }),
+    }
+}
+
+fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Int(n) => Ok(Value::Float(f64::from(n))),
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(n) => Ok(Value::Float(n as f64)),
+        Value::Float(x) => Ok(Value::Float(x)),
+        Value::Text(s) => {
+            s.trim()
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: format!("cannot parse {s:?} as float"),
+                })
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("cannot cast {:?} to float", other.data_type()),
+        }),
+    }
+}
+
+fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Bool(b) => Ok(Value::Bool(b)),
+        Value::Int(n) => Ok(Value::Bool(n != 0)),
+        Value::BigInt(n) => Ok(Value::Bool(n != 0)),
+        Value::Text(s) => {
+            let lo = s.trim().to_ascii_lowercase();
+            match lo.as_str() {
+                "true" | "t" | "yes" | "y" | "1" | "on" => Ok(Value::Bool(true)),
+                "false" | "f" | "no" | "n" | "0" | "off" => Ok(Value::Bool(false)),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: format!("cannot parse {s:?} as bool"),
+                }),
+            }
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("cannot cast {:?} to bool", other.data_type()),
+        }),
     }
 }
 
@@ -201,11 +323,21 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::L2Distance => l2_distance(l, r),
         BinOp::InnerProduct => inner_product(l, r),
         BinOp::CosineDistance => cosine_distance(l, r),
+        BinOp::Concat => Ok(text_concat(&l, &r)),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
         BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
+}
+
+/// SQL `||` string concatenation. Operands are coerced to text via the same
+/// rule as `::text` cast. NULL propagates (handled above; this function only
+/// runs with non-NULL operands).
+fn text_concat(l: &Value, r: &Value) -> Value {
+    let a = value_to_text(l);
+    let b = value_to_text(r);
+    Value::Text(a + &b)
 }
 
 /// pgvector inner-product `<#>`. Returns the *negative* dot product so
@@ -441,7 +573,8 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::Div
         | BinOp::L2Distance
         | BinOp::InnerProduct
-        | BinOp::CosineDistance => {
+        | BinOp::CosineDistance
+        | BinOp::Concat => {
             unreachable!("compare() only called with comparison ops")
         }
     };

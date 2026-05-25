@@ -17,8 +17,9 @@ use core::fmt;
 use core::mem;
 
 use crate::ast::{
-    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement, Expr,
-    InsertStatement, Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp,
+    BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
+    CreateTableStatement, Expr, InsertStatement, Literal, SelectItem, SelectStatement, Statement,
+    TableRef, UnOp,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -364,29 +365,46 @@ impl Parser {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after VALUES, got {:?}", self.peek())));
         }
-        self.advance();
-        let mut values = Vec::new();
+        let mut rows = Vec::new();
         loop {
-            values.push(self.parse_expr(0)?);
-            match self.peek() {
-                Token::Comma => {
-                    self.advance();
-                }
-                Token::RParen => {
-                    self.advance();
-                    break;
-                }
-                other => {
-                    return Err(
-                        self.err(format!("expected ',' or ')' in VALUES list, got {other:?}"))
-                    );
+            // Each iteration consumes one `(expr, expr, …)` tuple.
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(format!(
+                    "expected '(' for next VALUES tuple, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut tuple = Vec::new();
+            loop {
+                tuple.push(self.parse_expr(0)?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in VALUES tuple, got {other:?}"
+                        )));
+                    }
                 }
             }
+            if tuple.is_empty() {
+                return Err(self.err("INSERT VALUES tuple requires at least one value".into()));
+            }
+            rows.push(tuple);
+            // Continue with comma-separated tuples.
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
         }
-        if values.is_empty() {
-            return Err(self.err("INSERT VALUES requires at least one value".into()));
-        }
-        Ok(Statement::Insert(InsertStatement { table, values }))
+        Ok(Statement::Insert(InsertStatement { table, rows }))
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParseError> {
@@ -514,32 +532,64 @@ impl Parser {
         .and_then(|atom| self.finish_postfix_casts(atom))
     }
 
-    /// While the next token is `::`, consume `::<type-ident>` and wrap the
-    /// expression. v1.2 only recognises `::vector`; other type names land in
-    /// later milestones.
+    /// Postfix operators on an atom: `::TYPE` cast and `IS [NOT] NULL`.
+    /// Both bind tighter than any binary op.
     fn finish_postfix_casts(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
-        while matches!(self.peek(), Token::DoubleColon) {
-            self.advance();
-            let ty_ident = match self.advance() {
-                Token::Ident(s) => s,
-                other => {
-                    return Err(ParseError {
-                        message: format!("expected type ident after `::`, got {other:?}"),
-                        token_pos: self.pos.saturating_sub(1),
-                    });
-                }
-            };
-            if ty_ident.as_str() != "vector" {
-                return Err(ParseError {
-                    message: format!(
-                        "only `::vector` cast is supported in v1.2 (got `::{ty_ident}`)"
-                    ),
-                    token_pos: self.pos.saturating_sub(1),
-                });
+        loop {
+            if matches!(self.peek(), Token::DoubleColon) {
+                self.advance();
+                let target = match self.advance() {
+                    Token::Ident(s) => match s.as_str() {
+                        "int" => CastTarget::Int,
+                        "bigint" => CastTarget::BigInt,
+                        "float" => CastTarget::Float,
+                        "text" => CastTarget::Text,
+                        "bool" => CastTarget::Bool,
+                        "vector" => CastTarget::Vector,
+                        other => {
+                            return Err(ParseError {
+                                message: format!("unsupported cast target `::{other}`"),
+                                token_pos: self.pos.saturating_sub(1),
+                            });
+                        }
+                    },
+                    other => {
+                        return Err(ParseError {
+                            message: format!("expected type ident after `::`, got {other:?}"),
+                            token_pos: self.pos.saturating_sub(1),
+                        });
+                    }
+                };
+                expr = Expr::Cast {
+                    expr: Box::new(expr),
+                    target,
+                };
+                continue;
             }
-            expr = Expr::VectorCast(Box::new(expr));
+            if matches!(self.peek(), Token::Is) {
+                self.advance();
+                let negated = if matches!(self.peek(), Token::Not) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                if !matches!(self.peek(), Token::Null) {
+                    return Err(self.err(format!(
+                        "expected NULL after IS{}, got {:?}",
+                        if negated { " NOT" } else { "" },
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                expr = Expr::IsNull {
+                    expr: Box::new(expr),
+                    negated,
+                };
+                continue;
+            }
+            return Ok(expr);
         }
-        Ok(expr)
     }
 
     /// Parse a pgvector array literal `[ x1, x2, ... ]`. The opening `[` is
@@ -609,6 +659,9 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::CosineDistance => (BinOp::CosineDistance, 5),
         Token::Plus => (BinOp::Add, 6),
         Token::Minus => (BinOp::Sub, 6),
+        // `||` sits beside `+`/`-` (matches PG conceptually — concat groups
+        // by the same level as binary additive arithmetic).
+        Token::Concat => (BinOp::Concat, 6),
         Token::Star => (BinOp::Mul, 7),
         Token::Slash => (BinOp::Div, 7),
         _ => return None,
@@ -947,15 +1000,17 @@ mod tests {
             panic!("expected Insert")
         };
         assert_eq!(i.table, "foo");
-        assert_eq!(i.values.len(), 1);
-        assert!(matches!(i.values[0], Expr::Literal(Literal::Integer(42))));
+        assert_eq!(i.rows.len(), 1);
+        assert_eq!(i.rows[0].len(), 1);
+        assert!(matches!(i.rows[0][0], Expr::Literal(Literal::Integer(42))));
     }
 
     #[test]
     fn insert_multi_value_with_mixed_literals() {
         let s = parse("INSERT INTO foo VALUES (1, 'hi', 3.14, TRUE, NULL)");
         let Statement::Insert(i) = s else { panic!() };
-        assert_eq!(i.values.len(), 5);
+        assert_eq!(i.rows.len(), 1);
+        assert_eq!(i.rows[0].len(), 5);
     }
 
     #[test]
@@ -1068,13 +1123,20 @@ mod tests {
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             panic!()
         };
-        assert!(matches!(expr, Expr::VectorCast(_)));
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                target: CastTarget::Vector,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn unsupported_cast_target_errors() {
+        // `::numeric` isn't in the v1.3 cast target set.
         let err = parse_statement("SELECT 1::numeric FROM t").unwrap_err();
-        assert!(err.message.contains("::vector"));
+        assert!(err.message.contains("unsupported cast target"));
     }
 
     #[test]
