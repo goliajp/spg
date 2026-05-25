@@ -86,6 +86,7 @@ pub struct SelectStatement {
     pub items: Vec<SelectItem>,
     pub from: Option<TableRef>,
     pub where_: Option<Expr>,
+    pub group_by: Option<Vec<Expr>>,
     pub order_by: Option<Expr>,
     pub limit: Option<u32>,
 }
@@ -312,6 +313,15 @@ impl fmt::Display for SelectStatement {
         if let Some(e) = &self.where_ {
             write!(f, " WHERE {e}")?;
         }
+        if let Some(gs) = &self.group_by {
+            f.write_str(" GROUP BY ")?;
+            for (i, g) in gs.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{g}")?;
+            }
+        }
         if let Some(e) = &self.order_by {
             write!(f, " ORDER BY {e}")?;
         }
@@ -528,6 +538,7 @@ fn is_keyword(s: &str) -> bool {
             | "between"
             | "in"
             | "like"
+            | "group"
     )
 }
 
@@ -579,6 +590,7 @@ mod tests {
                 alias: None,
             }),
             where_: None,
+            group_by: None,
             order_by: None,
             limit: None,
         };
