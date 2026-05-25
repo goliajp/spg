@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -227,6 +228,9 @@ pub enum StorageError {
     NullInNotNull {
         column: String,
     },
+    /// On-disk format failed to parse — corrupted file, wrong magic, truncated
+    /// payload, or unknown tag bytes.
+    Corrupt(String),
 }
 
 impl fmt::Display for StorageError {
@@ -250,6 +254,7 @@ impl fmt::Display for StorageError {
             Self::NullInNotNull { column } => {
                 write!(f, "NULL value in NOT NULL column {column:?}")
             }
+            Self::Corrupt(detail) => write!(f, "corrupt on-disk format: {detail}"),
         }
     }
 }
@@ -269,6 +274,257 @@ impl TableSchema {
         Self {
             name: name.into(),
             columns,
+        }
+    }
+}
+
+// =========================================================================
+// Persistent binary format for the catalog (v0.6).
+//
+// Layout (little-endian throughout):
+//
+//   [magic "SPGDB001" 8 bytes][version u8]
+//   [table_count u32]
+//   for each table:
+//       [name_len u16][name bytes]
+//       [col_count u16]
+//       for each col:
+//           [name_len u16][name bytes]
+//           [type_tag u8]   1=Int 2=BigInt 3=Float 4=Text 5=Bool
+//           [nullable u8]   0/1
+//       [row_count u32]
+//       for each row, for each col, one [value_tag u8] + value bytes:
+//           tag 0 (Null)   → no body
+//           tag 1 (Int)    → i32 LE
+//           tag 2 (BigInt) → i64 LE
+//           tag 3 (Float)  → f64 LE
+//           tag 4 (Text)   → u16 LE len + UTF-8 bytes
+//           tag 5 (Bool)   → u8 0/1
+// =========================================================================
+
+const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
+const FILE_VERSION: u8 = 1;
+
+impl Catalog {
+    /// Serialize the whole catalog (schema + every row) into a self-contained
+    /// byte buffer. Format is documented above the impl block.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(FILE_MAGIC);
+        out.push(FILE_VERSION);
+        write_u32(
+            &mut out,
+            u32::try_from(self.tables.len()).expect("≤ 4G tables"),
+        );
+        for t in &self.tables {
+            write_str(&mut out, &t.schema.name);
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.columns.len()).expect("≤ 65k columns/table"),
+            );
+            for c in &t.schema.columns {
+                write_str(&mut out, &c.name);
+                out.push(data_type_tag(c.ty));
+                out.push(u8::from(c.nullable));
+            }
+            write_u32(
+                &mut out,
+                u32::try_from(t.rows.len()).expect("≤ 4G rows/table"),
+            );
+            for row in &t.rows {
+                for v in &row.values {
+                    write_value(&mut out, v);
+                }
+            }
+        }
+        out
+    }
+
+    /// Deserialize a previously-serialized catalog. Rejects bad magic, version
+    /// mismatch, unknown tags, truncation, and trailing bytes.
+    pub fn deserialize(buf: &[u8]) -> Result<Self, StorageError> {
+        let mut cur = Cursor::new(buf);
+        let magic = cur.take(8)?;
+        if magic != FILE_MAGIC {
+            return Err(StorageError::Corrupt(format!(
+                "bad magic: expected SPGDB001, got {magic:?}"
+            )));
+        }
+        let version = cur.read_u8()?;
+        if version != FILE_VERSION {
+            return Err(StorageError::Corrupt(format!(
+                "unsupported file version: {version}"
+            )));
+        }
+        let table_count = cur.read_u32()? as usize;
+        let mut cat = Self::new();
+        for _ in 0..table_count {
+            let name = cur.read_str()?;
+            let col_count = cur.read_u16()? as usize;
+            let mut cols = Vec::with_capacity(col_count);
+            for _ in 0..col_count {
+                let c_name = cur.read_str()?;
+                let ty = data_type_from_tag(cur.read_u8()?)?;
+                let nullable = cur.read_u8()? != 0;
+                cols.push(ColumnSchema {
+                    name: c_name,
+                    ty,
+                    nullable,
+                });
+            }
+            cat.create_table(TableSchema::new(name.clone(), cols))?;
+            let n_cols = cat.get(&name).expect("just inserted").schema.columns.len();
+            let row_count = cur.read_u32()? as usize;
+            for _ in 0..row_count {
+                let mut values = Vec::with_capacity(n_cols);
+                for _ in 0..n_cols {
+                    values.push(cur.read_value()?);
+                }
+                let t = cat.get_mut(&name).expect("just inserted");
+                t.rows.push(Row { values });
+            }
+        }
+        if cur.pos < buf.len() {
+            return Err(StorageError::Corrupt(format!(
+                "trailing bytes: {} unread",
+                buf.len() - cur.pos
+            )));
+        }
+        Ok(cat)
+    }
+}
+
+// --- low-level binary helpers ---------------------------------------------
+
+const fn data_type_tag(t: DataType) -> u8 {
+    match t {
+        DataType::Int => 1,
+        DataType::BigInt => 2,
+        DataType::Float => 3,
+        DataType::Text => 4,
+        DataType::Bool => 5,
+    }
+}
+
+fn data_type_from_tag(tag: u8) -> Result<DataType, StorageError> {
+    match tag {
+        1 => Ok(DataType::Int),
+        2 => Ok(DataType::BigInt),
+        3 => Ok(DataType::Float),
+        4 => Ok(DataType::Text),
+        5 => Ok(DataType::Bool),
+        other => Err(StorageError::Corrupt(format!(
+            "unknown data type tag: {other}"
+        ))),
+    }
+}
+
+fn write_value(out: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Null => out.push(0),
+        Value::Int(n) => {
+            out.push(1);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::BigInt(n) => {
+            out.push(2);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Float(x) => {
+            out.push(3);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Text(s) => {
+            out.push(4);
+            write_str(out, s);
+        }
+        Value::Bool(b) => {
+            out.push(5);
+            out.push(u8::from(*b));
+        }
+    }
+}
+
+fn write_u16(out: &mut Vec<u8>, n: u16) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+fn write_u32(out: &mut Vec<u8>, n: u32) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    let len = u16::try_from(s.len()).expect("identifier / text fits in u16");
+    write_u16(out, len);
+    out.extend_from_slice(s.as_bytes());
+}
+
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], StorageError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| StorageError::Corrupt(format!("length overflow taking {n} bytes")))?;
+        if end > self.buf.len() {
+            return Err(StorageError::Corrupt(format!(
+                "unexpected EOF at offset {} (wanted {n} more bytes)",
+                self.pos
+            )));
+        }
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, StorageError> {
+        Ok(self.take(1)?[0])
+    }
+    fn read_u16(&mut self) -> Result<u16, StorageError> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn read_u32(&mut self) -> Result<u32, StorageError> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn read_i32(&mut self) -> Result<i32, StorageError> {
+        let s = self.take(4)?;
+        Ok(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn read_i64(&mut self) -> Result<i64, StorageError> {
+        let s = self.take(8)?;
+        let arr: [u8; 8] = s.try_into().expect("checked");
+        Ok(i64::from_le_bytes(arr))
+    }
+    fn read_f64(&mut self) -> Result<f64, StorageError> {
+        let s = self.take(8)?;
+        let arr: [u8; 8] = s.try_into().expect("checked");
+        Ok(f64::from_le_bytes(arr))
+    }
+    fn read_str(&mut self) -> Result<String, StorageError> {
+        let len = self.read_u16()? as usize;
+        let bytes = self.take(len)?;
+        core::str::from_utf8(bytes)
+            .map(String::from)
+            .map_err(|_| StorageError::Corrupt("invalid UTF-8 in identifier or text".into()))
+    }
+    fn read_value(&mut self) -> Result<Value, StorageError> {
+        let tag = self.read_u8()?;
+        match tag {
+            0 => Ok(Value::Null),
+            1 => Ok(Value::Int(self.read_i32()?)),
+            2 => Ok(Value::BigInt(self.read_i64()?)),
+            3 => Ok(Value::Float(self.read_f64()?)),
+            4 => Ok(Value::Text(self.read_str()?)),
+            5 => Ok(Value::Bool(self.read_u8()? != 0)),
+            other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }
 }
@@ -452,5 +708,112 @@ mod tests {
             .unwrap();
         assert_eq!(cat.get("a").unwrap().row_count(), 1);
         assert_eq!(cat.get("b").unwrap().row_count(), 0);
+    }
+
+    // --- v0.6 persistence round-trips --------------------------------------
+
+    fn assert_round_trip(cat: &Catalog) {
+        let bytes = cat.serialize();
+        let restored = Catalog::deserialize(&bytes).expect("deserialize");
+        // Compare semantic state: same tables in same order, same schema +
+        // rows in each.
+        assert_eq!(restored.table_count(), cat.table_count());
+        for (a, b) in cat.tables.iter().zip(&restored.tables) {
+            assert_eq!(a.schema, b.schema);
+            assert_eq!(a.rows, b.rows);
+        }
+    }
+
+    #[test]
+    fn serialize_empty_catalog_round_trips() {
+        assert_round_trip(&Catalog::new());
+    }
+
+    #[test]
+    fn serialize_single_empty_table_round_trips() {
+        let mut cat = Catalog::new();
+        cat.create_table(make_users_schema()).unwrap();
+        assert_round_trip(&cat);
+    }
+
+    #[test]
+    fn serialize_table_with_rows_round_trips() {
+        let mut cat = Catalog::new();
+        cat.create_table(make_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.insert(Row::new(vec![
+            Value::Int(1),
+            Value::Text("alice".into()),
+            Value::Float(95.5),
+        ]))
+        .unwrap();
+        t.insert(Row::new(vec![
+            Value::Int(2),
+            Value::Text("bob".into()),
+            Value::Null,
+        ]))
+        .unwrap();
+        assert_round_trip(&cat);
+    }
+
+    #[test]
+    fn serialize_multiple_tables_round_trips() {
+        let mut cat = Catalog::new();
+        cat.create_table(make_users_schema()).unwrap();
+        cat.create_table(TableSchema::new(
+            "flags",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("active", DataType::Bool, false),
+            ],
+        ))
+        .unwrap();
+        cat.get_mut("flags")
+            .unwrap()
+            .insert(Row::new(vec![Value::BigInt(7), Value::Bool(true)]))
+            .unwrap();
+        assert_round_trip(&cat);
+    }
+
+    #[test]
+    fn deserialize_rejects_bad_magic() {
+        let mut buf = b"BADMAGIC".to_vec();
+        buf.push(FILE_VERSION);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = Catalog::deserialize(&buf).unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt(_)));
+    }
+
+    #[test]
+    fn deserialize_rejects_unsupported_version() {
+        let mut buf = FILE_MAGIC.to_vec();
+        buf.push(99); // future version
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = Catalog::deserialize(&buf).unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt(ref s) if s.contains("version")));
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_file() {
+        let mut cat = Catalog::new();
+        cat.create_table(make_users_schema()).unwrap();
+        let bytes = cat.serialize();
+        // Drop the last byte to simulate truncation.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            Catalog::deserialize(truncated),
+            Err(StorageError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn deserialize_rejects_trailing_garbage() {
+        let cat = Catalog::new();
+        let mut bytes = cat.serialize();
+        bytes.push(0xFF);
+        assert!(matches!(
+            Catalog::deserialize(&bytes),
+            Err(StorageError::Corrupt(ref s)) if s.contains("trailing")
+        ));
     }
 }
