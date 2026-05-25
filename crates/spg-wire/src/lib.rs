@@ -41,6 +41,9 @@ pub enum Op {
     DataRow = 0x12,         // server → client: one result row
     CommandComplete = 0x13, // server → client: affected count
     ErrorResponse = 0x14,   // server → client: human-readable error text
+    // v0.12 admin / observability.
+    Stats = 0x15,         // client → server: request a human-readable status report
+    StatsResponse = 0x16, // server → client: status report text (UTF-8)
     Error = 0xFF,
 }
 
@@ -54,6 +57,8 @@ impl Op {
             0x12 => Ok(Self::DataRow),
             0x13 => Ok(Self::CommandComplete),
             0x14 => Ok(Self::ErrorResponse),
+            0x15 => Ok(Self::Stats),
+            0x16 => Ok(Self::StatsResponse),
             0xFF => Ok(Self::Error),
             other => Err(FrameError::UnknownOp(other)),
         }
@@ -413,6 +418,20 @@ pub fn parse_error_response(frame: &Frame) -> Result<&str, FrameError> {
     core::str::from_utf8(&frame.payload).map_err(|_| FrameError::InvalidUtf8)
 }
 
+/// Build a `Stats` request frame. Payload is empty.
+pub fn build_stats_request() -> Frame {
+    Frame::new(Op::Stats, Vec::new())
+}
+
+/// Build a `StatsResponse` frame carrying a UTF-8 text body.
+pub fn build_stats_response(body: &str) -> Frame {
+    Frame::new(Op::StatsResponse, body.as_bytes().to_vec())
+}
+
+pub fn parse_stats_response(frame: &Frame) -> Result<&str, FrameError> {
+    core::str::from_utf8(&frame.payload).map_err(|_| FrameError::InvalidUtf8)
+}
+
 // --- low-level cursor helpers ---------------------------------------------
 
 fn read_u8(buf: &[u8], off: usize) -> Result<(u8, usize), FrameError> {
@@ -640,6 +659,17 @@ mod tests {
     }
 
     #[test]
+    fn stats_request_and_response_round_trip() {
+        let req = build_stats_request();
+        assert_eq!(req.op, Op::Stats);
+        assert!(req.payload.is_empty());
+
+        let resp = build_stats_response("tables=2 rows=42");
+        assert_eq!(resp.op, Op::StatsResponse);
+        assert_eq!(parse_stats_response(&resp).unwrap(), "tables=2 rows=42");
+    }
+
+    #[test]
     fn frame_decode_recognises_new_opcodes() {
         for op in [
             Op::Query,
@@ -647,6 +677,8 @@ mod tests {
             Op::DataRow,
             Op::CommandComplete,
             Op::ErrorResponse,
+            Op::Stats,
+            Op::StatsResponse,
         ] {
             let mut buf = Vec::new();
             encode(&Frame::new(op, vec![]), &mut buf).unwrap();

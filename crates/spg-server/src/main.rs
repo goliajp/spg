@@ -35,7 +35,7 @@ use spg_engine::{Engine, EngineError, QueryResult};
 use spg_storage::{Catalog, ColumnSchema, DataType, Row, Value};
 use spg_wire::{
     ColumnDesc, Frame, FrameError, Op, WireType, WireValue, build_command_complete, build_data_row,
-    build_error_response, build_row_description, decode, encode, parse_query,
+    build_error_response, build_row_description, build_stats_response, decode, encode, parse_query,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
@@ -49,19 +49,32 @@ struct ServerState {
     wal: Option<Mutex<File>>,
     /// Kept so the path can be reported in error messages; runtime appends go
     /// through `wal` directly.
-    _wal_path: Option<PathBuf>,
+    wal_path: Option<PathBuf>,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
     arg.filter(|s| !s.is_empty() && s != "-").map(PathBuf::from)
 }
 
+/// Resolve a path setting from (CLI arg | env var) — CLI wins, env fills in
+/// when the CLI slot is omitted (or passed as `-`).
+fn resolve_path(cli: Option<String>, env_key: &str) -> Option<PathBuf> {
+    parse_optional_path(cli).or_else(|| {
+        env::var(env_key)
+            .ok()
+            .and_then(|s| parse_optional_path(Some(s)))
+    })
+}
+
 fn main() {
     let mut args = env::args().skip(1);
-    let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
-    let db_path = parse_optional_path(args.next());
-    let audit_path = parse_optional_path(args.next());
-    let wal_path = parse_optional_path(args.next());
+    let addr = args
+        .next()
+        .or_else(|| env::var("SPG_ADDR").ok())
+        .unwrap_or_else(|| DEFAULT_ADDR.to_string());
+    let db_path = resolve_path(args.next(), "SPG_DB");
+    let audit_path = resolve_path(args.next(), "SPG_AUDIT");
+    let wal_path = resolve_path(args.next(), "SPG_WAL");
     if let Err(e) = run(&addr, db_path, audit_path, wal_path) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
@@ -160,7 +173,7 @@ fn run(
         audit_log: Mutex::new(audit_log),
         audit_path,
         wal,
-        _wal_path: wal_path,
+        wal_path,
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -210,6 +223,10 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
 fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::io::Result<()> {
     match frame.op {
         Op::Ping => write_frame(stream, &Frame::pong()),
+        Op::Stats => {
+            let body = render_stats(state)?;
+            write_frame(stream, &build_stats_response(&body))
+        }
         Op::Query => {
             let sql = match parse_query(frame) {
                 Ok(s) => s.to_string(),
@@ -280,12 +297,15 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
             }
             emit_result(stream, result)
         }
-        Op::Pong | Op::RowDescription | Op::DataRow | Op::CommandComplete | Op::ErrorResponse => {
-            write_frame(
-                stream,
-                &Frame::error("client → server opcode not accepted on this side"),
-            )
-        }
+        Op::Pong
+        | Op::RowDescription
+        | Op::DataRow
+        | Op::CommandComplete
+        | Op::ErrorResponse
+        | Op::StatsResponse => write_frame(
+            stream,
+            &Frame::error("client → server opcode not accepted on this side"),
+        ),
         Op::Error => write_frame(
             stream,
             &Frame::error("clients should not send Error frames"),
@@ -297,6 +317,69 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
 /// returning so a successful `CommandComplete` on the wire reflects durable
 /// state. Caller is expected to hold the engine lock around `execute()`,
 /// release it, then call this — there's no need to keep both locks held.
+/// Render a `key=value`-per-line summary of server state for the Stats opcode.
+/// Acquires the engine and audit locks; intentionally cheap (no per-table
+/// row walk beyond `row_count()`).
+fn render_stats(state: &ServerState) -> std::io::Result<String> {
+    use std::fmt::Write as _;
+    let engine = state
+        .engine
+        .lock()
+        .map_err(|_| std::io::Error::other("engine mutex poisoned"))?;
+    let audit = state
+        .audit_log
+        .lock()
+        .map_err(|_| std::io::Error::other("audit mutex poisoned"))?;
+    let catalog = engine.catalog();
+
+    let mut out = String::new();
+    writeln!(out, "spg_version={}", env!("CARGO_PKG_VERSION")).unwrap();
+    writeln!(out, "tables={}", catalog.table_count()).unwrap();
+    for i in 0..catalog.table_count() {
+        // The catalog doesn't currently expose iteration directly; walk via
+        // table name lookup via successive name(). It does have `.get()` but
+        // not an iterator API. For v1.0 we ship the simplest stats.
+        // Catalog has private `tables` field — use `get_*` on names…
+        // Actually we have no name iterator. Skip per-table breakdown; emit
+        // total row count instead.
+        let _ = i; // suppress unused; placeholder until catalog grows iter.
+    }
+    // Total rows: walk via the public API. There is no rows-iterator on
+    // Catalog yet; for v1.0 stats we report total table count and audit /
+    // wal facts. Per-table row counts will require a Catalog::table_names()
+    // addition — left for v1.1.
+    writeln!(out, "in_transaction={}", engine.in_transaction()).unwrap();
+    writeln!(out, "audit_entries={}", audit.len()).unwrap();
+    writeln!(
+        out,
+        "db_path={}",
+        state
+            .db_path
+            .as_deref()
+            .map_or("<in-memory>".to_string(), |p| p.display().to_string())
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "audit_path={}",
+        state
+            .audit_path
+            .as_deref()
+            .map_or("<disabled>".to_string(), |p| p.display().to_string())
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "wal_path={}",
+        state
+            .wal_path
+            .as_deref()
+            .map_or("<disabled>".to_string(), |p| p.display().to_string())
+    )
+    .unwrap();
+    Ok(out)
+}
+
 fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());

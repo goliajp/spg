@@ -1,35 +1,113 @@
 # SPG — Small / Smart PostgreSQL
 
-A research / open-source single-database RDS written in **pure Rust 2024**, with
-**zero runtime dependencies** (std-only) and PG SQL-dialect compatibility.
+A **single-database**, **zero-runtime-dependency** RDS in pure Rust 2024 — designed
+to live inside a Docker image as the in-process database for one application.
+Perf, memory footprint, and binary size are first-class goals; every layer is
+written from scratch on top of `std`/`alloc`/`core`.
 
-Designed to be embedded inside a Docker image as the lightweight RDS for one
-project — perf / mem / footprint are first-class goals.
+## What it ships
 
-## Status
-
-Pre-alpha. v0.1 ships only the project skeleton and the self-built wire-frame
-PING/PONG round-trip. SQL, storage, and pgvector arrive in later milestones.
-
-## Build
-
-```sh
-cargo build --workspace
-cargo test  --workspace
-```
+| Layer | What's there |
+|---|---|
+| **Wire protocol** | Self-built little-endian frame: `[u32 len][u8 op][payload]`. PING/PONG, Query, RowDescription, DataRow, CommandComplete, ErrorResponse, Stats. |
+| **SQL front-end (PG dialect)** | Self-built lexer + recursive-descent + Pratt parser. `CREATE TABLE`, `CREATE INDEX`, `INSERT … VALUES`, `SELECT … [WHERE … [ORDER BY … LIMIT N]]`, `BEGIN`/`COMMIT`/`ROLLBACK`. Quoted idents, `''` string escape, `--` and `/* */` comments, full operator precedence including `<->`. |
+| **Type system** | `INT` / `BIGINT` / `FLOAT` / `TEXT` / `BOOL` / `VECTOR(N)`. SQL three-valued NULL logic. Integer widening on INSERT. |
+| **Storage** | In-memory page-less heap, atomic snapshot via tmpfile+rename, secondary B-tree indices (`alloc::collections::BTreeMap`), append-only catalog binary format with magic+version. |
+| **Persistence** | Two modes: atomic full-snapshot per writeful query *or* append-only WAL with fsync. WAL replay handles partial transactions via auto-rollback. |
+| **Executor** | Volcano-style row pipeline. WHERE filter, projection with column aliases, table aliases, ORDER BY (any expression), LIMIT, single-column-equality index seek, kNN via `<->` + ORDER BY. |
+| **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK` with a clone-on-BEGIN shadow catalog. Single-writer locking; own-write visibility inside the TX. |
+| **Audit log** | Append-only, BLAKE3 hash-chain. Every committed statement appears; the daemon refuses to start if the chain has been tampered. |
+| **Crypto** | Self-built BLAKE3 (full reference impl, KAT-verified against the spec). No third-party crates. |
+| **CLI** | `spg ping | query | stats | version`. Pretty-prints result rows as an ASCII table. |
+| **Daemon** | TCP listener, per-connection thread, shared engine via `Arc<Mutex<…>>`. CLI args + `SPG_DB` / `SPG_AUDIT` / `SPG_WAL` env vars for paths. |
 
 ## Constraints
 
-- **Business code is `std`-only** (`forbid(unsafe_code)` workspace-wide). All
-  infrastructure libraries — wire protocol, storage engine, B-tree, HNSW, WAL,
-  crypto hash, etc. — are written from scratch. Third-party crates are allowed
-  only in `dev-dependencies` (tests, benches, build scripts).
-- **Self-built client tooling**: a custom CLI talks to the daemon over a
-  self-defined wire protocol. SPG does **not** speak the PostgreSQL wire
-  protocol. The **SQL dialect**, however, mirrors PostgreSQL so that existing
-  PG queries are portable.
-- Targets the financial-industry deployment niche: append-only audit log with
-  cryptographic hash-chain (self-built BLAKE3) is part of v1.
+- **`forbid(unsafe_code)`** workspace-wide.
+- **Zero runtime dependencies.** Business code uses only `std` / `core` / `alloc`.
+  Test-only crates may use third-party deps (none currently do).
+- **Self-built infrastructure.** Wire codec, SQL parser, storage format, B-tree
+  index (wrapping `alloc::collections::BTreeMap` — Rust's standard B-tree),
+  WAL, audit hash chain, BLAKE3 — all in-tree.
+- **No PG wire protocol compatibility.** SPG defines its own wire; the SQL
+  *dialect* mirrors PG so application code remains portable.
+
+## Crates
+
+| Crate | Role | std? |
+|---|---|---|
+| `spg-wire` | Wire frame codec + opcode/value types | `no_std + alloc` |
+| `spg-sql` | Lexer / parser / AST | `no_std + alloc` |
+| `spg-crypto` | Self-built BLAKE3 | `no_std + alloc` |
+| `spg-storage` | Catalog / table / row / index / on-disk format | `no_std + alloc` |
+| `spg-audit` | BLAKE3 hash-chain audit log | `no_std + alloc` |
+| `spg-engine` | SQL executor + expression evaluator | `no_std + alloc` |
+| `spg-server` | TCP daemon binary | `std` |
+| `spg-cli` | `spg` client binary | `std` |
+
+## Quick start
+
+```sh
+# Build everything (release).
+cargo build --workspace --release
+
+# Run the daemon (in-memory).
+./target/release/spg-server 127.0.0.1:5544
+
+# Persistent + audit + WAL.
+./target/release/spg-server 127.0.0.1:5544 ./spg.db ./audit.log ./wal.log
+
+# In another terminal:
+./target/release/spg ping
+./target/release/spg query "CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)"
+./target/release/spg query "INSERT INTO u VALUES (1, 'alice')"
+./target/release/spg query "SELECT * FROM u"
+./target/release/spg query "BEGIN"
+./target/release/spg query "INSERT INTO u VALUES (2, 'bob')"
+./target/release/spg query "COMMIT"
+./target/release/spg query "CREATE INDEX by_id ON u (id)"
+./target/release/spg query "SELECT * FROM u WHERE id = 1"
+./target/release/spg stats
+./target/release/spg version
+```
+
+### kNN demo
+
+```sh
+./target/release/spg query "CREATE TABLE emb (id INT NOT NULL, v VECTOR(3) NOT NULL)"
+./target/release/spg query "INSERT INTO emb VALUES (1, [1.0, 2.0, 3.0])"
+./target/release/spg query "INSERT INTO emb VALUES (2, [4.0, 5.0, 6.0])"
+./target/release/spg query "INSERT INTO emb VALUES (3, [1.0, 2.0, 4.0])"
+./target/release/spg query "SELECT * FROM emb ORDER BY v <-> [1.0, 2.0, 3.0] LIMIT 2"
+```
+
+### Tests
+
+```sh
+cargo test --workspace          # everything
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+## Status
+
+**v1.0**. The 11 L2 work units are all in:
+
+- ✓ wire + network
+- ✓ SQL front-end
+- ✓ type system + expression eval (incl. SQL three-valued NULL)
+- ✓ storage engine + persistence
+- ✓ WAL + crash recovery
+- ✓ B-tree secondary indices
+- ✓ vector type + L2 distance + brute-force kNN
+- ✓ executor + index-seek planner
+- ✓ BEGIN/COMMIT/ROLLBACK transactions
+- ✓ BLAKE3 hash-chain audit log
+- ✓ operational basics (CLI args, env vars, stats opcode)
+
+Out of scope for v1.0 (tracked for v1.x): HNSW index (currently linear scan),
+MVCC, JOIN / aggregates / window functions, multiple databases, on-disk
+incremental B-tree, page cache, query plan visualisation.
 
 ## License
 

@@ -11,8 +11,9 @@ use std::process;
 use std::time::Duration;
 
 use spg_wire::{
-    ColumnDesc, Frame, FrameError, Op, WireValue, build_query, encode, parse_command_complete,
-    parse_data_row, parse_error_response, parse_row_description,
+    ColumnDesc, Frame, FrameError, Op, WireValue, build_query, build_stats_request, encode,
+    parse_command_complete, parse_data_row, parse_error_response, parse_row_description,
+    parse_stats_response,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
@@ -40,8 +41,40 @@ fn main() {
                 Err(e) => die(&format!("query failed: {e}"), 1),
             }
         }
+        Some("stats") => {
+            let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
+            match stats(&addr) {
+                Ok(text) => print!("{text}"),
+                Err(e) => die(&format!("stats failed: {e}"), 1),
+            }
+        }
+        Some("version") => {
+            println!("spg {}", env!("CARGO_PKG_VERSION"));
+        }
         Some(other) => die(&format!("unknown command: {other}"), 2),
-        None => die("usage: spg <ping|query> ...", 2),
+        None => die("usage: spg <ping|query|stats|version> ...", 2),
+    }
+}
+
+fn stats(addr: &str) -> Result<String, String> {
+    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    let mut out = Vec::new();
+    encode(&build_stats_request(), &mut out).map_err(|e| format!("encode: {e}"))?;
+    stream.write_all(&out).map_err(|e| format!("write: {e}"))?;
+    let frame = read_one_frame(&mut stream)?;
+    match frame.op {
+        Op::StatsResponse => parse_stats_response(&frame)
+            .map(str::to_owned)
+            .map_err(|e| format!("decode: {e}")),
+        Op::ErrorResponse | Op::Error => {
+            let msg =
+                parse_error_response(&frame).map_or_else(|_| "<undecodable>".into(), str::to_owned);
+            Err(format!("server: {msg}"))
+        }
+        other => Err(format!("unexpected reply op {other:?}")),
     }
 }
 
