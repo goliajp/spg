@@ -83,6 +83,90 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             let is_null = matches!(v, Value::Null);
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
+        Expr::FunctionCall { name, args } => {
+            let evaluated: Result<Vec<Value>, _> =
+                args.iter().map(|a| eval_expr(a, row, ctx)).collect();
+            apply_function(name, &evaluated?)
+        }
+    }
+}
+
+/// Dispatch on lowercased function name. v1.4 implements only a handful of
+/// scalar functions; aggregates land in v1.5 alongside GROUP BY.
+fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name.to_ascii_lowercase().as_str() {
+        "length" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("length() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let n = i32::try_from(s.chars().count()).unwrap_or(i32::MAX);
+                    Ok(Value::Int(n))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("length() needs text, got {:?}", other.data_type()),
+                }),
+            }
+        }
+        "upper" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("upper() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.to_uppercase())),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("upper() needs text, got {:?}", other.data_type()),
+                }),
+            }
+        }
+        "lower" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("lower() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.to_lowercase())),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("lower() needs text, got {:?}", other.data_type()),
+                }),
+            }
+        }
+        "abs" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("abs() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(n) => Ok(Value::Int(n.wrapping_abs())),
+                Value::BigInt(n) => Ok(Value::BigInt(n.wrapping_abs())),
+                Value::Float(x) => Ok(Value::Float(x.abs())),
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!("abs() needs numeric, got {:?}", other.data_type()),
+                }),
+            }
+        }
+        "coalesce" => {
+            for a in args {
+                if !matches!(a, Value::Null) {
+                    return Ok(a.clone());
+                }
+            }
+            Ok(Value::Null)
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("unknown function `{other}`"),
+        }),
     }
 }
 

@@ -263,10 +263,27 @@ impl Engine {
     }
 
     fn exec_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
+        // Constant SELECT (no FROM) — evaluate each item once against an
+        // empty dummy row. Useful for `SELECT 1`, `SELECT coalesce(...)`,
+        // `SELECT '7'::INT`. Column references will surface as
+        // ColumnNotFound on eval since the schema is empty.
         let Some(from) = &stmt.from else {
-            return Err(EngineError::Unsupported(
-                "SELECT without FROM not supported yet".into(),
-            ));
+            let empty_schema: Vec<ColumnSchema> = Vec::new();
+            let ctx = EvalContext::new(&empty_schema, None);
+            let projection = build_projection(&stmt.items, &empty_schema, "")?;
+            let dummy_row = Row::new(Vec::new());
+            let mut values = Vec::with_capacity(projection.len());
+            for p in &projection {
+                values.push(eval::eval_expr(&p.expr, &dummy_row, &ctx)?);
+            }
+            let columns: Vec<ColumnSchema> = projection
+                .into_iter()
+                .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+                .collect();
+            return Ok(QueryResult::Rows {
+                columns,
+                rows: alloc::vec![Row::new(values)],
+            });
         };
         let table =
             self.active_catalog()

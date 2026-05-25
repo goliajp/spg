@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "duckdb", "pass": 106, "fail": 20, "skip": 0,
+    { "name": "duckdb", "pass": 112, "fail": 14, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -29,15 +29,15 @@
         { "file": "13_between_in_like.test", "pass": 5, "fail": 3, "skip": 0,
           "fail_reasons": ["record 5: parse: parse error at token #6: expected end of input, got Ident(\"between\")", "record 6: parse: parse error at token #6: expected end of input, got Ident(\"in\")", "record 7: parse: parse error at token #6: expected end of input, got Ident(\"like\")"] },
         { "file": "14_aggregates.test", "pass": 5, "fail": 4, "skip": 0,
-          "fail_reasons": ["record 5: parse: parse error at token #2: expected end of input, got LParen", "record 6: parse: parse error at token #2: expected end of input, got LParen", "record 7: parse: parse error at token #2: expected end of input, got LParen"] },
+          "fail_reasons": ["record 5: parse: parse error at token #3: unexpected token Star in expression", "record 6: eval: type mismatch: unknown function `sum`", "record 7: eval: type mismatch: unknown function `max`"] },
         { "file": "15_joins.test", "pass": 7, "fail": 2, "skip": 0,
           "fail_reasons": ["record 7: parse: parse error at token #10: expected end of input, got Comma", "record 8: parse: parse error at token #11: expected end of input, got Ident(\"join\")"] },
         { "file": "16_distinct_union.test", "pass": 4, "fail": 3, "skip": 0,
           "fail_reasons": ["record 4: eval: column not found: distinct", "record 5: parse: parse error at token #3: expected end of input, got Select", "record 6: parse: parse error at token #3: expected end of input, got Ident(\"all\")"] },
-        { "file": "17_functions.test", "pass": 2, "fail": 5, "skip": 0,
-          "fail_reasons": ["record 2: parse: parse error at token #2: expected end of input, got LParen", "record 3: parse: parse error at token #2: expected end of input, got LParen", "record 4: parse: parse error at token #2: expected end of input, got LParen"] },
-        { "file": "18_cast_expr.test", "pass": 4, "fail": 1, "skip": 0,
-          "fail_reasons": ["record 4: unsupported: SELECT without FROM not supported yet"] }
+        { "file": "17_functions.test", "pass": 7, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "18_cast_expr.test", "pass": 5, "fail": 0, "skip": 0,
+          "fail_reasons": [] }
       ] },
     { "name": "pg_regress", "pass": 25, "fail": 8, "skip": 0,
       "files": [

@@ -121,6 +121,13 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// Function call `name(args...)`. v1.4 supports a small built-in set
+    /// (length, upper, lower, abs, coalesce); unknown names error at eval
+    /// time so the parser stays open for v1.5 aggregates.
+    FunctionCall {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +350,16 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "({expr} IS NULL)")
                 }
+            }
+            Self::FunctionCall { name, args } => {
+                write!(f, "{name}(")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                f.write_str(")")
             }
         }
     }

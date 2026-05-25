@@ -522,7 +522,7 @@ impl Parser {
                 }
             }
             Token::LBracket => self.parse_vector_literal_body(),
-            Token::Ident(s) | Token::QuotedIdent(s) => self.finish_column(s),
+            Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
                 token_pos: tok_pos,
@@ -625,20 +625,44 @@ impl Parser {
         Ok(Expr::Literal(Literal::Vector(elems)))
     }
 
-    fn finish_column(&mut self, first: String) -> Result<Expr, ParseError> {
+    /// Atom that started with an identifier: could be `t.col`, `col`, or
+    /// `func(arg, ...)`. Detect each shape by looking at the next token.
+    fn finish_ident_atom(&mut self, first: String) -> Result<Expr, ParseError> {
         if matches!(self.peek(), Token::Dot) {
             self.advance();
             let name = self.expect_ident_like()?;
-            Ok(Expr::Column(ColumnName {
+            return Ok(Expr::Column(ColumnName {
                 qualifier: Some(first),
                 name,
-            }))
-        } else {
-            Ok(Expr::Column(ColumnName {
-                qualifier: None,
-                name: first,
-            }))
+            }));
         }
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            // Function call. PG-style: zero-or-more comma-separated args.
+            let mut args = Vec::new();
+            if !matches!(self.peek(), Token::RParen) {
+                loop {
+                    args.push(self.parse_expr(0)?);
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                        }
+                        Token::RParen => break,
+                        other => {
+                            return Err(self.err(format!(
+                                "expected ',' or ')' in function args, got {other:?}"
+                            )));
+                        }
+                    }
+                }
+            }
+            self.advance(); // consume ')'
+            return Ok(Expr::FunctionCall { name: first, args });
+        }
+        Ok(Expr::Column(ColumnName {
+            qualifier: None,
+            name: first,
+        }))
     }
 }
 
