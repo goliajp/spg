@@ -114,8 +114,21 @@ impl Parser {
             Token::Select => self.parse_select_stmt(),
             Token::Create => self.parse_create_stmt(),
             Token::Insert => self.parse_insert_stmt(),
+            Token::Begin => {
+                self.advance();
+                Ok(Statement::Begin)
+            }
+            Token::Commit => {
+                self.advance();
+                Ok(Statement::Commit)
+            }
+            Token::Rollback => {
+                self.advance();
+                Ok(Statement::Rollback)
+            }
             other => Err(self.err(format!(
-                "expected SELECT / CREATE / INSERT at start of statement, got {other:?}"
+                "expected SELECT / CREATE / INSERT / BEGIN / COMMIT / ROLLBACK \
+                 at start of statement, got {other:?}"
             ))),
         }
     }
@@ -854,5 +867,25 @@ mod tests {
         let original = parse("CREATE INDEX by_name ON users (name)");
         let again = parse_statement(&original.to_string()).unwrap();
         assert_eq!(original, again);
+    }
+
+    // --- v0.9 transactions -------------------------------------------------
+
+    #[test]
+    fn begin_commit_rollback_parse_as_unit_variants() {
+        assert_eq!(parse("BEGIN"), Statement::Begin);
+        assert_eq!(parse("COMMIT"), Statement::Commit);
+        assert_eq!(parse("ROLLBACK"), Statement::Rollback);
+        // Trailing semicolons accepted too.
+        assert_eq!(parse("BEGIN;"), Statement::Begin);
+    }
+
+    #[test]
+    fn tx_statements_round_trip() {
+        for q in ["BEGIN", "COMMIT", "ROLLBACK"] {
+            let original = parse(q);
+            let again = parse_statement(&original.to_string()).unwrap();
+            assert_eq!(original, again);
+        }
     }
 }

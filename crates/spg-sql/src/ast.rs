@@ -17,6 +17,9 @@ pub enum Statement {
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     Insert(InsertStatement),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +157,9 @@ impl fmt::Display for Statement {
             Self::CreateTable(s) => s.fmt(f),
             Self::CreateIndex(s) => s.fmt(f),
             Self::Insert(s) => s.fmt(f),
+            Self::Begin => f.write_str("BEGIN"),
+            Self::Commit => f.write_str("COMMIT"),
+            Self::Rollback => f.write_str("ROLLBACK"),
         }
     }
 }
@@ -374,6 +380,9 @@ fn is_keyword(s: &str) -> bool {
             | "values"
             | "index"
             | "on"
+            | "begin"
+            | "commit"
+            | "rollback"
     )
 }
 

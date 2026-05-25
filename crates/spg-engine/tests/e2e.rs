@@ -22,7 +22,7 @@ fn create_two_inserts_then_select_returns_two_rows() {
         .execute("CREATE TABLE accounts (id BIGINT NOT NULL, owner TEXT NOT NULL, balance FLOAT)")
         .expect("create table");
     match r {
-        QueryResult::CommandOk { affected } => assert_eq!(affected, 0),
+        QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 0),
         QueryResult::Rows { .. } => panic!("expected CommandOk"),
     }
 

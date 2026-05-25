@@ -26,9 +26,18 @@ use crate::eval::{EvalContext, EvalError};
 /// Result of executing one statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
-    /// DDL or DML succeeded; `affected` is the row count for `INSERT` and 0
-    /// for `CREATE TABLE`.
-    CommandOk { affected: usize },
+    /// DDL or DML succeeded.
+    ///
+    /// `affected` is the row count for `INSERT` and 0 elsewhere.
+    /// `modified_catalog` tells the server whether this statement
+    /// caused the *committed* catalog to change — it's the signal to
+    /// snapshot/audit. False for `BEGIN`/`ROLLBACK`, false for writeful
+    /// statements executed inside a transaction (those only touch the
+    /// shadow), and true for `COMMIT` and for writes outside a TX.
+    CommandOk {
+        affected: usize,
+        modified_catalog: bool,
+    },
     /// `SELECT` returned a (possibly empty) row set.
     Rows {
         columns: Vec<ColumnSchema>,
@@ -43,6 +52,10 @@ pub enum EngineError {
     Eval(EvalError),
     /// Front-end accepted a construct that the v0.x executor doesn't support.
     Unsupported(String),
+    /// `BEGIN` while another transaction is already open.
+    TransactionAlreadyOpen,
+    /// `COMMIT` / `ROLLBACK` with no active transaction.
+    NoActiveTransaction,
 }
 
 impl fmt::Display for EngineError {
@@ -52,6 +65,8 @@ impl fmt::Display for EngineError {
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::Eval(e) => write!(f, "eval: {e}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
+            Self::TransactionAlreadyOpen => f.write_str("a transaction is already open"),
+            Self::NoActiveTransaction => f.write_str("no active transaction"),
         }
     }
 }
@@ -77,30 +92,60 @@ impl From<EvalError> for EngineError {
 /// per database, per test.
 #[derive(Debug, Default)]
 pub struct Engine {
+    /// Committed catalog — what survives `Engine::snapshot()` and what
+    /// outside-TX `SELECT`s read.
     catalog: Catalog,
+    /// While `Some(_)`, all writes go into this shadow copy. `COMMIT` swaps
+    /// it into `catalog`; `ROLLBACK` drops it. SELECTs during a TX read the
+    /// shadow so they see uncommitted changes (own-write visibility).
+    tx_catalog: Option<Catalog>,
 }
 
 impl Engine {
     pub const fn new() -> Self {
         Self {
             catalog: Catalog::new(),
+            tx_catalog: None,
         }
     }
 
     /// Construct an engine restored from a previously-snapshotted catalog
     /// (see `snapshot()`).
     pub const fn restore(catalog: Catalog) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            tx_catalog: None,
+        }
     }
 
+    /// The *committed* catalog. Note: during a transaction this returns the
+    /// pre-TX state — `SELECT` inside a TX goes through `execute()` and reads
+    /// the shadow. Tests that inspect outside-TX state should use this.
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    /// Serialize the catalog to bytes that `Engine::restore(Catalog::deserialize(..))`
-    /// can reload. v0.6 snapshots the full state; v0.x will add WAL.
+    /// Serialize the *committed* catalog to bytes. v0.6 was full-snapshot; v0.9
+    /// adds the rule that an open TX's shadow is never snapshotted — only the
+    /// post-COMMIT state is persisted.
     pub fn snapshot(&self) -> Vec<u8> {
         self.catalog.serialize()
+    }
+
+    pub const fn in_transaction(&self) -> bool {
+        self.tx_catalog.is_some()
+    }
+
+    fn active_catalog(&self) -> &Catalog {
+        self.tx_catalog.as_ref().unwrap_or(&self.catalog)
+    }
+
+    fn active_catalog_mut(&mut self) -> &mut Catalog {
+        if let Some(tx) = self.tx_catalog.as_mut() {
+            tx
+        } else {
+            &mut self.catalog
+        }
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
@@ -110,20 +155,62 @@ impl Engine {
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Select(s) => self.exec_select(&s),
+            Statement::Begin => self.exec_begin(),
+            Statement::Commit => self.exec_commit(),
+            Statement::Rollback => self.exec_rollback(),
         }
+    }
+
+    fn exec_begin(&mut self) -> Result<QueryResult, EngineError> {
+        if self.tx_catalog.is_some() {
+            return Err(EngineError::TransactionAlreadyOpen);
+        }
+        self.tx_catalog = Some(self.catalog.clone());
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
+
+    fn exec_commit(&mut self) -> Result<QueryResult, EngineError> {
+        let shadow = self
+            .tx_catalog
+            .take()
+            .ok_or(EngineError::NoActiveTransaction)?;
+        self.catalog = shadow;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
+    fn exec_rollback(&mut self) -> Result<QueryResult, EngineError> {
+        if self.tx_catalog.take().is_none() {
+            return Err(EngineError::NoActiveTransaction);
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
     }
 
     fn exec_create_index(
         &mut self,
         stmt: CreateIndexStatement,
     ) -> Result<QueryResult, EngineError> {
-        let table = self.catalog.get_mut(&stmt.table).ok_or_else(|| {
-            EngineError::Storage(StorageError::TableNotFound {
-                name: stmt.table.clone(),
-            })
-        })?;
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.table)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
         table.add_index(stmt.name, &stmt.column)?;
-        Ok(QueryResult::CommandOk { affected: 0 })
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
     }
 
     fn exec_create_table(
@@ -135,17 +222,23 @@ impl Engine {
             .into_iter()
             .map(column_def_to_schema)
             .collect::<Vec<_>>();
-        self.catalog
+        self.active_catalog_mut()
             .create_table(TableSchema::new(stmt.name, cols))?;
-        Ok(QueryResult::CommandOk { affected: 0 })
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
     }
 
     fn exec_insert(&mut self, stmt: InsertStatement) -> Result<QueryResult, EngineError> {
-        let table = self.catalog.get_mut(&stmt.table).ok_or_else(|| {
-            EngineError::Storage(StorageError::TableNotFound {
-                name: stmt.table.clone(),
-            })
-        })?;
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.table)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
         let schema = table.schema().clone();
         if stmt.values.len() != schema.columns.len() {
             return Err(EngineError::Storage(StorageError::ArityMismatch {
@@ -159,7 +252,10 @@ impl Engine {
             values.push(coerce_value(raw, col.ty, &col.name, i)?);
         }
         table.insert(Row::new(values))?;
-        Ok(QueryResult::CommandOk { affected: 1 })
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: !self.in_transaction(),
+        })
     }
 
     fn exec_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
@@ -168,12 +264,12 @@ impl Engine {
                 "SELECT without FROM not supported yet".into(),
             ));
         };
-        let table = self
-            .catalog
-            .get(&from.name)
-            .ok_or_else(|| StorageError::TableNotFound {
-                name: from.name.clone(),
-            })?;
+        let table =
+            self.active_catalog()
+                .get(&from.name)
+                .ok_or_else(|| StorageError::TableNotFound {
+                    name: from.name.clone(),
+                })?;
         let schema_cols = &table.schema().columns;
         // The qualifier accepted on column refs is the alias (if any) else the
         // bare table name.
@@ -449,7 +545,7 @@ mod tests {
 
     fn unwrap_command_ok(r: &QueryResult) -> usize {
         match r {
-            QueryResult::CommandOk { affected } => *affected,
+            QueryResult::CommandOk { affected, .. } => *affected,
             QueryResult::Rows { .. } => panic!("expected CommandOk, got Rows"),
         }
     }
@@ -760,5 +856,90 @@ mod tests {
         e.execute("CREATE INDEX by_id ON users (id)").unwrap();
         let (_, rows) = unwrap_rows(e.execute("SELECT * FROM users WHERE id = 999").unwrap());
         assert_eq!(rows.len(), 0);
+    }
+
+    // --- v0.9 transactions -------------------------------------------------
+
+    #[test]
+    fn begin_sets_in_transaction_flag() {
+        let mut e = Engine::new();
+        assert!(!e.in_transaction());
+        e.execute("BEGIN").unwrap();
+        assert!(e.in_transaction());
+    }
+
+    #[test]
+    fn double_begin_errors() {
+        let mut e = Engine::new();
+        e.execute("BEGIN").unwrap();
+        let err = e.execute("BEGIN").unwrap_err();
+        assert_eq!(err, EngineError::TransactionAlreadyOpen);
+    }
+
+    #[test]
+    fn commit_without_begin_errors() {
+        let mut e = Engine::new();
+        let err = e.execute("COMMIT").unwrap_err();
+        assert_eq!(err, EngineError::NoActiveTransaction);
+    }
+
+    #[test]
+    fn rollback_without_begin_errors() {
+        let mut e = Engine::new();
+        let err = e.execute("ROLLBACK").unwrap_err();
+        assert_eq!(err, EngineError::NoActiveTransaction);
+    }
+
+    #[test]
+    fn commit_applies_shadow_to_committed_catalog() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v INT NOT NULL)").unwrap();
+        e.execute("BEGIN").unwrap();
+        e.execute("INSERT INTO t VALUES (1)").unwrap();
+        e.execute("INSERT INTO t VALUES (2)").unwrap();
+        e.execute("COMMIT").unwrap();
+        assert!(!e.in_transaction());
+        assert_eq!(e.catalog().get("t").unwrap().row_count(), 2);
+    }
+
+    #[test]
+    fn rollback_discards_shadow() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v INT NOT NULL)").unwrap();
+        e.execute("BEGIN").unwrap();
+        e.execute("INSERT INTO t VALUES (1)").unwrap();
+        e.execute("INSERT INTO t VALUES (2)").unwrap();
+        e.execute("ROLLBACK").unwrap();
+        assert!(!e.in_transaction());
+        assert_eq!(e.catalog().get("t").unwrap().row_count(), 0);
+    }
+
+    #[test]
+    fn select_during_tx_sees_uncommitted_writes_own_session() {
+        // The shadow catalog is read by SELECTs while a TX is open — the
+        // session can see its own pending writes.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v INT NOT NULL)").unwrap();
+        e.execute("BEGIN").unwrap();
+        e.execute("INSERT INTO t VALUES (42)").unwrap();
+        let (_, rows) = unwrap_rows(e.execute("SELECT * FROM t").unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(42));
+    }
+
+    #[test]
+    fn ddl_inside_tx_also_rolled_back() {
+        let mut e = Engine::new();
+        e.execute("BEGIN").unwrap();
+        e.execute("CREATE TABLE t (v INT)").unwrap();
+        // Visible inside the TX.
+        e.execute("SELECT * FROM t").unwrap();
+        e.execute("ROLLBACK").unwrap();
+        // Gone after rollback.
+        let err = e.execute("SELECT * FROM t").unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Storage(StorageError::TableNotFound { .. })
+        ));
     }
 }
