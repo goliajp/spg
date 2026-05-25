@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `duckdb` | 121 | 5 | 0 | 96.0% |
+| `duckdb` | 124 | 2 | 0 | 98.4% |
 | `pg_regress` | 26 | 8 | 0 | 76.5% |
 | `pgvector` | 42 | 0 | 0 | 100.0% |
 
@@ -12,13 +12,11 @@ Per-corpus pass / fail / skip:
 
 | count | pattern |
 |---|---|
-| 2 | `record 5: parse: parse error at` |
 | 1 | `record 0: parse: parse error at` |
 | 1 | `record 1: parse: parse error at` |
 | 1 | `record 2: parse: parse error at` |
 | 1 | `record 3: parse: parse error at` |
-| 1 | `record 4: eval: column not found:` |
-| 1 | `record 6: parse: parse error at` |
+| 1 | `record 5: parse: parse error at` |
 | 1 | `record 7: parse: parse error at` |
 | 1 | `record 7: row mismatch | expected:` |
 | 1 | `record 8: parse: parse error at` |
@@ -44,7 +42,7 @@ Per-corpus pass / fail / skip:
 | `13_between_in_like.test` | 8 | 0 | 0 |
 | `14_aggregates.test` | 9 | 0 | 0 |
 | `15_joins.test` | 7 | 2 | 0 |
-| `16_distinct_union.test` | 4 | 3 | 0 |
+| `16_distinct_union.test` | 7 | 0 | 0 |
 | `17_functions.test` | 7 | 0 | 0 |
 | `18_cast_expr.test` | 5 | 0 | 0 |
 
@@ -52,13 +50,6 @@ Per-corpus pass / fail / skip:
 
 - record 7: parse: parse error at token #10: expected end of input, got Comma
 - record 8: parse: parse error at token #11: expected end of input, got Ident("join")
-</details>
-
-<details><summary>`16_distinct_union.test` fail snippets</summary>
-
-- record 4: eval: column not found: distinct
-- record 5: parse: parse error at token #3: expected end of input, got Select
-- record 6: parse: parse error at token #3: expected end of input, got Ident("all")
 </details>
 
 ### `pg_regress/`

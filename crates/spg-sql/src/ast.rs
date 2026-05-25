@@ -83,12 +83,26 @@ pub struct InsertStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Option<TableRef>,
     pub where_: Option<Expr>,
     pub group_by: Option<Vec<Expr>>,
+    /// UNION / UNION ALL chain. Empty for a plain SELECT. Each peer is
+    /// itself a `SelectStatement` with `order_by = None` and `limit =
+    /// None` (the parser enforces that — ORDER BY / LIMIT belong to the
+    /// top of the chain).
+    pub unions: Vec<(UnionKind, SelectStatement)>,
     pub order_by: Option<Expr>,
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnionKind {
+    /// `UNION` — dedupes the combined set.
+    Distinct,
+    /// `UNION ALL` — concatenates without dedup.
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,27 +314,13 @@ impl fmt::Display for InsertStatement {
 
 impl fmt::Display for SelectStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SELECT ")?;
-        for (i, item) in self.items.iter().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
-            }
-            write!(f, "{item}")?;
-        }
-        if let Some(t) = &self.from {
-            write!(f, " FROM {t}")?;
-        }
-        if let Some(e) = &self.where_ {
-            write!(f, " WHERE {e}")?;
-        }
-        if let Some(gs) = &self.group_by {
-            f.write_str(" GROUP BY ")?;
-            for (i, g) in gs.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write!(f, "{g}")?;
-            }
+        write_bare_select(self, f)?;
+        for (kind, peer) in &self.unions {
+            f.write_str(match kind {
+                UnionKind::Distinct => " UNION ",
+                UnionKind::All => " UNION ALL ",
+            })?;
+            write_bare_select(peer, f)?;
         }
         if let Some(e) = &self.order_by {
             write!(f, " ORDER BY {e}")?;
@@ -330,6 +330,39 @@ impl fmt::Display for SelectStatement {
         }
         Ok(())
     }
+}
+
+fn write_bare_select(s: &SelectStatement, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("SELECT ")?;
+    if s.distinct {
+        f.write_str("DISTINCT ")?;
+    }
+    write_bare_select_body(s, f)
+}
+
+fn write_bare_select_body(s: &SelectStatement, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    for (i, item) in s.items.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{item}")?;
+    }
+    if let Some(t) = &s.from {
+        write!(f, " FROM {t}")?;
+    }
+    if let Some(e) = &s.where_ {
+        write!(f, " WHERE {e}")?;
+    }
+    if let Some(gs) = &s.group_by {
+        f.write_str(" GROUP BY ")?;
+        for (i, g) in gs.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{g}")?;
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for SelectItem {
@@ -539,6 +572,9 @@ fn is_keyword(s: &str) -> bool {
             | "in"
             | "like"
             | "group"
+            | "distinct"
+            | "union"
+            | "all"
     )
 }
 
@@ -591,8 +627,10 @@ mod tests {
             }),
             where_: None,
             group_by: None,
+            unions: vec![],
             order_by: None,
             limit: None,
+            distinct: false,
         };
         assert_eq!(s.to_string(), "SELECT * FROM users");
     }

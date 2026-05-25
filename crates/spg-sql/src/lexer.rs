@@ -87,6 +87,9 @@ pub enum Token {
     In,
     Like,
     Group,
+    Distinct,
+    Union,
+    All,
 
     Eof,
 }
@@ -311,6 +314,9 @@ fn keyword_or_ident(lower: String) -> Token {
         "in" => Token::In,
         "like" => Token::Like,
         "group" => Token::Group,
+        "distinct" => Token::Distinct,
+        "union" => Token::Union,
+        "all" => Token::All,
         _ => Token::Ident(lower),
     }
 }

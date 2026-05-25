@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "duckdb", "pass": 121, "fail": 5, "skip": 0,
+    { "name": "duckdb", "pass": 124, "fail": 2, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -32,8 +32,8 @@
           "fail_reasons": [] },
         { "file": "15_joins.test", "pass": 7, "fail": 2, "skip": 0,
           "fail_reasons": ["record 7: parse: parse error at token #10: expected end of input, got Comma", "record 8: parse: parse error at token #11: expected end of input, got Ident(\"join\")"] },
-        { "file": "16_distinct_union.test", "pass": 4, "fail": 3, "skip": 0,
-          "fail_reasons": ["record 4: eval: column not found: distinct", "record 5: parse: parse error at token #3: expected end of input, got Select", "record 6: parse: parse error at token #3: expected end of input, got Ident(\"all\")"] },
+        { "file": "16_distinct_union.test", "pass": 7, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
         { "file": "17_functions.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "18_cast_expr.test", "pass": 5, "fail": 0, "skip": 0,
