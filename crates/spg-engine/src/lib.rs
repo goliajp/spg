@@ -15,7 +15,8 @@ use core::fmt;
 
 use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement, Expr,
-    InsertStatement, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
+    FromClause, InsertStatement, JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp,
+    UnionKind,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -362,6 +363,7 @@ impl Engine {
         Ok(QueryResult::Rows { columns, rows })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn exec_bare_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
         // Constant SELECT (no FROM) — evaluate each item once against an
         // empty dummy row. Useful for `SELECT 1`, `SELECT coalesce(...)`,
@@ -385,16 +387,22 @@ impl Engine {
                 rows: alloc::vec![Row::new(values)],
             });
         };
-        let table =
-            self.active_catalog()
-                .get(&from.name)
-                .ok_or_else(|| StorageError::TableNotFound {
-                    name: from.name.clone(),
-                })?;
+        // Multi-table FROM (one or more joined peers) goes through the
+        // nested-loop join executor. Single-table FROM stays on the
+        // existing scan + index-seek path.
+        if !from.joins.is_empty() {
+            return self.exec_joined_select(stmt, from);
+        }
+        let primary = &from.primary;
+        let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
+            StorageError::TableNotFound {
+                name: primary.name.clone(),
+            }
+        })?;
         let schema_cols = &table.schema().columns;
         // The qualifier accepted on column refs is the alias (if any) else the
         // bare table name.
-        let alias = from.alias.as_deref().unwrap_or(from.name.as_str());
+        let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
         let ctx = EvalContext::new(schema_cols, Some(alias));
 
         // Index seek: if WHERE is `col = literal` (or commuted) and the
@@ -477,6 +485,176 @@ impl Engine {
             .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
             .collect();
 
+        Ok(QueryResult::Rows {
+            columns,
+            rows: output_rows,
+        })
+    }
+
+    /// Multi-table SELECT executor (one or more JOIN peers).
+    ///
+    /// v1.10 builds the joined row set up-front via nested-loop joins,
+    /// then runs WHERE + projection + ORDER BY against the combined
+    /// rows. No index seek. Aggregates and DISTINCT still work because
+    /// the executor delegates projection through the same shared paths.
+    #[allow(clippy::too_many_lines)]
+    fn exec_joined_select(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+    ) -> Result<QueryResult, EngineError> {
+        // Resolve every table reference up front so we surface
+        // TableNotFound before we start the cartesian work.
+        let primary_table = self
+            .active_catalog()
+            .get(&from.primary.name)
+            .ok_or_else(|| StorageError::TableNotFound {
+                name: from.primary.name.clone(),
+            })?;
+        let primary_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str())
+            .to_string();
+        let mut joined_tables: Vec<(&Table, String, JoinKind, Option<&Expr>)> = Vec::new();
+        for j in &from.joins {
+            let t = self.active_catalog().get(&j.table.name).ok_or_else(|| {
+                StorageError::TableNotFound {
+                    name: j.table.name.clone(),
+                }
+            })?;
+            let a = j
+                .table
+                .alias
+                .as_deref()
+                .unwrap_or(j.table.name.as_str())
+                .to_string();
+            joined_tables.push((t, a, j.kind, j.on.as_ref()));
+        }
+
+        // Build the combined schema: composite "alias.col" names so the
+        // qualified-column resolver can find anything by exact match.
+        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &primary_table.schema().columns {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{primary_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for (t, a, _, _) in &joined_tables {
+            for col in &t.schema().columns {
+                combined_schema.push(ColumnSchema::new(
+                    alloc::format!("{a}.{}", col.name),
+                    col.ty,
+                    col.nullable,
+                ));
+            }
+        }
+        let ctx = EvalContext::new(&combined_schema, None);
+
+        // Nested-loop join. Starting set: every primary row, padded with
+        // (no joined columns yet).
+        let mut working: Vec<Row> = primary_table.rows().to_vec();
+        let mut produced_len = primary_table.schema().columns.len();
+        for (t, _, kind, on) in &joined_tables {
+            let right_arity = t.schema().columns.len();
+            let mut next: Vec<Row> = Vec::new();
+            for left in &working {
+                let mut left_matched = false;
+                for right in t.rows() {
+                    let mut combined_vals = left.values.clone();
+                    combined_vals.extend(right.values.iter().cloned());
+                    // Pad combined to the eventual full width so the
+                    // partial schema still matches positions used by ON.
+                    let combined = Row::new(combined_vals);
+                    let keep = if let Some(on_expr) = on {
+                        let cond = eval::eval_expr(on_expr, &combined, &ctx)?;
+                        matches!(cond, Value::Bool(true))
+                    } else {
+                        // CROSS / comma-list: every pair survives.
+                        true
+                    };
+                    if keep {
+                        next.push(combined);
+                        left_matched = true;
+                    }
+                }
+                if !left_matched && matches!(kind, JoinKind::Left) {
+                    // LEFT OUTER JOIN: emit the left row with NULLs on
+                    // the right side when no peer matched.
+                    let mut combined_vals = left.values.clone();
+                    for _ in 0..right_arity {
+                        combined_vals.push(Value::Null);
+                    }
+                    next.push(Row::new(combined_vals));
+                }
+            }
+            working = next;
+            produced_len += right_arity;
+            debug_assert!(produced_len <= combined_schema.len());
+        }
+
+        // WHERE filter against combined rows.
+        let mut filtered: Vec<Row> = Vec::new();
+        for row in working {
+            if let Some(where_expr) = &stmt.where_ {
+                let cond = eval::eval_expr(where_expr, &row, &ctx)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            filtered.push(row);
+        }
+
+        // Aggregate path: handle GROUP BY / aggregate calls over the
+        // joined+filtered rows.
+        if aggregate::uses_aggregate(stmt) {
+            let refs: Vec<&Row> = filtered.iter().collect();
+            let mut agg = aggregate::run(stmt, &refs, &combined_schema, None)?;
+            if let Some(n) = stmt.limit {
+                agg.rows.truncate(n as usize);
+            }
+            return Ok(QueryResult::Rows {
+                columns: agg.columns,
+                rows: agg.rows,
+            });
+        }
+
+        let projection = build_projection(&stmt.items, &combined_schema, "")?;
+        let mut tagged: Vec<(Option<f64>, Row)> = Vec::new();
+        for row in &filtered {
+            let mut values = Vec::with_capacity(projection.len());
+            for p in &projection {
+                values.push(eval::eval_expr(&p.expr, row, &ctx)?);
+            }
+            let order_key = if let Some(order_expr) = &stmt.order_by {
+                let key = eval::eval_expr(order_expr, row, &ctx)?;
+                Some(value_to_order_key(&key)?)
+            } else {
+                None
+            };
+            tagged.push((order_key, Row::new(values)));
+        }
+        if stmt.order_by.is_some() {
+            tagged.sort_by(|a, b| {
+                let ka = a.0.unwrap_or(f64::INFINITY);
+                let kb = b.0.unwrap_or(f64::INFINITY);
+                ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal)
+            });
+        }
+        let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+        if stmt.distinct {
+            output_rows = dedup_rows(output_rows);
+        }
+        if let Some(n) = stmt.limit {
+            output_rows.truncate(n as usize);
+        }
+        let columns: Vec<ColumnSchema> = projection
+            .into_iter()
+            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .collect();
         Ok(QueryResult::Rows {
             columns,
             rows: output_rows,
@@ -601,6 +779,60 @@ fn resolve_col_literal_pair(
     Some((pos, v))
 }
 
+/// Find the schema entry that a SELECT-list `Expr::Column` refers to.
+/// Mirrors `resolve_column` in `eval.rs`, but returns a proper
+/// `EngineError` so the projection-build path keeps `UnknownQualifier`
+/// vs `ColumnNotFound` distinct.
+fn resolve_projection_column<'a>(
+    c: &ColumnName,
+    schema_cols: &'a [ColumnSchema],
+    table_alias: &str,
+) -> Result<&'a ColumnSchema, EngineError> {
+    if let Some(q) = &c.qualifier {
+        let composite = alloc::format!("{q}.{name}", name = c.name);
+        if let Some(s) = schema_cols.iter().find(|s| s.name == composite) {
+            return Ok(s);
+        }
+        // Single-table case: the qualifier may equal the active alias —
+        // then look for the bare column name.
+        if q == table_alias
+            && let Some(s) = schema_cols.iter().find(|s| s.name == c.name)
+        {
+            return Ok(s);
+        }
+        // For multi-table schemas the qualifier is unknown only if no
+        // column bears the "<q>." prefix. For single-table, the alias
+        // mismatch alone is enough.
+        let prefix = alloc::format!("{q}.");
+        let qualifier_known =
+            q == table_alias || schema_cols.iter().any(|s| s.name.starts_with(&prefix));
+        if !qualifier_known {
+            return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                qualifier: q.clone(),
+            }));
+        }
+        return Err(EngineError::Eval(EvalError::ColumnNotFound {
+            name: c.name.clone(),
+        }));
+    }
+    if let Some(s) = schema_cols.iter().find(|s| s.name == c.name) {
+        return Ok(s);
+    }
+    let suffix = alloc::format!(".{name}", name = c.name);
+    let mut matches = schema_cols.iter().filter(|s| s.name.ends_with(&suffix));
+    let first = matches.next();
+    let extra = matches.next();
+    match (first, extra) {
+        (Some(s), None) => Ok(s),
+        (Some(_), Some(_)) => Err(EngineError::Eval(EvalError::TypeMismatch {
+            detail: alloc::format!("ambiguous column reference: {}", c.name),
+        })),
+        _ => Err(EngineError::Eval(EvalError::ColumnNotFound {
+            name: c.name.clone(),
+        })),
+    }
+}
+
 fn build_projection(
     items: &[SelectItem],
     schema_cols: &[ColumnSchema],
@@ -628,20 +860,8 @@ fn build_projection(
                 // no static type — surface them as nullable TEXT, which is
                 // what most clients render anyway.
                 if let Expr::Column(c) = expr {
-                    if let Some(q) = &c.qualifier
-                        && q != table_alias
-                    {
-                        return Err(EngineError::Eval(EvalError::UnknownQualifier {
-                            qualifier: q.clone(),
-                        }));
-                    }
-                    let sch = schema_cols
-                        .iter()
-                        .find(|s| s.name == c.name)
-                        .ok_or_else(|| EvalError::ColumnNotFound {
-                            name: c.name.clone(),
-                        })?;
-                    let output_name = alias.clone().unwrap_or_else(|| sch.name.clone());
+                    let sch = resolve_projection_column(c, schema_cols, table_alias)?;
+                    let output_name = alias.clone().unwrap_or_else(|| c.name.clone());
                     out.push(ProjectedItem {
                         expr: expr.clone(),
                         output_name,

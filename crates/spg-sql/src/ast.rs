@@ -85,7 +85,7 @@ pub struct InsertStatement {
 pub struct SelectStatement {
     pub distinct: bool,
     pub items: Vec<SelectItem>,
-    pub from: Option<TableRef>,
+    pub from: Option<FromClause>,
     pub where_: Option<Expr>,
     pub group_by: Option<Vec<Expr>>,
     /// UNION / UNION ALL chain. Empty for a plain SELECT. Each peer is
@@ -115,6 +115,30 @@ pub enum SelectItem {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+}
+
+/// FROM clause shape. v1.10 accepts a primary table plus a flat list of
+/// joined peers — `FROM a [, b]* [INNER|LEFT] JOIN c ON expr ...`. The
+/// joins evaluate left-associatively in nested-loop order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromClause {
+    pub primary: TableRef,
+    pub joins: Vec<FromJoin>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromJoin {
+    pub kind: JoinKind,
+    pub table: TableRef,
+    /// Required for INNER/LEFT; must be `None` for CROSS / comma-list.
+    pub on: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,6 +404,23 @@ impl fmt::Display for SelectItem {
     }
 }
 
+impl fmt::Display for FromClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.primary)?;
+        for j in &self.joins {
+            match j.kind {
+                JoinKind::Inner => write!(f, " INNER JOIN {}", j.table)?,
+                JoinKind::Left => write!(f, " LEFT JOIN {}", j.table)?,
+                JoinKind::Cross => write!(f, " CROSS JOIN {}", j.table)?,
+            }
+            if let Some(on) = &j.on {
+                write!(f, " ON {on}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for TableRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", quote_ident(&self.name))?;
@@ -575,6 +616,11 @@ fn is_keyword(s: &str) -> bool {
             | "distinct"
             | "union"
             | "all"
+            | "join"
+            | "inner"
+            | "left"
+            | "cross"
+            | "outer"
     )
 }
 
@@ -621,9 +667,12 @@ mod tests {
     fn select_star_from_table() {
         let s = SelectStatement {
             items: vec![SelectItem::Wildcard],
-            from: Some(TableRef {
-                name: "users".into(),
-                alias: None,
+            from: Some(FromClause {
+                primary: TableRef {
+                    name: "users".into(),
+                    alias: None,
+                },
+                joins: vec![],
             }),
             where_: None,
             group_by: None,
