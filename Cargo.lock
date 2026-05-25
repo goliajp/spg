@@ -3,11 +3,22 @@
 version = 4
 
 [[package]]
+name = "spg-audit"
+version = "0.1.0"
+dependencies = [
+ "spg-crypto",
+]
+
+[[package]]
 name = "spg-cli"
 version = "0.1.0"
 dependencies = [
  "spg-wire",
 ]
+
+[[package]]
+name = "spg-crypto"
+version = "0.1.0"
 
 [[package]]
 name = "spg-engine"
@@ -21,6 +32,7 @@ dependencies = [
 name = "spg-server"
 version = "0.1.0"
 dependencies = [
+ "spg-audit",
  "spg-engine",
  "spg-storage",
  "spg-wire",

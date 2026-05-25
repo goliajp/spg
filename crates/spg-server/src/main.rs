@@ -1,18 +1,20 @@
 //! SPG daemon — TCP listener that accepts wire frames and dispatches them.
 //!
-//! v0.6 adds optional persistence: pass a second CLI arg with a file path and
-//! the daemon will restore the catalog from it on startup and atomically
-//! snapshot after every successful DDL / DML statement.
+//! v0.7 CLI:
 //!
 //! ```text
-//! spg-server [addr] [db_path]
+//! spg-server [addr] [db_path] [audit_path]
 //! ```
 //!
-//! Both arguments are optional. `addr` defaults to `127.0.0.1:5544`. When
-//! `db_path` is absent the engine is fully in-memory.
+//! - `addr` defaults to `127.0.0.1:5544`.
+//! - `db_path` (3rd positional) enables catalog persistence — atomic snapshot
+//!   after every successful DDL / DML. Pass `-` (or omit) to stay in-memory.
+//! - `audit_path` enables an append-only BLAKE3 hash-chain audit log — every
+//!   successful DDL / DML is bound to the previous entry by hash, so any
+//!   tamper / reorder / splice is caught on startup. Pass `-` to skip.
 
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -21,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use spg_audit::AuditLog;
 use spg_engine::{Engine, EngineError, QueryResult};
 use spg_storage::{Catalog, ColumnSchema, DataType, Row, Value};
 use spg_wire::{
@@ -34,19 +37,26 @@ const READ_CHUNK: usize = 4096;
 struct ServerState {
     engine: Mutex<Engine>,
     db_path: Option<PathBuf>,
+    audit_log: Mutex<AuditLog>,
+    audit_path: Option<PathBuf>,
+}
+
+fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
+    arg.filter(|s| !s.is_empty() && s != "-").map(PathBuf::from)
 }
 
 fn main() {
     let mut args = env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
-    let db_path = args.next().map(PathBuf::from);
-    if let Err(e) = run(&addr, db_path) {
+    let db_path = parse_optional_path(args.next());
+    let audit_path = parse_optional_path(args.next());
+    if let Err(e) = run(&addr, db_path, audit_path) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
     }
 }
 
-fn run(addr: &str, db_path: Option<PathBuf>) -> std::io::Result<()> {
+fn run(addr: &str, db_path: Option<PathBuf>, audit_path: Option<PathBuf>) -> std::io::Result<()> {
     let engine = match &db_path {
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;
@@ -69,9 +79,33 @@ fn run(addr: &str, db_path: Option<PathBuf>) -> std::io::Result<()> {
         None => Engine::new(),
     };
 
+    let audit_log = match &audit_path {
+        Some(p) if p.exists() => {
+            let bytes = fs::read(p)?;
+            let log = AuditLog::deserialize(&bytes).map_err(|e| {
+                std::io::Error::other(format!("audit log {} rejected: {e}", p.display()))
+            })?;
+            eprintln!(
+                "spg-server: verified audit log {} ({} entries)",
+                p.display(),
+                log.len()
+            );
+            log
+        }
+        Some(p) => {
+            // Write a fresh header so the first append has somewhere to go.
+            fs::write(p, AuditLog::header_bytes())?;
+            eprintln!("spg-server: started fresh audit log at {}", p.display());
+            AuditLog::new()
+        }
+        None => AuditLog::new(),
+    };
+
     let state = Arc::new(ServerState {
         engine: Mutex::new(engine),
         db_path,
+        audit_log: Mutex::new(audit_log),
+        audit_path,
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -126,8 +160,6 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
                 Ok(s) => s.to_string(),
                 Err(e) => return write_frame(stream, &build_error_response(&e.to_string())),
             };
-            // Lock once: execute + (if writeful) take a snapshot byte buffer
-            // under the same lock so the file matches a definite state.
             let (result, snapshot) = {
                 let mut engine = state
                     .engine
@@ -140,15 +172,24 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
                 };
                 (result, snap)
             };
+            // Snapshot the catalog first; an audit entry that survives a
+            // partial flush would be inconsistent.
             if let (Some(bytes), Some(path)) = (snapshot, state.db_path.as_deref())
                 && let Err(e) = write_atomic(path, &bytes)
             {
-                // Report the snapshot failure to the client AND propagate up so
-                // the connection is torn down — better fail loud than silently
-                // lose durability guarantees.
                 let _ = write_frame(
                     stream,
                     &build_error_response(&format!("snapshot write failed: {e}")),
+                );
+                return Err(e);
+            }
+            // Audit-log this successful writeful query.
+            if matches!(result, Ok(QueryResult::CommandOk { .. }))
+                && let Err(e) = append_audit(state, &sql)
+            {
+                let _ = write_frame(
+                    stream,
+                    &build_error_response(&format!("audit append failed: {e}")),
                 );
                 return Err(e);
             }
@@ -167,10 +208,29 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
     }
 }
 
+fn append_audit(state: &ServerState, sql: &str) -> std::io::Result<()> {
+    let ts_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(u64::MAX);
+    let mut log = state
+        .audit_log
+        .lock()
+        .map_err(|_| std::io::Error::other("audit mutex poisoned"))?;
+    log.append(sql.to_string(), ts_ms);
+    if let Some(path) = state.audit_path.as_deref() {
+        let mut entry_bytes = Vec::new();
+        log.encode_entry_to(log.len() - 1, &mut entry_bytes);
+        let mut f = OpenOptions::new().append(true).open(path)?;
+        f.write_all(&entry_bytes)?;
+    }
+    Ok(())
+}
+
 /// Write `data` to `path` atomically: write to a sibling tmp file then
-/// `rename` over the target. `rename` is atomic on POSIX, so concurrent
-/// readers either see the old content or the new content, never a
-/// half-written file.
+/// `rename` over the target. `rename` is atomic on POSIX.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let pid = process::id();
@@ -180,7 +240,6 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = dir.join(format!(".spg-tmp-{pid}-{nanos}"));
     fs::write(&tmp, data)?;
     if let Err(e) = fs::rename(&tmp, path) {
-        // Best-effort cleanup on rename failure.
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
