@@ -32,6 +32,9 @@ pub enum Token {
     Values,
     Index,
     On,
+    Begin,
+    Commit,
+    Rollback,
 
     // Identifiers
     Ident(String),       // ASCII case-folded
@@ -254,6 +257,9 @@ fn keyword_or_ident(lower: String) -> Token {
         "values" => Token::Values,
         "index" => Token::Index,
         "on" => Token::On,
+        "begin" => Token::Begin,
+        "commit" => Token::Commit,
+        "rollback" => Token::Rollback,
         _ => Token::Ident(lower),
     }
 }

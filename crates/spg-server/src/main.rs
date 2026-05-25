@@ -166,8 +166,14 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
                     .lock()
                     .map_err(|_| std::io::Error::other("engine mutex poisoned"))?;
                 let result = engine.execute(&sql);
+                // Snapshot only when the committed catalog actually changed —
+                // i.e. for COMMIT and for writes outside a TX. Intra-TX writes
+                // and BEGIN/ROLLBACK never trigger persistence.
                 let snap = match &result {
-                    Ok(QueryResult::CommandOk { .. }) => Some(engine.snapshot()),
+                    Ok(QueryResult::CommandOk {
+                        modified_catalog: true,
+                        ..
+                    }) => Some(engine.snapshot()),
                     _ => None,
                 };
                 (result, snap)
@@ -183,9 +189,16 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
                 );
                 return Err(e);
             }
-            // Audit-log this successful writeful query.
-            if matches!(result, Ok(QueryResult::CommandOk { .. }))
-                && let Err(e) = append_audit(state, &sql)
+            // Audit-log only when the committed state actually changed. For
+            // a TX, this means one audit entry on COMMIT (its SQL text is
+            // "COMMIT" — the body of the TX is recorded only implicitly).
+            if matches!(
+                result,
+                Ok(QueryResult::CommandOk {
+                    modified_catalog: true,
+                    ..
+                })
+            ) && let Err(e) = append_audit(state, &sql)
             {
                 let _ = write_frame(
                     stream,
@@ -251,7 +264,7 @@ fn emit_result(
     result: Result<QueryResult, EngineError>,
 ) -> std::io::Result<()> {
     match result {
-        Ok(QueryResult::CommandOk { affected }) => {
+        Ok(QueryResult::CommandOk { affected, .. }) => {
             write_frame(stream, &build_command_complete(affected as u64))
         }
         Ok(QueryResult::Rows { columns, rows }) => {
