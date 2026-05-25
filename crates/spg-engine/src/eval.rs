@@ -1178,6 +1178,16 @@ fn arith(
     float_op: impl Fn(f64, f64) -> f64,
     op_name: &str,
 ) -> Result<Value, EvalError> {
+    // Widen SmallInt to Int up front so the rest of the arithmetic
+    // table only deals with Int / BigInt / Float pairs.
+    let widen = |v: Value| -> Value {
+        match v {
+            Value::SmallInt(n) => Value::Int(i32::from(n)),
+            other => other,
+        }
+    };
+    let l = widen(l);
+    let r = widen(r);
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => {
             let result = int_op(i64::from(a), i64::from(b)).ok_or(EvalError::TypeMismatch {

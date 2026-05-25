@@ -455,11 +455,21 @@ impl Parser {
         };
         let ty = match ty_ident.as_str() {
             "smallint" => ColumnTypeName::SmallInt,
-            "int" => ColumnTypeName::Int,
+            // MySQL flavours we accept by aliasing to the closest SPG
+            // type. TINYINT covers MySQL's i8 — we hold it in an i16
+            // since SPG doesn't have a dedicated i8. MEDIUMINT (MySQL
+            // 24-bit) maps to INT. UNSIGNED modifiers are consumed
+            // below without semantic effect.
+            "tinyint" => ColumnTypeName::SmallInt,
+            "mediumint" => ColumnTypeName::Int,
+            // MySQL's INTEGER spelling for INT.
+            "int" | "integer" => ColumnTypeName::Int,
             "bigint" => ColumnTypeName::BigInt,
             "float" => ColumnTypeName::Float,
+            // MySQL DOUBLE / REAL are 64-bit IEEE — same as our FLOAT.
+            "double" | "real" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
-            "bool" => ColumnTypeName::Bool,
+            "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
             "char" => ColumnTypeName::Char(self.parse_paren_size("CHAR")?),
             "vector" => ColumnTypeName::Vector(self.parse_paren_size("VECTOR")?),
@@ -478,6 +488,13 @@ impl Parser {
                 });
             }
         };
+        // MySQL's `UNSIGNED` modifier sits right after the type
+        // keyword. SPG doesn't carry a separate unsigned variant —
+        // accepting the keyword keeps existing schemas compatible
+        // without changing semantics. Drop it silently.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unsigned")) {
+            self.advance();
+        }
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
         // each at most once.
