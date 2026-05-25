@@ -9,3 +9,10 @@ description  = "In-memory storage primitives for SPG: values, rows, table schema
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name    = "catalog"
+harness = false

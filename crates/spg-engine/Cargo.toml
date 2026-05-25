@@ -13,3 +13,10 @@ spg-storage = { path = "../spg-storage" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name    = "execute"
+harness = false
