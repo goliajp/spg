@@ -506,12 +506,16 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
     }
 }
 
-/// Convert an INSERT VALUES expression to a storage Value. v0.3 supports
-/// literal expressions and unary-minus over numeric literals — anything more
-/// complex (column refs, binary ops, etc.) returns `Unsupported`.
+/// Convert an INSERT VALUES expression to a storage Value. Supports literal
+/// expressions, unary-minus over numeric literals, and pgvector-style
+/// `'[..]'::vector` cast (v1.2). Anything more complex returns `Unsupported`.
 fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
     match expr {
         Expr::Literal(l) => Ok(literal_to_value(l)),
+        Expr::VectorCast(inner) => {
+            let inner_value = literal_expr_to_value(*inner)?;
+            crate::eval::cast_to_vector(inner_value).map_err(EngineError::Eval)
+        }
         Expr::Unary {
             op: UnOp::Neg,
             expr,

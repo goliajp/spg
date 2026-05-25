@@ -108,6 +108,11 @@ pub enum Expr {
         op: UnOp,
         expr: Box<Expr>,
     },
+    /// PG-style `expr::vector` cast. v1.2 supports `::vector` only; the
+    /// engine parses the inner text-literal `'[1,2,3]'` into a Vector value
+    /// at evaluation time (or, when nested in INSERT VALUES, at planning
+    /// time). Other type casts are reserved for v1.x.
+    VectorCast(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +149,11 @@ pub enum BinOp {
     /// pgvector L2 (Euclidean) distance `<->`. Defined for two vector
     /// operands of equal dimension; engine returns `Value::Float(d)`.
     L2Distance,
+    /// pgvector inner-product `<#>` — returns `-Σ aᵢ bᵢ` so "smaller =
+    /// more similar" remains true (matches pgvector's published convention).
+    InnerProduct,
+    /// pgvector cosine distance `<=>` — `1 - (a·b)/(|a| |b|)`.
+    CosineDistance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +296,7 @@ impl fmt::Display for Expr {
                 UnOp::Not => write!(f, "(NOT {expr})"),
                 UnOp::Neg => write!(f, "(-{expr})"),
             },
+            Self::VectorCast(inner) => write!(f, "({inner}::vector)"),
         }
     }
 }
@@ -354,6 +365,8 @@ impl fmt::Display for BinOp {
             Self::Mul => "*",
             Self::Div => "/",
             Self::L2Distance => "<->",
+            Self::InnerProduct => "<#>",
+            Self::CosineDistance => "<=>",
         })
     }
 }

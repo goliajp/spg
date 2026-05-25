@@ -71,6 +71,14 @@ pub enum Token {
     /// pgvector L2 distance operator `<->`. Lexed as one token so the
     /// parser can give it its own precedence rung.
     L2Distance,
+    /// pgvector inner-product operator `<#>` (returns negative dot product
+    /// so smaller still means more similar — same semantics as pgvector).
+    InnerProduct,
+    /// pgvector cosine distance operator `<=>`.
+    CosineDistance,
+    /// PG-style cast `expr::type` — single token because we want it to bind
+    /// at postfix precedence.
+    DoubleColon,
 
     Eof,
 }
@@ -198,19 +206,29 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             b'.' => single(&mut out, Token::Dot, &mut i),
             b'=' => single(&mut out, Token::Eq, &mut i),
             b'<' => {
-                if peek_eq(bytes, i + 1, b'=') {
+                if peek_eq(bytes, i + 1, b'=') && peek_eq(bytes, i + 2, b'>') {
+                    out.push(Token::CosineDistance);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'#') && peek_eq(bytes, i + 2, b'>') {
+                    out.push(Token::InnerProduct);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'-') && peek_eq(bytes, i + 2, b'>') {
+                    out.push(Token::L2Distance);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'=') {
                     out.push(Token::LtEq);
                     i += 2;
                 } else if peek_eq(bytes, i + 1, b'>') {
                     out.push(Token::NotEq);
                     i += 2;
-                } else if peek_eq(bytes, i + 1, b'-') && peek_eq(bytes, i + 2, b'>') {
-                    out.push(Token::L2Distance);
-                    i += 3;
                 } else {
                     out.push(Token::Lt);
                     i += 1;
                 }
+            }
+            b':' if peek_eq(bytes, i + 1, b':') => {
+                out.push(Token::DoubleColon);
+                i += 2;
             }
             b'>' => {
                 if peek_eq(bytes, i + 1, b'=') {
@@ -584,5 +602,63 @@ mod tests {
             lex("ORDER BY LIMIT"),
             vec![Token::Order, Token::By, Token::Limit, Token::Eof]
         );
+    }
+
+    // --- v1.2: pgvector distance ops + PG cast --------------------------
+
+    #[test]
+    fn inner_product_operator_3char() {
+        assert_eq!(
+            lex("a <#> b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::InnerProduct,
+                Token::Ident("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn cosine_distance_operator_3char() {
+        assert_eq!(
+            lex("a <=> b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::CosineDistance,
+                Token::Ident("b".into()),
+                Token::Eof,
+            ]
+        );
+        // Make sure `<=` and `<>` and `<->` still lex right when `<=>` is
+        // around (greedy match takes the longest).
+        assert_eq!(
+            lex("a <= b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::LtEq,
+                Token::Ident("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn double_colon_cast_token() {
+        assert_eq!(
+            lex("x::INT"),
+            vec![
+                Token::Ident("x".into()),
+                Token::DoubleColon,
+                Token::Ident("int".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_single_colon_is_unknown_char() {
+        let err = tokenize(":x").unwrap_err();
+        assert!(matches!(err.kind, LexErrorKind::UnknownChar(':')));
     }
 }

@@ -6,21 +6,21 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 101 | 23 | 0 | 81.5% |
 | `pg_regress` | 25 | 8 | 0 | 75.8% |
-| `pgvector` | 38 | 4 | 0 | 90.5% |
+| `pgvector` | 42 | 0 | 0 | 100.0% |
 
 ## Top fail patterns
 
 | count | pattern |
 |---|---|
-| 5 | `record 5: parse: parse error at` |
 | 4 | `record 2: parse: parse error at` |
-| 3 | `record 1: parse: parse error at` |
+| 4 | `record 5: parse: parse error at` |
 | 3 | `record 3: parse: parse error at` |
-| 3 | `record 4: parse: parse error at` |
 | 3 | `record 6: parse: parse error at` |
 | 3 | `record 7: parse: parse error at` |
-| 2 | `record 2: row mismatch | expected:` |
+| 2 | `record 1: parse: parse error at` |
+| 2 | `record 4: parse: parse error at` |
 | 1 | `record 0: parse: parse error at` |
+| 1 | `record 2: row mismatch | expected:` |
 | 1 | `record 4: eval: column not found:` |
 | 1 | `record 7: row mismatch | expected:` |
 | 1 | `record 8: parse: parse error at` |
@@ -97,9 +97,9 @@ Per-corpus pass / fail / skip:
 
 <details><summary>`18_cast_expr.test` fail snippets</summary>
 
-- record 2: parse: parse error at token #0: lex: unknown char ':' at byte 8
-- record 3: parse: parse error at token #0: lex: unknown char ':' at byte 8
-- record 4: parse: parse error at token #0: lex: unknown char ':' at byte 10
+- record 2: parse: parse error at token #3: only `::vector` cast is supported in v1.2 (got `::text`)
+- record 3: parse: parse error at token #3: only `::vector` cast is supported in v1.2 (got `::float`)
+- record 4: parse: parse error at token #3: only `::vector` cast is supported in v1.2 (got `::int`)
 </details>
 
 ### `pg_regress/`
@@ -135,17 +135,5 @@ Per-corpus pass / fail / skip:
 | `03_dim_mismatch.test` | 4 | 0 | 0 |
 | `04_l2_distance_order_limit.test` | 8 | 0 | 0 |
 | `05_vector_in_transaction.test` | 10 | 0 | 0 |
-| `06_distance_variants.test` | 4 | 2 | 0 |
-| `07_cast_vector_literal.test` | 1 | 2 | 0 |
-
-<details><summary>`06_distance_variants.test` fail snippets</summary>
-
-- record 4: parse: parse error at token #0: lex: unknown char '#' at byte 31
-- record 5: parse: parse error at token #8: unexpected token Gt in expression
-</details>
-
-<details><summary>`07_cast_vector_literal.test` fail snippets</summary>
-
-- record 1: parse: parse error at token #0: lex: unknown char ':' at byte 33
-- record 2: row mismatch |   expected: ["[1.000, 2.000, 3.000]"] |   actual:   []
-</details>
+| `06_distance_variants.test` | 6 | 0 | 0 |
+| `07_cast_vector_literal.test` | 3 | 0 | 0 |
