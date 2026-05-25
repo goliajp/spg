@@ -38,6 +38,18 @@ pub struct CreateIndexStatement {
     pub name: String,
     pub table: String,
     pub column: String,
+    /// Optional `USING <method>` clause. v2.0 recognises `hnsw` (NSW
+    /// graph for vector kNN); unspecified is the default B-tree index.
+    pub method: IndexMethod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethod {
+    /// Default — B-tree over `IndexKey`. Used for equality / range
+    /// lookups on scalar columns.
+    BTree,
+    /// `USING hnsw` — NSW graph for kNN over a vector column.
+    Hnsw,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -310,11 +322,14 @@ impl fmt::Display for CreateIndexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CREATE INDEX {} ON {} ({})",
+            "CREATE INDEX {} ON {} ",
             quote_ident(&self.name),
-            quote_ident(&self.table),
-            quote_ident(&self.column),
-        )
+            quote_ident(&self.table)
+        )?;
+        if matches!(self.method, IndexMethod::Hnsw) {
+            f.write_str("USING hnsw ")?;
+        }
+        write!(f, "({})", quote_ident(&self.column))
     }
 }
 

@@ -18,8 +18,8 @@ use core::mem;
 
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreateTableStatement, Expr, FromClause, FromJoin, InsertStatement, JoinKind, Literal,
-    SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
+    CreateTableStatement, Expr, FromClause, FromJoin, IndexMethod, InsertStatement, JoinKind,
+    Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -337,6 +337,25 @@ impl Parser {
         }
         self.advance();
         let table = self.expect_ident_like()?;
+        // Optional `USING <method>` — only recognised method in v2.0 is
+        // `hnsw` (a single-layer NSW graph for kNN). `USING` is the bare
+        // ident `using` (we don't promote it to a reserved keyword
+        // because it isn't reserved anywhere else in our SQL surface).
+        let method = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+            self.advance();
+            let m = self.expect_ident_like()?;
+            match m.to_ascii_lowercase().as_str() {
+                "hnsw" => IndexMethod::Hnsw,
+                "btree" => IndexMethod::BTree,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "unknown index method {other:?}; supported: hnsw, btree"
+                    )));
+                }
+            }
+        } else {
+            IndexMethod::BTree
+        };
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!(
                 "expected '(' before indexed column, got {:?}",
@@ -356,6 +375,7 @@ impl Parser {
             name,
             table,
             column,
+            method,
         }))
     }
 

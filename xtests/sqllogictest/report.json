@@ -52,7 +52,7 @@
         { "file": "05_savepoints.test", "pass": 8, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pgvector", "pass": 42, "fail": 0, "skip": 0,
+    { "name": "pgvector", "pass": 53, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_vector_column.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -67,6 +67,8 @@
         { "file": "06_distance_variants.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "07_cast_vector_literal.test", "pass": 3, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "08_hnsw_knn.test", "pass": 11, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] }
   ]
