@@ -1,0 +1,28 @@
+# Column and table aliases
+
+statement ok
+CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO users VALUES (1, 'alice')
+
+statement ok
+INSERT INTO users VALUES (2, 'bob')
+
+query I nosort
+SELECT id AS user_id FROM users WHERE id = 2
+----
+2
+
+query I nosort
+SELECT u.id FROM users AS u WHERE u.id = 1
+----
+1
+
+query IT nosort
+SELECT u.id, u.name FROM users AS u ORDER BY u.id
+----
+1
+alice
+2
+bob

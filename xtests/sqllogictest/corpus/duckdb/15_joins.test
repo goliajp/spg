@@ -1,0 +1,44 @@
+# JOINs — PG / DuckDB / MySQL bread-and-butter.
+
+statement ok
+CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE TABLE o (uid INT NOT NULL, total INT NOT NULL)
+
+statement ok
+INSERT INTO u VALUES (1, 'alice')
+
+statement ok
+INSERT INTO u VALUES (2, 'bob')
+
+statement ok
+INSERT INTO o VALUES (1, 100)
+
+statement ok
+INSERT INTO o VALUES (1, 200)
+
+statement ok
+INSERT INTO o VALUES (2, 50)
+
+# Inner join.
+query TI rowsort
+SELECT u.name, o.total FROM u, o WHERE u.id = o.uid
+----
+alice
+100
+alice
+200
+bob
+50
+
+# Explicit INNER JOIN ... ON
+query TI rowsort
+SELECT u.name, o.total FROM u INNER JOIN o ON u.id = o.uid
+----
+alice
+100
+alice
+200
+bob
+50

@@ -1,0 +1,22 @@
+# `expr::type` cast — PG syntax, also accepted by DuckDB.
+
+statement ok
+CREATE TABLE t (a INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (42)
+
+query T nosort
+SELECT a::TEXT FROM t
+----
+42
+
+query R nosort
+SELECT a::FLOAT FROM t
+----
+42.000
+
+query I nosort
+SELECT '7'::INT
+----
+7

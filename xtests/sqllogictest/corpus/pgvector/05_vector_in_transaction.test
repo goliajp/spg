@@ -1,0 +1,35 @@
+# pgvector: vector inserts inside a transaction are atomic
+
+statement ok
+CREATE TABLE emb (id INT NOT NULL, v VECTOR(2) NOT NULL)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO emb VALUES (1, [1.0, 1.0])
+
+statement ok
+INSERT INTO emb VALUES (2, [2.0, 2.0])
+
+statement ok
+ROLLBACK
+
+# Nothing committed.
+query I nosort
+SELECT id FROM emb
+----
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO emb VALUES (10, [0.5, 0.5])
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM emb
+----
+10

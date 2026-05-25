@@ -49,3 +49,11 @@ version = "1.0.0"
 [[package]]
 name = "spg-wire"
 version = "1.0.0"
+
+[[package]]
+name = "sqllogictest"
+version = "1.0.0"
+dependencies = [
+ "spg-engine",
+ "spg-storage",
+]

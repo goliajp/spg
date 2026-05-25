@@ -1,0 +1,17 @@
+# pgvector: CREATE TABLE with VECTOR(N) columns
+
+statement ok
+CREATE TABLE small_emb (id INT NOT NULL, v VECTOR(3) NOT NULL)
+
+statement ok
+CREATE TABLE medium_emb (id INT NOT NULL, v VECTOR(128))
+
+statement ok
+CREATE TABLE pair (a VECTOR(2) NOT NULL, b VECTOR(2) NOT NULL)
+
+# Two vectors of different dims in the same table is fine.
+statement ok
+CREATE TABLE mixed_dim (a VECTOR(3) NOT NULL, b VECTOR(5))
+
+statement ok
+CREATE TABLE typed_row (id INT NOT NULL, name TEXT NOT NULL, embedding VECTOR(4))

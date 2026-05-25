@@ -9,6 +9,7 @@ members = [
     "crates/spg-engine",
     "crates/spg-server",
     "crates/spg-cli",
+    "xtests/sqllogictest",
 ]
 
 [workspace.package]

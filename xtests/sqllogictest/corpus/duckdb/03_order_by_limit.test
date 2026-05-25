@@ -1,0 +1,31 @@
+# ORDER BY and LIMIT
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (3, 'cara')
+
+statement ok
+INSERT INTO t VALUES (1, 'alice')
+
+statement ok
+INSERT INTO t VALUES (2, 'bob')
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t ORDER BY id LIMIT 2
+----
+1
+2
+
+query T nosort
+SELECT name FROM t ORDER BY id LIMIT 1
+----
+alice

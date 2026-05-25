@@ -1,0 +1,12 @@
+# `||` string concatenation — standard SQL, supported by PG / DuckDB / SQLite.
+
+statement ok
+CREATE TABLE t (a TEXT NOT NULL, b TEXT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES ('hello', 'world')
+
+query T nosort
+SELECT a || ' ' || b FROM t
+----
+hello world

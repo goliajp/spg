@@ -1,0 +1,35 @@
+# CREATE INDEX + index-seek planner
+
+statement ok
+CREATE TABLE u (id INT NOT NULL, email TEXT NOT NULL)
+
+statement ok
+INSERT INTO u VALUES (1, 'a@x')
+
+statement ok
+INSERT INTO u VALUES (2, 'b@x')
+
+statement ok
+INSERT INTO u VALUES (3, 'c@x')
+
+statement ok
+CREATE INDEX by_id ON u (id)
+
+# Result must be the same as without an index — index is an optimisation.
+query T nosort
+SELECT email FROM u WHERE id = 2
+----
+b@x
+
+query T nosort
+SELECT email FROM u WHERE id = 99
+----
+
+# Index on text column also works.
+statement ok
+CREATE INDEX by_email ON u (email)
+
+query I nosort
+SELECT id FROM u WHERE email = 'a@x'
+----
+1

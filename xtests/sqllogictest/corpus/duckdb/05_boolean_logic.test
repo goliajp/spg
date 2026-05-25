@@ -1,0 +1,35 @@
+# AND / OR / NOT three-valued logic
+
+statement ok
+CREATE TABLE f (id INT NOT NULL, ok BOOL)
+
+statement ok
+INSERT INTO f VALUES (1, TRUE)
+
+statement ok
+INSERT INTO f VALUES (2, FALSE)
+
+statement ok
+INSERT INTO f VALUES (3, NULL)
+
+# Only TRUE rows pass; FALSE and NULL filtered.
+query I nosort
+SELECT id FROM f WHERE ok
+----
+1
+
+query I nosort
+SELECT id FROM f WHERE NOT ok
+----
+2
+
+query I nosort
+SELECT id FROM f WHERE ok OR id = 3
+----
+1
+3
+
+# TRUE AND NULL → NULL → filtered.
+query I nosort
+SELECT id FROM f WHERE ok AND id = 3
+----

@@ -1,0 +1,17 @@
+# `IS NULL` / `IS NOT NULL` — v1 SPG doesn't implement; expect errors.
+
+statement ok
+CREATE TABLE u (id INT NOT NULL, name TEXT)
+
+statement ok
+INSERT INTO u VALUES (1, 'alice')
+
+statement ok
+INSERT INTO u VALUES (2, NULL)
+
+# WHERE col IS NULL — should parse fail in v1.
+statement error
+SELECT id FROM u WHERE name IS NULL
+
+statement error
+SELECT id FROM u WHERE name IS NOT NULL

@@ -1,0 +1,17 @@
+# PG-specific column types: SMALLINT / NUMERIC / VARCHAR / CHAR.
+# v1 SPG only has INT / BIGINT / FLOAT / TEXT / BOOL / VECTOR.
+
+statement ok
+CREATE TABLE small_ints (x SMALLINT)
+
+statement ok
+CREATE TABLE money (price NUMERIC(10, 2))
+
+statement ok
+CREATE TABLE bounded (name VARCHAR(64))
+
+statement ok
+CREATE TABLE fixed (code CHAR(4))
+
+statement ok
+CREATE TABLE with_default (n INT DEFAULT 0)

@@ -1,0 +1,29 @@
+# pgvector: INSERT vector literals with various dims and signs
+
+statement ok
+CREATE TABLE emb (id INT NOT NULL, v VECTOR(3) NOT NULL)
+
+statement ok
+INSERT INTO emb VALUES (1, [1.0, 2.0, 3.0])
+
+statement ok
+INSERT INTO emb VALUES (2, [-1.5, 0.0, 2.25])
+
+statement ok
+INSERT INTO emb VALUES (3, [0.0, 0.0, 0.0])
+
+# Integer-looking literals are accepted and stored as f32.
+statement ok
+INSERT INTO emb VALUES (4, [1, 2, 3])
+
+query IT nosort
+SELECT id, v FROM emb ORDER BY id
+----
+1
+[1.000, 2.000, 3.000]
+2
+[-1.500, 0.000, 2.250]
+3
+[0.000, 0.000, 0.000]
+4
+[1.000, 2.000, 3.000]

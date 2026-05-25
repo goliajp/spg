@@ -1,0 +1,14 @@
+# Column-list INSERT: `INSERT INTO t (col1, col2) VALUES (...)`
+# PG / DuckDB / MySQL all support this. SPG v1 doesn't.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, score INT)
+
+# Provocative: SPG v1 lacks column-list INSERT.
+statement ok
+INSERT INTO t (id, name) VALUES (1, 'alice')
+
+query I nosort
+SELECT score FROM t WHERE id = 1
+----
+NULL
