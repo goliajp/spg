@@ -865,6 +865,9 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Null => Ok(f64::INFINITY),
         Value::SmallInt(n) => Ok(f64::from(*n)),
         Value::Int(n) => Ok(f64::from(*n)),
+        Value::Date(d) => Ok(f64::from(*d)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Timestamp(t) => Ok(*t as f64),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -1320,6 +1323,8 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Bool => DataType::Bool,
         ColumnTypeName::Vector(n) => DataType::Vector(n),
         ColumnTypeName::Numeric(precision, scale) => DataType::Numeric { precision, scale },
+        ColumnTypeName::Date => DataType::Date,
+        ColumnTypeName::Timestamp => DataType::Timestamp,
     }
 }
 
@@ -1383,6 +1388,7 @@ fn int_value_for(n: i64) -> Value {
 /// (`BigInt → Int` succeeds only when the value fits in `i32`). Everything
 /// else returns `TypeMismatch` carrying the column name for caller diagnostics.
 /// `NULL` is always permitted; the nullability check happens later in storage.
+#[allow(clippy::too_many_lines)]
 fn coerce_value(
     v: Value,
     expected: DataType,
@@ -1422,6 +1428,36 @@ fn coerce_value(
             ),
             (Value::Float(x), DataType::Numeric { precision, scale }) => {
                 Some(numeric_from_float(x, precision, scale, col_name)?)
+            }
+            // Text → DATE / TIMESTAMP: parse canonical text forms.
+            (Value::Text(s), DataType::Date) => {
+                let d = eval::parse_date_literal(&s).ok_or_else(|| {
+                    EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot parse {s:?} as DATE for column `{col_name}`"
+                        ),
+                    })
+                })?;
+                Some(Value::Date(d))
+            }
+            (Value::Text(s), DataType::Timestamp) => {
+                let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
+                    EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot parse {s:?} as TIMESTAMP for column `{col_name}`"
+                        ),
+                    })
+                })?;
+                Some(Value::Timestamp(t))
+            }
+            // DATE ↔ TIMESTAMP convertibility (DATE → midnight,
+            // TIMESTAMP → day truncation).
+            (Value::Date(d), DataType::Timestamp) => {
+                Some(Value::Timestamp(i64::from(d) * 86_400_000_000))
+            }
+            (Value::Timestamp(t), DataType::Date) => {
+                let days = t.div_euclid(86_400_000_000);
+                i32::try_from(days).ok().map(Value::Date)
             }
             (
                 Value::Numeric {

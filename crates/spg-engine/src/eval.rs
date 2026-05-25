@@ -257,6 +257,52 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
         CastTarget::BigInt => cast_numeric_to_bigint(v),
         CastTarget::Float => cast_numeric_to_float(v),
         CastTarget::Bool => cast_to_bool(v),
+        CastTarget::Date => cast_to_date(v),
+        CastTarget::Timestamp => cast_to_timestamp(v),
+    }
+}
+
+fn cast_to_date(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Date(d) => Ok(Value::Date(d)),
+        // Timestamp truncates to its day boundary.
+        Value::Timestamp(t) => {
+            let days = t.div_euclid(86_400_000_000);
+            i32::try_from(days)
+                .map(Value::Date)
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: "timestamp out of DATE range".into(),
+                })
+        }
+        Value::Text(s) => parse_date_literal(&s)
+            .map(Value::Date)
+            .ok_or(EvalError::TypeMismatch {
+                detail: format!("cannot parse {s:?} as DATE (expected YYYY-MM-DD)"),
+            }),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("cannot cast {:?} to DATE", other.data_type()),
+        }),
+    }
+}
+
+fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Timestamp(t) => Ok(Value::Timestamp(t)),
+        // DATE → TIMESTAMP picks midnight on the date.
+        Value::Date(d) => Ok(Value::Timestamp(i64::from(d) * 86_400_000_000)),
+        Value::Text(s) => {
+            parse_timestamp_literal(&s)
+                .map(Value::Timestamp)
+                .ok_or(EvalError::TypeMismatch {
+                    detail: format!(
+                        "cannot parse {s:?} as TIMESTAMP \
+                     (expected YYYY-MM-DD[ HH:MM:SS[.ffffff]])"
+                    ),
+                })
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("cannot cast {:?} to TIMESTAMP", other.data_type()),
+        }),
     }
 }
 
@@ -273,8 +319,150 @@ fn value_to_text(v: &Value) -> String {
             format!("[{}]", cells.join(", "))
         }
         Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
+        Value::Date(d) => format_date(*d),
+        Value::Timestamp(t) => format_timestamp(*t),
         Value::Null => "NULL".into(),
     }
+}
+
+/// Render a `Date` (days since epoch) as `YYYY-MM-DD`. Negative values
+/// for pre-1970 dates render with a leading `-` on the year.
+pub fn format_date(days: i32) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Render a `Timestamp` (microseconds since epoch) as
+/// `YYYY-MM-DD HH:MM:SS[.fff...]`. Trailing-zero fractional digits are
+/// dropped; a whole-second value has no fractional part.
+pub fn format_timestamp(micros: i64) -> String {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    // Split into day + intra-day part with proper floor division so
+    // negative timestamps render right too.
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let day_micros = micros.rem_euclid(MICROS_PER_DAY);
+    let day_i32 = i32::try_from(days).unwrap_or(i32::MAX);
+    let (y, m, d) = civil_from_days(day_i32);
+    let secs = day_micros / 1_000_000;
+    let frac = day_micros % 1_000_000;
+    let hh = secs / 3600;
+    let mm = (secs / 60) % 60;
+    let ss = secs % 60;
+    if frac == 0 {
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
+    } else {
+        // Strip trailing zeros from the 6-digit fractional component.
+        let raw = format!("{frac:06}");
+        let trimmed = raw.trim_end_matches('0');
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{trimmed}")
+    }
+}
+
+/// Howard Hinnant's `civil_from_days` — converts days since the Unix
+/// epoch back to a proleptic-Gregorian (year, month, day) triple. Both
+/// directions of this calendar conversion live in `eval.rs` so the
+/// engine never reaches for `std` time facilities.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn civil_from_days(days: i32) -> (i32, u32, u32) {
+    let z = i64::from(days) + 719_468;
+    let era = z.div_euclid(146_097);
+    // doe ∈ [0, 146_097); fits in u32 with room to spare. Same for
+    // every other quantity below — `as u32` truncations are safe by
+    // construction.
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe.saturating_sub(doe / 1460) + doe / 36524 - doe / 146_096) / 365;
+    let y_base = i64::from(yoe) + era * 400;
+    let doy = doe.saturating_sub(365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy.saturating_sub((153 * mp + 2) / 5) + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y_base + 1 } else { y_base };
+    (y as i32, m, d)
+}
+
+/// Inverse of `civil_from_days` — converts (year, month, day) to days
+/// since 1970-01-01. Out-of-range months / days saturate.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
+    let y_adj = if m <= 2 {
+        i64::from(y) - 1
+    } else {
+        i64::from(y)
+    };
+    let era = y_adj.div_euclid(400);
+    let yoe = (y_adj - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d.saturating_sub(1);
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let total = era * 146_097 + i64::from(doe) - 719_468;
+    i32::try_from(total).unwrap_or(i32::MAX)
+}
+
+/// Parse `YYYY-MM-DD` into a `Date` (days since Unix epoch). Returns
+/// `None` on shape / numeric failure; the engine surfaces that as a
+/// `TypeMismatch` with the original text included.
+pub fn parse_date_literal(s: &str) -> Option<i32> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let y: i32 = s[0..4].parse().ok()?;
+    let m: u32 = s[5..7].parse().ok()?;
+    let d: u32 = s[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// Parse `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` into a `Timestamp`
+/// (microseconds since Unix epoch). The time portion is optional;
+/// missing → midnight. The fractional portion accepts 1–6 digits and
+/// pads with zeros to microseconds.
+pub fn parse_timestamp_literal(s: &str) -> Option<i64> {
+    let trimmed = s.trim();
+    let (date_part, time_part) = match trimmed.find([' ', 'T']) {
+        Some(i) => (&trimmed[..i], Some(&trimmed[i + 1..])),
+        None => (trimmed, None),
+    };
+    let days = parse_date_literal(date_part)?;
+    let day_micros = match time_part {
+        None => 0,
+        Some(t) => parse_time_of_day_micros(t)?,
+    };
+    Some(i64::from(days) * 86_400_000_000 + day_micros)
+}
+
+fn parse_time_of_day_micros(t: &str) -> Option<i64> {
+    let (time, frac_str) = match t.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (t, None),
+    };
+    let bytes = time.as_bytes();
+    if bytes.len() != 8 || bytes[2] != b':' || bytes[5] != b':' {
+        return None;
+    }
+    let hh: i64 = time[0..2].parse().ok()?;
+    let mm: i64 = time[3..5].parse().ok()?;
+    let ss: i64 = time[6..8].parse().ok()?;
+    if !(0..24).contains(&hh) || !(0..60).contains(&mm) || !(0..60).contains(&ss) {
+        return None;
+    }
+    let frac_micros: i64 = match frac_str {
+        None => 0,
+        Some(f) => {
+            // Pad right with zeros to 6 digits, then truncate extras.
+            if f.is_empty() || f.len() > 9 {
+                return None;
+            }
+            let mut padded = String::with_capacity(6);
+            padded.push_str(&f[..f.len().min(6)]);
+            while padded.len() < 6 {
+                padded.push('0');
+            }
+            padded.parse().ok()?
+        }
+    };
+    Some(((hh * 3600 + mm * 60 + ss) * 1_000_000) + frac_micros)
 }
 
 /// Render a `Numeric { scaled, scale }` as its decimal text form.
@@ -947,6 +1135,40 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         }
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        // Date / Timestamp compare on their integer storage repr.
+        // Cross-domain (Date vs Timestamp) lifts the Date to the
+        // matching midnight TIMESTAMP first.
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::Date(a), Value::Timestamp(b)) => (i64::from(*a) * 86_400_000_000).cmp(b),
+        (Value::Timestamp(a), Value::Date(b)) => a.cmp(&(i64::from(*b) * 86_400_000_000)),
+        // PG-style implicit coercion: comparing a DATE / TIMESTAMP
+        // column against a text literal lifts the literal into the
+        // matching domain (e.g. `day >= '2024-01-01'`).
+        (Value::Date(a), Value::Text(b)) => {
+            let bd = parse_date_literal(b).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("cannot parse {b:?} as DATE for comparison"),
+            })?;
+            a.cmp(&bd)
+        }
+        (Value::Text(a), Value::Date(b)) => {
+            let ad = parse_date_literal(a).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("cannot parse {a:?} as DATE for comparison"),
+            })?;
+            ad.cmp(b)
+        }
+        (Value::Timestamp(a), Value::Text(b)) => {
+            let bt = parse_timestamp_literal(b).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("cannot parse {b:?} as TIMESTAMP for comparison"),
+            })?;
+            a.cmp(&bt)
+        }
+        (Value::Text(a), Value::Timestamp(b)) => {
+            let at = parse_timestamp_literal(a).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("cannot parse {a:?} as TIMESTAMP for comparison"),
+            })?;
+            at.cmp(b)
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(

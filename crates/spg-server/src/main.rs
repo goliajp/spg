@@ -568,13 +568,15 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         DataType::SmallInt | DataType::Int => WireType::Int,
         DataType::BigInt => WireType::BigInt,
         DataType::Float => WireType::Float,
-        // VARCHAR / CHAR / NUMERIC collapse to TEXT on the wire — only
-        // the schema tracks bounds and precision/scale; values are
-        // plain UTF-8 (NUMERIC values render with their exact decimal
-        // representation).
-        DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::Numeric { .. } => {
-            WireType::Text
-        }
+        // VARCHAR / CHAR / NUMERIC / DATE / TIMESTAMP collapse to
+        // TEXT on the wire. Schema tracks bounds and precision; values
+        // are plain UTF-8 in their canonical text forms.
+        DataType::Text
+        | DataType::Varchar(_)
+        | DataType::Char(_)
+        | DataType::Numeric { .. }
+        | DataType::Date
+        | DataType::Timestamp => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -597,12 +599,14 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Text(s) => WireValue::Text(s.clone()),
         Value::Bool(b) => WireValue::Bool(*b),
         Value::Vector(v) => WireValue::Vector(v.clone()),
-        // NUMERIC renders as its exact decimal string on the wire.
-        // Drivers receive plain text, identical to what `value_to_text`
-        // produces in the engine.
+        // NUMERIC / DATE / TIMESTAMP render as their canonical
+        // text form on the wire. Drivers receive plain UTF-8,
+        // identical to what `value_to_text` produces in the engine.
         Value::Numeric { scaled, scale } => {
             WireValue::Text(spg_engine::eval::format_numeric(*scaled, *scale))
         }
+        Value::Date(d) => WireValue::Text(spg_engine::eval::format_date(*d)),
+        Value::Timestamp(t) => WireValue::Text(spg_engine::eval::format_timestamp(*t)),
     }
 }
 

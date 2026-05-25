@@ -46,7 +46,7 @@
         { "file": "01_dialect.test", "pass": 12, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 53, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 66, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -57,6 +57,8 @@
         { "file": "04_pg_types.test", "pass": 24, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "05_savepoints.test", "pass": 8, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "06_date_time.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 53, "fail": 0, "skip": 0,
