@@ -21,6 +21,8 @@ dependencies = [
 name = "spg-server"
 version = "0.1.0"
 dependencies = [
+ "spg-engine",
+ "spg-storage",
  "spg-wire",
 ]
 
