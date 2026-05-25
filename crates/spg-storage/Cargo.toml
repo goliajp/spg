@@ -1,0 +1,11 @@
+[package]
+name         = "spg-storage"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "In-memory storage primitives for SPG: values, rows, table schema, catalog."
+
+[lints]
+workspace = true

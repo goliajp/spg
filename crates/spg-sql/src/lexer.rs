@@ -25,6 +25,11 @@ pub enum Token {
     And,
     Or,
     Not,
+    Create,
+    Table,
+    Insert,
+    Into,
+    Values,
 
     // Identifiers
     Ident(String),       // ASCII case-folded
@@ -240,6 +245,11 @@ fn keyword_or_ident(lower: String) -> Token {
         "and" => Token::And,
         "or" => Token::Or,
         "not" => Token::Not,
+        "create" => Token::Create,
+        "table" => Token::Table,
+        "insert" => Token::Insert,
+        "into" => Token::Into,
+        "values" => Token::Values,
         _ => Token::Ident(lower),
     }
 }

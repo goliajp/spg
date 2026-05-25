@@ -17,7 +17,8 @@ use core::fmt;
 use core::mem;
 
 use crate::ast::{
-    BinOp, ColumnName, Expr, Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp,
+    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateTableStatement, Expr, InsertStatement,
+    Literal, SelectItem, SelectStatement, Statement, TableRef, UnOp,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -52,7 +53,7 @@ impl From<LexError> for ParseError {
 pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
     let tokens = lexer::tokenize(input)?;
     let mut p = Parser::new(tokens);
-    let stmt = p.parse_select_stmt()?;
+    let stmt = p.parse_one_statement()?;
     if matches!(p.peek(), Token::Semicolon) {
         p.advance();
     }
@@ -108,10 +109,20 @@ impl Parser {
         }
     }
 
-    fn parse_select_stmt(&mut self) -> Result<Statement, ParseError> {
-        if !matches!(self.peek(), Token::Select) {
-            return Err(self.err(format!("expected SELECT, got {:?}", self.peek())));
+    fn parse_one_statement(&mut self) -> Result<Statement, ParseError> {
+        match self.peek() {
+            Token::Select => self.parse_select_stmt(),
+            Token::Create => self.parse_create_table_stmt(),
+            Token::Insert => self.parse_insert_stmt(),
+            other => Err(self.err(format!(
+                "expected SELECT / CREATE / INSERT at start of statement, got {other:?}"
+            ))),
         }
+    }
+
+    fn parse_select_stmt(&mut self) -> Result<Statement, ParseError> {
+        // Caller dispatches on Token::Select; assert and advance.
+        debug_assert!(matches!(self.peek(), Token::Select));
         self.advance();
         let items = self.parse_select_list()?;
         let from = if matches!(self.peek(), Token::From) {
@@ -131,6 +142,137 @@ impl Parser {
             from,
             where_,
         }))
+    }
+
+    fn parse_create_table_stmt(&mut self) -> Result<Statement, ParseError> {
+        debug_assert!(matches!(self.peek(), Token::Create));
+        self.advance();
+        if !matches!(self.peek(), Token::Table) {
+            return Err(self.err(format!(
+                "expected TABLE after CREATE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let name = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "expected '(' after table name, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_column_def()?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(
+                        self.err(format!("expected ',' or ')' in column list, got {other:?}"))
+                    );
+                }
+            }
+        }
+        if columns.is_empty() {
+            return Err(self.err("CREATE TABLE requires at least one column".into()));
+        }
+        Ok(Statement::CreateTable(CreateTableStatement {
+            name,
+            columns,
+        }))
+    }
+
+    fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
+        let name = self.expect_ident_like()?;
+        // Type keyword arrives as a bare Ident (we did not promote type names
+        // to keyword tokens — see lexer rationale).
+        let ty_ident = match self.advance() {
+            Token::Ident(s) => s,
+            other => {
+                return Err(ParseError {
+                    message: format!("expected column type, got {other:?}"),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
+        };
+        let ty = match ty_ident.as_str() {
+            "int" => ColumnTypeName::Int,
+            "bigint" => ColumnTypeName::BigInt,
+            "float" => ColumnTypeName::Float,
+            "text" => ColumnTypeName::Text,
+            "bool" => ColumnTypeName::Bool,
+            other => {
+                return Err(ParseError {
+                    message: format!("unsupported column type {other:?}"),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
+        };
+        // Optional NOT NULL.
+        let nullable = if matches!(self.peek(), Token::Not) {
+            self.advance();
+            if !matches!(self.peek(), Token::Null) {
+                return Err(self.err(format!(
+                    "expected NULL after NOT in column def, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            false
+        } else {
+            true
+        };
+        Ok(ColumnDef { name, ty, nullable })
+    }
+
+    fn parse_insert_stmt(&mut self) -> Result<Statement, ParseError> {
+        debug_assert!(matches!(self.peek(), Token::Insert));
+        self.advance();
+        if !matches!(self.peek(), Token::Into) {
+            return Err(self.err(format!("expected INTO after INSERT, got {:?}", self.peek())));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::Values) {
+            return Err(self.err(format!(
+                "expected VALUES after table name, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("expected '(' after VALUES, got {:?}", self.peek())));
+        }
+        self.advance();
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_expr(0)?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(
+                        self.err(format!("expected ',' or ')' in VALUES list, got {other:?}"))
+                    );
+                }
+            }
+        }
+        if values.is_empty() {
+            return Err(self.err("INSERT VALUES requires at least one value".into()));
+        }
+        Ok(Statement::Insert(InsertStatement { table, values }))
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParseError> {
@@ -313,26 +455,29 @@ mod tests {
     #[test]
     fn select_single_integer() {
         let s = parse("SELECT 1");
-        match s {
-            Statement::Select(s) => {
-                assert_eq!(s.items.len(), 1);
-                assert!(s.from.is_none());
-                assert!(s.where_.is_none());
-            }
-        }
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
+        assert_eq!(s.items.len(), 1);
+        assert!(s.from.is_none());
+        assert!(s.where_.is_none());
     }
 
     #[test]
     fn select_multiple_literal_kinds() {
         let s = parse("SELECT 1, 'hi', NULL, TRUE, 1.5");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         assert_eq!(s.items.len(), 5);
     }
 
     #[test]
     fn select_wildcard_from_table() {
         let s = parse("SELECT * FROM users");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         assert!(matches!(s.items[..], [SelectItem::Wildcard]));
         assert_eq!(s.from.as_ref().unwrap().name, "users");
     }
@@ -340,7 +485,9 @@ mod tests {
     #[test]
     fn select_with_table_alias() {
         let s = parse("SELECT * FROM users AS u");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let t = s.from.as_ref().unwrap();
         assert_eq!(t.name, "users");
         assert_eq!(t.alias.as_deref(), Some("u"));
@@ -349,7 +496,9 @@ mod tests {
     #[test]
     fn select_with_where_eq() {
         let s = parse("SELECT a FROM t WHERE a = 1");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let w = s.where_.unwrap();
         assert_eq!(
             w,
@@ -364,7 +513,9 @@ mod tests {
     #[test]
     fn arithmetic_precedence() {
         let s = parse("SELECT 1 + 2 * 3");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             panic!("wildcard?")
         };
@@ -385,7 +536,9 @@ mod tests {
     #[test]
     fn parentheses_override_precedence() {
         let s = parse("SELECT (1 + 2) * 3");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             panic!()
         };
@@ -407,7 +560,9 @@ mod tests {
     fn not_binds_below_comparison() {
         // `NOT a = 1` should parse as `NOT (a = 1)`.
         let s = parse("SELECT NOT a = 1 FROM t");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             panic!()
         };
@@ -428,7 +583,9 @@ mod tests {
     fn unary_minus_binds_above_multiplication() {
         // `-a * 2` should be `(-a) * 2`.
         let s = parse("SELECT -a * 2 FROM t");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             panic!()
         };
@@ -448,7 +605,9 @@ mod tests {
     #[test]
     fn qualified_column() {
         let s = parse("SELECT t.col FROM t");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             panic!()
         };
@@ -464,7 +623,9 @@ mod tests {
     #[test]
     fn select_item_alias_with_as() {
         let s = parse("SELECT a AS y FROM t");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let SelectItem::Expr { alias, .. } = &s.items[0] else {
             panic!()
         };
@@ -474,7 +635,9 @@ mod tests {
     #[test]
     fn trailing_semicolon_accepted() {
         let s = parse("SELECT 1;");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         assert_eq!(s.items.len(), 1);
     }
 
@@ -482,7 +645,9 @@ mod tests {
     fn boolean_chain_with_and_or_not() {
         // (NOT a) OR (b AND (NOT c))
         let s = parse("SELECT NOT a OR b AND NOT c FROM t");
-        let Statement::Select(s) = s;
+        let Statement::Select(s) = s else {
+            panic!("expected SELECT")
+        };
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             panic!()
         };
@@ -521,5 +686,102 @@ mod tests {
         let text = original.to_string();
         let again = parse_statement(&text).expect("re-parse");
         assert_eq!(original, again);
+    }
+
+    // --- CREATE TABLE & INSERT (v0.3) ---------------------------------------
+
+    #[test]
+    fn create_table_single_column() {
+        let s = parse("CREATE TABLE foo (a INT)");
+        let Statement::CreateTable(c) = s else {
+            panic!("expected CreateTable")
+        };
+        assert_eq!(c.name, "foo");
+        assert_eq!(c.columns.len(), 1);
+        assert_eq!(c.columns[0].name, "a");
+        assert_eq!(c.columns[0].ty, ColumnTypeName::Int);
+        assert!(c.columns[0].nullable);
+    }
+
+    #[test]
+    fn create_table_multi_column_with_not_null_mix() {
+        let s = parse("CREATE TABLE u (id INT NOT NULL, name TEXT, score FLOAT NOT NULL, ok BOOL)");
+        let Statement::CreateTable(c) = s else {
+            panic!()
+        };
+        assert_eq!(c.columns.len(), 4);
+        assert_eq!(c.columns[0].ty, ColumnTypeName::Int);
+        assert!(!c.columns[0].nullable);
+        assert_eq!(c.columns[1].ty, ColumnTypeName::Text);
+        assert!(c.columns[1].nullable);
+        assert_eq!(c.columns[2].ty, ColumnTypeName::Float);
+        assert!(!c.columns[2].nullable);
+        assert_eq!(c.columns[3].ty, ColumnTypeName::Bool);
+    }
+
+    #[test]
+    fn create_table_bigint_supported() {
+        let s = parse("CREATE TABLE accounts (id BIGINT NOT NULL)");
+        let Statement::CreateTable(c) = s else {
+            panic!()
+        };
+        assert_eq!(c.columns[0].ty, ColumnTypeName::BigInt);
+    }
+
+    #[test]
+    fn create_table_unknown_type_errors() {
+        let err = parse_statement("CREATE TABLE x (a NUMERIC)").unwrap_err();
+        assert!(err.message.contains("unsupported column type"));
+    }
+
+    #[test]
+    fn create_table_missing_table_keyword_errors() {
+        assert!(parse_statement("CREATE x (a INT)").is_err());
+    }
+
+    #[test]
+    fn insert_single_value() {
+        let s = parse("INSERT INTO foo VALUES (42)");
+        let Statement::Insert(i) = s else {
+            panic!("expected Insert")
+        };
+        assert_eq!(i.table, "foo");
+        assert_eq!(i.values.len(), 1);
+        assert!(matches!(i.values[0], Expr::Literal(Literal::Integer(42))));
+    }
+
+    #[test]
+    fn insert_multi_value_with_mixed_literals() {
+        let s = parse("INSERT INTO foo VALUES (1, 'hi', 3.14, TRUE, NULL)");
+        let Statement::Insert(i) = s else { panic!() };
+        assert_eq!(i.values.len(), 5);
+    }
+
+    #[test]
+    fn insert_missing_into_errors() {
+        assert!(parse_statement("INSERT foo VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn create_table_round_trip() {
+        let original =
+            parse("CREATE TABLE foo (id BIGINT NOT NULL, label TEXT, score FLOAT NOT NULL)");
+        let text = original.to_string();
+        let again = parse_statement(&text).expect("re-parse");
+        assert_eq!(original, again);
+    }
+
+    #[test]
+    fn insert_round_trip_with_negation_and_string() {
+        let original = parse("INSERT INTO t VALUES (-1, 'it''s', NULL)");
+        let text = original.to_string();
+        let again = parse_statement(&text).expect("re-parse");
+        assert_eq!(original, again);
+    }
+
+    #[test]
+    fn unknown_keyword_at_statement_start_errors() {
+        let err = parse_statement("UPDATE foo SET x = 1").unwrap_err();
+        assert!(err.message.contains("expected SELECT"));
     }
 }

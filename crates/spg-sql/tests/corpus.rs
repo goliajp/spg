@@ -25,6 +25,19 @@ const CORPUS: &[&str] = &[
     "SELECT * FROM t WHERE x = TRUE OR x = FALSE",
     "SELECT u.name AS who, u.score AS pts FROM users AS u WHERE u.score >= 80",
     "SELECT 1 / 2 + 3 * 4 - 5",
+    // --- v0.3: DDL & DML --------------------------------------------------
+    "CREATE TABLE foo (a INT)",
+    "CREATE TABLE bar (a INT NOT NULL)",
+    "CREATE TABLE users (id BIGINT NOT NULL, name TEXT NOT NULL, age INT, score FLOAT)",
+    "CREATE TABLE flags (id INT NOT NULL, active BOOL NOT NULL)",
+    "CREATE TABLE accounts (id BIGINT NOT NULL, balance FLOAT, label TEXT NOT NULL)",
+    "INSERT INTO foo VALUES (1)",
+    "INSERT INTO foo VALUES (-1)",
+    "INSERT INTO foo VALUES (1, 'hi', 3.14, TRUE, NULL)",
+    "INSERT INTO accounts VALUES (42, NULL, 'alice')",
+    "INSERT INTO t VALUES ('it''s', 1 + 2)",
+    "INSERT INTO logs VALUES (NULL, 'event', FALSE)",
+    "INSERT INTO foo VALUES (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
 ];
 
 #[test]
