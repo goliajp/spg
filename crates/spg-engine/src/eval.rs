@@ -17,6 +17,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use spg_sql::ast::{BinOp, ColumnName, Expr, Literal, UnOp};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
@@ -73,7 +74,44 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             let r = eval_expr(rhs, row, ctx)?;
             apply_binary(*op, l, r)
         }
+        Expr::VectorCast(inner) => {
+            let v = eval_expr(inner, row, ctx)?;
+            cast_to_vector(v)
+        }
     }
+}
+
+/// Parse a `Value::Text("[1.0, 2.0, 3.0]")` into a `Value::Vector(..)`. Mirrors
+/// pgvector's `'[..]'::vector` cast. NULL casts as NULL.
+pub fn cast_to_vector(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Vector(v) => Ok(Value::Vector(v)),
+        Value::Text(s) => parse_vector_text(&s)
+            .map(Value::Vector)
+            .ok_or(EvalError::TypeMismatch {
+                detail: format!("cannot parse {s:?} as a vector literal"),
+            }),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!("::vector requires text input, got {:?}", other.data_type()),
+        }),
+    }
+}
+
+/// Parse `"[1.0, 2.0, -3]"` into `Vec<f32>`. Returns `None` on malformed input.
+fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
+    let trimmed = s.trim();
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    let trimmed_inner = inner.trim();
+    if trimmed_inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for part in trimmed_inner.split(',') {
+        let f: f32 = part.trim().parse().ok()?;
+        out.push(f);
+    }
+    Some(out)
 }
 
 fn literal_to_value(l: &Literal) -> Value {
@@ -161,10 +199,64 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::Mul => arith(l, r, i64::checked_mul, |a, b| a * b, "*"),
         BinOp::Div => div_op(l, r),
         BinOp::L2Distance => l2_distance(l, r),
+        BinOp::InnerProduct => inner_product(l, r),
+        BinOp::CosineDistance => cosine_distance(l, r),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
         BinOp::And | BinOp::Or => unreachable!("handled above"),
+    }
+}
+
+/// pgvector inner-product `<#>`. Returns the *negative* dot product so
+/// smaller still means more similar — same convention as pgvector.
+fn inner_product(l: Value, r: Value) -> Result<Value, EvalError> {
+    let (a, b) = unwrap_vec_pair(l, r, "<#>")?;
+    let mut dot: f64 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += f64::from(*x) * f64::from(*y);
+    }
+    Ok(Value::Float(-dot))
+}
+
+/// pgvector cosine distance `<=>` — `1 - (a·b) / (‖a‖ ‖b‖)`. A zero-norm
+/// operand produces NaN (matches pgvector).
+fn cosine_distance(l: Value, r: Value) -> Result<Value, EvalError> {
+    let (a, b) = unwrap_vec_pair(l, r, "<=>")?;
+    let mut dot: f64 = 0.0;
+    let mut na: f64 = 0.0;
+    let mut nb: f64 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let xf = f64::from(*x);
+        let yf = f64::from(*y);
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    let denom = sqrt_newton(na) * sqrt_newton(nb);
+    if denom == 0.0 {
+        return Ok(Value::Float(f64::NAN));
+    }
+    Ok(Value::Float(1.0 - dot / denom))
+}
+
+fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>), EvalError> {
+    match (l, r) {
+        (Value::Vector(a), Value::Vector(b)) => {
+            if a.len() != b.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("vector dim mismatch in {op}: {} vs {}", a.len(), b.len()),
+                });
+            }
+            Ok((a, b))
+        }
+        (a, b) => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "{op} requires two vectors, got {:?} and {:?}",
+                a.data_type(),
+                b.data_type()
+            ),
+        }),
     }
 }
 
@@ -347,7 +439,9 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::Sub
         | BinOp::Mul
         | BinOp::Div
-        | BinOp::L2Distance => {
+        | BinOp::L2Distance
+        | BinOp::InnerProduct
+        | BinOp::CosineDistance => {
             unreachable!("compare() only called with comparison ops")
         }
     };

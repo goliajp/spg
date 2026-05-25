@@ -510,6 +510,36 @@ impl Parser {
                 token_pos: tok_pos,
             }),
         }
+        // After parsing the atom, fold any postfix `::vector` casts.
+        .and_then(|atom| self.finish_postfix_casts(atom))
+    }
+
+    /// While the next token is `::`, consume `::<type-ident>` and wrap the
+    /// expression. v1.2 only recognises `::vector`; other type names land in
+    /// later milestones.
+    fn finish_postfix_casts(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
+        while matches!(self.peek(), Token::DoubleColon) {
+            self.advance();
+            let ty_ident = match self.advance() {
+                Token::Ident(s) => s,
+                other => {
+                    return Err(ParseError {
+                        message: format!("expected type ident after `::`, got {other:?}"),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            };
+            if ty_ident.as_str() != "vector" {
+                return Err(ParseError {
+                    message: format!(
+                        "only `::vector` cast is supported in v1.2 (got `::{ty_ident}`)"
+                    ),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
+            expr = Expr::VectorCast(Box::new(expr));
+        }
+        Ok(expr)
     }
 
     /// Parse a pgvector array literal `[ x1, x2, ... ]`. The opening `[` is
@@ -572,9 +602,11 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::LtEq => (BinOp::LtEq, 4),
         Token::Gt => (BinOp::Gt, 4),
         Token::GtEq => (BinOp::GtEq, 4),
-        // `<->` binds tighter than comparisons so `col <-> v < threshold`
-        // parses as `(col <-> v) < threshold`.
+        // pgvector distance ops all sit on the same rung — tighter than
+        // comparisons (4) so `col <-> v < threshold` parses correctly.
         Token::L2Distance => (BinOp::L2Distance, 5),
+        Token::InnerProduct => (BinOp::InnerProduct, 5),
+        Token::CosineDistance => (BinOp::CosineDistance, 5),
         Token::Plus => (BinOp::Add, 6),
         Token::Minus => (BinOp::Sub, 6),
         Token::Star => (BinOp::Mul, 7),
@@ -993,6 +1025,56 @@ mod tests {
         assert_eq!(parse("ROLLBACK"), Statement::Rollback);
         // Trailing semicolons accepted too.
         assert_eq!(parse("BEGIN;"), Statement::Begin);
+    }
+
+    // --- v1.2: pgvector distance ops + ::vector cast --------------------
+
+    #[test]
+    fn inner_product_binop_parses() {
+        let s = parse("SELECT v <#> [1.0, 2.0] FROM t");
+        let Statement::Select(s) = s else { panic!() };
+        let SelectItem::Expr { expr, .. } = &s.items[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinOp::InnerProduct,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cosine_distance_binop_parses() {
+        let s = parse("SELECT v <=> [1.0, 2.0] FROM t");
+        let Statement::Select(s) = s else { panic!() };
+        let SelectItem::Expr { expr, .. } = &s.items[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinOp::CosineDistance,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vector_cast_postfix_wraps_string_literal() {
+        let s = parse("SELECT '[1,2,3]'::vector FROM t");
+        let Statement::Select(s) = s else { panic!() };
+        let SelectItem::Expr { expr, .. } = &s.items[0] else {
+            panic!()
+        };
+        assert!(matches!(expr, Expr::VectorCast(_)));
+    }
+
+    #[test]
+    fn unsupported_cast_target_errors() {
+        let err = parse_statement("SELECT 1::numeric FROM t").unwrap_err();
+        assert!(err.message.contains("::vector"));
     }
 
     #[test]
