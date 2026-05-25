@@ -1,20 +1,27 @@
 //! SPG daemon — TCP listener that accepts wire frames and dispatches them.
 //!
-//! v0.7 CLI:
+//! v0.10 CLI:
 //!
 //! ```text
-//! spg-server [addr] [db_path] [audit_path]
+//! spg-server [addr] [db_path] [audit_path] [wal_path]
 //! ```
 //!
 //! - `addr` defaults to `127.0.0.1:5544`.
-//! - `db_path` (3rd positional) enables catalog persistence — atomic snapshot
-//!   after every successful DDL / DML. Pass `-` (or omit) to stay in-memory.
+//! - `db_path` (2nd positional) is the catalog snapshot file. With WAL off it
+//!   is rewritten atomically after every successful DDL / DML. With WAL on
+//!   it's only the *initial* checkpoint — runtime writes go to the WAL.
 //! - `audit_path` enables an append-only BLAKE3 hash-chain audit log — every
 //!   successful DDL / DML is bound to the previous entry by hash, so any
-//!   tamper / reorder / splice is caught on startup. Pass `-` to skip.
+//!   tamper / reorder / splice is caught on startup.
+//! - `wal_path` enables a write-ahead log: every successful `CommandOk` SQL
+//!   text is appended (length-prefixed, fsync'd). On startup the WAL is
+//!   replayed on top of the db snapshot; an open transaction at end-of-WAL
+//!   (e.g. server crash mid-COMMIT) is auto-rolled-back.
+//!
+//! Pass `-` (or omit) to skip any positional after the first.
 
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -39,6 +46,10 @@ struct ServerState {
     db_path: Option<PathBuf>,
     audit_log: Mutex<AuditLog>,
     audit_path: Option<PathBuf>,
+    wal: Option<Mutex<File>>,
+    /// Kept so the path can be reported in error messages; runtime appends go
+    /// through `wal` directly.
+    _wal_path: Option<PathBuf>,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
@@ -50,14 +61,20 @@ fn main() {
     let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
     let db_path = parse_optional_path(args.next());
     let audit_path = parse_optional_path(args.next());
-    if let Err(e) = run(&addr, db_path, audit_path) {
+    let wal_path = parse_optional_path(args.next());
+    if let Err(e) = run(&addr, db_path, audit_path, wal_path) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
     }
 }
 
-fn run(addr: &str, db_path: Option<PathBuf>, audit_path: Option<PathBuf>) -> std::io::Result<()> {
-    let engine = match &db_path {
+fn run(
+    addr: &str,
+    db_path: Option<PathBuf>,
+    audit_path: Option<PathBuf>,
+    wal_path: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let mut engine = match &db_path {
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;
             let path_str = p.display();
@@ -101,11 +118,49 @@ fn run(addr: &str, db_path: Option<PathBuf>, audit_path: Option<PathBuf>) -> std
         None => AuditLog::new(),
     };
 
+    // Replay WAL onto the loaded snapshot. Truncated entries (server crash
+    // mid-fsync) abort the loop with a warning rather than fatal — the
+    // already-applied prefix wins, the trailing partial entry is dropped.
+    // An open TX at end-of-WAL is auto-rolled-back.
+    if let Some(p) = &wal_path
+        && p.exists()
+    {
+        let bytes = fs::read(p)?;
+        let applied = replay_wal_bytes(&bytes, &mut engine)?;
+        eprintln!(
+            "spg-server: replayed {} WAL entries from {}",
+            applied,
+            p.display()
+        );
+        if engine.in_transaction() {
+            eprintln!("spg-server: WAL ended mid-transaction — auto-rollback");
+            engine
+                .execute("ROLLBACK")
+                .map_err(|e| std::io::Error::other(format!("post-replay rollback: {e}")))?;
+        }
+    } else if let Some(p) = &wal_path {
+        // Create empty WAL file ahead of time so OpenOptions::append below
+        // doesn't need a `create(true)` branch.
+        fs::write(p, b"")?;
+        eprintln!("spg-server: started fresh WAL at {}", p.display());
+    }
+
+    let wal = match &wal_path {
+        Some(p) => Some(Mutex::new(
+            OpenOptions::new().append(true).open(p).map_err(|e| {
+                std::io::Error::other(format!("open WAL {} for append: {e}", p.display()))
+            })?,
+        )),
+        None => None,
+    };
+
     let state = Arc::new(ServerState {
         engine: Mutex::new(engine),
         db_path,
         audit_log: Mutex::new(audit_log),
         audit_path,
+        wal,
+        _wal_path: wal_path,
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -168,12 +223,17 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
                 let result = engine.execute(&sql);
                 // Snapshot only when the committed catalog actually changed —
                 // i.e. for COMMIT and for writes outside a TX. Intra-TX writes
-                // and BEGIN/ROLLBACK never trigger persistence.
-                let snap = match &result {
-                    Ok(QueryResult::CommandOk {
-                        modified_catalog: true,
-                        ..
-                    }) => Some(engine.snapshot()),
+                // and BEGIN/ROLLBACK never trigger persistence. Additionally,
+                // when WAL is on, we don't update the db snapshot at runtime:
+                // the WAL captures every op and the db file is checkpoint-only.
+                let snap = match (&result, state.wal.is_some()) {
+                    (
+                        Ok(QueryResult::CommandOk {
+                            modified_catalog: true,
+                            ..
+                        }),
+                        false,
+                    ) => Some(engine.snapshot()),
                     _ => None,
                 };
                 (result, snap)
@@ -186,6 +246,18 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
                 let _ = write_frame(
                     stream,
                     &build_error_response(&format!("snapshot write failed: {e}")),
+                );
+                return Err(e);
+            }
+            // Append every successful CommandOk SQL to the WAL (when WAL is on).
+            // This captures BEGIN/intra-TX/COMMIT/ROLLBACK literally so replay
+            // reconstructs state via engine.execute().
+            if matches!(result, Ok(QueryResult::CommandOk { .. }))
+                && let Err(e) = append_wal(state, &sql)
+            {
+                let _ = write_frame(
+                    stream,
+                    &build_error_response(&format!("WAL append failed: {e}")),
                 );
                 return Err(e);
             }
@@ -219,6 +291,60 @@ fn dispatch(stream: &mut TcpStream, frame: &Frame, state: &ServerState) -> std::
             &Frame::error("clients should not send Error frames"),
         ),
     }
+}
+
+/// Append one WAL entry: `[u32 LE sql_len][sql_bytes]`. Fsync'd before
+/// returning so a successful `CommandComplete` on the wire reflects durable
+/// state. Caller is expected to hold the engine lock around `execute()`,
+/// release it, then call this — there's no need to keep both locks held.
+fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
+    let Some(wal) = state.wal.as_ref() else {
+        return Ok(());
+    };
+    let len = u32::try_from(sql.len())
+        .map_err(|_| std::io::Error::other("SQL too large for WAL entry"))?;
+    let mut entry = Vec::with_capacity(4 + sql.len());
+    entry.extend_from_slice(&len.to_le_bytes());
+    entry.extend_from_slice(sql.as_bytes());
+    let mut f = wal
+        .lock()
+        .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
+    f.write_all(&entry)?;
+    f.sync_data()?;
+    Ok(())
+}
+
+/// Replay WAL bytes onto `engine`. Returns the number of entries applied.
+/// A truncated trailing entry (e.g. crash mid-append) is dropped with a
+/// warning to stderr. Non-truncation errors (engine rejected the SQL, bad
+/// UTF-8) are fatal — the operator must inspect.
+fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize> {
+    let mut cur = 0;
+    let mut applied = 0usize;
+    while cur < bytes.len() {
+        if bytes.len() - cur < 4 {
+            eprintln!(
+                "spg-server: WAL truncated at offset {cur} (need 4-byte length, have {})",
+                bytes.len() - cur
+            );
+            break;
+        }
+        let len_arr: [u8; 4] = bytes[cur..cur + 4].try_into().expect("checked");
+        let len = u32::from_le_bytes(len_arr) as usize;
+        cur += 4;
+        if cur + len > bytes.len() {
+            eprintln!("spg-server: WAL entry truncated (sql_len={len}) — dropping tail");
+            break;
+        }
+        let sql = core::str::from_utf8(&bytes[cur..cur + len])
+            .map_err(|_| std::io::Error::other("WAL entry has non-UTF-8 SQL"))?;
+        engine
+            .execute(sql)
+            .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+        cur += len;
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 fn append_audit(state: &ServerState, sql: &str) -> std::io::Result<()> {
