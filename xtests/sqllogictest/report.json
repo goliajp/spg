@@ -39,7 +39,7 @@
         { "file": "18_cast_expr.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 44, "fail": 3, "skip": 0,
+    { "name": "pg_regress", "pass": 50, "fail": 3, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -47,7 +47,7 @@
           "fail_reasons": [] },
         { "file": "03_dml_v2_unsupported.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "04_pg_types.test", "pass": 18, "fail": 0, "skip": 0,
+        { "file": "04_pg_types.test", "pass": 24, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "05_savepoints.test", "pass": 5, "fail": 3, "skip": 0,
           "fail_reasons": ["record 3: parse: parse error at token #0: expected SELECT / CREATE / INSERT / BEGIN / COMMIT / ROLLBACK at start of statement, got Ident(\"savepoint\")", "record 5: parse: parse error at token #1: expected end of input, got Ident(\"to\")", "record 7: row mismatch |   expected: [\"1\"] |   actual:   [\"1\", \"2\"]"] }

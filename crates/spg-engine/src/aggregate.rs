@@ -511,6 +511,13 @@ fn encode_key(vals: &[Value]) -> String {
                 }
                 out.push('|');
             }
+            Value::Numeric { scaled, scale } => {
+                out.push('D');
+                out.push_str(&scaled.to_string());
+                out.push('@');
+                out.push_str(&scale.to_string());
+                out.push('|');
+            }
         }
     }
     out

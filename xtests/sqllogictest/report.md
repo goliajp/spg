@@ -5,7 +5,7 @@ Per-corpus pass / fail / skip:
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
 | `duckdb` | 126 | 0 | 0 | 100.0% |
-| `pg_regress` | 44 | 3 | 0 | 93.6% |
+| `pg_regress` | 50 | 3 | 0 | 94.3% |
 | `pgvector` | 42 | 0 | 0 | 100.0% |
 
 ## Top fail patterns
@@ -48,7 +48,7 @@ Per-corpus pass / fail / skip:
 | `01_create_table_shapes.test` | 6 | 0 | 0 |
 | `02_insert_shapes.test` | 9 | 0 | 0 |
 | `03_dml_v2_unsupported.test` | 6 | 0 | 0 |
-| `04_pg_types.test` | 18 | 0 | 0 |
+| `04_pg_types.test` | 24 | 0 | 0 |
 | `05_savepoints.test` | 5 | 3 | 0 |
 
 <details><summary>`05_savepoints.test` fail snippets</summary>

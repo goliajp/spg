@@ -1,13 +1,37 @@
 # PG-specific column types: SMALLINT / NUMERIC / VARCHAR / CHAR / DEFAULT.
-# v1.11 adds SMALLINT, VARCHAR(n), CHAR(n), and DEFAULT clauses.
-# NUMERIC is reserved for v1.12 (fixed-point arithmetic).
+# v1.11 added SMALLINT/VARCHAR/CHAR/DEFAULT; v1.12 adds NUMERIC.
 
 statement ok
 CREATE TABLE small_ints (x SMALLINT)
 
-# NUMERIC parse-only (v1.12 will implement fixed-point arithmetic).
-statement error
+statement ok
 CREATE TABLE money (price NUMERIC(10, 2))
+
+# NUMERIC stores exact decimals — no f64 rounding artifacts.
+statement ok
+INSERT INTO money VALUES (123.45)
+
+statement ok
+INSERT INTO money VALUES (-9.99)
+
+statement ok
+INSERT INTO money VALUES (0.01)
+
+# Sorted by exact decimal value — no f64 rounding artifacts.
+query T nosort
+SELECT price FROM money ORDER BY price
+----
+-9.99
+0.01
+123.45
+
+# NUMERIC(10, 2) leaves 8 integer digits — 100000000 (9 digits) overflows.
+statement error
+INSERT INTO money VALUES (100000000.00)
+
+# But 99999999.99 (8 + 2 = 10 digits) fits exactly.
+statement ok
+INSERT INTO money VALUES (99999999.99)
 
 statement ok
 CREATE TABLE bounded (name VARCHAR(64))

@@ -512,9 +512,13 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         DataType::SmallInt | DataType::Int => WireType::Int,
         DataType::BigInt => WireType::BigInt,
         DataType::Float => WireType::Float,
-        // VARCHAR / CHAR collapse to TEXT on the wire — only the schema
-        // tracks the bound; values are plain UTF-8.
-        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => WireType::Text,
+        // VARCHAR / CHAR / NUMERIC collapse to TEXT on the wire — only
+        // the schema tracks bounds and precision/scale; values are
+        // plain UTF-8 (NUMERIC values render with their exact decimal
+        // representation).
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::Numeric { .. } => {
+            WireType::Text
+        }
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -537,6 +541,12 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Text(s) => WireValue::Text(s.clone()),
         Value::Bool(b) => WireValue::Bool(*b),
         Value::Vector(v) => WireValue::Vector(v.clone()),
+        // NUMERIC renders as its exact decimal string on the wire.
+        // Drivers receive plain text, identical to what `value_to_text`
+        // produces in the engine.
+        Value::Numeric { scaled, scale } => {
+            WireValue::Text(spg_engine::eval::format_numeric(*scaled, *scale))
+        }
     }
 }
 
