@@ -240,17 +240,61 @@ impl Engine {
                 })
             })?;
         let schema = table.schema().clone();
+        // Build a permutation `tuple_pos[c] = Some(j)` meaning schema
+        // column `c` is filled from the `j`-th tuple slot; `None` means
+        // "fill with NULL". Validated once and reused for every row.
+        let tuple_pos: Vec<Option<usize>> = match &stmt.columns {
+            None => (0..schema.columns.len()).map(Some).collect(),
+            Some(cols) => {
+                let mut map = alloc::vec![None; schema.columns.len()];
+                for (j, name) in cols.iter().enumerate() {
+                    let idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *name)
+                        .ok_or_else(|| {
+                            EngineError::Eval(EvalError::ColumnNotFound { name: name.clone() })
+                        })?;
+                    if map[idx].is_some() {
+                        return Err(EngineError::Storage(StorageError::ArityMismatch {
+                            expected: schema.columns.len(),
+                            actual: cols.len(),
+                        }));
+                    }
+                    map[idx] = Some(j);
+                }
+                // Omitted NOT NULL columns can't silently become NULL —
+                // raise before any storage write so the WAL stays clean.
+                for (i, col) in schema.columns.iter().enumerate() {
+                    if map[i].is_none() && !col.nullable {
+                        return Err(EngineError::Storage(StorageError::NullInNotNull {
+                            column: col.name.clone(),
+                        }));
+                    }
+                }
+                map
+            }
+        };
+        let expected_tuple_len = stmt.columns.as_ref().map_or(schema.columns.len(), Vec::len);
         let mut affected = 0usize;
         for tuple in stmt.rows {
-            if tuple.len() != schema.columns.len() {
+            if tuple.len() != expected_tuple_len {
                 return Err(EngineError::Storage(StorageError::ArityMismatch {
-                    expected: schema.columns.len(),
+                    expected: expected_tuple_len,
                     actual: tuple.len(),
                 }));
             }
-            let mut values = Vec::with_capacity(tuple.len());
-            for (i, (expr, col)) in tuple.into_iter().zip(&schema.columns).enumerate() {
-                let raw = literal_expr_to_value(expr)?;
+            // Stage the row in schema order so we can index by `tuple_pos`.
+            let raw_tuple: Vec<Value> = tuple
+                .into_iter()
+                .map(literal_expr_to_value)
+                .collect::<Result<_, _>>()?;
+            let mut values = Vec::with_capacity(schema.columns.len());
+            for (i, col) in schema.columns.iter().enumerate() {
+                let raw = match tuple_pos[i] {
+                    Some(j) => raw_tuple[j].clone(),
+                    None => Value::Null,
+                };
                 values.push(coerce_value(raw, col.ty, &col.name, i)?);
             }
             table.insert(Row::new(values))?;
