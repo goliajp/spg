@@ -41,6 +41,9 @@ pub struct CreateIndexStatement {
     /// Optional `USING <method>` clause. v2.0 recognises `hnsw` (NSW
     /// graph for vector kNN); unspecified is the default B-tree index.
     pub method: IndexMethod,
+    /// `IF NOT EXISTS` — engine returns `CommandOk` no-op when the
+    /// index name already exists, instead of raising `DuplicateIndex`.
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,9 @@ pub enum IndexMethod {
 pub struct CreateTableStatement {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    /// `IF NOT EXISTS` — engine returns `CommandOk` no-op when the
+    /// table name already exists, instead of raising `DuplicateTable`.
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +73,10 @@ pub struct ColumnDef {
     /// evaluates this once (with an empty row) and caches the resulting
     /// `Value` on the column schema.
     pub default: Option<Expr>,
+    /// MySQL-style `AUTO_INCREMENT` — the engine maintains a counter
+    /// per such column and fills the slot when INSERT leaves it
+    /// unbound (omitted from a column-list INSERT or explicitly NULL).
+    pub auto_increment: bool,
 }
 
 /// SQL-level type names. The mapping to the storage runtime's `DataType`
@@ -320,9 +330,13 @@ impl fmt::Display for Statement {
 
 impl fmt::Display for CreateIndexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE INDEX ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
         write!(
             f,
-            "CREATE INDEX {} ON {} ",
+            "{} ON {} ",
             quote_ident(&self.name),
             quote_ident(&self.table)
         )?;
@@ -335,7 +349,11 @@ impl fmt::Display for CreateIndexStatement {
 
 impl fmt::Display for CreateTableStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE TABLE {} (", quote_ident(&self.name))?;
+        f.write_str("CREATE TABLE ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "{} (", quote_ident(&self.name))?;
         for (i, col) in self.columns.iter().enumerate() {
             if i > 0 {
                 f.write_str(", ")?;
@@ -351,6 +369,9 @@ impl fmt::Display for ColumnDef {
         write!(f, "{} {}", quote_ident(&self.name), self.ty)?;
         if let Some(d) = &self.default {
             write!(f, " DEFAULT {d}")?;
+        }
+        if self.auto_increment {
+            f.write_str(" AUTO_INCREMENT")?;
         }
         if !self.nullable {
             f.write_str(" NOT NULL")?;

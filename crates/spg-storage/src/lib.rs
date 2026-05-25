@@ -153,6 +153,10 @@ pub struct ColumnSchema {
     /// means "no default" (so omitted columns become NULL, or error
     /// out when the column is NOT NULL).
     pub default: Option<Value>,
+    /// MySQL-style `AUTO_INCREMENT`. When set, an INSERT that leaves
+    /// this column unbound (or sets it to NULL) gets the next integer
+    /// computed from the column's current max + 1.
+    pub auto_increment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -306,6 +310,36 @@ impl Table {
 
     pub fn indices(&self) -> &[Index] {
         &self.indices
+    }
+
+    /// Compute the next `AUTO_INCREMENT` value for the column at
+    /// `col_pos`. Defined as `max(existing) + 1`, falling back to `1`
+    /// when the column currently holds no integer values. NULL / non-
+    /// integer cells are skipped. Returns `None` when the column isn't
+    /// an integer type.
+    pub fn next_auto_value(&self, col_pos: usize) -> Option<i64> {
+        let ty = self.schema.columns.get(col_pos)?.ty;
+        if !matches!(ty, DataType::SmallInt | DataType::Int | DataType::BigInt) {
+            return None;
+        }
+        let mut max: Option<i64> = None;
+        for row in &self.rows {
+            match row.values.get(col_pos) {
+                Some(Value::SmallInt(n)) => {
+                    let v = i64::from(*n);
+                    max = Some(max.map_or(v, |m| m.max(v)));
+                }
+                Some(Value::Int(n)) => {
+                    let v = i64::from(*n);
+                    max = Some(max.map_or(v, |m| m.max(v)));
+                }
+                Some(Value::BigInt(n)) => {
+                    max = Some(max.map_or(*n, |m| m.max(*n)));
+                }
+                _ => {}
+            }
+        }
+        Some(max.map_or(1, |m| m + 1))
     }
 
     /// Return the first index defined over `column_position`, if any.
@@ -746,6 +780,7 @@ impl ColumnSchema {
             ty,
             nullable,
             default: None,
+            auto_increment: false,
         }
     }
 
@@ -755,6 +790,13 @@ impl ColumnSchema {
     #[must_use]
     pub fn with_default(mut self, default: Value) -> Self {
         self.default = Some(default);
+        self
+    }
+
+    /// Builder-style helper to mark a column as `AUTO_INCREMENT`.
+    #[must_use]
+    pub const fn with_auto_increment(mut self) -> Self {
+        self.auto_increment = true;
         self
     }
 }
@@ -801,11 +843,12 @@ impl TableSchema {
 //           tag 7 (SmallInt) → i16 LE
 //           tag 8 (Numeric)  → i128 LE (16 bytes) + u8 scale
 //
-// Bumped to version 3 when NUMERIC was added.
+// Bumped to version 3 when NUMERIC was added; to version 4 when
+// AUTO_INCREMENT (per-column flag) + NSW index `kind` byte landed.
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 3;
+const FILE_VERSION: u8 = 4;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -835,6 +878,7 @@ impl Catalog {
                         write_value(&mut out, v);
                     }
                 }
+                out.push(u8::from(c.auto_increment));
             }
             write_u32(
                 &mut out,
@@ -908,11 +952,13 @@ impl Catalog {
                         )));
                     }
                 };
+                let auto_increment = cur.read_u8()? != 0;
                 cols.push(ColumnSchema {
                     name: c_name,
                     ty,
                     nullable,
                     default,
+                    auto_increment,
                 });
             }
             cat.create_table(TableSchema::new(name.clone(), cols))?;

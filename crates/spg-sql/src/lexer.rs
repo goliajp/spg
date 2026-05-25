@@ -186,6 +186,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 out.push(tok);
                 i += consumed;
             }
+            // MySQL-flavoured backtick-quoted identifier. Same semantics
+            // as the standard `"..."` form, including embedded "``" as
+            // a literal backtick.
+            b'`' => {
+                let (tok, consumed) = lex_quoted(input, i, b'`', true)?;
+                out.push(tok);
+                i += consumed;
+            }
             b if b.is_ascii_alphabetic() || b == b'_' => {
                 let start = i;
                 i += 1;

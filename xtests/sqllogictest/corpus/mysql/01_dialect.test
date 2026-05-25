@@ -1,0 +1,58 @@
+# MySQL dialect quirks SPG accepts in v2.1:
+# - backtick-quoted identifiers
+# - IF NOT EXISTS on CREATE TABLE / CREATE INDEX
+# - AUTO_INCREMENT column attribute
+
+# Backtick-quoted identifiers (same semantics as PG `"..."`).
+statement ok
+CREATE TABLE `Users` (`id` INT NOT NULL, `name` TEXT NOT NULL)
+
+# IF NOT EXISTS on a fresh name is a regular create.
+statement ok
+CREATE TABLE IF NOT EXISTS notes (id INT NOT NULL, body TEXT)
+
+# IF NOT EXISTS on an existing name is a no-op (no DuplicateTable error).
+statement ok
+CREATE TABLE IF NOT EXISTS notes (id INT NOT NULL, body TEXT)
+
+# AUTO_INCREMENT fills in omitted integer columns.
+statement ok
+CREATE TABLE counters (id BIGINT AUTO_INCREMENT NOT NULL, label TEXT)
+
+statement ok
+INSERT INTO counters (label) VALUES ('alpha')
+
+statement ok
+INSERT INTO counters (label) VALUES ('beta')
+
+# Explicit NULL still triggers AUTO_INCREMENT (MySQL parity).
+statement ok
+INSERT INTO counters VALUES (NULL, 'gamma')
+
+# Explicit ids skip the counter; subsequent AUTO_INCREMENT picks max+1.
+statement ok
+INSERT INTO counters VALUES (100, 'manual')
+
+statement ok
+INSERT INTO counters (label) VALUES ('after-manual')
+
+query IT nosort
+SELECT id, label FROM counters ORDER BY id
+----
+1
+alpha
+2
+beta
+3
+gamma
+100
+manual
+101
+after-manual
+
+# IF NOT EXISTS works for CREATE INDEX too.
+statement ok
+CREATE INDEX IF NOT EXISTS by_id ON counters (id)
+
+statement ok
+CREATE INDEX IF NOT EXISTS by_id ON counters (id)
