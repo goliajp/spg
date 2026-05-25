@@ -225,25 +225,32 @@ impl Parser {
         };
         head.limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
-            let n = match self.advance() {
-                Token::Integer(n) if n >= 0 => u32::try_from(n).map_err(|_| ParseError {
-                    message: format!("LIMIT value too large: {n}"),
-                    token_pos: self.pos.saturating_sub(1),
-                })?,
-                other => {
-                    return Err(ParseError {
-                        message: format!(
-                            "expected non-negative integer after LIMIT, got {other:?}"
-                        ),
-                        token_pos: self.pos.saturating_sub(1),
-                    });
-                }
-            };
+            let n = self.expect_u32_literal("LIMIT")?;
+            Some(n)
+        } else {
+            None
+        };
+        head.offset = if matches!(self.peek(), Token::Offset) {
+            self.advance();
+            let n = self.expect_u32_literal("OFFSET")?;
             Some(n)
         } else {
             None
         };
         Ok(Statement::Select(head))
+    }
+
+    fn expect_u32_literal(&mut self, label: &str) -> Result<u32, ParseError> {
+        match self.advance() {
+            Token::Integer(n) if n >= 0 => u32::try_from(n).map_err(|_| ParseError {
+                message: format!("{label} value too large: {n}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+            other => Err(ParseError {
+                message: format!("expected non-negative integer after {label}, got {other:?}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+        }
     }
 
     /// Parse one SELECT block without ORDER BY / LIMIT / UNION chaining —
@@ -312,6 +319,7 @@ impl Parser {
             unions: Vec::new(),
             order_by: None,
             limit: None,
+            offset: None,
         })
     }
 
@@ -454,20 +462,17 @@ impl Parser {
             }
         };
         let ty = match ty_ident.as_str() {
-            "smallint" => ColumnTypeName::SmallInt,
             // MySQL flavours we accept by aliasing to the closest SPG
-            // type. TINYINT covers MySQL's i8 — we hold it in an i16
+            // type. TINYINT covers MySQL's i8 — held inside SMALLINT
             // since SPG doesn't have a dedicated i8. MEDIUMINT (MySQL
-            // 24-bit) maps to INT. UNSIGNED modifiers are consumed
-            // below without semantic effect.
-            "tinyint" => ColumnTypeName::SmallInt,
-            "mediumint" => ColumnTypeName::Int,
-            // MySQL's INTEGER spelling for INT.
-            "int" | "integer" => ColumnTypeName::Int,
+            // 24-bit) → INT. UNSIGNED modifiers are consumed below
+            // without semantic effect.
+            "smallint" | "tinyint" => ColumnTypeName::SmallInt,
+            // INTEGER is MySQL's spelling for INT; MEDIUMINT widens up.
+            "int" | "integer" | "mediumint" => ColumnTypeName::Int,
             "bigint" => ColumnTypeName::BigInt,
-            "float" => ColumnTypeName::Float,
-            // MySQL DOUBLE / REAL are 64-bit IEEE — same as our FLOAT.
-            "double" | "real" => ColumnTypeName::Float,
+            // DOUBLE / REAL are 64-bit IEEE — same as our FLOAT.
+            "float" | "double" | "real" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),

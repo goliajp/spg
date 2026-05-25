@@ -1652,8 +1652,9 @@ mod tests {
         ))
         .unwrap();
         let t = cat.get_mut("docs").unwrap();
-        for i in 0..6 {
-            let base = i as f32 * 0.1;
+        for i in 0..6_i32 {
+            #[allow(clippy::cast_precision_loss)] // 0..6 — no precision lost
+            let base = (i as f32) * 0.1;
             let row = Row::new(alloc::vec![
                 Value::Int(i),
                 Value::Vector(alloc::vec![base, base + 0.05, base + 0.1]),
