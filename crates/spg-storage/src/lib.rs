@@ -490,6 +490,29 @@ impl Table {
         column_name: &str,
         m: usize,
     ) -> Result<(), StorageError> {
+        self.add_nsw_index_inner(name, column_name, m, None)
+    }
+
+    /// Restore an NSW index from a pre-built graph (used on
+    /// deserialize). Skips the bulk-build pass since the topology is
+    /// already known. Returns `DuplicateIndex` or `ColumnNotFound` on
+    /// schema mismatch as usual.
+    pub fn restore_nsw_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        graph: NswGraph,
+    ) -> Result<(), StorageError> {
+        self.add_nsw_index_inner(name, column_name, graph.m, Some(graph))
+    }
+
+    fn add_nsw_index_inner(
+        &mut self,
+        name: String,
+        column_name: &str,
+        m: usize,
+        restore: Option<NswGraph>,
+    ) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
         }
@@ -505,6 +528,14 @@ impl Table {
                 actual: self.schema.columns[column_position].ty,
                 position: column_position,
             });
+        }
+        if let Some(graph) = restore {
+            self.indices.push(Index {
+                name,
+                column_position,
+                kind: IndexKind::Nsw(graph),
+            });
+            return Ok(());
         }
         let idx = Index::new_nsw(name, column_position, m);
         self.indices.push(idx);
@@ -944,11 +975,12 @@ impl TableSchema {
 //
 // Bumped to version 3 when NUMERIC was added; to version 4 when
 // AUTO_INCREMENT (per-column flag) + NSW index `kind` byte landed;
-// to version 5 when DATE / TIMESTAMP were added.
+// to version 5 when DATE / TIMESTAMP were added; to version 6 when
+// NSW graph topology started travelling on disk (v2.7).
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 5;
+const FILE_VERSION: u8 = 6;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -989,12 +1021,12 @@ impl Catalog {
                     write_value(&mut out, v);
                 }
             }
-            // Index definitions (v0.8 + v2.0). Per-index payload:
+            // Index definitions. Per-index payload:
             //   [name][col_pos u16][kind u8]
-            //     kind 0 = B-tree    (no params)
-            //     kind 1 = NSW graph (u16 M)
-            // The actual graph / map is rebuilt by walking the restored
-            // rows.
+            //     kind 0 = B-tree           (no params — rebuilt on load)
+            //     kind 1 = NSW graph        (u16 M + serialized graph)
+            // For NSW the graph topology travels on disk so startup
+            // doesn't re-run the O(n²M) rebuild — see v2.7 notes.
             write_u16(
                 &mut out,
                 u16::try_from(t.indices.len()).expect("≤ 65k indices/table"),
@@ -1010,6 +1042,7 @@ impl Catalog {
                     IndexKind::Nsw(g) => {
                         out.push(1);
                         write_u16(&mut out, u16::try_from(g.m).expect("≤ 65k NSW neighbours"));
+                        write_nsw_graph(&mut out, g);
                     }
                 }
             }
@@ -1101,7 +1134,8 @@ impl Catalog {
                     }
                     1 => {
                         let m = cur.read_u16()? as usize;
-                        t.add_nsw_index(idx_name, &column_name, m)?;
+                        let graph = cur.read_nsw_graph(m)?;
+                        t.restore_nsw_index(idx_name, &column_name, graph)?;
                     }
                     other => {
                         return Err(StorageError::Corrupt(format!(
@@ -1125,6 +1159,34 @@ impl Catalog {
 
 /// Write a `DataType` as a tag byte + optional payload (Vector carries its
 /// `u32` dimension). Inverse: [`read_data_type`].
+/// Serialize an NSW graph after the `[kind=1][u16 M]` header.
+/// Layout:
+/// - `[entry u32]` — `u32::MAX` means `None`, else the entry node index
+/// - `[node_count u32]`
+/// - for each node: `[neighbor_count u16] [neighbor u32]*`
+fn write_nsw_graph(out: &mut Vec<u8>, g: &NswGraph) {
+    let entry = g.entry.map_or(u32::MAX, |e| {
+        u32::try_from(e).expect("NSW entry fits in u32")
+    });
+    out.extend_from_slice(&entry.to_le_bytes());
+    write_u32(
+        out,
+        u32::try_from(g.neighbors.len()).expect("NSW node count fits in u32"),
+    );
+    for neighbors in &g.neighbors {
+        write_u16(
+            out,
+            u16::try_from(neighbors.len()).expect("NSW neighbour list fits in u16"),
+        );
+        for &peer in neighbors {
+            write_u32(
+                out,
+                u32::try_from(peer).expect("NSW neighbour index fits in u32"),
+            );
+        }
+    }
+}
+
 fn write_data_type(out: &mut Vec<u8>, t: DataType) {
     match t {
         DataType::Int => out.push(1),
@@ -1337,6 +1399,33 @@ impl<'a> Cursor<'a> {
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }
+
+    /// Read an NSW graph that was emitted via `write_nsw_graph`. `m`
+    /// is passed in because it was already consumed from the per-
+    /// index header. Returns the reconstituted `NswGraph`.
+    fn read_nsw_graph(&mut self, m: usize) -> Result<NswGraph, StorageError> {
+        let entry_raw = self.read_u32()?;
+        let entry = if entry_raw == u32::MAX {
+            None
+        } else {
+            Some(entry_raw as usize)
+        };
+        let node_count = self.read_u32()? as usize;
+        let mut neighbors: Vec<Vec<usize>> = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            let cnt = self.read_u16()? as usize;
+            let mut row = Vec::with_capacity(cnt);
+            for _ in 0..cnt {
+                row.push(self.read_u32()? as usize);
+            }
+            neighbors.push(row);
+        }
+        Ok(NswGraph {
+            m,
+            entry,
+            neighbors,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1544,6 +1633,48 @@ mod tests {
         let mut cat = Catalog::new();
         cat.create_table(make_users_schema()).unwrap();
         assert_round_trip(&cat);
+    }
+
+    #[test]
+    fn nsw_index_topology_persists_through_round_trip() {
+        // Build an NSW index, capture its (entry, neighbors) tuple, do
+        // a full serialize → deserialize, and verify the restored
+        // graph is byte-for-byte identical. The point of v2.7 is that
+        // startup skips the rebuild, so the topology has to survive
+        // the disk hop.
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "docs",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new("v", DataType::Vector(3), true),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("docs").unwrap();
+        for i in 0..6 {
+            let base = i as f32 * 0.1;
+            let row = Row::new(alloc::vec![
+                Value::Int(i),
+                Value::Vector(alloc::vec![base, base + 0.05, base + 0.1]),
+            ]);
+            t.insert(row).unwrap();
+        }
+        t.add_nsw_index("docs_nsw".into(), "v", NSW_DEFAULT_M)
+            .unwrap();
+        let original = match &cat.get("docs").unwrap().indices()[0].kind {
+            IndexKind::Nsw(g) => g.clone(),
+            IndexKind::BTree(_) => panic!("expected NSW"),
+        };
+        let bytes = cat.serialize();
+        let restored = Catalog::deserialize(&bytes).expect("deserialize");
+        let restored_graph = match &restored.get("docs").unwrap().indices()[0].kind {
+            IndexKind::Nsw(g) => g.clone(),
+            IndexKind::BTree(_) => panic!("expected NSW"),
+        };
+        assert_eq!(restored_graph.m, original.m);
+        assert_eq!(restored_graph.entry, original.entry);
+        assert_eq!(restored_graph.neighbors, original.neighbors);
     }
 
     #[test]
