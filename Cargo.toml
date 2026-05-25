@@ -4,6 +4,8 @@ members = [
     "crates/spg-wire",
     "crates/spg-sql",
     "crates/spg-storage",
+    "crates/spg-crypto",
+    "crates/spg-audit",
     "crates/spg-engine",
     "crates/spg-server",
     "crates/spg-cli",
