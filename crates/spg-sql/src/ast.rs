@@ -14,6 +14,56 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Select(SelectStatement),
+    CreateTable(CreateTableStatement),
+    Insert(InsertStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableStatement {
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub ty: ColumnTypeName,
+    pub nullable: bool,
+}
+
+/// SQL-level type names. The mapping to the storage runtime's `DataType`
+/// happens in `spg-engine` — keeping `spg-sql` free of storage deps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnTypeName {
+    Int,
+    BigInt,
+    Float,
+    Text,
+    Bool,
+}
+
+impl ColumnTypeName {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Int => "INT",
+            Self::BigInt => "BIGINT",
+            Self::Float => "FLOAT",
+            Self::Text => "TEXT",
+            Self::Bool => "BOOL",
+        }
+    }
+}
+
+impl fmt::Display for ColumnTypeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertStatement {
+    pub table: String,
+    pub values: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,7 +143,45 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Select(s) => s.fmt(f),
+            Self::CreateTable(s) => s.fmt(f),
+            Self::Insert(s) => s.fmt(f),
         }
+    }
+}
+
+impl fmt::Display for CreateTableStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE TABLE {} (", quote_ident(&self.name))?;
+        for (i, col) in self.columns.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{col}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl fmt::Display for ColumnDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", quote_ident(&self.name), self.ty)?;
+        if !self.nullable {
+            f.write_str(" NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for InsertStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "INSERT INTO {} VALUES (", quote_ident(&self.table))?;
+        for (i, v) in self.values.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{v}")?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -248,7 +336,21 @@ fn quote_ident(s: &str) -> String {
 fn is_keyword(s: &str) -> bool {
     matches!(
         &*s.to_ascii_lowercase(),
-        "select" | "from" | "where" | "as" | "null" | "true" | "false" | "and" | "or" | "not"
+        "select"
+            | "from"
+            | "where"
+            | "as"
+            | "null"
+            | "true"
+            | "false"
+            | "and"
+            | "or"
+            | "not"
+            | "create"
+            | "table"
+            | "insert"
+            | "into"
+            | "values"
     )
 }
 

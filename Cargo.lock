@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spg-engine"
+version = "0.1.0"
+dependencies = [
+ "spg-sql",
+ "spg-storage",
+]
+
+[[package]]
 name = "spg-server"
 version = "0.1.0"
 dependencies = [
@@ -18,6 +26,10 @@ dependencies = [
 
 [[package]]
 name = "spg-sql"
+version = "0.1.0"
+
+[[package]]
+name = "spg-storage"
 version = "0.1.0"
 
 [[package]]
