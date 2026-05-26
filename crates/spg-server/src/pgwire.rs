@@ -122,6 +122,13 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
 
     // ---- Query loop ----
     let mut tx_state = b'I'; // 'I' idle / 'T' in transaction / 'E' failed
+    // v4.7: extended-query state. Anonymous statement / portal use
+    // empty-string names per PG spec. Named statements survive
+    // until explicitly Closed (`C` message) or the connection ends.
+    let mut prepared: std::collections::HashMap<String, PreparedStmt> =
+        std::collections::HashMap::default();
+    let mut portals: std::collections::HashMap<String, Portal> =
+        std::collections::HashMap::default();
     loop {
         let mut header = [0u8; 5];
         if let Err(e) = stream.read_exact(&mut header) {
@@ -193,15 +200,85 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 send_ready_for_query(&mut stream, tx_state)?;
             }
             b'X' => return Ok(()),
-            // ParseDescribeBindExecuteSync (extended query) — we don't
-            // support, but psql's `\d` works around it via simple
-            // query. Just send an empty ReadyForQuery and hope.
-            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | b'S' | b'F' => {
-                send_error(
-                    &mut stream,
-                    "0A000",
-                    "extended query protocol not supported",
-                )?;
+            // ---- v4.7: extended-query protocol ----
+            // Parse (P): name + SQL + parameter type OIDs. Store the
+            // statement; reply ParseComplete (no ReadyForQuery — that
+            // waits for Sync).
+            b'P' => {
+                if let Err(msg) = handle_parse(&body, &mut prepared) {
+                    send_error(&mut stream, "42601", &msg)?;
+                } else {
+                    send_msg(&mut stream, b'1', &[])?;
+                }
+            }
+            // Bind (B): create a portal with parameter values
+            // substituted into the prepared statement's SQL.
+            b'B' => {
+                match handle_bind(&body, &prepared) {
+                    Ok(portal) => {
+                        portals.insert(portal.0.clone(), portal.1);
+                        send_msg(&mut stream, b'2', &[])?; // BindComplete
+                    }
+                    Err(msg) => send_error(&mut stream, "42601", &msg)?,
+                }
+            }
+            // Describe (D): describe statement ('S') or portal ('P').
+            // For statements we send ParameterDescription + NoData (we
+            // don't dry-run-parse to discover row shape). For portals
+            // we likewise send NoData; the real RowDescription
+            // arrives after Execute via the regular row stream.
+            b'D' => {
+                if !body.is_empty() {
+                    let kind = body[0];
+                    // PG spec says NoData (`n`) is the right reply
+                    // when we can't compute the row description ahead
+                    // of time. Most drivers tolerate this even though
+                    // it forces them to read RD off the Execute reply.
+                    if kind == b'S' {
+                        // ParameterDescription: zero parameters
+                        // declared (we'll trust the Bind to count them).
+                        let mut pd = Vec::with_capacity(2);
+                        pd.extend_from_slice(&0u16.to_be_bytes());
+                        send_msg(&mut stream, b't', &pd)?;
+                    }
+                    send_msg(&mut stream, b'n', &[])?; // NoData
+                }
+            }
+            // Execute (E): portal name + max-rows (0 = all).
+            b'E' => {
+                if let Err(msg) =
+                    handle_execute(&body, &portals, &mut stream, state, role, &mut tx_state)
+                {
+                    send_error(&mut stream, "42000", &msg)?;
+                }
+            }
+            // Close (C): drop the named statement or portal. Reply
+            // CloseComplete.
+            b'C' => {
+                if body.len() >= 2 {
+                    let kind = body[0];
+                    let name = cstring_at(&body, 1).unwrap_or_default();
+                    if kind == b'S' {
+                        prepared.remove(&name);
+                    } else if kind == b'P' {
+                        portals.remove(&name);
+                    }
+                }
+                send_msg(&mut stream, b'3', &[])?; // CloseComplete
+            }
+            // Flush (H): no-op for our buffered TcpStream (everything
+            // is already on the wire after each send_msg). Spec says
+            // no reply is required.
+            b'H' => {}
+            // Sync (S): boundary marker — reply with ReadyForQuery
+            // reflecting the current transaction state.
+            b'S' => {
+                send_ready_for_query(&mut stream, tx_state)?;
+            }
+            // CopyData (d), CopyDone (c), CopyFail (f) — we don't
+            // support COPY at all, but reject cleanly.
+            b'd' | b'c' | b'f' => {
+                send_error(&mut stream, "0A000", "COPY protocol not supported")?;
                 send_ready_for_query(&mut stream, tx_state)?;
             }
             _ => {
@@ -513,6 +590,302 @@ fn pg_tables_response(state: &Arc<ServerState>) -> CannedResponse {
         })
         .unwrap_or_default();
     CannedResponse::Rows { columns, rows }
+}
+
+// ---- v4.7 extended-query protocol ----
+
+#[derive(Debug, Clone)]
+struct PreparedStmt {
+    sql: String,
+    /// Number of `$N` placeholders we expect in the SQL. PG drivers
+    /// declare param types in the Parse message; we ignore the
+    /// declared types and accept whatever the Bind hands over,
+    /// substituting via text-format conversion.
+    placeholder_count: u16,
+}
+
+#[derive(Debug, Clone)]
+struct Portal {
+    /// SQL with parameter placeholders already substituted (text
+    /// format only; binary params are rejected at Bind time).
+    bound_sql: String,
+}
+
+/// Parse a null-terminated C string starting at `pos` of `body`.
+/// Returns the string + 1-past-null offset for chained reads. Bumps
+/// position via outer mutation in callers that read multiple fields.
+fn cstring_at(body: &[u8], pos: usize) -> Option<String> {
+    let null_off = body[pos..].iter().position(|&b| b == 0)?;
+    let bytes = &body[pos..pos + null_off];
+    std::str::from_utf8(bytes).ok().map(str::to_string)
+}
+
+fn read_cstring<'a>(body: &'a [u8], cursor: &mut usize) -> Option<&'a str> {
+    let null_off = body[*cursor..].iter().position(|&b| b == 0)?;
+    let bytes = &body[*cursor..*cursor + null_off];
+    *cursor += null_off + 1;
+    std::str::from_utf8(bytes).ok()
+}
+
+fn handle_parse(
+    body: &[u8],
+    prepared: &mut std::collections::HashMap<String, PreparedStmt>,
+) -> Result<(), String> {
+    let mut cur = 0;
+    let name = read_cstring(body, &mut cur)
+        .ok_or("Parse: name not null-terminated UTF-8")?
+        .to_string();
+    let sql = read_cstring(body, &mut cur)
+        .ok_or("Parse: SQL not null-terminated UTF-8")?
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
+    // Trailing u16 = param-type count, then that many u32 OIDs. We
+    // ignore the declared types; placeholder_count is sourced from
+    // the SQL by counting $N occurrences (cheap, robust).
+    if cur + 2 > body.len() {
+        return Err("Parse: missing parameter type count".into());
+    }
+    let _declared = u16::from_be_bytes([body[cur], body[cur + 1]]);
+    let placeholder_count = count_placeholders(&sql);
+    prepared.insert(
+        name,
+        PreparedStmt {
+            sql,
+            placeholder_count,
+        },
+    );
+    Ok(())
+}
+
+/// Count distinct `$N` placeholders by scanning. PG numbers them
+/// 1..=N; we just want the max N.
+fn count_placeholders(sql: &str) -> u16 {
+    let bytes = sql.as_bytes();
+    let mut max: u32 = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut n: u32 = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n * 10 + u32::from(bytes[j] - b'0');
+                j += 1;
+            }
+            if n > max {
+                max = n;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    u16::try_from(max).unwrap_or(u16::MAX)
+}
+
+fn handle_bind(
+    body: &[u8],
+    prepared: &std::collections::HashMap<String, PreparedStmt>,
+) -> Result<(String, Portal), String> {
+    let mut cur = 0;
+    let portal_name = read_cstring(body, &mut cur)
+        .ok_or("Bind: portal name not UTF-8")?
+        .to_string();
+    let stmt_name = read_cstring(body, &mut cur)
+        .ok_or("Bind: statement name not UTF-8")?
+        .to_string();
+    let stmt = prepared
+        .get(&stmt_name)
+        .ok_or_else(|| format!("Bind: prepared statement {stmt_name:?} not found"))?;
+    // Param-format-codes count (u16), then that many u16 codes:
+    // 0 = text, 1 = binary. We only support text for v4.7.
+    if cur + 2 > body.len() {
+        return Err("Bind: truncated format-code count".into());
+    }
+    let fmt_count = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
+    cur += 2;
+    if cur + fmt_count * 2 > body.len() {
+        return Err("Bind: truncated format codes".into());
+    }
+    let mut formats = Vec::with_capacity(fmt_count);
+    for _ in 0..fmt_count {
+        formats.push(u16::from_be_bytes([body[cur], body[cur + 1]]));
+        cur += 2;
+    }
+    // Param values count (u16), then for each: [i32 len][bytes...].
+    // -1 = SQL NULL.
+    if cur + 2 > body.len() {
+        return Err("Bind: truncated parameter count".into());
+    }
+    let param_count = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
+    cur += 2;
+    if usize::from(stmt.placeholder_count) != param_count {
+        return Err(format!(
+            "Bind: parameter count mismatch (SQL has {}, Bind has {param_count})",
+            stmt.placeholder_count
+        ));
+    }
+    let mut params: Vec<Option<String>> = Vec::with_capacity(param_count);
+    for i in 0..param_count {
+        if cur + 4 > body.len() {
+            return Err("Bind: truncated parameter length".into());
+        }
+        let len = i32::from_be_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]);
+        cur += 4;
+        if len < 0 {
+            params.push(None);
+            continue;
+        }
+        let len = len as usize;
+        if cur + len > body.len() {
+            return Err("Bind: parameter value truncated".into());
+        }
+        // Format: 0 = text (default if formats empty), 1 = binary.
+        // If only one format code provided, it applies to all params.
+        let fmt = match formats.len() {
+            0 => 0,
+            1 => formats[0],
+            _ => formats.get(i).copied().unwrap_or(0),
+        };
+        if fmt != 0 {
+            return Err("Bind: binary parameter format not supported (v4.7 text-only)".into());
+        }
+        let s = std::str::from_utf8(&body[cur..cur + len])
+            .map_err(|_| "Bind: text parameter not valid UTF-8".to_string())?
+            .to_string();
+        params.push(Some(s));
+        cur += len;
+    }
+    // Trailing result-format-codes — we always return text, so ignore.
+    let bound_sql = substitute_placeholders(&stmt.sql, &params);
+    Ok((portal_name, Portal { bound_sql }))
+}
+
+/// Replace `$1`, `$2`, etc. in `sql` with the corresponding params.
+/// String parameters are SQL-quoted (`'...'` with `''` escape).
+/// NULL parameters render as the literal `NULL`. Numeric-looking
+/// strings keep their text form — the engine's parser coerces them
+/// per the column types.
+fn substitute_placeholders(sql: &str, params: &[Option<String>]) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(
+        sql.len()
+            + params
+                .iter()
+                .map(|p| p.as_ref().map_or(4, |s| s.len() + 2))
+                .sum::<usize>(),
+    );
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut n: usize = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n * 10 + (bytes[j] - b'0') as usize;
+                j += 1;
+            }
+            if n >= 1 && n <= params.len() {
+                match &params[n - 1] {
+                    None => out.push_str("NULL"),
+                    Some(v) => {
+                        // Numeric-looking values render bare so the
+                        // engine sees an `INT` literal rather than a
+                        // `TEXT` literal it would then refuse to
+                        // coerce into an INT column. Booleans get the
+                        // same treatment.
+                        if looks_numeric(v)
+                            || matches!(v.as_str(), "true" | "false" | "TRUE" | "FALSE")
+                        {
+                            out.push_str(v);
+                        } else {
+                            // Quote + escape `'` as `''` per SQL.
+                            out.push('\'');
+                            for ch in v.chars() {
+                                if ch == '\'' {
+                                    out.push('\'');
+                                }
+                                out.push(ch);
+                            }
+                            out.push('\'');
+                        }
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// True when `s` parses as a decimal integer or float — matching the
+/// grammar `[+-]?[0-9]+(.[0-9]+)?([eE][+-]?[0-9]+)?`. Used to decide
+/// whether to substitute a bind parameter as a bare literal vs a
+/// quoted string. We deliberately keep this narrow to avoid letting
+/// SQL fragments slip through unquoted.
+fn looks_numeric(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // Reject anything with non-numeric punctuation that an integer
+    // or float parser would reject.
+    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
+}
+
+fn handle_execute(
+    body: &[u8],
+    portals: &std::collections::HashMap<String, Portal>,
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    role: Role,
+    tx_state: &mut u8,
+) -> Result<(), String> {
+    let mut cur = 0;
+    let portal_name = read_cstring(body, &mut cur)
+        .ok_or("Execute: portal name not UTF-8")?
+        .to_string();
+    // Max-rows (i32, 0 = unlimited). We always return everything;
+    // SELECT result sets in SPG are typically bounded, and respecting
+    // a partial cursor would mean keeping the result Vec around
+    // across Execute calls. Future work.
+    if cur + 4 > body.len() {
+        return Err("Execute: missing max-rows".into());
+    }
+    let portal = portals
+        .get(&portal_name)
+        .ok_or_else(|| format!("Execute: portal {portal_name:?} not found"))?;
+    // Allow the canned (pg_catalog etc.) path to handle the bound SQL
+    // too, so an ORM that always prepares `SELECT version()` still
+    // gets the right reply.
+    if let Some(canned) = canned_response(&portal.bound_sql, state) {
+        send_canned(stream, &canned).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let result = execute_with_role(state, &portal.bound_sql, role);
+    match result {
+        Ok(QueryResult::Rows { columns, rows }) => {
+            send_row_description(stream, &columns).map_err(|e| e.to_string())?;
+            let n = rows.len();
+            for row in &rows {
+                send_data_row(stream, &columns, row).map_err(|e| e.to_string())?;
+            }
+            send_command_complete(stream, &format!("SELECT {n}")).map_err(|e| e.to_string())?;
+        }
+        Ok(QueryResult::CommandOk { affected, .. }) => {
+            let tag = command_tag(&portal.bound_sql, affected);
+            send_command_complete(stream, &tag).map_err(|e| e.to_string())?;
+            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+                b'T'
+            } else {
+                b'I'
+            };
+        }
+        Err(e) => return Err(e.to_string()),
+    }
+    Ok(())
 }
 
 // ---- Startup message ----
