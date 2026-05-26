@@ -668,7 +668,8 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
         }
     }
     // Phase 2: from `min(level, entry_level)` down to 0, beam-search
-    // `ef_construction` candidates and connect to the M closest.
+    // `ef_construction` candidates, run the HNSW §4 heuristic neighbour
+    // selection over them, and connect bidirectionally.
     let top = level.min(entry_level);
     let ef = (m * 2).max(8);
     for layer in (0..=top).rev() {
@@ -684,13 +685,13 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
             NswMetric::L2,
         );
         candidates.retain(|&(_, n)| n != new_row_idx);
-        candidates.truncate(cap);
-        // Take the closest as the entry for the next layer down.
+        // Take the closest as the entry for the next layer down — done
+        // before heuristic narrowing because the heuristic can reorder.
         if let Some(&(d, n)) = candidates.first() {
             current = n;
             current_d = d;
         }
-        let peers: Vec<usize> = candidates.iter().map(|&(_, n)| n).collect();
+        let peers = select_neighbours_heuristic(&candidates, cap, table, col_pos);
         connect_at_layer(table, idx_pos, layer, new_row_idx, &peers);
     }
     // Phase 3: if the new node climbed above the current entry, take
@@ -768,6 +769,13 @@ fn greedy_layer_walk(
 /// `entry_d`. Returns the top `ef` candidates in ascending-distance
 /// order. Caller picks the closest as the next layer's entry and / or
 /// trims to M for connection.
+///
+/// v3.0.1: uses two `BinaryHeap`s (min-heap for the open frontier,
+/// max-heap for the working top-`ef` results) and a `Vec<bool>` visited
+/// bitmap, replacing the v2.x `Vec` + `partition_point` + `BTreeSet`
+/// implementation. Same algorithm shape (HNSW search algorithm 2 from
+/// the paper); the data-structure swap cuts per-visit cost from
+/// `O(ef + log row_count)` to amortised `O(log ef)`.
 #[allow(clippy::too_many_arguments)] // Beam search threads layer, entry, query, ef, metric — each is intrinsic. Bundling them into a config struct hides the call sites.
 fn layer_beam_search(
     table: &Table,
@@ -792,25 +800,40 @@ fn layer_beam_search(
             _ => return Vec::new(),
         }
     };
-    let mut visited: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
-    visited.insert(entry_node);
-    let mut candidates: Vec<(f32, usize)> = alloc::vec![(d0, entry_node)];
-    let mut results: Vec<(f32, usize)> = alloc::vec![(d0, entry_node)];
-    while let Some(&(d_cur, idx)) = candidates.first() {
-        candidates.remove(0);
-        let worst = results.last().map_or(f32::INFINITY, |&(d, _)| d);
-        if d_cur > worst && results.len() >= ef {
+    let row_count = table.rows.len();
+    let mut visited: Vec<bool> = alloc::vec![false; row_count];
+    if entry_node < row_count {
+        visited[entry_node] = true;
+    }
+    // candidates: min-heap by distance (Closest wrapper) — frontier
+    // results:    max-heap by distance (Furthest wrapper) — top-ef working set
+    let mut candidates: alloc::collections::BinaryHeap<NodeClosest> =
+        alloc::collections::BinaryHeap::with_capacity(ef);
+    let mut results: alloc::collections::BinaryHeap<NodeFurthest> =
+        alloc::collections::BinaryHeap::with_capacity(ef);
+    candidates.push(NodeClosest {
+        dist: d0,
+        node: entry_node,
+    });
+    results.push(NodeFurthest {
+        dist: d0,
+        node: entry_node,
+    });
+    while let Some(cur) = candidates.pop() {
+        let worst = results.peek().map_or(f32::INFINITY, |c| c.dist);
+        if cur.dist > worst && results.len() >= ef {
             break;
         }
         let neighbours: &[usize] = g
             .layers
             .get(layer as usize)
-            .and_then(|layer_v| layer_v.get(idx))
+            .and_then(|layer_v| layer_v.get(cur.node))
             .map_or(&[][..], Vec::as_slice);
         for &n in neighbours {
-            if !visited.insert(n) {
+            if n >= row_count || visited[n] {
                 continue;
             }
+            visited[n] = true;
             let Value::Vector(nv) = &table.rows[n].values[col_pos] else {
                 continue;
             };
@@ -818,19 +841,124 @@ fn layer_beam_search(
                 continue;
             }
             let dn = metric_distance(metric, nv, query);
-            let worst = results.last().map_or(f32::INFINITY, |&(d, _)| d);
+            let worst = results.peek().map_or(f32::INFINITY, |c| c.dist);
             if results.len() < ef || dn < worst {
-                let pos = results.partition_point(|&(d, _)| d <= dn);
-                results.insert(pos, (dn, n));
+                results.push(NodeFurthest { dist: dn, node: n });
                 if results.len() > ef {
-                    results.truncate(ef);
+                    results.pop();
                 }
-                let pos = candidates.partition_point(|&(d, _)| d <= dn);
-                candidates.insert(pos, (dn, n));
+                candidates.push(NodeClosest { dist: dn, node: n });
             }
         }
     }
-    results
+    // Drain results (max-heap order) and re-sort ascending so callers
+    // can take `closest = result[0]` without flipping.
+    let mut out: Vec<(f32, usize)> = results.into_iter().map(|c| (c.dist, c.node)).collect();
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+    out
+}
+
+/// Min-heap wrapper: smaller `dist` → higher priority in a `BinaryHeap`
+/// (which is a max-heap), so we flip the comparison. NaN sorts last
+/// (lowest priority) to keep the heap total-ordered.
+#[derive(Debug, Clone, Copy)]
+struct NodeClosest {
+    dist: f32,
+    node: usize,
+}
+impl PartialEq for NodeClosest {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist && self.node == other.node
+    }
+}
+impl Eq for NodeClosest {}
+impl PartialOrd for NodeClosest {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for NodeClosest {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Reversed: smaller dist = greater priority.
+        other
+            .dist
+            .partial_cmp(&self.dist)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    }
+}
+
+/// Max-heap wrapper: larger `dist` sits at the top so the worst result
+/// can be evicted in O(log n) when a better candidate arrives.
+#[derive(Debug, Clone, Copy)]
+struct NodeFurthest {
+    dist: f32,
+    node: usize,
+}
+impl PartialEq for NodeFurthest {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist && self.node == other.node
+    }
+}
+impl Eq for NodeFurthest {}
+impl PartialOrd for NodeFurthest {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for NodeFurthest {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.dist
+            .partial_cmp(&other.dist)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    }
+}
+
+/// HNSW paper §4 algorithm 4: pick `m` neighbours from `candidates` so
+/// that each chosen point isn't already covered by a closer chosen
+/// point. Improves graph diversity → fewer hops needed at search time.
+///
+/// `candidates` arrives sorted ascending by distance-to-query. We walk
+/// it in order, keeping a candidate only when no already-chosen point
+/// is closer to it than the query is. Result is a vector of row
+/// indices (length ≤ `m`).
+fn select_neighbours_heuristic(
+    candidates: &[(f32, usize)],
+    m: usize,
+    table: &Table,
+    col_pos: usize,
+) -> Vec<usize> {
+    let mut chosen: Vec<usize> = Vec::with_capacity(m);
+    for &(d_q, e) in candidates {
+        if chosen.len() >= m {
+            break;
+        }
+        let Some(Value::Vector(e_vec)) = table.rows.get(e).and_then(|r| r.values.get(col_pos))
+        else {
+            continue;
+        };
+        let mut covered = false;
+        for &r in &chosen {
+            let Some(Value::Vector(r_vec)) =
+                table.rows.get(r).and_then(|row| row.values.get(col_pos))
+            else {
+                continue;
+            };
+            if e_vec.len() != r_vec.len() {
+                continue;
+            }
+            // dist(e, r) measured in the same metric the topology was
+            // built with (L2). If a chosen `r` is closer to `e` than
+            // the query is, `r` already "covers" `e` for navigation.
+            if l2_distance_sq(e_vec, r_vec) < d_q {
+                covered = true;
+                break;
+            }
+        }
+        if !covered {
+            chosen.push(e);
+        }
+    }
+    chosen
 }
 
 /// Bidirectionally connect `new_row_idx` to each of `peers` at `layer`,
@@ -857,25 +985,40 @@ fn connect_at_layer(
             Value::Vector(v) => v.clone(),
             _ => continue,
         };
+        // 1. add the new node to peer's adjacency
         if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
             let layer_v = &mut g.layers[layer as usize];
             if !layer_v[peer].contains(&new_row_idx) {
                 layer_v[peer].push(new_row_idx);
             }
-            if layer_v[peer].len() > cap {
-                let host = peer;
-                let mut tagged: Vec<(f32, usize)> = layer_v[host]
-                    .iter()
-                    .map(|&p| {
-                        let Value::Vector(pv) = &table.rows[p].values[col_pos] else {
-                            return (f32::INFINITY, p);
-                        };
-                        (l2_distance_sq(&host_vec, pv), p)
-                    })
-                    .collect();
-                tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
-                tagged.truncate(cap);
-                layer_v[host] = tagged.into_iter().map(|(_, p)| p).collect();
+        }
+        // 2. if peer is over budget, rebuild its adjacency with the
+        //    HNSW §4 heuristic — same diversity criterion as the
+        //    insert path so connectivity stays consistent.
+        let needs_trim = match &table.indices[idx_pos].kind {
+            IndexKind::Nsw(g) => g.layers[layer as usize][peer].len() > cap,
+            IndexKind::BTree(_) => false,
+        };
+        if needs_trim {
+            let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
+                IndexKind::Nsw(g) => g.layers[layer as usize][peer].clone(),
+                IndexKind::BTree(_) => continue,
+            };
+            // Sort by distance to `host_vec` ascending so the heuristic
+            // receives candidates closest-first.
+            let mut tagged: Vec<(f32, usize)> = current_peers
+                .iter()
+                .map(|&p| {
+                    let Value::Vector(pv) = &table.rows[p].values[col_pos] else {
+                        return (f32::INFINITY, p);
+                    };
+                    (l2_distance_sq(&host_vec, pv), p)
+                })
+                .collect();
+            tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+            let kept = select_neighbours_heuristic(&tagged, cap, table, col_pos);
+            if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
+                g.layers[layer as usize][peer] = kept;
             }
         }
     }
