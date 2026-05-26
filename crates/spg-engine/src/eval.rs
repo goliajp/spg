@@ -1217,6 +1217,8 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::InnerProduct => inner_product(l, r),
         BinOp::CosineDistance => cosine_distance(l, r),
         BinOp::Concat => Ok(text_concat(&l, &r)),
+        BinOp::JsonGet => crate::json::path_get(&l, &r, false),
+        BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
@@ -1886,7 +1888,9 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::L2Distance
         | BinOp::InnerProduct
         | BinOp::CosineDistance
-        | BinOp::Concat => {
+        | BinOp::Concat
+        | BinOp::JsonGet
+        | BinOp::JsonGetText => {
             unreachable!("compare() only called with comparison ops")
         }
     };

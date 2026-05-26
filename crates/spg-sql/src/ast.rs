@@ -464,6 +464,13 @@ pub enum BinOp {
     CosineDistance,
     /// SQL string concatenation `||`. NULL propagates.
     Concat,
+    /// v4.14 `json -> key` — element access by string key (object)
+    /// or integer index (array). Returns a JSON value.
+    JsonGet,
+    /// v4.14 `json ->> key` — same access, returns the result as
+    /// TEXT (unwraps a top-level JSON string; renders other scalars
+    /// as their canonical text).
+    JsonGetText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -907,6 +914,8 @@ impl fmt::Display for BinOp {
             Self::InnerProduct => "<#>",
             Self::CosineDistance => "<=>",
             Self::Concat => "||",
+            Self::JsonGet => "->",
+            Self::JsonGetText => "->>",
         })
     }
 }

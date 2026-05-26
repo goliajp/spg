@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod aggregate;
 pub mod eval;
+pub mod json;
 pub mod users;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};

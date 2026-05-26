@@ -1694,6 +1694,11 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::Concat => (BinOp::Concat, 6),
         Token::Star => (BinOp::Mul, 7),
         Token::Slash => (BinOp::Div, 7),
+        // v4.14: JSON path ops bind tighter than comparisons (4)
+        // and additive (6) so `doc->'k' = 'v'` parses correctly.
+        // Same rung as the multiplicative ops.
+        Token::JsonGet => (BinOp::JsonGet, 7),
+        Token::JsonGetText => (BinOp::JsonGetText, 7),
         _ => return None,
     };
     Some(pair)
