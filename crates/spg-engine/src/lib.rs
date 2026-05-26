@@ -2671,8 +2671,214 @@ fn compute_window_partition(
             }
             Ok(())
         }
+        "lag" | "lead" => {
+            // lag(expr [, offset [, default]])
+            // lead(expr [, offset [, default]])
+            if args.is_empty() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "{lower}() requires at least one argument"
+                )));
+            }
+            let offset: i64 = if args.len() >= 2 {
+                let v = eval::eval_expr(&args[1], filtered_rows[slice[0].2], ctx)
+                    .map_err(EngineError::Eval)?;
+                match v {
+                    Value::SmallInt(n) => i64::from(n),
+                    Value::Int(n) => i64::from(n),
+                    Value::BigInt(n) => n,
+                    _ => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "{lower}() offset must be integer"
+                        )));
+                    }
+                }
+            } else {
+                1
+            };
+            let default: Value = if args.len() >= 3 {
+                eval::eval_expr(&args[2], filtered_rows[slice[0].2], ctx)
+                    .map_err(EngineError::Eval)?
+            } else {
+                Value::Null
+            };
+            let values: Vec<Value> = slice
+                .iter()
+                .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
+                .collect::<Result<_, _>>()
+                .map_err(EngineError::Eval)?;
+            let n = slice.len();
+            for (i, (_, _, idx)) in slice.iter().enumerate() {
+                let signed_offset = if lower == "lag" { -offset } else { offset };
+                let target_signed = i64::try_from(i).unwrap_or(i64::MAX) + signed_offset;
+                let v = if target_signed < 0 || target_signed >= i64::try_from(n).unwrap_or(i64::MAX) {
+                    default.clone()
+                } else {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        values[target_signed as usize].clone()
+                    }
+                };
+                out_vals[*idx] = v;
+            }
+            Ok(())
+        }
+        "first_value" | "last_value" | "nth_value" => {
+            if args.is_empty() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "{lower}() requires at least one argument"
+                )));
+            }
+            let values: Vec<Value> = slice
+                .iter()
+                .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
+                .collect::<Result<_, _>>()
+                .map_err(EngineError::Eval)?;
+            let nth: usize = if lower == "nth_value" {
+                if args.len() < 2 {
+                    return Err(EngineError::Unsupported(
+                        "nth_value() requires (expr, n)".into(),
+                    ));
+                }
+                let v = eval::eval_expr(&args[1], filtered_rows[slice[0].2], ctx)
+                    .map_err(EngineError::Eval)?;
+                let raw = match v {
+                    Value::SmallInt(n) => i64::from(n),
+                    Value::Int(n) => i64::from(n),
+                    Value::BigInt(n) => n,
+                    _ => {
+                        return Err(EngineError::Unsupported(
+                            "nth_value() n must be integer".into(),
+                        ));
+                    }
+                };
+                if raw < 1 {
+                    return Err(EngineError::Unsupported(
+                        "nth_value() n must be >= 1".into(),
+                    ));
+                }
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    raw as usize
+                }
+            } else {
+                0
+            };
+            let eff = effective_frame(frame, ordered)?;
+            for i in 0..slice.len() {
+                let (lo, hi) = frame_bounds_for_row(&eff, i, slice);
+                let (_, _, idx) = &slice[i];
+                let v = if lo > hi {
+                    Value::Null
+                } else {
+                    match lower.as_str() {
+                        "first_value" => values[lo].clone(),
+                        "last_value" => values[hi].clone(),
+                        "nth_value" => {
+                            let pos = lo + nth - 1;
+                            if pos > hi { Value::Null } else { values[pos].clone() }
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                out_vals[*idx] = v;
+            }
+            Ok(())
+        }
+        "ntile" => {
+            if args.is_empty() {
+                return Err(EngineError::Unsupported(
+                    "ntile(n) requires an integer argument".into(),
+                ));
+            }
+            let v = eval::eval_expr(&args[0], filtered_rows[slice[0].2], ctx)
+                .map_err(EngineError::Eval)?;
+            let bucket_count: i64 = match v {
+                Value::SmallInt(n) => i64::from(n),
+                Value::Int(n) => i64::from(n),
+                Value::BigInt(n) => n,
+                _ => {
+                    return Err(EngineError::Unsupported(
+                        "ntile() argument must be integer".into(),
+                    ));
+                }
+            };
+            if bucket_count < 1 {
+                return Err(EngineError::Unsupported(
+                    "ntile() argument must be >= 1".into(),
+                ));
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let buckets = bucket_count as usize;
+            let n = slice.len();
+            // Each bucket gets `base` rows; the first `extras` buckets
+            // get one extra. PG semantics.
+            let base = n / buckets;
+            let extras = n % buckets;
+            let mut bucket: usize = 1;
+            let mut remaining_in_bucket = if extras > 0 { base + 1 } else { base };
+            let mut buckets_with_extra_remaining = extras;
+            for (_, _, idx) in slice {
+                if remaining_in_bucket == 0 {
+                    bucket += 1;
+                    buckets_with_extra_remaining =
+                        buckets_with_extra_remaining.saturating_sub(1);
+                    remaining_in_bucket = if buckets_with_extra_remaining > 0 {
+                        base + 1
+                    } else {
+                        base
+                    };
+                    // Edge: if base==0 and extras==0, all rows fit;
+                    // shouldn't reach here, but guard anyway.
+                    if remaining_in_bucket == 0 {
+                        remaining_in_bucket = 1;
+                    }
+                }
+                out_vals[*idx] = Value::BigInt(i64::try_from(bucket).unwrap_or(i64::MAX));
+                remaining_in_bucket -= 1;
+            }
+            Ok(())
+        }
+        "percent_rank" => {
+            // (rank - 1) / (n - 1) where rank is the standard RANK().
+            // Single-row partitions get 0.
+            let n = slice.len();
+            let mut prev_key: Option<&[(Value, bool)]> = None;
+            let mut current_rank: i64 = 1;
+            for (i, (_, okey, idx)) in slice.iter().enumerate() {
+                if let Some(p) = prev_key
+                    && order_key_cmp(p, okey) != core::cmp::Ordering::Equal
+                {
+                    current_rank = i64::try_from(i + 1).unwrap_or(i64::MAX);
+                }
+                if prev_key.is_none() {
+                    current_rank = 1;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let pr = if n <= 1 {
+                    0.0
+                } else {
+                    (current_rank - 1) as f64 / (n - 1) as f64
+                };
+                out_vals[*idx] = Value::Float(pr);
+                prev_key = Some(okey.as_slice());
+            }
+            Ok(())
+        }
+        "cume_dist" => {
+            // # rows up to and including this row's peer group / n.
+            let n = slice.len();
+            // First pass: find peer-group-end rank for each row.
+            for i in 0..slice.len() {
+                let peer_end = peer_group_end(slice, i);
+                #[allow(clippy::cast_precision_loss)]
+                let cd = (peer_end + 1) as f64 / n as f64;
+                let (_, _, idx) = &slice[i];
+                out_vals[*idx] = Value::Float(cd);
+            }
+            Ok(())
+        }
         other => Err(EngineError::Unsupported(alloc::format!(
-            "window function {other:?} not supported (v4.12: row_number/rank/dense_rank/sum/avg/count/min/max)"
+            "window function {other:?} not supported (v4.21: row_number/rank/dense_rank/sum/avg/count/min/max/lag/lead/first_value/last_value/nth_value/ntile/percent_rank/cume_dist)"
         ))),
     }
 }
