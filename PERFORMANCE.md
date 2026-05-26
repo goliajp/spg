@@ -71,10 +71,10 @@ Run: `cargo bench -p spg-sql --bench parse`.
 
 | Path                                | Median   | Notes |
 |-------------------------------------|---------:|-------|
-| `catalog_serialize_100rows`         | **1.03 µs** | v3.0.2: was 1.13 µs; **−9%** ✅ via schema-driven dense encode (FILE_VERSION 8): per-row NULL bitmap, no per-cell tag byte. |
-| `catalog_deserialize_100rows`       | **3.68 µs** | v3.0.2: was 4.19 µs; **−12%** ✅. Same change + cached `&mut Table` (skip per-row `Vec<Table>` linear scan) + `rows.reserve(row_count)`. Below the −52% target — `String` allocation for the 100 Text cells is a ~3 µs hard floor; the remaining ~700 ns is structural dispatch + Vec push. |
-| `hnsw_build_200rows_dim8`           | **154 µs** | v3.0.1: was 2.41 ms; **−94% / 15.7×** ✅. Heuristic neighbour selection (HNSW paper §4) + `BinaryHeap` frontier + bitmap visited set. |
-| `hnsw_search_top10_dim8_n200`       | **397 ns** | v3.0.1: was 4.75 µs; **−92% / 12×** ✅. Bonus from the same data-structure swap (search shares `layer_beam_search`). |
+| `catalog_serialize_100rows`         | **1.03 µs** | v3.0.2: was 1.13 µs; **−9%** ✅ via schema-driven dense encode (FILE_VERSION 8): per-row NULL bitmap, no per-cell tag byte. Small absolute win (~100 ns) but the directional change is real across re-measurements. |
+| `catalog_deserialize_100rows`       | **3.72 µs** | v3.0.2: was 4.19 µs; **−11%** ✅. Same change + cached `&mut Table` (skip per-row `Vec<Table>` linear scan) + `rows.reserve(row_count)`. Below the −52% target — `String` allocation for the 100 Text cells is a ~3 µs hard floor; the remaining ~700 ns is structural dispatch + Vec push. |
+| `hnsw_build_200rows_dim8`           | **151 µs** | v3.0.1 + v3.0.6 re-measurement: was 2.41 ms; **−94% / 16.0×** ✅. Heuristic neighbour selection (HNSW paper §4) + `BinaryHeap` frontier + bitmap visited set. |
+| `hnsw_search_top10_dim8_n200`       | **378 ns** | v3.0.1 + v3.0.6 re-measurement: was 4.75 µs; **−92% / 12.6×** ✅. Bonus from the same data-structure swap (search shares `layer_beam_search`). |
 
 Run: `cargo bench -p spg-storage --bench catalog`.
 
@@ -82,9 +82,9 @@ Run: `cargo bench -p spg-storage --bench catalog`.
 
 | Path        | Median       | Notes |
 |-------------|-------------:|-------|
-| `hash_64b`  | **74 ns**    | Single BLAKE3 block. v3.0.4 measurement-with-no-NEON; the median moves ±10 ns between runs. |
-| `hash_1kib` | **1.27 µs**  | Single chunk; ~810 MB/s. |
-| `hash_16kib`| **21.4 µs**  | 16 chunks; ~770 MB/s. |
+| `hash_64b`  | **68 ns**    | Single BLAKE3 block. (v3.0.6 re-measurement; matches v3.0.0 baseline.) |
+| `hash_1kib` | **1.17 µs**  | Single chunk; ~875 MB/s. |
+| `hash_16kib`| **20.0 µs**  | 16 chunks; ~820 MB/s. |
 
 **v3.0.4 negative result (recorded honestly):** a NEON-vectorised
 `compress` (one block split across 4 lanes) was implemented end-to-end,
@@ -98,6 +98,14 @@ compress) without buying parallelism. The real BLAKE3 SIMD win is
 audit-log + per-small-catalog hash workload. NEON path kept under
 `#[cfg(test)]` as a cross-check oracle for the scalar reference; the
 runtime stays scalar.
+
+**v3.0.6 correction:** the v3.0.4 reverted-state numbers in this table
+(74 ns / 1.27 µs / 21.4 µs) appeared to show a ~10% regression vs the
+v3.0.0 baseline. Subsequent re-measurement found that was measurement
+noise — the path was never touched by v3.0.4 (the NEON code lived
+under `#[cfg(test)]`). Numbers above are corrected; the spurious
+"regression" was an artefact of the warm/cold machine state during
+the v3.0.4 measurement.
 
 Run: `cargo bench -p spg-crypto --bench hash`.
 
@@ -115,10 +123,10 @@ Run: `cargo bench -p spg-audit --bench log`.
 
 | Path                                | Median       | Notes |
 |-------------------------------------|-------------:|-------|
-| `execute_select_const`              | **250 ns**   | v3.0.3: was 255 ns; **−2%** (near noise — rewrite walk was already a small share of the const-SELECT total). |
-| `execute_select_where_n100`         | **2.35 µs**  | v3.0.3: was 2.57 µs; **−9%** ✅. |
-| `execute_select_count_group_n100`   | **3.12 µs**  | v3.0.3: was 3.33 µs; **−6%**. |
-| `execute_insert_one`                | **2.26 µs**  | v3.0.3: was 2.60 µs; **−13%** ✅. INSERT's per-row rewrite loop is where the single-`match` `rewrite_expr_clock` restructure shows up most. |
+| `execute_select_const`              | **228 ns**   | v3.0.3 + v3.0.6 re-measurement: was 255 ns; **−11%** ✅. (The v3.0.3 commit reported "−2% noise" — that was itself measurement-window jitter; the real change is bigger.) |
+| `execute_select_where_n100`         | **2.33 µs**  | v3.0.3: was 2.57 µs; **−9%** ✅. |
+| `execute_select_count_group_n100`   | **3.10 µs**  | v3.0.3: was 3.33 µs; **−7%**. |
+| `execute_insert_one`                | **2.20 µs**  | v3.0.3 + v3.0.6 re-measurement: was 2.60 µs; **−15%** ✅. INSERT's per-row rewrite loop is where the single-`match` `rewrite_expr_clock` restructure shows up most. |
 
 Run: `cargo bench -p spg-engine --bench execute`.
 
@@ -133,9 +141,37 @@ wall-time row at the top.
 
 | Path                                | Median        | Notes |
 |-------------------------------------|--------------:|-------|
-| `backup_roundtrip_100rows`          | **~12 ms**    | Full read+deserialize+serialize+write loop, including disk syscalls. High variance (5–22 ms across runs) — disk I/O dominates; on-machine number, not portable. |
+| `backup_roundtrip_100rows`          | **~12 ms cold / 47 µs warm** | Full read+deserialize+serialize+write loop, including disk syscalls. **Wildly unstable** — `5 ms ≤ cold ≤ 22 ms`, OS page-cache-warm runs drop to ~47 µs. The number is dominated by the kernel's page-cache state at measurement time, not by `spg-cli` code. Don't quote either figure as a perf claim; treat as "user-visible latency, depends on disk and cache". A reliable in-memory variant of this bench (read from `Vec<u8>` instead of `fs::read`) would land near the underlying `catalog_deserialize` + `serialize` cost (~5 µs) — added in a future round. |
 
 Run: `cargo bench -p spg-cli --bench backup`.
+
+## What's still volatile or near floor (as of v3.0.6)
+
+Bench numbers fall into three honest buckets:
+
+- **Solid wins** — re-measure within ±2% of the reported delta across
+  separate runs: HNSW build/search, lex / parse-family, INSERT, the
+  WHERE-100 path. Quote these.
+- **Real but small** (within run-to-run noise's own ~±5% band):
+  catalog serialize/deserialize (-9% / -11%). The direction is
+  consistent across re-measurements; the absolute change is ~100 ns,
+  which is close to noise size, so a single A/B comparison can fail
+  to show it. Quote them as "small directional wins" rather than
+  hard numbers.
+- **Untrustworthy / disk-bound**: `backup_roundtrip_100rows`. See its
+  row above — page-cache state dominates, the figure swings 300×.
+
+Three baselines are at their hard floor and won't move without an API
+change:
+
+- `hash_*` — scalar BLAKE3 + LLVM auto-vec already saturates a single
+  ARM core. Within-block NEON regressed (see v3.0.4). 4-chunk-parallel
+  SIMD would help bulk hashing, not single-block hashing.
+- `catalog_deserialize_100rows` — 100 × `String` alloc for Text cells
+  is ~3 µs of the 3.7 µs total. Would need `Value::Text(Cow<'a, str>)`
+  with lifetimes to dent further.
+- `append_one` (audit) — dominated by one BLAKE3 over prev-hash plus
+  serialized entry; same hash-throughput floor.
 
 ## Perf gates
 
