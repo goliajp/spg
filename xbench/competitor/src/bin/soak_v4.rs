@@ -142,11 +142,7 @@ fn run(minutes: u64) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cycle<W: Write, R: Read>(
-    w: &mut W,
-    r: &mut BufReader<R>,
-    cycles: u64,
-) -> Result<(), String> {
+fn cycle<W: Write, R: Read>(w: &mut W, r: &mut BufReader<R>, cycles: u64) -> Result<(), String> {
     // 1. JSON path access (exercises engine/json.rs allocator)
     let id = (cycles % 200) + 1;
     drain_query(
@@ -183,7 +179,11 @@ fn cycle<W: Write, R: Read>(
     Ok(())
 }
 
-fn drain_query<W: Write, R: Read>(w: &mut W, r: &mut BufReader<R>, sql: &str) -> Result<(), String> {
+fn drain_query<W: Write, R: Read>(
+    w: &mut W,
+    r: &mut BufReader<R>,
+    sql: &str,
+) -> Result<(), String> {
     use spg_wire::{Op, build_query, encode};
     let mut out = Vec::with_capacity(sql.len() + 16);
     encode(&build_query(sql), &mut out).map_err(|e| format!("encode: {e}"))?;
@@ -191,12 +191,14 @@ fn drain_query<W: Write, R: Read>(w: &mut W, r: &mut BufReader<R>, sql: &str) ->
     // Drain frames until CommandComplete or ErrorResponse.
     loop {
         let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
-        r.read_exact(&mut header).map_err(|e| format!("header: {e}"))?;
+        r.read_exact(&mut header)
+            .map_err(|e| format!("header: {e}"))?;
         let plen = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let op = Op::from_byte(header[4]).map_err(|e| format!("op: {e}"))?;
         let mut payload = vec![0u8; plen];
         if plen > 0 {
-            r.read_exact(&mut payload).map_err(|e| format!("payload: {e}"))?;
+            r.read_exact(&mut payload)
+                .map_err(|e| format!("payload: {e}"))?;
         }
         match op {
             Op::CommandComplete => return Ok(()),
@@ -262,10 +264,7 @@ fn print_report(start_rss: u64, end_rss: u64, cycles: u64, samples: &[(u64, u64)
     println!("- cycles        : {cycles}");
     println!("- start RSS     : {start_rss} KiB");
     println!("- end RSS       : {end_rss} KiB");
-    println!(
-        "- raw start→end : {:+.1}%",
-        drift_pct(start_rss, end_rss)
-    );
+    println!("- raw start→end : {:+.1}%", drift_pct(start_rss, end_rss));
     // Skip first ~60s as warm-up (initial allocator commit + index
     // build + page-in). Real leak detection compares the
     // post-warmup RSS to the final RSS. Match the v3.4.2 baseline
@@ -291,8 +290,7 @@ fn print_report(start_rss: u64, end_rss: u64, cycles: u64, samples: &[(u64, u64)
     }
     println!();
     // Verdict uses post-warmup drift when available, raw otherwise.
-    let drift = warm_drift
-        .map_or_else(|| drift_pct(start_rss, end_rss).abs(), f64::abs);
+    let drift = warm_drift.map_or_else(|| drift_pct(start_rss, end_rss).abs(), f64::abs);
     if drift < 2.0 {
         println!("verdict: ✅ leak-free (drift < 2% threshold, v3.4.2 baseline was 0.2%)");
     } else if drift < 10.0 {

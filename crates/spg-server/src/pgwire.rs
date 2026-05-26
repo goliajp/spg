@@ -167,6 +167,33 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                     continue;
                 };
                 let sql = sql_str.trim_end_matches(';').trim().to_string();
+                // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
+                // multi-frame protocol; intercept before the regular
+                // execute path tries to parse them.
+                if let Some(copy) = parse_copy_intent(&sql) {
+                    match copy {
+                        CopyIntent::From(table) => {
+                            handle_copy_from_stdin(
+                                &mut stream,
+                                state,
+                                role,
+                                &table,
+                                &mut tx_state,
+                            )?;
+                        }
+                        CopyIntent::To(table) => {
+                            handle_copy_to_stdout(
+                                &mut stream,
+                                state,
+                                role,
+                                &table,
+                                &mut tx_state,
+                            )?;
+                        }
+                    }
+                    send_ready_for_query(&mut stream, tx_state)?;
+                    continue;
+                }
                 // psql sends startup probes like "SELECT version()" /
                 // "SHOW search_path". Stub the common ones with sane
                 // canned answers so the client doesn't error out.
@@ -286,10 +313,14 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             b'S' => {
                 send_ready_for_query(&mut stream, tx_state)?;
             }
-            // CopyData (d), CopyDone (c), CopyFail (f) — we don't
-            // support COPY at all, but reject cleanly.
+            // CopyData / CopyDone / CopyFail outside of an active
+            // COPY block — protocol error from the client.
             b'd' | b'c' | b'f' => {
-                send_error(&mut stream, "0A000", "COPY protocol not supported")?;
+                send_error(
+                    &mut stream,
+                    "08P01",
+                    "unexpected CopyData/Done/Fail outside COPY mode",
+                )?;
                 send_ready_for_query(&mut stream, tx_state)?;
             }
             _ => {
@@ -942,6 +973,334 @@ fn handle_execute(
         Err(e) => return Err(e.to_string()),
     }
     Ok(())
+}
+
+// ---- v4.17 COPY FROM STDIN / COPY TO STDOUT ----
+
+enum CopyIntent {
+    From(String),
+    To(String),
+}
+
+/// Detects `COPY <table> FROM STDIN` and `COPY <table> TO STDOUT`
+/// (case-insensitive). Anything else (e.g. `COPY ... FROM '/path'`)
+/// falls through to the regular engine path, which will report a
+/// parse error — file-based COPY is intentionally not supported
+/// (no filesystem access from the server in the docker-compose
+/// deployment shape).
+fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
+    let lower = sql.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("copy ")?;
+    let mut it = rest.split_ascii_whitespace();
+    let table = it.next()?.to_string();
+    let dir = it.next()?;
+    let endpoint = it.next()?;
+    match (dir, endpoint) {
+        ("from", "stdin") => Some(CopyIntent::From(table)),
+        ("to", "stdout") => Some(CopyIntent::To(table)),
+        _ => None,
+    }
+}
+
+/// COPY FROM STDIN — server sends CopyInResponse, reads CopyData
+/// frames, parses each row (tab-delimited text, `\N` = NULL),
+/// inserts via engine.execute("INSERT ..."). CopyDone commits;
+/// CopyFail aborts.
+fn handle_copy_from_stdin(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    role: Role,
+    table: &str,
+    tx_state: &mut u8,
+) -> std::io::Result<()> {
+    if !role.can_write() {
+        send_error(
+            stream,
+            "42501",
+            "permission denied: COPY FROM requires admin or readwrite",
+        )?;
+        return Ok(());
+    }
+    // Look up the column count so we can size the CopyInResponse
+    // and validate row arity.
+    let Some(col_count) = state
+        .engine
+        .read()
+        .ok()
+        .and_then(|e| e.catalog().get(table).map(|t| t.schema().columns.len()))
+    else {
+        send_error(
+            stream,
+            "42P01",
+            &format!("relation {table:?} does not exist"),
+        )?;
+        return Ok(());
+    };
+    // CopyInResponse 'G' body:
+    //   [u8 overall_format = 0=text]
+    //   [u16 col_count]
+    //   per-col [u16 format = 0=text]
+    let mut body = Vec::with_capacity(3 + col_count * 2);
+    body.push(0);
+    body.extend_from_slice(&u16::try_from(col_count).unwrap_or(0).to_be_bytes());
+    for _ in 0..col_count {
+        body.extend_from_slice(&0u16.to_be_bytes());
+    }
+    send_msg(stream, b'G', &body)?;
+
+    // Stream loop: keep reading frames; each CopyData ('d') frame
+    // may carry partial / multiple / no rows. Buffer bytes, split
+    // on \n. CopyDone ('c') ends the input.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut inserted: u64 = 0;
+    loop {
+        let mut header = [0u8; 5];
+        stream.read_exact(&mut header)?;
+        let ty = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let body_len = len.saturating_sub(4);
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            stream.read_exact(&mut body)?;
+        }
+        match ty {
+            b'd' => buf.extend_from_slice(&body),
+            b'c' => {
+                // Drain remaining bytes as a final row (if any).
+                if !buf.is_empty() && !buf.ends_with(b"\n") {
+                    buf.push(b'\n');
+                }
+                break;
+            }
+            b'f' => {
+                send_error(stream, "57014", "client aborted COPY")?;
+                return Ok(());
+            }
+            other => {
+                send_error(
+                    stream,
+                    "08P01",
+                    &format!("unexpected frame 0x{other:02x} during COPY"),
+                )?;
+                return Ok(());
+            }
+        }
+        // Process whatever full lines we have.
+        if let Err(msg) = process_copy_chunk(state, table, &mut buf, &mut inserted) {
+            send_error(stream, "22P02", &msg)?;
+            return Ok(());
+        }
+    }
+    // Final drain.
+    if let Err(msg) = process_copy_chunk(state, table, &mut buf, &mut inserted) {
+        send_error(stream, "22P02", &msg)?;
+        return Ok(());
+    }
+    send_command_complete(stream, &format!("COPY {inserted}"))?;
+    *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+        b'T'
+    } else {
+        b'I'
+    };
+    Ok(())
+}
+
+/// Split the buffer into newline-terminated rows, INSERT each one
+/// via the regular engine path. Leftover bytes (partial row) stay
+/// in `buf` for the next call.
+fn process_copy_chunk(
+    state: &Arc<ServerState>,
+    table: &str,
+    buf: &mut Vec<u8>,
+    inserted: &mut u64,
+) -> Result<(), String> {
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=nl).collect();
+        let line = &line[..line.len() - 1]; // strip the '\n'
+        // PG's COPY text format treats a single '.' on a line as
+        // end-of-data (legacy psql). Honour it.
+        if line == b"\\." {
+            return Ok(());
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let row_text =
+            std::str::from_utf8(line).map_err(|_| "COPY row not valid UTF-8".to_string())?;
+        let values = decode_copy_text_row(row_text);
+        let sql = build_copy_insert(table, &values);
+        let mut engine = state
+            .engine
+            .write()
+            .map_err(|_| "engine rwlock poisoned".to_string())?;
+        engine
+            .execute(&sql)
+            .map_err(|e| format!("COPY row INSERT failed: {e}"))?;
+        *inserted += 1;
+    }
+    Ok(())
+}
+
+/// PG COPY text format: tab-separated cells, `\N` for NULL,
+/// backslash escapes \\b \f \n \r \t \v. We decode each cell into
+/// a SQL-literal-ready string (quoted; backslashes preserved as
+/// literal text) — the engine parser sees regular VALUES syntax.
+fn decode_copy_text_row(line: &str) -> Vec<Option<String>> {
+    line.split('\t')
+        .map(|cell| {
+            if cell == "\\N" {
+                None
+            } else {
+                let mut out = String::with_capacity(cell.len());
+                let mut chars = cell.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\\'
+                        && let Some(n) = chars.next()
+                    {
+                        out.push(match n {
+                            'b' => '\u{08}',
+                            'f' => '\u{0c}',
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            'v' => '\u{0b}',
+                            '\\' => '\\',
+                            other => other,
+                        });
+                    } else {
+                        out.push(c);
+                    }
+                }
+                Some(out)
+            }
+        })
+        .collect()
+}
+
+/// Build `INSERT INTO <table> VALUES (...)` from a decoded row.
+/// Numeric-looking cells go in bare so the engine sees an INT/FLOAT
+/// literal; everything else is single-quoted with SQL escape.
+fn build_copy_insert(table: &str, values: &[Option<String>]) -> String {
+    let mut sql = format!("INSERT INTO {table} VALUES (");
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        match v {
+            None => sql.push_str("NULL"),
+            Some(s) => {
+                if looks_numeric(s) || matches!(s.as_str(), "true" | "false" | "TRUE" | "FALSE") {
+                    sql.push_str(s);
+                } else {
+                    sql.push('\'');
+                    for ch in s.chars() {
+                        if ch == '\'' {
+                            sql.push('\'');
+                        }
+                        sql.push(ch);
+                    }
+                    sql.push('\'');
+                }
+            }
+        }
+    }
+    sql.push(')');
+    sql
+}
+
+/// COPY TO STDOUT — server runs `SELECT * FROM <table>`, sends
+/// CopyOutResponse, streams each row as one CopyData frame (text
+/// format), then CopyDone + CommandComplete.
+fn handle_copy_to_stdout(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    role: Role,
+    table: &str,
+    tx_state: &mut u8,
+) -> std::io::Result<()> {
+    let _ = role.can_read(); // every role can read
+    let sql = format!("SELECT * FROM {table}");
+    let result = execute_with_role(state, &sql, role);
+    let (columns, rows) = match result {
+        Ok(QueryResult::Rows { columns, rows }) => (columns, rows),
+        Ok(QueryResult::CommandOk { .. }) => {
+            send_error(stream, "42000", "COPY TO source produced no rows")?;
+            return Ok(());
+        }
+        Err(e) => {
+            send_error(stream, "42000", &e.to_string())?;
+            return Ok(());
+        }
+    };
+    let col_count = columns.len();
+    // CopyOutResponse 'H' body, same layout as CopyInResponse.
+    let mut body = Vec::with_capacity(3 + col_count * 2);
+    body.push(0);
+    body.extend_from_slice(&u16::try_from(col_count).unwrap_or(0).to_be_bytes());
+    for _ in 0..col_count {
+        body.extend_from_slice(&0u16.to_be_bytes());
+    }
+    send_msg(stream, b'H', &body)?;
+    let n = rows.len();
+    for row in &rows {
+        let mut line = String::new();
+        for (i, v) in row.values.iter().enumerate() {
+            if i > 0 {
+                line.push('\t');
+            }
+            line.push_str(&encode_copy_cell(v));
+        }
+        line.push('\n');
+        send_msg(stream, b'd', line.as_bytes())?;
+    }
+    send_msg(stream, b'c', &[])?; // CopyDone
+    send_command_complete(stream, &format!("COPY {n}"))?;
+    // No TX state change.
+    let _ = tx_state;
+    Ok(())
+}
+
+/// Inverse of decode_copy_text_row's cell decode: render a Value
+/// as a tab-safe text cell with `\N` for NULL.
+fn encode_copy_cell(v: &spg_storage::Value) -> String {
+    use spg_storage::Value;
+    match v {
+        Value::Null => "\\N".to_string(),
+        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(x) => format!("{x}"),
+        Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
+        Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
+        Value::Date(d) => spg_engine::eval::format_date(*d),
+        Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
+        Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
+        Value::Vector(v) => {
+            let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
+            escape_copy_cell(&format!("[{}]", parts.join(", ")))
+        }
+    }
+}
+
+/// Escape a text cell per PG COPY text-format rules: backslash,
+/// tab, newline, CR, and a literal `\b`/`\f`/`\v` get the standard
+/// escape sequences.
+fn escape_copy_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\u{0b}' => out.push_str("\\v"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---- Auth helpers (cleartext + SCRAM) ----
