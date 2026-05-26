@@ -22,6 +22,7 @@
 
 mod observability;
 mod pgwire;
+mod replication;
 mod scram;
 
 use std::env;
@@ -302,6 +303,47 @@ fn run(
         match observability::spawn_http(&http_addr, Arc::clone(&state)) {
             Ok(http_local) => eprintln!("spg-server: http listening on {http_local}"),
             Err(e) => eprintln!("spg-server: http failed to start on {http_addr}: {e}"),
+        }
+    }
+
+    // v4.24: optional master-side replication listener. When set,
+    // followers can connect and stream the WAL.
+    if let Ok(repl_addr) = env::var("SPG_REPL_ADDR")
+        && !repl_addr.is_empty()
+    {
+        match replication::spawn_master_listener(&repl_addr, Arc::clone(&state)) {
+            Ok(repl_local) => {
+                eprintln!("spg-server: replication listening on {repl_local}");
+            }
+            Err(e) => {
+                eprintln!("spg-server: replication failed to start on {repl_addr}: {e}");
+            }
+        }
+    }
+
+    // v4.24: optional follower mode. When set, the server tails
+    // the master's WAL and applies it locally. Requires a db_path
+    // and wal_path so the snapshot + WAL stream can be persisted
+    // (and survive restart).
+    if let Ok(master_addr) = env::var("SPG_FOLLOW_OF")
+        && !master_addr.is_empty()
+    {
+        if let (Some(db), Some(wal)) =
+            (state.db_path.clone(), state.wal_path.clone())
+        {
+            let state_for_follower = Arc::clone(&state);
+            thread::Builder::new()
+                .name("spg-follower".into())
+                .spawn(move || {
+                    replication::run_follower(master_addr, db, wal, state_for_follower);
+                })
+                .ok();
+            eprintln!("spg-server: started as follower");
+        } else {
+            eprintln!(
+                "spg-server: SPG_FOLLOW_OF set but db_path or wal_path missing — \
+                 follower mode requires both"
+            );
         }
     }
 
@@ -891,7 +933,7 @@ fn append_audit(state: &ServerState, sql: &str) -> std::io::Result<()> {
 /// `rename` over the target. `rename` is atomic on POSIX.
 /// Wall clock impl injected into the engine. Microseconds since the
 /// Unix epoch; clamps to `i64::MAX` for far-future system clocks.
-fn wall_clock_micros() -> i64 {
+pub(crate) fn wall_clock_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
