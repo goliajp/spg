@@ -59,5 +59,9 @@ path = "src/bin/large_data.rs"
 name = "soak"
 path = "src/bin/soak.rs"
 
+[[bin]]
+name = "concurrent"
+path = "src/bin/concurrent.rs"
+
 [lints]
 workspace = true

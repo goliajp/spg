@@ -566,6 +566,51 @@ Reproduce (mixed): `cargo run --release -p spg-bench-competitor
 Reproduce (readonly): `cargo run --release -p spg-bench-competitor
 --bin soak -- --minutes 10 --readonly`
 
+## Concurrency (v4.0) — RwLock + read/write split
+
+Pre-v4 spg-server held `Mutex<Engine>` globally; every query — even
+a pure SELECT — serialised on a single mutex. Bad for the
+docker-compose RDBMS use case (app + DBA + BI users all in the same
+deployment).
+
+v4.0 changes:
+
+- `Engine::execute_readonly(&self, sql)` — succeeds for SELECT /
+  SHOW; returns `EngineError::WriteRequired` for everything else.
+  Engine state isn't mutated on the success path.
+- `ServerState.engine: RwLock<Engine>` (was `Mutex<Engine>`).
+- Server peeks first SQL keyword (`select` / `show`) and, **outside
+  an active TX**, takes `.read()` → `execute_readonly`. Falls
+  through to `.write()` → `execute` only for writes or if the peek
+  mis-classifies.
+- Per-connection `in_tx: bool`. Once `BEGIN` opens a TX, all
+  subsequent statements on that connection take the write lock
+  until `COMMIT`/`ROLLBACK` — keeps TX state visible to its own
+  reads. Engine's `in_transaction()` is the authority; we sync from
+  it after every write.
+
+### Scaling (M-series 8-core Mac, indexed PK lookup, 5 s each)
+
+| threads | aggregate ops/s | per-thread ops/s | vs 1-thread |
+|--------:|----------------:|-----------------:|------------:|
+|       1 |          66,573 |           66,573 | 1.00× |
+|       2 |         105,919 |           52,960 | 1.59× |
+|       4 |         128,627 |           32,157 | 1.93× |
+|       8 |         134,425 |           16,803 | 2.02× |
+
+Pre-v4 with `Mutex<Engine>` would have stayed flat at the 1-thread
+rate regardless of `N` — every reader fighting one lock. v4.0
+delivers a real **2× aggregate scaling** at 8 threads (and would
+keep climbing for a few more threads).
+
+Why not linear? The read lock is shared, but each connection still
+allocates per-query (SQL parse, Vec<Value> per row). A future
+v4-series target is a parse-cache or per-thread arena to push toward
+linear; logged as v4.x candidate.
+
+Reproduce: `cargo run --release -p spg-bench-competitor --bin
+concurrent -- --threads N --seconds S`.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
