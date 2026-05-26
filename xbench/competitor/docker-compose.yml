@@ -1,0 +1,84 @@
+# Competitor benchmark stack. Three containers running on
+# loopback-only non-standard ports so they can coexist with any
+# host-side PG / MySQL installation:
+#
+#   PostgreSQL 18 + pgvector → 127.0.0.1:25432
+#   MySQL 9                  → 127.0.0.1:23306
+#   MariaDB 11               → 127.0.0.1:23307
+#
+# All three use the same `bench` / `bench` credentials and `bench`
+# database/schema so the bench harness can keep its config flat. Data
+# is intentionally NOT persisted across `down` runs (no named
+# volumes) — every bench run starts with cold servers so the numbers
+# don't drift on prior cache state.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: spg-bench-postgres
+    restart: "no"
+    ports:
+      - "127.0.0.1:25432:5432"
+    environment:
+      POSTGRES_DB: bench
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      # Tune for bench workloads: shared_buffers / fsync stay default,
+      # max_connections lowered (we only need a handful), turn off
+      # autovacuum so cold-start runs aren't perturbed.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    command:
+      - postgres
+      - -c
+      - max_connections=20
+      - -c
+      - autovacuum=off
+      - -c
+      - shared_preload_libraries=vector
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "bench", "-d", "bench"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mysql:
+    image: mysql:9
+    container_name: spg-bench-mysql
+    restart: "no"
+    ports:
+      - "127.0.0.1:23306:3306"
+    environment:
+      MYSQL_DATABASE: bench
+      MYSQL_USER: bench
+      MYSQL_PASSWORD: bench
+      MYSQL_ROOT_PASSWORD: rootpw
+    command:
+      # MySQL 9 makes caching_sha2_password the default; the explicit
+      # --default-authentication-plugin flag was removed in 8.4.
+      - --max_connections=20
+      - --innodb_flush_log_at_trx_commit=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "bench", "-pbench"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mariadb:
+    image: mariadb:11
+    container_name: spg-bench-mariadb
+    restart: "no"
+    ports:
+      - "127.0.0.1:23307:3306"
+    environment:
+      MARIADB_DATABASE: bench
+      MARIADB_USER: bench
+      MARIADB_PASSWORD: bench
+      MARIADB_ROOT_PASSWORD: rootpw
+    command:
+      - --max_connections=20
+      - --innodb_flush_log_at_trx_commit=1
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
