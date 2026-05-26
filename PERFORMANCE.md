@@ -128,6 +128,7 @@ Run: `cargo bench -p spg-audit --bench log`.
 | `execute_select_where_n100_indexed` | **840 ns**   | v3.1.0: same query as above with `CREATE INDEX users_id_idx ON users (id)` first; the planner's existing `try_index_seek` skips the scan and goes straight to the B-tree. **−67% / 3×** vs the un-indexed path. |
 | `execute_select_count_group_n100`   | **3.10 µs**  | v3.0.3: was 3.33 µs; **−7%**. |
 | `execute_insert_one`                | **2.20 µs**  | v3.0.3 + v3.0.6 re-measurement: was 2.60 µs; **−15%** ✅. INSERT's per-row rewrite loop is where the single-`match` `rewrite_expr_clock` restructure shows up most. |
+| `execute_select_order_limit_k_n1000`| **41.4 µs**  | v3.1.1: was 43.0 µs; **−5%** via partial sort (select_nth_unstable + sort first k). Win is small because at n=1000 / k=10 the sort itself is only ~25% of total time — the bigger share is the 1000-row scan + per-row projection eval. Cost ratio improves at larger n. |
 
 Run: `cargo bench -p spg-engine --bench execute`.
 
