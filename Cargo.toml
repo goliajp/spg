@@ -28,7 +28,11 @@ repository   = "https://github.com/lihao/spg"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
-unsafe_code            = "forbid"
+# v3.0.4: relaxed from `forbid` to `deny` so spg-crypto can drop into
+# inline NEON / AVX2 intrinsics (all unsafe). The crate-level allow is
+# narrowly scoped — every other workspace crate still inherits `deny`
+# and must justify any new unsafe block.
+unsafe_code            = "deny"
 unused_must_use        = "deny"
 missing_debug_implementations = "warn"
 
