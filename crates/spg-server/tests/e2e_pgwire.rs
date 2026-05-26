@@ -120,7 +120,6 @@ fn send_startup(s: &mut TcpStream, user: &str) {
     s.write_all(&out).unwrap();
 }
 
-
 fn send_query(s: &mut TcpStream, sql: &str) {
     let mut body = Vec::with_capacity(sql.len() + 1);
     body.extend_from_slice(sql.as_bytes());

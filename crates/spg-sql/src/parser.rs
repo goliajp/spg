@@ -1064,18 +1064,44 @@ impl Parser {
             Token::False => Ok(Expr::Literal(Literal::Bool(false))),
             Token::Null => Ok(Expr::Literal(Literal::Null)),
             Token::LParen => {
-                let e = self.parse_expr(0)?;
-                match self.advance() {
-                    Token::RParen => Ok(e),
-                    other => Err(ParseError {
-                        message: format!("expected ')', got {other:?}"),
-                        token_pos: self.pos.saturating_sub(1),
-                    }),
+                // v4.10: `(SELECT ...)` in expression position is a
+                // scalar subquery; otherwise it's a parenthesised
+                // expression. Peek for SELECT keyword to dispatch.
+                if matches!(self.peek(), Token::Select) {
+                    let inner = self.parse_select_stmt()?;
+                    match self.advance() {
+                        Token::RParen => {
+                            let Statement::Select(s) = inner else {
+                                unreachable!("parse_select_stmt returns Select")
+                            };
+                            Ok(Expr::ScalarSubquery(Box::new(s)))
+                        }
+                        other => Err(ParseError {
+                            message: format!("expected ')' after scalar subquery, got {other:?}"),
+                            token_pos: self.pos.saturating_sub(1),
+                        }),
+                    }
+                } else {
+                    let e = self.parse_expr(0)?;
+                    match self.advance() {
+                        Token::RParen => Ok(e),
+                        other => Err(ParseError {
+                            message: format!("expected ')', got {other:?}"),
+                            token_pos: self.pos.saturating_sub(1),
+                        }),
+                    }
                 }
             }
             Token::LBracket => self.parse_vector_literal_body(),
             Token::Extract => self.parse_extract_atom(),
             Token::Interval => self.parse_interval_atom(),
+            // v4.10: EXISTS / NOT EXISTS. EXISTS isn't a reserved
+            // token; we match on the bare ident. NOT is a token
+            // (consumed in the comparison rung), but `EXISTS (...)`
+            // at the top of an expression starts here.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exists") => {
+                self.parse_exists_atom(false)
+            }
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
@@ -1213,12 +1239,56 @@ impl Parser {
 
     /// `x IN (a, b, c)`  →  chained OR of equalities. Empty list collapses
     /// to FALSE (TRUE under NOT IN), matching standard SQL semantics.
+    /// v4.10: parse `EXISTS (SELECT ...)`. Caller (`parse_atom`)
+    /// already consumed the leading `EXISTS` ident via
+    /// `self.advance()`.
+    fn parse_exists_atom(&mut self, negated: bool) -> Result<Expr, ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("expected '(' after EXISTS, got {:?}", self.peek())));
+        }
+        self.advance();
+        let inner = self.parse_select_stmt()?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' after EXISTS-subquery, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let Statement::Select(s) = inner else {
+            unreachable!("parse_select_stmt returns Select")
+        };
+        Ok(Expr::Exists {
+            subquery: Box::new(s),
+            negated,
+        })
+    }
+
     fn parse_in_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
         self.advance(); // IN
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after IN, got {:?}", self.peek())));
         }
         self.advance();
+        // v4.10: `IN (SELECT ...)` — subquery branch.
+        if matches!(self.peek(), Token::Select) {
+            let inner = self.parse_select_stmt()?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(format!(
+                    "expected ')' after IN-subquery, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let Statement::Select(s) = inner else {
+                unreachable!("parse_select_stmt always returns Statement::Select")
+            };
+            return Ok(Expr::InSubquery {
+                expr: Box::new(expr),
+                subquery: Box::new(s),
+                negated,
+            });
+        }
         let mut elements = Vec::new();
         if !matches!(self.peek(), Token::RParen) {
             loop {
