@@ -491,6 +491,52 @@ faster on every metric.
 Reproduce: `xbench/competitor/scripts/up.sh && cargo run --release
 -p spg-bench-competitor --bin large_data` (≈3 min total).
 
+## Long-running stability (v3.4.2)
+
+Two complementary soak runs against spg-server, sampling RSS (KiB)
+and per-op p50 latency every 30 s.
+
+### 15-min MIXED soak (60% indexed SELECT / 30% INSERT / 10% HNSW kNN)
+
+| metric                | start    | end      | drift    | verdict |
+|-----------------------|---------:|---------:|---------:|---------|
+| RSS                   |  108 MiB | 1.85 GiB | +1597%   | **expected** — data growth |
+| SELECT p50            |  16.3 µs |  14.8 µs |  -9.7%   | ✅ stable |
+| INSERT p50            |  16.0 µs |  13.9 µs |  -13%    | ✅ stable |
+| HNSW kNN p50          |  54.5 µs |  48.7 µs |  -11%    | ✅ stable |
+| total ops             |        — |   36.3M  |          | 40K ops/s sustained |
+
+The +1597% RSS drift looks alarming but every byte is **honest data
+growth**: 10.9M INSERTs at ~150 bytes each (Value::Int + Value::Text
++ Vec headers + BTree index entry) = ~1.6 GiB expected catalog
+growth. Latency stays flat throughout, so the server is not
+degrading — it's just growing the data set it was told to.
+
+### 10-min READ-ONLY soak (60% indexed SELECT / 40% HNSW kNN, **no writes**)
+
+| metric                | start    | end      | drift    | verdict |
+|-----------------------|---------:|---------:|---------:|---------|
+| RSS                   |  10.0 MiB | 10.0 MiB | **-0.2%** | ✅ **no leak** |
+| SELECT p50            |  17.0 µs |  13.8 µs |  -18.6%  | ✅ improved (cache warm) |
+| HNSW kNN p50          |  55.9 µs |  44.2 µs |  -21%    | ✅ improved |
+| total ops             |        — |   18.5M  |          | 30K ops/s sustained |
+
+This is the **real leak detector**: data volume is constant (no
+INSERTs), so if there were a leak it would surface. RSS is flat to
+the kilobyte across 18.5 million round-trip ops. Latency actually
+improved as warm caches / branch predictors settled.
+
+**Combined verdict**: spg-server is **leak-free**; the soak captured
+zero unexplained memory growth. Mixed-workload RSS climb tracks data
+size proportionally. Sustained 30-40K ops/sec for tens of millions
+of round trips with no latency degradation.
+
+Reproduce (mixed): `cargo run --release -p spg-bench-competitor
+--bin soak -- --minutes 15`
+
+Reproduce (readonly): `cargo run --release -p spg-bench-competitor
+--bin soak -- --minutes 10 --readonly`
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
