@@ -2099,10 +2099,14 @@ mod tests {
             let mut a = Vec::with_capacity(d);
             let mut b = Vec::with_capacity(d);
             for _ in 0..d {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
                 let x = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
                 let y = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
                 a.push(x);

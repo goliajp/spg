@@ -361,6 +361,77 @@ Fresh, cold-container measurements (M-series Mac, release):
 The competitor scoreboard's one "behind" row from v3.2 is gone; every
 leading number widened.
 
+## Footprint — binary size + RSS at workload (v3.4.0)
+
+Two things production deployments care about beyond latency / throughput:
+
+1. **Binary size**: matters for docker image bloat, cold-start time,
+   embedded deployments.
+2. **Resident set size (RSS) at workload**: matters for sizing a
+   container, for memory-cap reasoning, and for catching leaks.
+
+### Binary sizes (release, stripped, M-series Mac)
+
+| binary       |    size  |
+|--------------|---------:|
+| `spg-server` |    736 K |
+| `spg`        |   ~800 K (similar) |
+
+Per-crate `rlib` (the deps the binaries link in — strictly larger
+than what ends up in the linked binary because of LTO dead-code
+elimination):
+
+| crate         |    rlib  |
+|---------------|---------:|
+| `spg_wire`    |    120 K |
+| `spg_sql`     |    624 K |
+| `spg_storage` |    500 K |
+| `spg_crypto`  |     44 K |
+| `spg_audit`   |     64 K |
+| `spg_engine`  |    1.0 M |
+
+Reproduce: `bash xbench/competitor/scripts/sizes.sh`.
+
+### RSS at workload (KiB resident, measured via `ps -o rss=`)
+
+Both modes seed identical data: `users (id INT, name TEXT)` filled
+to 10K then 100K rows, then a `vecs (id INT, v VECTOR(128))` table
+filled with 10K vectors plus a `CREATE INDEX … USING hnsw` build.
+spg-server runs with no WAL, no audit, no db_path (the simplest
+useful config).
+
+| stage                        | spg-embedded | spg-server |
+|------------------------------|-------------:|-----------:|
+| idle (no workload)           |     1.7 MiB  |   1.6 MiB  |
+| after 10K-row INSERT         |     3.4 MiB  |   3.4 MiB  |
+| after 100K-row INSERT        |    13.9 MiB  |  13.9 MiB  |
+| after 10K dim-128 HNSW       |    22.5 MiB  |  22.7 MiB  |
+| peak observed                |    22.5 MiB  |  22.7 MiB  |
+
+Embedded and server now overlap inside 200 KiB across every stage —
+the wire-frame buffering, audit / WAL / snapshot mutexes, and per-
+connection threads cost almost nothing in residency terms.
+
+**Found and fixed during this baseline (v3.4.0):**
+
+- `engine.snapshot()` ran on every successful write even when no
+  `db_path` was configured — the resulting Vec<u8> was discarded a
+  few lines later by the `if let Some(path)` write-out gate, but
+  the allocation churn was real: 110K writes × ~3 MB serialised
+  catalog ≈ 330 GB of allocator traffic per soak run, surfacing as
+  a one-off 400+ MB RSS high-water on the macOS allocator before
+  it released back to the OS. Now gated on `db_path.is_some()` too.
+- `append_audit` (in-memory AuditLog grow) ran on every successful
+  CommandOk even when no `audit_path` was configured. SQL text was
+  cloned into the log forever; a 100K-write soak retained ~25 MB of
+  string data. Now gated on `audit_path.is_some()` too.
+
+Without these two fixes the v3.4.0 server-mode RSS was **445 MiB**
+for the HNSW stage — vs the 23 MiB above. The bench discovered both
+bugs; they're the v3.4.0 commit's payload.
+
+Reproduce: `cargo run --release -p spg-bench-competitor --bin memory`.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
