@@ -120,6 +120,13 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                 detail: "subquery reached row eval — engine resolver bug".into(),
             })
         }
+        // v4.12: window functions should have been rewritten into
+        // synthetic __win_N column references by
+        // exec_select_with_window before row eval. Anything
+        // reaching here is similarly a bug.
+        Expr::WindowFunction { .. } => Err(EvalError::TypeMismatch {
+            detail: "window function reached row eval — engine rewrite bug".into(),
+        }),
     }
 }
 

@@ -67,11 +67,14 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         }
         Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
         Expr::Extract { source, .. } => contains_aggregate(source),
-        // v4.10 subqueries / Literal / Column — all non-aggregate
-        // leaves. Subquery nodes are resolved before this pass.
+        // v4.10 subqueries + v4.12 window functions / Literal /
+        // Column — all non-aggregate leaves from the regular
+        // aggregate planner's POV. Window-bearing projections are
+        // routed to exec_select_with_window before this runs.
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
+        | Expr::WindowFunction { .. }
         | Expr::Literal(_)
         | Expr::Column(_) => false,
     }
@@ -317,11 +320,12 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(pattern, out);
         }
         Expr::Extract { source, .. } => collect_aggregates(source, out),
-        // v4.10 subquery nodes / Literal / Column — non-recursing
-        // leaves from the aggregate-collector's point of view.
+        // v4.10 subquery + v4.12 window / Literal / Column —
+        // non-recursing leaves for the aggregate collector.
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
+        | Expr::WindowFunction { .. }
         | Expr::Literal(_)
         | Expr::Column(_) => {}
     }
@@ -508,11 +512,12 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             field: *field,
             source: Box::new(rewrite_expr(source, group_exprs, aggs)),
         },
-        // v4.10 subqueries / Literal / Column — clone-pass.
-        // Subquery nodes are resolved before this rewrite runs.
+        // v4.10 subquery + v4.12 window / Literal / Column —
+        // clone-pass (these don't participate in aggregate rewrite).
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
+        | Expr::WindowFunction { .. }
         | Expr::Literal(_)
         | Expr::Column(_) => e.clone(),
     }

@@ -319,6 +319,19 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// v4.12 window function call: `name(args) OVER (PARTITION BY
+    /// ... ORDER BY ...)`. Supports `ROW_NUMBER` / `RANK` /
+    /// `DENSE_RANK` and the partition-aware aggregates `SUM` /
+    /// `AVG` / `COUNT` / `MIN` / `MAX`. The window frame defaults to "entire partition" for
+    /// unordered windows and "from start of partition through
+    /// current row" for ordered windows — no explicit ROWS /
+    /// RANGE clause in v4.12 MVP.
+    WindowFunction {
+        name: String,
+        args: Vec<Expr>,
+        partition_by: Vec<Expr>,
+        order_by: Vec<(Expr, bool /* desc */)>,
+    },
     /// v4.10 scalar subquery — `(SELECT ...)` used in expression
     /// position. Must return exactly one row × one column at eval
     /// time; the engine errors out otherwise. Uncorrelated only —
@@ -753,6 +766,46 @@ impl fmt::Display for Expr {
                 }
             }
             Self::Extract { field, source } => write!(f, "EXTRACT({field} FROM {source})"),
+            Self::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+            } => {
+                write!(f, "{name}(")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                f.write_str(") OVER (")?;
+                if !partition_by.is_empty() {
+                    f.write_str("PARTITION BY ")?;
+                    for (i, p) in partition_by.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{p}")?;
+                    }
+                }
+                if !order_by.is_empty() {
+                    if !partition_by.is_empty() {
+                        f.write_str(" ")?;
+                    }
+                    f.write_str("ORDER BY ")?;
+                    for (i, (e, desc)) in order_by.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{e}")?;
+                        if *desc {
+                            f.write_str(" DESC")?;
+                        }
+                    }
+                }
+                f.write_str(")")
+            }
             Self::ScalarSubquery(s) => write!(f, "({s})"),
             Self::Exists { subquery, negated } => {
                 if *negated {
