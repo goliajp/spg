@@ -413,6 +413,43 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     if lower == "select current_user" || lower == "select user" {
         return Some(CannedResponse::single_text("current_user", "admin"));
     }
+    // ---- v4.15 pgbouncer compat: connection-reset statements ----
+    // pgbouncer issues these between pooled client sessions to
+    // wipe per-connection state. SPG doesn't have per-connection
+    // settings worth wiping, so all are no-ops.
+    if lower.starts_with("discard all") {
+        return Some(CannedResponse::Tag("DISCARD ALL"));
+    }
+    if lower.starts_with("discard temp")
+        || lower.starts_with("discard sequences")
+        || lower.starts_with("discard plans")
+    {
+        return Some(CannedResponse::Tag("DISCARD"));
+    }
+    if lower == "reset all" || lower.starts_with("reset ") {
+        return Some(CannedResponse::Tag("RESET"));
+    }
+    // BEGIN ISOLATION LEVEL READ COMMITTED / SERIALIZABLE etc. —
+    // pgbouncer + ORMs often prefix transactions with a level.
+    // SPG only has one isolation level; accept the syntactic
+    // variants without disturbing the engine. Real BEGIN dispatch
+    // happens through the normal engine path when it's a bare
+    // BEGIN / START TRANSACTION (no isolation specifier).
+    if lower.starts_with("begin isolation level")
+        || lower.starts_with("begin transaction isolation level")
+        || lower.starts_with("start transaction isolation level")
+        || lower.starts_with("set transaction isolation level")
+        || lower.starts_with("set transaction read")
+        || lower.starts_with("set transaction snapshot")
+    {
+        // BEGIN-ish variants need to actually open a TX in the
+        // engine. Fall through to the regular path by returning
+        // None; the engine ignores trailing modifiers in BEGIN.
+        // SET TRANSACTION is purely informational — no-op tag.
+        if lower.starts_with("set transaction") {
+            return Some(CannedResponse::Tag("SET"));
+        }
+    }
     // ---- v4.6 pg_catalog subset ----
     if mentions_pg_table(&lower, "pg_class") {
         return Some(pg_class_response(state));
@@ -450,6 +487,11 @@ enum CannedResponse {
         columns: Vec<ColumnSchema>,
         rows: Vec<Row>,
     },
+    /// v4.15: empty-result statement that just needs a
+    /// CommandComplete with a specific tag. Used for DISCARD ALL /
+    /// RESET ALL / SET (no-op forms) — pgbouncer sends these
+    /// between pooled client sessions.
+    Tag(&'static str),
 }
 
 impl CannedResponse {
@@ -469,6 +511,9 @@ fn send_canned(stream: &mut TcpStream, c: &CannedResponse) -> std::io::Result<()
                 send_data_row(stream, columns, row)?;
             }
             send_command_complete(stream, &format!("SELECT {}", rows.len()))?;
+        }
+        CannedResponse::Tag(tag) => {
+            send_command_complete(stream, tag)?;
         }
     }
     Ok(())
