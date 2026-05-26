@@ -71,8 +71,8 @@ Run: `cargo bench -p spg-sql --bench parse`.
 
 | Path                                | Median   | Notes |
 |-------------------------------------|---------:|-------|
-| `catalog_serialize_100rows`         | **1.15 µs** | 100-row, 3-col (Int / Text / Float) table → bytes. |
-| `catalog_deserialize_100rows`       | **4.15 µs** | Same bytes → Catalog. Deserialize is ~4× slower than serialize. |
+| `catalog_serialize_100rows`         | **1.03 µs** | v3.0.2: was 1.13 µs; **−9%** ✅ via schema-driven dense encode (FILE_VERSION 8): per-row NULL bitmap, no per-cell tag byte. |
+| `catalog_deserialize_100rows`       | **3.68 µs** | v3.0.2: was 4.19 µs; **−12%** ✅. Same change + cached `&mut Table` (skip per-row `Vec<Table>` linear scan) + `rows.reserve(row_count)`. Below the −52% target — `String` allocation for the 100 Text cells is a ~3 µs hard floor; the remaining ~700 ns is structural dispatch + Vec push. |
 | `hnsw_build_200rows_dim8`           | **154 µs** | v3.0.1: was 2.41 ms; **−94% / 15.7×** ✅. Heuristic neighbour selection (HNSW paper §4) + `BinaryHeap` frontier + bitmap visited set. |
 | `hnsw_search_top10_dim8_n200`       | **397 ns** | v3.0.1: was 4.75 µs; **−92% / 12×** ✅. Bonus from the same data-structure swap (search shares `layer_beam_search`). |
 
