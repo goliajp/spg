@@ -1,0 +1,39 @@
+[package]
+name         = "spg-bench-competitor"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "Side-by-side benchmark harness: SPG vs Postgres / MySQL / MariaDB."
+publish      = false
+
+# This crate intentionally pulls external Rust deps (sqlx, tokio,
+# criterion). Those deps are *only* present in this xbench crate —
+# spg-wire / spg-sql / spg-storage / spg-engine / spg-server / spg-cli
+# stay pure-stdlib / pure-alloc as before. The workspace lints carve
+# out unsafe_code for spg-crypto; this crate inherits the default deny.
+
+[dependencies]
+spg-engine  = { path = "../../crates/spg-engine" }
+spg-storage = { path = "../../crates/spg-storage" }
+spg-wire    = { path = "../../crates/spg-wire" }
+spg-sql     = { path = "../../crates/spg-sql" }
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "mysql",
+    "runtime-tokio",
+    "macros",
+    "any",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bin]]
+name = "smoke"
+path = "src/smoke.rs"
+
+[lints]
+workspace = true
