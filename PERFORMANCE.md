@@ -82,9 +82,22 @@ Run: `cargo bench -p spg-storage --bench catalog`.
 
 | Path        | Median       | Notes |
 |-------------|-------------:|-------|
-| `hash_64b`  | **67 ns**    | Single BLAKE3 block. |
-| `hash_1kib` | **1.14 µs**  | Single chunk; ~900 MB/s. |
-| `hash_16kib`| **19.5 µs**  | 16 chunks; ~840 MB/s. |
+| `hash_64b`  | **74 ns**    | Single BLAKE3 block. v3.0.4 measurement-with-no-NEON; the median moves ±10 ns between runs. |
+| `hash_1kib` | **1.27 µs**  | Single chunk; ~810 MB/s. |
+| `hash_16kib`| **21.4 µs**  | 16 chunks; ~770 MB/s. |
+
+**v3.0.4 negative result (recorded honestly):** a NEON-vectorised
+`compress` (one block split across 4 lanes) was implemented end-to-end,
+bit-identical-to-scalar, and benchmarked. Result: hash_64b regressed
+to 85 ns, hash_1kib to 2.24 µs, hash_16kib to 38.2 µs — between **1.5×
+and 2× slower** than scalar. Why: scalar BLAKE3 is already heavily
+auto-vectorised by LLVM, and a within-block 4-lane split adds 6 NEON
+EXT permute instructions per round (42 extra instructions per
+compress) without buying parallelism. The real BLAKE3 SIMD win is
+4-chunk-parallel compression, which doesn't apply to SPG's per-entry
+audit-log + per-small-catalog hash workload. NEON path kept under
+`#[cfg(test)]` as a cross-check oracle for the scalar reference; the
+runtime stays scalar.
 
 Run: `cargo bench -p spg-crypto --bench hash`.
 
