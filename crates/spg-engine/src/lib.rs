@@ -417,17 +417,22 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
-        let schema = table.schema().clone();
+        // v3.1.5: clone the columns vector only (not the whole
+        // TableSchema — saves one String alloc for the table name).
+        // We need an owned snapshot because we'll call `table.insert`
+        // (mutable borrow on `table`) inside the row loop while
+        // reading schema fields.
+        let column_meta: Vec<ColumnSchema> = table.schema().columns.clone();
+        let schema_cols_len = column_meta.len();
         // Build a permutation `tuple_pos[c] = Some(j)` meaning schema
         // column `c` is filled from the `j`-th tuple slot; `None` means
         // "fill with NULL". Validated once and reused for every row.
-        let tuple_pos: Vec<Option<usize>> = match &stmt.columns {
-            None => (0..schema.columns.len()).map(Some).collect(),
+        let tuple_pos: Option<Vec<Option<usize>>> = match &stmt.columns {
+            None => None, // 1-1 mapping, fast path
             Some(cols) => {
-                let mut map = alloc::vec![None; schema.columns.len()];
+                let mut map = alloc::vec![None; schema_cols_len];
                 for (j, name) in cols.iter().enumerate() {
-                    let idx = schema
-                        .columns
+                    let idx = column_meta
                         .iter()
                         .position(|c| c.name == *name)
                         .ok_or_else(|| {
@@ -435,7 +440,7 @@ impl Engine {
                         })?;
                     if map[idx].is_some() {
                         return Err(EngineError::Storage(StorageError::ArityMismatch {
-                            expected: schema.columns.len(),
+                            expected: schema_cols_len,
                             actual: cols.len(),
                         }));
                     }
@@ -444,7 +449,7 @@ impl Engine {
                 // Omitted columns must either be nullable, carry a
                 // DEFAULT, or be AUTO_INCREMENT. Catch NOT NULL
                 // omissions up front so the WAL stays clean.
-                for (i, col) in schema.columns.iter().enumerate() {
+                for (i, col) in column_meta.iter().enumerate() {
                     if map[i].is_none()
                         && !col.nullable
                         && col.default.is_none()
@@ -455,10 +460,10 @@ impl Engine {
                         }));
                     }
                 }
-                map
+                Some(map)
             }
         };
-        let expected_tuple_len = stmt.columns.as_ref().map_or(schema.columns.len(), Vec::len);
+        let expected_tuple_len = stmt.columns.as_ref().map_or(schema_cols_len, Vec::len);
         let mut affected = 0usize;
         for tuple in stmt.rows {
             if tuple.len() != expected_tuple_len {
@@ -467,35 +472,51 @@ impl Engine {
                     actual: tuple.len(),
                 }));
             }
-            // Stage the row in schema order so we can index by `tuple_pos`.
-            let raw_tuple: Vec<Value> = tuple
-                .into_iter()
-                .map(literal_expr_to_value)
-                .collect::<Result<_, _>>()?;
-            let mut values = Vec::with_capacity(schema.columns.len());
-            for (i, col) in schema.columns.iter().enumerate() {
-                let mut raw = match tuple_pos[i] {
-                    Some(j) => raw_tuple[j].clone(),
-                    // Omitted column: prefer the column's stored DEFAULT;
-                    // fall back to NULL for unbound nullable columns.
-                    None => col.default.clone().unwrap_or(Value::Null),
-                };
-                // AUTO_INCREMENT fires when the slot would be NULL —
-                // either because the column wasn't named in a column-
-                // list INSERT or because the user explicitly wrote
-                // NULL. The next value is computed against the table's
-                // current contents.
-                if col.auto_increment && raw.is_null() {
-                    let next = table.next_auto_value(i).ok_or_else(|| {
-                        EngineError::Unsupported(alloc::format!(
-                            "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                            col.name
-                        ))
-                    })?;
-                    raw = Value::BigInt(next);
+            // Fast path: no column-list permutation → tuple slot j
+            // maps to schema column j. We can zip schema with tuple
+            // and skip the `raw_tuple` staging allocation entirely.
+            let values: Vec<Value> = if let Some(map) = &tuple_pos {
+                // Permuted path: still need raw_tuple to index by `map[i]`.
+                let raw_tuple: Vec<Value> = tuple
+                    .into_iter()
+                    .map(literal_expr_to_value)
+                    .collect::<Result<_, _>>()?;
+                let mut out = Vec::with_capacity(schema_cols_len);
+                for (i, col) in column_meta.iter().enumerate() {
+                    let mut raw = match map[i] {
+                        Some(j) => raw_tuple[j].clone(),
+                        None => col.default.clone().unwrap_or(Value::Null),
+                    };
+                    if col.auto_increment && raw.is_null() {
+                        let next = table.next_auto_value(i).ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                col.name
+                            ))
+                        })?;
+                        raw = Value::BigInt(next);
+                    }
+                    out.push(coerce_value(raw, col.ty, &col.name, i)?);
                 }
-                values.push(coerce_value(raw, col.ty, &col.name, i)?);
-            }
+                out
+            } else {
+                // 1-1 mapping fast path: single Vec alloc, no raw_tuple.
+                let mut out = Vec::with_capacity(schema_cols_len);
+                for (i, (col, expr)) in column_meta.iter().zip(tuple).enumerate() {
+                    let mut raw = literal_expr_to_value(expr)?;
+                    if col.auto_increment && raw.is_null() {
+                        let next = table.next_auto_value(i).ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                col.name
+                            ))
+                        })?;
+                        raw = Value::BigInt(next);
+                    }
+                    out.push(coerce_value(raw, col.ty, &col.name, i)?);
+                }
+                out
+            };
             table.insert(Row::new(values))?;
             affected += 1;
         }
