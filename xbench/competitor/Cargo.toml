@@ -47,5 +47,9 @@ path = "src/bin/throughput.rs"
 name = "vector_knn"
 path = "src/bin/vector_knn.rs"
 
+[[bin]]
+name = "memory"
+path = "src/bin/memory.rs"
+
 [lints]
 workspace = true

@@ -248,6 +248,7 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // big dispatch table, splitting would scatter the per-op gates
 fn dispatch(
     stream: &mut TcpStream,
     frame: &Frame,
@@ -307,15 +308,24 @@ fn dispatch(
                 // and BEGIN/ROLLBACK never trigger persistence. Additionally,
                 // when WAL is on, we don't update the db snapshot at runtime:
                 // the WAL captures every op and the db file is checkpoint-only.
-                let snap = match (&result, state.wal.is_some()) {
-                    (
+                //
+                // v3.4.0 fix: also skip `engine.snapshot()` when
+                // `db_path` is None — the bytes would have been
+                // discarded immediately. Without this gate, every
+                // write allocates+frees a fresh full-catalog
+                // serialisation (catalog 3 MB per snapshot × 110K
+                // writes = ~330 GB of allocator churn, observable as
+                // a 400+ MB RSS spike).
+                let snap = if state.db_path.is_some() && state.wal.is_none() {
+                    match &result {
                         Ok(QueryResult::CommandOk {
                             modified_catalog: true,
                             ..
-                        }),
-                        false,
-                    ) => Some(engine.snapshot()),
-                    _ => None,
+                        }) => Some(engine.snapshot()),
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
                 (result, snap)
             };
@@ -342,16 +352,21 @@ fn dispatch(
                 );
                 return Err(e);
             }
-            // Audit-log only when the committed state actually changed. For
-            // a TX, this means one audit entry on COMMIT (its SQL text is
-            // "COMMIT" — the body of the TX is recorded only implicitly).
-            if matches!(
-                result,
-                Ok(QueryResult::CommandOk {
-                    modified_catalog: true,
-                    ..
-                })
-            ) && let Err(e) = append_audit(state, &sql)
+            // Audit-log only when the committed state actually changed AND
+            // an audit path is configured. v3.4.0 fix: previously the
+            // in-memory AuditLog grew every write even without an audit
+            // file (the SQL text was cloned into the log forever), so a
+            // long-running server with no audit configured still leaked
+            // a few MB per 10K writes.
+            if state.audit_path.is_some()
+                && matches!(
+                    result,
+                    Ok(QueryResult::CommandOk {
+                        modified_catalog: true,
+                        ..
+                    })
+                )
+                && let Err(e) = append_audit(state, &sql)
             {
                 let _ = write_frame(
                     stream,

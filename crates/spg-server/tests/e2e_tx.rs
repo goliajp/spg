@@ -136,6 +136,7 @@ fn begin_insert_commit_persists() {
         let f = read_frame(&mut s);
         match f.op {
             Op::DataRow => count += 1,
+            Op::DataRowBatch => count += spg_wire::parse_data_row_batch(&f).unwrap().len(),
             Op::CommandComplete => break,
             other => panic!("unexpected: {other:?}"),
         }
