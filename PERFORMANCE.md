@@ -16,6 +16,35 @@ crate (eight of them; see `Cargo.toml`). Each stone owns its own
 `benches/`, `BUDGETS.md`, and `tests/perf_gate.rs`; the workspace owns
 this `PERFORMANCE.md` as the rolled-up index.
 
+## v3.4 frozen baseline (pre-v4 reference, 2026-05-26)
+
+One-table summary of the headline numbers at the end of the v3.4.x
+hardening series. **Every v4.x change must re-run the relevant rows
+below** and either match (within noise) or improve. Regression beyond
+±10% is a release blocker.
+
+| dimension                        | spg-embedded | spg-server | best competitor       |
+|----------------------------------|-------------:|-----------:|----------------------:|
+| single-row INSERT p50            |      0.5 µs |    30.5 µs |  854 µs (MariaDB)    |
+| single-row SEL (indexed) p50     |      0.8 µs |    14.0 µs |  722 µs (MySQL)      |
+| bulk INSERT throughput (10K r)   |    3.04 M/s |   1.11 M/s |  184K/s (MariaDB 100K)|
+| full-table SCAN throughput       |    7.20 M/s |   7.07 M/s |  3.45M/s (MariaDB)   |
+| HNSW dim-128 build (10K vec)     |      0.62 s |     6.23 s |  2.29 s (pgvector)   |
+| HNSW dim-128 kNN p50             |      26 µs |      51 µs |   2.18 ms (pgvector) |
+| 1M-row INSERT total              |       380 ms|      449 ms| ~21 s (estimated 100K linear scale) |
+| 1M-row SCAN total                |       47 ms |      103 ms| ~676 ms (estimated)  |
+| RSS after 100K rows              |     13.9 MiB|    13.9 MiB| n/a (server-managed)  |
+| RSS after 10K dim-128 HNSW       |     22.5 MiB|    22.7 MiB| n/a                   |
+| RSS after 1M rows                |        —    |    239 MiB | n/a                   |
+| spg-server binary size           |          —  |     736 KiB| ~50 MiB (typical PG)  |
+| 15-min mixed-workload soak       |        —    | 36.3M ops, p50 ±10%, RSS tracks data | n/a |
+| 10-min readonly soak             |        —    | 18.5M ops, RSS drift -0.2% (leak-free) | n/a |
+| sqllogictest 369-record suite    |        —    |     1.57 s | n/a                   |
+| conformance corpus pass rate     |    100%     |    100%    | n/a                   |
+
+Detailed breakdowns, per-bench shapes, and the v3.0/3.1/3.2/3.3
+deltas that got us here are in the sections below.
+
 ## Methodology
 
 - **Run criterion in release**: `cargo bench -p <stone> --bench <name>`.
