@@ -1167,43 +1167,62 @@ pub fn nsw_index_on(table: &Table, column_position: usize) -> Option<&Index> {
         .find(|i| i.column_position == column_position && matches!(i.kind, IndexKind::Nsw(_)))
 }
 
-/// Flat catalog. `Vec` is intentional — std `HashMap` is unavailable in
-/// `no_std` + alloc, and v0.3 is single-database with a small table count.
+/// Catalog: insertion-ordered `Vec<Table>` for stable iter / serialize,
+/// plus a `BTreeMap<String, usize>` sidecar index so `get` / `get_mut`
+/// run in O(log n) instead of the old linear scan with per-element
+/// string compares.
+///
+/// A pure `BTreeMap<String, Table>` was tried in an interim version
+/// of v3.1.2 and regressed the single-table catalog benches by ~10%
+/// (the per-element `BTreeMap` overhead outweighs the lookup win
+/// when n is small). The sidecar shape preserves the insertion-order
+/// iteration the on-disk encoding relies on and keeps `last_mut`
+/// (used by the deserialize hot path) cheap.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: Vec<Table>,
+    /// `name → tables[index]`. Kept in lock-step with `tables`.
+    /// `create_table` is the only write path.
+    by_name: BTreeMap<String, usize>,
 }
 
 impl Catalog {
     pub const fn new() -> Self {
-        Self { tables: Vec::new() }
+        Self {
+            tables: Vec::new(),
+            by_name: BTreeMap::new(),
+        }
     }
 
     pub fn create_table(&mut self, schema: TableSchema) -> Result<(), StorageError> {
-        if self.tables.iter().any(|t| t.schema.name == schema.name) {
+        if self.by_name.contains_key(&schema.name) {
             return Err(StorageError::DuplicateTable {
                 name: schema.name.clone(),
             });
         }
+        let idx = self.tables.len();
+        let name = schema.name.clone();
         self.tables.push(Table::new(schema));
+        self.by_name.insert(name, idx);
         Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&Table> {
-        self.tables.iter().find(|t| t.schema.name == name)
+        let idx = *self.by_name.get(name)?;
+        self.tables.get(idx)
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Table> {
-        self.tables.iter_mut().find(|t| t.schema.name == name)
+        let idx = *self.by_name.get(name)?;
+        self.tables.get_mut(idx)
     }
 
     pub fn table_count(&self) -> usize {
         self.tables.len()
     }
 
-    /// Borrow-free copy of every table's name in catalog order. Used
-    /// by `SHOW TABLES` so the engine can build a result set without
-    /// holding a reference into the catalog past the row build.
+    /// Borrow-free copy of every table's name in catalog order
+    /// (= insertion order, matching the on-disk encoding).
     pub fn table_names(&self) -> Vec<String> {
         self.tables.iter().map(|t| t.schema.name.clone()).collect()
     }
@@ -1507,6 +1526,9 @@ fn deserialize_table(cur: &mut Cursor<'_>, cat: &mut Catalog) -> Result<(), Stor
     }
     let n_cols = cols.len();
     cat.create_table(TableSchema::new(name, cols))?;
+    // Vec<Table> with insertion-order semantics — the just-pushed
+    // table is at the end. Sidecar `by_name` is already wired up but
+    // we skip the map lookup here since we know the position.
     let t = cat.tables.last_mut().expect("create_table just pushed");
     deserialize_rows(cur, t, n_cols)?;
     deserialize_indices(cur, t)?;
@@ -2186,7 +2208,7 @@ mod tests {
         // Compare semantic state: same tables in same order, same schema +
         // rows in each.
         assert_eq!(restored.table_count(), cat.table_count());
-        for (a, b) in cat.tables.iter().zip(&restored.tables) {
+        for (a, b) in cat.tables.iter().zip(restored.tables.iter()) {
             assert_eq!(a.schema, b.schema);
             assert_eq!(a.rows, b.rows);
         }

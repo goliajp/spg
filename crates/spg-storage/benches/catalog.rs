@@ -77,6 +77,32 @@ fn build_vector_catalog(n_rows: usize) -> Catalog {
     cat
 }
 
+/// 50-table catalog with 1000 random lookups by name. Exercises the
+/// v3.1.2 sidecar `by_name: BTreeMap<String, usize>` lookup index —
+/// the win over the old `Vec<Table>` linear scan only shows when the
+/// catalog actually has more than a handful of tables.
+fn bench_catalog_multitable_lookup(c: &mut Criterion) {
+    let mut cat = Catalog::new();
+    for i in 0..50 {
+        cat.create_table(TableSchema::new(
+            format!("table_{i:02}"),
+            vec![ColumnSchema::new("id", DataType::Int, false)],
+        ))
+        .unwrap();
+    }
+    // Cycle through every name many times so the bench reflects steady
+    // state, not a one-off lookup.
+    let names: Vec<String> = (0..50).map(|i| format!("table_{i:02}")).collect();
+    c.bench_function("catalog_lookup_n50", |b| {
+        b.iter(|| {
+            for n in &names {
+                let t = cat.get(black_box(n.as_str())).expect("present");
+                black_box(t);
+            }
+        });
+    });
+}
+
 fn bench_catalog_roundtrip(c: &mut Criterion) {
     let cat = build_catalog(100);
     let bytes = cat.serialize();
@@ -160,6 +186,7 @@ fn bench_hnsw_search(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_catalog_roundtrip,
+    bench_catalog_multitable_lookup,
     bench_hnsw_build,
     bench_hnsw_search
 );

@@ -75,6 +75,7 @@ Run: `cargo bench -p spg-sql --bench parse`.
 | `catalog_deserialize_100rows`       | **3.72 µs** | v3.0.2: was 4.19 µs; **−11%** ✅. Same change + cached `&mut Table` (skip per-row `Vec<Table>` linear scan) + `rows.reserve(row_count)`. Below the −52% target — `String` allocation for the 100 Text cells is a ~3 µs hard floor; the remaining ~700 ns is structural dispatch + Vec push. |
 | `hnsw_build_200rows_dim8`           | **151 µs** | v3.0.1 + v3.0.6 re-measurement: was 2.41 ms; **−94% / 16.0×** ✅. Heuristic neighbour selection (HNSW paper §4) + `BinaryHeap` frontier + bitmap visited set. |
 | `hnsw_search_top10_dim8_n200`       | **378 ns** | v3.0.1 + v3.0.6 re-measurement: was 4.75 µs; **−92% / 12.6×** ✅. Bonus from the same data-structure swap (search shares `layer_beam_search`). |
+| `catalog_lookup_n50`                | **789 ns** | v3.1.2: 50 `cat.get(name)` calls against a 50-table catalog = ~16 ns / lookup via the BTreeMap sidecar index, vs estimated ~100 ns / lookup with the old `Vec<Table>` linear scan + per-element string compare. Multi-table win is structural; single-table benches don't change (the sidecar adds one BTreeMap insert per CREATE TABLE, ~30 ns, lost in noise). |
 
 Run: `cargo bench -p spg-storage --bench catalog`.
 
