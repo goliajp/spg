@@ -1251,9 +1251,45 @@ impl Parser {
     /// v4.11: parse `WITH name AS (SELECT ...) [, ...] SELECT ...`.
     /// Caller already consumed the leading `WITH` ident.
     fn parse_with_cte_then_select(&mut self) -> Result<Statement, ParseError> {
+        // v4.22: WITH RECURSIVE — optional keyword right after WITH.
+        // Comes through as an identifier; consume it if present and
+        // mark every CTE in the clause as recursive (PG semantics —
+        // the flag is per-WITH, not per-CTE).
+        let mut recursive = false;
+        if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
+            && s.eq_ignore_ascii_case("recursive")
+        {
+            self.advance();
+            recursive = true;
+        }
         let mut ctes = Vec::new();
         loop {
             let name = self.expect_ident_like()?;
+            // v4.22: optional column-name list — `WITH t(a,b,c) AS ...`.
+            // PG uses these to rename the body's output columns; we
+            // do the same below by overriding `columns[i].name`.
+            let column_overrides: Vec<String> = if matches!(self.peek(), Token::LParen) {
+                self.advance();
+                let mut names = Vec::new();
+                loop {
+                    names.push(self.expect_ident_like()?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' to close CTE column list, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                names
+            } else {
+                Vec::new()
+            };
             // AS is a reserved Token::As (used by SELECT-item / FROM
             // aliasing) — handle it specially rather than as a bare
             // ident.
@@ -1285,7 +1321,12 @@ impl Parser {
             let Statement::Select(body) = inner else {
                 unreachable!("parse_select_stmt returns Select")
             };
-            ctes.push(crate::ast::Cte { name, body });
+            ctes.push(crate::ast::Cte {
+                name,
+                body,
+                recursive,
+                column_overrides,
+            });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;

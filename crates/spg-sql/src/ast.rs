@@ -227,6 +227,16 @@ pub struct SelectStatement {
 pub struct Cte {
     pub name: String,
     pub body: SelectStatement,
+    /// v4.22: `WITH RECURSIVE` — set when the WITH clause had the
+    /// RECURSIVE keyword. Applies to every CTE in the clause per
+    /// PG semantics. A non-recursive body in a RECURSIVE WITH is
+    /// allowed; the engine just runs it once.
+    pub recursive: bool,
+    /// v4.22: optional `WITH name(a, b, c)` column-name list. When
+    /// non-empty, these override the body's output column names
+    /// position-by-position; the engine errors out if the count
+    /// doesn't match the body's projection width.
+    pub column_overrides: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
