@@ -299,6 +299,68 @@ different thing (brute-force scan).
 Reproduce: `xbench/competitor/scripts/up.sh && cargo run --release
 -p spg-bench-competitor --bin vector_knn`.
 
+### v3.3.x — competitor numbers after wire + SIMD work
+
+Three changes between v3.2.x and v3.3.x targeted the spots the v3.2
+competitor tables had called out as "behind" or "leading-but-narrow":
+
+- **v3.3.0** added a wire op (`DataRowBatch`, 0x17) that packs many
+  result rows into one frame. SELECT scan throughput on spg-server
+  went from a lagging 1.35M rows/sec to leading 5.7M+ rows/sec.
+- **v3.3.1** set `TCP_NODELAY` on every spg-server accept, coalesced
+  the RowDescription + DataRowBatch + CommandComplete sequence into
+  one `write_all`, and wrapped the bench client's read half in a
+  64 KiB `BufReader`. The spg-server SELECT p50 dropped 28%.
+- **v3.3.2** vectorised `l2_distance_sq` for aarch64 NEON (every
+  vector dim that's a multiple of 4 — i.e. all production embedding
+  sizes). HNSW search and build both fell ~30-58%.
+
+Fresh, cold-container measurements (M-series Mac, release):
+
+#### latency p50 / p95 / p99 (µs)
+
+| backend       |  ins p50 |  ins p95 |  ins p99 |  sel p50 |  sel p95 |  sel p99 |
+|---------------|---------:|---------:|---------:|---------:|---------:|---------:|
+| spg-embedded  |    **0.5**|    0.5  |    1.5  |    **0.8**|    0.9  |    1.0  |
+| spg-server    |   **30.5**|   43.6  |   54.6  |   **14.0**|   22.0  |   33.1  |
+| postgres 18   |   1038.1 |  2230.0 |  2958.9 |    895.4 |  2027.5 |  2713.4 |
+| mysql 9       |   1346.7 |  2884.8 |  3612.0 |    722.2 |  1809.9 |  2486.3 |
+| mariadb 11    |    940.1 |  2232.0 |  3618.6 |    835.0 |  2067.8 |  2980.8 |
+
+  vs PG/MySQL/MariaDB on indexed PK lookup (p50):
+    spg-embedded   ~1100× / ~900× / ~1000× faster
+    spg-server     ~64× / ~52× / ~60× faster   (was 36-43× in v3.2.1)
+
+#### bulk throughput (10K rows, 100-row VALUES batches)
+
+| backend       |  INSERT ms |     INS rows/s |   SCAN ms |    SCAN rows/s |
+|---------------|-----------:|---------------:|----------:|---------------:|
+| spg-embedded  |       3.29 |    **3,037,090** |      1.39 |    **7,197,263** |
+| spg-server    |       8.98 |    **1,113,767** |      1.75 |    **5,719,054** |
+| postgres 18   |     118.15 |          84,641 |      4.41 |      2,269,933 |
+| mysql 9       |     244.98 |          40,819 |      3.51 |      2,847,144 |
+| mariadb 11    |     178.31 |          56,082 |      7.03 |      1,421,877 |
+
+  SCAN: spg-server 5.72M is now **2.0-4.0× ahead** of every server
+        competitor (vs 0.4× *behind* in v3.2.2 — fix of v3.3.0).
+  INS:  spg-server ~13-27× faster, spg-embedded ~36-74× faster
+        (essentially unchanged from v3.2.2).
+
+#### vector kNN (top-10 over 10K dim-128, 500 measured queries)
+
+| backend             |  build s |  q p50 µs |  q p95 µs |  q p99 µs |
+|---------------------|---------:|----------:|----------:|----------:|
+| spg-embedded        |   **0.55**|     **26.0**|      38.5 |      53.0 |
+| spg-server          |     5.38 |     **51.0**|      73.0 |      96.0 |
+| postgres+pgvector   |     2.02 |    1415.7 |    2577.0 |    3564.4 |
+
+  spg-embedded vs pgvector: **54× faster at p50, 67× at p99**
+                            (was 42× / 59× in v3.2.3 — v3.3.2 NEON win)
+  spg-server   vs pgvector: **28× at p50**
+
+The competitor scoreboard's one "behind" row from v3.2 is gone; every
+leading number widened.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
