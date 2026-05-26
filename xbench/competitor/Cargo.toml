@@ -35,5 +35,9 @@ criterion = { workspace = true }
 name = "smoke"
 path = "src/smoke.rs"
 
+[[bin]]
+name = "latency"
+path = "src/bin/latency.rs"
+
 [lints]
 workspace = true

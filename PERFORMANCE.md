@@ -177,6 +177,55 @@ change:
 - `append_one` (audit) — dominated by one BLAKE3 over prev-hash plus
   serialized entry; same hash-throughput floor.
 
+## Competitor comparison (v3.2.x — `xbench/competitor`)
+
+A separate workspace member, `xbench/competitor`, runs SPG side-by-side
+against reference SQL servers in docker (loopback-only ports
+`25432` / `23306` / `23307`). Same bench harness drives all five
+backends. **The bench is opt-in dev tooling**; nothing in
+`spg-wire` / `spg-sql` / `spg-storage` / `spg-crypto` / `spg-audit`
+/ `spg-engine` / `spg-server` / `spg-cli` depends on it. Bring up
+the stack with `xbench/competitor/scripts/up.sh`; tear down with
+`down.sh`.
+
+### v3.2.1 — single-row latency (µs, M-series Mac, release)
+
+Single-row `INSERT INTO bench_users` and single-row
+`SELECT … WHERE id = ?` (PK lookup); 2000 measured iterations after
+200 warm-up, with 1000 seed rows pre-loaded.
+
+| backend       |  ins p50 |  ins p95 |  ins p99 |  sel p50 |  sel p95 |  sel p99 |
+|---------------|---------:|---------:|---------:|---------:|---------:|---------:|
+| spg-embedded  |    **0.5**|    0.6  |    1.5  |    **0.8**|    1.0  |    1.1  |
+| spg-server    |   **30.8**|   40.9  |   51.8  |   **20.9**|   29.8  |   43.1  |
+| postgres 18   |    937.1 |  2028.6 |  2601.8 |    850.1 |  1953.2 |  2423.1 |
+| mysql 9       |   1315.0 |  2754.2 |  3470.0 |    761.5 |  1774.2 |  2157.0 |
+| mariadb 11    |    854.0 |  1879.6 |  2248.9 |    781.0 |  1841.9 |  2472.0 |
+
+**Reading this honestly:**
+
+- `spg-embedded` is in-process — no TCP, no wire, no fsync, no
+  concurrent-write locking. Numbers compare *architecturally*, not
+  apples-to-apples. **1700-2600× faster than the servers on INSERT,
+  ~1000× on SELECT** because the entire client/server stack is
+  removed.
+- `spg-server` does TCP + wire framing, same shape as the three
+  competitors. **30-43× faster than the fastest competitor**
+  (MariaDB) on INSERT, **36× on SELECT**. The win comes from
+  (a) in-memory storage with no fsync on the INSERT path (SPG has no
+  WAL configured in this bench — durability is opt-in), (b) a much
+  lighter wire protocol than PG/MySQL's, (c) no constraint /
+  trigger / FK / MVCC bookkeeping.
+- **What the bench doesn't measure:** durability, concurrent writes,
+  bigger schemas, joins, query planning at scale, multi-statement
+  transactions. PG/MySQL/MariaDB will close the gap (and exceed SPG
+  on richer workloads) once those are in play. This number is fair
+  for "single-row OLTP latency on a small schema", and *only* for
+  that.
+
+Reproduce: `xbench/competitor/scripts/up.sh && cargo run --release
+-p spg-bench-competitor --bin latency`.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
