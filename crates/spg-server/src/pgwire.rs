@@ -152,7 +152,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 // psql sends startup probes like "SELECT version()" /
                 // "SHOW search_path". Stub the common ones with sane
                 // canned answers so the client doesn't error out.
-                if let Some(canned) = canned_response(&sql) {
+                if let Some(canned) = canned_response(&sql, state) {
                     send_canned(&mut stream, &canned)?;
                     send_ready_for_query(&mut stream, tx_state)?;
                     continue;
@@ -281,51 +281,238 @@ fn command_tag(sql: &str, affected: usize) -> String {
     }
 }
 
-/// Canned answers for client startup probes — saves us implementing
-/// PG catalog tables just to make `psql` not bail on connect.
-fn canned_response(sql: &str) -> Option<CannedResponse> {
+/// Canned answers for client startup probes + the v4.6 pg_catalog
+/// subset. Saves us implementing real pg_class / pg_namespace / etc.
+/// tables in the engine just to make `psql` and friends not bail on
+/// connect. The patterns matched here are exact-prefix lowercased
+/// matches; anything stranger drops through to the engine, which
+/// will reject pg_catalog table names with a clear "not found"
+/// error.
+fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse> {
     let lower = sql.trim().to_ascii_lowercase();
     if lower.starts_with("select version()") || lower == "select version()" {
-        return Some(CannedResponse::SingleText("version", "spg 4.3"));
+        return Some(CannedResponse::single_text("version", "spg 4.6"));
     }
     if lower.starts_with("show transaction_isolation")
         || lower.starts_with("show transaction isolation level")
     {
-        return Some(CannedResponse::SingleText(
+        return Some(CannedResponse::single_text(
             "transaction_isolation",
             "read committed",
         ));
     }
     if lower.starts_with("show search_path") || lower == "show search_path" {
-        return Some(CannedResponse::SingleText(
+        return Some(CannedResponse::single_text(
             "search_path",
             "\"$user\", public",
         ));
     }
     if lower.starts_with("show standard_conforming_strings") {
-        return Some(CannedResponse::SingleText(
+        return Some(CannedResponse::single_text(
             "standard_conforming_strings",
             "on",
         ));
     }
+    if lower.starts_with("select current_database()") || lower == "select current_database()" {
+        return Some(CannedResponse::single_text("current_database", "spg"));
+    }
+    if lower.starts_with("select current_schema()")
+        || lower == "select current_schema()"
+        || lower == "select current_schema"
+    {
+        return Some(CannedResponse::single_text("current_schema", "public"));
+    }
+    if lower == "select current_user" || lower == "select user" {
+        return Some(CannedResponse::single_text("current_user", "admin"));
+    }
+    // ---- v4.6 pg_catalog subset ----
+    if mentions_pg_table(&lower, "pg_class") {
+        return Some(pg_class_response(state));
+    }
+    if mentions_pg_table(&lower, "pg_namespace") {
+        return Some(pg_namespace_response());
+    }
+    if mentions_pg_table(&lower, "pg_database") {
+        return Some(pg_database_response());
+    }
+    if mentions_pg_table(&lower, "pg_user") || mentions_pg_table(&lower, "pg_roles") {
+        return Some(pg_user_response(state));
+    }
+    if mentions_pg_table(&lower, "pg_tables") {
+        // The convenience view PG ships; columns: schemaname, tablename, tableowner.
+        return Some(pg_tables_response(state));
+    }
     None
 }
 
+/// True when `sql_lower` references the given pg_catalog table name,
+/// either bare (`pg_class`) or schema-qualified (`pg_catalog.pg_class`).
+/// Used to dispatch the canned synthesizer; intentionally permissive —
+/// any false-positive just gets a synthesized response with all rows,
+/// and the client filters client-side.
+fn mentions_pg_table(sql_lower: &str, table: &str) -> bool {
+    sql_lower.contains(&format!("from {table}"))
+        || sql_lower.contains(&format!("from pg_catalog.{table}"))
+        || sql_lower.contains(&format!("join {table}"))
+        || sql_lower.contains(&format!("join pg_catalog.{table}"))
+}
+
 enum CannedResponse {
-    SingleText(&'static str, &'static str),
+    Rows {
+        columns: Vec<ColumnSchema>,
+        rows: Vec<Row>,
+    },
+}
+
+impl CannedResponse {
+    fn single_text(col: &'static str, val: &'static str) -> Self {
+        Self::Rows {
+            columns: vec![ColumnSchema::new(col, DataType::Text, false)],
+            rows: vec![Row::new(vec![Value::Text(val.to_string())])],
+        }
+    }
 }
 
 fn send_canned(stream: &mut TcpStream, c: &CannedResponse) -> std::io::Result<()> {
     match c {
-        CannedResponse::SingleText(col, val) => {
-            let cols = vec![ColumnSchema::new(*col, DataType::Text, false)];
-            send_row_description(stream, &cols)?;
-            let row = Row::new(vec![Value::Text((*val).to_string())]);
-            send_data_row(stream, &cols, &row)?;
-            send_command_complete(stream, "SELECT 1")?;
+        CannedResponse::Rows { columns, rows } => {
+            send_row_description(stream, columns)?;
+            for row in rows {
+                send_data_row(stream, columns, row)?;
+            }
+            send_command_complete(stream, &format!("SELECT {}", rows.len()))?;
         }
     }
     Ok(())
+}
+
+// ---- v4.6 pg_catalog synthesizers ----
+//
+// These return *all* canonical columns from the current SPG catalog
+// state — the client filters via WHERE/projection on its side. SPG's
+// SQL doesn't support CASE WHEN / regex / function-call selects that
+// psql's `\dt` SQL relies on, so psql `\dt` still won't work end-to-end
+// without further engine work. Simpler PG drivers and DBeaver-style
+// browser panels that issue plain `SELECT ... FROM pg_catalog.X`
+// queries do work.
+
+fn pg_class_response(state: &Arc<ServerState>) -> CannedResponse {
+    // Canonical-ish pg_class columns. We expose just oid / relname /
+    // relkind / relnamespace / relowner — the columns most simple
+    // clients project. SPG only has user tables (kind `r`) — no
+    // indexes/sequences/views in the pg_catalog sense.
+    let columns = vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("relname", DataType::Text, false),
+        ColumnSchema::new("relkind", DataType::Text, false),
+        ColumnSchema::new("relnamespace", DataType::BigInt, false),
+        ColumnSchema::new("relowner", DataType::BigInt, false),
+    ];
+    let rows = state
+        .engine
+        .read()
+        .map(|e| {
+            e.catalog()
+                .table_names()
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    Row::new(vec![
+                        Value::BigInt(16384 + i as i64), // synthetic oid (PG user oids start ~16384)
+                        Value::Text(name),
+                        Value::Text("r".to_string()),
+                        Value::BigInt(2200), // public schema oid
+                        Value::BigInt(10),   // owner oid (synthetic admin)
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    CannedResponse::Rows { columns, rows }
+}
+
+fn pg_namespace_response() -> CannedResponse {
+    let columns = vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("nspname", DataType::Text, false),
+        ColumnSchema::new("nspowner", DataType::BigInt, false),
+    ];
+    let rows = vec![Row::new(vec![
+        Value::BigInt(2200),
+        Value::Text("public".to_string()),
+        Value::BigInt(10),
+    ])];
+    CannedResponse::Rows { columns, rows }
+}
+
+fn pg_database_response() -> CannedResponse {
+    let columns = vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("datname", DataType::Text, false),
+        ColumnSchema::new("datdba", DataType::BigInt, false),
+    ];
+    let rows = vec![Row::new(vec![
+        Value::BigInt(16384),
+        Value::Text("spg".to_string()),
+        Value::BigInt(10),
+    ])];
+    CannedResponse::Rows { columns, rows }
+}
+
+fn pg_user_response(state: &Arc<ServerState>) -> CannedResponse {
+    let columns = vec![
+        ColumnSchema::new("usename", DataType::Text, false),
+        ColumnSchema::new("usesuper", DataType::Bool, false),
+    ];
+    let rows = state
+        .engine
+        .read()
+        .map(|e| {
+            if e.users().is_empty() {
+                vec![Row::new(vec![
+                    Value::Text("admin".to_string()),
+                    Value::Bool(true),
+                ])]
+            } else {
+                e.users()
+                    .iter()
+                    .map(|(name, rec)| {
+                        Row::new(vec![
+                            Value::Text(name.to_string()),
+                            Value::Bool(matches!(rec.role, spg_engine::Role::Admin)),
+                        ])
+                    })
+                    .collect()
+            }
+        })
+        .unwrap_or_default();
+    CannedResponse::Rows { columns, rows }
+}
+
+fn pg_tables_response(state: &Arc<ServerState>) -> CannedResponse {
+    let columns = vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("tablename", DataType::Text, false),
+        ColumnSchema::new("tableowner", DataType::Text, false),
+    ];
+    let rows = state
+        .engine
+        .read()
+        .map(|e| {
+            e.catalog()
+                .table_names()
+                .into_iter()
+                .map(|name| {
+                    Row::new(vec![
+                        Value::Text("public".to_string()),
+                        Value::Text(name),
+                        Value::Text("admin".to_string()),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    CannedResponse::Rows { columns, rows }
 }
 
 // ---- Startup message ----
