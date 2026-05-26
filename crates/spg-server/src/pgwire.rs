@@ -182,13 +182,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                             )?;
                         }
                         CopyIntent::To(table) => {
-                            handle_copy_to_stdout(
-                                &mut stream,
-                                state,
-                                role,
-                                &table,
-                                &mut tx_state,
-                            )?;
+                            handle_copy_to_stdout(&mut stream, state, role, &table, &mut tx_state)?;
                         }
                     }
                     send_ready_for_query(&mut stream, tx_state)?;
@@ -459,6 +453,23 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     }
     if lower == "reset all" || lower.starts_with("reset ") {
         return Some(CannedResponse::Tag("RESET"));
+    }
+    // v4.18: VACUUM / ANALYZE / CLUSTER / REINDEX — BI clients
+    // (Metabase, DBeaver) run these defensively after schema
+    // changes. SPG has no vacuum or analyze concept (rows are
+    // dense; no MVCC dead tuples; index stats aren't sampled),
+    // so they're all no-ops.
+    if lower.starts_with("vacuum") {
+        return Some(CannedResponse::Tag("VACUUM"));
+    }
+    if lower.starts_with("analyze") {
+        return Some(CannedResponse::Tag("ANALYZE"));
+    }
+    if lower.starts_with("cluster") {
+        return Some(CannedResponse::Tag("CLUSTER"));
+    }
+    if lower.starts_with("reindex") {
+        return Some(CannedResponse::Tag("REINDEX"));
     }
     // BEGIN ISOLATION LEVEL READ COMMITTED / SERIALIZABLE etc. —
     // pgbouncer + ORMs often prefix transactions with a level.
