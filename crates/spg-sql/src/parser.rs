@@ -18,8 +18,9 @@ use core::mem;
 
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreateTableStatement, Expr, ExtractField, FromClause, FromJoin, IndexMethod, InsertStatement,
-    JoinKind, Literal, OrderBy, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
+    CreateTableStatement, Expr, ExtractField, FrameBound, FrameKind, FromClause, FromJoin,
+    IndexMethod, InsertStatement, JoinKind, Literal, OrderBy, SelectItem, SelectStatement,
+    Statement, TableRef, UnOp, UnionKind, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -1513,7 +1514,9 @@ impl Parser {
     /// is optional; an empty `()` is also legal (PG semantics).
     /// No frame clause is supported.
     #[allow(clippy::type_complexity)] // (partitions, ordered-keys-with-desc) is the natural shape
-    fn parse_over_clause(&mut self) -> Result<(Vec<Expr>, Vec<(Expr, bool)>), ParseError> {
+    fn parse_over_clause(
+        &mut self,
+    ) -> Result<(Vec<Expr>, Vec<(Expr, bool)>, Option<WindowFrame>), ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after OVER, got {:?}", self.peek())));
         }
@@ -1567,6 +1570,23 @@ impl Parser {
                 break;
             }
         }
+        // v4.20: optional explicit frame, `ROWS ...` / `RANGE ...`.
+        // Both keywords come through the lexer as identifiers; match
+        // case-insensitively.
+        let mut frame: Option<WindowFrame> = None;
+        if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek() {
+            let kind = if s.eq_ignore_ascii_case("rows") {
+                Some(FrameKind::Rows)
+            } else if s.eq_ignore_ascii_case("range") {
+                Some(FrameKind::Range)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.advance();
+                frame = Some(self.parse_frame_tail(kind)?);
+            }
+        }
         if !matches!(self.peek(), Token::RParen) {
             return Err(self.err(format!(
                 "expected ')' to close OVER clause, got {:?}",
@@ -1574,7 +1594,86 @@ impl Parser {
             )));
         }
         self.advance();
-        Ok((partition_by, order_by))
+        Ok((partition_by, order_by, frame))
+    }
+
+    /// v4.20: parse the tail of an explicit frame, given the `ROWS`
+    /// or `RANGE` keyword was just consumed. Accepts both
+    /// `BETWEEN <bound> AND <bound>` and the single-bound shorthand
+    /// (`ROWS UNBOUNDED PRECEDING`, `ROWS 5 PRECEDING`, etc.) which
+    /// PG normalises to `BETWEEN <bound> AND CURRENT ROW`.
+    fn parse_frame_tail(&mut self, kind: FrameKind) -> Result<WindowFrame, ParseError> {
+        if matches!(self.peek(), Token::Between) {
+            self.advance();
+            let start = self.parse_frame_bound()?;
+            if !matches!(self.peek(), Token::And) {
+                return Err(self.err(format!(
+                    "expected AND in frame spec, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let end = self.parse_frame_bound()?;
+            Ok(WindowFrame {
+                kind,
+                start,
+                end: Some(end),
+            })
+        } else {
+            let start = self.parse_frame_bound()?;
+            Ok(WindowFrame {
+                kind,
+                start,
+                end: None,
+            })
+        }
+    }
+
+    /// Parse one frame bound: `UNBOUNDED PRECEDING`, `<n> PRECEDING`,
+    /// `CURRENT ROW`, `<n> FOLLOWING`, `UNBOUNDED FOLLOWING`.
+    fn parse_frame_bound(&mut self) -> Result<FrameBound, ParseError> {
+        // Number-led: "<n> PRECEDING" / "<n> FOLLOWING".
+        if let Token::Integer(n) = *self.peek() {
+            self.advance();
+            let n: u64 = u64::try_from(n).map_err(|_| {
+                self.err(format!(
+                    "invalid frame offset {n} — expected non-negative integer"
+                ))
+            })?;
+            let dir = self.expect_ident_like()?;
+            return if dir.eq_ignore_ascii_case("preceding") {
+                Ok(FrameBound::OffsetPreceding(n))
+            } else if dir.eq_ignore_ascii_case("following") {
+                Ok(FrameBound::OffsetFollowing(n))
+            } else {
+                Err(self.err(format!(
+                    "expected PRECEDING or FOLLOWING after offset, got {dir:?}"
+                )))
+            };
+        }
+        let first = self.expect_ident_like()?;
+        if first.eq_ignore_ascii_case("unbounded") {
+            let dir = self.expect_ident_like()?;
+            return if dir.eq_ignore_ascii_case("preceding") {
+                Ok(FrameBound::UnboundedPreceding)
+            } else if dir.eq_ignore_ascii_case("following") {
+                Ok(FrameBound::UnboundedFollowing)
+            } else {
+                Err(self.err(format!(
+                    "expected PRECEDING or FOLLOWING after UNBOUNDED, got {dir:?}"
+                )))
+            };
+        }
+        if first.eq_ignore_ascii_case("current") {
+            let row = self.expect_ident_like()?;
+            if !row.eq_ignore_ascii_case("row") {
+                return Err(self.err(format!("expected ROW after CURRENT, got {row:?}")));
+            }
+            return Ok(FrameBound::CurrentRow);
+        }
+        Err(self.err(format!(
+            "expected frame bound (UNBOUNDED/CURRENT/<n>), got {first:?}"
+        )))
     }
 
     fn finish_ident_atom(&mut self, first: String) -> Result<Expr, ParseError> {
@@ -1605,12 +1704,13 @@ impl Parser {
                     && s.eq_ignore_ascii_case("over")
                 {
                     self.advance();
-                    let (partition_by, order_by) = self.parse_over_clause()?;
+                    let (partition_by, order_by, frame) = self.parse_over_clause()?;
                     return Ok(Expr::WindowFunction {
                         name: "count_star".into(),
                         args: Vec::new(),
                         partition_by,
                         order_by,
+                        frame,
                     });
                 }
                 return Ok(Expr::FunctionCall {
@@ -1644,12 +1744,13 @@ impl Parser {
                 && s.eq_ignore_ascii_case("over")
             {
                 self.advance();
-                let (partition_by, order_by) = self.parse_over_clause()?;
+                let (partition_by, order_by, frame) = self.parse_over_clause()?;
                 return Ok(Expr::WindowFunction {
                     name: first,
                     args,
                     partition_by,
                     order_by,
+                    frame,
                 });
             }
             return Ok(Expr::FunctionCall { name: first, args });

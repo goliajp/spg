@@ -20,8 +20,8 @@ use core::fmt;
 
 use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement,
-    CreateUserStatement, Expr, FromClause, IndexMethod, InsertStatement, JoinKind, Literal,
-    SelectItem, SelectStatement, Statement, UnOp, UnionKind,
+    CreateUserStatement, Expr, FrameBound, FrameKind, FromClause, IndexMethod, InsertStatement,
+    JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind, WindowFrame,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -2025,6 +2025,7 @@ impl Engine {
                 args,
                 partition_by,
                 order_by,
+                frame,
             } = wnode
             else {
                 unreachable!("collect_window_nodes pushes only WindowFunction");
@@ -2068,6 +2069,7 @@ impl Engine {
                     name,
                     args,
                     !order_by.is_empty(),
+                    frame.as_ref(),
                     &indexed[p_start..p_end],
                     &filtered,
                     &ctx,
@@ -2561,6 +2563,7 @@ fn compute_window_partition(
     name: &str,
     args: &[Expr],
     ordered: bool,
+    frame: Option<&WindowFrame>,
     slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)],
     filtered_rows: &[&Row],
     ctx: &EvalContext<'_>,
@@ -2604,11 +2607,6 @@ fn compute_window_partition(
             Ok(())
         }
         "sum" | "avg" | "min" | "max" | "count" | "count_star" => {
-            // Aggregate-style windows. When the window is ordered,
-            // the result is a running aggregate from the start of
-            // the partition through the current row. Without ORDER
-            // BY, every row in the partition gets the same final
-            // aggregate.
             // Pre-evaluate the function arg per row in the slice
             // (count_star has no arg).
             let arg_values: Vec<Value> = if lower == "count_star" || args.is_empty() {
@@ -2620,76 +2618,42 @@ fn compute_window_partition(
                     .collect::<Result<_, _>>()
                     .map_err(EngineError::Eval)?
             };
-            if ordered {
-                // Running aggregate.
+            // v4.20: pick the effective frame. Explicit frame
+            // overrides the implicit default (running for ordered,
+            // whole-partition for unordered).
+            let eff = effective_frame(frame, ordered)?;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..slice.len() {
+                let (lo, hi) = frame_bounds_for_row(&eff, i, slice);
                 let mut sum: f64 = 0.0;
                 let mut count: i64 = 0;
                 let mut min_v: Option<f64> = None;
                 let mut max_v: Option<f64> = None;
-                for (i, (_, _, idx)) in slice.iter().enumerate() {
-                    let v = &arg_values[i];
-                    match lower.as_str() {
-                        "count_star" => {
-                            count += 1;
-                            out_vals[*idx] = Value::BigInt(count);
-                        }
-                        "count" => {
-                            if !v.is_null() {
-                                count += 1;
-                            }
-                            out_vals[*idx] = Value::BigInt(count);
-                        }
-                        "sum" | "avg" | "min" | "max" => {
-                            let x = value_to_f64(v);
-                            if let Some(x) = x {
-                                sum += x;
-                                count += 1;
-                                min_v = Some(min_v.map_or(x, |m| m.min(x)));
-                                max_v = Some(max_v.map_or(x, |m| m.max(x)));
-                            }
-                            out_vals[*idx] = match lower.as_str() {
-                                "sum" => Value::Float(sum),
-                                "avg" => {
-                                    if count == 0 {
-                                        Value::Null
-                                    } else {
-                                        Value::Float(sum / count as f64)
-                                    }
+                let mut row_count: i64 = 0;
+                if lo <= hi {
+                    for j in lo..=hi {
+                        let v = &arg_values[j];
+                        match lower.as_str() {
+                            "count_star" => row_count += 1,
+                            "count" => {
+                                if !v.is_null() {
+                                    count += 1;
                                 }
-                                "min" => min_v.map_or(Value::Null, Value::Float),
-                                "max" => max_v.map_or(Value::Null, Value::Float),
-                                _ => unreachable!(),
-                            };
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            } else {
-                // Whole-partition aggregate — single value broadcast.
-                let mut sum: f64 = 0.0;
-                let mut count: i64 = 0;
-                let mut min_v: Option<f64> = None;
-                let mut max_v: Option<f64> = None;
-                for v in &arg_values {
-                    match lower.as_str() {
-                        "count_star" => count += 1,
-                        "count" => {
-                            if !v.is_null() {
-                                count += 1;
                             }
-                        }
-                        _ => {
-                            if let Some(x) = value_to_f64(v) {
-                                sum += x;
-                                count += 1;
-                                min_v = Some(min_v.map_or(x, |m| m.min(x)));
-                                max_v = Some(max_v.map_or(x, |m| m.max(x)));
+                            _ => {
+                                if let Some(x) = value_to_f64(v) {
+                                    sum += x;
+                                    count += 1;
+                                    min_v = Some(min_v.map_or(x, |m| m.min(x)));
+                                    max_v = Some(max_v.map_or(x, |m| m.max(x)));
+                                }
                             }
                         }
                     }
                 }
-                let result = match lower.as_str() {
-                    "count" | "count_star" => Value::BigInt(count),
+                let value = match lower.as_str() {
+                    "count_star" => Value::BigInt(row_count),
+                    "count" => Value::BigInt(count),
                     "sum" => Value::Float(sum),
                     "avg" => {
                         if count == 0 {
@@ -2702,9 +2666,8 @@ fn compute_window_partition(
                     "max" => max_v.map_or(Value::Null, Value::Float),
                     _ => unreachable!(),
                 };
-                for (_, _, idx) in slice {
-                    out_vals[*idx] = result.clone();
-                }
+                let (_, _, idx) = &slice[i];
+                out_vals[*idx] = value;
             }
             Ok(())
         }
@@ -2712,6 +2675,166 @@ fn compute_window_partition(
             "window function {other:?} not supported (v4.12: row_number/rank/dense_rank/sum/avg/count/min/max)"
         ))),
     }
+}
+
+/// v4.20: resolve the user-provided frame down to a normalised
+/// `(kind, start, end)`. `None` means default — derive from
+/// `ordered`: ordered ⇒ RANGE UNBOUNDED PRECEDING AND CURRENT ROW,
+/// unordered ⇒ ROWS UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING.
+/// Single-bound shorthand (e.g. `ROWS 5 PRECEDING`) normalises
+/// end → CURRENT ROW per the PG spec.
+fn effective_frame(
+    frame: Option<&WindowFrame>,
+    ordered: bool,
+) -> Result<(FrameKind, FrameBound, FrameBound), EngineError> {
+    match frame {
+        None => {
+            if ordered {
+                Ok((
+                    FrameKind::Range,
+                    FrameBound::UnboundedPreceding,
+                    FrameBound::CurrentRow,
+                ))
+            } else {
+                Ok((
+                    FrameKind::Rows,
+                    FrameBound::UnboundedPreceding,
+                    FrameBound::UnboundedFollowing,
+                ))
+            }
+        }
+        Some(fr) => {
+            let end = fr
+                .end
+                .clone()
+                .unwrap_or(FrameBound::CurrentRow);
+            // Reject start > end (a few impossible combinations).
+            if matches!(fr.start, FrameBound::UnboundedFollowing)
+                || matches!(end, FrameBound::UnboundedPreceding)
+            {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "invalid frame: start={:?} end={:?}",
+                    fr.start, end
+                )));
+            }
+            // RANGE OFFSET PRECEDING / FOLLOWING needs value-typed
+            // arithmetic on the ORDER BY key (e.g. `RANGE BETWEEN
+            // INTERVAL '1 day' PRECEDING AND CURRENT ROW`). Not
+            // implemented in v4.20.
+            if fr.kind == FrameKind::Range
+                && (matches!(
+                    fr.start,
+                    FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
+                ) || matches!(
+                    end,
+                    FrameBound::OffsetPreceding(_) | FrameBound::OffsetFollowing(_)
+                ))
+            {
+                return Err(EngineError::Unsupported(
+                    "RANGE with explicit offset bounds is not supported (v4.20: only UNBOUNDED / CURRENT ROW for RANGE)".into(),
+                ));
+            }
+            Ok((fr.kind, fr.start.clone(), end))
+        }
+    }
+}
+
+/// Compute `(lo, hi)` row-index bounds inside the partition slice
+/// for the row at position `i`. Inclusive, clamped to
+/// `[0, slice.len()-1]`. Empty result if `lo > hi`.
+#[allow(clippy::type_complexity)]
+fn frame_bounds_for_row(
+    eff: &(FrameKind, FrameBound, FrameBound),
+    i: usize,
+    slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)],
+) -> (usize, usize) {
+    let (kind, start, end) = eff;
+    let n = slice.len();
+    let last = n.saturating_sub(1);
+    let (mut lo, mut hi) = match kind {
+        FrameKind::Rows => {
+            let lo = match start {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::OffsetPreceding(k) => {
+                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
+                    i.saturating_sub(k)
+                }
+                FrameBound::CurrentRow => i,
+                FrameBound::OffsetFollowing(k) => {
+                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
+                    i.saturating_add(k).min(last)
+                }
+                FrameBound::UnboundedFollowing => last,
+            };
+            let hi = match end {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::OffsetPreceding(k) => {
+                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
+                    i.saturating_sub(k)
+                }
+                FrameBound::CurrentRow => i,
+                FrameBound::OffsetFollowing(k) => {
+                    let k = usize::try_from(*k).unwrap_or(usize::MAX);
+                    i.saturating_add(k).min(last)
+                }
+                FrameBound::UnboundedFollowing => last,
+            };
+            (lo, hi)
+        }
+        FrameKind::Range => {
+            // RANGE bounds are peer-aware. With only UNBOUNDED and
+            // CURRENT ROW supported (rejected at effective_frame for
+            // explicit offsets), the start/end map to the
+            // partition's full extent at the same-order-key peer
+            // group boundary.
+            let lo = match start {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::CurrentRow => peer_group_start(slice, i),
+                FrameBound::UnboundedFollowing => last,
+                _ => unreachable!("offset bounds rejected for RANGE"),
+            };
+            let hi = match end {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::CurrentRow => peer_group_end(slice, i),
+                FrameBound::UnboundedFollowing => last,
+                _ => unreachable!("offset bounds rejected for RANGE"),
+            };
+            (lo, hi)
+        }
+    };
+    if hi >= n {
+        hi = last;
+    }
+    if lo >= n {
+        lo = last;
+    }
+    (lo, hi)
+}
+
+/// Find the inclusive index of the first row with the same ORDER
+/// BY key as `slice[i]`. Slice is already sorted by partition then
+/// order, so peers are contiguous.
+#[allow(clippy::type_complexity)]
+fn peer_group_start(slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)], i: usize) -> usize {
+    let key = &slice[i].1;
+    let mut j = i;
+    while j > 0 && order_key_cmp(&slice[j - 1].1, key) == core::cmp::Ordering::Equal {
+        j -= 1;
+    }
+    j
+}
+
+/// Find the inclusive index of the last row with the same ORDER
+/// BY key as `slice[i]`.
+#[allow(clippy::type_complexity)]
+fn peer_group_end(slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)], i: usize) -> usize {
+    let key = &slice[i].1;
+    let mut j = i;
+    while j + 1 < slice.len() && order_key_cmp(&slice[j + 1].1, key) == core::cmp::Ordering::Equal
+    {
+        j += 1;
+    }
+    j
 }
 
 fn value_to_f64(v: &Value) -> Option<f64> {

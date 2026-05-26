@@ -331,6 +331,10 @@ pub enum Expr {
         args: Vec<Expr>,
         partition_by: Vec<Expr>,
         order_by: Vec<(Expr, bool /* desc */)>,
+        /// v4.20 explicit frame. `None` means "use the default":
+        /// whole-partition when unordered, running aggregate from
+        /// partition start through current row when ordered.
+        frame: Option<WindowFrame>,
     },
     /// v4.10 scalar subquery — `(SELECT ...)` used in expression
     /// position. Must return exactly one row × one column at eval
@@ -360,6 +364,43 @@ pub enum Expr {
         field: ExtractField,
         source: Box<Expr>,
     },
+}
+
+/// v4.20 explicit window frame: `ROWS|RANGE BETWEEN <bound> AND
+/// <bound>`. `end` is `None` for the shorthand "ROWS <bound>"
+/// where end implicitly = CURRENT ROW.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFrame {
+    pub kind: FrameKind,
+    pub start: FrameBound,
+    pub end: Option<FrameBound>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    Rows,
+    Range,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    OffsetPreceding(u64),
+    CurrentRow,
+    OffsetFollowing(u64),
+    UnboundedFollowing,
+}
+
+impl fmt::Display for FrameBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnboundedPreceding => f.write_str("UNBOUNDED PRECEDING"),
+            Self::OffsetPreceding(n) => write!(f, "{n} PRECEDING"),
+            Self::CurrentRow => f.write_str("CURRENT ROW"),
+            Self::OffsetFollowing(n) => write!(f, "{n} FOLLOWING"),
+            Self::UnboundedFollowing => f.write_str("UNBOUNDED FOLLOWING"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,6 +775,7 @@ impl fmt::Display for ColumnName {
 }
 
 impl fmt::Display for Expr {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Literal(l) => write!(f, "{l}"),
@@ -778,6 +820,7 @@ impl fmt::Display for Expr {
                 args,
                 partition_by,
                 order_by,
+                frame,
             } => {
                 write!(f, "{name}(")?;
                 for (i, a) in args.iter().enumerate() {
@@ -809,6 +852,20 @@ impl fmt::Display for Expr {
                         if *desc {
                             f.write_str(" DESC")?;
                         }
+                    }
+                }
+                if let Some(fr) = frame {
+                    if !partition_by.is_empty() || !order_by.is_empty() {
+                        f.write_str(" ")?;
+                    }
+                    let k = match fr.kind {
+                        FrameKind::Rows => "ROWS",
+                        FrameKind::Range => "RANGE",
+                    };
+                    if let Some(end) = &fr.end {
+                        write!(f, "{k} BETWEEN {} AND {}", fr.start, end)?;
+                    } else {
+                        write!(f, "{k} {}", fr.start)?;
                     }
                 }
                 f.write_str(")")
