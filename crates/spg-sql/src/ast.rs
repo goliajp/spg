@@ -37,6 +37,24 @@ pub enum Statement {
     /// `SHOW COLUMNS FROM <table>` — return one row per column with
     /// its declared name / type / nullability.
     ShowColumns(String),
+    /// `CREATE USER 'name' WITH PASSWORD 'pw' ROLE 'admin'` (v4.1).
+    /// Role is optional; defaults to `readonly` when omitted.
+    CreateUser(CreateUserStatement),
+    /// `DROP USER 'name'` (v4.1).
+    DropUser(String),
+    /// `SHOW USERS` (v4.1) — admin-only listing of (name, role).
+    ShowUsers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateUserStatement {
+    pub name: String,
+    pub password: String,
+    /// One of `admin` / `readwrite` / `readonly`. Stored verbatim from
+    /// the parser; the engine validates against `Role::parse` so a
+    /// typo lands as a runtime error with a clear message rather than
+    /// a parse failure.
+    pub role: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +418,14 @@ impl fmt::Display for Statement {
             Self::ReleaseSavepoint(n) => write!(f, "RELEASE SAVEPOINT {}", quote_ident(n)),
             Self::ShowTables => f.write_str("SHOW TABLES"),
             Self::ShowColumns(t) => write!(f, "SHOW COLUMNS FROM {}", quote_ident(t)),
+            Self::CreateUser(s) => write!(
+                f,
+                "CREATE USER {} WITH PASSWORD '<redacted>' ROLE '{}'",
+                quote_ident(&s.name),
+                s.role
+            ),
+            Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
+            Self::ShowUsers => f.write_str("SHOW USERS"),
         }
     }
 }

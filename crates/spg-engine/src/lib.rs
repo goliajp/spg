@@ -17,9 +17,9 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use spg_sql::ast::{
-    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement, Expr,
-    FromClause, IndexMethod, InsertStatement, JoinKind, Literal, SelectItem, SelectStatement,
-    Statement, UnOp, UnionKind,
+    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement,
+    CreateUserStatement, Expr, FromClause, IndexMethod, InsertStatement, JoinKind, Literal,
+    SelectItem, SelectStatement, Statement, UnOp, UnionKind,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -110,6 +110,14 @@ impl From<EvalError> for EngineError {
 /// `Unsupported`.
 pub type ClockFn = fn() -> i64;
 
+/// Function pointer that produces 16 cryptographically random bytes.
+/// Like `ClockFn`, the engine is `no_std` and can't reach for /dev/urandom
+/// itself — host (`spg-server`) injects an OS-backed source. `None`
+/// means SQL-driven `CREATE USER` falls back to a deterministic salt
+/// derived from the username (acceptable in tests; the server always
+/// installs a real RNG so production paths never see this).
+pub type SaltFn = fn() -> [u8; 16];
+
 // ---- snapshot envelope (v4.1) ----
 //
 // Wraps a catalog blob + a user blob behind a small header so the
@@ -189,6 +197,10 @@ pub struct Engine {
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
+    /// v4.1 cryptographic RNG for per-user password salt. Set by the
+    /// host. `None` means SQL-driven `CREATE USER` uses a
+    /// deterministic fallback — see `SaltFn`.
+    salt_fn: Option<SaltFn>,
     /// v4.1 RBAC user table. Empty means "no RBAC configured yet" —
     /// the server decides what that means at the auth boundary
     /// (open mode vs legacy single-password mode). User CRUD goes
@@ -204,6 +216,7 @@ impl Engine {
             tx_catalog: None,
             savepoints: Vec::new(),
             clock: None,
+            salt_fn: None,
             users: UserStore::new(),
         }
     }
@@ -216,6 +229,7 @@ impl Engine {
             tx_catalog: None,
             savepoints: Vec::new(),
             clock: None,
+            salt_fn: None,
             users: UserStore::new(),
         }
     }
@@ -234,6 +248,7 @@ impl Engine {
                 tx_catalog: None,
                 savepoints: Vec::new(),
                 clock: None,
+                salt_fn: None,
                 users,
             })
         } else {
@@ -272,6 +287,14 @@ impl Engine {
     #[must_use]
     pub const fn with_clock(mut self, clock: ClockFn) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Builder: attach an OS-backed RNG for per-user password salts.
+    /// The host (`spg-server`) typically wires this to `/dev/urandom`.
+    #[must_use]
+    pub const fn with_salt_fn(mut self, f: SaltFn) -> Self {
+        self.salt_fn = Some(f);
         self
     }
 
@@ -336,6 +359,7 @@ impl Engine {
             Statement::Select(s) => self.exec_select(&s),
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
+            Statement::ShowUsers => Ok(self.exec_show_users()),
             _ => Err(EngineError::WriteRequired),
         }
     }
@@ -370,7 +394,74 @@ impl Engine {
             Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(&name),
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
+            Statement::ShowUsers => Ok(self.exec_show_users()),
+            Statement::CreateUser(s) => self.exec_create_user(&s),
+            Statement::DropUser(name) => self.exec_drop_user(&name),
         }
+    }
+
+    /// v4.1 `SHOW USERS` — `(name, role)` per row, ordered by name.
+    fn exec_show_users(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("role", DataType::Text, false),
+        ];
+        let rows: Vec<Row> = self
+            .users
+            .iter()
+            .map(|(name, rec)| {
+                Row::new(alloc::vec![
+                    Value::Text(name.to_string()),
+                    Value::Text(rec.role.as_str().to_string()),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    fn exec_create_user(&mut self, s: &CreateUserStatement) -> Result<QueryResult, EngineError> {
+        if self.in_transaction() {
+            return Err(EngineError::Unsupported(
+                "CREATE USER is not allowed inside a transaction".into(),
+            ));
+        }
+        let role = users::Role::parse(&s.role).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("invalid role: {:?}", s.role))
+        })?;
+        // Prefer the host-injected RNG. Falls back to a deterministic
+        // salt derived from the username only when no RNG is wired —
+        // acceptable for tests; the server always installs one.
+        let salt = self.salt_fn.map_or_else(
+            || {
+                let mut s_bytes = [0u8; 16];
+                let digest = spg_crypto::hash(s.name.as_bytes());
+                s_bytes.copy_from_slice(&digest[..16]);
+                s_bytes
+            },
+            |f| f(),
+        );
+        self.users
+            .create(&s.name, &s.password, role, salt)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE USER: {e}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    fn exec_drop_user(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        if self.in_transaction() {
+            return Err(EngineError::Unsupported(
+                "DROP USER is not allowed inside a transaction".into(),
+            ));
+        }
+        self.users
+            .drop(name)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("DROP USER: {e}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
     }
 
     /// `SHOW TABLES` — one row per table in the active catalog.

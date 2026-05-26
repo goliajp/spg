@@ -611,6 +611,51 @@ linear; logged as v4.x candidate.
 Reproduce: `cargo run --release -p spg-bench-competitor --bin
 concurrent -- --threads N --seconds S`.
 
+## Multi-user + RBAC (v4.1)
+
+For the docker-compose RDBMS use case (app + DBA + BI users in one
+deployment), v4.1 adds a minimal RBAC layer on top of v4.0's
+concurrency. The single-password `SPG_PASSWORD` mode still works
+when no users have been created.
+
+Three roles:
+
+- `admin` — full read/write + user management (`CREATE USER` /
+  `DROP USER` / `SHOW USERS`)
+- `readwrite` — full read/write, no user-mgmt
+- `readonly` — `SELECT` / `SHOW` only
+
+Wire: new `Op::AuthUser` (0x03) carries `[u16 user_len][user][pw]`.
+Legacy `Op::Auth` is refused once a user table exists — forces
+clients onto per-user creds.
+
+Persistence: snapshot file gains an envelope wrapper (magic
+`SPGENV01`) that bundles the catalog + the user table. v3.x
+snapshots load unchanged (the loader falls back to the bare
+catalog format when the envelope magic is absent), so the upgrade
+is one-way only and zero-effort.
+
+Bootstrap: `SPG_ADMIN_PASSWORD` (and optional `SPG_ADMIN_USER`,
+default `admin`) create an admin on first start if the user table
+is empty. Idempotent — once an admin exists in the snapshot, env
+vars are ignored on restart. Use SQL to rotate passwords.
+
+SQL surface:
+
+```sql
+CREATE USER 'bi' WITH PASSWORD 'p' ROLE 'readonly';
+CREATE USER 'app' WITH PASSWORD 'p' ROLE 'readwrite';
+DROP USER 'temp';
+SHOW USERS;
+```
+
+Password storage: `BLAKE3(salt || password)` with per-user
+16-byte salt from `/dev/urandom`. Verify is constant-time.
+
+No measurable cost on the v4.0 concurrent SELECT scaling — the
+read path doesn't touch the user table after auth, and the
+envelope/no-envelope branch fires only at snapshot time.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
