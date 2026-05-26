@@ -124,7 +124,8 @@ Run: `cargo bench -p spg-audit --bench log`.
 | Path                                | Median       | Notes |
 |-------------------------------------|-------------:|-------|
 | `execute_select_const`              | **228 ns**   | v3.0.3 + v3.0.6 re-measurement: was 255 ns; **−11%** ✅. (The v3.0.3 commit reported "−2% noise" — that was itself measurement-window jitter; the real change is bigger.) |
-| `execute_select_where_n100`         | **2.33 µs**  | v3.0.3: was 2.57 µs; **−9%** ✅. |
+| `execute_select_where_n100`         | **2.33 µs**  | v3.0.3: was 2.57 µs; **−9%** ✅. Full 100-row scan; no index on `id`. |
+| `execute_select_where_n100_indexed` | **840 ns**   | v3.1.0: same query as above with `CREATE INDEX users_id_idx ON users (id)` first; the planner's existing `try_index_seek` skips the scan and goes straight to the B-tree. **−67% / 3×** vs the un-indexed path. |
 | `execute_select_count_group_n100`   | **3.10 µs**  | v3.0.3: was 3.33 µs; **−7%**. |
 | `execute_insert_one`                | **2.20 µs**  | v3.0.3 + v3.0.6 re-measurement: was 2.60 µs; **−15%** ✅. INSERT's per-row rewrite loop is where the single-`match` `rewrite_expr_clock` restructure shows up most. |
 

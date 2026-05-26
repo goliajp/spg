@@ -55,6 +55,21 @@ fn bench_select_where(c: &mut Criterion) {
             black_box(r);
         });
     });
+    // Same query, this time with an explicit BTree index on `id`. The
+    // engine planner picks it up via `try_index_seek`, so the scan
+    // collapses to a single B-tree lookup.
+    let mut eng_idx = fresh_engine();
+    eng_idx
+        .execute("CREATE INDEX users_id_idx ON users (id)")
+        .unwrap();
+    c.bench_function("execute_select_where_n100_indexed", |b| {
+        b.iter(|| {
+            let r = eng_idx
+                .execute(black_box("SELECT id, name FROM users WHERE id = 42"))
+                .expect("ok");
+            black_box(r);
+        });
+    });
 }
 
 fn bench_select_aggregate(c: &mut Criterion) {
