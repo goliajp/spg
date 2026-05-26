@@ -26,6 +26,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,6 +46,19 @@ const READ_CHUNK: usize = 4096;
 /// on huge SELECTs while still amortising the per-frame header.
 const BATCH_ROWS_PER_FRAME: usize = 256;
 
+/// v4.2 resource limits. Each field is `None` = unlimited.
+#[derive(Debug, Default, Clone, Copy)]
+struct Limits {
+    /// Maximum concurrent client connections. New accepts beyond
+    /// this number get a clear error and the socket closes
+    /// immediately. None = unlimited.
+    max_connections: Option<usize>,
+    /// Maximum rows a single SELECT may return. Enforced inside the
+    /// engine so a runaway full-scan can't blow the server's heap
+    /// before the result is shaped into wire frames.
+    max_query_rows: Option<usize>,
+}
+
 struct ServerState {
     /// v4.0: `RwLock` instead of `Mutex` so read-only statements
     /// (SELECT / SHOW outside an active TX) can run in parallel
@@ -62,6 +76,12 @@ struct ServerState {
     /// server demands `AUTH <password>` before any non-Ping frame; `None`
     /// means open access (the default).
     password: Option<String>,
+    /// v4.2: configured resource limits.
+    limits: Limits,
+    /// v4.2: live connection counter, used to enforce
+    /// `limits.max_connections`. Incremented at accept, decremented
+    /// when the handle thread's `ConnectionGuard` drops.
+    active_connections: AtomicUsize,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
@@ -91,10 +111,23 @@ fn main() {
     // leak into shell history / process listings (`ps`). Matches the
     // Valkey/Redis convention.
     let password = env::var("SPG_PASSWORD").ok().filter(|s| !s.is_empty());
-    if let Err(e) = run(&addr, db_path, audit_path, wal_path, password) {
+    let limits = Limits {
+        max_connections: parse_env_usize("SPG_MAX_CONNECTIONS"),
+        max_query_rows: parse_env_usize("SPG_MAX_QUERY_ROWS"),
+    };
+    if let Err(e) = run(&addr, db_path, audit_path, wal_path, password, limits) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
     }
+}
+
+/// Read a usize from `env_key`; non-positive / unparseable / unset
+/// becomes `None` (= unlimited). Used by the v4.2 limits envs.
+fn parse_env_usize(env_key: &str) -> Option<usize> {
+    env::var(env_key)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
 }
 
 #[allow(clippy::too_many_lines)] // startup wires snapshot+audit+WAL+bootstrap; splitting scatters init logic
@@ -104,6 +137,7 @@ fn run(
     audit_path: Option<PathBuf>,
     wal_path: Option<PathBuf>,
     password: Option<String>,
+    limits: Limits,
 ) -> std::io::Result<()> {
     let mut engine = match &db_path {
         Some(p) if p.exists() => {
@@ -132,6 +166,10 @@ fn run(
     }
     .with_clock(wall_clock_micros)
     .with_salt_fn(urandom_salt_or_panic);
+
+    if let Some(n) = limits.max_query_rows {
+        engine = engine.with_max_query_rows(n);
+    }
 
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {
@@ -206,6 +244,8 @@ fn run(
         wal,
         wal_path,
         password,
+        limits,
+        active_connections: AtomicUsize::new(0),
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -213,9 +253,29 @@ fn run(
     eprintln!("spg-server: listening on {local}{auth_msg}");
 
     for stream in listener.incoming() {
-        let stream = stream?;
+        let mut stream = stream?;
+        // v4.2 max_connections: try to claim a slot. On full, emit a
+        // clear error frame and drop the socket. Doing the check
+        // *after* accept costs us one extra accept+close per
+        // overflow, but keeps the listener responsive to the
+        // currently-allowed clients (an unbounded accept queue would
+        // pile up).
+        let guard = ConnectionGuard::try_claim(&state);
+        let Some(guard) = guard else {
+            let peer = stream.peer_addr().ok();
+            let _ = write_frame(
+                &mut stream,
+                &build_error_response(&format!(
+                    "max_connections reached ({} active)",
+                    state.limits.max_connections.unwrap_or(0)
+                )),
+            );
+            eprintln!("spg-server: rejected {peer:?}: max_connections reached");
+            continue;
+        };
         let state = Arc::clone(&state);
         thread::spawn(move || {
+            let _guard = guard; // released when this thread exits
             let peer = stream.peer_addr().ok();
             if let Err(e) = handle(stream, &state) {
                 eprintln!("spg-server: conn {peer:?}: {e}");
@@ -223,6 +283,43 @@ fn run(
         });
     }
     Ok(())
+}
+
+/// RAII slot in the `active_connections` counter. `try_claim`
+/// returns `None` when the configured `max_connections` cap is
+/// already reached; otherwise it bumps the counter and the slot
+/// frees on drop.
+struct ConnectionGuard {
+    state: Arc<ServerState>,
+}
+
+impl ConnectionGuard {
+    fn try_claim(state: &Arc<ServerState>) -> Option<Self> {
+        let max = state.limits.max_connections;
+        loop {
+            let current = state.active_connections.load(Ordering::Acquire);
+            if let Some(cap) = max
+                && current >= cap
+            {
+                return None;
+            }
+            if state
+                .active_connections
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self {
+                    state: Arc::clone(state),
+                });
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {

@@ -611,6 +611,31 @@ linear; logged as v4.x candidate.
 Reproduce: `cargo run --release -p spg-bench-competitor --bin
 concurrent -- --threads N --seconds S`.
 
+## Resource limits (v4.2)
+
+Two server-side caps, both opt-in via env (unset = unlimited):
+
+- `SPG_MAX_CONNECTIONS=N` — concurrent client connections. New
+  accepts beyond `N` get a clear error frame ("max_connections
+  reached (N active)") and the socket closes immediately.
+  Implemented as an `AtomicUsize` + RAII `ConnectionGuard` that
+  releases on the handle thread's exit. Existing clients keep
+  working through the overflow.
+- `SPG_MAX_QUERY_ROWS=N` — cap on rows a single SELECT may
+  materialise. Returns `query exceeded max_query_rows=N`
+  surfaced as `EngineError::RowLimitExceeded`. Enforced at the
+  engine boundary (after exec, before wire-shaping), so a
+  runaway full-scan can't blow heap from inside the executor.
+
+`SPG_QUERY_TIMEOUT_MS` (cooperative mid-query cancellation) is
+deferred — needs engine-level checkpoint hooks to be honest
+(killing the connection mid-write only frees the wire, not the
+already-allocated result vector). Tracked for v4.x followup.
+
+E2E coverage in `crates/spg-server/tests/e2e_limits.rs`:
+- `max_connections_rejects_overflow_with_clear_error`
+- `max_query_rows_caps_select_result`
+
 ## Multi-user + RBAC (v4.1)
 
 For the docker-compose RDBMS use case (app + DBA + BI users in one

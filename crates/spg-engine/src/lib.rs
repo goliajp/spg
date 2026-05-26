@@ -66,6 +66,9 @@ pub enum EngineError {
     /// The caller should retake the write lock and dispatch through
     /// `execute(&mut self)` instead.
     WriteRequired,
+    /// v4.2: a SELECT would have returned more rows than the
+    /// configured `max_query_rows` cap. Carries the cap.
+    RowLimitExceeded(usize),
 }
 
 impl fmt::Display for EngineError {
@@ -79,6 +82,9 @@ impl fmt::Display for EngineError {
             Self::NoActiveTransaction => f.write_str("no active transaction"),
             Self::WriteRequired => {
                 f.write_str("statement requires a write lock (use execute, not execute_readonly)")
+            }
+            Self::RowLimitExceeded(n) => {
+                write!(f, "query exceeded max_query_rows={n}")
             }
         }
     }
@@ -201,6 +207,12 @@ pub struct Engine {
     /// host. `None` means SQL-driven `CREATE USER` uses a
     /// deterministic fallback — see `SaltFn`.
     salt_fn: Option<SaltFn>,
+    /// v4.2 per-query row cap. `None` = unlimited. When set, a
+    /// SELECT that materialises more than `n` rows returns
+    /// `EngineError::RowLimitExceeded`. Enforced before the result
+    /// is shaped into wire frames so a runaway scan can't blow the
+    /// server's heap.
+    max_query_rows: Option<usize>,
     /// v4.1 RBAC user table. Empty means "no RBAC configured yet" —
     /// the server decides what that means at the auth boundary
     /// (open mode vs legacy single-password mode). User CRUD goes
@@ -217,6 +229,7 @@ impl Engine {
             savepoints: Vec::new(),
             clock: None,
             salt_fn: None,
+            max_query_rows: None,
             users: UserStore::new(),
         }
     }
@@ -230,6 +243,7 @@ impl Engine {
             savepoints: Vec::new(),
             clock: None,
             salt_fn: None,
+            max_query_rows: None,
             users: UserStore::new(),
         }
     }
@@ -249,6 +263,7 @@ impl Engine {
                 savepoints: Vec::new(),
                 clock: None,
                 salt_fn: None,
+                max_query_rows: None,
                 users,
             })
         } else {
@@ -295,6 +310,17 @@ impl Engine {
     #[must_use]
     pub const fn with_salt_fn(mut self, f: SaltFn) -> Self {
         self.salt_fn = Some(f);
+        self
+    }
+
+    /// Builder: cap the number of rows a single SELECT may return.
+    /// Exceeding the cap raises `EngineError::RowLimitExceeded` —
+    /// the bound is checked inside the executor so a runaway
+    /// catalog scan can't allocate millions of rows before the
+    /// server gets a chance to reject the result.
+    #[must_use]
+    pub const fn with_max_query_rows(mut self, n: usize) -> Self {
+        self.max_query_rows = Some(n);
         self
     }
 
@@ -355,13 +381,29 @@ impl Engine {
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
         }
-        match stmt {
+        let result = match stmt {
             Statement::Select(s) => self.exec_select(&s),
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             _ => Err(EngineError::WriteRequired),
+        };
+        self.enforce_row_limit(result)
+    }
+
+    /// v4.2: cap result-set size. Applied after the executor
+    /// materialises rows but before they leave the engine — wrapping
+    /// every Rows-returning exec_* function would scatter the check.
+    fn enforce_row_limit(
+        &self,
+        result: Result<QueryResult, EngineError>,
+    ) -> Result<QueryResult, EngineError> {
+        if let (Ok(QueryResult::Rows { rows, .. }), Some(cap)) = (&result, self.max_query_rows)
+            && rows.len() > cap
+        {
+            return Err(EngineError::RowLimitExceeded(cap));
         }
+        result
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
@@ -381,7 +423,7 @@ impl Engine {
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
         }
-        match stmt {
+        let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
@@ -397,7 +439,8 @@ impl Engine {
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::CreateUser(s) => self.exec_create_user(&s),
             Statement::DropUser(name) => self.exec_drop_user(&name),
-        }
+        };
+        self.enforce_row_limit(result)
     }
 
     /// v4.1 `SHOW USERS` — `(name, role)` per row, ordered by name.
