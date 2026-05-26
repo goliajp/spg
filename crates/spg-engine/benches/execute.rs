@@ -84,6 +84,31 @@ fn bench_select_aggregate(c: &mut Criterion) {
     });
 }
 
+fn bench_order_limit(c: &mut Criterion) {
+    // Larger table so the difference between full sort O(n log n) and
+    // partial sort O(n) is measurable.
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE items (id INT NOT NULL, weight FLOAT)")
+        .unwrap();
+    for i in 0..1000 {
+        let sql = format!(
+            "INSERT INTO items VALUES ({i}, {})",
+            (1000 - i) as f64 * 0.001
+        );
+        eng.execute(&sql).unwrap();
+    }
+    c.bench_function("execute_select_order_limit_k_n1000", |b| {
+        b.iter(|| {
+            let r = eng
+                .execute(black_box(
+                    "SELECT id, weight FROM items ORDER BY weight DESC LIMIT 10",
+                ))
+                .expect("ok");
+            black_box(r);
+        });
+    });
+}
+
 fn bench_insert_one(c: &mut Criterion) {
     c.bench_function("execute_insert_one", |b| {
         b.iter_batched(
@@ -104,6 +129,7 @@ criterion_group!(
     bench_select_one,
     bench_select_where,
     bench_select_aggregate,
+    bench_order_limit,
     bench_insert_one
 );
 criterion_main!(benches);

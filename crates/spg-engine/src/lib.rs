@@ -666,12 +666,17 @@ impl Engine {
         }
 
         if let Some(order) = &stmt.order_by {
-            tagged.sort_by(|a, b| {
-                let ka = a.0.unwrap_or(f64::INFINITY);
-                let kb = b.0.unwrap_or(f64::INFINITY);
-                let cmp = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
-                if order.desc { cmp.reverse() } else { cmp }
-            });
+            // Partial-sort fast path: when LIMIT is small relative to
+            // the row count, select_nth_unstable + sort just the
+            // prefix is O(n + k log k) instead of O(n log n). DISTINCT
+            // requires the full sort because de-dup happens after.
+            let keep = if stmt.distinct {
+                None
+            } else {
+                stmt.limit
+                    .map(|l| l as usize + stmt.offset.map_or(0, |o| o as usize))
+            };
+            partial_sort_tagged(&mut tagged, keep, order.desc);
         }
 
         let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
@@ -836,12 +841,13 @@ impl Engine {
             tagged.push((order_key, Row::new(values)));
         }
         if let Some(order) = &stmt.order_by {
-            tagged.sort_by(|a, b| {
-                let ka = a.0.unwrap_or(f64::INFINITY);
-                let kb = b.0.unwrap_or(f64::INFINITY);
-                let cmp = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
-                if order.desc { cmp.reverse() } else { cmp }
-            });
+            let keep = if stmt.distinct {
+                None
+            } else {
+                stmt.limit
+                    .map(|l| l as usize + stmt.offset.map_or(0, |o| o as usize))
+            };
+            partial_sort_tagged(&mut tagged, keep, order.desc);
         }
         let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
         if stmt.distinct {
@@ -1508,6 +1514,39 @@ fn resolve_order_by_position(s: &mut SelectStatement) {
 /// Sort `tagged` by `f64` key, reversing the comparator under DESC.
 /// Used by the UNION ORDER BY path; per-block paths inline the same
 /// comparator because they already hold `&OrderBy` directly.
+/// v3.1.1: partial-sort helper. When `keep` (= offset + limit) is
+/// strictly less than `tagged.len()`, run `select_nth_unstable_by` to
+/// partition the prefix in O(n), then sort just that prefix in O(k
+/// log k). Total O(n + k log k), vs O(n log n) for a full sort. The
+/// caller decides what `keep` is; passing `None` (no LIMIT) keeps the
+/// full-sort behaviour.
+///
+/// `tagged` holds `(Option<f64>, Row)` (the SELECT path) — `None` keys
+/// sort last in ascending order, mirroring NULL-sorts-last in SQL.
+fn partial_sort_tagged(tagged: &mut Vec<(Option<f64>, Row)>, keep: Option<usize>, desc: bool) {
+    let cmp = move |a: &(Option<f64>, Row), b: &(Option<f64>, Row)| {
+        let ka = a.0.unwrap_or(f64::INFINITY);
+        let kb = b.0.unwrap_or(f64::INFINITY);
+        let ord = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
+        if desc { ord.reverse() } else { ord }
+    };
+    match keep {
+        Some(k) if k < tagged.len() && k > 0 => {
+            // Partition: every element at or before index k-1 is "≤"
+            // (or "≥" under DESC) every element after it. Then sort
+            // just the prefix to give the caller a proper ordering of
+            // the kept rows.
+            let pivot = k - 1;
+            tagged.select_nth_unstable_by(pivot, cmp);
+            tagged[..k].sort_by(cmp);
+            tagged.truncate(k);
+        }
+        _ => {
+            tagged.sort_by(cmp);
+        }
+    }
+}
+
 fn sort_by_key_with_direction(tagged: &mut [(f64, Row)], desc: bool) {
     tagged.sort_by(|a, b| {
         let cmp = a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal);
