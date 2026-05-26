@@ -28,7 +28,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,7 +48,7 @@ const READ_CHUNK: usize = 4096;
 /// on huge SELECTs while still amortising the per-frame header.
 const BATCH_ROWS_PER_FRAME: usize = 256;
 
-/// v4.2 resource limits. Each field is `None` = unlimited.
+/// v4.2 + v4.5 resource limits. Each field is `None` = unlimited.
 #[derive(Debug, Default, Clone, Copy)]
 struct Limits {
     /// Maximum concurrent client connections. New accepts beyond
@@ -59,6 +59,17 @@ struct Limits {
     /// engine so a runaway full-scan can't blow the server's heap
     /// before the result is shaped into wire frames.
     max_query_rows: Option<usize>,
+    /// v4.5: per-query wall-clock budget (milliseconds). When set, a
+    /// watchdog thread starts on each `Query` frame, flips a
+    /// `CancelToken` after the budget, and shuts down the TCP stream
+    /// so a stuck server thread can't hold the connection open
+    /// past the budget either.
+    query_timeout_ms: Option<u64>,
+    /// v4.5: close a connection that has been idle (no incoming
+    /// frame) for this many seconds. Implemented via the OS
+    /// read timeout on the TCP socket — when `read()` returns
+    /// `WouldBlock` the handle loop exits cleanly.
+    idle_timeout_sec: Option<u64>,
 }
 
 pub(crate) struct ServerState {
@@ -116,6 +127,8 @@ fn main() {
     let limits = Limits {
         max_connections: parse_env_usize("SPG_MAX_CONNECTIONS"),
         max_query_rows: parse_env_usize("SPG_MAX_QUERY_ROWS"),
+        query_timeout_ms: parse_env_u64("SPG_QUERY_TIMEOUT_MS"),
+        idle_timeout_sec: parse_env_u64("SPG_IDLE_TIMEOUT_SEC"),
     };
     if let Err(e) = run(&addr, db_path, audit_path, wal_path, password, limits) {
         eprintln!("spg-server: fatal: {e}");
@@ -129,6 +142,13 @@ fn parse_env_usize(env_key: &str) -> Option<usize> {
     env::var(env_key)
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn parse_env_u64(env_key: &str) -> Option<u64> {
+    env::var(env_key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
 }
 
@@ -338,6 +358,13 @@ impl Drop for ConnectionGuard {
 
 fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
+    // v4.5 idle timeout: when set, OS-level read timeout closes the
+    // connection automatically. read() will return WouldBlock /
+    // TimedOut after the budget; the outer loop translates that into
+    // a clean exit.
+    if let Some(secs) = state.limits.idle_timeout_sec {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(secs)));
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
     let mut chunk = [0u8; READ_CHUNK];
     // v4.1: per-connection role.
@@ -356,7 +383,24 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     let mut in_tx = false;
 
     loop {
-        let n = stream.read(&mut chunk)?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            // v4.5: idle read timeout (or any explicit OS read
+            // timeout) closes the connection cleanly.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                let _ = write_frame(
+                    &mut stream,
+                    &build_error_response("idle timeout reached, closing connection"),
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Ok(());
         }
@@ -534,12 +578,22 @@ fn dispatch(
             // matches like a column named "select" don't happen in
             // practice).
             if !*in_tx && sql_is_read_only(&sql) {
+                // v4.5: per-query cancellation token. Watchdog
+                // thread (if SPG_QUERY_TIMEOUT_MS set) trips the
+                // flag after the budget; the engine's row loops
+                // poll it at checkpoints and bail.
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                let watchdog = spawn_query_watchdog(state, &cancel_flag);
                 let engine = state
                     .engine
                     .read()
                     .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-                let result = engine.execute_readonly(&sql);
+                let result = engine.execute_readonly_with_cancel(
+                    &sql,
+                    spg_engine::CancelToken::from_flag(&cancel_flag),
+                );
                 drop(engine);
+                watchdog.cancel();
                 if !matches!(&result, Err(EngineError::WriteRequired)) {
                     return emit_result(stream, result);
                 }
@@ -566,12 +620,15 @@ fn dispatch(
                     ),
                 );
             }
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let watchdog = spawn_query_watchdog(state, &cancel_flag);
             let (result, snapshot) = {
                 let mut engine = state
                     .engine
                     .write()
                     .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-                let result = engine.execute(&sql);
+                let result = engine
+                    .execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
                 // v4.0: sync per-conn TX state from the engine.
                 // Engine.in_transaction() is the authoritative bit
                 // (it knows whether BEGIN succeeded, whether a nested
@@ -604,6 +661,7 @@ fn dispatch(
                 };
                 (result, snap)
             };
+            watchdog.cancel();
             // Snapshot the catalog first; an audit entry that survives a
             // partial flush would be inconsistent.
             if let (Some(bytes), Some(path)) = (snapshot, state.db_path.as_deref())
@@ -849,6 +907,48 @@ fn bootstrap_admin_from_env(engine: &mut Engine, db_path: Option<&Path>) -> std:
         eprintln!("spg-server: warning — failed to persist bootstrap admin: {e}");
     }
     Ok(())
+}
+
+/// v4.5: per-query watchdog. Reads `state.limits.query_timeout_ms`;
+/// when set, spawns a thread that sleeps the budget then flips
+/// `cancel_flag`. `Watchdog::cancel` is idempotent — call it once
+/// the query completes so the watchdog thread sees no work and the
+/// next query gets a fresh budget.
+struct Watchdog {
+    /// Shared with both this struct and the watchdog thread. Setting
+    /// it stops the timer's sleep loop without needing to join.
+    completed: Arc<AtomicBool>,
+}
+
+impl Watchdog {
+    fn cancel(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
+}
+
+fn spawn_query_watchdog(state: &ServerState, cancel_flag: &Arc<AtomicBool>) -> Watchdog {
+    let completed = Arc::new(AtomicBool::new(false));
+    let Some(budget_ms) = state.limits.query_timeout_ms else {
+        return Watchdog { completed };
+    };
+    let cancel_flag = Arc::clone(cancel_flag);
+    let completed_for_thread = Arc::clone(&completed);
+    thread::spawn(move || {
+        // Sleep in short slices so a finished query reclaims the
+        // watchdog quickly (avoids piling up parked threads when
+        // SPG_QUERY_TIMEOUT_MS is high but queries are usually fast).
+        let total = std::time::Duration::from_millis(budget_ms);
+        let slice = std::time::Duration::from_millis(50.min(budget_ms));
+        let start = std::time::Instant::now();
+        while start.elapsed() < total {
+            if completed_for_thread.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(slice);
+        }
+        cancel_flag.store(true, Ordering::Release);
+    });
+    Watchdog { completed }
 }
 
 /// 16 cryptographically random bytes from the OS via /dev/urandom.
