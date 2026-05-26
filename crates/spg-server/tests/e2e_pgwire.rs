@@ -120,17 +120,6 @@ fn send_startup(s: &mut TcpStream, user: &str) {
     s.write_all(&out).unwrap();
 }
 
-fn send_password(s: &mut TcpStream, password: &str) {
-    let mut body = Vec::with_capacity(password.len() + 1);
-    body.extend_from_slice(password.as_bytes());
-    body.push(0);
-    let total = (body.len() + 4) as u32;
-    let mut out = Vec::with_capacity(body.len() + 5);
-    out.push(b'p');
-    out.extend_from_slice(&total.to_be_bytes());
-    out.extend_from_slice(&body);
-    s.write_all(&out).unwrap();
-}
 
 fn send_query(s: &mut TcpStream, sql: &str) {
     let mut body = Vec::with_capacity(sql.len() + 1);

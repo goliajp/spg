@@ -1272,6 +1272,7 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Date => 1082,
         DataType::Interval => 1186,
         DataType::Numeric { .. } => 1700,
+        DataType::Json => 114, // PG's "json" type (jsonb would be 3802)
     }
 }
 
@@ -1294,7 +1295,7 @@ fn value_to_pg_text(v: &Value, _ty: Option<DataType>) -> Option<String> {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(f) => format!("{f}"),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) | Value::Json(s) => s.clone(),
         Value::Timestamp(micros) => format_timestamp(*micros),
         Value::Date(days) => format_date(*days),
         Value::Interval { months, micros } => format!("P{months}M{micros}U"),

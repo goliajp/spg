@@ -1057,7 +1057,8 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Numeric { .. }
         | DataType::Date
         | DataType::Timestamp
-        | DataType::Interval => WireType::Text,
+        | DataType::Interval
+        | DataType::Json => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -1077,7 +1078,10 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Int(n) => WireValue::Int(*n),
         Value::BigInt(n) => WireValue::BigInt(*n),
         Value::Float(x) => WireValue::Float(*x),
-        Value::Text(s) => WireValue::Text(s.clone()),
+        // v4.9: TEXT and JSON ride the wire identically — the
+        // client's column type (RowDescription OID) carries the
+        // "this is JSON" semantic.
+        Value::Text(s) | Value::Json(s) => WireValue::Text(s.clone()),
         Value::Bool(b) => WireValue::Bool(*b),
         Value::Vector(v) => WireValue::Vector(v.clone()),
         // NUMERIC / DATE / TIMESTAMP render as their canonical

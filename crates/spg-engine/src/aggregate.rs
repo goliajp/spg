@@ -567,6 +567,11 @@ fn encode_key(vals: &[Value]) -> String {
                 out.push_str(&micros.to_string());
                 out.push('|');
             }
+            Value::Json(s) => {
+                out.push('j');
+                out.push_str(s);
+                out.push('|');
+            }
         }
     }
     out

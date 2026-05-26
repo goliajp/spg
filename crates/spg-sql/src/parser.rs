@@ -636,6 +636,11 @@ impl Parser {
             // MySQL's `DATETIME` is the same domain as standard
             // `TIMESTAMP` — accept both spellings.
             "timestamp" | "datetime" => ColumnTypeName::Timestamp,
+            // v4.9: JSON / JSONB. Stored as raw text — no parse-time
+            // validation. We accept the JSONB spelling too because
+            // most PG clients default to it; SPG doesn't distinguish
+            // the two (no path-operator perf advantage to model).
+            "json" | "jsonb" => ColumnTypeName::Json,
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),
@@ -1817,8 +1822,9 @@ mod tests {
 
     #[test]
     fn create_table_unknown_type_errors() {
-        // NUMERIC is now a real type (v1.12); pick another unsupported keyword.
-        let err = parse_statement("CREATE TABLE x (a json)").unwrap_err();
+        // v4.9: JSON is now real; pick an actually unsupported keyword
+        // (XML never landed and isn't planned).
+        let err = parse_statement("CREATE TABLE x (a xml)").unwrap_err();
         assert!(err.message.contains("unsupported column type"));
     }
 

@@ -59,6 +59,12 @@ pub enum DataType {
     /// arithmetic results); on-disk encoding is rejected so this branch
     /// can't appear in a `ColumnSchema`.
     Interval,
+    /// v4.9: `JSON` / `JSONB` — text-backed JSON document. We don't
+    /// parse the content (no path operators or jsonb functions yet) —
+    /// the column accepts any TEXT-compatible value and round-trips
+    /// it verbatim. Equivalent to `Text` storage with a distinct
+    /// type tag for the wire layer (PG OID 114).
+    Json,
 }
 
 impl fmt::Display for DataType {
@@ -83,6 +89,7 @@ impl fmt::Display for DataType {
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::Interval => f.write_str("INTERVAL"),
+            Self::Json => f.write_str("JSON"),
         }
     }
 }
@@ -116,6 +123,10 @@ pub enum Value {
         months: i32,
         micros: i64,
     },
+    /// v4.9 `JSON` — raw JSON text. No structural validation
+    /// happens at the storage layer; whatever the parser hands us
+    /// round-trips verbatim. Equality is byte-wise.
+    Json(String),
     Null,
 }
 
@@ -145,6 +156,7 @@ impl Value {
             Self::Date(_) => Some(DataType::Date),
             Self::Timestamp(_) => Some(DataType::Timestamp),
             Self::Interval { .. } => Some(DataType::Interval),
+            Self::Json(_) => Some(DataType::Json),
             Self::Null => None,
         }
     }
@@ -233,7 +245,8 @@ impl IndexKey {
             | Value::Float(_)
             | Value::Vector(_)
             | Value::Numeric { .. }
-            | Value::Interval { .. } => None,
+            | Value::Interval { .. }
+            | Value::Json(_) => None,
         }
     }
 }
@@ -479,7 +492,10 @@ impl Table {
             let compatible = actual == col.ty
                 || matches!(
                     (actual, col.ty),
-                    (DataType::Text, DataType::Varchar(_) | DataType::Char(_))
+                    (
+                        DataType::Text,
+                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json
+                    ) | (DataType::Json, DataType::Text)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -646,7 +662,10 @@ impl Table {
             let compatible = actual == col.ty
                 || matches!(
                     (actual, col.ty),
-                    (DataType::Text, DataType::Varchar(_) | DataType::Char(_))
+                    (
+                        DataType::Text,
+                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json
+                    ) | (DataType::Json, DataType::Text)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -1884,6 +1903,7 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Interval => {
             unreachable!("DataType::Interval has no on-disk encoding in v2.11")
         }
+        DataType::Json => out.push(13),
     }
 }
 
@@ -1907,6 +1927,7 @@ impl Cursor<'_> {
             }
             11 => Ok(DataType::Date),
             12 => Ok(DataType::Timestamp),
+            13 => Ok(DataType::Json),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -1945,6 +1966,10 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         }
         (Value::Date(d), DataType::Date) => out.extend_from_slice(&d.to_le_bytes()),
         (Value::Timestamp(t), DataType::Timestamp) => out.extend_from_slice(&t.to_le_bytes()),
+        // v4.9: JSON stores as length-prefixed text; same shape as
+        // Text — the type tag lives in the column schema, not the
+        // per-cell body.
+        (Value::Json(s), DataType::Json) => write_str(out, s),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -1976,7 +2001,11 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.push(3);
             out.extend_from_slice(&x.to_le_bytes());
         }
-        Value::Text(s) => {
+        // v4.9: JSON shares the tag-4 (Text) on-disk encoding —
+        // schema decides which variant comes back on read. The
+        // bodies are byte-identical so collapsing the match keeps
+        // clippy::match_same_arms quiet.
+        Value::Text(s) | Value::Json(s) => {
             out.push(4);
             write_str(out, s);
         }
@@ -2131,6 +2160,7 @@ impl<'a> Cursor<'a> {
                     "INTERVAL column found on disk — runtime-only type, v3.0.2 rejects it".into(),
                 ))
             }
+            DataType::Json => Ok(Value::Json(self.read_str()?)),
         }
     }
 

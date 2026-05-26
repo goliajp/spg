@@ -1476,6 +1476,9 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
              (months vs micros has no single canonical ordering)"
                 .into(),
         )),
+        Value::Json(_) => Err(EngineError::Unsupported(
+            "ORDER BY of a JSON value is not supported — cast the document to text first".into(),
+        )),
     }
 }
 
@@ -2147,6 +2150,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Numeric(precision, scale) => DataType::Numeric { precision, scale },
         ColumnTypeName::Date => DataType::Date,
         ColumnTypeName::Timestamp => DataType::Timestamp,
+        ColumnTypeName::Json => DataType::Json,
     }
 }
 
@@ -2263,6 +2267,11 @@ fn coerce_value(
                 })?;
                 Some(Value::Date(d))
             }
+            // v4.9: Text ↔ JSON coercion. No structural validation —
+            // any text literal is accepted; the responsibility for
+            // valid JSON lies with the producer.
+            (Value::Text(s), DataType::Json) => Some(Value::Json(s)),
+            (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
             (Value::Text(s), DataType::Timestamp) => {
                 let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
                     EngineError::Eval(EvalError::TypeMismatch {
