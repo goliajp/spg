@@ -20,6 +20,7 @@
 //!
 //! Pass `-` (or omit) to skip any positional after the first.
 
+mod observability;
 mod pgwire;
 mod scram;
 
@@ -96,6 +97,9 @@ pub(crate) struct ServerState {
     /// `limits.max_connections`. Incremented at accept, decremented
     /// when the handle thread's `ConnectionGuard` drops.
     active_connections: AtomicUsize,
+    /// v4.13: observability counters surfaced via /metrics. Cheap
+    /// Relaxed atomics — increment from any dispatch site.
+    metrics: Arc<observability::Metrics>,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
@@ -269,6 +273,7 @@ fn run(
         password,
         limits,
         active_connections: AtomicUsize::new(0),
+        metrics: Arc::new(observability::Metrics::default()),
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -284,6 +289,19 @@ fn run(
         match pgwire::spawn_listener(&pg_addr, Arc::clone(&state)) {
             Ok(pg_local) => eprintln!("spg-server: pg-wire listening on {pg_local}"),
             Err(e) => eprintln!("spg-server: pg-wire failed to start on {pg_addr}: {e}"),
+        }
+    }
+
+    // v4.13: optional observability HTTP endpoint. /healthz for
+    // k8s liveness, /metrics for Prometheus scraping. The
+    // listener reads live counters out of state directly via
+    // an Arc<ServerState>.
+    if let Ok(http_addr) = env::var("SPG_HTTP_ADDR")
+        && !http_addr.is_empty()
+    {
+        match observability::spawn_http(&http_addr, Arc::clone(&state)) {
+            Ok(http_local) => eprintln!("spg-server: http listening on {http_local}"),
+            Err(e) => eprintln!("spg-server: http failed to start on {http_addr}: {e}"),
         }
     }
 
@@ -568,9 +586,13 @@ fn dispatch(
             write_frame(stream, &build_stats_response(&body))
         }
         Op::Query => {
+            state.metrics.queries_total.fetch_add(1, Ordering::Relaxed);
             let sql = match parse_query(frame) {
                 Ok(s) => s.to_string(),
-                Err(e) => return write_frame(stream, &build_error_response(&e.to_string())),
+                Err(e) => {
+                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return write_frame(stream, &build_error_response(&e.to_string()));
+                }
             };
             // v4.0 fast path: SELECT / SHOW outside an active TX take
             // the engine *read* lock and run in parallel with other
