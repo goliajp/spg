@@ -18,6 +18,10 @@ pub enum Statement {
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     Insert(InsertStatement),
+    /// v4.4 — `UPDATE <table> SET col=expr [, ...] [WHERE cond]`.
+    Update(UpdateStatement),
+    /// v4.4 — `DELETE FROM <table> [WHERE cond]`.
+    Delete(DeleteStatement),
     Begin,
     Commit,
     Rollback,
@@ -152,6 +156,25 @@ impl fmt::Display for ColumnTypeName {
             Self::Timestamp => f.write_str("TIMESTAMP"),
         }
     }
+}
+
+/// `UPDATE <table> SET col = expr [, ...] [WHERE cond]`. v4.4 — the
+/// engine evaluates `expr` per matched row in the table's row order
+/// and rewrites cells in place. Indexed columns are dropped + re-
+/// inserted into the affected B-tree on each row change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatement {
+    pub table: String,
+    pub assignments: Vec<(String, Expr)>,
+    pub where_: Option<Expr>,
+}
+
+/// `DELETE FROM <table> [WHERE cond]`. v4.4 — removes matched rows
+/// from the active catalog and prunes them from every index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStatement {
+    pub table: String,
+    pub where_: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -410,6 +433,8 @@ impl fmt::Display for Statement {
             Self::CreateTable(s) => s.fmt(f),
             Self::CreateIndex(s) => s.fmt(f),
             Self::Insert(s) => s.fmt(f),
+            Self::Update(s) => s.fmt(f),
+            Self::Delete(s) => s.fmt(f),
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
@@ -508,6 +533,32 @@ impl fmt::Display for InsertStatement {
                 write!(f, "{v}")?;
             }
             f.write_str(")")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for UpdateStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UPDATE {} SET ", quote_ident(&self.table))?;
+        for (i, (col, expr)) in self.assignments.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{} = {expr}", quote_ident(col))?;
+        }
+        if let Some(w) = &self.where_ {
+            write!(f, " WHERE {w}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for DeleteStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DELETE FROM {}", quote_ident(&self.table))?;
+        if let Some(w) = &self.where_ {
+            write!(f, " WHERE {w}")?;
         }
         Ok(())
     }

@@ -178,18 +178,26 @@ impl Parser {
                     ))),
                 }
             }
-            // v4.1: DROP USER 'name' — DROP isn't a reserved keyword so we
-            // dispatch on the bare ident. Other DROP targets (TABLE, INDEX)
-            // can land alongside this when wanted.
+            // v4.1: DROP USER 'name' / v4.4: DELETE FROM table / UPDATE
+            // table SET. None of these leading keywords are reserved in
+            // our lexer, so dispatch on the bare ident.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("drop") => {
                 self.advance();
                 self.expect_keyword_ident("user")?;
                 let name = self.expect_ident_or_string()?;
                 Ok(Statement::DropUser(name))
             }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
+                self.advance();
+                self.parse_update_after_keyword()
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete") => {
+                self.advance();
+                self.parse_delete_after_keyword()
+            }
             other => Err(self.err(format!(
-                "expected SELECT / CREATE / DROP / INSERT / BEGIN / COMMIT / ROLLBACK / \
-                 SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
+                "expected SELECT / CREATE / DROP / INSERT / UPDATE / DELETE / BEGIN / COMMIT / \
+                 ROLLBACK / SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
             ))),
         }
     }
@@ -233,6 +241,62 @@ impl Parser {
             name,
             password,
             role,
+        }))
+    }
+
+    /// v4.4 `UPDATE <table> SET col = expr [, col = expr]* [WHERE cond]`.
+    /// Caller already consumed the leading `UPDATE` ident.
+    fn parse_update_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let table = self.expect_ident_like()?;
+        self.expect_keyword_ident("set")?;
+        let mut assignments = Vec::new();
+        loop {
+            let col = self.expect_ident_like()?;
+            if !matches!(self.peek(), Token::Eq) {
+                return Err(self.err(format!(
+                    "expected `=` after column name in UPDATE SET, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let value = self.parse_expr(0)?;
+            assignments.push((col, value));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let where_ = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        Ok(Statement::Update(crate::ast::UpdateStatement {
+            table,
+            assignments,
+            where_,
+        }))
+    }
+
+    /// v4.4 `DELETE FROM <table> [WHERE cond]`. Caller already consumed
+    /// the leading `DELETE` ident.
+    fn parse_delete_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        if !matches!(self.peek(), Token::From) {
+            return Err(self.err(format!("expected FROM after DELETE, got {:?}", self.peek())));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+        let where_ = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        Ok(Statement::Delete(crate::ast::DeleteStatement {
+            table,
+            where_,
         }))
     }
 
@@ -1807,7 +1871,9 @@ mod tests {
 
     #[test]
     fn unknown_keyword_at_statement_start_errors() {
-        let err = parse_statement("UPDATE foo SET x = 1").unwrap_err();
+        // v4.4: UPDATE is real SQL now. Use a fabricated keyword so
+        // the top-level dispatch still has no branch to take.
+        let err = parse_statement("FROBNICATE foo SET x = 1").unwrap_err();
         assert!(err.message.contains("expected SELECT"));
     }
 

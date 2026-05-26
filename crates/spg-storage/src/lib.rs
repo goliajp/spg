@@ -580,6 +580,138 @@ impl Table {
         self.add_nsw_index_inner(name, column_name, graph.m, Some(graph))
     }
 
+    /// v4.4: delete the rows at the given positions in one pass.
+    /// `positions` must be unique; ordering doesn't matter. Indices
+    /// are rebuilt from scratch (cheaper than tracking incremental
+    /// shifts across both B-tree and NSW). Returns the number of
+    /// rows removed.
+    pub fn delete_rows(&mut self, positions: &[usize]) -> usize {
+        if positions.is_empty() {
+            return 0;
+        }
+        // Mark positions; sweep + retain in one pass keeps cost O(n).
+        let mut to_remove = alloc::vec![false; self.rows.len()];
+        let mut removed = 0;
+        for &p in positions {
+            if p < to_remove.len() && !to_remove[p] {
+                to_remove[p] = true;
+                removed += 1;
+            }
+        }
+        let mut i = 0;
+        self.rows.retain(|_| {
+            let keep = !to_remove[i];
+            i += 1;
+            keep
+        });
+        self.rebuild_indices();
+        removed
+    }
+
+    /// v4.4: replace the row at `position` with `new_values` (must
+    /// match the schema arity + types). Indices are rebuilt for
+    /// correctness — the affected column might be indexed and its
+    /// key may have shifted, and a NSW node's vector may have
+    /// changed, both of which need fresh state.
+    pub fn update_row(
+        &mut self,
+        position: usize,
+        new_values: Vec<Value>,
+    ) -> Result<(), StorageError> {
+        if position >= self.rows.len() {
+            return Err(StorageError::Corrupt(alloc::format!(
+                "update_row: position {position} out of bounds (rows={})",
+                self.rows.len()
+            )));
+        }
+        if new_values.len() != self.schema.columns.len() {
+            return Err(StorageError::ArityMismatch {
+                expected: self.schema.columns.len(),
+                actual: new_values.len(),
+            });
+        }
+        // Reuse the per-cell type-compat validation that `insert`
+        // applies. The body below mirrors that check intentionally —
+        // factoring it would be more code than the duplication.
+        for (i, (val, col)) in new_values.iter().zip(&self.schema.columns).enumerate() {
+            if val.is_null() {
+                if !col.nullable {
+                    return Err(StorageError::NullInNotNull {
+                        column: col.name.clone(),
+                    });
+                }
+                continue;
+            }
+            let actual = val.data_type().expect("non-null");
+            let compatible = actual == col.ty
+                || matches!(
+                    (actual, col.ty),
+                    (DataType::Text, DataType::Varchar(_) | DataType::Char(_))
+                )
+                || matches!(
+                    (actual, col.ty),
+                    (
+                        DataType::Numeric { scale: a, .. },
+                        DataType::Numeric { scale: b, .. },
+                    ) if a == b
+                );
+            if !compatible {
+                return Err(StorageError::TypeMismatch {
+                    column: col.name.clone(),
+                    expected: col.ty,
+                    actual,
+                    position: i,
+                });
+            }
+        }
+        self.rows[position] = Row::new(new_values);
+        self.rebuild_indices();
+        Ok(())
+    }
+
+    /// v4.4 helper used by `delete_rows` / `update_row`: discard all
+    /// index payloads and rebuild from `self.rows`. Cheap enough
+    /// for typical SPG scale (catalogs in the docker-compose
+    /// deployment shape are small); the alternative — incremental
+    /// shift bookkeeping across B-tree + NSW — would be far more
+    /// invasive than the savings justify.
+    fn rebuild_indices(&mut self) {
+        let descriptors: Vec<(String, usize, Option<usize>)> = self
+            .indices
+            .iter()
+            .map(|idx| {
+                let m = if let IndexKind::Nsw(g) = &idx.kind {
+                    Some(g.m)
+                } else {
+                    None
+                };
+                (idx.name.clone(), idx.column_position, m)
+            })
+            .collect();
+        self.indices.clear();
+        for (name, column_position, nsw_m) in descriptors {
+            if let Some(m) = nsw_m {
+                let idx = Index::new_nsw(name, column_position, m);
+                self.indices.push(idx);
+                let idx_pos = self.indices.len() - 1;
+                let row_indices: Vec<usize> = (0..self.rows.len()).collect();
+                for row_idx in row_indices {
+                    nsw_insert_at(self, idx_pos, row_idx);
+                }
+            } else {
+                let mut idx = Index::new_btree(name, column_position);
+                if let IndexKind::BTree(map) = &mut idx.kind {
+                    for (i, row) in self.rows.iter().enumerate() {
+                        if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
+                            map.entry(key).or_default().push(i);
+                        }
+                    }
+                }
+                self.indices.push(idx);
+            }
+        }
+    }
+
     fn add_nsw_index_inner(
         &mut self,
         name: String,

@@ -1,4 +1,5 @@
-# DML that v1 SPG doesn't implement: UPDATE / DELETE / DROP / ALTER.
+# DML coverage: v4.4 added UPDATE / DELETE. DROP TABLE / ALTER TABLE
+# remain unsupported (v4.x cold backlog).
 
 statement ok
 CREATE TABLE t (id INT NOT NULL, name TEXT)
@@ -6,11 +7,30 @@ CREATE TABLE t (id INT NOT NULL, name TEXT)
 statement ok
 INSERT INTO t VALUES (1, 'x')
 
-statement error
+statement ok
+INSERT INTO t VALUES (2, 'z')
+
+# v4.4: UPDATE now supported
+statement ok
 UPDATE t SET name = 'y' WHERE id = 1
 
-statement error
+query IT rowsort
+SELECT id, name FROM t
+----
+1
+y
+2
+z
+
+# v4.4: DELETE now supported
+statement ok
 DELETE FROM t WHERE id = 1
+
+query IT rowsort
+SELECT id, name FROM t
+----
+2
+z
 
 statement error
 DROP TABLE t
