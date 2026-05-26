@@ -131,6 +131,9 @@ pub enum ColumnTypeName {
     /// `TIMESTAMP` / `MySQL` `DATETIME` — instant with microsecond
     /// precision.
     Timestamp,
+    /// v4.9 `JSON` / `JSONB` — text-backed JSON document. No parse-
+    /// time validation; the engine round-trips the literal verbatim.
+    Json,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -154,6 +157,7 @@ impl fmt::Display for ColumnTypeName {
             }
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
+            Self::Json => f.write_str("JSON"),
         }
     }
 }

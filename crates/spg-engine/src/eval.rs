@@ -683,7 +683,8 @@ fn value_to_text(v: &Value) -> String {
         Value::Int(n) => format!("{n}"),
         Value::BigInt(n) => format!("{n}"),
         Value::Float(x) => format!("{x}"),
-        Value::Text(s) => s.clone(),
+        // v4.9: JSON renders identically to Text — both are raw UTF-8.
+        Value::Text(s) | Value::Json(s) => s.clone(),
         Value::Bool(b) => (if *b { "true" } else { "false" }).into(),
         Value::Vector(v) => {
             let cells: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
