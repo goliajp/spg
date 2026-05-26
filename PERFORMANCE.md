@@ -261,6 +261,44 @@ shape (PG/MySQL/Maria still attach one to PRIMARY KEY).
 Reproduce: `xbench/competitor/scripts/up.sh && cargo run --release
 -p spg-bench-competitor --bin throughput`.
 
+### v3.2.3 — vector kNN, top-10 over 10K dim-128 vectors
+
+Bulk-build a 10000-vector HNSW index, then time 500 ANN queries
+(`SELECT id FROM vecs ORDER BY v <-> query LIMIT 10`) after a 50-query
+warm-up. Vectors are deterministic LCG-generated f32 in [-1, 1] so
+SPG and pgvector index identical data. MySQL / MariaDB skipped —
+neither has a native vector index, so any comparison would test a
+different thing (brute-force scan).
+
+| backend             |  build s |  q p50 µs |  q p95 µs |  q p99 µs |
+|---------------------|---------:|----------:|----------:|----------:|
+| spg-embedded        |   **1.49** |    **51.9** |     128.0 |     169.5 |
+| spg-server          |     8.10 |   **118.6** |     254.9 |     506.1 |
+| postgres+pgvector   |    24.33 |    2182.8 |    4729.5 |   10076.7 |
+
+**Reading this honestly:**
+
+- spg-embedded builds the 10K HNSW index in **1.5 s** vs pgvector's
+  **24.3 s** — **16× faster build**. pgvector's `CREATE INDEX … USING
+  hnsw` is a heavier operation per node (planner cost, MVCC,
+  WAL-logged inserts on the index relation).
+- spg-server build is 8.1 s — slower than embedded because each of
+  10K INSERTs takes a TCP round trip, but still **3× faster than
+  pgvector**.
+- Query latency: spg-embedded **42× faster** than pgvector at p50
+  (52 µs vs 2183 µs), **59× at p99** (170 µs vs 10077 µs);
+  spg-server is **18× faster at p50** (119 µs vs 2183 µs).
+- Both SPG modes use the v3.0.1 HNSW (heuristic neighbour selection
+  + BinaryHeap frontier + bitmap visited set) which gave the 16×
+  internal speedup. The competitor bench shows the architectural
+  win on top of the algorithmic win.
+- pgvector parameters are defaults (M = 16, ef_construction = 64,
+  ef = 40); SPG uses M = 16 too. Same algorithmic family, the win
+  is implementation-level.
+
+Reproduce: `xbench/competitor/scripts/up.sh && cargo run --release
+-p spg-bench-competitor --bin vector_knn`.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
