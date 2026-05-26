@@ -155,76 +155,13 @@ fn read_until_ready(s: &mut TcpStream) {
     }
 }
 
-#[test]
-fn psql_style_handshake_then_select() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
-    let dir = unique_tmpdir();
-    let db = dir.join("spg.db");
-
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db, Some("admin-pw")));
-    // Native socket is the readiness gate.
-    let _ = wait_for_listener(&native, &mut child.0);
-    // PG socket may take an extra tick to bind.
-    let mut s = wait_for_listener(&pg, &mut child.0);
-    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-
-    // Startup → AuthenticationCleartextPassword
-    send_startup(&mut s, "admin");
-    let auth = read_message(&mut s);
-    assert_eq!(auth.ty, b'R');
-    let subtype = u32::from_be_bytes([auth.body[0], auth.body[1], auth.body[2], auth.body[3]]);
-    assert_eq!(subtype, 3, "expected CleartextPassword");
-
-    // Send password, expect AuthOk + parameter statuses + ReadyForQuery.
-    send_password(&mut s, "admin-pw");
-    let ok = read_message(&mut s);
-    assert_eq!(ok.ty, b'R');
-    let ok_subtype = u32::from_be_bytes([ok.body[0], ok.body[1], ok.body[2], ok.body[3]]);
-    assert_eq!(ok_subtype, 0, "expected AuthenticationOk");
-    read_until_ready(&mut s);
-
-    // Set up some data + query it.
-    send_query(
-        &mut s,
-        "CREATE TABLE t (id INT NOT NULL, label TEXT NOT NULL)",
-    );
-    let cc = read_message(&mut s);
-    assert_eq!(cc.ty, b'C');
-    read_until_ready(&mut s);
-    send_query(&mut s, "INSERT INTO t VALUES (1, 'alpha')");
-    let cc = read_message(&mut s);
-    assert_eq!(cc.ty, b'C');
-    read_until_ready(&mut s);
-
-    send_query(&mut s, "SELECT id, label FROM t");
-    let rd = read_message(&mut s);
-    assert_eq!(rd.ty, b'T', "expected RowDescription");
-    let dr = read_message(&mut s);
-    assert_eq!(dr.ty, b'D', "expected DataRow");
-    let cc = read_message(&mut s);
-    assert_eq!(cc.ty, b'C', "expected CommandComplete");
-    read_until_ready(&mut s);
-}
-
-#[test]
-fn wrong_password_gets_error() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
-    let dir = unique_tmpdir();
-    let db = dir.join("spg.db");
-
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db, Some("admin-pw")));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = wait_for_listener(&pg, &mut child.0);
-    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-
-    send_startup(&mut s, "admin");
-    let _ = read_message(&mut s); // AuthRequest
-    send_password(&mut s, "wrong");
-    let err = read_message(&mut s);
-    assert_eq!(err.ty, b'E', "expected ErrorResponse");
-}
+// NOTE: the v4.3 cleartext-password tests previously here
+// (psql_style_handshake_then_select, wrong_password_gets_error)
+// were retired in v4.8 — bootstrap admin now has SCRAM-SHA-256
+// secrets, so the server advertises SCRAM (AuthSASL subtype 10)
+// not CleartextPassword. Equivalent coverage lives in
+// tests/e2e_pg_scram.rs (full SCRAM handshake + wrong-creds
+// rejection) and tests/e2e_pg_catalog.rs (open mode no-auth).
 
 #[test]
 fn select_version_canned_response_works() {

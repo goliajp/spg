@@ -16,6 +16,7 @@ spg-wire    = { path = "../spg-wire" }
 spg-engine  = { path = "../spg-engine" }
 spg-storage = { path = "../spg-storage" }
 spg-audit   = { path = "../spg-audit" }
+spg-crypto  = { path = "../spg-crypto" }
 
 [dev-dependencies]
 spg-audit   = { path = "../spg-audit" }

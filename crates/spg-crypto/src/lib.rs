@@ -21,6 +21,11 @@
 
 extern crate alloc;
 
+pub mod base64;
+pub mod hmac;
+pub mod pbkdf2;
+pub mod sha256;
+
 use alloc::vec::Vec;
 
 pub const OUT_LEN: usize = 32;
