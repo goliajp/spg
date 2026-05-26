@@ -178,13 +178,9 @@ fn print_report(per_thread: &[u64], total: u64, elapsed_sec: f64) {
     // roughly flat. If mean falls off a cliff as N grows, contention
     // is the bottleneck.
     println!("## interpretation");
-    println!(
-        "- if `mean per-thread throughput` stays close across runs at different `--threads`,"
-    );
+    println!("- if `mean per-thread throughput` stays close across runs at different `--threads`,");
     println!("  the read path scales (RwLock::read in parallel)");
-    println!(
-        "- if it collapses (e.g. total_rps barely grows past N=1), threads are serialising —"
-    );
+    println!("- if it collapses (e.g. total_rps barely grows past N=1), threads are serialising —");
     println!("  v4.0's RwLock work didn't take effect");
 }
 

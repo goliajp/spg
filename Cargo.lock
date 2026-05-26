@@ -1210,6 +1210,7 @@ name = "spg-engine"
 version = "1.0.0"
 dependencies = [
  "criterion",
+ "spg-crypto",
  "spg-sql",
  "spg-storage",
 ]

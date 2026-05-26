@@ -8,6 +8,7 @@ license      = { workspace = true }
 description  = "Execution engine for SPG: glues spg-sql parsing to spg-storage."
 
 [dependencies]
+spg-crypto  = { path = "../spg-crypto" }
 spg-sql     = { path = "../spg-sql" }
 spg-storage = { path = "../spg-storage" }
 

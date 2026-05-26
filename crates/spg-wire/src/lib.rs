@@ -41,6 +41,13 @@ pub enum Op {
     /// opcode until `Auth` succeeds. A matching password gets a `Pong`
     /// reply; a wrong one gets `ErrorResponse`.
     Auth = 0x02,
+    /// v4.1 client → server. Carries `(username, password)` for
+    /// per-user authentication. Layout:
+    /// `[u16 user_len][user UTF-8][password UTF-8]`. When the server
+    /// has a user table configured, this is the only auth that
+    /// works; legacy `Op::Auth` (password-only) still works in
+    /// single-password mode for backwards compatibility.
+    AuthUser = 0x03,
     // Query / result opcodes (v0.5).
     Query = 0x10,           // client → server: SQL text payload
     RowDescription = 0x11,  // server → client: column metadata
@@ -67,6 +74,7 @@ impl Op {
             0x00 => Ok(Self::Ping),
             0x01 => Ok(Self::Pong),
             0x02 => Ok(Self::Auth),
+            0x03 => Ok(Self::AuthUser),
             0x10 => Ok(Self::Query),
             0x11 => Ok(Self::RowDescription),
             0x12 => Ok(Self::DataRow),
@@ -363,6 +371,35 @@ pub fn parse_auth(frame: &Frame) -> Result<&str, FrameError> {
     core::str::from_utf8(&frame.payload).map_err(|_| FrameError::InvalidUtf8)
 }
 
+/// Build an `AuthUser` frame: `[u16 user_len][user][password]`.
+pub fn build_auth_user(user: &str, password: &str) -> Result<Frame, FrameError> {
+    let user_len = u16::try_from(user.len()).map_err(|_| FrameError::FieldTooLarge)?;
+    let mut p = Vec::with_capacity(2 + user.len() + password.len());
+    p.extend_from_slice(&user_len.to_le_bytes());
+    p.extend_from_slice(user.as_bytes());
+    p.extend_from_slice(password.as_bytes());
+    Ok(Frame::new(Op::AuthUser, p))
+}
+
+/// Parse `(username, password)` out of an `AuthUser` frame. Both
+/// slices must be valid UTF-8; truncated payloads surface as a clear
+/// protocol error.
+pub fn parse_auth_user(frame: &Frame) -> Result<(&str, &str), FrameError> {
+    debug_assert!(matches!(frame.op, Op::AuthUser));
+    if frame.payload.len() < 2 {
+        return Err(FrameError::TruncatedPayload);
+    }
+    let user_len = u16::from_le_bytes([frame.payload[0], frame.payload[1]]) as usize;
+    if 2 + user_len > frame.payload.len() {
+        return Err(FrameError::TruncatedPayload);
+    }
+    let user_bytes = &frame.payload[2..2 + user_len];
+    let pass_bytes = &frame.payload[2 + user_len..];
+    let user = core::str::from_utf8(user_bytes).map_err(|_| FrameError::InvalidUtf8)?;
+    let password = core::str::from_utf8(pass_bytes).map_err(|_| FrameError::InvalidUtf8)?;
+    Ok((user, password))
+}
+
 pub fn build_row_description(cols: &[ColumnDesc]) -> Result<Frame, FrameError> {
     let count = u16::try_from(cols.len()).map_err(|_| FrameError::FieldTooLarge)?;
     let mut p = Vec::new();
@@ -569,6 +606,42 @@ fn read_f64(buf: &[u8], off: usize) -> Result<(f64, usize), FrameError> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn auth_user_round_trip() {
+        let f = build_auth_user("alice", "hunter2").unwrap();
+        assert_eq!(f.op, Op::AuthUser);
+        let (u, p) = parse_auth_user(&f).unwrap();
+        assert_eq!(u, "alice");
+        assert_eq!(p, "hunter2");
+    }
+
+    #[test]
+    fn auth_user_empty_username_is_allowed_and_means_password_only() {
+        let f = build_auth_user("", "secret").unwrap();
+        let (u, p) = parse_auth_user(&f).unwrap();
+        assert!(u.is_empty());
+        assert_eq!(p, "secret");
+    }
+
+    #[test]
+    fn auth_user_payload_too_short_is_caught() {
+        let bad = Frame::new(Op::AuthUser, vec![0x05]); // only 1 byte
+        assert!(matches!(
+            parse_auth_user(&bad),
+            Err(FrameError::TruncatedPayload)
+        ));
+    }
+
+    #[test]
+    fn auth_user_declared_user_len_past_end_is_caught() {
+        // user_len = 10, but only 2 bytes follow
+        let bad = Frame::new(Op::AuthUser, vec![10, 0, b'a', b'b']);
+        assert!(matches!(
+            parse_auth_user(&bad),
+            Err(FrameError::TruncatedPayload)
+        ));
+    }
 
     #[test]
     fn round_trip_ping_pong_and_error() {
