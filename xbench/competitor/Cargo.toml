@@ -55,5 +55,9 @@ path = "src/bin/memory.rs"
 name = "large_data"
 path = "src/bin/large_data.rs"
 
+[[bin]]
+name = "soak"
+path = "src/bin/soak.rs"
+
 [lints]
 workspace = true
