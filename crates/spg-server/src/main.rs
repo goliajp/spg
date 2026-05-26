@@ -20,6 +20,8 @@
 //!
 //! Pass `-` (or omit) to skip any positional after the first.
 
+mod pgwire;
+
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -59,12 +61,12 @@ struct Limits {
     max_query_rows: Option<usize>,
 }
 
-struct ServerState {
+pub(crate) struct ServerState {
     /// v4.0: `RwLock` instead of `Mutex` so read-only statements
     /// (SELECT / SHOW outside an active TX) can run in parallel
     /// across connections. The write path takes `.write()`; the
     /// read path takes `.read()` and uses `Engine::execute_readonly`.
-    engine: RwLock<Engine>,
+    pub(crate) engine: RwLock<Engine>,
     db_path: Option<PathBuf>,
     audit_log: Mutex<AuditLog>,
     audit_path: Option<PathBuf>,
@@ -251,6 +253,18 @@ fn run(
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     eprintln!("spg-server: listening on {local}{auth_msg}");
+
+    // v4.3: optional PG-wire compatibility listener. Opt-in via env
+    // so a deployment that doesn't need psql / Metabase / DBeaver
+    // doesn't pay the extra port + thread.
+    if let Ok(pg_addr) = env::var("SPG_PG_ADDR")
+        && !pg_addr.is_empty()
+    {
+        match pgwire::spawn_listener(&pg_addr, Arc::clone(&state)) {
+            Ok(pg_local) => eprintln!("spg-server: pg-wire listening on {pg_local}"),
+            Err(e) => eprintln!("spg-server: pg-wire failed to start on {pg_addr}: {e}"),
+        }
+    }
 
     for stream in listener.incoming() {
         let mut stream = stream?;

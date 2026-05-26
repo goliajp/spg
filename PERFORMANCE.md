@@ -611,6 +611,49 @@ linear; logged as v4.x candidate.
 Reproduce: `cargo run --release -p spg-bench-competitor --bin
 concurrent -- --threads N --seconds S`.
 
+## PostgreSQL-wire compatibility (v4.3)
+
+Opt-in compatibility shim so `psql` / DBeaver / Metabase / any
+PG driver can connect to the same Engine. Set `SPG_PG_ADDR=host:port`
+and the server boots a second TCP listener that talks the simple
+PostgreSQL v3 wire protocol.
+
+What works:
+
+- StartupMessage → AuthenticationCleartextPassword →
+  PasswordMessage → AuthenticationOk + ParameterStatus +
+  BackendKeyData + ReadyForQuery.
+- Query (`Q`) → engine.execute_readonly / execute with the same
+  RBAC role enforcement the native wire applies.
+- RowDescription + DataRow + CommandComplete + ReadyForQuery
+  responses.
+- SSLRequest gets a clean `N` refusal (so `sslmode=allow` clients
+  fall back to plaintext) — matches our [[out-of-scope]] decision
+  on TLS.
+- Canned responses for the common psql startup probes
+  (`SELECT version()`, `SHOW transaction_isolation`,
+  `SHOW search_path`, `SHOW standard_conforming_strings`) so
+  the client doesn't bail before reaching the user's query.
+- Type OID mapping for bool / smallint / int4 / int8 / float8 /
+  text / numeric / date / timestamp / interval. Unknown SPG
+  types render as `text` (still readable).
+
+What doesn't (deferred):
+
+- Extended-query protocol (Parse / Bind / Describe / Execute /
+  Sync) — sends `0A000 feature_not_supported`. Most clients fall
+  back to the simple query protocol.
+- COPY, NOTIFY, LISTEN, replication, large objects, cancellation.
+- True PG catalog tables (`pg_class`, `pg_attribute`, etc.) —
+  needed for `psql \d`. The canned-response table covers the
+  startup probes only.
+
+E2E coverage in `tests/e2e_pgwire.rs`:
+- `psql_style_handshake_then_select` (full happy-path round-trip
+  including auth + CREATE TABLE + INSERT + SELECT)
+- `wrong_password_gets_error`
+- `select_version_canned_response_works`
+
 ## Resource limits (v4.2)
 
 Two server-side caps, both opt-in via env (unset = unlimited):
