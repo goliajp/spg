@@ -1037,6 +1037,16 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v4.11: CTEs materialise into a temporary enriched catalog
+        // *before* anything else — the body SELECT can then refer
+        // to CTE names via the regular FROM-clause resolution.
+        // Uncorrelated only: each CTE body runs once against the
+        // current catalog, not against later CTEs' results (left-
+        // to-right materialisation would relax this, but we keep
+        // it simple for v4.11 MVP).
+        if !stmt.ctes.is_empty() {
+            return self.exec_with_ctes(stmt, cancel);
+        }
         // v4.10: subqueries (uncorrelated) are resolved here, before
         // the executor sees the row loop. We clone the statement so
         // we can mutate without disturbing the caller's AST — most
@@ -1934,6 +1944,60 @@ fn pow10_i128(p: u8) -> i128 {
 /// regular row-loop executor which no longer sees Subquery nodes
 /// in its tree.
 impl Engine {
+    /// v4.11: materialise each CTE into a temp table inside a
+    /// cloned catalog, then run the body SELECT against a fresh
+    /// engine instance that owns the enriched catalog. The clone
+    /// is moderately expensive — only paid by CTE-bearing queries.
+    /// Subqueries inside CTE bodies / the main body resolve as
+    /// usual; `clock_fn` is propagated so `NOW()` lines up.
+    fn exec_with_ctes(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
+        let mut catalog = self.active_catalog().clone();
+        for cte in &stmt.ctes {
+            // Each CTE body runs against the *original* (un-enriched)
+            // catalog. This is the simple interpretation: CTEs don't
+            // see siblings. Same semantics as PG `WITH` without
+            // explicit ordering hints — siblings are out of scope.
+            let body_result = self.exec_select_cancel(&cte.body, cancel)?;
+            let QueryResult::Rows { columns, rows } = body_result else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CTE {:?} body did not return rows",
+                    cte.name
+                )));
+            };
+            if catalog.get(&cte.name).is_some() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CTE name {:?} shadows an existing table; rename the CTE",
+                    cte.name
+                )));
+            }
+            let schema = TableSchema::new(cte.name.clone(), columns);
+            catalog.create_table(schema).map_err(EngineError::Storage)?;
+            let table = catalog
+                .get_mut(&cte.name)
+                .expect("just-created CTE table must exist");
+            for row in rows {
+                table.insert(row).map_err(EngineError::Storage)?;
+            }
+        }
+        // Strip CTEs from the body before running on the temp engine
+        // so we don't recurse forever.
+        let mut body = stmt.clone();
+        body.ctes = Vec::new();
+        let mut temp = Engine::restore(catalog);
+        if let Some(c) = self.clock {
+            temp = temp.with_clock(c);
+        }
+        if let Some(f) = self.salt_fn {
+            temp = temp.with_salt_fn(f);
+        }
+        temp.exec_select_cancel(&body, cancel)
+    }
+
     fn resolve_select_subqueries(
         &self,
         stmt: &mut SelectStatement,
