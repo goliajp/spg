@@ -362,13 +362,27 @@ fn eq_ci(input: &[u8], lower: &[u8]) -> bool {
 #[inline]
 fn kw_len2(b: &[u8]) -> Option<Token> {
     // 7 keywords: as, by, in, is, on, or, to
-    if eq_ci(b, b"as") { return Some(Token::As); }
-    if eq_ci(b, b"by") { return Some(Token::By); }
-    if eq_ci(b, b"in") { return Some(Token::In); }
-    if eq_ci(b, b"is") { return Some(Token::Is); }
-    if eq_ci(b, b"on") { return Some(Token::On); }
-    if eq_ci(b, b"or") { return Some(Token::Or); }
-    if eq_ci(b, b"to") { return Some(Token::To); }
+    if eq_ci(b, b"as") {
+        return Some(Token::As);
+    }
+    if eq_ci(b, b"by") {
+        return Some(Token::By);
+    }
+    if eq_ci(b, b"in") {
+        return Some(Token::In);
+    }
+    if eq_ci(b, b"is") {
+        return Some(Token::Is);
+    }
+    if eq_ci(b, b"on") {
+        return Some(Token::On);
+    }
+    if eq_ci(b, b"or") {
+        return Some(Token::Or);
+    }
+    if eq_ci(b, b"to") {
+        return Some(Token::To);
+    }
     None
 }
 
