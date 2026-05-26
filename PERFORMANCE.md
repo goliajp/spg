@@ -71,10 +71,10 @@ Run: `cargo bench -p spg-sql --bench parse`.
 
 | Path                                | Median   | Notes |
 |-------------------------------------|---------:|-------|
-| `catalog_serialize_100rows`         | **1.13 µs** | 100-row, 3-col (Int / Text / Float) table → bytes. |
-| `catalog_deserialize_100rows`       | **4.19 µs** | Same bytes → Catalog. Deserialize is ~4× slower than serialize. |
-| `hnsw_build_200rows_dim8`           | **2.41 ms** | Bulk index build over 200 vectors, M=16. |
-| `hnsw_search_top10_dim8_n200`       | **4.75 µs** | Top-10 L2 search against the 200-node index. |
+| `catalog_serialize_100rows`         | **1.15 µs** | 100-row, 3-col (Int / Text / Float) table → bytes. |
+| `catalog_deserialize_100rows`       | **4.15 µs** | Same bytes → Catalog. Deserialize is ~4× slower than serialize. |
+| `hnsw_build_200rows_dim8`           | **154 µs** | v3.0.1: was 2.41 ms; **−94% / 15.7×** ✅. Heuristic neighbour selection (HNSW paper §4) + `BinaryHeap` frontier + bitmap visited set. |
+| `hnsw_search_top10_dim8_n200`       | **397 ns** | v3.0.1: was 4.75 µs; **−92% / 12×** ✅. Bonus from the same data-structure swap (search shares `layer_beam_search`). |
 
 Run: `cargo bench -p spg-storage --bench catalog`.
 

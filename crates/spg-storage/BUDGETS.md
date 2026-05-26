@@ -7,7 +7,7 @@ only.
 | Gate                                              | Budget   | Bench (criterion median) | Headroom |
 |---------------------------------------------------|---------:|-------------------------:|---------:|
 | `catalog_roundtrip_100rows` (≤)                   | 5 ms     | **5.3 µs** ser+deser (v3.0.0) | ~940×    |
-| `hnsw_search_top10_dim8_n200` (≤)                 | 1 ms     | **4.75 µs** (v3.0.0)     | ~210×    |
+| `hnsw_search_top10_dim8_n200` (≤)                 | 1 ms     | **397 ns** (v3.0.1)      | ~2500×   |
 
 Run: `cargo test -p spg-storage --test perf_gate`.
 
