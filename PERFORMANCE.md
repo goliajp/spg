@@ -724,6 +724,32 @@ No measurable cost on the v4.0 concurrent SELECT scaling — the
 read path doesn't touch the user table after auth, and the
 envelope/no-envelope branch fires only at snapshot time.
 
+## pgbouncer compatibility (v4.15)
+
+Audited the PG-wire shim against pgbouncer's three pool modes:
+
+| pool mode    | works | notes |
+|--------------|-------|-------|
+| session      | ✅    | One server connection per client connection. SCRAM, prepared statements, TX state — all behave as if directly connected. |
+| transaction  | ✅    | Per-TX pooling. v4.15 adds `DISCARD ALL` / `DISCARD TEMP` / `DISCARD SEQUENCES` / `DISCARD PLANS` / `RESET ALL` / `RESET <name>` as no-ops (SPG holds no per-connection settings worth wiping), plus `SET TRANSACTION ISOLATION LEVEL ...` as a no-op (SPG only has one isolation). Without these the proxy would error on every connection return. |
+| statement    | ⚠️    | Should work since each statement is a fresh TX, but extended-query prepared statements get a fresh server connection per statement — clients that rely on named prepared statement reuse will fail. Use transaction mode instead. |
+
+What pgbouncer-side config to set:
+- `pool_mode = transaction` (recommended)
+- `server_reset_query = DISCARD ALL` (now handled)
+- `ignore_startup_parameters = extra_float_digits,application_name` if your client sends these (SPG doesn't reject — they're stored in `params` and dropped — but pgbouncer prefers an explicit allow-list)
+- `auth_type = scram-sha-256` (matches v4.8 default)
+
+What's NOT verified end-to-end:
+- Real pgbouncer container test (queued for v5.x once Docker harness lands)
+- Listen address rewriting / TLS termination — pgbouncer doing TLS in front of SPG is fine since SPG never sees the TLS handshake
+
+E2E (tests/e2e_pgbouncer_compat.rs, 4 cases):
+- discard_all_returns_clean_cc
+- discard_temp_sequences_plans_each_work (3 sub-variants)
+- reset_all_returns_cc
+- set_transaction_isolation_returns_cc
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
