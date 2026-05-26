@@ -20,6 +20,7 @@
 //!
 //! Pass `-` (or omit) to skip any positional after the first.
 
+mod backup;
 mod observability;
 mod pgwire;
 mod replication;
@@ -228,7 +229,21 @@ fn run(
     if let Some(p) = &wal_path
         && p.exists()
     {
-        let bytes = fs::read(p)?;
+        let mut bytes = fs::read(p)?;
+        // v4.25 PITR: SPG_REPLAY_UPTO caps replay at a specific
+        // byte offset of the WAL. Anything past that offset is
+        // ignored on this boot — operator's restore mechanism.
+        if let Some(upto) = parse_env_u64("SPG_REPLAY_UPTO") {
+            let upto_usize = usize::try_from(upto).unwrap_or(usize::MAX);
+            if bytes.len() > upto_usize {
+                eprintln!(
+                    "spg-server: PITR — truncating WAL replay at offset {upto} \
+                     (of {} total bytes)",
+                    bytes.len()
+                );
+                bytes.truncate(upto_usize);
+            }
+        }
         let applied = replay_wal_bytes(&bytes, &mut engine)?;
         eprintln!(
             "spg-server: replayed {} WAL entries from {}",
@@ -685,6 +700,21 @@ fn dispatch(
                     ),
                 );
             }
+            // v4.25: intercept BACKUP TO '<path>' [INCREMENTAL SINCE <n>]
+            // before passing to the engine. Admin-only — backup writes
+            // arbitrary file paths so it lives behind the same gate as
+            // user management.
+            if let Some(backup_intent) = parse_backup_intent(&sql) {
+                if !acting.can_manage_users() {
+                    return write_frame(
+                        stream,
+                        &build_error_response(
+                            "permission denied: BACKUP requires admin role",
+                        ),
+                    );
+                }
+                return run_backup_command(stream, state, &backup_intent);
+            }
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let watchdog = spawn_query_watchdog(state, &cancel_flag);
             let (result, snapshot) = {
@@ -856,6 +886,65 @@ fn render_stats(state: &ServerState) -> std::io::Result<String> {
     )
     .unwrap();
     Ok(out)
+}
+
+/// v4.25: parse `BACKUP TO '<path>'` and
+/// `BACKUP TO '<path>' INCREMENTAL SINCE <n>` from the raw SQL
+/// text. Returns None if the statement isn't a backup. Preserves
+/// the path's original case (the lowercased form is only used to
+/// recognise keywords).
+fn parse_backup_intent(sql: &str) -> Option<BackupIntent> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let after_prefix = lower
+        .strip_prefix("backup ")?
+        .trim_start()
+        .strip_prefix("to ")?
+        .trim_start();
+    let prefix_consumed = lower.len() - after_prefix.len();
+    if !trimmed[prefix_consumed..].starts_with('\'') {
+        return None;
+    }
+    let after_open = &trimmed[prefix_consumed + 1..];
+    let close = after_open.find('\'')?;
+    let path = after_open[..close].to_string();
+    let tail = after_open[close + 1..].trim().to_ascii_lowercase();
+    if tail.is_empty() {
+        return Some(BackupIntent::Full { path });
+    }
+    let since_str = tail
+        .strip_prefix("incremental ")?
+        .trim_start()
+        .strip_prefix("since ")?
+        .trim_start();
+    let since: u64 = since_str.parse().ok()?;
+    Some(BackupIntent::Incremental { path, since })
+}
+
+#[derive(Debug)]
+enum BackupIntent {
+    Full { path: String },
+    Incremental { path: String, since: u64 },
+}
+
+fn run_backup_command(
+    stream: &mut TcpStream,
+    state: &ServerState,
+    intent: &BackupIntent,
+) -> std::io::Result<()> {
+    let result = match intent {
+        BackupIntent::Full { path } => backup::take_full_backup(state, Path::new(path)),
+        BackupIntent::Incremental { path, since } => {
+            backup::take_incremental_backup(state, Path::new(path), *since)
+        }
+    };
+    match result {
+        // Re-use the existing `affected rows` slot to ship the
+        // captured WAL position back to the caller — it's the
+        // number an incremental backup will pass as SINCE.
+        Ok(wal_pos) => write_frame(stream, &build_command_complete(wal_pos)),
+        Err(e) => write_frame(stream, &build_error_response(&format!("backup failed: {e}"))),
+    }
 }
 
 fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
