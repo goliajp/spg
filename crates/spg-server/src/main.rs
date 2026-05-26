@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,7 +46,11 @@ const READ_CHUNK: usize = 4096;
 const BATCH_ROWS_PER_FRAME: usize = 256;
 
 struct ServerState {
-    engine: Mutex<Engine>,
+    /// v4.0: `RwLock` instead of `Mutex` so read-only statements
+    /// (SELECT / SHOW outside an active TX) can run in parallel
+    /// across connections. The write path takes `.write()`; the
+    /// read path takes `.read()` and uses `Engine::execute_readonly`.
+    engine: RwLock<Engine>,
     db_path: Option<PathBuf>,
     audit_log: Mutex<AuditLog>,
     audit_path: Option<PathBuf>,
@@ -187,7 +191,7 @@ fn run(
         ""
     };
     let state = Arc::new(ServerState {
-        engine: Mutex::new(engine),
+        engine: RwLock::new(engine),
         db_path,
         audit_log: Mutex::new(audit_log),
         audit_path,
@@ -214,16 +218,16 @@ fn run(
 }
 
 fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
-    // v3.3.1: disable Nagle. Every request/response round trip is one
-    // logical message; Nagle's 40ms coalescing delay was the dominant
-    // wire-mode latency cost.
     let _ = stream.set_nodelay(true);
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
     let mut chunk = [0u8; READ_CHUNK];
-    // When the server is open, every connection starts authenticated.
-    // When the server has a password configured, the connection must
-    // send a successful `Auth` frame before any non-Ping op is honoured.
     let mut authenticated = state.password.is_none();
+    // v4.0: per-connection transaction state. BEGIN sets this to
+    // true; COMMIT / ROLLBACK clear it. While true the dispatch path
+    // takes the engine *write* lock for every statement on this
+    // connection so the TX state stays consistent across reads and
+    // writes inside the transaction.
+    let mut in_tx = false;
 
     loop {
         let n = stream.read(&mut chunk)?;
@@ -236,7 +240,7 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
             match decode(&buf) {
                 Ok((frame, consumed)) => {
                     buf.drain(..consumed);
-                    dispatch(&mut stream, &frame, state, &mut authenticated)?;
+                    dispatch(&mut stream, &frame, state, &mut authenticated, &mut in_tx)?;
                 }
                 Err(FrameError::ShortHeader | FrameError::ShortPayload) => break,
                 Err(e) => {
@@ -248,12 +252,42 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     }
 }
 
+/// True for statements that mutate no engine state — exactly the set
+/// `Engine::execute_readonly` accepts. Cheap byte peek (skip leading
+/// whitespace, ASCII-case-fold the first alphabetic run); over-broad
+/// hits (e.g. a column literally named "select") just take the read
+/// path and engine returns `WriteRequired` if wrong — caller falls
+/// back. False negatives are fine (cost: one extra write lock).
+fn sql_is_read_only(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len()
+        && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+    {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let kw = &bytes[start..i];
+    matches!(kw.len(), 4 | 6) && {
+        let mut lower = [0u8; 6];
+        for (k, b) in kw.iter().enumerate() {
+            lower[k] = b.to_ascii_lowercase();
+        }
+        let s = &lower[..kw.len()];
+        s == b"select" || s == b"show"
+    }
+}
+
 #[allow(clippy::too_many_lines)] // big dispatch table, splitting would scatter the per-op gates
 fn dispatch(
     stream: &mut TcpStream,
     frame: &Frame,
     state: &ServerState,
     authenticated: &mut bool,
+    in_tx: &mut bool,
 ) -> std::io::Result<()> {
     // Gate every non-Ping / non-Auth op until the connection has
     // authenticated. Ping stays accessible so health probes still work
@@ -297,12 +331,35 @@ fn dispatch(
                 Ok(s) => s.to_string(),
                 Err(e) => return write_frame(stream, &build_error_response(&e.to_string())),
             };
+            // v4.0 fast path: SELECT / SHOW outside an active TX take
+            // the engine *read* lock and run in parallel with other
+            // readers. WriteRequired drop-through is rare (only if
+            // `sql_is_read_only` peek mis-classifies — over-broad
+            // matches like a column named "select" don't happen in
+            // practice).
+            if !*in_tx && sql_is_read_only(&sql) {
+                let engine = state
+                    .engine
+                    .read()
+                    .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+                let result = engine.execute_readonly(&sql);
+                drop(engine);
+                if !matches!(&result, Err(EngineError::WriteRequired)) {
+                    return emit_result(stream, result);
+                }
+            }
             let (result, snapshot) = {
                 let mut engine = state
                     .engine
-                    .lock()
-                    .map_err(|_| std::io::Error::other("engine mutex poisoned"))?;
+                    .write()
+                    .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
                 let result = engine.execute(&sql);
+                // v4.0: sync per-conn TX state from the engine.
+                // Engine.in_transaction() is the authoritative bit
+                // (it knows whether BEGIN succeeded, whether a nested
+                // SAVEPOINT was opened, whether COMMIT/ROLLBACK left
+                // us outside a TX, etc.).
+                *in_tx = engine.in_transaction();
                 // Snapshot only when the committed catalog actually changed —
                 // i.e. for COMMIT and for writes outside a TX. Intra-TX writes
                 // and BEGIN/ROLLBACK never trigger persistence. Additionally,
@@ -404,8 +461,8 @@ fn render_stats(state: &ServerState) -> std::io::Result<String> {
     use std::fmt::Write as _;
     let engine = state
         .engine
-        .lock()
-        .map_err(|_| std::io::Error::other("engine mutex poisoned"))?;
+        .read()
+        .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
     let audit = state
         .audit_log
         .lock()

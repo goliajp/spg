@@ -114,6 +114,7 @@ fn count_select_rows(stream: &mut TcpStream, sql: &str) -> usize {
         let f = read_frame(stream);
         match f.op {
             Op::DataRow => count += 1,
+            Op::DataRowBatch => count += spg_wire::parse_data_row_batch(&f).unwrap().len(),
             Op::CommandComplete => return count,
             other => panic!("unexpected: {other:?}"),
         }

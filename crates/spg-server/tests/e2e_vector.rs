@@ -93,6 +93,7 @@ fn run_select(s: &mut TcpStream, sql: &str) -> Vec<Vec<WireValue>> {
         let f = read_frame(s);
         match f.op {
             Op::DataRow => rows.push(parse_data_row(&f).unwrap()),
+            Op::DataRowBatch => rows.extend(spg_wire::parse_data_row_batch(&f).unwrap()),
             Op::CommandComplete => return rows,
             Op::ErrorResponse => {
                 let msg = spg_wire::parse_error_response(&f).unwrap();

@@ -58,6 +58,11 @@ pub enum EngineError {
     TransactionAlreadyOpen,
     /// `COMMIT` / `ROLLBACK` with no active transaction.
     NoActiveTransaction,
+    /// v4.0 sentinel: `execute_readonly` got a statement that
+    /// mutates engine state (INSERT / CREATE / BEGIN / COMMIT / …).
+    /// The caller should retake the write lock and dispatch through
+    /// `execute(&mut self)` instead.
+    WriteRequired,
 }
 
 impl fmt::Display for EngineError {
@@ -69,6 +74,9 @@ impl fmt::Display for EngineError {
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::TransactionAlreadyOpen => f.write_str("a transaction is already open"),
             Self::NoActiveTransaction => f.write_str("no active transaction"),
+            Self::WriteRequired => {
+                f.write_str("statement requires a write lock (use execute, not execute_readonly)")
+            }
         }
     }
 }
@@ -174,6 +182,32 @@ impl Engine {
             tx
         } else {
             &mut self.catalog
+        }
+    }
+
+    /// Read-only execute path. Succeeds for `SELECT` / `SHOW TABLES`
+    /// / `SHOW COLUMNS`; returns `EngineError::WriteRequired` for
+    /// every other statement, so the caller can fall through to the
+    /// `&mut self` `execute` path under a write lock. Engine state is
+    /// not mutated even on the success path (`rewrite_clock_calls`
+    /// and `resolve_order_by_position` both mutate the locally-owned
+    /// AST, not `self`).
+    ///
+    /// **v4.0 concurrency**: this is the entry point the server takes
+    /// under an `RwLock::read()` so multiple `SELECT` clients run in
+    /// parallel without serialising on a single mutex.
+    pub fn execute_readonly(&self, sql: &str) -> Result<QueryResult, EngineError> {
+        let mut stmt = parser::parse_statement(sql)?;
+        let now_micros = self.clock.map(|f| f());
+        rewrite_clock_calls(&mut stmt, now_micros);
+        if let Statement::Select(s) = &mut stmt {
+            resolve_order_by_position(s);
+        }
+        match stmt {
+            Statement::Select(s) => self.exec_select(&s),
+            Statement::ShowTables => Ok(self.exec_show_tables()),
+            Statement::ShowColumns(table) => self.exec_show_columns(&table),
+            _ => Err(EngineError::WriteRequired),
         }
     }
 
