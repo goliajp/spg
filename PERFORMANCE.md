@@ -144,7 +144,8 @@ wall-time row at the top.
 
 | Path                                | Median        | Notes |
 |-------------------------------------|--------------:|-------|
-| `backup_roundtrip_100rows`          | **~12 ms cold / 47 µs warm** | Full read+deserialize+serialize+write loop, including disk syscalls. **Wildly unstable** — `5 ms ≤ cold ≤ 22 ms`, OS page-cache-warm runs drop to ~47 µs. The number is dominated by the kernel's page-cache state at measurement time, not by `spg-cli` code. Don't quote either figure as a perf claim; treat as "user-visible latency, depends on disk and cache". A reliable in-memory variant of this bench (read from `Vec<u8>` instead of `fs::read`) would land near the underlying `catalog_deserialize` + `serialize` cost (~5 µs) — added in a future round. |
+| `backup_inmemory_100rows`           | **4.63 µs**  | v3.1.4: pure CPU cost (deserialize + re-serialize against in-memory `Vec<u8>`). Matches `catalog_deserialize_100rows + catalog_serialize_100rows ≈ 3.7 + 1.0 = 4.7 µs` as expected. **Quote this for the backup-path perf claim.** |
+| `backup_roundtrip_100rows`          | **7–11 ms** (disk-bound) | Same shape but with real `fs::read` + `fs::write`. Dominated by fsync + page-cache state, swings 1500–2400× over the in-memory figure above. Kept as an informational figure for "user-visible latency depends on disk"; **don't quote this number as a perf claim** — it reflects the kernel + storage layer, not `spg-cli` code. |
 
 Run: `cargo bench -p spg-cli --bench backup`.
 
