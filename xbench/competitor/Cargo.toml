@@ -51,5 +51,9 @@ path = "src/bin/vector_knn.rs"
 name = "memory"
 path = "src/bin/memory.rs"
 
+[[bin]]
+name = "large_data"
+path = "src/bin/large_data.rs"
+
 [lints]
 workspace = true
