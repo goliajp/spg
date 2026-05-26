@@ -196,6 +196,11 @@ pub struct InsertStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
+    /// v4.11: `WITH name AS (SELECT ...) [, ...]` common-table
+    /// expressions, materialised once at query start before the
+    /// body SELECT runs. Empty for a regular SELECT. Non-recursive
+    /// only — no `WITH RECURSIVE` for v4.x.
+    pub ctes: Vec<Cte>,
     pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Option<FromClause>,
@@ -216,6 +221,12 @@ pub struct SelectStatement {
     /// `OFFSET <n>` — drop the first `n` rows after ORDER BY but
     /// before LIMIT (so `LIMIT 10 OFFSET 5` keeps rows 6..=15).
     pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub body: SelectStatement,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -985,6 +996,7 @@ mod tests {
             limit: None,
             offset: None,
             distinct: false,
+            ctes: vec![],
         };
         assert_eq!(s.to_string(), "SELECT * FROM users");
     }

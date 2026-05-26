@@ -113,6 +113,13 @@ impl Parser {
     fn parse_one_statement(&mut self) -> Result<Statement, ParseError> {
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
+            // v4.11: `WITH name AS (SELECT ...) [, ...] SELECT ...`.
+            // WITH isn't a reserved token in our lexer — comes through
+            // as `Token::Ident("with")` (case-insensitive).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with") => {
+                self.advance();
+                self.parse_with_cte_then_select()
+            }
             Token::Create => self.parse_create_stmt(),
             Token::Insert => self.parse_insert_stmt(),
             Token::Begin => {
@@ -460,6 +467,7 @@ impl Parser {
             None
         };
         Ok(SelectStatement {
+            ctes: Vec::new(),
             distinct,
             items,
             from,
@@ -1239,6 +1247,65 @@ impl Parser {
 
     /// `x IN (a, b, c)`  →  chained OR of equalities. Empty list collapses
     /// to FALSE (TRUE under NOT IN), matching standard SQL semantics.
+    /// v4.11: parse `WITH name AS (SELECT ...) [, ...] SELECT ...`.
+    /// Caller already consumed the leading `WITH` ident.
+    fn parse_with_cte_then_select(&mut self) -> Result<Statement, ParseError> {
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.expect_ident_like()?;
+            // AS is a reserved Token::As (used by SELECT-item / FROM
+            // aliasing) — handle it specially rather than as a bare
+            // ident.
+            if !matches!(self.peek(), Token::As) {
+                return Err(self.err(format!(
+                    "expected AS after CTE name {name:?}, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(format!(
+                    "expected '(' after AS in WITH clause, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if !matches!(self.peek(), Token::Select) {
+                return Err(self.err(format!("WITH body must be a SELECT, got {:?}", self.peek())));
+            }
+            let inner = self.parse_select_stmt()?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(format!(
+                    "expected ')' after CTE body, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let Statement::Select(body) = inner else {
+                unreachable!("parse_select_stmt returns Select")
+            };
+            ctes.push(crate::ast::Cte { name, body });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        // The body SELECT follows. Must start with SELECT.
+        if !matches!(self.peek(), Token::Select) {
+            return Err(self.err(format!(
+                "expected SELECT after WITH clause, got {:?}",
+                self.peek()
+            )));
+        }
+        let body_stmt = self.parse_select_stmt()?;
+        let Statement::Select(mut body) = body_stmt else {
+            unreachable!()
+        };
+        body.ctes = ctes;
+        Ok(Statement::Select(body))
+    }
+
     /// v4.10: parse `EXISTS (SELECT ...)`. Caller (`parse_atom`)
     /// already consumed the leading `EXISTS` ident via
     /// `self.advance()`.
