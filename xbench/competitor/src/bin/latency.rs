@@ -226,14 +226,18 @@ fn spawn_spg_server() -> Result<Child, Box<dyn std::error::Error>> {
 
 fn bench_spg_server() -> Result<(Stats, Stats), Box<dyn std::error::Error>> {
     use spg_wire::{Op, build_query, encode, parse_command_complete, parse_error_response};
-    fn round_trip(stream: &mut TcpStream, sql: &str) -> Result<(), String> {
+    fn round_trip<W: Write, R: Read>(
+        writer: &mut W,
+        reader: &mut BufReader<R>,
+        sql: &str,
+    ) -> Result<(), String> {
         let mut out = Vec::with_capacity(64);
         encode(&build_query(sql), &mut out).map_err(|e| format!("encode: {e}"))?;
-        stream.write_all(&out).map_err(|e| format!("write: {e}"))?;
+        writer.write_all(&out).map_err(|e| format!("write: {e}"))?;
         // Drain until CommandComplete or ErrorResponse.
         loop {
             let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
-            stream
+            reader
                 .read_exact(&mut header)
                 .map_err(|e| format!("read header: {e}"))?;
             let payload_len =
@@ -241,7 +245,7 @@ fn bench_spg_server() -> Result<(Stats, Stats), Box<dyn std::error::Error>> {
             let op = Op::from_byte(header[4]).map_err(|e| format!("op: {e}"))?;
             let mut payload = vec![0u8; payload_len];
             if payload_len > 0 {
-                stream
+                reader
                     .read_exact(&mut payload)
                     .map_err(|e| format!("read payload: {e}"))?;
             }
@@ -261,27 +265,38 @@ fn bench_spg_server() -> Result<(Stats, Stats), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut stream = TcpStream::connect(SPG_SERVER_ADDR)?;
+    let stream = TcpStream::connect(SPG_SERVER_ADDR)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_nodelay(true)?; // We're measuring single round trips.
+    // v3.3.1: separate write half + buffered read half so the per-
+    // round-trip syscall count drops (writer = 1 write_all per req,
+    // reader = 1 BufReader fill per response frame burst).
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::with_capacity(64 * 1024, stream);
     round_trip(
-        &mut stream,
+        &mut writer,
+        &mut reader,
         "CREATE TABLE bench_users (id INT NOT NULL, name TEXT NOT NULL)",
     )?;
     round_trip(
-        &mut stream,
+        &mut writer,
+        &mut reader,
         "CREATE INDEX bench_users_id_idx ON bench_users (id)",
     )?;
     for i in 1..=SEED_ROWS {
         let sql = format!("INSERT INTO bench_users VALUES ({i}, 'user-{i}')");
-        round_trip(&mut stream, &sql)?;
+        round_trip(&mut writer, &mut reader, &sql)?;
     }
     for i in (SEED_ROWS + 1)..(SEED_ROWS + 1 + WARMUP as i32) {
         let sql = format!("INSERT INTO bench_users VALUES ({i}, 'user-{i}')");
-        round_trip(&mut stream, &sql)?;
+        round_trip(&mut writer, &mut reader, &sql)?;
     }
     for _ in 0..WARMUP {
-        round_trip(&mut stream, "SELECT id, name FROM bench_users WHERE id = 1")?;
+        round_trip(
+            &mut writer,
+            &mut reader,
+            "SELECT id, name FROM bench_users WHERE id = 1",
+        )?;
     }
 
     let next_id = SEED_ROWS + 1 + WARMUP as i32;
@@ -290,7 +305,7 @@ fn bench_spg_server() -> Result<(Stats, Stats), Box<dyn std::error::Error>> {
         let id = next_id + k as i32;
         let sql = format!("INSERT INTO bench_users VALUES ({id}, 'u-{id}')");
         let t0 = Instant::now();
-        round_trip(&mut stream, &sql)?;
+        round_trip(&mut writer, &mut reader, &sql)?;
         insert_samples.push(t0.elapsed().as_nanos() as u64);
     }
     let mut select_samples: Vec<u64> = Vec::with_capacity(ITERS);
@@ -298,7 +313,7 @@ fn bench_spg_server() -> Result<(Stats, Stats), Box<dyn std::error::Error>> {
         let id = ((k as i32) % SEED_ROWS) + 1;
         let sql = format!("SELECT id, name FROM bench_users WHERE id = {id}");
         let t0 = Instant::now();
-        round_trip(&mut stream, &sql)?;
+        round_trip(&mut writer, &mut reader, &sql)?;
         select_samples.push(t0.elapsed().as_nanos() as u64);
     }
     Ok((stats_from(insert_samples), stats_from(select_samples)))

@@ -214,6 +214,10 @@ fn run(
 }
 
 fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
+    // v3.3.1: disable Nagle. Every request/response round trip is one
+    // logical message; Nagle's 40ms coalescing delay was the dominant
+    // wire-mode latency cost.
+    let _ = stream.set_nodelay(true);
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
     let mut chunk = [0u8; READ_CHUNK];
     // When the server is open, every connection starts authenticated.
@@ -546,34 +550,38 @@ fn emit_result(
             write_frame(stream, &build_command_complete(affected as u64))
         }
         Ok(QueryResult::Rows { columns, rows }) => {
+            // v3.3.1: encode the entire response (RowDescription +
+            // DataRowBatch chunks + CommandComplete) into one Vec<u8>
+            // then a single write_all. Saves 2 syscalls per SELECT vs
+            // the old 3-write_frame path.
             let descs = columns
                 .iter()
                 .map(column_schema_to_desc)
                 .collect::<Vec<_>>();
             let rd =
                 build_row_description(&descs).map_err(|e| std::io::Error::other(e.to_string()))?;
-            write_frame(stream, &rd)?;
-            // v3.3.0: pack rows into DataRowBatch frames. Chunked at
-            // 256 rows so a huge SELECT doesn't build one multi-MB
-            // frame in memory before any byte hits the wire. Single-
-            // row results stay on the legacy DataRow op for back-
-            // compat with v3.2 / v3.1 clients.
+            let mut out: Vec<u8> = Vec::with_capacity(
+                spg_wire::FRAME_HEADER_LEN + rd.payload.len() + rows.len() * 64 + 16,
+            );
+            encode(&rd, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
             if rows.len() <= 1 {
                 for row in rows {
                     let wire = row_to_wire(&row);
                     let frame =
                         build_data_row(&wire).map_err(|e| std::io::Error::other(e.to_string()))?;
-                    write_frame(stream, &frame)?;
+                    encode(&frame, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
             } else {
                 let wire_rows: Vec<Vec<WireValue>> = rows.iter().map(row_to_wire).collect();
                 for chunk in wire_rows.chunks(BATCH_ROWS_PER_FRAME) {
                     let frame = build_data_row_batch(chunk)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    write_frame(stream, &frame)?;
+                    encode(&frame, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
             }
-            write_frame(stream, &build_command_complete(0))
+            let cc = build_command_complete(0);
+            encode(&cc, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
+            stream.write_all(&out)
         }
         Err(e) => write_frame(stream, &build_error_response(&e.to_string())),
     }

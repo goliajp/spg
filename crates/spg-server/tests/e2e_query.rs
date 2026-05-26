@@ -115,6 +115,7 @@ fn create_insert_select_full_cycle() {
         let f = read_frame(&mut stream);
         match f.op {
             Op::DataRow => rows.push(parse_data_row(&f).unwrap()),
+            Op::DataRowBatch => rows.extend(spg_wire::parse_data_row_batch(&f).unwrap()),
             Op::CommandComplete => break,
             other => panic!("unexpected: {other:?}"),
         }
@@ -150,6 +151,7 @@ fn select_with_where_via_wire() {
         let f = read_frame(&mut stream);
         match f.op {
             Op::DataRow => count += 1,
+            Op::DataRowBatch => count += spg_wire::parse_data_row_batch(&f).unwrap().len(),
             Op::CommandComplete => break,
             other => panic!("unexpected: {other:?}"),
         }
