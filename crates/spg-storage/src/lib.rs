@@ -1349,11 +1349,14 @@ impl TableSchema {
 // AUTO_INCREMENT (per-column flag) + NSW index `kind` byte landed;
 // to version 5 when DATE / TIMESTAMP were added; to version 6 when
 // NSW graph topology started travelling on disk (v2.7); to version 7
-// when the NSW topology became multi-layer HNSW (v2.13).
+// when the NSW topology became multi-layer HNSW (v2.13); to version 8
+// when row encoding switched to schema-driven dense layout (v3.0.2 —
+// per-row NULL bitmap + per-column fixed-width body, no per-cell type
+// tag).
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 7;
+const FILE_VERSION: u8 = 8;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -1389,9 +1392,27 @@ impl Catalog {
                 &mut out,
                 u32::try_from(t.rows.len()).expect("≤ 4G rows/table"),
             );
+            // v3.0.2 dense row encoding (FILE_VERSION 8): per-row NULL
+            // bitmap inlined into `out` (no per-row alloc), then a
+            // tightly packed body for each non-NULL cell, decoded by
+            // column type. Saves one tag byte per cell vs the v7
+            // self-describing value format.
+            let bitmap_bytes = t.schema.columns.len().div_ceil(8);
             for row in &t.rows {
-                for v in &row.values {
-                    write_value(&mut out, v);
+                // Reserve the bitmap slot first (zeroed), remember the
+                // offset, OR-in each NULL bit, then write bodies.
+                let bitmap_offset = out.len();
+                out.resize(bitmap_offset + bitmap_bytes, 0);
+                for (i, v) in row.values.iter().enumerate() {
+                    if matches!(v, Value::Null) {
+                        out[bitmap_offset + i / 8] |= 1 << (i % 8);
+                    }
+                }
+                for (col_idx, v) in row.values.iter().enumerate() {
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    write_value_body(&mut out, v, t.schema.columns[col_idx].ty);
                 }
             }
             // Index definitions. Per-index payload:
@@ -1442,81 +1463,7 @@ impl Catalog {
         let table_count = cur.read_u32()? as usize;
         let mut cat = Self::new();
         for _ in 0..table_count {
-            let name = cur.read_str()?;
-            let col_count = cur.read_u16()? as usize;
-            let mut cols = Vec::with_capacity(col_count);
-            for _ in 0..col_count {
-                let c_name = cur.read_str()?;
-                let ty = cur.read_data_type()?;
-                let nullable = cur.read_u8()? != 0;
-                let default = match cur.read_u8()? {
-                    0 => None,
-                    1 => Some(cur.read_value()?),
-                    other => {
-                        return Err(StorageError::Corrupt(format!(
-                            "unknown default tag: {other}"
-                        )));
-                    }
-                };
-                let auto_increment = cur.read_u8()? != 0;
-                cols.push(ColumnSchema {
-                    name: c_name,
-                    ty,
-                    nullable,
-                    default,
-                    auto_increment,
-                });
-            }
-            cat.create_table(TableSchema::new(name.clone(), cols))?;
-            let n_cols = cat.get(&name).expect("just inserted").schema.columns.len();
-            let row_count = cur.read_u32()? as usize;
-            for _ in 0..row_count {
-                let mut values = Vec::with_capacity(n_cols);
-                for _ in 0..n_cols {
-                    values.push(cur.read_value()?);
-                }
-                let t = cat.get_mut(&name).expect("just inserted");
-                t.rows.push(Row { values });
-            }
-            // v0.8 index definitions — rebuild data from the rows we just
-            // restored. (Older files without this section will fail at
-            // `read_u16` with `Truncated`; not a concern for this branch
-            // because all on-disk dumps are written by the current code.)
-            let index_count = cur.read_u16()? as usize;
-            for _ in 0..index_count {
-                let idx_name = cur.read_str()?;
-                let col_pos = cur.read_u16()? as usize;
-                let column_name = cat
-                    .get(&name)
-                    .expect("just inserted")
-                    .schema
-                    .columns
-                    .get(col_pos)
-                    .ok_or_else(|| {
-                        StorageError::Corrupt(format!(
-                            "index {idx_name:?} points at non-existent column position {col_pos}"
-                        ))
-                    })?
-                    .name
-                    .clone();
-                let kind_tag = cur.read_u8()?;
-                let t = cat.get_mut(&name).expect("just inserted");
-                match kind_tag {
-                    0 => {
-                        t.add_index(idx_name, &column_name)?;
-                    }
-                    1 => {
-                        let m = cur.read_u16()? as usize;
-                        let graph = cur.read_nsw_graph(m)?;
-                        t.restore_nsw_index(idx_name, &column_name, graph)?;
-                    }
-                    other => {
-                        return Err(StorageError::Corrupt(format!(
-                            "unknown index kind tag: {other}"
-                        )));
-                    }
-                }
-            }
+            deserialize_table(&mut cur, &mut cat)?;
         }
         if cur.pos < buf.len() {
             return Err(StorageError::Corrupt(format!(
@@ -1526,6 +1473,111 @@ impl Catalog {
         }
         Ok(cat)
     }
+}
+
+/// Per-table deserialize body — schema, rows, indices. Pulled out of
+/// `Catalog::deserialize` to keep the latter under the line-budget lint
+/// and to give the row hot loop its own scope (so the borrow on `t`
+/// stays scoped here rather than across the whole catalog loop).
+fn deserialize_table(cur: &mut Cursor<'_>, cat: &mut Catalog) -> Result<(), StorageError> {
+    let name = cur.read_str()?;
+    let col_count = cur.read_u16()? as usize;
+    let mut cols = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let c_name = cur.read_str()?;
+        let ty = cur.read_data_type()?;
+        let nullable = cur.read_u8()? != 0;
+        let default = match cur.read_u8()? {
+            0 => None,
+            1 => Some(cur.read_value()?),
+            other => {
+                return Err(StorageError::Corrupt(format!(
+                    "unknown default tag: {other}"
+                )));
+            }
+        };
+        let auto_increment = cur.read_u8()? != 0;
+        cols.push(ColumnSchema {
+            name: c_name,
+            ty,
+            nullable,
+            default,
+            auto_increment,
+        });
+    }
+    let n_cols = cols.len();
+    cat.create_table(TableSchema::new(name, cols))?;
+    let t = cat.tables.last_mut().expect("create_table just pushed");
+    deserialize_rows(cur, t, n_cols)?;
+    deserialize_indices(cur, t)?;
+    Ok(())
+}
+
+fn deserialize_rows(
+    cur: &mut Cursor<'_>,
+    t: &mut Table,
+    n_cols: usize,
+) -> Result<(), StorageError> {
+    let row_count = cur.read_u32()? as usize;
+    t.rows.reserve(row_count);
+    let bitmap_bytes = n_cols.div_ceil(8);
+    let col_types: Vec<DataType> = t.schema.columns.iter().map(|c| c.ty).collect();
+    let mut bitmap_buf = [0u8; 32];
+    for _ in 0..row_count {
+        let slice = cur.take(bitmap_bytes)?;
+        if bitmap_bytes > bitmap_buf.len() {
+            return Err(StorageError::Corrupt(format!(
+                "row NULL bitmap {bitmap_bytes} B exceeds 32 B cap"
+            )));
+        }
+        bitmap_buf[..bitmap_bytes].copy_from_slice(slice);
+        let mut values = Vec::with_capacity(n_cols);
+        for col_idx in 0..n_cols {
+            if (bitmap_buf[col_idx / 8] >> (col_idx % 8)) & 1 == 1 {
+                values.push(Value::Null);
+            } else {
+                values.push(cur.read_value_body(col_types[col_idx])?);
+            }
+        }
+        t.rows.push(Row { values });
+    }
+    Ok(())
+}
+
+fn deserialize_indices(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), StorageError> {
+    let index_count = cur.read_u16()? as usize;
+    for _ in 0..index_count {
+        let idx_name = cur.read_str()?;
+        let col_pos = cur.read_u16()? as usize;
+        let column_name = t
+            .schema
+            .columns
+            .get(col_pos)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "index {idx_name:?} points at non-existent column position {col_pos}"
+                ))
+            })?
+            .name
+            .clone();
+        let kind_tag = cur.read_u8()?;
+        match kind_tag {
+            0 => {
+                t.add_index(idx_name, &column_name)?;
+            }
+            1 => {
+                let m = cur.read_u16()? as usize;
+                let graph = cur.read_nsw_graph(m)?;
+                t.restore_nsw_index(idx_name, &column_name, graph)?;
+            }
+            other => {
+                return Err(StorageError::Corrupt(format!(
+                    "unknown index kind tag: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 // --- low-level binary helpers ---------------------------------------------
@@ -1644,6 +1696,49 @@ impl Cursor<'_> {
                 "unknown data type tag: {other}"
             ))),
         }
+    }
+}
+
+/// Schema-driven dense value encoding (`FILE_VERSION` 8). Caller already
+/// knows the column type and has decided this cell is non-NULL, so we
+/// skip the per-cell type tag the v7 `write_value` was writing. NULL
+/// is encoded via the per-row bitmap before this function runs, never
+/// reaches here. Used only inside the row-encoding hot loop; the
+/// schema-default path still goes through the legacy `write_value` so
+/// DEFAULT values keep their self-describing tag and remain decodable
+/// without consulting a column type.
+fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
+    match (v, ty) {
+        (Value::SmallInt(n), DataType::SmallInt) => out.extend_from_slice(&n.to_le_bytes()),
+        (Value::Int(n), DataType::Int) => out.extend_from_slice(&n.to_le_bytes()),
+        (Value::BigInt(n), DataType::BigInt) => out.extend_from_slice(&n.to_le_bytes()),
+        (Value::Float(x), DataType::Float) => out.extend_from_slice(&x.to_le_bytes()),
+        (Value::Bool(b), DataType::Bool) => out.push(u8::from(*b)),
+        (Value::Text(s), DataType::Text | DataType::Varchar(_) | DataType::Char(_)) => {
+            write_str(out, s);
+        }
+        (Value::Vector(v), DataType::Vector(_)) => {
+            let dim = u32::try_from(v.len()).expect("vector dim fits in u32");
+            out.extend_from_slice(&dim.to_le_bytes());
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        (Value::Numeric { scaled, .. }, DataType::Numeric { scale, .. }) => {
+            out.extend_from_slice(&scaled.to_le_bytes());
+            out.push(scale);
+        }
+        (Value::Date(d), DataType::Date) => out.extend_from_slice(&d.to_le_bytes()),
+        (Value::Timestamp(t), DataType::Timestamp) => out.extend_from_slice(&t.to_le_bytes()),
+        // Type mismatch shouldn't happen — `Table::insert` validates
+        // value type against column type before pushing. Treat as a
+        // bug, not a runtime error.
+        (other, ty) => unreachable!(
+            "schema-driven encode received mismatched value/type pair: \
+             value tag={:?}, column type={:?}",
+            other.data_type(),
+            ty
+        ),
     }
 }
 
@@ -1776,6 +1871,54 @@ impl<'a> Cursor<'a> {
             .map(String::from)
             .map_err(|_| StorageError::Corrupt("invalid UTF-8 in identifier or text".into()))
     }
+    /// Schema-driven dense value decode (`FILE_VERSION` 8). Caller has
+    /// already cleared the NULL bit from the row bitmap; we read the
+    /// fixed-width body for the given column type. Used inside the row
+    /// hot loop; column defaults still go through `read_value` (which
+    /// reads its own type tag) so DEFAULT round-trips without a schema.
+    fn read_value_body(&mut self, ty: DataType) -> Result<Value, StorageError> {
+        match ty {
+            DataType::SmallInt => {
+                let s = self.take(2)?;
+                Ok(Value::SmallInt(i16::from_le_bytes([s[0], s[1]])))
+            }
+            DataType::Int => Ok(Value::Int(self.read_i32()?)),
+            DataType::BigInt => Ok(Value::BigInt(self.read_i64()?)),
+            DataType::Float => Ok(Value::Float(self.read_f64()?)),
+            DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
+                Ok(Value::Text(self.read_str()?))
+            }
+            DataType::Vector(_) => {
+                let dim = self.read_u32()? as usize;
+                let mut v = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    let bytes: [u8; 4] = self.take(4)?.try_into().expect("checked");
+                    v.push(f32::from_le_bytes(bytes));
+                }
+                Ok(Value::Vector(v))
+            }
+            DataType::Numeric { .. } => {
+                let s = self.take(16)?;
+                let arr: [u8; 16] = s.try_into().expect("checked");
+                let scaled = i128::from_le_bytes(arr);
+                let scale = self.read_u8()?;
+                Ok(Value::Numeric { scaled, scale })
+            }
+            DataType::Date => Ok(Value::Date(self.read_i32()?)),
+            DataType::Timestamp => Ok(Value::Timestamp(self.read_i64()?)),
+            DataType::Interval => {
+                // Defensive — schema gate (CREATE TABLE rejects Interval
+                // columns) means this branch can't be hit through normal
+                // flow; reject corrupt files explicitly rather than
+                // panic.
+                Err(StorageError::Corrupt(
+                    "INTERVAL column found on disk — runtime-only type, v3.0.2 rejects it".into(),
+                ))
+            }
+        }
+    }
+
     fn read_value(&mut self) -> Result<Value, StorageError> {
         let tag = self.read_u8()?;
         match tag {
