@@ -60,5 +60,41 @@ fn bench_backup_roundtrip(c: &mut Criterion) {
     let _ = fs::remove_file(&dst);
 }
 
-criterion_group!(benches, bench_backup_roundtrip);
+/// v3.1.4: in-memory variant. Bypasses the filesystem entirely so the
+/// median reflects only deserialize + re-serialize cost; the
+/// fs-backed `backup_roundtrip_100rows` above swings 300× depending
+/// on OS page-cache state, which makes its number useless as a perf
+/// signal. This one is the real CPU-side cost.
+fn bench_backup_inmemory(c: &mut Criterion) {
+    // Build the seed catalog once and capture its serialized form;
+    // the bench loop then operates on a `Vec<u8>` source, with the
+    // destination going to a freshly allocated `Vec<u8>` each iter.
+    let mut cat = Catalog::new();
+    cat.create_table(spg_storage::TableSchema::new(
+        "users",
+        vec![
+            spg_storage::ColumnSchema::new("id", spg_storage::DataType::Int, false),
+            spg_storage::ColumnSchema::new("name", spg_storage::DataType::Text, false),
+        ],
+    ))
+    .unwrap();
+    let t = cat.get_mut("users").unwrap();
+    for i in 0..100 {
+        t.insert(spg_storage::Row::new(vec![
+            spg_storage::Value::Int(i),
+            spg_storage::Value::Text(format!("user-{i}")),
+        ]))
+        .unwrap();
+    }
+    let src_bytes = cat.serialize();
+    c.bench_function("backup_inmemory_100rows", |b| {
+        b.iter(|| {
+            let parsed = Catalog::deserialize(black_box(&src_bytes)).expect("deserialize");
+            let out = parsed.serialize();
+            black_box(out);
+        });
+    });
+}
+
+criterion_group!(benches, bench_backup_roundtrip, bench_backup_inmemory);
 criterion_main!(benches);
