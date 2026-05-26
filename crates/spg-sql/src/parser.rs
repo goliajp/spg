@@ -11,7 +11,7 @@
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem;
@@ -161,6 +161,7 @@ impl Parser {
                 let what = self.expect_ident_like()?;
                 match what.to_ascii_lowercase().as_str() {
                     "tables" => Ok(Statement::ShowTables),
+                    "users" => Ok(Statement::ShowUsers),
                     "columns" => {
                         if !matches!(self.peek(), Token::From) {
                             return Err(self.err(format!(
@@ -173,12 +174,21 @@ impl Parser {
                         Ok(Statement::ShowColumns(table))
                     }
                     other => Err(self.err(format!(
-                        "unknown SHOW target {other:?}; supported: TABLES, COLUMNS"
+                        "unknown SHOW target {other:?}; supported: TABLES, COLUMNS, USERS"
                     ))),
                 }
             }
+            // v4.1: DROP USER 'name' — DROP isn't a reserved keyword so we
+            // dispatch on the bare ident. Other DROP targets (TABLE, INDEX)
+            // can land alongside this when wanted.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("drop") => {
+                self.advance();
+                self.expect_keyword_ident("user")?;
+                let name = self.expect_ident_or_string()?;
+                Ok(Statement::DropUser(name))
+            }
             other => Err(self.err(format!(
-                "expected SELECT / CREATE / INSERT / BEGIN / COMMIT / ROLLBACK / \
+                "expected SELECT / CREATE / DROP / INSERT / BEGIN / COMMIT / ROLLBACK / \
                  SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
             ))),
         }
@@ -190,9 +200,73 @@ impl Parser {
         match self.peek() {
             Token::Table => self.parse_create_table_stmt_after_create(),
             Token::Index => self.parse_create_index_stmt_after_create(),
+            // v4.1: CREATE USER 'name' WITH PASSWORD 'pw' [ROLE 'role'].
+            // USER isn't a reserved keyword — we look for the bare
+            // identifier so the lexer doesn't have to grow a token.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("user") => {
+                self.advance();
+                self.parse_create_user_after_keyword()
+            }
             other => Err(self.err(format!(
-                "expected TABLE or INDEX after CREATE, got {other:?}"
+                "expected TABLE / INDEX / USER after CREATE, got {other:?}"
             ))),
+        }
+    }
+
+    /// `CREATE USER` body — name + WITH PASSWORD '<pw>' + optional
+    /// ROLE '<role>' (defaults to readonly). All string slots accept
+    /// either a quoted ident or a quoted string literal.
+    fn parse_create_user_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_or_string()?;
+        self.expect_keyword_ident("with")?;
+        self.expect_keyword_ident("password")?;
+        let password = self.expect_string_literal()?;
+        let role = if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
+            && s.eq_ignore_ascii_case("role")
+        {
+            self.advance();
+            self.expect_string_literal()?
+        } else {
+            "readonly".to_string()
+        };
+        Ok(Statement::CreateUser(crate::ast::CreateUserStatement {
+            name,
+            password,
+            role,
+        }))
+    }
+
+    /// Consume a bare ident if its lowercase matches `kw`, else err.
+    fn expect_keyword_ident(&mut self, kw: &str) -> Result<(), ParseError> {
+        match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw) => Ok(()),
+            other => Err(ParseError {
+                message: format!("expected {kw:?}, got {other:?}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+        }
+    }
+
+    /// Accept either a quoted identifier (`"foo"`) or a quoted string
+    /// literal (`'foo'`) — same shape used by CREATE USER for the
+    /// username slot.
+    fn expect_ident_or_string(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => Ok(s),
+            other => Err(ParseError {
+                message: format!("expected identifier or string, got {other:?}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+        }
+    }
+
+    fn expect_string_literal(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::String(s) => Ok(s),
+            other => Err(ParseError {
+                message: format!("expected quoted string, got {other:?}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
         }
     }
 

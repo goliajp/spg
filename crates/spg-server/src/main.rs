@@ -97,6 +97,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)] // startup wires snapshot+audit+WAL+bootstrap; splitting scatters init logic
 fn run(
     addr: &str,
     db_path: Option<PathBuf>,
@@ -129,7 +130,8 @@ fn run(
         }
         None => Engine::new(),
     }
-    .with_clock(wall_clock_micros);
+    .with_clock(wall_clock_micros)
+    .with_salt_fn(urandom_salt_or_panic);
 
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {
@@ -294,6 +296,18 @@ fn current_role(role: Option<Role>) -> Role {
     role.expect("dispatch already gated on role.is_some()")
 }
 
+/// True for `CREATE USER ...` and `DROP USER ...` — the v4.1
+/// admin-only DDL. Cheap byte peek (two case-insensitive idents
+/// separated by whitespace). False negatives just route to the
+/// regular write gate; false positives reject a query the user
+/// would have been allowed to run, so we're conservative: only
+/// match when both keywords are present in the expected order.
+fn sql_is_user_mgmt(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    (lower.starts_with("create ") && lower["create ".len()..].trim_start().starts_with("user"))
+        || (lower.starts_with("drop ") && lower["drop ".len()..].trim_start().starts_with("user"))
+}
+
 /// True for statements that mutate no engine state — exactly the set
 /// `Engine::execute_readonly` accepts. Cheap byte peek (skip leading
 /// whitespace, ASCII-case-fold the first alphabetic run); over-broad
@@ -421,8 +435,19 @@ fn dispatch(
             }
             // v4.1: anything that falls through to the write path
             // requires a role with write privileges. ReadOnly users
-            // hit this gate; admin / readwrite proceed.
-            if !current_role(*role).can_write() {
+            // hit this gate; admin / readwrite proceed. CREATE USER
+            // / DROP USER need the stricter Admin role.
+            let acting = current_role(*role);
+            if sql_is_user_mgmt(&sql) {
+                if !acting.can_manage_users() {
+                    return write_frame(
+                        stream,
+                        &build_error_response(
+                            "permission denied: user management requires admin role",
+                        ),
+                    );
+                }
+            } else if !acting.can_write() {
                 return write_frame(
                     stream,
                     &build_error_response(
@@ -723,6 +748,15 @@ fn random_salt() -> std::io::Result<[u8; 16]> {
     let mut buf = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// Salt source for the engine. Engine's `SaltFn` is infallible; if
+/// /dev/urandom is unreadable we panic — running without a working
+/// kernel RNG is an environmental failure, not a recoverable
+/// condition. spg-server's startup already eats the same panic
+/// surface for any other OS-level resource gap.
+fn urandom_salt_or_panic() -> [u8; 16] {
+    random_salt().expect("/dev/urandom unreadable — refusing to create users without entropy")
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
