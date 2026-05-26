@@ -43,5 +43,9 @@ path = "src/bin/latency.rs"
 name = "throughput"
 path = "src/bin/throughput.rs"
 
+[[bin]]
+name = "vector_knn"
+path = "src/bin/vector_knn.rs"
+
 [lints]
 workspace = true
