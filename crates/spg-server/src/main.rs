@@ -31,12 +31,12 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use spg_audit::AuditLog;
-use spg_engine::{Engine, EngineError, QueryResult};
-use spg_storage::{Catalog, ColumnSchema, DataType, Row, Value};
+use spg_engine::{Engine, EngineError, QueryResult, Role};
+use spg_storage::{ColumnSchema, DataType, Row, Value};
 use spg_wire::{
     ColumnDesc, Frame, FrameError, Op, WireType, WireValue, build_command_complete, build_data_row,
     build_data_row_batch, build_error_response, build_row_description, build_stats_response,
-    decode, encode, parse_auth, parse_query,
+    decode, encode, parse_auth, parse_auth_user, parse_query,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
@@ -108,13 +108,17 @@ fn run(
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;
             let path_str = p.display();
-            let catalog = Catalog::deserialize(&bytes)
+            // v4.1: snapshot may be either a v4.1 envelope (catalog +
+            // users) or the bare v3.x catalog blob. `restore_envelope`
+            // handles both transparently — v3.x files keep loading.
+            let engine = Engine::restore_envelope(&bytes)
                 .map_err(|e| std::io::Error::other(format!("restore from {path_str}: {e}")))?;
             eprintln!(
-                "spg-server: restored {} table(s) from {path_str}",
-                catalog.table_count()
+                "spg-server: restored {} table(s), {} user(s) from {path_str}",
+                engine.catalog().table_count(),
+                engine.users().len()
             );
-            Engine::restore(catalog)
+            engine
         }
         Some(p) => {
             eprintln!(
@@ -176,6 +180,8 @@ fn run(
         eprintln!("spg-server: started fresh WAL at {}", p.display());
     }
 
+    bootstrap_admin_from_env(&mut engine, db_path.as_deref())?;
+
     let wal = match &wal_path {
         Some(p) => Some(Mutex::new(
             OpenOptions::new().append(true).open(p).map_err(|e| {
@@ -221,7 +227,14 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
     let mut chunk = [0u8; READ_CHUNK];
-    let mut authenticated = state.password.is_none();
+    // v4.1: per-connection role.
+    //   `None` = unauthenticated, must `AUTH` (legacy) or `AuthUser` first
+    //   `Some(Role::Admin)` etc. = authenticated, dispatch enforces caps
+    // Open mode (no SPG_PASSWORD + no users in catalog) starts as
+    // `Some(Admin)`. Single-password mode starts as `None` and `Auth`
+    // promotes to `Admin`. Multi-user mode (engine has users) starts as
+    // `None` and only `AuthUser` is accepted.
+    let mut role = initial_role(state)?;
     // v4.0: per-connection transaction state. BEGIN sets this to
     // true; COMMIT / ROLLBACK clear it. While true the dispatch path
     // takes the engine *write* lock for every statement on this
@@ -240,7 +253,7 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
             match decode(&buf) {
                 Ok((frame, consumed)) => {
                     buf.drain(..consumed);
-                    dispatch(&mut stream, &frame, state, &mut authenticated, &mut in_tx)?;
+                    dispatch(&mut stream, &frame, state, &mut role, &mut in_tx)?;
                 }
                 Err(FrameError::ShortHeader | FrameError::ShortPayload) => break,
                 Err(e) => {
@@ -250,6 +263,35 @@ fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
             }
         }
     }
+}
+
+/// Auth mode is decided per-connection at handshake time:
+///
+/// - engine has users → **multi-user RBAC**: start `None`, only
+///   `Op::AuthUser` can authenticate.
+/// - else `state.password` is set → **legacy single-password**: start
+///   `None`, `Op::Auth` promotes to `Admin`.
+/// - else → **open**: start `Some(Admin)`, every op allowed.
+fn initial_role(state: &ServerState) -> std::io::Result<Option<Role>> {
+    let has_users = {
+        let engine = state
+            .engine
+            .read()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        !engine.users().is_empty()
+    };
+    if has_users || state.password.is_some() {
+        Ok(None)
+    } else {
+        Ok(Some(Role::Admin))
+    }
+}
+
+/// Caller already passed the unauthenticated gate at the top of
+/// `dispatch`; the panic is unreachable in practice but cheaper than
+/// threading another error path through every write-gated branch.
+fn current_role(role: Option<Role>) -> Role {
+    role.expect("dispatch already gated on role.is_some()")
 }
 
 /// True for statements that mutate no engine state — exactly the set
@@ -286,13 +328,13 @@ fn dispatch(
     stream: &mut TcpStream,
     frame: &Frame,
     state: &ServerState,
-    authenticated: &mut bool,
+    role: &mut Option<Role>,
     in_tx: &mut bool,
 ) -> std::io::Result<()> {
     // Gate every non-Ping / non-Auth op until the connection has
     // authenticated. Ping stays accessible so health probes still work
     // (matches Valkey/Redis policy).
-    if !*authenticated && !matches!(frame.op, Op::Ping | Op::Auth) {
+    if role.is_none() && !matches!(frame.op, Op::Ping | Op::Auth | Op::AuthUser) {
         return write_frame(
             stream,
             &build_error_response("authentication required: send AUTH first"),
@@ -305,6 +347,17 @@ fn dispatch(
                 Ok(s) => s,
                 Err(e) => return write_frame(stream, &build_error_response(&e.to_string())),
             };
+            // v4.1: legacy `AUTH <password>` only makes sense in
+            // single-password mode. Once the engine has users, force
+            // clients onto `AuthUser` so a per-user password can't
+            // accidentally be reused as the global one.
+            let users_exist = state.engine.read().is_ok_and(|e| !e.users().is_empty());
+            if users_exist {
+                return write_frame(
+                    stream,
+                    &build_error_response("RBAC active: use AUTH USER <name> <password>"),
+                );
+            }
             // Constant-time compare is overkill for a local Docker
             // sidecar — a `==` here is fine in our threat model. If the
             // server has no password configured we still accept AUTH
@@ -316,10 +369,28 @@ fn dispatch(
                 None => true,
             };
             if ok {
-                *authenticated = true;
+                *role = Some(Role::Admin);
                 write_frame(stream, &Frame::pong())
             } else {
                 write_frame(stream, &build_error_response("AUTH: wrong password"))
+            }
+        }
+        Op::AuthUser => {
+            let (user, pw) = match parse_auth_user(frame) {
+                Ok(t) => t,
+                Err(e) => return write_frame(stream, &build_error_response(&e.to_string())),
+            };
+            let verified = state
+                .engine
+                .read()
+                .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?
+                .verify_user(user, pw);
+            match verified {
+                Some(r) => {
+                    *role = Some(r);
+                    write_frame(stream, &Frame::pong())
+                }
+                None => write_frame(stream, &build_error_response("AUTH: invalid credentials")),
             }
         }
         Op::Stats => {
@@ -347,6 +418,17 @@ fn dispatch(
                 if !matches!(&result, Err(EngineError::WriteRequired)) {
                     return emit_result(stream, result);
                 }
+            }
+            // v4.1: anything that falls through to the write path
+            // requires a role with write privileges. ReadOnly users
+            // hit this gate; admin / readwrite proceed.
+            if !current_role(*role).can_write() {
+                return write_frame(
+                    stream,
+                    &build_error_response(
+                        "permission denied: write requires admin or readwrite role",
+                    ),
+                );
             }
             let (result, snapshot) = {
                 let mut engine = state
@@ -596,6 +678,51 @@ fn wall_clock_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
+
+/// v4.1: when the engine has no users yet and `SPG_ADMIN_PASSWORD`
+/// is set in the environment, create an admin so a fresh
+/// docker-compose deployment has someone who can manage further
+/// users. Once an admin exists in the snapshot, changing the env
+/// var has no effect on restart (use SQL to rotate passwords).
+/// Default username is "admin"; override with `SPG_ADMIN_USER`.
+fn bootstrap_admin_from_env(engine: &mut Engine, db_path: Option<&Path>) -> std::io::Result<()> {
+    if !engine.users().is_empty() {
+        return Ok(());
+    }
+    let Ok(pw) = env::var("SPG_ADMIN_PASSWORD") else {
+        return Ok(());
+    };
+    if pw.is_empty() {
+        return Ok(());
+    }
+    let user = env::var("SPG_ADMIN_USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "admin".to_string());
+    let salt = random_salt()?;
+    engine
+        .create_user(&user, &pw, Role::Admin, salt)
+        .map_err(|e| std::io::Error::other(format!("bootstrap admin {user:?}: {e}")))?;
+    eprintln!("spg-server: bootstrapped admin user {user:?} from SPG_ADMIN_PASSWORD");
+    // Persist immediately so the bootstrap survives without waiting
+    // for the first successful DDL/DML to trigger a snapshot.
+    if let Some(p) = db_path
+        && let Err(e) = write_atomic(p, &engine.snapshot())
+    {
+        eprintln!("spg-server: warning — failed to persist bootstrap admin: {e}");
+    }
+    Ok(())
+}
+
+/// 16 cryptographically random bytes from the OS via /dev/urandom.
+/// Used as per-user salt for password hashing. Falls back to error
+/// if /dev/urandom is unreadable — better fail loudly at startup
+/// than silently degrade salt randomness.
+fn random_salt() -> std::io::Result<[u8; 16]> {
+    let mut buf = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {

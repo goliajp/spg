@@ -8,6 +8,9 @@ extern crate alloc;
 
 pub mod aggregate;
 pub mod eval;
+pub mod users;
+
+pub use crate::users::{Role, UserError, UserStore};
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -107,6 +110,68 @@ impl From<EvalError> for EngineError {
 /// `Unsupported`.
 pub type ClockFn = fn() -> i64;
 
+// ---- snapshot envelope (v4.1) ----
+//
+// Wraps a catalog blob + a user blob behind a small header so the
+// server can persist both atomically without inventing a new file.
+// Bare catalog blobs (v3.x) still load via `restore_envelope` since
+// the magic check fails fast and the function falls back to
+// `Catalog::deserialize`.
+//
+// Layout:
+//   [8 bytes magic "SPGENV01"]
+//   [u8 version = 1]
+//   [u32 catalog_len][catalog bytes]
+//   [u32 users_len][users bytes]
+
+const ENVELOPE_MAGIC: &[u8; 8] = b"SPGENV01";
+const ENVELOPE_VERSION: u8 = 1;
+
+fn build_envelope(catalog: &[u8], users: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 1 + 4 + catalog.len() + 4 + users.len());
+    out.extend_from_slice(ENVELOPE_MAGIC);
+    out.push(ENVELOPE_VERSION);
+    out.extend_from_slice(
+        &u32::try_from(catalog.len())
+            .expect("≤ 4G catalog")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(catalog);
+    out.extend_from_slice(
+        &u32::try_from(users.len())
+            .expect("≤ 4G users")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(users);
+    out
+}
+
+/// Returns `Some((catalog, users))` if the buffer is a v4.1
+/// envelope; `None` if it's a bare catalog blob (v3.x compat).
+fn split_envelope(buf: &[u8]) -> Option<(&[u8], &[u8])> {
+    if buf.len() < 8 + 1 + 4 || &buf[..8] != ENVELOPE_MAGIC {
+        return None;
+    }
+    if buf[8] != ENVELOPE_VERSION {
+        return None;
+    }
+    let mut p = 9usize;
+    let cat_len = u32::from_le_bytes(buf[p..p + 4].try_into().ok()?) as usize;
+    p += 4;
+    if p + cat_len + 4 > buf.len() {
+        return None;
+    }
+    let catalog = &buf[p..p + cat_len];
+    p += cat_len;
+    let user_len = u32::from_le_bytes(buf[p..p + 4].try_into().ok()?) as usize;
+    p += 4;
+    if p + user_len != buf.len() {
+        return None;
+    }
+    let users = &buf[p..p + user_len];
+    Some((catalog, users))
+}
+
 #[derive(Debug, Default)]
 pub struct Engine {
     /// Committed catalog — what survives `Engine::snapshot()` and what
@@ -124,6 +189,12 @@ pub struct Engine {
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
+    /// v4.1 RBAC user table. Empty means "no RBAC configured yet" —
+    /// the server decides what that means at the auth boundary
+    /// (open mode vs legacy single-password mode). User CRUD goes
+    /// through `create_user`/`drop_user`/`verify_user`; persistence
+    /// rides the snapshot envelope alongside the catalog.
+    users: UserStore,
 }
 
 impl Engine {
@@ -133,6 +204,7 @@ impl Engine {
             tx_catalog: None,
             savepoints: Vec::new(),
             clock: None,
+            users: UserStore::new(),
         }
     }
 
@@ -144,7 +216,55 @@ impl Engine {
             tx_catalog: None,
             savepoints: Vec::new(),
             clock: None,
+            users: UserStore::new(),
         }
+    }
+
+    /// Restore an engine + user table from a v4.1 envelope produced
+    /// by `snapshot_with_users()`. Falls back to plain catalog-only
+    /// restore if the envelope magic isn't present (so v3.x snapshot
+    /// files still load).
+    pub fn restore_envelope(buf: &[u8]) -> Result<Self, EngineError> {
+        if let Some((catalog_bytes, user_bytes)) = split_envelope(buf) {
+            let catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
+            let users = users::deserialize_users(user_bytes)
+                .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
+            Ok(Self {
+                catalog,
+                tx_catalog: None,
+                savepoints: Vec::new(),
+                clock: None,
+                users,
+            })
+        } else {
+            let catalog = Catalog::deserialize(buf).map_err(EngineError::Storage)?;
+            Ok(Self::restore(catalog))
+        }
+    }
+
+    pub const fn users(&self) -> &UserStore {
+        &self.users
+    }
+
+    /// `salt` is supplied by the caller (the host has a random
+    /// source; the engine is `no_std`). Caller should pass a fresh
+    /// 16-byte random value per user.
+    pub fn create_user(
+        &mut self,
+        name: &str,
+        password: &str,
+        role: Role,
+        salt: [u8; 16],
+    ) -> Result<(), UserError> {
+        self.users.create(name, password, role, salt)
+    }
+
+    pub fn drop_user(&mut self, name: &str) -> Result<(), UserError> {
+        self.users.drop(name)
+    }
+
+    pub fn verify_user(&self, name: &str, password: &str) -> Option<Role> {
+        self.users.verify(name, password)
     }
 
     /// Builder: attach a wall clock so `NOW()` / `CURRENT_TIMESTAMP` /
@@ -164,9 +284,18 @@ impl Engine {
 
     /// Serialize the *committed* catalog to bytes. v0.6 was full-snapshot; v0.9
     /// adds the rule that an open TX's shadow is never snapshotted — only the
-    /// post-COMMIT state is persisted.
+    /// post-COMMIT state is persisted. v4.1 wraps the catalog in an envelope
+    /// when there are users to persist; an empty user table snapshots as the
+    /// bare catalog format (backwards-compat with v3.x readers).
     pub fn snapshot(&self) -> Vec<u8> {
-        self.catalog.serialize()
+        if self.users.is_empty() {
+            self.catalog.serialize()
+        } else {
+            build_envelope(
+                &self.catalog.serialize(),
+                &users::serialize_users(&self.users),
+            )
+        }
     }
 
     pub const fn in_transaction(&self) -> bool {
@@ -2260,6 +2389,38 @@ mod tests {
         let (_, rows) = unwrap_rows(e.execute("SELECT * FROM t").unwrap());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Int(42));
+    }
+
+    #[test]
+    fn snapshot_with_no_users_is_bare_catalog_format() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        let bytes = e.snapshot();
+        assert_eq!(
+            &bytes[..8],
+            b"SPGDB001",
+            "must be the bare v3.x catalog magic"
+        );
+        let e2 = Engine::restore_envelope(&bytes).unwrap();
+        assert!(e2.users().is_empty());
+        assert_eq!(e2.catalog().table_count(), 1);
+    }
+
+    #[test]
+    fn snapshot_with_users_round_trips_both_via_envelope() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        e.create_user("alice", "pw1", Role::Admin, [9; 16]).unwrap();
+        e.create_user("bob", "pw2", Role::ReadOnly, [5; 16])
+            .unwrap();
+        let bytes = e.snapshot();
+        assert_eq!(&bytes[..8], b"SPGENV01", "must be the v4.1 envelope magic");
+        let e2 = Engine::restore_envelope(&bytes).unwrap();
+        assert_eq!(e2.users().len(), 2);
+        assert_eq!(e2.verify_user("alice", "pw1"), Some(Role::Admin));
+        assert_eq!(e2.verify_user("bob", "pw2"), Some(Role::ReadOnly));
+        assert_eq!(e2.verify_user("alice", "wrong"), None);
+        assert_eq!(e2.catalog().table_count(), 1);
     }
 
     #[test]
