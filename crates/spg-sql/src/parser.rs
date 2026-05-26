@@ -111,6 +111,7 @@ impl Parser {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_one_statement(&mut self) -> Result<Statement, ParseError> {
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
@@ -120,6 +121,28 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with") => {
                 self.advance();
                 self.parse_with_cte_then_select()
+            }
+            // v4.26: `EXPLAIN [ANALYZE] <select>`. Comes through as
+            // an identifier — not a reserved keyword.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("explain") => {
+                self.advance();
+                let mut analyze = false;
+                if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
+                    && (s.eq_ignore_ascii_case("analyze") || s.eq_ignore_ascii_case("analyse"))
+                {
+                    self.advance();
+                    analyze = true;
+                }
+                let inner = self.parse_select_stmt()?;
+                let Statement::Select(s) = inner else {
+                    return Err(self.err(format!(
+                        "EXPLAIN body must be a SELECT, got {inner:?}"
+                    )));
+                };
+                Ok(Statement::Explain(crate::ast::ExplainStatement {
+                    analyze,
+                    inner: Box::new(s),
+                }))
             }
             Token::Create => self.parse_create_stmt(),
             Token::Insert => self.parse_insert_stmt(),
