@@ -473,6 +473,7 @@ impl Engine {
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
+            Statement::Explain(e) => self.exec_explain(&e, cancel),
             _ => Err(EngineError::WriteRequired),
         };
         self.enforce_row_limit(result)
@@ -532,6 +533,7 @@ impl Engine {
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::CreateUser(s) => self.exec_create_user(&s),
             Statement::DropUser(name) => self.exec_drop_user(&name),
+            Statement::Explain(e) => self.exec_explain(&e, cancel),
         };
         self.enforce_row_limit(result)
     }
@@ -714,6 +716,46 @@ impl Engine {
     /// `SHOW TABLES` — one row per table in the active catalog.
     /// Column name is `name` so result-set consumers can downstream
     /// `SELECT name FROM ...` style logic if needed.
+    /// v4.26: `EXPLAIN [ANALYZE] <select>`. Returns a single-column
+    /// `QUERY PLAN` text table — first line names the top operator
+    /// (Scan / Aggregate / Window / etc.), indented children list
+    /// FROM joins, WHERE filters, ORDER BY / LIMIT, projection
+    /// shape, and any active index hits. `ANALYZE` execs the inner
+    /// SELECT and appends actual-row + elapsed-micros annotations.
+    #[allow(clippy::format_push_string)]
+    fn exec_explain(
+        &self,
+        e: &spg_sql::ast::ExplainStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let mut lines = Vec::<String>::new();
+        explain_select(&e.inner, self, 0, &mut lines);
+        if e.analyze {
+            let started = self.clock.map(|f| f());
+            let exec = self.exec_select_cancel(&e.inner, cancel)?;
+            let elapsed_micros = match (self.clock, started) {
+                (Some(f), Some(s)) => Some(f().saturating_sub(s)),
+                _ => None,
+            };
+            let row_count = if let QueryResult::Rows { rows, .. } = &exec {
+                rows.len()
+            } else {
+                0
+            };
+            let mut annot = alloc::format!("Actual: rows={row_count}");
+            if let Some(us) = elapsed_micros {
+                annot.push_str(&alloc::format!(" elapsed={us}us"));
+            }
+            lines.push(annot);
+        }
+        let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
+        let rows: Vec<Row> = lines
+            .into_iter()
+            .map(|l| Row::new(alloc::vec![Value::Text(l)]))
+            .collect();
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
     fn exec_show_tables(&self) -> QueryResult {
         let columns = alloc::vec![ColumnSchema::new("name", DataType::Text, false)];
         let rows: Vec<Row> = self
@@ -2822,6 +2864,135 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
         }
     }
     out
+}
+
+/// v4.26: render a human-readable plan tree for `EXPLAIN <select>`.
+/// Lines are pushed into `out`; `depth` controls indentation. We
+/// describe the rewritten SELECT — what the executor *would* do —
+/// using the engine handle to spot indexed lookups and table shapes.
+#[allow(clippy::too_many_lines, clippy::format_push_string)]
+fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &mut Vec<String>) {
+    let pad = "  ".repeat(depth);
+    // 1) Top-level operator label.
+    let top = if !stmt.ctes.is_empty() {
+        if stmt.ctes.iter().any(|c| c.recursive) {
+            "CTEScan (WITH RECURSIVE)"
+        } else {
+            "CTEScan (WITH)"
+        }
+    } else if !stmt.unions.is_empty() {
+        "UnionScan"
+    } else if select_has_window(stmt) {
+        "WindowAgg"
+    } else if aggregate::uses_aggregate(stmt) {
+        "Aggregate"
+    } else if stmt.distinct {
+        "Distinct"
+    } else if stmt.from.is_some() {
+        "TableScan"
+    } else {
+        "Result"
+    };
+    out.push(alloc::format!("{pad}{top}"));
+    let child = "  ".repeat(depth + 1);
+    // 2) CTE bodies.
+    for cte in &stmt.ctes {
+        let head = if cte.recursive {
+            alloc::format!("{child}CTE (recursive): {}", cte.name)
+        } else {
+            alloc::format!("{child}CTE: {}", cte.name)
+        };
+        out.push(head);
+        explain_select(&cte.body, engine, depth + 2, out);
+    }
+    // 3) FROM details — primary table + joins, index hits.
+    if let Some(from) = &stmt.from {
+        let mut tag = alloc::format!("{child}From: {}", from.primary.name);
+        if let Some(alias) = &from.primary.alias {
+            tag.push_str(&alloc::format!(" AS {alias}"));
+        }
+        // Try to detect an index-seek opportunity on WHERE against
+        // the primary table — same heuristic the executor uses.
+        if let Some(w) = &stmt.where_
+            && let Some(table) = engine.active_catalog().get(&from.primary.name)
+        {
+            let alias = from
+                .primary
+                .alias
+                .as_deref()
+                .unwrap_or(&from.primary.name);
+            let cols = &table.schema().columns;
+            if try_index_seek(w, cols, table, alias).is_some() {
+                tag.push_str(" [index seek]");
+            } else {
+                tag.push_str(" [full scan]");
+            }
+        } else {
+            tag.push_str(" [full scan]");
+        }
+        out.push(tag);
+        for j in &from.joins {
+            let kind = match j.kind {
+                spg_sql::ast::JoinKind::Inner => "INNER JOIN",
+                spg_sql::ast::JoinKind::Left => "LEFT JOIN",
+                spg_sql::ast::JoinKind::Cross => "CROSS JOIN",
+            };
+            let mut s = alloc::format!("{child}{kind}: {}", j.table.name);
+            if let Some(alias) = &j.table.alias {
+                s.push_str(&alloc::format!(" AS {alias}"));
+            }
+            if j.on.is_some() {
+                s.push_str(" (ON …)");
+            }
+            out.push(s);
+        }
+    }
+    // 4) WHERE / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET.
+    if let Some(w) = &stmt.where_ {
+        let mut s = alloc::format!("{child}Filter: {w}");
+        if expr_has_subquery(w) {
+            s.push_str(" [subquery]");
+        }
+        out.push(s);
+    }
+    if let Some(gs) = &stmt.group_by {
+        let mut parts = Vec::new();
+        for g in gs {
+            parts.push(alloc::format!("{g}"));
+        }
+        out.push(alloc::format!("{child}GroupBy: {}", parts.join(", ")));
+    }
+    if let Some(h) = &stmt.having {
+        out.push(alloc::format!("{child}Having: {h}"));
+    }
+    if let Some(o) = &stmt.order_by {
+        let dir = if o.desc { "DESC" } else { "ASC" };
+        out.push(alloc::format!("{child}OrderBy: {} {dir}", o.expr));
+    }
+    if let Some(lim) = stmt.limit {
+        out.push(alloc::format!("{child}Limit: {lim}"));
+    }
+    if let Some(off) = stmt.offset {
+        out.push(alloc::format!("{child}Offset: {off}"));
+    }
+    // 5) Projection — collapse Wildcard or render N items.
+    if stmt.items.iter().any(|it| matches!(it, SelectItem::Wildcard)) {
+        out.push(alloc::format!("{child}Project: *"));
+    } else {
+        out.push(alloc::format!(
+            "{child}Project: {} item(s)",
+            stmt.items.len()
+        ));
+    }
+    // 6) Recurse into UNION peers.
+    for (kind, peer) in &stmt.unions {
+        let label = match kind {
+            UnionKind::All => "UNION ALL",
+            UnionKind::Distinct => "UNION",
+        };
+        out.push(alloc::format!("{child}{label}"));
+        explain_select(peer, engine, depth + 2, out);
+    }
 }
 
 /// v4.23: recognise the engine errors that indicate the inner

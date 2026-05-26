@@ -48,6 +48,17 @@ pub enum Statement {
     DropUser(String),
     /// `SHOW USERS` (v4.1) — admin-only listing of (name, role).
     ShowUsers,
+    /// v4.26 — `EXPLAIN [ANALYZE] <select>`. The engine returns a
+    /// single-column text table describing the rewritten plan tree
+    /// for `inner`. `analyze` triggers an actual exec to attach
+    /// observed row counts and elapsed micros to each node.
+    Explain(ExplainStatement),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainStatement {
+    pub analyze: bool,
+    pub inner: Box<SelectStatement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,6 +568,13 @@ impl fmt::Display for Statement {
             ),
             Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
             Self::ShowUsers => f.write_str("SHOW USERS"),
+            Self::Explain(e) => {
+                if e.analyze {
+                    write!(f, "EXPLAIN ANALYZE {}", e.inner)
+                } else {
+                    write!(f, "EXPLAIN {}", e.inner)
+                }
+            }
         }
     }
 }
