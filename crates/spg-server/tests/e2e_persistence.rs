@@ -147,6 +147,12 @@ fn rows_survive_a_full_daemon_restart() {
         let f = read_frame(&mut stream);
         match f.op {
             Op::DataRow => rows.push(parse_data_row(&f).unwrap()),
+            Op::DataRowBatch => {
+                // v3.3.0: multi-row results arrive as one batched
+                // frame; decode it into the same `Vec<Vec<WireValue>>`
+                // shape the per-row path produces.
+                rows.extend(spg_wire::parse_data_row_batch(&f).unwrap());
+            }
             Op::CommandComplete => break,
             other => panic!("unexpected: {other:?}"),
         }

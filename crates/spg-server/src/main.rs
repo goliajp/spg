@@ -35,12 +35,15 @@ use spg_engine::{Engine, EngineError, QueryResult};
 use spg_storage::{Catalog, ColumnSchema, DataType, Row, Value};
 use spg_wire::{
     ColumnDesc, Frame, FrameError, Op, WireType, WireValue, build_command_complete, build_data_row,
-    build_error_response, build_row_description, build_stats_response, decode, encode, parse_auth,
-    parse_query,
+    build_data_row_batch, build_error_response, build_row_description, build_stats_response,
+    decode, encode, parse_auth, parse_query,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
 const READ_CHUNK: usize = 4096;
+/// Rows per `DataRowBatch` frame (v3.3.0). Caps in-memory frame size
+/// on huge SELECTs while still amortising the per-frame header.
+const BATCH_ROWS_PER_FRAME: usize = 256;
 
 struct ServerState {
     engine: Mutex<Engine>,
@@ -357,6 +360,7 @@ fn dispatch(
         Op::Pong
         | Op::RowDescription
         | Op::DataRow
+        | Op::DataRowBatch
         | Op::CommandComplete
         | Op::ErrorResponse
         | Op::StatsResponse => write_frame(
@@ -549,11 +553,25 @@ fn emit_result(
             let rd =
                 build_row_description(&descs).map_err(|e| std::io::Error::other(e.to_string()))?;
             write_frame(stream, &rd)?;
-            for row in rows {
-                let wire = row_to_wire(&row);
-                let frame =
-                    build_data_row(&wire).map_err(|e| std::io::Error::other(e.to_string()))?;
-                write_frame(stream, &frame)?;
+            // v3.3.0: pack rows into DataRowBatch frames. Chunked at
+            // 256 rows so a huge SELECT doesn't build one multi-MB
+            // frame in memory before any byte hits the wire. Single-
+            // row results stay on the legacy DataRow op for back-
+            // compat with v3.2 / v3.1 clients.
+            if rows.len() <= 1 {
+                for row in rows {
+                    let wire = row_to_wire(&row);
+                    let frame =
+                        build_data_row(&wire).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    write_frame(stream, &frame)?;
+                }
+            } else {
+                let wire_rows: Vec<Vec<WireValue>> = rows.iter().map(row_to_wire).collect();
+                for chunk in wire_rows.chunks(BATCH_ROWS_PER_FRAME) {
+                    let frame = build_data_row_batch(chunk)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    write_frame(stream, &frame)?;
+                }
             }
             write_frame(stream, &build_command_complete(0))
         }

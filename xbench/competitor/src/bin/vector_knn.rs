@@ -280,6 +280,10 @@ fn bench_spg_server(
             let frame = spg_wire::Frame { op, payload };
             match frame.op {
                 Op::DataRow => row_count += 1,
+                Op::DataRowBatch if frame.payload.len() >= 2 => {
+                    row_count +=
+                        u16::from_le_bytes([frame.payload[0], frame.payload[1]]) as usize;
+                }
                 Op::CommandComplete => {
                     let _ = parse_command_complete(&frame);
                     return Ok(row_count);
