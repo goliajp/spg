@@ -4,6 +4,10 @@
 //! as `Vec<Value>` (positional, matching the table's `TableSchema`). No MVCC,
 //! no on-disk format — those land in later milestones.
 #![no_std]
+// v3.3.2 NEON path for l2_distance_sq (aarch64 only). Scoped allow:
+// `unsafe_code = "deny"` at workspace level stays in force for every
+// other crate.
+#![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
 
 extern crate alloc;
 
@@ -1130,13 +1134,70 @@ fn sqrt_newton_f32(x: f32) -> f32 {
 
 /// Squared Euclidean distance — used for ordering inside NSW (the sqrt
 /// preserves the order). Caller takes sqrt before reporting back to SQL.
+///
+/// v3.3.2: aarch64 NEON path for `len % 4 == 0` (which covers every
+/// HNSW-indexed VECTOR(N) where N is a multiple of 4 — i.e. all
+/// production-shaped embeddings: 64, 128, 256, 384, 512, 768, 1024,
+/// 1536, ...). Other shapes fall back to the scalar loop.
+#[inline]
 fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if a.len() == b.len() && a.len() >= 4 && a.len().is_multiple_of(4) {
+            // SAFETY: NEON is a baseline aarch64 feature (ARMv8);
+            // the precondition is checked above (matching lengths,
+            // multiple of 4, at least one 128-bit lane group).
+            return unsafe { l2_distance_sq_neon(a, b) };
+        }
+    }
+    l2_distance_sq_scalar(a, b)
+}
+
+fn l2_distance_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut sum: f32 = 0.0;
     for (x, y) in a.iter().zip(b.iter()) {
         let d = *x - *y;
         sum += d * d;
     }
     sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)] // NEON intrinsics work in single-letter regs by convention
+unsafe fn l2_distance_sq_neon(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vsubq_f32,
+    };
+    unsafe {
+        // Two independent accumulator registers so the FMA dependency
+        // chain doesn't serialise (each FMA depends on prior FMA).
+        // Pre-conditions checked by caller: `a.len() == b.len()`,
+        // `a.len() % 4 == 0`, `a.len() >= 4`.
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc0 = zero;
+        let mut acc1 = zero;
+        let n = a.len();
+        let mut i = 0usize;
+        // Process 8 floats per iter when available (two parallel
+        // accumulators). Tail of 4 falls into the second loop.
+        while i + 8 <= n {
+            let d0 = vsubq_f32(vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+            acc0 = vfmaq_f32(acc0, d0, d0);
+            let d1 = vsubq_f32(
+                vld1q_f32(a.as_ptr().add(i + 4)),
+                vld1q_f32(b.as_ptr().add(i + 4)),
+            );
+            acc1 = vfmaq_f32(acc1, d1, d1);
+            i += 8;
+        }
+        while i + 4 <= n {
+            let d = vsubq_f32(vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+            acc0 = vfmaq_f32(acc0, d, d);
+            i += 4;
+        }
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
 }
 
 /// Public wrapper: run an NSW kNN search and return the top-k row
@@ -2024,6 +2085,39 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
     use alloc::vec;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_l2_matches_scalar() {
+        // For every dim that's a multiple of 4 (4, 8, 12, 16, 64,
+        // 128, 256, 384, 512, 768, 1024, 1536), the NEON impl must
+        // agree with the scalar reference within tight float
+        // tolerance (FMA rounding differs from separate * + +).
+        let dims = [4usize, 8, 12, 16, 64, 128, 256, 384, 512, 768, 1024, 1536];
+        for &d in &dims {
+            let mut state: u64 = (d as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut a = Vec::with_capacity(d);
+            let mut b = Vec::with_capacity(d);
+            for _ in 0..d {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let x = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let y = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
+                a.push(x);
+                b.push(y);
+            }
+            let scalar = l2_distance_sq_scalar(&a, &b);
+            let neon = unsafe { l2_distance_sq_neon(&a, &b) };
+            let tol = (scalar.abs().max(1e-6)) * 1e-4;
+            assert!(
+                (scalar - neon).abs() <= tol,
+                "dim={d}: scalar={scalar} neon={neon} diff={}",
+                (scalar - neon).abs()
+            );
+        }
+    }
 
     fn make_users_schema() -> TableSchema {
         TableSchema::new(
