@@ -427,6 +427,8 @@ impl Engine {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
+            Statement::Update(s) => self.exec_update(&s),
+            Statement::Delete(s) => self.exec_delete(&s),
             Statement::Select(s) => self.exec_select(&s),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
@@ -504,6 +506,106 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: 1,
             modified_catalog: true,
+        })
+    }
+
+    /// v4.4 `UPDATE <table> SET col = expr [, ...] [WHERE cond]`.
+    /// Filter pass uses the same WHERE eval as `exec_select`. Per
+    /// matched row, evaluate each RHS expression against the *old*
+    /// row, then call `Table::update_row` which rebuilds indices.
+    /// Indexed columns are correctly reflected because rebuild
+    /// happens after the cell rewrite.
+    fn exec_update(
+        &mut self,
+        stmt: &spg_sql::ast::UpdateStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.table)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
+        let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
+        // Resolve each SET target to a column position once, validate
+        // up front so a typo'd column doesn't leave a partial mutation
+        // behind.
+        let mut targets: Vec<(usize, &Expr)> = Vec::with_capacity(stmt.assignments.len());
+        for (col, expr) in &stmt.assignments {
+            let pos = schema_cols
+                .iter()
+                .position(|c| c.name == *col)
+                .ok_or_else(|| {
+                    EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                })?;
+            targets.push((pos, expr));
+        }
+        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+        // Walk every row, evaluate WHERE then SET expressions. We
+        // gather (position, new_values) tuples first and apply them
+        // afterwards so the WHERE/RHS evaluation reads the original
+        // row state — matches PG semantics (UPDATE doesn't see its
+        // own writes).
+        let mut planned: Vec<(usize, Vec<Value>)> = Vec::new();
+        for (i, row) in table.rows().iter().enumerate() {
+            if let Some(w) = &stmt.where_ {
+                let cond = eval::eval_expr(w, row, &ctx)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            let mut new_vals = row.values.clone();
+            for (pos, expr) in &targets {
+                let v = eval::eval_expr(expr, row, &ctx)?;
+                new_vals[*pos] =
+                    coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
+            }
+            planned.push((i, new_vals));
+        }
+        let affected = planned.len();
+        for (pos, vals) in planned {
+            table.update_row(pos, vals)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v4.4 `DELETE FROM <table> [WHERE cond]`. Collects matching
+    /// positions then delegates to `Table::delete_rows` (single index
+    /// rebuild for the batch).
+    fn exec_delete(
+        &mut self,
+        stmt: &spg_sql::ast::DeleteStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.table)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
+        let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
+        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+        let mut positions: Vec<usize> = Vec::new();
+        for (i, row) in table.rows().iter().enumerate() {
+            let keep = if let Some(w) = &stmt.where_ {
+                let cond = eval::eval_expr(w, row, &ctx)?;
+                !matches!(cond, Value::Bool(true))
+            } else {
+                false
+            };
+            if !keep {
+                positions.push(i);
+            }
+        }
+        let affected = table.delete_rows(&positions);
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: !self.in_transaction(),
         })
     }
 
@@ -2391,8 +2493,10 @@ mod tests {
 
     #[test]
     fn invalid_sql_returns_parse_error() {
+        // v4.4: UPDATE is now real SQL, so use a true syntactic
+        // garbage payload for the parse-error path.
         let mut e = Engine::new();
-        let err = e.execute("UPDATE foo SET x = 1").unwrap_err();
+        let err = e.execute("THIS_IS_NOT_A_KEYWORD foo bar baz").unwrap_err();
         assert!(matches!(err, EngineError::Parse(_)));
     }
 
