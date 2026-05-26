@@ -215,8 +215,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     }
                 }
                 let raw = &input[start..i];
-                let lower = raw.to_ascii_lowercase();
-                out.push(keyword_or_ident(lower));
+                // v3.0.5: try the keyword table case-insensitively
+                // without allocating; only the ident fall-through
+                // pays for a lowercase String.
+                out.push(keyword_or_ident_raw(raw));
             }
             b if b.is_ascii_digit() => {
                 let (tok, consumed) =
@@ -310,57 +312,227 @@ fn single(out: &mut Vec<Token>, tok: Token, i: &mut usize) {
     *i += 1;
 }
 
-fn keyword_or_ident(lower: String) -> Token {
-    match lower.as_str() {
-        "select" => Token::Select,
-        "from" => Token::From,
-        "where" => Token::Where,
-        "as" => Token::As,
-        "null" => Token::Null,
-        "true" => Token::True,
-        "false" => Token::False,
-        "and" => Token::And,
-        "or" => Token::Or,
-        "not" => Token::Not,
-        "create" => Token::Create,
-        "table" => Token::Table,
-        "insert" => Token::Insert,
-        "into" => Token::Into,
-        "values" => Token::Values,
-        "index" => Token::Index,
-        "on" => Token::On,
-        "begin" => Token::Begin,
-        "commit" => Token::Commit,
-        "rollback" => Token::Rollback,
-        "order" => Token::Order,
-        "by" => Token::By,
-        "limit" => Token::Limit,
-        "is" => Token::Is,
-        "between" => Token::Between,
-        "in" => Token::In,
-        "like" => Token::Like,
-        "group" => Token::Group,
-        "distinct" => Token::Distinct,
-        "union" => Token::Union,
-        "all" => Token::All,
-        "join" => Token::Join,
-        "inner" => Token::Inner,
-        "left" => Token::Left,
-        "cross" => Token::Cross,
-        "outer" => Token::Outer,
-        "default" => Token::Default,
-        "savepoint" => Token::Savepoint,
-        "release" => Token::Release,
-        "to" => Token::To,
-        "having" => Token::Having,
-        "show" => Token::Show,
-        "extract" => Token::Extract,
-        "offset" => Token::Offset,
-        "asc" => Token::Asc,
-        "desc" => Token::Desc,
-        "interval" => Token::Interval,
-        _ => Token::Ident(lower),
+/// Length-first ASCII-CI keyword lookup. Avoids allocating a
+/// lowercase `String` when the input matches a keyword; only the ident
+/// fall-through path pays for the lowercase copy.
+///
+/// Grouped by length so the outer `match` becomes a small jump table.
+/// Within a length bucket every keyword has either a unique first
+/// byte (cheap dispatch) or a small set of disambiguating
+/// trailing-byte comparisons. All comparisons are ASCII-CI (XOR
+/// 0x20 on each byte before the compare).
+fn keyword_or_ident_raw(raw: &str) -> Token {
+    let b = raw.as_bytes();
+    let tok = match b.len() {
+        2 => kw_len2(b),
+        3 => kw_len3(b),
+        4 => kw_len4(b),
+        5 => kw_len5(b),
+        6 => kw_len6(b),
+        7 => kw_len7(b),
+        8 => kw_len8(b),
+        9 => kw_len9(b),
+        _ => None,
+    };
+    match tok {
+        Some(t) => t,
+        // Ident fall-through: this is the only path that allocates.
+        None => Token::Ident(raw.to_ascii_lowercase()),
     }
+}
+
+/// ASCII-CI equality on a byte slice against a lowercase literal.
+/// Letters that differ only in case satisfy `(a ^ b) == 0x20`; other
+/// mismatches set bits outside the 0x20 mask. We compare each byte
+/// against its lowercase form via `to_ascii_lowercase` for clarity;
+/// the compiler folds the loop into a tight cmov chain.
+#[inline]
+fn eq_ci(input: &[u8], lower: &[u8]) -> bool {
+    if input.len() != lower.len() {
+        return false;
+    }
+    for i in 0..lower.len() {
+        if input[i].to_ascii_lowercase() != lower[i] {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn kw_len2(b: &[u8]) -> Option<Token> {
+    // 7 keywords: as, by, in, is, on, or, to
+    if eq_ci(b, b"as") { return Some(Token::As); }
+    if eq_ci(b, b"by") { return Some(Token::By); }
+    if eq_ci(b, b"in") { return Some(Token::In); }
+    if eq_ci(b, b"is") { return Some(Token::Is); }
+    if eq_ci(b, b"on") { return Some(Token::On); }
+    if eq_ci(b, b"or") { return Some(Token::Or); }
+    if eq_ci(b, b"to") { return Some(Token::To); }
+    None
+}
+
+#[inline]
+fn kw_len3(b: &[u8]) -> Option<Token> {
+    // 4 keywords: all, and, asc, not
+    if eq_ci(b, b"all") {
+        return Some(Token::All);
+    }
+    if eq_ci(b, b"and") {
+        return Some(Token::And);
+    }
+    if eq_ci(b, b"asc") {
+        return Some(Token::Asc);
+    }
+    if eq_ci(b, b"not") {
+        return Some(Token::Not);
+    }
+    None
+}
+
+#[inline]
+fn kw_len4(b: &[u8]) -> Option<Token> {
+    // 9 keywords: from, null, true, into, like, join, left, show, desc
+    if eq_ci(b, b"from") {
+        return Some(Token::From);
+    }
+    if eq_ci(b, b"null") {
+        return Some(Token::Null);
+    }
+    if eq_ci(b, b"true") {
+        return Some(Token::True);
+    }
+    if eq_ci(b, b"into") {
+        return Some(Token::Into);
+    }
+    if eq_ci(b, b"like") {
+        return Some(Token::Like);
+    }
+    if eq_ci(b, b"join") {
+        return Some(Token::Join);
+    }
+    if eq_ci(b, b"left") {
+        return Some(Token::Left);
+    }
+    if eq_ci(b, b"show") {
+        return Some(Token::Show);
+    }
+    if eq_ci(b, b"desc") {
+        return Some(Token::Desc);
+    }
+    None
+}
+
+#[inline]
+fn kw_len5(b: &[u8]) -> Option<Token> {
+    // 12 keywords: false, where, table, index, begin, order, limit,
+    // group, union, inner, cross, outer
+    if eq_ci(b, b"false") {
+        return Some(Token::False);
+    }
+    if eq_ci(b, b"where") {
+        return Some(Token::Where);
+    }
+    if eq_ci(b, b"table") {
+        return Some(Token::Table);
+    }
+    if eq_ci(b, b"index") {
+        return Some(Token::Index);
+    }
+    if eq_ci(b, b"begin") {
+        return Some(Token::Begin);
+    }
+    if eq_ci(b, b"order") {
+        return Some(Token::Order);
+    }
+    if eq_ci(b, b"limit") {
+        return Some(Token::Limit);
+    }
+    if eq_ci(b, b"group") {
+        return Some(Token::Group);
+    }
+    if eq_ci(b, b"union") {
+        return Some(Token::Union);
+    }
+    if eq_ci(b, b"inner") {
+        return Some(Token::Inner);
+    }
+    if eq_ci(b, b"cross") {
+        return Some(Token::Cross);
+    }
+    if eq_ci(b, b"outer") {
+        return Some(Token::Outer);
+    }
+    None
+}
+
+#[inline]
+fn kw_len6(b: &[u8]) -> Option<Token> {
+    // 7 keywords: select, create, insert, values, commit, having, offset
+    if eq_ci(b, b"select") {
+        return Some(Token::Select);
+    }
+    if eq_ci(b, b"create") {
+        return Some(Token::Create);
+    }
+    if eq_ci(b, b"insert") {
+        return Some(Token::Insert);
+    }
+    if eq_ci(b, b"values") {
+        return Some(Token::Values);
+    }
+    if eq_ci(b, b"commit") {
+        return Some(Token::Commit);
+    }
+    if eq_ci(b, b"having") {
+        return Some(Token::Having);
+    }
+    if eq_ci(b, b"offset") {
+        return Some(Token::Offset);
+    }
+    None
+}
+
+#[inline]
+fn kw_len7(b: &[u8]) -> Option<Token> {
+    // 4 keywords: between, default, release, extract
+    if eq_ci(b, b"between") {
+        return Some(Token::Between);
+    }
+    if eq_ci(b, b"default") {
+        return Some(Token::Default);
+    }
+    if eq_ci(b, b"release") {
+        return Some(Token::Release);
+    }
+    if eq_ci(b, b"extract") {
+        return Some(Token::Extract);
+    }
+    None
+}
+
+#[inline]
+fn kw_len8(b: &[u8]) -> Option<Token> {
+    // 3 keywords: rollback, distinct, interval
+    if eq_ci(b, b"rollback") {
+        return Some(Token::Rollback);
+    }
+    if eq_ci(b, b"distinct") {
+        return Some(Token::Distinct);
+    }
+    if eq_ci(b, b"interval") {
+        return Some(Token::Interval);
+    }
+    None
+}
+
+#[inline]
+fn kw_len9(b: &[u8]) -> Option<Token> {
+    // 1 keyword: savepoint
+    if eq_ci(b, b"savepoint") {
+        return Some(Token::Savepoint);
+    }
+    None
 }
 
 /// Lex a `'...'` string literal or `"..."` quoted identifier. The opening

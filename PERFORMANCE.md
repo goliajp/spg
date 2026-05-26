@@ -60,10 +60,10 @@ Run: `cargo bench -p spg-wire --bench frames`.
 
 | Path                                | Median   | Notes |
 |-------------------------------------|---------:|-------|
-| `lex_select_one`                    | **42 ns** | Tokenize `SELECT 1`. |
-| `parse_select_one`                  | **135 ns**| Full parse of `SELECT 1`. |
-| `parse_select_where_order_limit`    | **666 ns**| `SELECT id, name FROM users WHERE id > 100 ORDER BY id DESC LIMIT 10`. |
-| `parse_join_aggregate`              | **1.45 µs** | Multi-table JOIN + GROUP BY + HAVING + ORDER BY <int> + LIMIT. |
+| `lex_select_one`                    | **27 ns** | v3.0.5: was 42 ns; **−36%** ✅ (length-first ASCII-CI keyword lookup + no `String` allocation on the keyword path). |
+| `parse_select_one`                  | **106 ns**| v3.0.5: was 135 ns; **−21%** ✅. |
+| `parse_select_where_order_limit`    | **508 ns**| v3.0.5: was 666 ns; **−24%** ✅. |
+| `parse_join_aggregate`              | **1.11 µs** | v3.0.5: was 1.45 µs; **−23%** ✅. |
 
 Run: `cargo bench -p spg-sql --bench parse`.
 
