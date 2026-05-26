@@ -70,6 +70,10 @@ pub enum Token {
     Dot,
     /// pgvector L2 distance operator `<->`. Lexed as one token so the
     /// parser can give it its own precedence rung.
+    /// v4.14 `->` — JSON object/array element access, returns json.
+    JsonGet,
+    /// v4.14 `->>` — same access, returns text.
+    JsonGetText,
     L2Distance,
     /// pgvector inner-product operator `<#>` (returns negative dot product
     /// so smaller still means more similar — same semantics as pgvector).
@@ -233,7 +237,19 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 i += consumed;
             }
             b'+' => single(&mut out, Token::Plus, &mut i),
-            b'-' => single(&mut out, Token::Minus, &mut i),
+            b'-' => {
+                // v4.14: `->>` and `->` for JSON path access. `->>`
+                // must be tried before `->` (longest match).
+                if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'>') {
+                    out.push(Token::JsonGetText);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'>') {
+                    out.push(Token::JsonGet);
+                    i += 2;
+                } else {
+                    single(&mut out, Token::Minus, &mut i);
+                }
+            }
             b'*' => single(&mut out, Token::Star, &mut i),
             b'/' => single(&mut out, Token::Slash, &mut i),
             b'(' => single(&mut out, Token::LParen, &mut i),
