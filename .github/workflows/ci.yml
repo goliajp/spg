@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clippy
+        run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+      - name: cargo test --workspace
+        # Replication and backup e2e tests spawn `spg-server` child
+        # processes; serial runner keeps port-grabbing tests honest.
+        run: cargo test --workspace --locked -- --test-threads=1
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  release-build:
+    name: release build (sanity)
+    runs-on: ubuntu-latest
+    # Catches optimization-only bugs and confirms the production
+    # binary still links cleanly — runs only on main-branch pushes
+    # to keep PR CI fast.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release -p spg-server
+        run: cargo build --release -p spg-server --locked
+      - name: Upload spg-server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: spg-server-linux-amd64
+          path: target/release/spg-server
+          retention-days: 14

@@ -125,7 +125,10 @@ fn explain_simple_table_scan_reports_full_scan() {
     let blob = lines.join("\n");
     assert!(blob.contains("TableScan"), "missing TableScan: {blob}");
     assert!(blob.contains("From: t"), "missing From: t: {blob}");
-    assert!(blob.contains("full scan"), "expected full scan note: {blob}");
+    assert!(
+        blob.contains("full scan"),
+        "expected full scan note: {blob}"
+    );
 }
 
 #[test]
@@ -200,10 +203,7 @@ fn explain_window_function_labels_window_op() {
     let mut s = wait_for_listener(&addr, &mut child.0);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
-    exec_ok(
-        &mut s,
-        "CREATE TABLE w (n INT NOT NULL, v INT NOT NULL)",
-    );
+    exec_ok(&mut s, "CREATE TABLE w (n INT NOT NULL, v INT NOT NULL)");
     exec_ok(&mut s, "INSERT INTO w VALUES (1, 10)");
 
     let lines = explain_lines(

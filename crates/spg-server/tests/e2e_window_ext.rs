@@ -141,10 +141,7 @@ fn lag_default_offset_and_default_value() {
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed_ts(&mut s);
 
-    let rows = select_rows(
-        &mut s,
-        "SELECT n, LAG(v) OVER (ORDER BY n) FROM ts",
-    );
+    let rows = select_rows(&mut s, "SELECT n, LAG(v) OVER (ORDER BY n) FROM ts");
     let mut got: Vec<(i64, Option<i64>)> = rows
         .iter()
         .map(|r| (as_i64(&r[0]), as_i64_opt(&r[1])))
@@ -152,7 +149,13 @@ fn lag_default_offset_and_default_value() {
     got.sort_by_key(|(n, _)| *n);
     assert_eq!(
         got,
-        vec![(1, None), (2, Some(10)), (3, Some(20)), (4, Some(30)), (5, Some(40))]
+        vec![
+            (1, None),
+            (2, Some(10)),
+            (3, Some(20)),
+            (4, Some(30)),
+            (5, Some(40))
+        ]
     );
 }
 
@@ -164,10 +167,7 @@ fn lead_with_offset_and_default() {
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed_ts(&mut s);
 
-    let rows = select_rows(
-        &mut s,
-        "SELECT n, LEAD(v, 2, -1) OVER (ORDER BY n) FROM ts",
-    );
+    let rows = select_rows(&mut s, "SELECT n, LEAD(v, 2, -1) OVER (ORDER BY n) FROM ts");
     let mut got: Vec<(i64, i64)> = rows
         .iter()
         .map(|r| (as_i64(&r[0]), as_i64(&r[1])))
@@ -199,7 +199,13 @@ fn first_and_last_value_honor_frame() {
     got.sort_by_key(|(n, _, _)| *n);
     assert_eq!(
         got,
-        vec![(1, 10, 10), (2, 10, 20), (3, 10, 30), (4, 10, 40), (5, 10, 50)]
+        vec![
+            (1, 10, 10),
+            (2, 10, 20),
+            (3, 10, 30),
+            (4, 10, 40),
+            (5, 10, 50)
+        ]
     );
 }
 
@@ -230,10 +236,7 @@ fn ntile_distributes_evenly_and_handles_remainders() {
     seed_ts(&mut s);
 
     // 5 rows / 2 buckets → first bucket gets 3, second gets 2.
-    let rows = select_rows(
-        &mut s,
-        "SELECT n, NTILE(2) OVER (ORDER BY n) FROM ts",
-    );
+    let rows = select_rows(&mut s, "SELECT n, NTILE(2) OVER (ORDER BY n) FROM ts");
     let mut got: Vec<(i64, i64)> = rows
         .iter()
         .map(|r| (as_i64(&r[0]), as_i64(&r[1])))
@@ -250,17 +253,17 @@ fn percent_rank_spans_zero_to_one() {
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed_ts(&mut s);
 
-    let rows = select_rows(
-        &mut s,
-        "SELECT n, PERCENT_RANK() OVER (ORDER BY n) FROM ts",
-    );
+    let rows = select_rows(&mut s, "SELECT n, PERCENT_RANK() OVER (ORDER BY n) FROM ts");
     let mut got: Vec<(i64, f64)> = rows
         .iter()
         .map(|r| (as_i64(&r[0]), as_f64(&r[1])))
         .collect();
     got.sort_by_key(|(n, _)| *n);
     // (rank-1)/(n-1) for ranks 1..5 in n=5: 0, 0.25, 0.5, 0.75, 1.0.
-    assert_eq!(got, vec![(1, 0.0), (2, 0.25), (3, 0.5), (4, 0.75), (5, 1.0)]);
+    assert_eq!(
+        got,
+        vec![(1, 0.0), (2, 0.25), (3, 0.5), (4, 0.75), (5, 1.0)]
+    );
 }
 
 #[test]
@@ -274,10 +277,7 @@ fn cume_dist_is_peer_inclusive_running_share() {
         exec_ok(&mut s, &format!("INSERT INTO peers VALUES ({k})"));
     }
 
-    let rows = select_rows(
-        &mut s,
-        "SELECT k, CUME_DIST() OVER (ORDER BY k) FROM peers",
-    );
+    let rows = select_rows(&mut s, "SELECT k, CUME_DIST() OVER (ORDER BY k) FROM peers");
     let mut got: Vec<(i64, f64)> = rows
         .iter()
         .map(|r| (as_i64(&r[0]), as_f64(&r[1])))

@@ -45,10 +45,9 @@ impl core::fmt::Display for BackupError {
         match self {
             Self::Io(e) => write!(f, "backup io: {e}"),
             Self::NoWal => f.write_str("server has no WAL configured — backup requires WAL"),
-            Self::BadSinceOffset(n) => write!(
-                f,
-                "incremental SINCE offset {n} exceeds current WAL length"
-            ),
+            Self::BadSinceOffset(n) => {
+                write!(f, "incremental SINCE offset {n} exceeds current WAL length")
+            }
         }
     }
 }

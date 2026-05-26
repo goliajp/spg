@@ -135,9 +135,7 @@ impl Parser {
                 }
                 let inner = self.parse_select_stmt()?;
                 let Statement::Select(s) = inner else {
-                    return Err(self.err(format!(
-                        "EXPLAIN body must be a SELECT, got {inner:?}"
-                    )));
+                    return Err(self.err(format!("EXPLAIN body must be a SELECT, got {inner:?}")));
                 };
                 Ok(Statement::Explain(crate::ast::ExplainStatement {
                     analyze,
@@ -1671,10 +1669,7 @@ impl Parser {
             self.advance();
             let start = self.parse_frame_bound()?;
             if !matches!(self.peek(), Token::And) {
-                return Err(self.err(format!(
-                    "expected AND in frame spec, got {:?}",
-                    self.peek()
-                )));
+                return Err(self.err(format!("expected AND in frame spec, got {:?}", self.peek())));
             }
             self.advance();
             let end = self.parse_frame_bound()?;
