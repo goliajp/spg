@@ -1037,10 +1037,7 @@ fn parse_set_statement(sql: &str) -> Option<(String, String)> {
         return None;
     }
     // Strip surrounding quotes from the value.
-    let value = value_part
-        .trim_matches('\'')
-        .trim_matches('"')
-        .to_string();
+    let value = value_part.trim_matches('\'').trim_matches('"').to_string();
     Some((name, value))
 }
 
@@ -1055,10 +1052,7 @@ fn parse_show_statement(sql: &str) -> Option<String> {
 
 /// Render a SHOW result: the value from `settings` first, else a
 /// known default. SHOW ALL emits one row per known setting.
-fn render_show(
-    name: &str,
-    settings: &std::collections::HashMap<String, String>,
-) -> CannedResponse {
+fn render_show(name: &str, settings: &std::collections::HashMap<String, String>) -> CannedResponse {
     if name == "all" {
         let mut entries: Vec<(String, String)> = known_defaults()
             .iter()
@@ -1080,9 +1074,7 @@ fn render_show(
         ];
         let rows: Vec<Row> = entries
             .into_iter()
-            .map(|(n, v)| {
-                Row::new(vec![Value::Text(n), Value::Text(v), Value::Null])
-            })
+            .map(|(n, v)| Row::new(vec![Value::Text(n), Value::Text(v), Value::Null]))
             .collect();
         return CannedResponse::Rows { columns, rows };
     }

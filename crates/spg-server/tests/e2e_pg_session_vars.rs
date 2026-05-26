@@ -233,7 +233,10 @@ fn show_all_lists_known_settings() {
     send_query(&mut s, "SHOW ALL");
     let msgs = drain_until_ready(&mut s);
     let row_count = msgs.iter().filter(|m| m.ty == b'D').count();
-    assert!(row_count >= 10, "SHOW ALL should list >=10 settings, got {row_count}");
+    assert!(
+        row_count >= 10,
+        "SHOW ALL should list >=10 settings, got {row_count}"
+    );
 }
 
 #[test]

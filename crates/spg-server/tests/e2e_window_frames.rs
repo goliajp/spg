@@ -138,9 +138,15 @@ fn rows_between_unbounded_preceding_and_current_row() {
         &mut s,
         "SELECT n, SUM(v) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM ts",
     );
-    let mut got: Vec<(i64, f64)> = rows.iter().map(|r| (as_i64(&r[0]), as_f64(&r[1]))).collect();
+    let mut got: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|r| (as_i64(&r[0]), as_f64(&r[1])))
+        .collect();
     got.sort_by_key(|(n, _)| *n);
-    assert_eq!(got, vec![(1, 10.0), (2, 30.0), (3, 60.0), (4, 100.0), (5, 150.0)]);
+    assert_eq!(
+        got,
+        vec![(1, 10.0), (2, 30.0), (3, 60.0), (4, 100.0), (5, 150.0)]
+    );
 }
 
 #[test]
@@ -156,11 +162,17 @@ fn rows_between_one_preceding_and_one_following() {
         &mut s,
         "SELECT n, SUM(v) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM ts",
     );
-    let mut got: Vec<(i64, f64)> = rows.iter().map(|r| (as_i64(&r[0]), as_f64(&r[1]))).collect();
+    let mut got: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|r| (as_i64(&r[0]), as_f64(&r[1])))
+        .collect();
     got.sort_by_key(|(n, _)| *n);
     // n=1: [10,20]=30; n=2: [10,20,30]=60; n=3: [20,30,40]=90;
     // n=4: [30,40,50]=120; n=5: [40,50]=90.
-    assert_eq!(got, vec![(1, 30.0), (2, 60.0), (3, 90.0), (4, 120.0), (5, 90.0)]);
+    assert_eq!(
+        got,
+        vec![(1, 30.0), (2, 60.0), (3, 90.0), (4, 120.0), (5, 90.0)]
+    );
 }
 
 #[test]
@@ -194,11 +206,17 @@ fn rows_shorthand_n_preceding() {
         &mut s,
         "SELECT n, AVG(v) OVER (ORDER BY n ROWS 2 PRECEDING) FROM ts",
     );
-    let mut got: Vec<(i64, f64)> = rows.iter().map(|r| (as_i64(&r[0]), as_f64(&r[1]))).collect();
+    let mut got: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|r| (as_i64(&r[0]), as_f64(&r[1])))
+        .collect();
     got.sort_by_key(|(n, _)| *n);
     // n=1: avg(10)=10; n=2: avg(10,20)=15; n=3: avg(10,20,30)=20;
     // n=4: avg(20,30,40)=30; n=5: avg(30,40,50)=40.
-    assert_eq!(got, vec![(1, 10.0), (2, 15.0), (3, 20.0), (4, 30.0), (5, 40.0)]);
+    assert_eq!(
+        got,
+        vec![(1, 10.0), (2, 15.0), (3, 20.0), (4, 30.0), (5, 40.0)]
+    );
 }
 
 #[test]
@@ -207,7 +225,10 @@ fn range_peer_semantics_with_ties() {
     let mut child = ChildGuard(spawn_server(&addr));
     let mut s = wait_for_listener(&addr, &mut child.0);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    exec_ok(&mut s, "CREATE TABLE peers (k INT NOT NULL, v INT NOT NULL)");
+    exec_ok(
+        &mut s,
+        "CREATE TABLE peers (k INT NOT NULL, v INT NOT NULL)",
+    );
     // ORDER BY key has ties at k=2 and k=3.
     for (k, v) in [(1, 10), (2, 20), (2, 25), (3, 30), (3, 35)] {
         exec_ok(&mut s, &format!("INSERT INTO peers VALUES ({k}, {v})"));
@@ -270,7 +291,10 @@ fn count_star_over_sliding_window() {
         &mut s,
         "SELECT n, COUNT(*) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM ts",
     );
-    let mut got: Vec<(i64, i64)> = rows.iter().map(|r| (as_i64(&r[0]), as_i64(&r[1]))).collect();
+    let mut got: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|r| (as_i64(&r[0]), as_i64(&r[1])))
+        .collect();
     got.sort_by_key(|(n, _)| *n);
     // n=1: 2 (no preceding); n=2,3,4: 3; n=5: 2 (no following).
     assert_eq!(got, vec![(1, 2), (2, 3), (3, 3), (4, 3), (5, 2)]);

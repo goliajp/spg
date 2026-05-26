@@ -135,11 +135,7 @@ fn capture_snapshot(state: &ServerState) -> std::io::Result<(Vec<u8>, u64)> {
 
 /// Tail `wal_path` from `start_offset` forever, streaming new bytes
 /// to the follower as they appear. Polls every 50 ms when idle.
-fn tail_wal(
-    mut stream: TcpStream,
-    wal_path: &Path,
-    start_offset: u64,
-) -> std::io::Result<()> {
+fn tail_wal(mut stream: TcpStream, wal_path: &Path, start_offset: u64) -> std::io::Result<()> {
     let mut f = std::fs::File::open(wal_path)?;
     f.seek(SeekFrom::Start(start_offset))?;
     let mut buf = [0u8; 4096];
@@ -209,9 +205,12 @@ fn follow_once(
 
     if snap_len > 0 {
         // Receive snapshot.
-        let mut snap = vec![0u8; usize::try_from(snap_len).map_err(|_| {
-            std::io::Error::other("snapshot length exceeds usize range")
-        })?];
+        let mut snap = vec![
+            0u8;
+            usize::try_from(snap_len).map_err(|_| {
+                std::io::Error::other("snapshot length exceeds usize range")
+            })?
+        ];
         stream.read_exact(&mut snap)?;
         std::fs::write(db_path, &snap)?;
         // Receive starting WAL position; pre-allocate the wal file
@@ -220,9 +219,8 @@ fn follow_once(
         stream.read_exact(&mut pos_buf)?;
         std::fs::write(wal_path, b"")?;
         // Reload engine from new snapshot bytes.
-        let new_engine = Engine::restore_envelope(&snap).map_err(|e| {
-            std::io::Error::other(format!("follower restore from snapshot: {e}"))
-        })?;
+        let new_engine = Engine::restore_envelope(&snap)
+            .map_err(|e| std::io::Error::other(format!("follower restore from snapshot: {e}")))?;
         let mut g = state
             .engine
             .write()
@@ -254,9 +252,8 @@ fn follow_once(
                 break;
             }
             let sql_bytes = &pending[cur + 4..cur + 4 + rec_len];
-            let sql = core::str::from_utf8(sql_bytes).map_err(|_| {
-                std::io::Error::other("non-UTF-8 SQL in replicated WAL record")
-            })?;
+            let sql = core::str::from_utf8(sql_bytes)
+                .map_err(|_| std::io::Error::other("non-UTF-8 SQL in replicated WAL record"))?;
             {
                 let mut eng = state
                     .engine

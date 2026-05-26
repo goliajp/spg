@@ -2311,7 +2311,11 @@ impl Engine {
             )));
         }
         let anchor_result = self.exec_select_cancel(&anchor, cancel)?;
-        let QueryResult::Rows { columns: anchor_cols, rows: anchor_rows } = anchor_result else {
+        let QueryResult::Rows {
+            columns: anchor_cols,
+            rows: anchor_rows,
+        } = anchor_result
+        else {
             return Err(EngineError::Unsupported(alloc::format!(
                 "WITH RECURSIVE {:?}: anchor did not return rows",
                 cte.name
@@ -2339,9 +2343,7 @@ impl Engine {
         let mut seen: alloc::collections::BTreeSet<Vec<u8>> = alloc::collections::BTreeSet::new();
         // Track at least one "all UNION ALL" flag — if every union
         // kind is ALL we skip the dedup step (faster + matches PG).
-        let all_union_all = union_terms
-            .iter()
-            .all(|(k, _)| matches!(k, UnionKind::All));
+        let all_union_all = union_terms.iter().all(|(k, _)| matches!(k, UnionKind::All));
         if !all_union_all {
             for r in &all_rows {
                 seen.insert(encode_row_key(r));
@@ -2359,9 +2361,7 @@ impl Engine {
                 .create_table(schema)
                 .map_err(EngineError::Storage)?;
             {
-                let table = iter_catalog
-                    .get_mut(&cte.name)
-                    .expect("just-created");
+                let table = iter_catalog.get_mut(&cte.name).expect("just-created");
                 for row in &working_set {
                     table.insert(row.clone()).map_err(EngineError::Storage)?;
                 }
@@ -2379,7 +2379,11 @@ impl Engine {
                 let mut term = term.clone();
                 term.ctes = Vec::new();
                 let r = iter_engine.exec_select_cancel(&term, cancel)?;
-                let QueryResult::Rows { columns: rc, rows: rs } = r else {
+                let QueryResult::Rows {
+                    columns: rc,
+                    rows: rs,
+                } = r
+                else {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "WITH RECURSIVE {:?}: recursive term did not return rows",
                         cte.name
@@ -2388,7 +2392,9 @@ impl Engine {
                 if rc.len() != columns.len() {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "WITH RECURSIVE {:?}: column count of recursive term ({}) does not match anchor ({})",
-                        cte.name, rc.len(), columns.len()
+                        cte.name,
+                        rc.len(),
+                        columns.len()
                     )));
                 }
                 for row in rs {
@@ -2576,8 +2582,7 @@ impl Engine {
                 negated,
             } => {
                 self.resolve_correlated_in_expr(lhs, row, ctx, cancel)?;
-                let lhs_val =
-                    eval::eval_expr(lhs, row, ctx).map_err(EngineError::Eval)?;
+                let lhs_val = eval::eval_expr(lhs, row, ctx).map_err(EngineError::Eval)?;
                 let mut s = (**subquery).clone();
                 substitute_outer_columns(&mut s, row, ctx);
                 let r = self.exec_select_cancel(&s, cancel)?;
@@ -2916,11 +2921,7 @@ fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &m
         if let Some(w) = &stmt.where_
             && let Some(table) = engine.active_catalog().get(&from.primary.name)
         {
-            let alias = from
-                .primary
-                .alias
-                .as_deref()
-                .unwrap_or(&from.primary.name);
+            let alias = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
             let cols = &table.schema().columns;
             if try_index_seek(w, cols, table, alias).is_some() {
                 tag.push_str(" [index seek]");
@@ -2976,7 +2977,11 @@ fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &m
         out.push(alloc::format!("{child}Offset: {off}"));
     }
     // 5) Projection — collapse Wildcard or render N items.
-    if stmt.items.iter().any(|it| matches!(it, SelectItem::Wildcard)) {
+    if stmt
+        .items
+        .iter()
+        .any(|it| matches!(it, SelectItem::Wildcard))
+    {
         out.push(alloc::format!("{child}Project: *"));
     } else {
         out.push(alloc::format!(
@@ -3432,14 +3437,15 @@ fn compute_window_partition(
             for (i, (_, _, idx)) in slice.iter().enumerate() {
                 let signed_offset = if lower == "lag" { -offset } else { offset };
                 let target_signed = i64::try_from(i).unwrap_or(i64::MAX) + signed_offset;
-                let v = if target_signed < 0 || target_signed >= i64::try_from(n).unwrap_or(i64::MAX) {
-                    default.clone()
-                } else {
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        values[target_signed as usize].clone()
-                    }
-                };
+                let v =
+                    if target_signed < 0 || target_signed >= i64::try_from(n).unwrap_or(i64::MAX) {
+                        default.clone()
+                    } else {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            values[target_signed as usize].clone()
+                        }
+                    };
                 out_vals[*idx] = v;
             }
             Ok(())
@@ -3497,7 +3503,11 @@ fn compute_window_partition(
                         "last_value" => values[hi].clone(),
                         "nth_value" => {
                             let pos = lo + nth - 1;
-                            if pos > hi { Value::Null } else { values[pos].clone() }
+                            if pos > hi {
+                                Value::Null
+                            } else {
+                                values[pos].clone()
+                            }
                         }
                         _ => unreachable!(),
                     }
@@ -3542,8 +3552,7 @@ fn compute_window_partition(
             for (_, _, idx) in slice {
                 if remaining_in_bucket == 0 {
                     bucket += 1;
-                    buckets_with_extra_remaining =
-                        buckets_with_extra_remaining.saturating_sub(1);
+                    buckets_with_extra_remaining = buckets_with_extra_remaining.saturating_sub(1);
                     remaining_in_bucket = if buckets_with_extra_remaining > 0 {
                         base + 1
                     } else {
@@ -3632,17 +3641,15 @@ fn effective_frame(
             }
         }
         Some(fr) => {
-            let end = fr
-                .end
-                .clone()
-                .unwrap_or(FrameBound::CurrentRow);
+            let end = fr.end.clone().unwrap_or(FrameBound::CurrentRow);
             // Reject start > end (a few impossible combinations).
             if matches!(fr.start, FrameBound::UnboundedFollowing)
                 || matches!(end, FrameBound::UnboundedPreceding)
             {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "invalid frame: start={:?} end={:?}",
-                    fr.start, end
+                    fr.start,
+                    end
                 )));
             }
             // RANGE OFFSET PRECEDING / FOLLOWING needs value-typed
@@ -3758,8 +3765,7 @@ fn peer_group_start(slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)], i: usize)
 fn peer_group_end(slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)], i: usize) -> usize {
     let key = &slice[i].1;
     let mut j = i;
-    while j + 1 < slice.len() && order_key_cmp(&slice[j + 1].1, key) == core::cmp::Ordering::Equal
-    {
+    while j + 1 < slice.len() && order_key_cmp(&slice[j + 1].1, key) == core::cmp::Ordering::Equal {
         j += 1;
     }
     j

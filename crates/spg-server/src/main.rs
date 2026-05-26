@@ -343,9 +343,7 @@ fn run(
     if let Ok(master_addr) = env::var("SPG_FOLLOW_OF")
         && !master_addr.is_empty()
     {
-        if let (Some(db), Some(wal)) =
-            (state.db_path.clone(), state.wal_path.clone())
-        {
+        if let (Some(db), Some(wal)) = (state.db_path.clone(), state.wal_path.clone()) {
             let state_for_follower = Arc::clone(&state);
             thread::Builder::new()
                 .name("spg-follower".into())
@@ -708,9 +706,7 @@ fn dispatch(
                 if !acting.can_manage_users() {
                     return write_frame(
                         stream,
-                        &build_error_response(
-                            "permission denied: BACKUP requires admin role",
-                        ),
+                        &build_error_response("permission denied: BACKUP requires admin role"),
                     );
                 }
                 return run_backup_command(stream, state, &backup_intent);
@@ -943,7 +939,10 @@ fn run_backup_command(
         // captured WAL position back to the caller — it's the
         // number an incremental backup will pass as SINCE.
         Ok(wal_pos) => write_frame(stream, &build_command_complete(wal_pos)),
-        Err(e) => write_frame(stream, &build_error_response(&format!("backup failed: {e}"))),
+        Err(e) => write_frame(
+            stream,
+            &build_error_response(&format!("backup failed: {e}")),
+        ),
     }
 }
 

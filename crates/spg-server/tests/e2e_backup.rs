@@ -173,7 +173,8 @@ fn apply_bundle_to(dest_db: &Path, dest_wal: &Path, bundle: &Path) -> (u8, u64, 
     let snap_len = u64::from_le_bytes(bytes[25..33].try_into().unwrap()) as usize;
     let snap_end = 33 + snap_len;
     let wal_pos = u64::from_le_bytes(bytes[snap_end..snap_end + 8].try_into().unwrap());
-    let wal_len = u64::from_le_bytes(bytes[snap_end + 8..snap_end + 16].try_into().unwrap()) as usize;
+    let wal_len =
+        u64::from_le_bytes(bytes[snap_end + 8..snap_end + 16].try_into().unwrap()) as usize;
     let wal_start = snap_end + 16;
     let wal_slice = &bytes[wal_start..wal_start + wal_len];
 
@@ -205,17 +206,13 @@ fn full_plus_incremental_round_trip_restores_state() {
     let mut s = wait_for_listener(&addr, &mut child.0);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
-    exec_ok(
-        &mut s,
-        "CREATE TABLE k (id INT NOT NULL, v INT NOT NULL)",
-    );
+    exec_ok(&mut s, "CREATE TABLE k (id INT NOT NULL, v INT NOT NULL)");
     for i in 1..=3 {
         exec_ok(&mut s, &format!("INSERT INTO k VALUES ({i}, {})", i * 10));
     }
 
     let full_bundle = dir.join("full.bkp");
-    let pos_after_full =
-        exec_with_count(&mut s, &format!("BACKUP TO '{}'", full_bundle.display()));
+    let pos_after_full = exec_with_count(&mut s, &format!("BACKUP TO '{}'", full_bundle.display()));
 
     for i in 4..=5 {
         exec_ok(&mut s, &format!("INSERT INTO k VALUES ({i}, {})", i * 10));
@@ -271,8 +268,7 @@ fn pitr_via_replay_upto_truncates_history() {
     exec_ok(&mut s, "INSERT INTO p VALUES (2)");
 
     let bundle = dir.join("snap.bkp");
-    let pivot_pos =
-        exec_with_count(&mut s, &format!("BACKUP TO '{}'", bundle.display()));
+    let pivot_pos = exec_with_count(&mut s, &format!("BACKUP TO '{}'", bundle.display()));
 
     // More writes after the pivot — these get captured in the WAL
     // (and on disk), but PITR will truncate them at startup.

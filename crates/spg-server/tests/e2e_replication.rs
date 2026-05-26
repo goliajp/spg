@@ -40,12 +40,7 @@ fn unique_tmpdir() -> PathBuf {
     p
 }
 
-fn spawn(
-    addr: &str,
-    db: &PathBuf,
-    wal: &PathBuf,
-    extra_env: Vec<(&str, String)>,
-) -> Child {
+fn spawn(addr: &str, db: &PathBuf, wal: &PathBuf, extra_env: Vec<(&str, String)>) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
     cmd.arg(addr)
         .arg(db)
@@ -179,7 +174,10 @@ fn follower_bootstraps_from_master_snapshot_and_tails_writes() {
         "CREATE TABLE rep (id INT NOT NULL, v INT NOT NULL)",
     );
     for i in 1..=3 {
-        exec_ok(&mut ms, &format!("INSERT INTO rep VALUES ({i}, {})", i * 10));
+        exec_ok(
+            &mut ms,
+            &format!("INSERT INTO rep VALUES ({i}, {})", i * 10),
+        );
     }
     assert_eq!(select_count(&mut ms, "SELECT count(*) FROM rep"), 3);
 
