@@ -69,6 +69,12 @@ pub enum EngineError {
     /// v4.2: a SELECT would have returned more rows than the
     /// configured `max_query_rows` cap. Carries the cap.
     RowLimitExceeded(usize),
+    /// v4.5: cooperative cancellation — the host (server's
+    /// per-query watchdog) set the cancel flag while a long-running
+    /// SELECT / UPDATE / DELETE was scanning rows. The partial work
+    /// is discarded; the caller should surface this as a timeout
+    /// to the client.
+    Cancelled,
 }
 
 impl fmt::Display for EngineError {
@@ -86,6 +92,7 @@ impl fmt::Display for EngineError {
             Self::RowLimitExceeded(n) => {
                 write!(f, "query exceeded max_query_rows={n}")
             }
+            Self::Cancelled => f.write_str("query cancelled (timeout or client request)"),
         }
     }
 }
@@ -123,6 +130,51 @@ pub type ClockFn = fn() -> i64;
 /// derived from the username (acceptable in tests; the server always
 /// installs a real RNG so production paths never see this).
 pub type SaltFn = fn() -> [u8; 16];
+
+/// v4.5 cooperative cancellation token. A long-running SELECT /
+/// UPDATE / DELETE checks `is_cancelled` at row-loop checkpoints
+/// and bails with `EngineError::Cancelled`. The host
+/// (`spg-server`) creates an `AtomicBool` per query, spawns a
+/// watchdog thread that sets it after `SPG_QUERY_TIMEOUT_MS`,
+/// and passes it via `execute_with_cancel` / `execute_readonly_with_cancel`.
+///
+/// `CancelToken::none()` is a no-op — used by the legacy `execute`
+/// and `execute_readonly` entry points so existing callers don't
+/// change.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelToken<'a> {
+    flag: Option<&'a core::sync::atomic::AtomicBool>,
+}
+
+impl<'a> CancelToken<'a> {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { flag: None }
+    }
+
+    #[must_use]
+    pub const fn from_flag(f: &'a core::sync::atomic::AtomicBool) -> Self {
+        Self { flag: Some(f) }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(self) -> bool {
+        self.flag
+            .is_some_and(|f| f.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Returns `Err(Cancelled)` if the token has been tripped.
+    /// Used at row-loop checkpoints to bail cooperatively without
+    /// scattering raw `is_cancelled` checks across the executor.
+    #[inline]
+    pub fn check(self) -> Result<(), EngineError> {
+        if self.is_cancelled() {
+            Err(EngineError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 // ---- snapshot envelope (v4.1) ----
 //
@@ -375,6 +427,20 @@ impl Engine {
     /// under an `RwLock::read()` so multiple `SELECT` clients run in
     /// parallel without serialising on a single mutex.
     pub fn execute_readonly(&self, sql: &str) -> Result<QueryResult, EngineError> {
+        self.execute_readonly_with_cancel(sql, CancelToken::none())
+    }
+
+    /// v4.5 — read path with cooperative cancellation. Token's
+    /// `is_cancelled` is checked at the start (so a watchdog that
+    /// already fired returns Cancelled immediately) and at row-loop
+    /// checkpoints inside `exec_select`. SHOW paths are O(small) and
+    /// don't bother checking.
+    pub fn execute_readonly_with_cancel(
+        &self,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
         let mut stmt = parser::parse_statement(sql)?;
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
@@ -382,7 +448,7 @@ impl Engine {
             resolve_order_by_position(s);
         }
         let result = match stmt {
-            Statement::Select(s) => self.exec_select(&s),
+            Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
@@ -407,19 +473,23 @@ impl Engine {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
+        self.execute_with_cancel(sql, CancelToken::none())
+    }
+
+    /// v4.5 — write path with cooperative cancellation. Token is
+    /// checked at entry and then by `exec_update` / `exec_delete` /
+    /// `exec_select_cancel` row-loop checkpoints. INSERT, DDL, and
+    /// TX-state ops complete atomically and don't honour the token —
+    /// killing those mid-flight would leave the catalog half-mutated.
+    pub fn execute_with_cancel(
+        &mut self,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
         let mut stmt = parser::parse_statement(sql)?;
-        // Replace `NOW()` / `CURRENT_TIMESTAMP()` / `CURRENT_DATE()`
-        // function calls with the engine's clock reading, rewritten
-        // as `<literal int>::TIMESTAMP` / `::DATE`. The rewrite reads
-        // the clock once per statement so every reference observes the
-        // same instant. The walk is structured as a single `match` so
-        // expressions that don't reference the clock (the common case)
-        // take exactly one pattern dispatch and bail out.
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
-        // `ORDER BY <n>` (1-based select-list position) gets resolved
-        // to the matching SELECT item expression here so the executor
-        // can treat it uniformly with all the other order_by forms.
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
         }
@@ -427,9 +497,9 @@ impl Engine {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
-            Statement::Update(s) => self.exec_update(&s),
-            Statement::Delete(s) => self.exec_delete(&s),
-            Statement::Select(s) => self.exec_select(&s),
+            Statement::Update(s) => self.exec_update_cancel(&s, cancel),
+            Statement::Delete(s) => self.exec_delete_cancel(&s, cancel),
+            Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -515,9 +585,10 @@ impl Engine {
     /// row, then call `Table::update_row` which rebuilds indices.
     /// Indexed columns are correctly reflected because rebuild
     /// happens after the cell rewrite.
-    fn exec_update(
+    fn exec_update_cancel(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
+        cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let table = self
             .active_catalog_mut()
@@ -549,6 +620,12 @@ impl Engine {
         // own writes).
         let mut planned: Vec<(usize, Vec<Value>)> = Vec::new();
         for (i, row) in table.rows().iter().enumerate() {
+            // v4.5: cooperative cancel checkpoint every 256 rows so
+            // a runaway UPDATE without WHERE doesn't drag past the
+            // server's query-timeout watchdog.
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
             if let Some(w) = &stmt.where_ {
                 let cond = eval::eval_expr(w, row, &ctx)?;
                 if !matches!(cond, Value::Bool(true)) {
@@ -576,9 +653,10 @@ impl Engine {
     /// v4.4 `DELETE FROM <table> [WHERE cond]`. Collects matching
     /// positions then delegates to `Table::delete_rows` (single index
     /// rebuild for the batch).
-    fn exec_delete(
+    fn exec_delete_cancel(
         &mut self,
         stmt: &spg_sql::ast::DeleteStatement,
+        cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let table = self
             .active_catalog_mut()
@@ -592,6 +670,9 @@ impl Engine {
         let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
         let mut positions: Vec<usize> = Vec::new();
         for (i, row) in table.rows().iter().enumerate() {
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
             let keep = if let Some(w) = &stmt.where_ {
                 let cond = eval::eval_expr(w, row, &ctx)?;
                 !matches!(cond, Value::Bool(true))
@@ -925,11 +1006,19 @@ impl Engine {
         })
     }
 
-    fn exec_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
-        // Single-block SELECT (no UNION peers) takes the fast path —
-        // ORDER BY and LIMIT live on this same statement.
+    /// v4.5: SELECT with cooperative cancellation. The token is
+    /// honoured between UNION peers and inside the bare-SELECT row
+    /// loop; HNSW kNN graph walks and the aggregate executor don't
+    /// honour it yet (deferred — those paths bound their work
+    /// internally by `LIMIT k` and `GROUP BY` cardinality).
+    fn exec_select_cancel(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
         if stmt.unions.is_empty() {
-            return self.exec_bare_select(stmt);
+            return self.exec_bare_select_cancel(stmt, cancel);
         }
         // UNION path: clone-strip the head into a bare block (its own
         // DISTINCT and any inner ORDER BY are dropped by parser rule —
@@ -939,14 +1028,16 @@ impl Engine {
         head.unions = Vec::new();
         head.order_by = None;
         head.limit = None;
-        let QueryResult::Rows { columns, mut rows } = self.exec_bare_select(&head)? else {
+        let QueryResult::Rows { columns, mut rows } =
+            self.exec_bare_select_cancel(&head, cancel)?
+        else {
             unreachable!("bare SELECT cannot return CommandOk")
         };
         for (kind, peer) in &stmt.unions {
             let QueryResult::Rows {
                 columns: peer_cols,
                 rows: peer_rows,
-            } = self.exec_bare_select(peer)?
+            } = self.exec_bare_select_cancel(peer, cancel)?
             else {
                 unreachable!("bare SELECT cannot return CommandOk")
             };
@@ -979,7 +1070,12 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn exec_bare_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
+    #[allow(clippy::too_many_lines)] // huge match — splitting fragments the planner
+    fn exec_bare_select_cancel(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
         // Constant SELECT (no FROM) — evaluate each item once against an
         // empty dummy row. Useful for `SELECT 1`, `SELECT coalesce(...)`,
         // `SELECT '7'::INT`. Column references will surface as
@@ -1064,7 +1160,11 @@ impl Engine {
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
         let mut tagged: Vec<(Option<f64>, Row)> = Vec::new();
-        for &i in &candidate_rows {
+        for (loop_idx, &i) in candidate_rows.iter().enumerate() {
+            // v4.5: cooperative cancel checkpoint every 256 rows.
+            if loop_idx.is_multiple_of(256) {
+                cancel.check()?;
+            }
             let row = &table.rows()[i];
             if let Some(where_expr) = &stmt.where_ {
                 let cond = eval::eval_expr(where_expr, row, &ctx)?;
