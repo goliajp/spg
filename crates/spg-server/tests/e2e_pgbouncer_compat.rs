@@ -93,7 +93,7 @@ fn read_message(s: &mut TcpStream) -> PgMessage {
 
 fn send_startup(s: &mut TcpStream, user: &str) {
     let mut body = Vec::new();
-    body.extend_from_slice(&196608u32.to_be_bytes());
+    body.extend_from_slice(&196_608_u32.to_be_bytes());
     body.extend_from_slice(b"user\0");
     body.extend_from_slice(user.as_bytes());
     body.push(0);
