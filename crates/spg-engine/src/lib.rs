@@ -183,7 +183,9 @@ impl Engine {
         // function calls with the engine's clock reading, rewritten
         // as `<literal int>::TIMESTAMP` / `::DATE`. The rewrite reads
         // the clock once per statement so every reference observes the
-        // same instant.
+        // same instant. The walk is structured as a single `match` so
+        // expressions that don't reference the clock (the common case)
+        // take exactly one pattern dispatch and bail out.
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
         // `ORDER BY <n>` (1-based select-list position) gets resolved
@@ -1401,63 +1403,20 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: i64) {
     }
 }
 
+/// v3.0.3 hot path: every recursion lands in exactly one `match` arm.
+/// Literal / Column-with-qualifier (the dominant cases on a typical
+/// AST) take a single pattern dispatch and exit. The clock-rewrite
+/// targets (zero-arg `NOW` / `CURRENT_TIMESTAMP` / `CURRENT_DATE`
+/// functions, and bare `CURRENT_TIMESTAMP` / `CURRENT_DATE` column
+/// refs) sit on their own arms with match guards so the fall-through
+/// to the recursive arms is unambiguous.
 fn rewrite_expr_clock(e: &mut Expr, now: i64) {
-    if let Expr::FunctionCall { name, args } = e
-        && args.is_empty()
-    {
-        let lower = name.to_ascii_lowercase();
-        match lower.as_str() {
-            "now" | "current_timestamp" => {
-                *e = Expr::Cast {
-                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
-                        now,
-                    ))),
-                    target: spg_sql::ast::CastTarget::Timestamp,
-                };
-                return;
-            }
-            "current_date" => {
-                let days = now.div_euclid(86_400_000_000);
-                *e = Expr::Cast {
-                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
-                        days,
-                    ))),
-                    target: spg_sql::ast::CastTarget::Date,
-                };
-                return;
-            }
-            _ => {}
-        }
-    }
-    // Bare-identifier forms: PG accepts `CURRENT_TIMESTAMP` /
-    // `CURRENT_DATE` without parens. They parse here as unqualified
-    // column refs; intercept and rewrite to the same literal cast.
-    if let Expr::Column(c) = e
-        && c.qualifier.is_none()
-    {
-        let lower = c.name.to_ascii_lowercase();
-        match lower.as_str() {
-            "current_timestamp" => {
-                *e = Expr::Cast {
-                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
-                        now,
-                    ))),
-                    target: spg_sql::ast::CastTarget::Timestamp,
-                };
-                return;
-            }
-            "current_date" => {
-                let days = now.div_euclid(86_400_000_000);
-                *e = Expr::Cast {
-                    expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(
-                        days,
-                    ))),
-                    target: spg_sql::ast::CastTarget::Date,
-                };
-                return;
-            }
-            _ => {}
-        }
+    // Fast-path test on the no-recursion shapes first. We can't fold
+    // them into the big match below because they need to *replace* `e`
+    // outright; the recursive arms below match on its sub-fields.
+    if let Some(replacement) = clock_replacement_for(e, now) {
+        *e = replacement;
+        return;
     }
     match e {
         Expr::Binary { lhs, rhs, .. } => {
@@ -1479,6 +1438,49 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         Expr::Extract { source, .. } => rewrite_expr_clock(source, now),
         Expr::Literal(_) | Expr::Column(_) => {}
     }
+}
+
+/// Returns `Some(Expr)` when `e` is one of the clock-call shapes that
+/// must be rewritten; otherwise `None` so the caller falls through to
+/// the recursive walk. Identifies both function-call forms (`NOW()` /
+/// `CURRENT_TIMESTAMP()` / `CURRENT_DATE()`) and bare-identifier forms
+/// (`CURRENT_TIMESTAMP` / `CURRENT_DATE` as unqualified column refs,
+/// which is how PG accepts them without parens).
+fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
+    let (kind, name) = match e {
+        Expr::FunctionCall { name, args } if args.is_empty() => (ClockSite::Fn, name.as_str()),
+        Expr::Column(c) if c.qualifier.is_none() => (ClockSite::BareIdent, c.name.as_str()),
+        _ => return None,
+    };
+    // ASCII case-insensitive name match. Limited to the three keywords
+    // that actually need rewriting.
+    let matched = match name.len() {
+        3 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("now") => Some(true),
+        12 if name.eq_ignore_ascii_case("current_date") => Some(false),
+        17 if name.eq_ignore_ascii_case("current_timestamp") => Some(true),
+        _ => None,
+    };
+    let is_timestamp = matched?;
+    let payload = if is_timestamp {
+        now
+    } else {
+        now.div_euclid(86_400_000_000)
+    };
+    let target = if is_timestamp {
+        spg_sql::ast::CastTarget::Timestamp
+    } else {
+        spg_sql::ast::CastTarget::Date
+    };
+    Some(Expr::Cast {
+        expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(payload))),
+        target,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockSite {
+    Fn,
+    BareIdent,
 }
 
 /// `ORDER BY <integer>` references the N-th SELECT item (1-based).

@@ -102,10 +102,10 @@ Run: `cargo bench -p spg-audit --bench log`.
 
 | Path                                | Median       | Notes |
 |-------------------------------------|-------------:|-------|
-| `execute_select_const`              | **255 ns**   | `SELECT 1`; parser-dominated. |
-| `execute_select_where_n100`         | **2.57 µs**  | `SELECT id, name FROM users WHERE id = 42` against a 100-row table. |
-| `execute_select_count_group_n100`   | **3.33 µs**  | `SELECT COUNT(*) FROM users WHERE id < 50` (filter + aggregate). |
-| `execute_insert_one`                | **2.60 µs**  | Single-row INSERT into a 100-row table (re-creates the table per iter via `iter_batched`). |
+| `execute_select_const`              | **250 ns**   | v3.0.3: was 255 ns; **−2%** (near noise — rewrite walk was already a small share of the const-SELECT total). |
+| `execute_select_where_n100`         | **2.35 µs**  | v3.0.3: was 2.57 µs; **−9%** ✅. |
+| `execute_select_count_group_n100`   | **3.12 µs**  | v3.0.3: was 3.33 µs; **−6%**. |
+| `execute_insert_one`                | **2.26 µs**  | v3.0.3: was 2.60 µs; **−13%** ✅. INSERT's per-row rewrite loop is where the single-`match` `rewrite_expr_clock` restructure shows up most. |
 
 Run: `cargo bench -p spg-engine --bench execute`.
 
