@@ -67,12 +67,38 @@ pub struct UserRecord {
     pub role: Role,
     salt: [u8; SALT_LEN],
     hash: [u8; HASH_LEN],
+    /// v4.8: SCRAM-SHA-256 verifier. Computed alongside the
+    /// BLAKE3 hash at user creation so PG-wire SASL auth can
+    /// verify without re-running PBKDF2 per attempt. `None`
+    /// means the user predates v4.8 (loaded from an older
+    /// snapshot); the PG-wire layer falls back to
+    /// `CleartextPassword` for those users.
+    scram: Option<ScramSecrets>,
 }
+
+/// SCRAM-SHA-256 stored credentials per RFC 5802 §5.
+/// `salt` and `iters` are sent to the client in server-first;
+/// `stored_key` and `server_key` are kept secret and used in the
+/// final-message verification.
+#[derive(Debug, Clone)]
+pub struct ScramSecrets {
+    pub iters: u32,
+    pub salt: [u8; SCRAM_SALT_LEN],
+    pub stored_key: [u8; HASH_LEN],
+    pub server_key: [u8; HASH_LEN],
+}
+
+pub const SCRAM_SALT_LEN: usize = 16;
+pub const SCRAM_DEFAULT_ITERS: u32 = 4096;
 
 impl UserRecord {
     pub fn verify(&self, password: &str) -> bool {
         let candidate = derive_hash(&self.salt, password);
         constant_time_eq(&candidate, &self.hash)
+    }
+
+    pub const fn scram(&self) -> Option<&ScramSecrets> {
+        self.scram.as_ref()
     }
 }
 
@@ -144,8 +170,15 @@ impl UserStore {
             return Err(UserError::Exists);
         }
         let hash = derive_hash(&salt, password);
-        self.users
-            .insert(name.to_string(), UserRecord { role, salt, hash });
+        self.users.insert(
+            name.to_string(),
+            UserRecord {
+                role,
+                salt,
+                hash,
+                scram: None,
+            },
+        );
         Ok(())
     }
 
@@ -154,6 +187,23 @@ impl UserStore {
             .remove(name)
             .map(|_| ())
             .ok_or(UserError::NotFound)
+    }
+
+    /// v4.8: attach SCRAM-SHA-256 verifier to an existing user.
+    /// Called by the engine right after `create` so new users have
+    /// both auth paths (legacy BLAKE3 + SCRAM) available. The salt
+    /// here is independent of the BLAKE3 hash salt — they serve
+    /// different purposes.
+    pub fn enable_scram(
+        &mut self,
+        name: &str,
+        password: &str,
+        salt: [u8; SCRAM_SALT_LEN],
+        iters: u32,
+    ) -> Result<(), UserError> {
+        let rec = self.users.get_mut(name).ok_or(UserError::NotFound)?;
+        rec.scram = Some(compute_scram_secrets(password, salt, iters));
+        Ok(())
     }
 
     pub fn verify(&self, name: &str, password: &str) -> Option<Role> {
@@ -173,6 +223,33 @@ fn derive_hash(salt: &[u8; SALT_LEN], password: &str) -> [u8; HASH_LEN] {
     spg_crypto::hash(&buf)
 }
 
+/// v4.8: derive SCRAM-SHA-256 stored credentials per RFC 5802 §3.
+///
+/// `SaltedPassword` = `PBKDF2(password, salt, iters)`
+/// `ClientKey`      = `HMAC(SaltedPassword, "Client Key")`
+/// `StoredKey`      = `SHA-256(ClientKey)`
+/// `ServerKey`      = `HMAC(SaltedPassword, "Server Key")`
+///
+/// PG-wire keeps the `StoredKey` + `ServerKey` on disk; verifying a
+/// client SCRAM proof needs only the `StoredKey` (no plaintext
+/// password ever stored).
+pub fn compute_scram_secrets(
+    password: &str,
+    salt: [u8; SCRAM_SALT_LEN],
+    iters: u32,
+) -> ScramSecrets {
+    let salted = spg_crypto::pbkdf2::pbkdf2_sha256_32(password.as_bytes(), &salt, iters);
+    let client_key = spg_crypto::hmac::hmac_sha256(&salted, b"Client Key");
+    let stored_key = spg_crypto::sha256::hash(&client_key);
+    let server_key = spg_crypto::hmac::hmac_sha256(&salted, b"Server Key");
+    ScramSecrets {
+        iters,
+        salt,
+        stored_key,
+        server_key,
+    }
+}
+
 /// Branch-free byte compare so verify timing doesn't leak whether
 /// a prefix matched.
 fn constant_time_eq(a: &[u8; HASH_LEN], b: &[u8; HASH_LEN]) -> bool {
@@ -186,15 +263,33 @@ fn constant_time_eq(a: &[u8; HASH_LEN], b: &[u8; HASH_LEN]) -> bool {
 // ---- snapshot encoding ----
 //
 // Layout (after a magic + version envelope handled at Engine level):
+//
+// v1 (v4.1.0 — original):
 //   [u32 user_count]
 //   for each user:
-//     [u16 name_len][name bytes]
-//     [u8 role]                ; 0=admin, 1=readwrite, 2=readonly
-//     [16 bytes salt]
-//     [32 bytes hash]
+//     [u16 name_len][name][u8 role][16 salt][32 hash]
+//
+// v2 (v4.8.0 — adds SCRAM):
+//   [u8 format_version = 2]    // distinguishes from v1 (where the
+//                                 first byte is the LO of user_count
+//                                 u32, never 0xff)
+//   [u32 user_count]
+//   for each user:
+//     [u16 name_len][name][u8 role][16 salt][32 hash]
+//     [u8 scram_present]       // 0 or 1
+//     if scram_present:
+//       [u32 iters][16 scram_salt][32 stored_key][32 server_key]
+//
+// We use byte 0xff as the v2 marker — v1 would have to have ≥
+// 4 billion users for its first byte to be 0xff, so the version
+// switch is unambiguous.
+
+const SCRAM_FORMAT_MARKER: u8 = 0xff;
 
 pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + store.len() * (2 + 16 + 1 + SALT_LEN + HASH_LEN));
+    let per_user_floor = 2 + 16 + 1 + SALT_LEN + HASH_LEN + 1;
+    let mut out = Vec::with_capacity(1 + 4 + store.len() * per_user_floor);
+    out.push(SCRAM_FORMAT_MARKER);
     out.extend_from_slice(
         &u32::try_from(store.users.len())
             .expect("≤ 4G users")
@@ -211,6 +306,16 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
         });
         out.extend_from_slice(&rec.salt);
         out.extend_from_slice(&rec.hash);
+        match &rec.scram {
+            None => out.push(0),
+            Some(s) => {
+                out.push(1);
+                out.extend_from_slice(&s.iters.to_le_bytes());
+                out.extend_from_slice(&s.salt);
+                out.extend_from_slice(&s.stored_key);
+                out.extend_from_slice(&s.server_key);
+            }
+        }
     }
     out
 }
@@ -243,6 +348,16 @@ fn take<'a>(p: &mut usize, n: usize, buf: &'a [u8]) -> Result<&'a [u8], UserDese
 
 pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserializeError> {
     let mut p = 0usize;
+    // v1 → starts with a u32 user_count (LO byte rarely 0xff in
+    // practice). v2 → starts with the 0xff marker, then u32 count.
+    // Probing the first byte before advancing keeps the v1 path
+    // intact for old snapshots.
+    let scram_present_inline = if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
+        p += 1;
+        true
+    } else {
+        false
+    };
     let count_bytes = take(&mut p, 4, buf)?;
     let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
     let mut store = UserStore::new();
@@ -264,7 +379,38 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         salt.copy_from_slice(take(&mut p, SALT_LEN, buf)?);
         let mut hash = [0u8; HASH_LEN];
         hash.copy_from_slice(take(&mut p, HASH_LEN, buf)?);
-        store.users.insert(name, UserRecord { role, salt, hash });
+        let scram = if scram_present_inline {
+            let flag = take(&mut p, 1, buf)?[0];
+            if flag == 1 {
+                let iters_bytes = take(&mut p, 4, buf)?;
+                let iters = u32::from_le_bytes(iters_bytes.try_into().unwrap());
+                let mut s_salt = [0u8; SCRAM_SALT_LEN];
+                s_salt.copy_from_slice(take(&mut p, SCRAM_SALT_LEN, buf)?);
+                let mut stored_key = [0u8; HASH_LEN];
+                stored_key.copy_from_slice(take(&mut p, HASH_LEN, buf)?);
+                let mut server_key = [0u8; HASH_LEN];
+                server_key.copy_from_slice(take(&mut p, HASH_LEN, buf)?);
+                Some(ScramSecrets {
+                    iters,
+                    salt: s_salt,
+                    stored_key,
+                    server_key,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        store.users.insert(
+            name,
+            UserRecord {
+                role,
+                salt,
+                hash,
+                scram,
+            },
+        );
     }
     if p != buf.len() {
         return Err(UserDeserializeError::Truncated);
@@ -329,12 +475,51 @@ mod tests {
     }
 
     #[test]
-    fn empty_store_round_trip_is_a_4_byte_blob() {
+    fn empty_store_round_trip() {
+        // v4.8: format prefix byte (0xff) + zero u32 count.
         let s = UserStore::new();
         let bytes = serialize_users(&s);
-        assert_eq!(bytes, [0u8; 4]);
+        assert_eq!(bytes, [0xff, 0, 0, 0, 0]);
         let s2 = deserialize_users(&bytes).unwrap();
         assert!(s2.is_empty());
+    }
+
+    #[test]
+    fn old_v1_user_blob_still_loads() {
+        // Hand-constructed v1 blob: 1 user, no SCRAM byte.
+        // [u32 count=1][u16 name_len=3]["bob"][u8 role=0][16 salt][32 hash]
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&3u16.to_le_bytes());
+        buf.extend_from_slice(b"bob");
+        buf.push(0); // role = admin
+        buf.extend_from_slice(&[7u8; SALT_LEN]);
+        buf.extend_from_slice(&[42u8; HASH_LEN]);
+        let s = deserialize_users(&buf).expect("v1 blob must still load");
+        assert_eq!(s.len(), 1);
+        let (n, rec) = s.iter().next().unwrap();
+        assert_eq!(n, "bob");
+        assert_eq!(rec.role, Role::Admin);
+        assert!(rec.scram().is_none(), "v1 users have no SCRAM secrets");
+    }
+
+    #[test]
+    fn scram_round_trip_preserves_iters_salt_keys() {
+        let mut s = UserStore::new();
+        s.create("alice", "pw", Role::Admin, [3; SALT_LEN]).unwrap();
+        s.enable_scram("alice", "pw", [9; SCRAM_SALT_LEN], 4096)
+            .unwrap();
+        let bytes = serialize_users(&s);
+        let s2 = deserialize_users(&bytes).unwrap();
+        let (_, rec) = s2.iter().next().unwrap();
+        let scram = rec.scram().expect("scram must round-trip");
+        assert_eq!(scram.iters, 4096);
+        assert_eq!(scram.salt, [9u8; SCRAM_SALT_LEN]);
+        // StoredKey and ServerKey are deterministic given (password,
+        // salt, iters); verify by recomputing.
+        let expected = compute_scram_secrets("pw", [9; SCRAM_SALT_LEN], 4096);
+        assert_eq!(scram.stored_key, expected.stored_key);
+        assert_eq!(scram.server_key, expected.server_key);
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! Pass `-` (or omit) to skip any positional after the first.
 
 mod pgwire;
+mod scram;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

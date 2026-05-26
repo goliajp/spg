@@ -85,19 +85,30 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     let has_users = state.engine.read().is_ok_and(|e| !e.users().is_empty());
 
     let role = if has_users {
-        // AuthenticationCleartextPassword
-        send_msg(&mut stream, b'R', &3u32.to_be_bytes())?;
-        let pwd = read_password_message(&mut stream)?;
-        let verified = state
+        // v4.8: prefer SCRAM-SHA-256 when the user has stored
+        // secrets. Fall back to CleartextPassword for legacy users
+        // (loaded from a pre-v4.8 snapshot, no SCRAM verifier on
+        // file). Modern PG drivers (JDBC, asyncpg, psycopg3) refuse
+        // cleartext over plain TCP unless explicitly opted in;
+        // SCRAM keeps them happy.
+        let user_has_scram = state
             .engine
             .read()
             .ok()
-            .and_then(|e| e.verify_user(&user, &pwd));
-        if let Some(r) = verified {
-            r
+            .and_then(|e| {
+                e.users()
+                    .iter()
+                    .find_map(|(n, r)| (n == user).then(|| r.scram().is_some()))
+            })
+            .unwrap_or(false);
+        let outcome = if user_has_scram {
+            scram_auth(&mut stream, state, &user)?
         } else {
-            send_error(&mut stream, "28P01", "password authentication failed")?;
-            return Ok(());
+            cleartext_auth(&mut stream, state, &user)?
+        };
+        match outcome {
+            Some(r) => r,
+            None => return Ok(()), // error already sent
         }
     } else {
         Role::Admin
@@ -886,6 +897,194 @@ fn handle_execute(
         Err(e) => return Err(e.to_string()),
     }
     Ok(())
+}
+
+// ---- Auth helpers (cleartext + SCRAM) ----
+
+fn cleartext_auth(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    user: &str,
+) -> std::io::Result<Option<Role>> {
+    send_msg(stream, b'R', &3u32.to_be_bytes())?;
+    let pwd = read_password_message(stream)?;
+    let verified = state
+        .engine
+        .read()
+        .ok()
+        .and_then(|e| e.verify_user(user, &pwd));
+    if let Some(r) = verified {
+        Ok(Some(r))
+    } else {
+        send_error(stream, "28P01", "password authentication failed")?;
+        Ok(None)
+    }
+}
+
+/// v4.8 SCRAM-SHA-256 server-side flow. Returns `Some(role)` on
+/// successful proof verification, `None` if anything goes wrong
+/// (caller closes the connection — error frame already written).
+fn scram_auth(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    user: &str,
+) -> std::io::Result<Option<Role>> {
+    // ---- Step 1: AuthenticationSASL ----
+    // Mechanism list is null-terminated mechanism strings, ended by
+    // an empty string (= double null).
+    let mut sasl_body = Vec::new();
+    sasl_body.extend_from_slice(&10u32.to_be_bytes());
+    sasl_body.extend_from_slice(b"SCRAM-SHA-256\0\0");
+    send_msg(stream, b'R', &sasl_body)?;
+
+    // ---- Step 2: read SASLInitialResponse ('p') ----
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header)?;
+    if header[0] != b'p' {
+        send_error(stream, "28000", "expected SASLInitialResponse")?;
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut body = vec![0u8; len.saturating_sub(4)];
+    stream.read_exact(&mut body)?;
+    // Body: [mech_name \0][i32 client_first_len][client_first bytes]
+    let Some(mech_end) = body.iter().position(|&b| b == 0) else {
+        send_error(
+            stream,
+            "28000",
+            "SASLInitial: mechanism name not null-terminated",
+        )?;
+        return Ok(None);
+    };
+    let mech = std::str::from_utf8(&body[..mech_end]).unwrap_or("");
+    if mech != "SCRAM-SHA-256" {
+        send_error(
+            stream,
+            "28000",
+            &format!("only SCRAM-SHA-256 is supported, got {mech:?}"),
+        )?;
+        return Ok(None);
+    }
+    let mut cur = mech_end + 1;
+    if cur + 4 > body.len() {
+        send_error(stream, "28000", "SASLInitial: missing client-first length")?;
+        return Ok(None);
+    }
+    let cf_len =
+        u32::from_be_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]) as usize;
+    cur += 4;
+    if cur + cf_len > body.len() {
+        send_error(stream, "28000", "SASLInitial: client-first truncated")?;
+        return Ok(None);
+    }
+    let Ok(client_first_msg) = std::str::from_utf8(&body[cur..cur + cf_len]).map(str::to_string)
+    else {
+        send_error(stream, "28000", "SASLInitial: client-first not UTF-8")?;
+        return Ok(None);
+    };
+    let client_first = match crate::scram::parse_client_first(&client_first_msg) {
+        Ok(c) => c,
+        Err(e) => {
+            send_error(stream, "28000", &e.to_string())?;
+            return Ok(None);
+        }
+    };
+
+    // ---- Step 3: pull this user's SCRAM secrets ----
+    let secrets = state
+        .engine
+        .read()
+        .ok()
+        .and_then(|e| {
+            e.users()
+                .iter()
+                .find(|(n, _)| *n == user)
+                .map(|(_, r)| r.scram().cloned())
+        })
+        .flatten();
+    let Some(secrets) = secrets else {
+        send_error(stream, "28P01", "user has no SCRAM verifier on file")?;
+        return Ok(None);
+    };
+
+    // ---- Step 4: server-first ----
+    let server_nonce = match random_nonce_b64(18) {
+        Ok(n) => n,
+        Err(e) => {
+            send_error(stream, "58000", &format!("RNG failure: {e}"))?;
+            return Ok(None);
+        }
+    };
+    let combined_nonce = format!("{}{}", client_first.client_nonce, server_nonce);
+    let server_first = crate::scram::build_server_first(&combined_nonce, &secrets);
+    let mut cont_body = Vec::new();
+    cont_body.extend_from_slice(&11u32.to_be_bytes());
+    cont_body.extend_from_slice(server_first.as_bytes());
+    send_msg(stream, b'R', &cont_body)?;
+
+    // ---- Step 5: read SASLResponse with client-final ----
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header)?;
+    if header[0] != b'p' {
+        send_error(stream, "28000", "expected SASLResponse")?;
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut body = vec![0u8; len.saturating_sub(4)];
+    stream.read_exact(&mut body)?;
+    let Ok(client_final_msg) = std::str::from_utf8(&body).map(str::to_string) else {
+        send_error(stream, "28000", "SASLResponse: client-final not UTF-8")?;
+        return Ok(None);
+    };
+    let client_final = match crate::scram::parse_client_final(&client_final_msg) {
+        Ok(f) => f,
+        Err(e) => {
+            send_error(stream, "28000", &e.to_string())?;
+            return Ok(None);
+        }
+    };
+    if client_final.combined_nonce != combined_nonce {
+        send_error(stream, "28000", "SCRAM: nonce mismatch")?;
+        return Ok(None);
+    }
+
+    // ---- Step 6: verify proof, send SASLFinal + AuthOk ----
+    let server_signature = match crate::scram::verify_and_sign(
+        &secrets,
+        &client_first.bare,
+        &server_first,
+        &client_final.without_proof,
+        &client_final.client_proof,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            send_error(stream, "28P01", &e.to_string())?;
+            return Ok(None);
+        }
+    };
+    let mut final_body = Vec::new();
+    final_body.extend_from_slice(&12u32.to_be_bytes());
+    final_body.extend_from_slice(server_signature.as_bytes());
+    send_msg(stream, b'R', &final_body)?;
+
+    // Role: the user table lookup we did earlier was for scram secrets;
+    // re-read for the role specifically.
+    let role = state.engine.read().ok().and_then(|e| {
+        e.users()
+            .iter()
+            .find(|(n, _)| *n == user)
+            .map(|(_, r)| r.role)
+    });
+    Ok(role)
+}
+
+/// 18 random bytes → ~24 base64 chars, used as the SCRAM server
+/// nonce. Sourced from /dev/urandom — same RNG path the v4.8
+/// user-record salt comes from.
+fn random_nonce_b64(byte_len: usize) -> std::io::Result<String> {
+    let mut buf = vec![0u8; byte_len];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(spg_crypto::base64::encode(&buf))
 }
 
 // ---- Startup message ----

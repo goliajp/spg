@@ -10,7 +10,7 @@ pub mod aggregate;
 pub mod eval;
 pub mod users;
 
-pub use crate::users::{Role, UserError, UserStore};
+pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -338,7 +338,26 @@ impl Engine {
         role: Role,
         salt: [u8; 16],
     ) -> Result<(), UserError> {
-        self.users.create(name, password, role, salt)
+        self.users.create(name, password, role, salt)?;
+        // v4.8: also derive SCRAM-SHA-256 secrets so PG-wire SASL
+        // auth can verify without re-running PBKDF2 per attempt.
+        // Uses a fresh salt from the host RNG (falls back to a
+        // deterministic per-username salt when no RNG is wired, same
+        // as the legacy hash path).
+        let scram_salt = self.salt_fn.map_or_else(
+            || {
+                let mut s = [0u8; users::SCRAM_SALT_LEN];
+                let digest = spg_crypto::hash(name.as_bytes());
+                // Use bytes 16..32 of BLAKE3 so we don't reuse the
+                // exact same fallback salt as the BLAKE3 hash path.
+                s.copy_from_slice(&digest[16..32]);
+                s
+            },
+            |f| f(),
+        );
+        self.users
+            .enable_scram(name, password, scram_salt, users::SCRAM_DEFAULT_ITERS)?;
+        Ok(())
     }
 
     pub fn drop_user(&mut self, name: &str) -> Result<(), UserError> {
