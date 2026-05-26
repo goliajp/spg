@@ -2171,22 +2171,43 @@ impl Engine {
         cancel.check()?;
         let mut catalog = self.active_catalog().clone();
         for cte in &stmt.ctes {
-            // Each CTE body runs against the *original* (un-enriched)
-            // catalog. This is the simple interpretation: CTEs don't
-            // see siblings. Same semantics as PG `WITH` without
-            // explicit ordering hints — siblings are out of scope.
-            let body_result = self.exec_select_cancel(&cte.body, cancel)?;
-            let QueryResult::Rows { columns, rows } = body_result else {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "CTE {:?} body did not return rows",
-                    cte.name
-                )));
-            };
             if catalog.get(&cte.name).is_some() {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "CTE name {:?} shadows an existing table; rename the CTE",
                     cte.name
                 )));
+            }
+            let (columns, rows) = if cte.recursive {
+                self.materialise_recursive_cte(cte, &catalog, cancel)?
+            } else {
+                let body_result = self.exec_select_cancel(&cte.body, cancel)?;
+                let QueryResult::Rows { columns, rows } = body_result else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "CTE {:?} body did not return rows",
+                        cte.name
+                    )));
+                };
+                (columns, rows)
+            };
+            // v4.22: the projection builder labels any non-column
+            // expression as Text — including literal SELECT 1.
+            // Promote each column's type to whatever the rows
+            // actually carry so the CTE storage table accepts them.
+            let inferred = infer_column_types(&columns, &rows);
+            let mut columns = inferred;
+            // v4.22: apply optional `WITH name(a, b, c)` overrides.
+            if !cte.column_overrides.is_empty() {
+                if cte.column_overrides.len() != columns.len() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "CTE {:?} column list has {} names but body returns {} columns",
+                        cte.name,
+                        cte.column_overrides.len(),
+                        columns.len()
+                    )));
+                }
+                for (col, name) in columns.iter_mut().zip(cte.column_overrides.iter()) {
+                    col.name.clone_from(name);
+                }
             }
             let schema = TableSchema::new(cte.name.clone(), columns);
             catalog.create_table(schema).map_err(EngineError::Storage)?;
@@ -2209,6 +2230,154 @@ impl Engine {
             temp = temp.with_salt_fn(f);
         }
         temp.exec_select_cancel(&body, cancel)
+    }
+
+    /// v4.22: materialise a WITH RECURSIVE CTE. The body must be a
+    /// UNION (or UNION ALL) of an anchor that does not reference
+    /// the CTE name, and one or more recursive terms that do. The
+    /// anchor runs first; each subsequent iteration runs the
+    /// recursive term against a temp catalog where the CTE name is
+    /// bound to the *previous* iteration's output. Iteration stops
+    /// when the recursive term yields no rows; UNION (DISTINCT)
+    /// deduplicates against the accumulated result, UNION ALL does
+    /// not. A hard cap on total rows prevents runaway queries.
+    #[allow(clippy::too_many_lines)]
+    fn materialise_recursive_cte(
+        &self,
+        cte: &spg_sql::ast::Cte,
+        base_catalog: &Catalog,
+        cancel: CancelToken<'_>,
+    ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
+        const MAX_TOTAL_ROWS: usize = 1_000_000;
+        const MAX_ITERATIONS: usize = 100_000;
+        cancel.check()?;
+        if cte.body.unions.is_empty() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "WITH RECURSIVE {:?} body must be a UNION of an anchor and a recursive term",
+                cte.name
+            )));
+        }
+        // Anchor: the body's leading SELECT, with unions stripped.
+        let mut anchor = cte.body.clone();
+        let union_terms = core::mem::take(&mut anchor.unions);
+        anchor.ctes = Vec::new();
+        // Anchor must not reference the CTE name.
+        if select_refers_to(&anchor, &cte.name) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "WITH RECURSIVE {:?}: the anchor must not reference the CTE itself",
+                cte.name
+            )));
+        }
+        let anchor_result = self.exec_select_cancel(&anchor, cancel)?;
+        let QueryResult::Rows { columns: anchor_cols, rows: anchor_rows } = anchor_result else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "WITH RECURSIVE {:?}: anchor did not return rows",
+                cte.name
+            )));
+        };
+        // The projection builder labels non-column expressions Text;
+        // refine column types from the anchor's actual values so the
+        // intermediate iter-catalog tables accept them.
+        let mut columns = infer_column_types(&anchor_cols, &anchor_rows);
+        if !cte.column_overrides.is_empty() {
+            if cte.column_overrides.len() != columns.len() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CTE {:?} column list has {} names but anchor returns {} columns",
+                    cte.name,
+                    cte.column_overrides.len(),
+                    columns.len()
+                )));
+            }
+            for (col, name) in columns.iter_mut().zip(cte.column_overrides.iter()) {
+                col.name.clone_from(name);
+            }
+        }
+        let mut all_rows: Vec<Row> = anchor_rows.clone();
+        let mut working_set: Vec<Row> = anchor_rows;
+        let mut seen: alloc::collections::BTreeSet<Vec<u8>> = alloc::collections::BTreeSet::new();
+        // Track at least one "all UNION ALL" flag — if every union
+        // kind is ALL we skip the dedup step (faster + matches PG).
+        let all_union_all = union_terms
+            .iter()
+            .all(|(k, _)| matches!(k, UnionKind::All));
+        if !all_union_all {
+            for r in &all_rows {
+                seen.insert(encode_row_key(r));
+            }
+        }
+        for iter in 0..MAX_ITERATIONS {
+            cancel.check()?;
+            if working_set.is_empty() {
+                break;
+            }
+            // Build a fresh catalog: base + CTE bound to working_set.
+            let mut iter_catalog = base_catalog.clone();
+            let schema = TableSchema::new(cte.name.clone(), columns.clone());
+            iter_catalog
+                .create_table(schema)
+                .map_err(EngineError::Storage)?;
+            {
+                let table = iter_catalog
+                    .get_mut(&cte.name)
+                    .expect("just-created");
+                for row in &working_set {
+                    table.insert(row.clone()).map_err(EngineError::Storage)?;
+                }
+            }
+            let mut iter_engine = Engine::restore(iter_catalog);
+            if let Some(c) = self.clock {
+                iter_engine = iter_engine.with_clock(c);
+            }
+            if let Some(f) = self.salt_fn {
+                iter_engine = iter_engine.with_salt_fn(f);
+            }
+            // Run each recursive term in sequence and collect new rows.
+            let mut next_set: Vec<Row> = Vec::new();
+            for (_, term) in &union_terms {
+                let mut term = term.clone();
+                term.ctes = Vec::new();
+                let r = iter_engine.exec_select_cancel(&term, cancel)?;
+                let QueryResult::Rows { columns: rc, rows: rs } = r else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "WITH RECURSIVE {:?}: recursive term did not return rows",
+                        cte.name
+                    )));
+                };
+                if rc.len() != columns.len() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "WITH RECURSIVE {:?}: column count of recursive term ({}) does not match anchor ({})",
+                        cte.name, rc.len(), columns.len()
+                    )));
+                }
+                for row in rs {
+                    if !all_union_all {
+                        let key = encode_row_key(&row);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                    }
+                    next_set.push(row);
+                }
+            }
+            if next_set.is_empty() {
+                break;
+            }
+            all_rows.extend(next_set.iter().cloned());
+            working_set = next_set;
+            if all_rows.len() > MAX_TOTAL_ROWS {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "WITH RECURSIVE {:?}: produced more than {MAX_TOTAL_ROWS} rows — likely runaway recursion",
+                    cte.name
+                )));
+            }
+            if iter + 1 == MAX_ITERATIONS {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "WITH RECURSIVE {:?}: exceeded {MAX_ITERATIONS} iterations",
+                    cte.name
+                )));
+            }
+        }
+        Ok((columns, all_rows))
     }
 
     fn resolve_select_subqueries(
@@ -2401,6 +2570,130 @@ impl Engine {
 // into a typedef adds indirection without making the code clearer,
 // so several lints are allowed inline on the affected functions
 // rather than module-wide.
+
+/// v4.22: cheap structural scan for `FROM <name>` (qualified or
+/// not) inside a SELECT — used to verify the anchor of a WITH
+/// RECURSIVE CTE doesn't recurse into itself. Conservative: walks
+/// FROM joins, subqueries, and unions.
+fn select_refers_to(stmt: &SelectStatement, target: &str) -> bool {
+    if let Some(from) = &stmt.from
+        && from_refers_to(from, target)
+    {
+        return true;
+    }
+    for (_, peer) in &stmt.unions {
+        if select_refers_to(peer, target) {
+            return true;
+        }
+    }
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item
+            && expr_refers_to(expr, target)
+        {
+            return true;
+        }
+    }
+    if let Some(w) = &stmt.where_
+        && expr_refers_to(w, target)
+    {
+        return true;
+    }
+    false
+}
+
+fn from_refers_to(from: &FromClause, target: &str) -> bool {
+    if from.primary.name.eq_ignore_ascii_case(target) {
+        return true;
+    }
+    from.joins
+        .iter()
+        .any(|j| j.table.name.eq_ignore_ascii_case(target))
+}
+
+fn expr_refers_to(e: &Expr, target: &str) -> bool {
+    match e {
+        Expr::ScalarSubquery(s) => select_refers_to(s, target),
+        Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
+            select_refers_to(subquery, target)
+        }
+        Expr::Binary { lhs, rhs, .. } => expr_refers_to(lhs, target) || expr_refers_to(rhs, target),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_refers_to(expr, target)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_refers_to(expr, target) || expr_refers_to(pattern, target)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(|a| expr_refers_to(a, target)),
+        Expr::Extract { source, .. } => expr_refers_to(source, target),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(|a| expr_refers_to(a, target))
+                || partition_by.iter().any(|p| expr_refers_to(p, target))
+                || order_by.iter().any(|(o, _)| expr_refers_to(o, target))
+        }
+        Expr::Literal(_) | Expr::Column(_) => false,
+    }
+}
+
+/// v4.22: pick more specific column types from observed rows when
+/// the projection builder defaulted to Text (the v1.x behavior for
+/// non-column expressions). Lets `WITH t(n) AS (SELECT 1 ...)`
+/// land an Int column in the CTE storage table rather than failing
+/// the insert with "expected TEXT, got INT".
+fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchema> {
+    let mut out = columns.to_vec();
+    for (col_idx, col) in out.iter_mut().enumerate() {
+        if col.ty != DataType::Text {
+            continue;
+        }
+        let mut inferred: Option<DataType> = None;
+        let mut all_null = true;
+        for row in rows {
+            let Some(v) = row.values.get(col_idx) else {
+                continue;
+            };
+            let ty = match v {
+                Value::Null => continue,
+                Value::SmallInt(_) => DataType::SmallInt,
+                Value::Int(_) => DataType::Int,
+                Value::BigInt(_) => DataType::BigInt,
+                Value::Float(_) => DataType::Float,
+                Value::Bool(_) => DataType::Bool,
+                Value::Vector(_) => DataType::Vector(0),
+                _ => DataType::Text,
+            };
+            all_null = false;
+            inferred = Some(match inferred {
+                None => ty,
+                Some(prev) if prev == ty => prev,
+                Some(_) => DataType::Text,
+            });
+        }
+        if let Some(t) = inferred {
+            col.ty = t;
+            col.nullable = true;
+        } else if all_null {
+            col.nullable = true;
+        }
+    }
+    out
+}
+
+/// v4.22: encode a Row to a comparable byte key for UNION-DISTINCT
+/// dedup inside the recursive iteration. Crude but deterministic
+/// — Debug prints embed type discriminants so NULL ≠ "" ≠ 0.
+fn encode_row_key(row: &Row) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in &row.values {
+        let s = alloc::format!("{v:?}|");
+        out.extend_from_slice(s.as_bytes());
+    }
+    out
+}
 
 fn select_has_window(stmt: &SelectStatement) -> bool {
     for item in &stmt.items {
