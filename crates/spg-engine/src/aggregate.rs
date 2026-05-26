@@ -67,7 +67,13 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         }
         Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
         Expr::Extract { source, .. } => contains_aggregate(source),
-        Expr::Literal(_) | Expr::Column(_) => false,
+        // v4.10 subqueries / Literal / Column — all non-aggregate
+        // leaves. Subquery nodes are resolved before this pass.
+        Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Literal(_)
+        | Expr::Column(_) => false,
     }
 }
 
@@ -311,7 +317,13 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(pattern, out);
         }
         Expr::Extract { source, .. } => collect_aggregates(source, out),
-        Expr::Literal(_) | Expr::Column(_) => {}
+        // v4.10 subquery nodes / Literal / Column — non-recursing
+        // leaves from the aggregate-collector's point of view.
+        Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Literal(_)
+        | Expr::Column(_) => {}
     }
 }
 
@@ -496,7 +508,13 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             field: *field,
             source: Box::new(rewrite_expr(source, group_exprs, aggs)),
         },
-        Expr::Literal(_) | Expr::Column(_) => e.clone(),
+        // v4.10 subqueries / Literal / Column — clone-pass.
+        // Subquery nodes are resolved before this rewrite runs.
+        Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Literal(_)
+        | Expr::Column(_) => e.clone(),
     }
 }
 

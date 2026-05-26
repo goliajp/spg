@@ -1220,6 +1220,7 @@ name = "spg-server"
 version = "1.0.0"
 dependencies = [
  "spg-audit",
+ "spg-crypto",
  "spg-engine",
  "spg-storage",
  "spg-wire",

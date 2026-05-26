@@ -308,6 +308,26 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// v4.10 scalar subquery — `(SELECT ...)` used in expression
+    /// position. Must return exactly one row × one column at eval
+    /// time; the engine errors out otherwise. Uncorrelated only —
+    /// the inner SELECT cannot reference outer columns.
+    ScalarSubquery(Box<SelectStatement>),
+    /// v4.10 `[NOT] EXISTS (SELECT ...)`. Returns Bool. Inner
+    /// projection is ignored; only row-count matters.
+    Exists {
+        subquery: Box<SelectStatement>,
+        negated: bool,
+    },
+    /// v4.10 `expr [NOT] IN (SELECT ...)`. Inner SELECT must
+    /// project exactly one column; membership is tested by Eq
+    /// against each row's value (NULL handling follows ANSI:
+    /// NULL ∈ list ⇒ NULL ; otherwise present ⇒ true).
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<SelectStatement>,
+        negated: bool,
+    },
     /// `EXTRACT(<field> FROM <source>)` — pull an integer component
     /// out of a `DATE` or `TIMESTAMP`. Parsed as its own AST node
     /// because the `FROM` keyword is what separates the two halves,
@@ -722,6 +742,25 @@ impl fmt::Display for Expr {
                 }
             }
             Self::Extract { field, source } => write!(f, "EXTRACT({field} FROM {source})"),
+            Self::ScalarSubquery(s) => write!(f, "({s})"),
+            Self::Exists { subquery, negated } => {
+                if *negated {
+                    write!(f, "NOT EXISTS ({subquery})")
+                } else {
+                    write!(f, "EXISTS ({subquery})")
+                }
+            }
+            Self::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "({expr} NOT IN ({subquery}))")
+                } else {
+                    write!(f, "({expr} IN ({subquery}))")
+                }
+            }
         }
     }
 }

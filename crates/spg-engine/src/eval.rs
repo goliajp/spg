@@ -112,6 +112,14 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             let v = eval_expr(source, row, ctx)?;
             extract_field(*field, &v)
         }
+        // v4.10: subquery nodes should have been resolved into
+        // Literal / Binary-Eq-OR chains by Engine::resolve_select_subqueries
+        // before the row loop. Anything reaching here is a bug.
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+            Err(EvalError::TypeMismatch {
+                detail: "subquery reached row eval — engine resolver bug".into(),
+            })
+        }
     }
 }
 

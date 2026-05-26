@@ -12,6 +12,7 @@ pub mod users;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
@@ -1036,14 +1037,28 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
-        if stmt.unions.is_empty() {
-            return self.exec_bare_select_cancel(stmt, cancel);
+        // v4.10: subqueries (uncorrelated) are resolved here, before
+        // the executor sees the row loop. We clone the statement so
+        // we can mutate without disturbing the caller's AST — most
+        // queries pass through with no subquery nodes and the clone
+        // is cheap; with subqueries the materialisation cost
+        // dominates anyway.
+        let mut stmt_owned;
+        let stmt_ref: &SelectStatement = if expr_tree_has_subquery(stmt) {
+            stmt_owned = stmt.clone();
+            self.resolve_select_subqueries(&mut stmt_owned, cancel)?;
+            &stmt_owned
+        } else {
+            stmt
+        };
+        if stmt_ref.unions.is_empty() {
+            return self.exec_bare_select_cancel(stmt_ref, cancel);
         }
         // UNION path: clone-strip the head into a bare block (its own
         // DISTINCT and any inner ORDER BY are dropped by parser rule —
         // the wrapper SelectStatement carries them), execute, then chain
         // peers with left-associative dedup semantics.
-        let mut head = stmt.clone();
+        let mut head = stmt_ref.clone();
         head.unions = Vec::new();
         head.order_by = None;
         head.limit = None;
@@ -1052,7 +1067,7 @@ impl Engine {
         else {
             unreachable!("bare SELECT cannot return CommandOk")
         };
-        for (kind, peer) in &stmt.unions {
+        for (kind, peer) in &stmt_ref.unions {
             let QueryResult::Rows {
                 columns: peer_cols,
                 rows: peer_rows,
@@ -1909,6 +1924,246 @@ fn pow10_i128(p: u8) -> i128 {
 /// literal cast that wraps the engine's per-statement clock reading.
 /// When `now_micros` is `None`, calls stay as-is and surface as
 /// `unknown function` at eval time — keeps the error path explicit.
+/// v4.10: pre-walk the WHERE / projection / etc. of a SELECT and
+/// replace every subquery node with a materialised literal. SPG
+/// only supports uncorrelated subqueries — the inner SELECT does
+/// not see outer-row columns, so the result is the same for every
+/// outer row and can be evaluated once.
+///
+/// Returns the rewritten statement; the caller passes this to the
+/// regular row-loop executor which no longer sees Subquery nodes
+/// in its tree.
+impl Engine {
+    fn resolve_select_subqueries(
+        &self,
+        stmt: &mut SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        for item in &mut stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.resolve_expr_subqueries(expr, cancel)?;
+            }
+        }
+        if let Some(w) = &mut stmt.where_ {
+            self.resolve_expr_subqueries(w, cancel)?;
+        }
+        if let Some(gs) = &mut stmt.group_by {
+            for g in gs {
+                self.resolve_expr_subqueries(g, cancel)?;
+            }
+        }
+        if let Some(h) = &mut stmt.having {
+            self.resolve_expr_subqueries(h, cancel)?;
+        }
+        if let Some(o) = &mut stmt.order_by {
+            self.resolve_expr_subqueries(&mut o.expr, cancel)?;
+        }
+        for (_, peer) in &mut stmt.unions {
+            self.resolve_select_subqueries(peer, cancel)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::only_used_in_recursion)] // engine handle reads aren't really pure
+    fn resolve_expr_subqueries(
+        &self,
+        e: &mut Expr,
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        // Replace-on-this-node cases first.
+        if let Some(replacement) = self.subquery_replacement(e, cancel)? {
+            *e = replacement;
+            return Ok(());
+        }
+        match e {
+            Expr::Binary { lhs, rhs, .. } => {
+                self.resolve_expr_subqueries(lhs, cancel)?;
+                self.resolve_expr_subqueries(rhs, cancel)?;
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                self.resolve_expr_subqueries(expr, cancel)?;
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    self.resolve_expr_subqueries(a, cancel)?;
+                }
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.resolve_expr_subqueries(expr, cancel)?;
+                self.resolve_expr_subqueries(pattern, cancel)?;
+            }
+            Expr::Extract { source, .. } => self.resolve_expr_subqueries(source, cancel)?,
+            // Subquery nodes are handled in subquery_replacement
+            // (which returned None — defensive no-op); Literal /
+            // Column are leaves.
+            Expr::ScalarSubquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::Literal(_)
+            | Expr::Column(_) => {}
+        }
+        Ok(())
+    }
+
+    fn subquery_replacement(
+        &self,
+        e: &Expr,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<Expr>, EngineError> {
+        match e {
+            Expr::ScalarSubquery(inner) => {
+                let mut s = (**inner).clone();
+                // Recurse into the inner SELECT first so nested
+                // subqueries materialise bottom-up.
+                self.resolve_select_subqueries(&mut s, cancel)?;
+                let r = self.exec_bare_select_cancel(&s, cancel)?;
+                let QueryResult::Rows { rows, .. } = r else {
+                    return Err(EngineError::Unsupported(
+                        "scalar subquery: inner statement did not return rows".into(),
+                    ));
+                };
+                let value = match rows.as_slice() {
+                    [] => Value::Null,
+                    [row] => row.values.first().cloned().unwrap_or(Value::Null),
+                    _ => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "scalar subquery returned {} rows; expected 0 or 1",
+                            rows.len()
+                        )));
+                    }
+                };
+                Ok(Some(value_to_literal_expr(value)?))
+            }
+            Expr::Exists { subquery, negated } => {
+                let mut s = (**subquery).clone();
+                self.resolve_select_subqueries(&mut s, cancel)?;
+                let r = self.exec_bare_select_cancel(&s, cancel)?;
+                let exists = match r {
+                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
+                    QueryResult::CommandOk { .. } => false,
+                };
+                let bit = if *negated { !exists } else { exists };
+                Ok(Some(Expr::Literal(Literal::Bool(bit))))
+            }
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let mut s = (**subquery).clone();
+                self.resolve_select_subqueries(&mut s, cancel)?;
+                let r = self.exec_bare_select_cancel(&s, cancel)?;
+                let QueryResult::Rows { columns, rows, .. } = r else {
+                    return Err(EngineError::Unsupported(
+                        "IN-subquery: inner statement did not return rows".into(),
+                    ));
+                };
+                if columns.len() != 1 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "IN-subquery must project exactly one column; got {}",
+                        columns.len()
+                    )));
+                }
+                // Build the same OR-Eq chain the parse-time literal-list
+                // path constructs, with each value lifted into a Literal.
+                let mut acc: Option<Expr> = None;
+                for row in rows {
+                    let v = row.values.into_iter().next().unwrap_or(Value::Null);
+                    let lit = value_to_literal_expr(v)?;
+                    let cmp = Expr::Binary {
+                        lhs: expr.clone(),
+                        op: BinOp::Eq,
+                        rhs: Box::new(lit),
+                    };
+                    acc = Some(match acc {
+                        None => cmp,
+                        Some(prev) => Expr::Binary {
+                            lhs: Box::new(prev),
+                            op: BinOp::Or,
+                            rhs: Box::new(cmp),
+                        },
+                    });
+                }
+                let combined = acc.unwrap_or(Expr::Literal(Literal::Bool(false)));
+                let final_expr = if *negated {
+                    Expr::Unary {
+                        op: UnOp::Not,
+                        expr: Box::new(combined),
+                    }
+                } else {
+                    combined
+                };
+                Ok(Some(final_expr))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// v4.10 helper: materialise a runtime `Value` back into an AST
+/// `Expr::Literal` for the subquery-rewrite path. Supports the
+/// types `Literal` can represent (Integer / Float / Text / Bool /
+/// Null). Date / Timestamp / Numeric / Vector / Interval / JSON
+/// would lose precision through Literal and aren't supported in
+/// uncorrelated-subquery results; they error with a clear hint.
+/// Quick scan for any subquery-bearing node in a SELECT's WHERE /
+/// projection / `order_by` — saves cloning the AST when there are
+/// none (the common case).
+fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
+    let mut any = false;
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            any = any || expr_has_subquery(expr);
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        any = any || expr_has_subquery(w);
+    }
+    if let Some(h) = &stmt.having {
+        any = any || expr_has_subquery(h);
+    }
+    if let Some(o) = &stmt.order_by {
+        any = any || expr_has_subquery(&o.expr);
+    }
+    for (_, peer) in &stmt.unions {
+        any = any || expr_tree_has_subquery(peer);
+    }
+    any
+}
+
+fn expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::Binary { lhs, rhs, .. } => expr_has_subquery(lhs) || expr_has_subquery(rhs),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_has_subquery(expr)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_has_subquery),
+        Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
+        Expr::Extract { source, .. } => expr_has_subquery(source),
+        Expr::Literal(_) | Expr::Column(_) => false,
+    }
+}
+
+fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
+    let lit = match v {
+        Value::Null => Literal::Null,
+        Value::SmallInt(n) => Literal::Integer(i64::from(n)),
+        Value::Int(n) => Literal::Integer(i64::from(n)),
+        Value::BigInt(n) => Literal::Integer(n),
+        Value::Float(x) => Literal::Float(x),
+        Value::Text(s) | Value::Json(s) => Literal::String(s),
+        Value::Bool(b) => Literal::Bool(b),
+        other => {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "subquery result type {:?} not yet materialisable; cast to text or integer in the inner SELECT",
+                other.data_type()
+            )));
+        }
+    };
+    Ok(Expr::Literal(lit))
+}
+
 fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>) {
     let Some(now) = now_micros else {
         return;
@@ -1984,6 +2239,15 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             rewrite_expr_clock(pattern, now);
         }
         Expr::Extract { source, .. } => rewrite_expr_clock(source, now),
+        // v4.10 subquery nodes — recurse into the inner SELECT's
+        // expression slots so e.g. SELECT NOW() in a scalar
+        // subquery picks up the same instant as the outer query.
+        Expr::ScalarSubquery(s) => rewrite_select_clock(s, now),
+        Expr::Exists { subquery, .. } => rewrite_select_clock(subquery, now),
+        Expr::InSubquery { expr, subquery, .. } => {
+            rewrite_expr_clock(expr, now);
+            rewrite_select_clock(subquery, now);
+        }
         Expr::Literal(_) | Expr::Column(_) => {}
     }
 }
