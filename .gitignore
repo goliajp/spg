@@ -7,3 +7,4 @@
 # Local dev sandboxes / scratch
 /scratch
 /.claude/handoff.md
+.claude/
