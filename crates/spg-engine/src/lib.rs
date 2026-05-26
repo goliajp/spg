@@ -1192,7 +1192,7 @@ impl Engine {
             for &i in &candidate_rows {
                 let row = &table.rows()[i];
                 if let Some(where_expr) = &stmt.where_ {
-                    let cond = eval::eval_expr(where_expr, row, &ctx)?;
+                    let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
                     if !matches!(cond, Value::Bool(true)) {
                         continue;
                     }
@@ -1219,7 +1219,7 @@ impl Engine {
             }
             let row = &table.rows()[i];
             if let Some(where_expr) = &stmt.where_ {
-                let cond = eval::eval_expr(where_expr, row, &ctx)?;
+                let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
                 if !matches!(cond, Value::Bool(true)) {
                     continue;
                 }
@@ -2469,6 +2469,135 @@ impl Engine {
         Ok(())
     }
 
+    /// v4.23: per-row eval that handles correlated subqueries.
+    /// Equivalent to `eval::eval_expr` when the expression has no
+    /// subqueries; otherwise clones the expression, substitutes
+    /// outer-row columns into each surviving subquery node, runs
+    /// the inner SELECT, and replaces the node with the literal
+    /// result. Only the WHERE-filter call sites use this path so
+    /// the uncorrelated fast path is preserved everywhere else.
+    fn eval_expr_with_correlated(
+        &self,
+        expr: &Expr,
+        row: &Row,
+        ctx: &EvalContext<'_>,
+        cancel: CancelToken<'_>,
+    ) -> Result<Value, EngineError> {
+        if !expr_has_subquery(expr) {
+            return eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval);
+        }
+        let mut e = expr.clone();
+        self.resolve_correlated_in_expr(&mut e, row, ctx, cancel)?;
+        eval::eval_expr(&e, row, ctx).map_err(EngineError::Eval)
+    }
+
+    fn resolve_correlated_in_expr(
+        &self,
+        e: &mut Expr,
+        row: &Row,
+        ctx: &EvalContext<'_>,
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        match e {
+            Expr::ScalarSubquery(inner) => {
+                let mut s = (**inner).clone();
+                substitute_outer_columns(&mut s, row, ctx);
+                let r = self.exec_select_cancel(&s, cancel)?;
+                let QueryResult::Rows { rows, .. } = r else {
+                    return Err(EngineError::Unsupported(
+                        "scalar subquery: inner did not return rows".into(),
+                    ));
+                };
+                let value = match rows.as_slice() {
+                    [] => Value::Null,
+                    [r0] => r0.values.first().cloned().unwrap_or(Value::Null),
+                    _ => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "scalar subquery returned {} rows; expected 0 or 1",
+                            rows.len()
+                        )));
+                    }
+                };
+                *e = value_to_literal_expr(value)?;
+            }
+            Expr::Exists { subquery, negated } => {
+                let mut s = (**subquery).clone();
+                substitute_outer_columns(&mut s, row, ctx);
+                let r = self.exec_select_cancel(&s, cancel)?;
+                let exists = matches!(r, QueryResult::Rows { rows, .. } if !rows.is_empty());
+                let bit = if *negated { !exists } else { exists };
+                *e = Expr::Literal(Literal::Bool(bit));
+            }
+            Expr::InSubquery {
+                expr: lhs,
+                subquery,
+                negated,
+            } => {
+                self.resolve_correlated_in_expr(lhs, row, ctx, cancel)?;
+                let lhs_val =
+                    eval::eval_expr(lhs, row, ctx).map_err(EngineError::Eval)?;
+                let mut s = (**subquery).clone();
+                substitute_outer_columns(&mut s, row, ctx);
+                let r = self.exec_select_cancel(&s, cancel)?;
+                let QueryResult::Rows { columns, rows, .. } = r else {
+                    return Err(EngineError::Unsupported(
+                        "IN-subquery: inner did not return rows".into(),
+                    ));
+                };
+                if columns.len() != 1 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "IN-subquery must project exactly one column; got {}",
+                        columns.len()
+                    )));
+                }
+                let mut found = false;
+                let mut any_null = false;
+                for r0 in rows {
+                    let v = r0.values.into_iter().next().unwrap_or(Value::Null);
+                    if v.is_null() {
+                        any_null = true;
+                        continue;
+                    }
+                    if value_cmp(&v, &lhs_val) == core::cmp::Ordering::Equal {
+                        found = true;
+                        break;
+                    }
+                }
+                let bit = if found {
+                    !*negated
+                } else if any_null {
+                    return Err(EngineError::Unsupported(
+                        "IN-subquery with NULL in result and no match: NULL semantics not yet implemented".into(),
+                    ));
+                } else {
+                    *negated
+                };
+                *e = Expr::Literal(Literal::Bool(bit));
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.resolve_correlated_in_expr(lhs, row, ctx, cancel)?;
+                self.resolve_correlated_in_expr(rhs, row, ctx, cancel)?;
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                self.resolve_correlated_in_expr(expr, row, ctx, cancel)?;
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.resolve_correlated_in_expr(expr, row, ctx, cancel)?;
+                self.resolve_correlated_in_expr(pattern, row, ctx, cancel)?;
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    self.resolve_correlated_in_expr(a, row, ctx, cancel)?;
+                }
+            }
+            Expr::Extract { source, .. } => {
+                self.resolve_correlated_in_expr(source, row, ctx, cancel)?;
+            }
+            Expr::WindowFunction { .. } | Expr::Literal(_) | Expr::Column(_) => {}
+        }
+        Ok(())
+    }
+
     fn subquery_replacement(
         &self,
         e: &Expr,
@@ -2480,7 +2609,11 @@ impl Engine {
                 // Recurse into the inner SELECT first so nested
                 // subqueries materialise bottom-up.
                 self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = self.exec_bare_select_cancel(&s, cancel)?;
+                let r = match self.exec_bare_select_cancel(&s, cancel) {
+                    Ok(r) => r,
+                    Err(e) if is_correlation_error(&e) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
                 let QueryResult::Rows { rows, .. } = r else {
                     return Err(EngineError::Unsupported(
                         "scalar subquery: inner statement did not return rows".into(),
@@ -2501,7 +2634,11 @@ impl Engine {
             Expr::Exists { subquery, negated } => {
                 let mut s = (**subquery).clone();
                 self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = self.exec_bare_select_cancel(&s, cancel)?;
+                let r = match self.exec_bare_select_cancel(&s, cancel) {
+                    Ok(r) => r,
+                    Err(e) if is_correlation_error(&e) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
                 let exists = match r {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
                     QueryResult::CommandOk { .. } => false,
@@ -2516,7 +2653,11 @@ impl Engine {
             } => {
                 let mut s = (**subquery).clone();
                 self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = self.exec_bare_select_cancel(&s, cancel)?;
+                let r = match self.exec_bare_select_cancel(&s, cancel) {
+                    Ok(r) => r,
+                    Err(e) if is_correlation_error(&e) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
                 let QueryResult::Rows { columns, rows, .. } = r else {
                     return Err(EngineError::Unsupported(
                         "IN-subquery: inner statement did not return rows".into(),
@@ -2681,6 +2822,123 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
         }
     }
     out
+}
+
+/// v4.23: recognise the engine errors that indicate the inner
+/// SELECT couldn't be evaluated in isolation because it references
+/// an outer column — used by `subquery_replacement` to skip
+/// materialisation and let row-eval handle it instead.
+fn is_correlation_error(e: &EngineError) -> bool {
+    matches!(
+        e,
+        EngineError::Eval(
+            eval::EvalError::ColumnNotFound { .. } | eval::EvalError::UnknownQualifier { .. }
+        )
+    )
+}
+
+/// v4.23: walk every Expr in `stmt` and replace each Column ref
+/// that targets the outer scope (qualifier matches the outer
+/// table alias) with a Literal carrying the outer row's value.
+/// Conservative: only qualified refs are substituted, so the user
+/// must write `outer_alias.col` to reference an outer column. This
+/// matches PG's lexical scoping for correlated subqueries and
+/// avoids accidentally rebinding inner columns of the same name.
+fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row, ctx: &EvalContext<'_>) {
+    let Some(outer_alias) = ctx.table_alias else {
+        return;
+    };
+    substitute_in_select(stmt, row, ctx, outer_alias);
+}
+
+fn substitute_in_select(
+    stmt: &mut SelectStatement,
+    row: &Row,
+    ctx: &EvalContext<'_>,
+    outer_alias: &str,
+) {
+    for item in &mut stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            substitute_in_expr(expr, row, ctx, outer_alias);
+        }
+    }
+    if let Some(w) = &mut stmt.where_ {
+        substitute_in_expr(w, row, ctx, outer_alias);
+    }
+    if let Some(gs) = &mut stmt.group_by {
+        for g in gs {
+            substitute_in_expr(g, row, ctx, outer_alias);
+        }
+    }
+    if let Some(h) = &mut stmt.having {
+        substitute_in_expr(h, row, ctx, outer_alias);
+    }
+    if let Some(o) = &mut stmt.order_by {
+        substitute_in_expr(&mut o.expr, row, ctx, outer_alias);
+    }
+    for (_, peer) in &mut stmt.unions {
+        substitute_in_select(peer, row, ctx, outer_alias);
+    }
+}
+
+fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alias: &str) {
+    if let Expr::Column(c) = e
+        && let Some(qual) = &c.qualifier
+        && qual.eq_ignore_ascii_case(outer_alias)
+    {
+        // Look up the column's index in the outer schema.
+        if let Some(idx) = ctx
+            .columns
+            .iter()
+            .position(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+        {
+            let v = row.values.get(idx).cloned().unwrap_or(Value::Null);
+            if let Ok(lit) = value_to_literal_expr(v) {
+                *e = lit;
+                return;
+            }
+        }
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            substitute_in_expr(lhs, row, ctx, outer_alias);
+            substitute_in_expr(rhs, row, ctx, outer_alias);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            substitute_in_expr(expr, row, ctx, outer_alias);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            substitute_in_expr(expr, row, ctx, outer_alias);
+            substitute_in_expr(pattern, row, ctx, outer_alias);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                substitute_in_expr(a, row, ctx, outer_alias);
+            }
+        }
+        Expr::Extract { source, .. } => substitute_in_expr(source, row, ctx, outer_alias),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                substitute_in_expr(a, row, ctx, outer_alias);
+            }
+            for p in partition_by {
+                substitute_in_expr(p, row, ctx, outer_alias);
+            }
+            for (o, _) in order_by {
+                substitute_in_expr(o, row, ctx, outer_alias);
+            }
+        }
+        Expr::ScalarSubquery(s) => substitute_in_select(s, row, ctx, outer_alias),
+        Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
+            substitute_in_select(subquery, row, ctx, outer_alias);
+        }
+        Expr::Literal(_) | Expr::Column(_) => {}
+    }
 }
 
 /// v4.22: encode a Row to a comparable byte key for UNION-DISTINCT
