@@ -50,6 +50,14 @@ pub enum Op {
     // v0.12 admin / observability.
     Stats = 0x15,         // client → server: request a human-readable status report
     StatsResponse = 0x16, // server → client: status report text (UTF-8)
+    /// v3.3.0 server → client: many result rows packed into one frame.
+    /// Layout: `[u16 row_count][u16 cell_count][per-cell WireValue]*`.
+    /// `cell_count` is hoisted out (same for every row in the batch,
+    /// fixed by schema), saving 2 bytes / row vs sending a stream of
+    /// `DataRow` frames. The server only emits this for SELECTs with
+    /// more than one returned row — single-row paths still use `DataRow`
+    /// so a v3.2 / v3.1 client stays decodable.
+    DataRowBatch = 0x17,
     Error = 0xFF,
 }
 
@@ -66,6 +74,7 @@ impl Op {
             0x14 => Ok(Self::ErrorResponse),
             0x15 => Ok(Self::Stats),
             0x16 => Ok(Self::StatsResponse),
+            0x17 => Ok(Self::DataRowBatch),
             0xFF => Ok(Self::Error),
             other => Err(FrameError::UnknownOp(other)),
         }
@@ -416,6 +425,48 @@ pub fn parse_data_row(frame: &Frame) -> Result<Vec<WireValue>, FrameError> {
         off = next;
     }
     Ok(out)
+}
+
+/// Pack many rows into one frame. All rows must have the same
+/// `cell_count`; the count is written once at the front of the
+/// payload (saving 2 bytes per row vs a stream of `DataRow` frames).
+pub fn build_data_row_batch(rows: &[Vec<WireValue>]) -> Result<Frame, FrameError> {
+    let row_count = u16::try_from(rows.len()).map_err(|_| FrameError::FieldTooLarge)?;
+    let cell_count =
+        u16::try_from(rows.first().map_or(0, Vec::len)).map_err(|_| FrameError::FieldTooLarge)?;
+    // Defensive: every row must agree on cell count. The server only
+    // calls this with rows from one query result, so they always do —
+    // assert in debug to catch shape bugs.
+    debug_assert!(
+        rows.iter().all(|r| r.len() == cell_count as usize),
+        "DataRowBatch requires all rows to have the same cell count"
+    );
+    let mut p = Vec::with_capacity(4 + rows.len() * usize::from(cell_count) * 8);
+    p.extend_from_slice(&row_count.to_le_bytes());
+    p.extend_from_slice(&cell_count.to_le_bytes());
+    for row in rows {
+        for v in row {
+            v.encode(&mut p)?;
+        }
+    }
+    Ok(Frame::new(Op::DataRowBatch, p))
+}
+
+pub fn parse_data_row_batch(frame: &Frame) -> Result<Vec<Vec<WireValue>>, FrameError> {
+    let buf = &frame.payload;
+    let (row_count, off1) = read_u16(buf, 0)?;
+    let (cell_count, mut off) = read_u16(buf, off1)?;
+    let mut rows: Vec<Vec<WireValue>> = Vec::with_capacity(row_count as usize);
+    for _ in 0..row_count {
+        let mut row = Vec::with_capacity(cell_count as usize);
+        for _ in 0..cell_count {
+            let (v, next) = WireValue::decode(buf, off)?;
+            row.push(v);
+            off = next;
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 pub fn build_command_complete(affected: u64) -> Frame {

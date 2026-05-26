@@ -212,6 +212,12 @@ fn bench_spg_server() -> Result<RowRes, Box<dyn std::error::Error>> {
             let frame = spg_wire::Frame { op, payload };
             match frame.op {
                 Op::DataRow => row_count += 1,
+                Op::DataRowBatch if frame.payload.len() >= 2 => {
+                    // v3.3.0 batched rows — peek the leading u16
+                    // row_count without fully decoding the payload.
+                    row_count +=
+                        u16::from_le_bytes([frame.payload[0], frame.payload[1]]) as usize;
+                }
                 Op::CommandComplete => {
                     let _ = parse_command_complete(&frame);
                     return Ok(row_count);
