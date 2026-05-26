@@ -1508,6 +1508,75 @@ impl Parser {
 
     /// Atom that started with an identifier: could be `t.col`, `col`, or
     /// `func(arg, ...)`. Detect each shape by looking at the next token.
+    /// v4.12: parse `(PARTITION BY expr, ... ORDER BY expr [DESC]
+    /// [, ...])`. Caller has already consumed `OVER`. Either clause
+    /// is optional; an empty `()` is also legal (PG semantics).
+    /// No frame clause is supported.
+    #[allow(clippy::type_complexity)] // (partitions, ordered-keys-with-desc) is the natural shape
+    fn parse_over_clause(&mut self) -> Result<(Vec<Expr>, Vec<(Expr, bool)>), ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("expected '(' after OVER, got {:?}", self.peek())));
+        }
+        self.advance();
+        let mut partition_by = Vec::new();
+        let mut order_by = Vec::new();
+        // PARTITION BY ?
+        if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
+            && s.eq_ignore_ascii_case("partition")
+        {
+            self.advance();
+            if !matches!(self.peek(), Token::By) {
+                return Err(self.err(format!(
+                    "expected BY after PARTITION, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            loop {
+                partition_by.push(self.parse_expr(0)?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        // ORDER BY ?
+        if matches!(self.peek(), Token::Order) {
+            self.advance();
+            if !matches!(self.peek(), Token::By) {
+                return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
+            }
+            self.advance();
+            loop {
+                let e = self.parse_expr(0)?;
+                let desc = if matches!(self.peek(), Token::Desc) {
+                    self.advance();
+                    true
+                } else if matches!(self.peek(), Token::Asc) {
+                    self.advance();
+                    false
+                } else {
+                    false
+                };
+                order_by.push((e, desc));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' to close OVER clause, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok((partition_by, order_by))
+    }
+
     fn finish_ident_atom(&mut self, first: String) -> Result<Expr, ParseError> {
         if matches!(self.peek(), Token::Dot) {
             self.advance();
@@ -1531,6 +1600,19 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                // v4.12: COUNT(*) OVER (...) — same window tail.
+                if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
+                    && s.eq_ignore_ascii_case("over")
+                {
+                    self.advance();
+                    let (partition_by, order_by) = self.parse_over_clause()?;
+                    return Ok(Expr::WindowFunction {
+                        name: "count_star".into(),
+                        args: Vec::new(),
+                        partition_by,
+                        order_by,
+                    });
+                }
                 return Ok(Expr::FunctionCall {
                     name: "count_star".into(),
                     args: Vec::new(),
@@ -1555,6 +1637,21 @@ impl Parser {
                 }
             }
             self.advance(); // consume ')'
+            // v4.12: window-function tail — `name(args) OVER (...)`.
+            // Promotes the just-parsed FunctionCall into a
+            // WindowFunction node carrying partition + order.
+            if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
+                && s.eq_ignore_ascii_case("over")
+            {
+                self.advance();
+                let (partition_by, order_by) = self.parse_over_clause()?;
+                return Ok(Expr::WindowFunction {
+                    name: first,
+                    args,
+                    partition_by,
+                    order_by,
+                });
+            }
             return Ok(Expr::FunctionCall { name: first, args });
         }
         Ok(Expr::Column(ColumnName {

@@ -1120,6 +1120,13 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v4.12: window-function path. When the projection contains
+        // any `name(args) OVER (...)` we route to the dedicated
+        // executor — partition + sort + per-row window value before
+        // the regular projection.
+        if select_has_window(stmt) {
+            return self.exec_select_with_window(stmt, cancel);
+        }
         // Constant SELECT (no FROM) — evaluate each item once against an
         // empty dummy row. Useful for `SELECT 1`, `SELECT coalesce(...)`,
         // `SELECT '7'::INT`. Column references will surface as
@@ -1944,6 +1951,209 @@ fn pow10_i128(p: u8) -> i128 {
 /// regular row-loop executor which no longer sees Subquery nodes
 /// in its tree.
 impl Engine {
+    /// v4.12 window executor. Implements `ROW_NUMBER` / `RANK` /
+    /// `DENSE_RANK` and the partition-aware aggregates `SUM` /
+    /// `AVG` / `COUNT` / `MIN` / `MAX`. The plan is:
+    /// 1. Apply the WHERE filter.
+    /// 2. For each unique `WindowFunction` node in the projection,
+    ///    partition + sort, compute the per-row value.
+    /// 3. Append the window values as synthetic columns (`__win_N`)
+    ///    to the row schema.
+    /// 4. Rewrite the projection to read those columns.
+    /// 5. Hand off to the regular project / ORDER BY / LIMIT pipe.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::type_complexity,
+        clippy::needless_range_loop
+    )] // window-eval is one cohesive pipe; splitting fragments
+    fn exec_select_with_window(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let from = stmt.from.as_ref().ok_or_else(|| {
+            EngineError::Unsupported("window functions require a FROM clause".into())
+        })?;
+        // For v4.12 we only support a single-table FROM. Joins +
+        // windows is queued for v5.x.
+        if !from.joins.is_empty() {
+            return Err(EngineError::Unsupported(
+                "JOIN with window functions not yet supported".into(),
+            ));
+        }
+        let primary = &from.primary;
+        let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
+            StorageError::TableNotFound {
+                name: primary.name.clone(),
+            }
+        })?;
+        let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
+        let schema_cols = &table.schema().columns;
+        let ctx = EvalContext::new(schema_cols, Some(alias));
+
+        // 1) Filter pass.
+        let mut filtered: Vec<&Row> = Vec::new();
+        for (i, row) in table.rows().iter().enumerate() {
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            if let Some(w) = &stmt.where_ {
+                let cond = eval::eval_expr(w, row, &ctx)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            filtered.push(row);
+        }
+        let n_rows = filtered.len();
+
+        // 2) Collect unique window function nodes from projection.
+        let mut window_nodes: Vec<Expr> = Vec::new();
+        for item in &stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                collect_window_nodes(expr, &mut window_nodes);
+            }
+        }
+
+        // 3) For each window, compute per-row value.
+        // Index: same order as window_nodes; for row i, win_vals[w][i].
+        let mut win_vals: Vec<Vec<Value>> = Vec::with_capacity(window_nodes.len());
+        for wnode in &window_nodes {
+            let Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+            } = wnode
+            else {
+                unreachable!("collect_window_nodes pushes only WindowFunction");
+            };
+            // Compute (partition_key, order_key, original_index) for each row.
+            let mut indexed: Vec<(Vec<Value>, Vec<(Value, bool)>, usize)> =
+                Vec::with_capacity(n_rows);
+            for (i, row) in filtered.iter().enumerate() {
+                let pkey: Vec<Value> = partition_by
+                    .iter()
+                    .map(|p| eval::eval_expr(p, row, &ctx))
+                    .collect::<Result<_, _>>()?;
+                let okey: Vec<(Value, bool)> = order_by
+                    .iter()
+                    .map(|(e, desc)| eval::eval_expr(e, row, &ctx).map(|v| (v, *desc)))
+                    .collect::<Result<_, _>>()?;
+                indexed.push((pkey, okey, i));
+            }
+            // Sort by (partition_key, order_key). Partition key uses
+            // a stable encoded form; order key respects ASC/DESC.
+            indexed.sort_by(|a, b| {
+                let p_cmp = partition_key_cmp(&a.0, &b.0);
+                if p_cmp != core::cmp::Ordering::Equal {
+                    return p_cmp;
+                }
+                order_key_cmp(&a.1, &b.1)
+            });
+            // Per-partition compute.
+            let mut out_vals: Vec<Value> = alloc::vec![Value::Null; n_rows];
+            let mut p_start = 0;
+            while p_start < indexed.len() {
+                let mut p_end = p_start + 1;
+                while p_end < indexed.len()
+                    && partition_key_cmp(&indexed[p_start].0, &indexed[p_end].0)
+                        == core::cmp::Ordering::Equal
+                {
+                    p_end += 1;
+                }
+                // Compute the function within this partition slice.
+                compute_window_partition(
+                    name,
+                    args,
+                    !order_by.is_empty(),
+                    &indexed[p_start..p_end],
+                    &filtered,
+                    &ctx,
+                    &mut out_vals,
+                )?;
+                p_start = p_end;
+            }
+            win_vals.push(out_vals);
+        }
+
+        // 4) Build extended schema: original columns + synthetic.
+        let mut ext_cols = schema_cols.clone();
+        for i in 0..window_nodes.len() {
+            ext_cols.push(ColumnSchema::new(
+                alloc::format!("__win_{i}"),
+                DataType::Text, // type doesn't matter for projection eval
+                true,
+            ));
+        }
+        // 5) Build extended rows: each row gets its window values appended.
+        let mut ext_rows: Vec<Row> = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            let mut values = filtered[i].values.clone();
+            for w in 0..window_nodes.len() {
+                values.push(win_vals[w][i].clone());
+            }
+            ext_rows.push(Row::new(values));
+        }
+        // 6) Rewrite the projection: WindowFunction nodes → Column(__win_N).
+        let mut rewritten_items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
+        for item in &stmt.items {
+            let new_item = match item {
+                SelectItem::Wildcard => SelectItem::Wildcard,
+                SelectItem::Expr { expr, alias } => {
+                    let mut e = expr.clone();
+                    rewrite_window_to_columns(&mut e, &window_nodes);
+                    SelectItem::Expr {
+                        expr: e,
+                        alias: alias.clone(),
+                    }
+                }
+            };
+            rewritten_items.push(new_item);
+        }
+
+        // 7) Project into final rows.
+        let ext_ctx = EvalContext::new(&ext_cols, Some(alias));
+        let projection = build_projection(&rewritten_items, &ext_cols, alias)?;
+        let mut tagged: Vec<(Option<f64>, Row)> = Vec::with_capacity(n_rows);
+        for (i, row) in ext_rows.iter().enumerate() {
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            let mut values = Vec::with_capacity(projection.len());
+            for p in &projection {
+                values.push(eval::eval_expr(&p.expr, row, &ext_ctx)?);
+            }
+            let order_key = if let Some(order) = &stmt.order_by {
+                let mut e = order.expr.clone();
+                rewrite_window_to_columns(&mut e, &window_nodes);
+                let key = eval::eval_expr(&e, row, &ext_ctx)?;
+                Some(value_to_order_key(&key)?)
+            } else {
+                None
+            };
+            tagged.push((order_key, Row::new(values)));
+        }
+        // ORDER BY + LIMIT/OFFSET on the projected rows.
+        if let Some(order) = &stmt.order_by {
+            tagged.sort_by(|a, b| {
+                let (ka, kb) = (a.0.unwrap_or(f64::INFINITY), b.0.unwrap_or(f64::INFINITY));
+                let cmp = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
+                if order.desc { cmp.reverse() } else { cmp }
+            });
+        }
+        let mut out_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+        apply_offset_and_limit(&mut out_rows, stmt.offset, stmt.limit);
+        let final_cols: Vec<ColumnSchema> = projection
+            .into_iter()
+            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .collect();
+        Ok(QueryResult::Rows {
+            columns: final_cols,
+            rows: out_rows,
+        })
+    }
+
     /// v4.11: materialise each CTE into a temp table inside a
     /// cloned catalog, then run the body SELECT against a fresh
     /// engine instance that owns the enriched catalog. The clone
@@ -2057,6 +2267,24 @@ impl Engine {
                 self.resolve_expr_subqueries(pattern, cancel)?;
             }
             Expr::Extract { source, .. } => self.resolve_expr_subqueries(source, cancel)?,
+            // v4.12 window functions — recurse into args + ORDER BY
+            // + PARTITION BY in case they carry inner subqueries.
+            Expr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for a in args {
+                    self.resolve_expr_subqueries(a, cancel)?;
+                }
+                for p in partition_by {
+                    self.resolve_expr_subqueries(p, cancel)?;
+                }
+                for (e, _) in order_by {
+                    self.resolve_expr_subqueries(e, cancel)?;
+                }
+            }
             // Subquery nodes are handled in subquery_replacement
             // (which returned None — defensive no-op); Literal /
             // Column are leaves.
@@ -2164,12 +2392,338 @@ impl Engine {
     }
 }
 
-/// v4.10 helper: materialise a runtime `Value` back into an AST
-/// `Expr::Literal` for the subquery-rewrite path. Supports the
-/// types `Literal` can represent (Integer / Float / Text / Bool /
-/// Null). Date / Timestamp / Numeric / Vector / Interval / JSON
-/// would lose precision through Literal and aren't supported in
-/// uncorrelated-subquery results; they error with a clear hint.
+// ---- v4.12 window-function helpers ----
+// The (partition-key, order-key, original-index) tuple shape used
+// across these helpers is intrinsic to the planner. Factoring it
+// into a typedef adds indirection without making the code clearer,
+// so several lints are allowed inline on the affected functions
+// rather than module-wide.
+
+fn select_has_window(stmt: &SelectStatement) -> bool {
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item
+            && expr_has_window(expr)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_has_window(e: &Expr) -> bool {
+    match e {
+        Expr::WindowFunction { .. } => true,
+        Expr::Binary { lhs, rhs, .. } => expr_has_window(lhs) || expr_has_window(rhs),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_has_window(expr)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_has_window),
+        Expr::Like { expr, pattern, .. } => expr_has_window(expr) || expr_has_window(pattern),
+        Expr::Extract { source, .. } => expr_has_window(source),
+        Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Literal(_)
+        | Expr::Column(_) => false,
+    }
+}
+
+fn collect_window_nodes(e: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::WindowFunction { .. } = e {
+        // Deduplicate by structural equality on the expression
+        // (cheap because window args + partition + order are
+        // small). Without dedup we'd recompute identical windows
+        // once per occurrence in the projection.
+        if !out.iter().any(|x| x == e) {
+            out.push(e.clone());
+        }
+        return;
+    }
+    match e {
+        // Already handled by the early-return at the top.
+        Expr::WindowFunction { .. } => unreachable!(),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_window_nodes(lhs, out);
+            collect_window_nodes(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_window_nodes(expr, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_window_nodes(a, out);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_window_nodes(expr, out);
+            collect_window_nodes(pattern, out);
+        }
+        Expr::Extract { source, .. } => collect_window_nodes(source, out),
+        _ => {}
+    }
+}
+
+fn rewrite_window_to_columns(e: &mut Expr, window_nodes: &[Expr]) {
+    if let Expr::WindowFunction { .. } = e
+        && let Some(idx) = window_nodes.iter().position(|w| w == e)
+    {
+        *e = Expr::Column(spg_sql::ast::ColumnName {
+            qualifier: None,
+            name: alloc::format!("__win_{idx}"),
+        });
+        return;
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_window_to_columns(lhs, window_nodes);
+            rewrite_window_to_columns(rhs, window_nodes);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_window_to_columns(expr, window_nodes);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                rewrite_window_to_columns(a, window_nodes);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            rewrite_window_to_columns(expr, window_nodes);
+            rewrite_window_to_columns(pattern, window_nodes);
+        }
+        Expr::Extract { source, .. } => rewrite_window_to_columns(source, window_nodes),
+        _ => {}
+    }
+}
+
+/// Total order over partition-key tuples. NULL sorts as the
+/// lowest value (matches the `<` partial order's NULL-last
+/// behaviour with `INFINITY` flipped).
+fn partition_key_cmp(a: &[Value], b: &[Value]) -> core::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let c = value_cmp(x, y);
+        if c != core::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn order_key_cmp(a: &[(Value, bool)], b: &[(Value, bool)]) -> core::cmp::Ordering {
+    for ((va, desc), (vb, _)) in a.iter().zip(b.iter()) {
+        let c = value_cmp(va, vb);
+        let c = if *desc { c.reverse() } else { c };
+        if c != core::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+#[allow(clippy::match_same_arms)] // explicit arms per type document the supported pairs
+fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        (Value::SmallInt(x), Value::SmallInt(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        // Cross-type compare: fall back to the debug rendering —
+        // same-partition is the goal, exact order is irrelevant.
+        _ => alloc::format!("{a:?}").cmp(&alloc::format!("{b:?}")),
+    }
+}
+
+/// Compute the window function's per-row output for one partition.
+/// `slice` has (partition key, order key, original-row-index)
+/// tuples already sorted by order key. `filtered_rows` is the
+/// full row list indexed by original-row-index. `out_vals` is
+/// the destination, also indexed by original-row-index.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::match_same_arms
+)]
+fn compute_window_partition(
+    name: &str,
+    args: &[Expr],
+    ordered: bool,
+    slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)],
+    filtered_rows: &[&Row],
+    ctx: &EvalContext<'_>,
+    out_vals: &mut [Value],
+) -> Result<(), EngineError> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "row_number" => {
+            for (rank, (_, _, idx)) in slice.iter().enumerate() {
+                out_vals[*idx] = Value::BigInt((rank + 1) as i64);
+            }
+            Ok(())
+        }
+        "rank" => {
+            let mut prev_key: Option<&[(Value, bool)]> = None;
+            let mut current_rank: i64 = 1;
+            for (i, (_, okey, idx)) in slice.iter().enumerate() {
+                if let Some(p) = prev_key
+                    && order_key_cmp(p, okey) != core::cmp::Ordering::Equal
+                {
+                    current_rank = (i + 1) as i64;
+                }
+                if prev_key.is_none() {
+                    current_rank = 1;
+                }
+                out_vals[*idx] = Value::BigInt(current_rank);
+                prev_key = Some(okey.as_slice());
+            }
+            Ok(())
+        }
+        "dense_rank" => {
+            let mut prev_key: Option<&[(Value, bool)]> = None;
+            let mut current_rank: i64 = 0;
+            for (_, okey, idx) in slice {
+                if prev_key.is_none_or(|p| order_key_cmp(p, okey) != core::cmp::Ordering::Equal) {
+                    current_rank += 1;
+                }
+                out_vals[*idx] = Value::BigInt(current_rank);
+                prev_key = Some(okey.as_slice());
+            }
+            Ok(())
+        }
+        "sum" | "avg" | "min" | "max" | "count" | "count_star" => {
+            // Aggregate-style windows. When the window is ordered,
+            // the result is a running aggregate from the start of
+            // the partition through the current row. Without ORDER
+            // BY, every row in the partition gets the same final
+            // aggregate.
+            // Pre-evaluate the function arg per row in the slice
+            // (count_star has no arg).
+            let arg_values: Vec<Value> = if lower == "count_star" || args.is_empty() {
+                slice.iter().map(|_| Value::Null).collect()
+            } else {
+                slice
+                    .iter()
+                    .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
+                    .collect::<Result<_, _>>()
+                    .map_err(EngineError::Eval)?
+            };
+            if ordered {
+                // Running aggregate.
+                let mut sum: f64 = 0.0;
+                let mut count: i64 = 0;
+                let mut min_v: Option<f64> = None;
+                let mut max_v: Option<f64> = None;
+                for (i, (_, _, idx)) in slice.iter().enumerate() {
+                    let v = &arg_values[i];
+                    match lower.as_str() {
+                        "count_star" => {
+                            count += 1;
+                            out_vals[*idx] = Value::BigInt(count);
+                        }
+                        "count" => {
+                            if !v.is_null() {
+                                count += 1;
+                            }
+                            out_vals[*idx] = Value::BigInt(count);
+                        }
+                        "sum" | "avg" | "min" | "max" => {
+                            let x = value_to_f64(v);
+                            if let Some(x) = x {
+                                sum += x;
+                                count += 1;
+                                min_v = Some(min_v.map_or(x, |m| m.min(x)));
+                                max_v = Some(max_v.map_or(x, |m| m.max(x)));
+                            }
+                            out_vals[*idx] = match lower.as_str() {
+                                "sum" => Value::Float(sum),
+                                "avg" => {
+                                    if count == 0 {
+                                        Value::Null
+                                    } else {
+                                        Value::Float(sum / count as f64)
+                                    }
+                                }
+                                "min" => min_v.map_or(Value::Null, Value::Float),
+                                "max" => max_v.map_or(Value::Null, Value::Float),
+                                _ => unreachable!(),
+                            };
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            } else {
+                // Whole-partition aggregate — single value broadcast.
+                let mut sum: f64 = 0.0;
+                let mut count: i64 = 0;
+                let mut min_v: Option<f64> = None;
+                let mut max_v: Option<f64> = None;
+                for v in &arg_values {
+                    match lower.as_str() {
+                        "count_star" => count += 1,
+                        "count" => {
+                            if !v.is_null() {
+                                count += 1;
+                            }
+                        }
+                        _ => {
+                            if let Some(x) = value_to_f64(v) {
+                                sum += x;
+                                count += 1;
+                                min_v = Some(min_v.map_or(x, |m| m.min(x)));
+                                max_v = Some(max_v.map_or(x, |m| m.max(x)));
+                            }
+                        }
+                    }
+                }
+                let result = match lower.as_str() {
+                    "count" | "count_star" => Value::BigInt(count),
+                    "sum" => Value::Float(sum),
+                    "avg" => {
+                        if count == 0 {
+                            Value::Null
+                        } else {
+                            Value::Float(sum / count as f64)
+                        }
+                    }
+                    "min" => min_v.map_or(Value::Null, Value::Float),
+                    "max" => max_v.map_or(Value::Null, Value::Float),
+                    _ => unreachable!(),
+                };
+                for (_, _, idx) in slice {
+                    out_vals[*idx] = result.clone();
+                }
+            }
+            Ok(())
+        }
+        other => Err(EngineError::Unsupported(alloc::format!(
+            "window function {other:?} not supported (v4.12: row_number/rank/dense_rank/sum/avg/count/min/max)"
+        ))),
+    }
+}
+
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::SmallInt(n) => Some(f64::from(*n)),
+        Value::Int(n) => Some(f64::from(*n)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(n) => Some(*n as f64),
+        Value::Float(x) => Some(*x),
+        _ => None,
+    }
+}
+
 /// Quick scan for any subquery-bearing node in a SELECT's WHERE /
 /// projection / `order_by` — saves cloning the AST when there are
 /// none (the common case).
@@ -2205,10 +2759,26 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_subquery),
         Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
         Expr::Extract { source, .. } => expr_has_subquery(source),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(expr_has_subquery)
+                || partition_by.iter().any(expr_has_subquery)
+                || order_by.iter().any(|(e, _)| expr_has_subquery(e))
+        }
         Expr::Literal(_) | Expr::Column(_) => false,
     }
 }
 
+/// v4.10 helper: materialise a runtime `Value` back into an AST
+/// `Expr::Literal` for the subquery-rewrite path. Supports the
+/// types `Literal` can represent (Integer / Float / Text / Bool /
+/// Null). Date / Timestamp / Numeric / Vector / Interval / JSON
+/// would lose precision through Literal and aren't supported in
+/// uncorrelated-subquery results; they error with a clear hint.
 fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
     let lit = match v {
         Value::Null => Literal::Null,
@@ -2311,6 +2881,24 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         Expr::InSubquery { expr, subquery, .. } => {
             rewrite_expr_clock(expr, now);
             rewrite_select_clock(subquery, now);
+        }
+        // v4.12 window functions — args + PARTITION BY + ORDER BY
+        // may all reference clock literals.
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                rewrite_expr_clock(a, now);
+            }
+            for p in partition_by {
+                rewrite_expr_clock(p, now);
+            }
+            for (e, _) in order_by {
+                rewrite_expr_clock(e, now);
+            }
         }
         Expr::Literal(_) | Expr::Column(_) => {}
     }
