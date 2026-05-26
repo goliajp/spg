@@ -140,6 +140,12 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
         std::collections::HashMap::default();
     let mut portals: std::collections::HashMap<String, Portal> =
         std::collections::HashMap::default();
+    // v4.19: per-connection SET / SHOW state. PG clients SET
+    // application_name, client_encoding, search_path, etc. at
+    // startup; we accept and remember them. SHOW reads from this
+    // map first, falls back to a known-defaults table.
+    let mut settings: std::collections::HashMap<String, String> =
+        std::collections::HashMap::default();
     loop {
         let mut header = [0u8; 5];
         if let Err(e) = stream.read_exact(&mut header) {
@@ -170,6 +176,25 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
                 // multi-frame protocol; intercept before the regular
                 // execute path tries to parse them.
+                // v4.19: SET name=value / SET name TO value /
+                // SET SESSION name=value / SET LOCAL name=value.
+                // We store the assignment and return CC "SET";
+                // SPG doesn't act on the value (most are
+                // client-side hints), but `SHOW name` later
+                // returns what was stored.
+                if let Some((name, value)) = parse_set_statement(&sql) {
+                    settings.insert(name.to_ascii_lowercase(), value);
+                    send_command_complete(&mut stream, "SET")?;
+                    send_ready_for_query(&mut stream, tx_state)?;
+                    continue;
+                }
+                // v4.19: SHOW name / SHOW ALL.
+                if let Some(name) = parse_show_statement(&sql) {
+                    let resp = render_show(&name, &settings);
+                    send_canned(&mut stream, &resp)?;
+                    send_ready_for_query(&mut stream, tx_state)?;
+                    continue;
+                }
                 if let Some(copy) = parse_copy_intent(&sql) {
                     match copy {
                         CopyIntent::From(table) => {
@@ -984,6 +1009,119 @@ fn handle_execute(
         Err(e) => return Err(e.to_string()),
     }
     Ok(())
+}
+
+// ---- v4.19 SET / SHOW session-variable helpers ----
+
+/// Parse `SET name = value` / `SET name TO value` (plus optional
+/// `SESSION` or `LOCAL` keyword). Returns the (name, value) pair
+/// or None if the SQL isn't a SET we handle.
+fn parse_set_statement(sql: &str) -> Option<(String, String)> {
+    let trimmed = sql.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("set ")?;
+    // Strip optional SESSION / LOCAL.
+    let rest = rest
+        .strip_prefix("session ")
+        .or_else(|| rest.strip_prefix("local "))
+        .unwrap_or(rest);
+    // Find name + assign operator (= or TO).
+    let (name, value_part) = if let Some(idx) = rest.find('=') {
+        (rest[..idx].trim().to_string(), rest[idx + 1..].trim())
+    } else if let Some(idx) = rest.find(" to ") {
+        (rest[..idx].trim().to_string(), rest[idx + 4..].trim())
+    } else {
+        return None;
+    };
+    if name.is_empty() {
+        return None;
+    }
+    // Strip surrounding quotes from the value.
+    let value = value_part
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_string();
+    Some((name, value))
+}
+
+/// Parse `SHOW name` / `SHOW ALL` / `SHOW SESSION AUTHORIZATION`.
+/// Returns the requested name, lowercased, or None.
+fn parse_show_statement(sql: &str) -> Option<String> {
+    let lower = sql.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("show ")?;
+    let name = rest.split_ascii_whitespace().next()?.to_string();
+    Some(name)
+}
+
+/// Render a SHOW result: the value from `settings` first, else a
+/// known default. SHOW ALL emits one row per known setting.
+fn render_show(
+    name: &str,
+    settings: &std::collections::HashMap<String, String>,
+) -> CannedResponse {
+    if name == "all" {
+        let mut entries: Vec<(String, String)> = known_defaults()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        // Overlay session overrides.
+        for (k, v) in settings {
+            if let Some(pos) = entries.iter().position(|(name, _)| name == k) {
+                entries[pos].1.clone_from(v);
+            } else {
+                entries.push((k.clone(), v.clone()));
+            }
+        }
+        entries.sort();
+        let columns = vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("setting", DataType::Text, false),
+            ColumnSchema::new("description", DataType::Text, true),
+        ];
+        let rows: Vec<Row> = entries
+            .into_iter()
+            .map(|(n, v)| {
+                Row::new(vec![Value::Text(n), Value::Text(v), Value::Null])
+            })
+            .collect();
+        return CannedResponse::Rows { columns, rows };
+    }
+    let value = settings
+        .get(name)
+        .cloned()
+        .or_else(|| {
+            known_defaults()
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        })
+        .unwrap_or_default();
+    let columns = vec![ColumnSchema::new(name.to_string(), DataType::Text, false)];
+    CannedResponse::Rows {
+        columns,
+        rows: vec![Row::new(vec![Value::Text(value)])],
+    }
+}
+
+/// Built-in PG GUCs we report sane defaults for so clients
+/// configuring themselves at startup don't get an empty SHOW.
+fn known_defaults() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("application_name", ""),
+        ("client_encoding", "UTF8"),
+        ("datestyle", "ISO, MDY"),
+        ("default_transaction_isolation", "read committed"),
+        ("default_transaction_read_only", "off"),
+        ("intervalstyle", "postgres"),
+        ("search_path", "\"$user\", public"),
+        ("server_encoding", "UTF8"),
+        ("server_version", "16.0 (spg-4.19)"),
+        ("standard_conforming_strings", "on"),
+        ("statement_timeout", "0"),
+        ("timezone", "UTC"),
+        ("transaction_isolation", "read committed"),
+        ("transaction_read_only", "off"),
+    ]
 }
 
 // ---- v4.17 COPY FROM STDIN / COPY TO STDOUT ----
