@@ -39,5 +39,9 @@ path = "src/smoke.rs"
 name = "latency"
 path = "src/bin/latency.rs"
 
+[[bin]]
+name = "throughput"
+path = "src/bin/throughput.rs"
+
 [lints]
 workspace = true

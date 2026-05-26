@@ -226,6 +226,41 @@ Single-row `INSERT INTO bench_users` and single-row
 Reproduce: `xbench/competitor/scripts/up.sh && cargo run --release
 -p spg-bench-competitor --bin latency`.
 
+### v3.2.2 — bulk INSERT 10K rows + full SELECT scan
+
+10000-row load via 100-row multi-VALUES INSERT batches, then a
+single `SELECT id, name FROM bench_users` to materialise the whole
+table. Same five backends, same schema, no PK index in this bench
+shape (PG/MySQL/Maria still attach one to PRIMARY KEY).
+
+| backend       |  INSERT ms |     INS rows/s |   SCAN ms |    SCAN rows/s |
+|---------------|-----------:|---------------:|----------:|---------------:|
+| spg-embedded  |       3.16 |    **3,160,848** |      1.43 |    **7,006,888** |
+| spg-server    |       8.88 |    **1,125,809** |      7.42 |      1,347,187 |
+| postgres 18   |     132.02 |          75,744 |      4.13 |      2,420,477 |
+| mysql 9       |     221.91 |          45,064 |      3.34 |      2,994,983 |
+| mariadb 11    |     155.30 |          64,390 |      2.90 |      3,452,543 |
+
+**Reading this honestly:**
+
+- INSERT throughput: spg-embedded is **41-70× faster** than the
+  three competitors; spg-server is **15-25× faster**. The win is
+  the same as in the latency bench (no fsync, no MVCC, lighter
+  wire), just amortised over 10000 rows so the absolute numbers
+  are huge.
+- SCAN throughput surfaces an honest spg-server cost: **at 1.35M
+  rows/sec it's slower than every server-flavoured competitor**
+  (PG/MySQL/Maria land 2.4-3.5M rows/sec). The reason: spg-wire
+  emits one `DataRow` frame per row (one length-prefix + one op
+  byte per row), whereas the PG / MySQL binary protocols batch
+  rows into network buffers more aggressively. spg-embedded
+  doesn't pay this and runs at 7M rows/sec. A wire-level batch
+  format (multiple rows per frame) would close this gap — logged
+  as future work.
+
+Reproduce: `xbench/competitor/scripts/up.sh && cargo run --release
+-p spg-bench-competitor --bin throughput`.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
