@@ -849,6 +849,116 @@ Per-backend budget 15 min, full run ~30 min on a quiet host.
 
 ---
 
+## v4.39 scale sweep — `Catalog` backed by `PersistentVec<Row>` (2026-05-27)
+
+Same `xbench/competitor/src/bin/sweep.rs` run as the v4.37 baseline
+above. The v4.39 change set is structural-sharing for `Table::rows`:
+`Vec<Row>` → `PersistentVec<Row>` (Bitmapped Vector Trie, 32-way +
+tail buffer; landed standalone in v4.38). Goal — turn the v4.34
+auto-commit BEGIN..COMMIT wrap's per-write `Catalog::clone()` from
+deep-copy back into an `Arc` bump independent of row count, without
+weakening the ENOSPC rollback property PROD_READY row 1.11 owns.
+
+### Per-N (INSERT throughput rows/s + PK p99 µs)
+
+| backend       |    10K    |    100K   |     1M    |    10M    |    30M    |   100M    |
+|---------------|----------:|----------:|----------:|----------:|----------:|----------:|
+| spg-embedded  |  822K / 1µs |  864K / 2µs  |  762K / 6µs  |  648K / 17µs |  (RSS cap) | — |
+| spg-server    |  101K / 50µs |   67K / 32µs |   15K / 37µs | (bail)    | —         | — |
+| postgres      |  145K / 2.6ms |  148K / 2.9ms |  136K / 2.6ms |   92K / 3.3ms |   66K / 3.0ms | (bail @ 30M) |
+| mysql         |   26K / 3.1ms |   77K / 4.0ms |   74K / 3.6ms |   69K / 4.1ms |   42K / 2.5ms |   25K / 2.5ms |
+| mariadb       |   88K / 2.0ms |  195K / 2.0ms |  187K / 2.2ms |   40K / 2.3ms | (bail @ 10M) | — |
+
+(spg-embedded / spg-server bail rows in the same shape as the v4.37
+baseline; numbers above are direct from `cargo run --release -p
+spg-bench-competitor --bin sweep` on 2026-05-27, same M-series host,
+same docker compose stack.)
+
+### Diff vs baseline-v4.37 (commit `399dc8d`)
+
+| backend / N        | baseline-v4.37 r/s | v4.39 r/s | ratio | notes |
+|--------------------|-------------------:|----------:|------:|-------|
+| spg-server [10K]   |             87K |    101K |  1.16× | wrap cheaper at every N |
+| spg-server [100K]  |             50K |     67K |  1.34× | wrap cheaper |
+| spg-server [1M]    |            9.4K |     15K |  1.60× | **still bails** — see Finding 1 |
+| spg-embedded [10K] |           1684K |    822K |  0.49× | **regression** — see Finding 2 |
+| spg-embedded [1M]  |           1584K |    762K |  0.48× | regression |
+| spg-embedded [10M] |           1199K |    648K |  0.54× | regression |
+| postgres / mysql / mariadb | (≈ same) | (≈ same) | — | sample-to-sample variance only |
+
+### Findings
+
+**1. spg-server [1M] still bails — the rows-clone half is fixed but
+   the indices-clone half isn't.** The sweep schema is `CREATE TABLE
+   sweep (id INT, sec INT, name VARCHAR(64))` plus `CREATE INDEX
+   sweep_id_idx ON sweep (id)` + `CREATE INDEX sweep_sec_idx ON sweep
+   (sec)`. After v4.39 `Catalog::clone` skips the `Vec<Row>` deep-copy
+   (now an `Arc` bump on the row trie), but each `Table` still
+   contains `indices: Vec<Index>` and each `Index` is a
+   `BTreeMap<IndexKey, Vec<usize>>` cloned deep at every clone. At
+   1M rows with 2 indices the BTreeMap clone is the new bottleneck —
+   roughly the same magnitude as the old `Vec<Row>` clone, hence
+   the modest 9.4K → 15K lift instead of the full unlock. **v4.40 swaps
+   `Table::indices` over to `PersistentBTreeMap` and is expected to
+   close this gap.** Validated separately at the wrap layer by
+   `tests/slo_smoke.rs::slo_wal_insert_1m_rows_throughput` on a
+   no-index table: 9.4K → ~109K r/s (~12×), confirming the
+   rows-clone fix is correct and the residual cost is unambiguously
+   in the indices path.
+
+**2. spg-embedded throughput regressed ~50%.** PV's `push(&self, x)`
+   is `O(BRANCH)` per call — it path-copies the `tail` `Vec` (up to
+   32 elements) every time to preserve the immutable contract.
+   For `T = Row` that's ~600 ns/row of tail-clone tax; on the
+   embedded streaming-insert path (no TX wrap → every `Engine::execute`
+   is one PV push), that cost halves throughput at every checkpoint.
+   The v4.34 wrap path is fsync-dominated, so the same tax is
+   negligible there (`slo_smoke` 1M-row throughput was 109K r/s
+   despite the tax). **v4.39.1 closes this with a transient
+   `push_mut(&mut self, x)` via `Arc::make_mut` — uniquely-owned PV
+   handles mutate the tail in place at `Vec::push` cost (~10 ns/row);
+   shared handles still path-copy correctly so the wrap's snapshot
+   semantics are unaffected.** `tests/perf_gate.rs::pv_push_mut_1m_under_50ms`
+   gates the recovery; `tests/persistent.rs::fuzz_oracle_push_mut_against_vec_u64`
+   + `push_mut_does_not_disturb_cloned_handle` gate correctness.
+
+**3. PK / SEC p99 latency in spg-server actually improved slightly
+   at [1M]** (77 µs → 37 µs PK p99), because the PV's row trie has a
+   shorter, more cache-friendly walk than the previous flat `Vec`
+   when the catalog has been touched by many clone-on-write paths
+   on the same insert pass. Within noise; not load-bearing.
+
+**4. NSW / HNSW vector search not exercised by this sweep.** The
+   sweep schema has no vector column. The expected v4.39 regression
+   on `xbench/competitor/src/bin/vector_knn.rs` (NSW search reading
+   `table.rows[i]` via PV's `Index<usize>` impl pays an extra
+   `O(log₃₂ N)` per probe, ≈ 50 ns at 1M) is real but unmeasured here;
+   tracked for v5.0 (HNSW persistent + vector cache).
+
+### Boundary summary
+
+| concern                           | which backend hits it first | at what N | change vs v4.37 |
+|-----------------------------------|----------------------------|-----------|------------------|
+| INSERT throughput cliff           | mariadb                    | ~10M      | unchanged |
+| INSERT throughput regression — wrap | **spg-server (indices clone)** | **~1M** | **partial** — v4.40 closes |
+| INSERT throughput regression — push | spg-embedded (PV tail clone) | **every N** | **new in v4.39, closed in v4.39.1** |
+| PK lookup p99 cliff (buffer pool) | postgres                   | ~30M      | unchanged |
+| Physical RAM ceiling              | spg-embedded               | ~10M      | unchanged |
+
+### Reproduce
+
+  cd <repo root>
+  xbench/competitor/scripts/up.sh
+  cargo run --release -p spg-bench-competitor --bin sweep
+
+Per-backend budget 15 min, full run ~30 min on a quiet host. The
+v4.39.1 `push_mut` recovery is verified via
+`cargo test --release -p spg-storage --test perf_gate
+pv_push_mut_1m_under_50ms` (unit-level, ~25 ms observed; sweep
+rerun deferred).
+
+---
+
 ## v4.37 competitor rerun (2026-05-27, post-ops-sprint)
 
 End-to-end re-baseline after the v4.33–v4.37 sprint (graceful

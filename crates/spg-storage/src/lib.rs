@@ -535,7 +535,11 @@ impl Table {
                 map.entry(key).or_default().push(new_row_idx);
             }
         }
-        self.rows = self.rows.push(row);
+        // v4.39.1: push_mut keeps streaming inserts at Vec::push speed when
+        // the table is uniquely owned (the spg-embedded path); inside a TX
+        // wrap where a Catalog snapshot exists, push_mut path-copies the
+        // tail just like push() and the snapshot stays valid.
+        self.rows.push_mut(row);
         // NSW updates after the push so the new row is visible to the
         // greedy search used during connect.
         let new_row_idx = self.rows.len() - 1;
@@ -630,7 +634,7 @@ impl Table {
         let mut new_rows: PersistentVec<Row> = PersistentVec::new();
         for (i, row) in self.rows.iter().enumerate() {
             if !to_remove[i] {
-                new_rows = new_rows.push(row.clone());
+                new_rows.push_mut(row.clone());
             }
         }
         self.rows = new_rows;
@@ -1791,7 +1795,7 @@ fn deserialize_rows(
                 values.push(cur.read_value_body(col_types[col_idx])?);
             }
         }
-        t.rows = t.rows.push(Row { values });
+        t.rows.push_mut(Row { values });
     }
     Ok(())
 }

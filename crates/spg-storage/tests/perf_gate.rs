@@ -136,6 +136,29 @@ fn pv_push_1m_under_200ms() {
     assert_eq!(pv.len(), 1_000_000);
 }
 
+/// v4.39.1 transient push 性能门 — 1M 次 `push_mut` ≤ 50 ms。`push` 每次 path-copy
+/// tail（O(BRANCH) 上限，对 `T = Row` ~600 ns/row），所以 200 ms gate（v4.38）反映的是
+/// `push` 的成本。`push_mut` 用 `Arc::make_mut` 在 Arc 唯一拥有时直接 in-place mutate
+/// tail，恢复 `Vec::push` 同级 ~10-30 ns/row。50 ms gate 留 ~2× 余量。
+/// 这是 spg-embedded 流式 INSERT 路径恢复 baseline 吞吐的关键。
+#[test]
+fn pv_push_mut_1m_under_50ms() {
+    let start = Instant::now();
+    let mut pv: PersistentVec<u64> = PersistentVec::new();
+    for i in 0..1_000_000_u64 {
+        pv.push_mut(i);
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(&pv);
+    let budget_ms: u128 = 50;
+    let elapsed_ms = elapsed.as_millis();
+    assert!(
+        elapsed_ms < budget_ms,
+        "pv_push_mut_1m elapsed {elapsed_ms} ms exceeds budget {budget_ms} ms"
+    );
+    assert_eq!(pv.len(), 1_000_000);
+}
+
 /// v4.38 BVT random `get` 性能门 — 1M 元素的 PV 上随机 `get` 平均 ≤ 100 ns。
 /// 实测 ~30-60 ns；100 ns 同样留 ~2× 余量。100K 次采样平摊掉 Instant 噪声。
 #[test]

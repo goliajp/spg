@@ -213,6 +213,44 @@ impl<T: Clone> PersistentVec<T> {
         }
     }
 
+    /// `O(1)` amortized — transient in-place push. v4.39.1 perf path for the
+    /// `Table::insert` hot loop (and any other streaming caller that holds a
+    /// `&mut PersistentVec`). Uses `Arc::make_mut` on the tail buffer: when
+    /// the tail's `Arc` is uniquely owned (the common case), this mutates
+    /// in place — same cost as `Vec::push`. If a cloned handle is outstanding
+    /// (e.g. inside a TX wrap holding a Catalog snapshot), the tail is path-
+    /// copied just like `push` and the snapshot is unaffected. Either way,
+    /// callers observe the same end state as `self = self.push(x)`.
+    pub fn push_mut(&mut self, x: T) {
+        if self.tail.len() < BRANCH {
+            // Fast path: room in tail, mutate in place when uniquely owned.
+            let tail = Arc::make_mut(&mut self.tail);
+            tail.push(x);
+            self.len += 1;
+            return;
+        }
+        // Slow path: tail full → incorporate into trie, then start a fresh
+        // tail with [x]. Take ownership of the tail Arc to reuse its Vec
+        // when uniquely owned; the placeholder replacement makes self.tail
+        // the fresh `[x]` buffer.
+        let old_tail_arc = core::mem::replace(&mut self.tail, Arc::new(alloc::vec![x]));
+        let old_tail_vec: Vec<T> =
+            Arc::try_unwrap(old_tail_arc).unwrap_or_else(|arc| (*arc).clone());
+        let leaf: Arc<Node<T>> = Arc::new(Node::Leaf(old_tail_vec));
+        let old_trie_size = self.len - BRANCH;
+        let trie_capacity: usize = 1usize << (self.shift + SHIFT);
+        let needs_grow = old_trie_size + BRANCH > trie_capacity;
+        if needs_grow {
+            let internal_levels = self.shift / SHIFT;
+            let new_branch = new_path(internal_levels, leaf);
+            self.root = Arc::new(Node::Internal(alloc::vec![self.root.clone(), new_branch]));
+            self.shift += SHIFT;
+        } else {
+            self.root = push_leaf_into_node(&self.root, self.shift, old_trie_size, leaf);
+        }
+        self.len += 1;
+    }
+
     /// `O(log₃₂ N)` path-copy set. `None` for out-of-bounds (matches `get`).
     /// Result shares every node except the spine to the rewritten cell.
     #[must_use]
@@ -610,6 +648,63 @@ mod tests {
         assert_eq!(a.len(), oracle_a.len());
         assert_eq!(b.len(), oracle_b.len());
         assert_eq!(c.len(), oracle_c.len());
+    }
+
+    /// v4.39.1: `push_mut` fuzz oracle. Same shape as the `push` oracle but
+    /// drives the in-place transient path so every BVT branch / tail boundary
+    /// / root overflow is hit under `Arc::make_mut`. Confirms the optimization
+    /// preserves the canonical `Vec<u64>` ground-truth.
+    #[test]
+    fn fuzz_oracle_push_mut_against_vec_u64() {
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        let mut oracle: Vec<u64> = Vec::new();
+        let mut rng = Splitmix::new(0xFEEDFACE_u64);
+        const STEPS: usize = 100_000;
+        for step in 0..STEPS {
+            let val = rng.next();
+            pv.push_mut(val);
+            oracle.push(val);
+            assert_eq!(pv.len(), oracle.len(), "len drift @ step {step}");
+            if step % 1024 == 0 {
+                // Cheap spot-check; full sweep at end.
+                let probe = (rng.next() as usize) % oracle.len();
+                assert_eq!(
+                    pv.get(probe),
+                    Some(&oracle[probe]),
+                    "interior drift @ step {step}, probe {probe}"
+                );
+            }
+        }
+        for i in 0..oracle.len() {
+            assert_eq!(pv.get(i), Some(&oracle[i]), "final drift at {i}");
+        }
+    }
+
+    /// v4.39.1: critical invariant — when a `Clone`d handle B exists and the
+    /// original A calls `push_mut(x)`, B's view is **not** affected (the
+    /// `Arc::make_mut` tail-clone keeps the immutable contract). Without
+    /// this guarantee the v4.34 BEGIN..COMMIT wrap (which holds a Catalog
+    /// snapshot) would see writes leak across the snapshot boundary.
+    #[test]
+    fn push_mut_does_not_disturb_cloned_handle() {
+        let mut a: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..200_u64 {
+            a.push_mut(i);
+        }
+        let b = a.clone();
+        // A pushes through the tail boundary multiple times.
+        for i in 200_u64..500 {
+            a.push_mut(i);
+        }
+        assert_eq!(b.len(), 200);
+        for i in 0..200_u64 {
+            assert_eq!(b.get(i as usize), Some(&i), "B drift at {i}");
+        }
+        assert!(b.get(200).is_none());
+        assert_eq!(a.len(), 500);
+        for i in 0..500_u64 {
+            assert_eq!(a.get(i as usize), Some(&i), "A drift at {i}");
+        }
     }
 
     #[test]
