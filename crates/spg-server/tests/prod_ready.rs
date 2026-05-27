@@ -159,6 +159,94 @@ fn assert_doc_has_sections(doc_name: &str, required: &[&str]) {
     }
 }
 
+// ---- 3.9 cargo-deny ----
+
+#[test]
+fn row_3_9_cargo_deny_config_and_ci_present() {
+    assert!(
+        workspace_root().join("deny.toml").exists(),
+        "deny.toml must exist at workspace root"
+    );
+    let yml =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml")).expect("ci.yml");
+    assert!(yml.contains("cargo-deny-action"), "CI must run cargo-deny");
+}
+
+// ---- 3.11 fuzz harnesses ----
+
+#[test]
+fn row_3_11_fuzz_harnesses_present() {
+    let sql_fuzz = workspace_root().join("crates/spg-sql/tests/fuzz.rs");
+    let wire_fuzz = workspace_root().join("crates/spg-server/tests/e2e_fuzz.rs");
+    assert!(
+        sql_fuzz.exists(),
+        "SQL fuzz harness must exist at {}",
+        sql_fuzz.display()
+    );
+    assert!(
+        wire_fuzz.exists(),
+        "wire fuzz harness must exist at {}",
+        wire_fuzz.display()
+    );
+    let sql_src = std::fs::read_to_string(&sql_fuzz).unwrap();
+    let wire_src = std::fs::read_to_string(&wire_fuzz).unwrap();
+    assert!(sql_src.contains("fn fuzz_parse_statement_does_not_panic"));
+    assert!(wire_src.contains("fn fuzz_wire_frame_does_not_panic"));
+}
+
+// ---- 8.4 / 8.5 / 8.6 STABILITY + cross-version compat ----
+
+#[test]
+fn row_8_4_snapshot_backwards_compat_test_present() {
+    let p = workspace_root().join("crates/spg-server/tests/cross_version_compat.rs");
+    assert!(p.exists(), "cross_version_compat.rs missing");
+    let src = std::fs::read_to_string(&p).unwrap();
+    assert!(src.contains("fn every_fixture_restores_and_verifies"));
+}
+
+#[test]
+fn row_8_5_stability_doc_present() {
+    assert_doc_has_sections(
+        "STABILITY.md",
+        &[
+            "## Frozen surfaces",
+            "Native wire protocol",
+            "Snapshot file format",
+            "Backup bundle format",
+            "Env-var contract",
+        ],
+    );
+}
+
+#[test]
+fn row_8_6_cross_version_fixture_present() {
+    let fixtures = workspace_root().join("xtests/compat-fixtures");
+    assert!(fixtures.is_dir(), "compat-fixtures dir missing");
+    let entries: Vec<_> = std::fs::read_dir(&fixtures)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "compat-fixtures must contain at least one version directory"
+    );
+    // Each version dir must carry the trio expected.txt + full.bkp.
+    for e in &entries {
+        let p = e.path();
+        assert!(
+            p.join("expected.txt").exists(),
+            "{}/expected.txt missing",
+            p.display()
+        );
+        assert!(
+            p.join("full.bkp").exists(),
+            "{}/full.bkp missing",
+            p.display()
+        );
+    }
+}
+
 // ---- 2.5 / 2.6 RESTORE_DRILL ----
 
 #[test]
