@@ -116,6 +116,31 @@ layout. Versioned in-band via the `kind` byte (currently 0 =
 full, 1 = incremental); adding new kinds is a MINOR bump,
 changing the layout of an existing kind is MAJOR.
 
+### Replication protocol (port `SPG_REPL_ADDR`)
+
+Two negotiable wire versions on the same port; the follower
+picks the version with the handshake magic byte.
+
+- `SPGREPL\x01` (v4.24) — handshake byte + raw WAL byte stream
+  after snapshot. Frozen: any future change creates a new magic
+  byte (as v4.36 did).
+- `SPGREPL\x02` (v4.36) — same handshake + snapshot exchange,
+  then **framed** stream: `[u8 type][u32 LE len][payload]`.
+  - type `0x00` — WAL chunk (payload = bytes, parsed by the
+    follower's record accumulator just like v1).
+  - type `0x01` — status frame (payload = `[u64 LE
+    primary_wal_pos][u64 LE wall_time_us]`). Drives the
+    follower's `spg_replication_lag_bytes` and
+    `spg_replication_lag_seconds` metrics.
+
+Backwards-compat rule: unknown frame types and unknown payload
+sizes on known types MUST be tolerated (followers skip them).
+This is the extension point for future status fields without a
+v3 magic bump.
+
+The complete wire layout for both versions lives in
+`crates/spg-server/src/replication.rs`'s module doc.
+
 ### Env-var contract
 
 Every env var listed in DEPLOYMENT.md's table is stable. New

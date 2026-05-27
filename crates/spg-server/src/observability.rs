@@ -193,7 +193,46 @@ fn render_metrics(state: &crate::ServerState) -> String {
         state.metrics.errors_total.load(Ordering::Relaxed)
     ));
     render_table_metrics(state, &mut out);
+    render_replication_lag(state, &mut out);
     out
+}
+
+/// v4.36 follower-side replication lag. Emits two series:
+///
+/// - `spg_replication_lag_bytes` — `primary_pos − follower_applied_pos`
+///   from the master's most recent status frame. Zero on a primary
+///   or a v1-only follower; both series omitted when the follower
+///   hasn't received any status frame yet (so Prometheus doesn't
+///   reify a misleading 0 lag).
+/// - `spg_replication_lag_seconds` — `now − master_wall_time_us`,
+///   converted to floating seconds. Same omit-on-no-data rule.
+fn render_replication_lag(state: &crate::ServerState, out: &mut String) {
+    let primary_pos = state.lag_state.primary_pos.load(Ordering::Acquire);
+    let primary_wall = state.lag_state.primary_wall_time_us.load(Ordering::Acquire);
+    if primary_wall == 0 {
+        // No status frame seen yet — primary or v1 follower. Skip.
+        return;
+    }
+    let applied = state.lag_state.follower_applied_pos.load(Ordering::Acquire);
+    let lag_bytes = primary_pos.saturating_sub(applied);
+    let now_us = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(0);
+    // wall-time deltas can go briefly negative under NTP slew —
+    // saturate at 0 so the metric is monotonically meaningful.
+    let lag_us = now_us.saturating_sub(primary_wall);
+    let lag_seconds = (lag_us as f64) / 1_000_000.0;
+    out.push_str("# HELP spg_replication_lag_bytes WAL bytes follower is behind primary (v4.36 status frame)\n");
+    out.push_str("# TYPE spg_replication_lag_bytes gauge\n");
+    out.push_str(&format!("spg_replication_lag_bytes {lag_bytes}\n"));
+    out.push_str(
+        "# HELP spg_replication_lag_seconds Wall-clock seconds since primary's last status frame\n",
+    );
+    out.push_str("# TYPE spg_replication_lag_seconds gauge\n");
+    out.push_str(&format!("spg_replication_lag_seconds {lag_seconds}\n"));
 }
 
 /// v4.35: per-table `spg_table_rows{table="..."}` +

@@ -154,6 +154,11 @@ pub(crate) struct ServerState {
     /// All branches default-off and skip the check entirely when
     /// the env var wasn't set on startup.
     chaos: ChaosKnobs,
+    /// v4.36: follower-side replication lag tracking. Populated by
+    /// `replication::run_follower` when this node negotiated the v2
+    /// protocol (status frames). On a primary or a v1-only follower
+    /// these stay at zero and `/metrics` omits the series.
+    pub(crate) lag_state: Arc<replication::LagState>,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
@@ -357,6 +362,7 @@ fn run(
         active_connections: AtomicUsize::new(0),
         metrics: Arc::new(observability::Metrics::default()),
         chaos,
+        lag_state: Arc::new(replication::LagState::default()),
     });
 
     let listener = TcpListener::bind(addr)?;

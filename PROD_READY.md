@@ -18,8 +18,8 @@ Status legend:
 - ❌ — not done; on the roadmap
 - 🚫 — intentional out-of-scope (linked to memory or rationale)
 
-Last refresh: **v4.35 per-table metrics** (2026-05-27, commit
-hash filled at commit time).
+Last refresh: **v4.36 replication chaos + lag metric** (2026-05-27,
+commit hash filled at commit time).
 
 ---
 
@@ -58,7 +58,7 @@ practiced.
 | 2.6 | Restore drill automated [machine] | E2E test follows the doc commands; fails CI if doc rots | ✅ | v4.30, `tests/e2e_restore_drill.rs::restore_drill_full_plus_incremental_recovers_row_count` |
 | 2.7 | Graceful shutdown [machine] | SIGTERM drains in-flight queries up to a deadline, refuses new connections, exits 0 | ✅ | v4.33, `SPG_SHUTDOWN_DEADLINE_SEC` (default 30s) + SIGTERM/SIGINT handler in `crates/spg-server/src/main.rs`; e2e: `tests/e2e_graceful_shutdown.rs::graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero` |
 | 2.8 | Automated failover | A follower can be promoted to primary by operator action; coordinator handles it | 🚫 | manual promotion only; HA = "stop follower, point clients at it, restart in primary mode". See [[spg-out-of-scope]] |
-| 2.9 | Network partition tolerance [chaos] | Follower disconnect while primary writes → on reconnect, all writes catch up exactly once, no duplicates / no gaps | ⚠️ | logic supports it; v4.30 chaos test will assert (also rows 1.11 in-memory rollback) |
+| 2.9 | Network partition tolerance [chaos] [machine] | Follower disconnect while primary writes → on reconnect, all writes catch up exactly once, no duplicates / no gaps | ✅ | v4.36, in-test TCP proxy + `tests/e2e_chaos_netsplit.rs::netsplit_disconnect_then_heal_resyncs_without_loss_or_dup` (asserts row count + value sum both match). |
 
 ## 3. Security
 
@@ -94,7 +94,7 @@ seconds, and you have enough signal to diagnose.
 | 4.4 | EXPLAIN / EXPLAIN ANALYZE | Operator can inspect plan + actual rows for any query | ✅ | v4.26.0, `tests/e2e_explain.rs` |
 | 4.5 | Slow-query log [machine] | Queries exceeding threshold logged with SQL + elapsed | ✅ | v4.33, `SPG_SLOW_QUERY_LOG_MS`; one JSON line per slow query on stderr (`sql`/`elapsed_us`/`role`/`threshold_us`); e2e: `tests/e2e_slow_query_log.rs::slow_query_log_fires_above_threshold_and_silent_below` |
 | 4.6 | Per-table row count / size metrics [machine] | `spg_table_rows{table=…}` series exposed via /metrics | ✅ | v4.35, `spg_table_rows{table=…}` + `spg_table_bytes{table=…}` in `crates/spg-server/src/observability.rs`. Cardinality cap via `SPG_METRICS_TABLE_TOPN` (default 50) or exact `SPG_METRICS_TABLE_ALLOWLIST=t1,t2`. e2e: `tests/e2e_table_metrics.rs` (default top-N, allowlist filter, cardinality cap). |
-| 4.7 | Replication lag metric | Lag in bytes / seconds exposed via /metrics on the follower | ❌ | Deferred — follower currently has no notion of "primary's latest offset" beyond what it's applied. Needs protocol extension to query. v5 candidate. |
+| 4.7 | Replication lag metric [machine] | Lag in bytes / seconds exposed via /metrics on the follower | ✅ | v4.36, `spg_replication_lag_bytes` + `spg_replication_lag_seconds` in `/metrics`, fed by the new `SPGREPL\x02` status frames (`crates/spg-server/src/replication.rs`). Stable surface in STABILITY.md §"Replication protocol". e2e: `tests/e2e_chaos_netsplit.rs::follower_metrics_expose_replication_lag_after_status_frame`. |
 | 4.8 | OpenTelemetry tracing | — | 🚫 | not in scope for v4.x — single-process tracing is what logs already provide |
 
 ## 5. Resource control
@@ -220,20 +220,20 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.35 (2026-05-27).
+Last machine run: v4.36 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 73
-  ⚠️ partial          : 5
-  ❌ open             : 1
+  ✅ pass             : 75
+  ⚠️ partial          : 4
+  ❌ open             : 0
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 35
+[machine] rows scaffolded in prod_ready.rs : 37
   row_1_3, row_1_9, row_1_10, row_1_11,
-  row_2_5, row_2_6, row_2_7,
+  row_2_5, row_2_6, row_2_7, row_2_9,
   row_3_7, row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
-  row_4_1, row_4_2, row_4_5, row_4_6,
+  row_4_1, row_4_2, row_4_5, row_4_6, row_4_7,
   row_5_1, row_5_7,
   row_6_3,
   row_7_2, row_7_3, row_7_4, row_7_5, row_7_6,
@@ -242,17 +242,32 @@ Total rows in checklist : 85
   row_10_x, row_10_4, row_10_5
 ```
 
-v4.35 closes PROD_READY row 4.6. `spg_table_rows{table=…}` +
-`spg_table_bytes{table=…}` are now exposed via `/metrics`.
-Cardinality is bounded by `SPG_METRICS_TABLE_TOPN` (default 50 —
-silently truncates to the largest tables by row count) or, when
-operators want explicit control, `SPG_METRICS_TABLE_ALLOWLIST=
-t1,t2,...` (exact list).
+v4.36 closes the last two non-correctness gaps and zeros out the
+❌ column:
 
-The 1 remaining ❌ item is the replication observability gap
-slotted into v4.36 by NEXT.md:
+- **2.9 netsplit chaos** (⚠️ → ✅): an in-process TCP proxy sits
+  between primary and follower; the test flips it into
+  disconnect mode mid-write, lets the master keep advancing,
+  then heals it. After reconnect the follower converges to
+  exactly the same row count *and* the same row values — no
+  duplicates, no gaps.
+- **4.7 replication lag metric** (❌ → ✅): the master now speaks
+  a v2 replication protocol (`SPGREPL\x02`) that frames the WAL
+  stream and injects periodic status frames carrying its current
+  WAL position + wall time. The follower decodes them into
+  `spg_replication_lag_bytes` and `spg_replication_lag_seconds`
+  on `/metrics`. Old `SPGREPL\x01` clients keep working
+  unchanged. STABILITY.md §"Replication protocol" pins the v2
+  surface.
 
-- 4.7 replication lag metric: needs follower → primary RPC (v4.36)
+The 4 ⚠️ items are the strict-invariant rows deferred per
+NEXT.md (CRC32 in v4.37, allocator cap + OOM in v5.0, config
+validation post-v4.30):
+
+- 1.8 explicit CRC32 (today: truncation caught by length prefix; v4.37)
+- 5.5 per-query memory cap: needs custom global allocator (v5.0)
+- 5.6 OOM injection survives: needs alloc-error hook (v5.0)
+- 7.8 startup config validation (v4.30 candidate; rolled forward)
 
 The 5 ⚠️ items are all "works today within documented limits;
 strict invariant deferred per NEXT.md":

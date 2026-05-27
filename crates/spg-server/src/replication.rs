@@ -1,6 +1,8 @@
-//! v4.24 single-master / multi-follower WAL streaming replication.
+//! v4.24 single-master / multi-follower WAL streaming replication
+//! (extended in v4.36 with an opt-in framed protocol for lag-metric
+//! observability).
 //!
-//! ## Wire protocol (binary, framed)
+//! ## Wire protocol — v1 (legacy, magic `SPGREPL\x01`)
 //!
 //! Follower → Master handshake: 16 bytes
 //!   - 8 bytes magic `b"SPGREPL\x01"`
@@ -19,6 +21,29 @@
 //! records, fsynced after each append). The follower buffers and applies
 //! complete records via `Engine::execute`. No additional framing.
 //!
+//! ## Wire protocol — v2 (v4.36, magic `SPGREPL\x02`)
+//!
+//! Handshake is identical (just the magic byte differs). The initial
+//! snapshot reply is identical too. After that, instead of raw WAL
+//! bytes, the master emits a sequence of typed frames:
+//!
+//!   - 1 byte  — frame type (`0x00` = WAL chunk, `0x01` = status)
+//!   - 4 bytes — `u32` LE payload length
+//!   - N bytes — payload
+//!
+//! `0x00` WAL chunk: payload is opaque WAL bytes; the follower buffers
+//! and applies complete `[u32 len][sql]` records exactly as in v1.
+//!
+//! `0x01` status frame: 16-byte payload — `[primary_wal_pos: u64 LE,
+//! wall_time_us: u64 LE]`. The follower stores this in
+//! `state.lag_state` so `/metrics` can expose
+//! `spg_replication_lag_bytes` and `spg_replication_lag_seconds`.
+//!
+//! Status frames are advisory — dropping them never corrupts state.
+//! Old v1 followers connect with the v1 magic and see no behavior
+//! change; new v2 followers get the lag visibility for free. This is
+//! the stable surface v4.36 adds to STABILITY.md.
+//!
 //! ## Scope cuts
 //!
 //! - No TLS, no auth, no failover, no sync replication. This is the same
@@ -33,18 +58,58 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spg_engine::Engine;
 
 use crate::ServerState;
 
-const MAGIC: &[u8; 8] = b"SPGREPL\x01";
+const MAGIC_V1: &[u8; 8] = b"SPGREPL\x01";
+/// v4.36: framed protocol with periodic status frames carrying the
+/// primary's current WAL position. Old clients keep using v1; new
+/// clients send `\x02` and get lag visibility.
+const MAGIC_V2: &[u8; 8] = b"SPGREPL\x02";
+const FRAME_TYPE_WAL: u8 = 0x00;
+const FRAME_TYPE_STATUS: u8 = 0x01;
 /// Cadence for tailing the master WAL when no new bytes are present.
 const TAIL_POLL: Duration = Duration::from_millis(50);
+/// v4.36: cadence for periodic status-frame emission to v2 followers.
+/// 50 ms matches the existing tail-poll loop so we piggyback in the
+/// same idle slice rather than spinning up a separate timer thread.
+const STATUS_INTERVAL: Duration = Duration::from_millis(50);
 /// Cadence for the follower retry loop when the master is unreachable.
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
+/// v4.36: shared follower-side state populated from the master's
+/// status frames. `spg_replication_lag_bytes` and
+/// `spg_replication_lag_seconds` read from this; populated only when
+/// the follower negotiated the v2 protocol. All zero on a v1 follower
+/// — the /metrics path leaves the series out in that case.
+#[derive(Debug)]
+pub struct LagState {
+    /// Most recent `primary_wal_pos` advertised by the master.
+    pub primary_pos: AtomicU64,
+    /// WAL offset the follower has applied through (matches the
+    /// byte count of WAL the follower has fsynced + replayed).
+    pub follower_applied_pos: AtomicU64,
+    /// Wall-clock time (microseconds since UNIX epoch) the master
+    /// stamped on its latest status frame. The follower uses
+    /// `now() - this` for `spg_replication_lag_seconds`. Zero =
+    /// no status frame seen yet, so /metrics omits the series.
+    pub primary_wall_time_us: AtomicU64,
+}
+
+impl Default for LagState {
+    fn default() -> Self {
+        Self {
+            primary_pos: AtomicU64::new(0),
+            follower_applied_pos: AtomicU64::new(0),
+            primary_wall_time_us: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Spawn the master-side replication listener. Each accepted connection
 /// runs in its own thread for the lifetime of the follower.
@@ -73,13 +138,19 @@ pub fn spawn_master_listener(
 }
 
 /// Serve a single follower: handshake, snapshot, then tail the WAL.
+/// Dispatches between the v1 raw-stream protocol and the v2 framed
+/// protocol based on the handshake magic byte.
 fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut hs = [0u8; 16];
     stream.read_exact(&mut hs)?;
-    if &hs[..8] != MAGIC {
+    let protocol = if &hs[..8] == MAGIC_V1 {
+        Protocol::V1
+    } else if &hs[..8] == MAGIC_V2 {
+        Protocol::V2
+    } else {
         return Err(std::io::Error::other("bad replication magic"));
-    }
+    };
     let start_offset = u64::from_le_bytes(hs[8..16].try_into().unwrap());
 
     // Capture snapshot + WAL position under a brief lock so the
@@ -93,6 +164,8 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
 
     if start_offset == 0 {
         // Initial reply: snapshot len + bytes + WAL start position.
+        // Format unchanged between v1 and v2; the framed stream only
+        // applies to the post-snapshot tail.
         let snap_len = u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
         stream.write_all(&snap_len.to_le_bytes())?;
         if !snapshot.is_empty() {
@@ -112,7 +185,16 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
         // connection open in case future writes happen elsewhere.
         return Ok(());
     };
-    tail_wal(stream, &wal_path, wal_position)
+    match protocol {
+        Protocol::V1 => tail_wal_v1(stream, &wal_path, wal_position),
+        Protocol::V2 => tail_wal_v2(stream, &wal_path, wal_position),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    V1,
+    V2,
 }
 
 /// Grab the in-memory engine state + WAL length atomically. The
@@ -133,9 +215,9 @@ fn capture_snapshot(state: &ServerState) -> std::io::Result<(Vec<u8>, u64)> {
     Ok((snapshot, wal_position))
 }
 
-/// Tail `wal_path` from `start_offset` forever, streaming new bytes
-/// to the follower as they appear. Polls every 50 ms when idle.
-fn tail_wal(mut stream: TcpStream, wal_path: &Path, start_offset: u64) -> std::io::Result<()> {
+/// v1 tail: stream raw WAL bytes to the follower as they appear.
+/// Polls every 50 ms when idle.
+fn tail_wal_v1(mut stream: TcpStream, wal_path: &Path, start_offset: u64) -> std::io::Result<()> {
     let mut f = std::fs::File::open(wal_path)?;
     f.seek(SeekFrom::Start(start_offset))?;
     let mut buf = [0u8; 4096];
@@ -148,6 +230,64 @@ fn tail_wal(mut stream: TcpStream, wal_path: &Path, start_offset: u64) -> std::i
         stream.write_all(&buf[..n])?;
         stream.flush()?;
     }
+}
+
+/// v4.36: v2 tail. Frames WAL byte chunks as type `0x00`; emits a
+/// type `0x01` status frame at least every `STATUS_INTERVAL` whether
+/// or not new WAL bytes arrived. Status frames carry the master's
+/// current WAL file size + wall-clock so the follower can compute
+/// both `lag_bytes` (primary_pos − applied_pos) and `lag_seconds`
+/// (now − last status wall time).
+fn tail_wal_v2(mut stream: TcpStream, wal_path: &Path, start_offset: u64) -> std::io::Result<()> {
+    let mut f = std::fs::File::open(wal_path)?;
+    f.seek(SeekFrom::Start(start_offset))?;
+    let mut current_offset = start_offset;
+    let mut buf = [0u8; 4096];
+    let mut last_status = std::time::Instant::now() - STATUS_INTERVAL;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n > 0 {
+            write_frame(&mut stream, FRAME_TYPE_WAL, &buf[..n])?;
+            current_offset = current_offset.saturating_add(n as u64);
+        }
+        // Send a status frame on the timer regardless of WAL activity,
+        // or when we just made progress (so the follower's lag_bytes
+        // tracks fresh data without waiting up to STATUS_INTERVAL).
+        if n > 0 || last_status.elapsed() >= STATUS_INTERVAL {
+            // Source-of-truth for primary_pos: the actual on-disk WAL
+            // length, not the byte counter we maintain. They match
+            // unless the file is being truncated under us, which the
+            // engine doesn't do.
+            let primary_pos = std::fs::metadata(wal_path).map_or(current_offset, |m| m.len());
+            let wall_time_us = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros()),
+            )
+            .unwrap_or(0);
+            let mut payload = [0u8; 16];
+            payload[..8].copy_from_slice(&primary_pos.to_le_bytes());
+            payload[8..].copy_from_slice(&wall_time_us.to_le_bytes());
+            write_frame(&mut stream, FRAME_TYPE_STATUS, &payload)?;
+            last_status = std::time::Instant::now();
+        }
+        if n == 0 {
+            thread::sleep(TAIL_POLL);
+        }
+    }
+}
+
+fn write_frame(stream: &mut TcpStream, frame_type: u8, payload: &[u8]) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::other("replication frame payload too large"))?;
+    let mut header = [0u8; 5];
+    header[0] = frame_type;
+    header[1..].copy_from_slice(&len.to_le_bytes());
+    stream.write_all(&header)?;
+    if !payload.is_empty() {
+        stream.write_all(payload)?;
+    }
+    stream.flush()
 }
 
 /// Run as a follower: connect to `master`, fetch snapshot if our
@@ -191,9 +331,13 @@ fn follow_once(
         0
     };
 
-    // Handshake.
+    // v4.36: always negotiate v2. Old masters reject v2 magic with
+    // "bad replication magic" → caller retries via run_follower's
+    // reconnect loop. The expected upgrade path is master-before-
+    // follower (deploy v4.36 to the primary first); old v4.x clients
+    // keep working via v1 magic on the master side.
     let mut hs = Vec::with_capacity(16);
-    hs.extend_from_slice(MAGIC);
+    hs.extend_from_slice(MAGIC_V2);
     hs.extend_from_slice(&start_offset.to_le_bytes());
     stream.write_all(&hs)?;
     stream.flush()?;
@@ -203,6 +347,7 @@ fn follow_once(
     stream.read_exact(&mut len_buf)?;
     let snap_len = u64::from_le_bytes(len_buf);
 
+    let mut applied_offset = start_offset;
     if snap_len > 0 {
         // Receive snapshot.
         let mut snap = vec![
@@ -217,6 +362,7 @@ fn follow_once(
         // (we don't need its content — the master streams it).
         let mut pos_buf = [0u8; 8];
         stream.read_exact(&mut pos_buf)?;
+        applied_offset = u64::from_le_bytes(pos_buf);
         std::fs::write(wal_path, b"")?;
         // Reload engine from new snapshot bytes.
         let new_engine = Engine::restore_envelope(&snap)
@@ -227,48 +373,97 @@ fn follow_once(
             .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
         *g = new_engine.with_clock(crate::wall_clock_micros);
     }
+    state
+        .lag_state
+        .follower_applied_pos
+        .store(applied_offset, Ordering::Release);
 
-    // Tail: read bytes, accumulate, apply complete records.
+    // Tail: parse [u8 type][u32 len][payload] frames. WAL chunks
+    // feed the existing record accumulator; status frames update
+    // lag_state. The frame loop never errors on a status drop —
+    // status is advisory — but any malformed framing kills the
+    // connection so the reconnect loop can resync.
     let mut wal_appender = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(wal_path)?;
     let mut pending: Vec<u8> = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 4096];
     loop {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            return Ok(());
+        // Frame header.
+        let mut header = [0u8; 5];
+        if let Err(e) = stream.read_exact(&mut header) {
+            return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(()) // clean disconnect
+            } else {
+                Err(e)
+            };
         }
-        wal_appender.write_all(&chunk[..n])?;
-        wal_appender.sync_data()?;
-        pending.extend_from_slice(&chunk[..n]);
-        // Drain complete records: [4-byte LE len][sql bytes].
-        let mut cur = 0usize;
-        while pending.len() - cur >= 4 {
-            let len_bytes: [u8; 4] = pending[cur..cur + 4].try_into().unwrap();
-            let rec_len = u32::from_le_bytes(len_bytes) as usize;
-            if pending.len() - cur - 4 < rec_len {
-                break;
-            }
-            let sql_bytes = &pending[cur + 4..cur + 4 + rec_len];
-            let sql = core::str::from_utf8(sql_bytes)
-                .map_err(|_| std::io::Error::other("non-UTF-8 SQL in replicated WAL record"))?;
-            {
-                let mut eng = state
-                    .engine
-                    .write()
-                    .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
-                if let Err(e) = eng.execute(sql) {
-                    return Err(std::io::Error::other(format!(
-                        "follower apply rejected {sql:?}: {e}"
-                    )));
+        let frame_type = header[0];
+        let payload_len = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            stream.read_exact(&mut payload)?;
+        }
+        match frame_type {
+            FRAME_TYPE_WAL => {
+                wal_appender.write_all(&payload)?;
+                wal_appender.sync_data()?;
+                pending.extend_from_slice(&payload);
+                // Drain complete records: [4-byte LE len][sql bytes].
+                let mut cur = 0usize;
+                while pending.len() - cur >= 4 {
+                    let len_bytes: [u8; 4] = pending[cur..cur + 4].try_into().unwrap();
+                    let rec_len = u32::from_le_bytes(len_bytes) as usize;
+                    if pending.len() - cur - 4 < rec_len {
+                        break;
+                    }
+                    let sql_bytes = &pending[cur + 4..cur + 4 + rec_len];
+                    let sql = core::str::from_utf8(sql_bytes).map_err(|_| {
+                        std::io::Error::other("non-UTF-8 SQL in replicated WAL record")
+                    })?;
+                    {
+                        let mut eng = state
+                            .engine
+                            .write()
+                            .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
+                        if let Err(e) = eng.execute(sql) {
+                            return Err(std::io::Error::other(format!(
+                                "follower apply rejected {sql:?}: {e}"
+                            )));
+                        }
+                    }
+                    cur += 4 + rec_len;
+                    applied_offset = applied_offset.saturating_add((4 + rec_len) as u64);
                 }
+                if cur > 0 {
+                    pending.drain(0..cur);
+                }
+                state
+                    .lag_state
+                    .follower_applied_pos
+                    .store(applied_offset, Ordering::Release);
             }
-            cur += 4 + rec_len;
-        }
-        if cur > 0 {
-            pending.drain(0..cur);
+            FRAME_TYPE_STATUS => {
+                if payload.len() == 16 {
+                    let primary_pos = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    let wall_time_us = u64::from_le_bytes(payload[8..].try_into().unwrap());
+                    state
+                        .lag_state
+                        .primary_pos
+                        .store(primary_pos, Ordering::Release);
+                    state
+                        .lag_state
+                        .primary_wall_time_us
+                        .store(wall_time_us, Ordering::Release);
+                }
+                // Unknown payload size on a known frame type: ignore.
+                // The frame layout could grow in a future version and
+                // older followers should tolerate the trailing bytes.
+            }
+            _ => {
+                // Unknown frame type — same forward-compat rule:
+                // skip the payload and keep going.
+            }
         }
     }
 }
