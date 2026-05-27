@@ -63,6 +63,23 @@ enum BNode<K, V> {
     },
 }
 
+// Manual `Clone` impl so the bound only applies when `Arc::make_mut`
+// (the v4.40.1 transient path) actually needs it. The non-mutating
+// `get` / `iter` paths stay generic over any `K`, `V`.
+impl<K: Clone, V: Clone> Clone for BNode<K, V> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Leaf { entries } => Self::Leaf {
+                entries: entries.clone(),
+            },
+            Self::Internal { entries, children } => Self::Internal {
+                entries: entries.clone(),
+                children: children.clone(),
+            },
+        }
+    }
+}
+
 /// A persistent ordered map. `Clone` is `O(1)`; `insert` returns a new handle
 /// that shares unaffected subtrees with the old via `Arc::clone`.
 #[derive(Debug)]
@@ -186,14 +203,100 @@ impl<K: Ord + Clone, V: Clone> PersistentBTreeMap<K, V> {
         )
     }
 
-    /// `O(log₈ N)` transient insert. Same as [`insert`] but mutates in
-    /// place when the spine is uniquely owned (the common case inside
-    /// `Table::insert`), via `Arc::make_mut`. When a cloned handle exists,
-    /// the spine is path-copied and the original snapshot stays valid.
+    /// `O(log₈ N)` transient insert. v4.40.1 perf path: walks
+    /// `Arc::make_mut` down the spine — when the spine `Arc`s are uniquely
+    /// owned (the common case in `Table::insert` outside a TX wrap), every
+    /// touched node mutates in place at roughly `std::BTreeMap::insert`
+    /// cost. When a cloned handle is outstanding (e.g. a Catalog snapshot
+    /// inside a TX wrap), `Arc::make_mut` path-copies just the affected
+    /// node and the snapshot stays untouched. Either way, callers see the
+    /// same end state as the immutable `insert` followed by reassignment.
     pub fn insert_mut(&mut self, key: K, value: V) -> Option<V> {
-        let (new_self, prev) = self.insert(key, value);
-        *self = new_self;
-        prev
+        let (split, prev_v) = insert_transient_helper(&mut self.root, key, value);
+        if let Some((right, median)) = split {
+            // Root overflow: wrap the old root + new right sibling under a
+            // fresh top-level Internal carrying the median entry. We need
+            // to take ownership of self.root to move it into `children`,
+            // so swap in a placeholder Leaf and then overwrite with the
+            // real new root below.
+            let old_root = core::mem::replace(
+                &mut self.root,
+                Arc::new(BNode::Leaf {
+                    entries: Vec::new(),
+                }),
+            );
+            self.root = Arc::new(BNode::Internal {
+                entries: alloc::vec![median],
+                children: alloc::vec![old_root, right],
+            });
+        }
+        if prev_v.is_none() {
+            self.len += 1;
+        }
+        prev_v
+    }
+}
+
+/// Transient insert worker — walks `Arc::make_mut` down the spine so each
+/// uniquely-owned node mutates in place. Splits still allocate fresh
+/// `Arc<BNode>` for the new right sibling (those are genuinely new nodes,
+/// not CoW copies).
+fn insert_transient_helper<K: Ord + Clone, V: Clone>(
+    node: &mut Arc<BNode<K, V>>,
+    k: K,
+    v: V,
+) -> (Option<(Arc<BNode<K, V>>, (K, V))>, Option<V>) {
+    let inner = Arc::make_mut(node);
+    match inner {
+        BNode::Leaf { entries } => {
+            let pos = entries.binary_search_by(|(ek, _)| ek.cmp(&k));
+            let prev_v = match pos {
+                Ok(idx) => Some(core::mem::replace(&mut entries[idx].1, v)),
+                Err(idx) => {
+                    entries.insert(idx, (k, v));
+                    None
+                }
+            };
+            if entries.len() <= MAX_ENTRIES {
+                return (None, prev_v);
+            }
+            // Overflow: split (same arithmetic as the immutable path).
+            let mid = entries.len() / 2;
+            let right_entries = entries.split_off(mid + 1);
+            let median = entries.pop().expect("mid was in-bounds");
+            let right = Arc::new(BNode::Leaf {
+                entries: right_entries,
+            });
+            (Some((right, median)), prev_v)
+        }
+        BNode::Internal { entries, children } => {
+            let pos = entries.binary_search_by(|(ek, _)| ek.cmp(&k));
+            match pos {
+                Ok(idx) => {
+                    let prev_v = core::mem::replace(&mut entries[idx].1, v);
+                    (None, Some(prev_v))
+                }
+                Err(idx) => {
+                    let (split, prev_v) = insert_transient_helper(&mut children[idx], k, v);
+                    if let Some((right_sibling, median)) = split {
+                        entries.insert(idx, median);
+                        children.insert(idx + 1, right_sibling);
+                    }
+                    if children.len() <= MAX_CHILDREN {
+                        return (None, prev_v);
+                    }
+                    let mid = entries.len() / 2;
+                    let right_entries = entries.split_off(mid + 1);
+                    let median = entries.pop().expect("mid was in-bounds");
+                    let right_children = children.split_off(mid + 1);
+                    let right = Arc::new(BNode::Internal {
+                        entries: right_entries,
+                        children: right_children,
+                    });
+                    (Some((right, median)), prev_v)
+                }
+            }
+        }
     }
 }
 
