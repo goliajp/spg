@@ -10,6 +10,34 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.35.0] — 2026-05-27 (per-table metrics — `spg_table_rows` / `spg_table_bytes` + cardinality cap)
+
+### Added
+- `spg_table_rows{table=…}` and `spg_table_bytes{table=…}`
+  gauges in `/metrics`. Rows is the live row count; bytes is a
+  schema-width × row-count estimate (variable-width types pick
+  a defensible average — Text/JSON = 64 B, half-full Varchar,
+  etc.). Closes PROD_READY row 4.6.
+- `SPG_METRICS_TABLE_TOPN` (default 50) — when no explicit
+  allowlist is set, only the N largest tables by row count are
+  exported. Keeps Prometheus cardinality bounded for tenants
+  with thousands of tables.
+- `SPG_METRICS_TABLE_ALLOWLIST=t1,t2,...` — exact list mode for
+  operators who want explicit per-table control.
+- `tests/e2e_table_metrics.rs` — three e2e tests cover default
+  top-N, allowlist filtering, and the cardinality cap.
+- `prod_ready.rs::row_4_6_*` machine row.
+
+### Changed
+- PROD_READY.md audit snapshot: 72 → 73 ✅ / 2 → 1 ❌;
+  [machine] rows 34 → 35.
+- DEPLOYMENT.md env-var table gains both new entries.
+
+### Test verification
+  cargo test --release --workspace                              # all green
+  cargo clippy --workspace --all-targets -- -D warnings         # 0 warnings
+  cargo fmt --all -- --check                                    # clean
+
 ## [4.34.0] — 2026-05-27 (ENOSPC in-memory rollback — auto-commit BEGIN..COMMIT wrap)
 
 ### Added

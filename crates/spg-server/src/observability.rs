@@ -32,11 +32,21 @@
 //!   handful of atomic loads; even a busy server doesn't need
 //!   more.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+
+use spg_storage::{DataType, TableSchema};
+
+/// v4.35 per-table metrics: cap on how many tables get
+/// `spg_table_rows{...}` + `spg_table_bytes{...}` exported when no
+/// explicit allowlist is set. Defaults to 50 to keep Prometheus
+/// cardinality bounded for tenants with thousands of tables.
+/// Operators raise it explicitly via `SPG_METRICS_TABLE_TOPN`.
+const DEFAULT_TABLE_METRIC_TOPN: usize = 50;
 
 /// Atomic counters surfaced via the `/metrics` endpoint. Cheap to
 /// update from anywhere — every increment is a single Relaxed
@@ -182,6 +192,129 @@ fn render_metrics(state: &crate::ServerState) -> String {
         "spg_errors_total {}\n",
         state.metrics.errors_total.load(Ordering::Relaxed)
     ));
+    render_table_metrics(state, &mut out);
+    out
+}
+
+/// v4.35: per-table `spg_table_rows{table="..."}` +
+/// `spg_table_bytes{table="..."}` series. Operators bound
+/// cardinality via either:
+///
+/// - `SPG_METRICS_TABLE_ALLOWLIST=t1,t2,...` — exact list, in
+///   exposition order; tables not listed (or not present) are
+///   silently dropped.
+/// - `SPG_METRICS_TABLE_TOPN=N` — without an allowlist, only the
+///   N largest tables (by row count) are exported (default 50 —
+///   the `DEFAULT_TABLE_METRIC_TOPN` constant).
+///
+/// Reads the engine catalog under `engine.read()`. Cost is one
+/// pass over `Catalog::table_names()` + per-table `row_count()` +
+/// schema width — none of which allocate row data.
+fn render_table_metrics(state: &crate::ServerState, out: &mut String) {
+    let Ok(engine) = state.engine.read() else {
+        // Engine lock poisoned — leave the per-table series off so
+        // /metrics still serves the rest of the page. Operators see
+        // this via spg_errors_total.
+        return;
+    };
+    let catalog = engine.catalog();
+    let allowlist: Option<HashSet<String>> = std::env::var("SPG_METRICS_TABLE_ALLOWLIST")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        });
+    let topn = std::env::var("SPG_METRICS_TABLE_TOPN")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TABLE_METRIC_TOPN);
+
+    let mut entries: Vec<(String, u64, u64)> = catalog
+        .table_names()
+        .into_iter()
+        .filter_map(|name| {
+            let table = catalog.get(&name)?;
+            let rows = table.row_count() as u64;
+            let bytes = rows.saturating_mul(approx_row_bytes(table.schema()));
+            Some((name, rows, bytes))
+        })
+        .filter(|(name, _, _)| match &allowlist {
+            Some(set) => set.contains(name),
+            None => true,
+        })
+        .collect();
+
+    if allowlist.is_none() {
+        // Top-N by row count, tiebreak by name for stable output.
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries.truncate(topn);
+    } else {
+        // Allowlist defines the user-meaningful order; keep
+        // catalog order so the output is deterministic.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    out.push_str("# HELP spg_table_rows Live row count per user table\n");
+    out.push_str("# TYPE spg_table_rows gauge\n");
+    for (name, rows, _) in &entries {
+        out.push_str(&format!(
+            "spg_table_rows{{table=\"{}\"}} {rows}\n",
+            metric_label_escape(name)
+        ));
+    }
+    out.push_str("# HELP spg_table_bytes Approximate on-disk byte size per user table (rows × schema width)\n");
+    out.push_str("# TYPE spg_table_bytes gauge\n");
+    for (name, _, bytes) in &entries {
+        out.push_str(&format!(
+            "spg_table_bytes{{table=\"{}\"}} {bytes}\n",
+            metric_label_escape(name)
+        ));
+    }
+}
+
+/// v4.35: average row width estimate from the schema. Used for
+/// `spg_table_bytes`. Variable-width types pick a defensible
+/// upper-ish bound — operators who care about exact disk usage
+/// inspect the snapshot file directly.
+fn approx_row_bytes(schema: &TableSchema) -> u64 {
+    schema
+        .columns
+        .iter()
+        .map(|c| -> u64 {
+            match c.ty {
+                DataType::SmallInt => 2,
+                DataType::Int => 4,
+                DataType::BigInt | DataType::Date | DataType::Timestamp | DataType::Float => 8,
+                DataType::Bool => 1,
+                DataType::Char(n) => u64::from(n),
+                // Average a half-full VARCHAR; the exact value is
+                // operator-knowable but not in the catalog.
+                DataType::Varchar(n) => u64::from(n).max(1) / 2,
+                DataType::Text | DataType::Json => 64,
+                DataType::Numeric { .. } | DataType::Interval => 16,
+                // f32 per vector dimension.
+                DataType::Vector(dim) => u64::from(dim).saturating_mul(4),
+            }
+        })
+        .sum()
+}
+
+/// Escape `\\` and `"` per Prometheus exposition format (control
+/// characters not allowed in label values; we don't generate any).
+fn metric_label_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
     out
 }
 
