@@ -166,7 +166,13 @@ fn wire_to_i64(v: &WireValue) -> i64 {
 /// written to `dest_db` if `snap_len > 0`. Returns (kind, since, wal_pos).
 fn apply_bundle_to(dest_db: &Path, dest_wal: &Path, bundle: &Path) -> (u8, u64, u64) {
     let bytes = std::fs::read(bundle).unwrap();
-    assert_eq!(&bytes[..8], b"SPGBKUP\x01");
+    // v4.37: writers emit \x02 (with trailing CRC32). Restorers
+    // still accept \x01 — see backup.rs doc-comment.
+    assert!(
+        &bytes[..8] == b"SPGBKUP\x01" || &bytes[..8] == b"SPGBKUP\x02",
+        "unknown bundle magic {:?}",
+        &bytes[..8]
+    );
     let kind = bytes[8];
     let since = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
     // bytes[17..25] = ts (skip)

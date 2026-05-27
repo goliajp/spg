@@ -18,7 +18,7 @@ Status legend:
 - ❌ — not done; on the roadmap
 - 🚫 — intentional out-of-scope (linked to memory or rationale)
 
-Last refresh: **v4.36 replication chaos + lag metric** (2026-05-27,
+Last refresh: **v4.37 file format v9 + CRC32** (2026-05-27,
 commit hash filled at commit time).
 
 ---
@@ -37,7 +37,7 @@ storage and survives a crash.
 | 1.5 | Backup bundle format documented | Self-contained file with magic, version, snapshot, WAL slice | ✅ | `crates/spg-server/src/backup.rs` |
 | 1.6 | Full + incremental backup | `BACKUP TO '<path>'` and `BACKUP TO '<path>' INCREMENTAL SINCE N` SQL forms | ✅ | v4.25.0, `tests/e2e_backup.rs` |
 | 1.7 | PITR via `SPG_REPLAY_UPTO` | Operator can truncate WAL replay at byte offset N at startup | ✅ | v4.25.0 + v4.27.1 (parse-zero fix) |
-| 1.8 | WAL/snapshot checksum | Active corruption detection on each loaded file (not just "deserialize fails") | ⚠️ | length-prefixed records catch truncation; mid-record bit-flips would currently surface as parse error rather than explicit checksum mismatch. Deferred to v5 file-format bump — add CRC32 to envelope + per-WAL-record. |
+| 1.8 | WAL/snapshot checksum [machine] | Active corruption detection on each loaded file (not just "deserialize fails") | ✅ | v4.37, CRC32 on every storage envelope: WAL v2 records (`[u32 (len|0x80000000)][u32 crc32][sql]`), snapshot envelope v2 (`SPGENV01` + version 2 + trailing CRC32), backup bundle v2 (`SPGBKUP\x02` + trailing CRC32). v1 formats stay readable; mismatch is a hard fail with explicit error. e2e: `tests/e2e_chaos.rs::chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay`. |
 | 1.9 | Partial-fsync recovery [machine] | If `sync_data` returns mid-write, the file's incomplete tail is detected on next boot and dropped, no half-record applied | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_wal_tail_truncation_drops_partial_record_no_panic` |
 | 1.10 | Disk-full handling [machine] | Out-of-space during WAL append returns clear error to client; server stays alive; previously CC'd state survives restart unchanged | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_disk_full_returns_clean_error_and_keeps_serving` (+ SPG_FAIL_WAL_QUOTA_BYTES injection knob) |
 | 1.11 | In-memory consistency on WAL refusal [machine] | When the WAL layer refuses a write, the live in-memory state never reflects it. Caller's `SELECT` sees exactly what was CC'd. | ✅ | v4.34, auto-commit BEGIN..COMMIT wrap in `crates/spg-server/src/main.rs` (atomic WAL block + ROLLBACK on append failure); closes both the chaos path (kept v4.30 preflight) and the real ENOSPC mid-`write_all` path. e2e: `tests/e2e_chaos.rs::chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state` (forces failure inside `append_wal*` via `SPG_DISABLE_WAL_PREFLIGHT`); perf gate: `tests/slo_smoke.rs::slo_wal_insert_p99_under_budget`. |
@@ -220,17 +220,17 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.36 (2026-05-27).
+Last machine run: v4.37 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 75
-  ⚠️ partial          : 4
+  ✅ pass             : 76
+  ⚠️ partial          : 3
   ❌ open             : 0
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 37
-  row_1_3, row_1_9, row_1_10, row_1_11,
+[machine] rows scaffolded in prod_ready.rs : 38
+  row_1_3, row_1_8, row_1_9, row_1_10, row_1_11,
   row_2_5, row_2_6, row_2_7, row_2_9,
   row_3_7, row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
   row_4_1, row_4_2, row_4_5, row_4_6, row_4_7,
@@ -242,29 +242,28 @@ Total rows in checklist : 85
   row_10_x, row_10_4, row_10_5
 ```
 
-v4.36 closes the last two non-correctness gaps and zeros out the
-❌ column:
+v4.37 closes row **1.8** (WAL / snapshot / backup checksum). The
+three storage envelopes now all carry CRC32:
 
-- **2.9 netsplit chaos** (⚠️ → ✅): an in-process TCP proxy sits
-  between primary and follower; the test flips it into
-  disconnect mode mid-write, lets the master keep advancing,
-  then heals it. After reconnect the follower converges to
-  exactly the same row count *and* the same row values — no
-  duplicates, no gaps.
-- **4.7 replication lag metric** (❌ → ✅): the master now speaks
-  a v2 replication protocol (`SPGREPL\x02`) that frames the WAL
-  stream and injects periodic status frames carrying its current
-  WAL position + wall time. The follower decodes them into
-  `spg_replication_lag_bytes` and `spg_replication_lag_seconds`
-  on `/metrics`. Old `SPGREPL\x01` clients keep working
-  unchanged. STABILITY.md §"Replication protocol" pins the v2
-  surface.
+- **WAL records**: v2 records use a sentinel bit in the length
+  header (`u32 (len | 0x8000_0000)`) followed by a u32 CRC32 and
+  the payload. v1 records (pre-v4.37 WAL files) replay unchanged.
+- **Snapshot envelopes**: `SPGENV01` bumped from version `1` to
+  `2`; v2 carries a trailing u32 CRC32 over the whole body.
+  Old v1 envelopes load with no CRC check (frozen by STABILITY).
+- **Backup bundles**: `SPGBKUP\x01` writers replaced by
+  `SPGBKUP\x02` writers; the new bundle ends with a u32 CRC32.
+  v1 bundles inspect / restore unchanged.
 
-The 4 ⚠️ items are the strict-invariant rows deferred per
-NEXT.md (CRC32 in v4.37, allocator cap + OOM in v5.0, config
-validation post-v4.30):
+Bit-flips in any of the three surface as an explicit
+`CRC mismatch` failure with the expected / computed values; the
+operator chooses whether to discard the corrupt record or
+investigate. Covered by `tests/e2e_chaos.rs::chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay`.
 
-- 1.8 explicit CRC32 (today: truncation caught by length prefix; v4.37)
+The 3 ⚠️ items remaining are strict-invariant rows deferred per
+NEXT.md (allocator cap + OOM in v5.0; config validation rolled
+forward):
+
 - 5.5 per-query memory cap: needs custom global allocator (v5.0)
 - 5.6 OOM injection survives: needs alloc-error hook (v5.0)
 - 7.8 startup config validation (v4.30 candidate; rolled forward)

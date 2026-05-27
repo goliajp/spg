@@ -173,7 +173,13 @@ fn wire_to_string(v: &WireValue) -> String {
 /// into dest_wal. Same logic as RESTORE_DRILL.md step 1.
 fn apply_bundle(dest_db: &Path, dest_wal: &Path, bundle: &Path) {
     let bytes = std::fs::read(bundle).unwrap();
-    assert_eq!(&bytes[..8], b"SPGBKUP\x01", "not an SPG bundle");
+    // v4.37+ writes \x02 (with trailing CRC); pre-v4.37 fixtures
+    // are still \x01. Both are valid bundle magics.
+    assert!(
+        &bytes[..8] == b"SPGBKUP\x01" || &bytes[..8] == b"SPGBKUP\x02",
+        "not an SPG bundle (magic = {:?})",
+        &bytes[..8]
+    );
     let snap_len = u64::from_le_bytes(bytes[25..33].try_into().unwrap()) as usize;
     let snap_end = 33 + snap_len;
     let wal_len =

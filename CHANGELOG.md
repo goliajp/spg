@@ -10,6 +10,76 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.37.0] — 2026-05-27 (file format v9 + CRC32 on every storage envelope)
+
+### Closes PROD_READY row 1.8 — explicit corruption detection on
+### every storage surface.
+
+Three storage envelopes gain CRC32 in a backwards-compatible way.
+Old files keep loading unchanged; mid-record bit-flips on new
+files surface as `CRC mismatch` errors instead of
+deserializing-into-garbage. Forward-compat is not required
+(STABILITY.md — clients only need to read older formats), so old
+binaries reading new files crash on the "huge length" sentinel
+(WAL) or "unknown version" path (envelope / bundle).
+
+### WAL record format
+
+- v1 (≤ v4.36): `[u32 LE len][len bytes]` — no CRC.
+- v2 (v4.37+):  `[u32 LE (len | 0x8000_0000)][u32 LE crc32][len bytes]`.
+
+The sentinel bit 31 of the length distinguishes them; v1 records
+have it clear (sql_len < 2 GiB always). Replay handles both — a
+single WAL file may interleave v1 + v2 records during the
+upgrade window. The follower's record accumulator (in
+`replication.rs`) tracks the same v1/v2 split.
+
+### Snapshot envelope
+
+`SPGENV01` envelope version bumped `1` → `2`. v2 appends a u32
+CRC32 over every byte before it (magic + version + sections).
+`Engine::restore_envelope` accepts both: v1 loads with no CRC
+check (frozen by STABILITY); v2 verifies and returns
+`StorageError::Corrupt` on mismatch.
+
+### Backup bundle
+
+`SPGBKUP\x01` writer replaced by `SPGBKUP\x02` writer. v2 ends
+with a u32 CRC32; `inspect_bundle` verifies on read. Pre-v4.37
+bundles (v1 magic) inspect unchanged. The new `BackupError::
+Corrupt` variant carries the expected / computed values for
+operator debugging.
+
+### CRC32 implementation
+
+New `spg_crypto::crc32` module — pure-stdlib IEEE 802.3 (poly
+`0xEDB88320`), byte-at-a-time table lookup. `no_std`-compatible
+to stay consistent with the rest of spg-crypto. 256-entry table
+is built lazily on first call into a `[AtomicU32; 256]`; one
+known-vector test + bit-flip detection test cover it.
+
+### Tests added
+
+- `tests/e2e_chaos.rs::chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay`
+  — flips one bit mid-WAL, restart REFUSES to start with an
+  explicit CRC error on stderr (no silent corruption applied).
+- `prod_ready.rs::row_1_8_*` machine row.
+- `spg_crypto::crc32::tests` — known-vector + bit-flip detection.
+
+### Changed
+
+- STABILITY.md §"Snapshot file format" + §"Backup bundle format"
+  pin both v1 and v2 layouts plus the writers-from-v4.37-emit-v2
+  rule.
+- PROD_READY.md audit snapshot: 75 → 76 ✅ / 4 → 3 ⚠️; [machine]
+  rows 37 → 38.
+
+### Test verification
+
+  cargo test --release --workspace                              # all green
+  cargo clippy --workspace --all-targets -- -D warnings         # 0 warnings
+  cargo fmt --all -- --check                                    # clean
+
 ## [4.36.0] — 2026-05-27 (replication netsplit chaos + lag metric — `SPGREPL\x02`)
 
 ### Wire protocol — new minor version `SPGREPL\x02` (backwards-compat)

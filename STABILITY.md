@@ -97,7 +97,10 @@ via the workspace test job).
 
 - Magic: `SPGDB001` (bare catalog) or `SPGENV01` (envelope with
   user table).
-- File version range supported: v1 through v8 (current).
+- Envelope versions supported: `1` (v4.1, no CRC) and `2`
+  (v4.37, trailing CRC32 over the body). Bare-catalog file
+  versions: v1 through v8 (current).
+- Writers from v4.37 on emit envelope `2`; readers accept both.
 - Backwards-compat rule: every v4.x release must load every
   snapshot ever written. `prod_ready` row 8.6 [machine] gates
   this via `tests/cross_version_compat.rs`.
@@ -110,11 +113,13 @@ walks every fixture directory.
 
 ### Backup bundle format
 
-Self-contained file with magic `SPGBKUP\x01` — see
+Self-contained file with magic `SPGBKUP\x01` (v4.25, no CRC) or
+`SPGBKUP\x02` (v4.37, trailing CRC32 over the body) — see
 `crates/spg-server/src/backup.rs` doc-comment for the byte
 layout. Versioned in-band via the `kind` byte (currently 0 =
 full, 1 = incremental); adding new kinds is a MINOR bump,
-changing the layout of an existing kind is MAJOR.
+changing the layout of an existing kind is MAJOR. Writers from
+v4.37 on emit `\x02`; readers accept both magics.
 
 ### Replication protocol (port `SPG_REPL_ADDR`)
 

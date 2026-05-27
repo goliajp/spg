@@ -409,15 +409,37 @@ fn follow_once(
                 wal_appender.write_all(&payload)?;
                 wal_appender.sync_data()?;
                 pending.extend_from_slice(&payload);
-                // Drain complete records: [4-byte LE len][sql bytes].
+                // Drain complete records. v4.37+ records carry an
+                // 8-byte header `[u32 (len | sentinel)][u32 crc32]`
+                // and the CRC is verified; older records use the
+                // bare 4-byte length header. The sentinel bit
+                // distinguishes the two so a follower streams
+                // mixed-format WAL cleanly through a mid-upgrade.
                 let mut cur = 0usize;
-                while pending.len() - cur >= 4 {
-                    let len_bytes: [u8; 4] = pending[cur..cur + 4].try_into().unwrap();
-                    let rec_len = u32::from_le_bytes(len_bytes) as usize;
-                    if pending.len() - cur - 4 < rec_len {
+                loop {
+                    if pending.len() - cur < 4 {
                         break;
                     }
-                    let sql_bytes = &pending[cur + 4..cur + 4 + rec_len];
+                    let len_bytes: [u8; 4] = pending[cur..cur + 4].try_into().unwrap();
+                    let raw_len = u32::from_le_bytes(len_bytes);
+                    let is_v2 = raw_len & crate::WAL_V2_SENTINEL != 0;
+                    let rec_len = (raw_len & !crate::WAL_V2_SENTINEL) as usize;
+                    let header_len = if is_v2 { 8 } else { 4 };
+                    if pending.len() - cur < header_len + rec_len {
+                        break;
+                    }
+                    let sql_bytes = &pending[cur + header_len..cur + header_len + rec_len];
+                    if is_v2 {
+                        let expected =
+                            u32::from_le_bytes(pending[cur + 4..cur + 8].try_into().unwrap());
+                        let actual = spg_crypto::crc32::crc32(sql_bytes);
+                        if actual != expected {
+                            return Err(std::io::Error::other(format!(
+                                "replicated WAL CRC mismatch at follower offset {} (expected={expected:#010x}, computed={actual:#010x}, sql_len={rec_len})",
+                                applied_offset.saturating_add(cur as u64)
+                            )));
+                        }
+                    }
                     let sql = core::str::from_utf8(sql_bytes).map_err(|_| {
                         std::io::Error::other("non-UTF-8 SQL in replicated WAL record")
                     })?;
@@ -432,8 +454,8 @@ fn follow_once(
                             )));
                         }
                     }
-                    cur += 4 + rec_len;
-                    applied_offset = applied_offset.saturating_add((4 + rec_len) as u64);
+                    cur += header_len + rec_len;
+                    applied_offset = applied_offset.saturating_add((header_len + rec_len) as u64);
                 }
                 if cur > 0 {
                     pending.drain(0..cur);

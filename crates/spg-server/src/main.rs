@@ -1190,12 +1190,41 @@ fn run_backup_command(
     }
 }
 
-/// v4.34: serialized byte count an atomic block will occupy in the
-/// WAL (`4 + len(sql)` per entry, summed). Used by the preflight
-/// quota check so the rejection decision matches what the actual
-/// `append_wal_atomic_block` would write.
+/// v4.37 WAL record format:
+///   v1 (≤ v4.36): `[u32 LE len][len bytes]`
+///   v2 (v4.37+):  `[u32 LE (len | 0x8000_0000)][u32 LE crc32][len bytes]`
+///
+/// Sentinel-bit framing: v1 lengths are constrained to < 2 GiB (in
+/// practice << 64 KiB per SQL), so bit 31 is always clear for v1
+/// records. v4.37+ writers set bit 31 to signal "CRC32 of payload
+/// follows the length"; v4.37+ readers detect and verify. Old v4.x
+/// binaries reading v4.37 WAL crash on the "huge len" — forward-
+/// compat isn't required by STABILITY (clients only need to read
+/// older formats).
+pub(crate) const WAL_V2_SENTINEL: u32 = 0x8000_0000;
+
+fn encode_wal_record(sql: &str) -> std::io::Result<Vec<u8>> {
+    let len = u32::try_from(sql.len())
+        .map_err(|_| std::io::Error::other("SQL too large for WAL entry"))?;
+    if len & WAL_V2_SENTINEL != 0 {
+        return Err(std::io::Error::other(
+            "SQL byte count would alias the v4.37 WAL framing sentinel (≥ 2 GiB)",
+        ));
+    }
+    let crc = spg_crypto::crc32::crc32(sql.as_bytes());
+    let mut entry = Vec::with_capacity(8 + sql.len());
+    entry.extend_from_slice(&(len | WAL_V2_SENTINEL).to_le_bytes());
+    entry.extend_from_slice(&crc.to_le_bytes());
+    entry.extend_from_slice(sql.as_bytes());
+    Ok(entry)
+}
+
+/// v4.37+ atomic-block byte total — each v2 record needs 8 bytes
+/// of header (length + CRC32) before the SQL payload. Used by the
+/// preflight quota check so the rejection decision matches what
+/// `append_wal_atomic_block` will actually write.
 fn wal_block_size(sqls: &[&str]) -> u64 {
-    sqls.iter().map(|s| 4u64 + s.len() as u64).sum()
+    sqls.iter().map(|s| 8u64 + s.len() as u64).sum()
 }
 
 /// v4.34: append several length-prefixed WAL entries with **one**
@@ -1214,13 +1243,10 @@ fn append_wal_atomic_block(state: &ServerState, sqls: &[&str]) -> std::io::Resul
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
-    let total_len: usize = sqls.iter().map(|s| 4 + s.len()).sum();
+    let total_len: usize = sqls.iter().map(|s| 8 + s.len()).sum();
     let mut batch = Vec::with_capacity(total_len);
     for sql in sqls {
-        let len = u32::try_from(sql.len())
-            .map_err(|_| std::io::Error::other("SQL too large for WAL entry"))?;
-        batch.extend_from_slice(&len.to_le_bytes());
-        batch.extend_from_slice(sql.as_bytes());
+        batch.extend_from_slice(&encode_wal_record(sql)?);
     }
     let mut f = wal
         .lock()
@@ -1259,11 +1285,7 @@ fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
-    let len = u32::try_from(sql.len())
-        .map_err(|_| std::io::Error::other("SQL too large for WAL entry"))?;
-    let mut entry = Vec::with_capacity(4 + sql.len());
-    entry.extend_from_slice(&len.to_le_bytes());
-    entry.extend_from_slice(sql.as_bytes());
+    let entry = encode_wal_record(sql)?;
     let mut f = wal
         .lock()
         .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
@@ -1340,9 +1362,16 @@ fn wal_volume_free_bytes(path: &Path) -> std::io::Result<u64> {
 }
 
 /// Replay WAL bytes onto `engine`. Returns the number of entries applied.
-/// A truncated trailing entry (e.g. crash mid-append) is dropped with a
-/// warning to stderr. Non-truncation errors (engine rejected the SQL, bad
-/// UTF-8) are fatal — the operator must inspect.
+/// Handles both record formats:
+///   v1 (≤ v4.36): `[u32 len][len bytes]` — no CRC.
+///   v2 (v4.37+):  `[u32 (len | sentinel)][u32 crc32][len bytes]`.
+/// The format is detected per-record by the sentinel bit; an old
+/// WAL file (v1 records only) replays unchanged, a fresh v4.37 WAL
+/// gets CRC-verified, and a file that interleaves the two (mid-
+/// upgrade) still replays correctly. A truncated trailing entry
+/// (e.g. crash mid-append) is dropped with a warning to stderr.
+/// Non-truncation errors — engine rejected the SQL, bad UTF-8,
+/// CRC mismatch — are fatal: the operator must inspect.
 fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize> {
     let mut cur = 0;
     let mut applied = 0usize;
@@ -1355,13 +1384,39 @@ fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize>
             break;
         }
         let len_arr: [u8; 4] = bytes[cur..cur + 4].try_into().expect("checked");
-        let len = u32::from_le_bytes(len_arr) as usize;
+        let raw_len = u32::from_le_bytes(len_arr);
         cur += 4;
+        let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
+        let len = (raw_len & !WAL_V2_SENTINEL) as usize;
+        let expected_crc = if is_v2 {
+            if bytes.len() - cur < 4 {
+                eprintln!(
+                    "spg-server: v2 WAL truncated at offset {cur} (need 4-byte CRC, have {})",
+                    bytes.len() - cur
+                );
+                break;
+            }
+            let crc_arr: [u8; 4] = bytes[cur..cur + 4].try_into().expect("checked");
+            cur += 4;
+            Some(u32::from_le_bytes(crc_arr))
+        } else {
+            None
+        };
         if cur + len > bytes.len() {
             eprintln!("spg-server: WAL entry truncated (sql_len={len}) — dropping tail");
             break;
         }
-        let sql = core::str::from_utf8(&bytes[cur..cur + len])
+        let payload = &bytes[cur..cur + len];
+        if let Some(expected) = expected_crc {
+            let actual = spg_crypto::crc32::crc32(payload);
+            if actual != expected {
+                return Err(std::io::Error::other(format!(
+                    "WAL CRC mismatch at offset {} (expected={expected:#010x}, computed={actual:#010x}, sql_len={len}) — corruption detected, refusing to replay",
+                    cur - 4
+                )));
+            }
+        }
+        let sql = core::str::from_utf8(payload)
             .map_err(|_| std::io::Error::other("WAL entry has non-UTF-8 SQL"))?;
         engine
             .execute(sql)
