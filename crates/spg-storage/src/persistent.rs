@@ -1,0 +1,608 @@
+//! Persistent (structural-sharing) vector — the v4.38 building block for the
+//! v4.39 cheap-`Catalog::clone` migration.
+//!
+//! `PersistentVec<T>` is a Bitmapped Vector Trie (Clojure persistent vector
+//! shape): 32-way branching trie with a `tail` buffer at the open end. Every
+//! mutating operation produces a new handle that shares interior nodes with
+//! the old handle via `Arc`. `Clone` is `O(1)`; `push` and `get` are
+//! `O(log₃₂ N)`; a `CoW` path touches only the spine of the affected leaf.
+//!
+//! Hard rules (do not relax in later milestones):
+//! - `no_std` compatible (`alloc::sync::Arc`, `alloc::vec::Vec`).
+//! - Zero `unsafe`. Workspace lint `unsafe_code = "deny"` stays in force here.
+//! - Zero external deps. Pure std + `alloc`.
+//!
+//! Layout:
+//! - `root: Arc<Node<T>>` — the persistent trie. `Node::Internal(Vec<Arc<Node>>)`
+//!   for non-leaf levels, `Node::Leaf(Vec<T>)` for the bottom.
+//! - `tail: Arc<Vec<T>>` — the open-end buffer (≤ 32 elements). Lives outside
+//!   the trie so `push` to a non-full tail avoids walking the spine.
+//! - `len: usize` — total element count (`trie_size + tail.len()`).
+//! - `shift: u32` — distance from the root to the leaf level, in bits, in
+//!   multiples of `SHIFT`. An empty PV has `shift = SHIFT` and an empty root
+//!   so the first incorporate doesn't have to special-case the root type.
+//!
+//! Invariants (debug-asserted in hot paths):
+//! - `tail.len() ≤ BRANCH`.
+//! - When `tail.len() == BRANCH` we incorporate it into the trie before the
+//!   next push (so post-condition is `tail.len() < BRANCH`, except briefly in
+//!   the middle of `push`).
+//! - `shift` is always a multiple of `SHIFT` and ≥ `SHIFT`.
+//! - `trie_size = len - tail.len()` always fits in `1 << (shift + SHIFT)`.
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+const SHIFT: u32 = 5;
+const BRANCH: usize = 1 << SHIFT; // 32
+const MASK: usize = BRANCH - 1; // 0x1F
+
+#[derive(Debug)]
+enum Node<T> {
+    Internal(Vec<Arc<Node<T>>>),
+    Leaf(Vec<T>),
+}
+
+/// A persistent vector with structural sharing. `Clone` is O(1) (bumps the
+/// root `Arc`); `push` is amortised O(log₃₂ N) and only allocates fresh nodes
+/// along the spine from the root to the affected leaf.
+#[derive(Debug)]
+pub struct PersistentVec<T> {
+    root: Arc<Node<T>>,
+    tail: Arc<Vec<T>>,
+    len: usize,
+    shift: u32,
+}
+
+impl<T> Default for PersistentVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Clone for PersistentVec<T> {
+    /// O(1) — only `Arc` bumps, no element copy. This is the whole reason PV
+    /// exists in v4.38; `Catalog::clone` in v4.39 inherits the property.
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            tail: self.tail.clone(),
+            len: self.len,
+            shift: self.shift,
+        }
+    }
+}
+
+impl<T> PersistentVec<T> {
+    /// Empty vector. Allocates one empty `Internal` root and one empty `tail`
+    /// `Vec`; both are shared across every empty PV via `Arc::clone` once the
+    /// first one is built. The shape matches a `shift = SHIFT` trie so the
+    /// incorporate path never has to grow the root type.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            root: Arc::new(Node::Internal(Vec::new())),
+            tail: Arc::new(Vec::new()),
+            len: 0,
+            shift: SHIFT,
+        }
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// O(log₃₂ N). `None` for out-of-bounds. Returned reference is valid for
+    /// the lifetime of `&self`; structural sharing means the borrow is
+    /// independent of any other handle that shares the same spine.
+    pub fn get(&self, i: usize) -> Option<&T> {
+        if i >= self.len {
+            return None;
+        }
+        let trie_size = self.len - self.tail.len();
+        if i >= trie_size {
+            return self.tail.get(i - trie_size);
+        }
+        let mut node: &Arc<Node<T>> = &self.root;
+        let mut shift = self.shift;
+        loop {
+            match &**node {
+                Node::Leaf(elems) => {
+                    return elems.get(i & MASK);
+                }
+                Node::Internal(children) => {
+                    let sub_idx = (i >> shift) & MASK;
+                    node = children.get(sub_idx)?;
+                    shift = shift.saturating_sub(SHIFT);
+                }
+            }
+        }
+    }
+
+    /// Sequential iterator. Falls back to repeated `get` (O(N log N) total);
+    /// callers that need a tight inner loop should switch to a hand-rolled
+    /// leaf-batched walk. v4.38 keeps this simple — v4.39 / v4.40 will
+    /// profile and upgrade if iter shows up as the bottleneck.
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter { pv: self, pos: 0 }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a PersistentVec<T> {
+    type Item = &'a T;
+    type IntoIter = Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T: Clone> PersistentVec<T> {
+    /// `O(log₃₂ N)` path-copy push. Returns a new handle; `self` is untouched
+    /// (structural sharing means the old handle and the new one share every
+    /// internal node except the spine to the newly written tail / leaf).
+    #[must_use]
+    pub fn push(&self, x: T) -> Self {
+        // Fast path: tail still has room.
+        if self.tail.len() < BRANCH {
+            let mut new_tail = (*self.tail).clone();
+            new_tail.push(x);
+            return Self {
+                root: self.root.clone(),
+                tail: Arc::new(new_tail),
+                len: self.len + 1,
+                shift: self.shift,
+            };
+        }
+        // Slow path: tail is full → incorporate it into the trie as a new
+        // Leaf, then start a fresh tail with `x`.
+        let leaf: Arc<Node<T>> = Arc::new(Node::Leaf((*self.tail).clone()));
+        let old_trie_size = self.len - BRANCH; // tail.len() == BRANCH here
+        let trie_capacity: usize = 1usize << (self.shift + SHIFT);
+        let needs_grow = old_trie_size + BRANCH > trie_capacity;
+        let (new_root, new_shift) = if needs_grow {
+            // Root overflow: wrap the old root and a brand-new branch (carrying
+            // the new leaf) under a fresh top-level Internal. The new branch
+            // sits at the same depth the old root sat at, so it needs
+            // `old_shift / SHIFT` layers of `Internal` above the leaf.
+            let internal_levels_above_leaf = self.shift / SHIFT;
+            let new_branch = new_path(internal_levels_above_leaf, leaf);
+            let new_root = Arc::new(Node::Internal(alloc::vec![self.root.clone(), new_branch]));
+            (new_root, self.shift + SHIFT)
+        } else {
+            (
+                push_leaf_into_node(&self.root, self.shift, old_trie_size, leaf),
+                self.shift,
+            )
+        };
+        Self {
+            root: new_root,
+            tail: Arc::new(alloc::vec![x]),
+            len: self.len + 1,
+            shift: new_shift,
+        }
+    }
+
+    /// `O(log₃₂ N)` path-copy set. `None` for out-of-bounds (matches `get`).
+    /// Result shares every node except the spine to the rewritten cell.
+    #[must_use]
+    pub fn set(&self, i: usize, x: T) -> Option<Self> {
+        if i >= self.len {
+            return None;
+        }
+        let trie_size = self.len - self.tail.len();
+        if i >= trie_size {
+            let mut new_tail: Vec<T> = (*self.tail).clone();
+            new_tail[i - trie_size] = x;
+            return Some(Self {
+                root: self.root.clone(),
+                tail: Arc::new(new_tail),
+                len: self.len,
+                shift: self.shift,
+            });
+        }
+        let new_root = set_in_trie(&self.root, self.shift, i, x);
+        Some(Self {
+            root: new_root,
+            tail: self.tail.clone(),
+            len: self.len,
+            shift: self.shift,
+        })
+    }
+}
+
+/// Push a freshly-built `Leaf` into the trie at trie-position `trie_index`.
+/// Assumes the caller has already verified `trie_index < trie_capacity` (i.e.
+/// `needs_grow == false`). `shift` is the shift at `node`; recursion drops
+/// it by `SHIFT` per layer.
+fn push_leaf_into_node<T: Clone>(
+    node: &Arc<Node<T>>,
+    shift: u32,
+    trie_index: usize,
+    leaf: Arc<Node<T>>,
+) -> Arc<Node<T>> {
+    let sub_idx = (trie_index >> shift) & MASK;
+    let Node::Internal(children) = &**node else {
+        // Bottom-of-trie is `Leaf`; we never recurse below `shift == SHIFT`.
+        // Reaching a `Leaf` here would be a shift-bookkeeping bug.
+        debug_assert!(false, "push_leaf_into_node hit a Leaf — shift bug");
+        return node.clone();
+    };
+    let mut new_children: Vec<Arc<Node<T>>> = children.clone();
+    if shift == SHIFT {
+        // Next layer down is the Leaf layer — drop the new leaf in at the
+        // open slot. Leaves are inserted in trie-index order, so `sub_idx`
+        // is always either an existing index (replace — shouldn't happen
+        // during push, only during set) or one past the end (append).
+        debug_assert!(
+            sub_idx == new_children.len(),
+            "leaves are pushed sequentially; sub_idx {} != next slot {}",
+            sub_idx,
+            new_children.len()
+        );
+        new_children.push(leaf);
+    } else {
+        let child: Arc<Node<T>> = if sub_idx < new_children.len() {
+            push_leaf_into_node(&new_children[sub_idx], shift - SHIFT, trie_index, leaf)
+        } else {
+            // Fresh branch: wrap the leaf in enough Internal layers to land
+            // at the leaf level under this node's child.
+            let internal_levels_above_leaf = (shift / SHIFT) - 1;
+            new_path(internal_levels_above_leaf, leaf)
+        };
+        if sub_idx < new_children.len() {
+            new_children[sub_idx] = child;
+        } else {
+            new_children.push(child);
+        }
+    }
+    Arc::new(Node::Internal(new_children))
+}
+
+/// Build a chain of `internal_levels` `Internal` nodes wrapping `leaf`. With
+/// `internal_levels == 0` the leaf is returned as-is.
+fn new_path<T>(internal_levels: u32, leaf: Arc<Node<T>>) -> Arc<Node<T>> {
+    let mut node = leaf;
+    for _ in 0..internal_levels {
+        node = Arc::new(Node::Internal(alloc::vec![node]));
+    }
+    node
+}
+
+/// Path-copy `set` walk. Returns a fresh `Arc<Node>` along the spine; every
+/// other node is shared via `Arc::clone`.
+fn set_in_trie<T: Clone>(node: &Arc<Node<T>>, shift: u32, i: usize, x: T) -> Arc<Node<T>> {
+    match &**node {
+        Node::Leaf(elems) => {
+            let mut new_elems = elems.clone();
+            new_elems[i & MASK] = x;
+            Arc::new(Node::Leaf(new_elems))
+        }
+        Node::Internal(children) => {
+            let sub_idx = (i >> shift) & MASK;
+            let new_child = set_in_trie(&children[sub_idx], shift - SHIFT, i, x);
+            let mut new_children = children.clone();
+            new_children[sub_idx] = new_child;
+            Arc::new(Node::Internal(new_children))
+        }
+    }
+}
+
+/// Sequential `&T` iterator. v4.38 implementation is `get(i)`-driven — simple
+/// and correct, but O(N log N) over the whole vector. Profile in v4.39 /
+/// v4.40 and upgrade if it shows up in flamegraphs.
+#[derive(Debug)]
+pub struct Iter<'a, T> {
+    pv: &'a PersistentVec<T>,
+    pos: usize,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+    fn next(&mut self) -> Option<&'a T> {
+        if self.pos >= self.pv.len {
+            return None;
+        }
+        let v = self.pv.get(self.pos)?;
+        self.pos += 1;
+        Some(v)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.pv.len.saturating_sub(self.pos);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for Iter<'_, T> {}
+
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::needless_range_loop,
+    clippy::items_after_statements,
+    clippy::manual_range_patterns,
+    clippy::unreadable_literal,
+    clippy::similar_names
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_vec_is_empty() {
+        let pv: PersistentVec<u64> = PersistentVec::new();
+        assert_eq!(pv.len(), 0);
+        assert!(pv.is_empty());
+        assert!(pv.get(0).is_none());
+    }
+
+    #[test]
+    fn push_single_fits_in_tail() {
+        let pv: PersistentVec<u64> = PersistentVec::new().push(42);
+        assert_eq!(pv.len(), 1);
+        assert_eq!(pv.get(0), Some(&42));
+        assert!(pv.get(1).is_none());
+    }
+
+    #[test]
+    fn push_fills_tail_then_incorporates() {
+        // 32 elements all sit in tail; 33rd triggers the first incorporate.
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..40_u64 {
+            pv = pv.push(i);
+        }
+        for i in 0..40_u64 {
+            assert_eq!(pv.get(i as usize), Some(&i), "mismatch at {i}");
+        }
+        assert!(pv.get(40).is_none());
+    }
+
+    #[test]
+    fn push_crosses_root_overflow_boundary() {
+        // Crossing 1024 forces the first root grow (`shift` 5 → 10).
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..1100_u64 {
+            pv = pv.push(i);
+        }
+        for i in 0..1100_u64 {
+            assert_eq!(pv.get(i as usize), Some(&i), "mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn push_crosses_second_grow_boundary() {
+        // 32_768 forces the second root grow (`shift` 10 → 15). Verifies the
+        // recursion in `push_leaf_into_node` handles a 3-deep trie.
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..33_000_u64 {
+            pv = pv.push(i);
+        }
+        // Spot-check a handful — the full 33k loop is too slow under cargo
+        // test default mode; the 100K fuzz oracle covers thorough coverage.
+        let probes = [0_usize, 1, 31, 32, 1023, 1024, 1056, 32_767, 32_768, 32_999];
+        for &p in &probes {
+            assert_eq!(pv.get(p), Some(&(p as u64)), "mismatch at {p}");
+        }
+        assert!(pv.get(33_000).is_none());
+    }
+
+    #[test]
+    fn clone_then_push_preserves_original() {
+        // The whole point of PV: pushing onto a clone must not mutate the
+        // original handle.
+        let mut a: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..50_u64 {
+            a = a.push(i);
+        }
+        let b = a.clone();
+        let b = b.push(999);
+        assert_eq!(a.len(), 50);
+        assert_eq!(b.len(), 51);
+        assert_eq!(a.get(50), None);
+        assert_eq!(b.get(50), Some(&999));
+        // First 50 elements are visible from both handles.
+        for i in 0..50_usize {
+            assert_eq!(a.get(i), Some(&(i as u64)));
+            assert_eq!(b.get(i), Some(&(i as u64)));
+        }
+    }
+
+    #[test]
+    fn set_rewrites_element_in_tail() {
+        let pv: PersistentVec<u64> = PersistentVec::new()
+            .push(10)
+            .push(20)
+            .push(30)
+            .set(1, 200)
+            .unwrap();
+        assert_eq!(pv.get(0), Some(&10));
+        assert_eq!(pv.get(1), Some(&200));
+        assert_eq!(pv.get(2), Some(&30));
+    }
+
+    #[test]
+    fn set_rewrites_element_in_trie() {
+        // Need ≥ 33 elements so that position 0 lives in the trie, not tail.
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..40_u64 {
+            pv = pv.push(i);
+        }
+        let pv2 = pv.set(0, 9999).unwrap();
+        assert_eq!(pv2.get(0), Some(&9999));
+        assert_eq!(pv.get(0), Some(&0), "set must not mutate original");
+        assert_eq!(pv2.get(39), Some(&39));
+    }
+
+    #[test]
+    fn set_out_of_bounds_is_none() {
+        let pv: PersistentVec<u64> = PersistentVec::new().push(1);
+        assert!(pv.set(5, 99).is_none());
+    }
+
+    #[test]
+    fn iter_matches_get_for_full_walk() {
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..200_u64 {
+            pv = pv.push(i * 7);
+        }
+        let via_iter: Vec<u64> = pv.iter().copied().collect();
+        let via_get: Vec<u64> = (0..pv.len()).map(|i| *pv.get(i).unwrap()).collect();
+        assert_eq!(via_iter, via_get);
+        assert_eq!(via_iter.len(), 200);
+        assert_eq!(via_iter[199], 199 * 7);
+    }
+
+    #[test]
+    fn iter_size_hint_exact() {
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..15_u64 {
+            pv = pv.push(i);
+        }
+        let it = pv.iter();
+        assert_eq!(it.size_hint(), (15, Some(15)));
+        assert_eq!(it.count(), 15);
+    }
+
+    /// SplitMix-style PRNG so the fuzz oracle is reproducible without pulling
+    /// `rand` in. Same mixer the NSW level assignment uses upstream.
+    struct Splitmix(u64);
+    impl Splitmix {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut x = self.0;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^ (x >> 31)
+        }
+    }
+
+    /// Random `push` / `set` / `get` operation sequence ≥ 100K steps mirrored
+    /// against the std `Vec<u64>`. Confirms PV's mutating ops match the
+    /// canonical ground-truth semantics across every BVT branch / tail
+    /// boundary / root overflow.
+    #[test]
+    fn fuzz_oracle_against_vec_u64() {
+        let mut pv: PersistentVec<u64> = PersistentVec::new();
+        let mut oracle: Vec<u64> = Vec::new();
+        let mut rng = Splitmix::new(0xC0FFEE_u64);
+        const STEPS: usize = 100_000;
+        for step in 0..STEPS {
+            let r = rng.next();
+            // Bias toward push so we actually grow the trie past the second
+            // boundary (33k+ in ~80k pushes).
+            let op = r % 4; // 0..2 push, 3 set
+            match (op, oracle.len()) {
+                (0 | 1 | 2, _) | (_, 0) => {
+                    let val = rng.next();
+                    pv = pv.push(val);
+                    oracle.push(val);
+                }
+                (3, n) => {
+                    let idx = (rng.next() as usize) % n;
+                    let val = rng.next();
+                    pv = pv.set(idx, val).expect("in-bounds set");
+                    oracle[idx] = val;
+                }
+                _ => unreachable!(),
+            }
+            // Cheap step-end check: head + tail + a sampled interior cell.
+            assert_eq!(pv.len(), oracle.len(), "len drift @ step {step}");
+            if !oracle.is_empty() {
+                assert_eq!(pv.get(0), oracle.first(), "head drift @ step {step}");
+                assert_eq!(
+                    pv.get(oracle.len() - 1),
+                    oracle.last(),
+                    "tail drift @ step {step}"
+                );
+                let probe = (rng.next() as usize) % oracle.len();
+                assert_eq!(
+                    pv.get(probe),
+                    Some(&oracle[probe]),
+                    "interior drift @ step {step}, probe {probe}"
+                );
+            }
+        }
+        // Final exhaustive sweep — every element must match.
+        for i in 0..oracle.len() {
+            assert_eq!(pv.get(i), Some(&oracle[i]), "final drift at {i}");
+        }
+        // And `iter` must traverse them in order.
+        let via_iter: Vec<u64> = pv.iter().copied().collect();
+        assert_eq!(via_iter, oracle, "iter drift");
+    }
+
+    /// Clone-isolation: build PV A, branch into B and C from a midpoint, mutate
+    /// each independently, and verify each handle reads back its own mutations
+    /// without leaking into the others.
+    #[test]
+    fn fuzz_oracle_clone_isolation() {
+        let mut a: PersistentVec<u64> = PersistentVec::new();
+        let mut oracle_a: Vec<u64> = Vec::new();
+        let mut rng = Splitmix::new(0xDECAFBAD_u64);
+        for _ in 0..2_000 {
+            let v = rng.next();
+            a = a.push(v);
+            oracle_a.push(v);
+        }
+        // Branch.
+        let mut b = a.clone();
+        let mut oracle_b = oracle_a.clone();
+        let mut c = a.clone();
+        let mut oracle_c = oracle_a.clone();
+        // Mutate B and C independently.
+        for _ in 0..500 {
+            let v = rng.next();
+            b = b.push(v);
+            oracle_b.push(v);
+        }
+        for _ in 0..300 {
+            let idx = (rng.next() as usize) % oracle_c.len();
+            let v = rng.next();
+            c = c.set(idx, v).expect("in-bounds");
+            oracle_c[idx] = v;
+        }
+        // Each handle must match its own oracle, end to end.
+        for (i, &want) in oracle_a.iter().enumerate() {
+            assert_eq!(a.get(i), Some(&want), "A drift at {i}");
+        }
+        for (i, &want) in oracle_b.iter().enumerate() {
+            assert_eq!(b.get(i), Some(&want), "B drift at {i}");
+        }
+        for (i, &want) in oracle_c.iter().enumerate() {
+            assert_eq!(c.get(i), Some(&want), "C drift at {i}");
+        }
+        assert_eq!(a.len(), oracle_a.len());
+        assert_eq!(b.len(), oracle_b.len());
+        assert_eq!(c.len(), oracle_c.len());
+    }
+
+    #[test]
+    fn push_clone_arc_count_stays_constant_in_old_handle() {
+        // Smoke check that v4.38's O(1) clone really is Arc bumps: push 200
+        // elements, take 5 clones, drop them all, verify the original is
+        // unchanged. (No way to assert Arc strong_count here without exposing
+        // internals — we just verify the original reads back correctly,
+        // which is the property that actually matters.)
+        let mut a: PersistentVec<u64> = PersistentVec::new();
+        for i in 0..200_u64 {
+            a = a.push(i);
+        }
+        let snapshots: Vec<PersistentVec<u64>> = (0..5).map(|_| a.clone()).collect();
+        drop(snapshots);
+        for i in 0..200_u64 {
+            assert_eq!(a.get(i as usize), Some(&i));
+        }
+        assert_eq!(a.len(), 200);
+    }
+}

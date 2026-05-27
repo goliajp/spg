@@ -1,132 +1,145 @@
-# SPG next-steps roadmap (post v4.32)
+# SPG next-steps roadmap (post v4.37)
 
-Linear plan to close the remaining PROD_READY gaps. Six
-checkpoints, dependency-ordered. Each row maps back to its
-PROD_READY.md row ID so when the work lands you know exactly
-which checkbox to flip.
+Linear plan to make SPG win the `xbench/competitor/src/bin/sweep.rs`
+scale sweep across all N (10K → 100M) against PG 18 / MySQL 9 /
+MariaDB 11. The v4.37 baseline (commit `399dc8d`, tag
+`baseline-v4.37`) collapses at 1M-row INSERTs (9.4K r/s) because
+`Engine::tx_catalog: Option<Catalog>` clones the whole catalog
+inside every auto-commit BEGIN..COMMIT wrap; the structural fix is
+to back `Catalog`, `Table::rows`, and `Table::indices` with
+persistent (CoW, structural-sharing) data structures so a wrap
+that touches one row is O(log N) instead of O(N).
 
-Convention: each version is a "do-this-and-only-this" delivery.
-Don't bundle. If something turns out to need v(N+1) work,
-deliver v(N) as-is and move on.
+Five checkpoints, dependency-ordered. Each is shippable in
+isolation with its own perf gate. **Hard rule: 0 external deps,
+pure Rust, no `unsafe`.** spg-storage today depends only on std +
+spg-crypto; that property must hold post-v5.0.
+
+Baseline tag for diffing: `baseline-v4.37` → `399dc8d`. Every
+checkpoint sweep is compared against this point.
 
 ---
 
-## v4.33 — ops three-pack (graceful shutdown + slow query log + disk water-mark)
+## What v4.33-v4.37 already delivered (reference)
 
-Closes the smallest, most independent, highest-operator-value
-gaps. All three are isolated additions, no protocol or file-
-format impact.
+| version | what | status |
+|---------|------|--------|
+| v4.33 | ops three-pack (graceful shutdown + slow query log + disk water-mark) | ✅ shipped |
+| v4.34 | ENOSPC in-memory rollback (auto-commit savepoint wrap) | ✅ shipped — **introduced the per-write Catalog clone that v4.38-v4.41 are fixing** |
+| v4.35 | per-table metrics with cardinality control | ✅ shipped |
+| v4.36 | replication: netsplit chaos + lag metric | ✅ shipped |
+| v4.37 | file format v9 + CRC32 on every storage envelope | ✅ shipped — current baseline |
+
+The v4.34 auto-commit wrap was correct for ENOSPC rollback
+semantics but exposes a structural-sharing gap: today each wrap
+takes a *value-copy* `Catalog::clone()`. At 1M rows this is the
+bottleneck the scale sweep hits. v4.38-v4.41 close it without
+reverting v4.34's safety property.
+
+---
+
+## v4.38 — `PersistentVec<T>` (Bitmapped Vector Trie, standalone)
+
+Self-contained data-structure work. No Engine changes. Lets the
+algorithmic core land + get perf-gated before any Catalog
+migration.
 
 | # | item | est. | rows fixed |
 |---|------|------|------------|
-| 1 | **Graceful shutdown** — SIGTERM/SIGINT handler stops accepting new connections, drains in-flight queries up to a deadline (`SPG_SHUTDOWN_DEADLINE_SEC`, default 30), exits 0. SIGKILL bypasses (existing crash-recovery path covers it). | 1.5 d | 2.7 |
-| 2 | **Slow-query log** — `SPG_SLOW_QUERY_LOG_MS` env var; queries exceeding the threshold emit a JSON line on stderr with `sql`, `elapsed_us`, `connection_id`, `role`. Defaults off. Reuses the existing `SPG_LOG_FORMAT=json` framework. | 0.5 d | 4.5 |
-| 3 | **Disk water-mark** — `SPG_WAL_MIN_FREE_BYTES` env var; before each WAL append, `statvfs` checks free space on the WAL volume. Below the mark → refuse writes with a clear error, keep serving reads. Linux + Darwin both expose `statvfs`. | 1 d | 5.7 |
+| 1 | **`crates/spg-storage/src/persistent.rs`** — `pub struct PersistentVec<T>` with Clojure-style BVT: 32-way branching trie + tail buffer; `root: Arc<Node<T>>`, `tail: Arc<Vec<T>>`, `len: usize`, `shift: u32`. Node = `Internal(Vec<Arc<Node<T>>>)` \| `Leaf(Vec<T>)`. All API: `new` / `push` / `get` / `iter` / `len` / `Clone` (Arc-clone, O(1)). `no_std`-compatible (`alloc::sync::Arc`); zero unsafe. | 1 d | none directly; foundation for v4.39 |
+| 2 | **Fuzz oracle** — `crates/spg-storage/src/persistent_tests.rs` (cfg(test)). Random `push` / `get` operation sequences ≥ 100K steps mirrored against `Vec<u64>`; verify `clone()` then mutate doesn't disturb original. | 0.5 d | strengthens 1.10 |
+| 3 | **Perf gate** — extend `crates/spg-storage/tests/perf_gate.rs` with `pv_push_1m_under_200ms` + `pv_get_random_under_100ns_avg` (release). | 0.5 d | new gate |
 
 Dependencies: none.
-Risk: low. All three are pure additions, default-off.
-Test plan: each gets a `tests/e2e_*.rs` test; PROD_READY rows
-flip to ✅ with [machine] tag once the row_X_Y_* shim is added.
+Risk: low — pure algorithm work, fully sandboxed.
+Test plan: doctest + fuzz + perf gate; fmt + clippy + workspace.
+Why isolated: lets the BVT shake out 100K-step bugs before any
+real catalog data touches it.
 
 ---
 
-## v4.34 — ENOSPC in-memory rollback (closes chaos #3 fully)
+## v4.39 — `Catalog` / `Table::rows` / `Catalog::tables` backed by PV
 
-Today: the v4.30 preflight catches the chaos knob path
-(`SPG_FAIL_WAL_QUOTA_BYTES`), but a *real* mid-`write_all`
-ENOSPC still leaves the engine with a phantom row until restart.
-This checkpoint closes that gap properly.
+Migration step. Pub API unchanged; wire format unchanged. After
+this lands, `Catalog::clone()` is O(1) Arc bump, so the v4.34
+auto-commit wrap is cheap at any scale.
 
 | # | item | est. | rows fixed |
 |---|------|------|------------|
-| 1 | **Auto-commit savepoint wrap** — when a write arrives outside an explicit TX, take an implicit SAVEPOINT before `engine.execute`; on WAL append success → RELEASE; on WAL append failure → ROLLBACK TO. The engine already has SAVEPOINT machinery (v1.13), so the change is in main.rs not the engine. | 2 d | 1.11 (fully ✅) |
-| 2 | **Perf-regression check** — implicit savepoint per write adds engine overhead. Re-run `xbench/competitor/src/bin/latency.rs` and assert spg-server INSERT p99 stays within SLO (≤ 500 µs). If regression > 30 %, optimize before merge. | 0.5 d | maintains 10.4 |
-| 3 | **Tighten chaos test** — extend `tests/e2e_chaos.rs::chaos_disk_full_…` to also assert the live in-memory count matches CC'd count *without* relying on the preflight (turn off the preflight, force the path through real WAL append failure). | 0.5 d | strengthens 1.10 |
+| 1 | **Catalog / Table internals on PV** — `Table::rows: Vec<Row>` → `PersistentVec<Row>`; `Catalog::tables: Vec<Table>` → `PersistentVec<Table>`. All call sites (`.push`, `.iter`, `&self.rows[i]`, `row_count`) migrate. Public method signatures unchanged. | 1.5 d | none directly |
+| 2 | **`Engine::tx_catalog` benefits transparently** — `exec_begin` / `exec_commit` / `exec_rollback` logic unchanged, but `Catalog::clone()` is now O(1). v4.34 wrap stays in place and stays cheap. | 0 d | seals 1.11 at scale |
+| 3 | **SLO smoke** — `crates/spg-server/tests/slo_smoke.rs::slo_wal_insert_1m_rows_throughput`: insert 1M rows, assert throughput ≥ 50K r/s (≥ 5× of the 9.4K baseline). | 0.5 d | new gate |
+| 4 | **Scale sweep rerun** — `cargo run --release -p spg-bench-competitor --bin sweep`. Expect spg-server INSERT @ 1M ≥ 50K r/s, @ 10M no bail. Add "after v4.39" section to PERFORMANCE.md. | 0.25 d | PERFORMANCE.md |
+| 5 | **PROD_READY / CHANGELOG** — flip 1.11 evidence to "@ scale verified" or add [machine] row in §5.x. `[4.39.0]` changelog entry. | 0.25 d | PROD_READY 1.11 |
 
-Dependencies: v4.33 not required, but landing it first keeps
-each release small.
-Risk: medium — savepoint overhead could move INSERT p99. Bench
-gates this.
-Why not bundled into v4.33: this needs the perf gate to pass;
-keeping it separate makes the regression bisect cleanly.
+Dependencies: v4.38.
+Risk: medium — touches every caller of `Table::rows`. Catalog
+serialize/deserialize must still round-trip (the PV iterates so
+serialization is unchanged).
+Why not bundled into v4.38: keeping algorithm work and migration
+work as separate commits makes regression bisect clean.
 
 ---
 
-## v4.35 — per-table metrics with cardinality control
+## v4.40 — `PersistentBTreeMap<K, V>` for table indices (CoW B-tree)
+
+Same structural-sharing treatment for secondary indices. NSW /
+HNSW stays on the v4.34 wrap (carved out; addressed in v5.0).
 
 | # | item | est. | rows fixed |
 |---|------|------|------------|
-| 1 | **`spg_table_rows{table=…}` series** — exposed via `/metrics`. Each table contributes one gauge. | 0.5 d | 4.6 (partial) |
-| 2 | **Cardinality allowlist** — `SPG_METRICS_TABLE_ALLOWLIST=t1,t2,...` env var. Default: only the 50 largest tables by row count are exported. Prevents Prometheus card blow-up for tenants with thousands of tables. | 0.5 d | completes 4.6 |
-| 3 | **`spg_table_bytes{table=…}` series** — on-disk size approximation (rows × avg-row-bytes). Same allowlist applies. | 0.5 d | 4.6 |
+| 1 | **`crates/spg-storage/src/persistent_btree.rs`** — `pub struct PersistentBTreeMap<K: Ord, V>`; path-copy CoW B-tree, pure std. Branching factor 8–16 (tuned for cache lines). Operations: `insert` / `get` / `range` / `len` / `Clone`. Zero unsafe. | 2 d | foundation |
+| 2 | **Fuzz oracle vs `BTreeMap`** — 100K-step random `insert` / `get` / `range` sequences; verify split/merge corner cases (single-key page, root split, sibling borrow). | 0.5 d | strengthens 1.10 |
+| 3 | **`Table::indices` migration** — `IndexKind::BTree(BTreeMap<…>)` → `IndexKind::BTree(PersistentBTreeMap<…>)`. NSW path untouched. | 0.5 d | none directly |
+| 4 | **Scale sweep + secondary-index variant** — tables with secondary index INSERT @ 1M ≥ 65K r/s. PERFORMANCE.md "after v4.40". | 0.25 d | PERFORMANCE.md |
 
-Dependencies: none. Independent of v4.33/v4.34.
-Risk: low. Pure observability addition; no SQL or wire change.
-Why separate from v4.33: needs the cardinality design call,
-which the v4.33 trio doesn't.
+Dependencies: v4.39 (so the rows are already on PV).
+Risk: medium — B-tree CoW is the hardest of the three persistent
+structures; split/merge corner cases must be fuzz-covered.
+Carve-out: vector-indexed tables (NSW/HNSW) still take the v4.34
+wrap on INSERT — that path's structural fix lands in v5.0 along
+with the HNSW persistent graph.
 
 ---
 
-## v4.36 — replication: netsplit chaos + lag metric (paired delivery)
+## v4.41 — group commit + WAL binary encoding
 
-These two share the replication subsystem and benefit from
-landing together — the lag metric needs the protocol extension
-the netsplit test exercises.
+Throughput unlock. Once the BEGIN..COMMIT wrap is cheap, the next
+bottleneck is per-statement `fsync`. Group commit batches
+concurrent writers into one fsync; binary WAL drops the text-
+encoded INSERT overhead.
 
 | # | item | est. | rows fixed |
 |---|------|------|------------|
-| 1 | **Netsplit chaos test** — small TCP proxy in `xtests/` that sits between primary and follower; supports drop / delay / partition modes. New `tests/e2e_chaos_netsplit.rs` asserts: follower disconnect mid-stream → on reconnect, all CC'd writes arrive exactly once, no duplicates, no gaps. | 2 d | 2.9 |
-| 2 | **Replication lag metric (protocol extension)** — primary's repl stream gets a small periodic status frame carrying current WAL pos (every 50 ms, alongside the existing tail-poll cadence). Follower computes `lag = primary_pos - follower_applied_pos`, exposes `spg_replication_lag_bytes` and `spg_replication_lag_seconds` via its `/metrics`. The status frame is a backwards-compat addition (new framing magic), gated by STABILITY.md. | 1.5 d | 4.7 |
-| 3 | **Update STABILITY.md** — document the new status frame as part of the replication protocol's stable surface. | 0.25 d | maintains 8.5 |
+| 1 | **Group commit at dispatch** — writers contending on the WAL mutex have their bytes batched and `f.sync_data()` runs once for the group. Extend the existing `append_wal_atomic_block` helper to accept N statements. | 1 d | throughput 10.4 |
+| 2 | **WAL binary record** — new type byte (continues the v4.37 sentinel system): `[type=binary][u32 len][u32 crc32][u32 table_id][u32 row_count][packed binary rows...]`. Row body uses the dense schema-driven encoding `Catalog::serialize` already established (FILE_VERSION 8 layout). Replay handles text v1/v2 + binary v3. STABILITY.md documents the new tag. | 1.5 d | 1.8 (WAL extension) |
+| 3 | **Cross-version compat** — `tests/cross_version_compat` gains a v4.41 fixture; v4.31–v4.40 WAL still replays. | 0.5 d | maintains 8.5 |
+| 4 | **Sweep + multi-connection variant** — 4 / 8 client concurrent INSERT @ 1M ≥ MySQL same-conditions × 1.5. Single-client INSERT @ 1M ≥ 200K r/s (target: > PG's 146K). @ 10M ≥ 80K r/s. PERFORMANCE.md "after v4.41". | 0.25 d | PERFORMANCE.md |
 
-Dependencies: v4.24 replication (already shipped). Netsplit
-chaos doesn't depend on lag metric, but landing them together
-exercises the same code path twice.
-Risk: medium — TCP proxy infra needs to be reliable on macOS
-+ Linux CI. Use stdlib `TcpListener`/`TcpStream` only, no extra
-deps.
+Dependencies: v4.40 (so the structural-sharing path is the floor).
+Risk: medium — `fsync` semantics under group commit need a chaos
+test (one writer fails the fsync, the group's failure handling
+fans out correctly). Reuse the v4.37 bit-flip chaos infra for the
+binary-encoding round-trip.
 
 ---
 
-## v4.37 — file format v9: CRC32 checksums
+## v5.0.0 — HNSW persistent + allocator + OOM survival
+
+SemVer major bump (changes panic / OOM semantics + closes the
+v4.38-v4.40 vector-table carve-out).
 
 | # | item | est. | rows fixed |
 |---|------|------|------------|
-| 1 | **WAL record CRC32** — append a u32 CRC32 to each WAL record (after the length prefix, before the SQL bytes). Replay verifies the CRC; mismatch → drop the record with a loud stderr warning, abort if mid-tail (vs. truncation). | 1 d | 1.8 (WAL half) |
-| 2 | **Snapshot envelope CRC32** — bump `FILE_VERSION` 8 → 9. v9 envelope carries CRC32 of the catalog blob; v8 still readable (no CRC). Cross-version compat test gains a v4.37 fixture. | 1 d | 1.8 (snapshot half) |
-| 3 | **Backup bundle CRC32** — bump `SPGBKUP\x02` magic with per-section CRC32. v\x01 stays readable. | 0.5 d | 1.8 (bundle) |
-| 4 | **Bit-flip chaos test** — adversarial test: flip random bits in WAL records, assert CRC catches it (no silent corruption). | 0.5 d | strengthens 1.10 |
+| 1 | **HNSW persistent** — `NswGraph`'s `levels: Vec<u8>` and `layers: Vec<Vec<Vec<usize>>>` migrate to PV-style structural sharing so vector-table INSERT joins the cheap-TX path. Edge mutation = path-copy at the affected node only. | 4 d | seals 1.11 for vector |
+| 2 | **Custom global allocator with per-query budget** — `#[global_allocator]` tracks per-thread bytes-allocated; `SPG_MAX_QUERY_BYTES` enforces cap; over → flip CancelToken so the query bails at the next checkpoint. (From the legacy v5.0 plan; spec unchanged.) | 3 d | 5.5 (fully ✅) |
+| 3 | **OOM survives** — `set_alloc_error_hook` (stable since 1.59) returns a clean error to the client instead of aborting, except during WAL replay where abort is still correct. | 2 d | 5.6 |
+| 4 | **Perf-regression gate** — allocator hot-path atomics + HNSW persistent walk; latency bench must hold SLO ceilings. Sweep at all N including 100M with vector-indexed tables. | 0.5 d | maintains 10.4 / 10.5 |
+| 5 | **STABILITY.md v2 contract** — restate frozen surfaces; v5 cuts `SPG_FAIL_WAL_QUOTA_BYTES` chaos knob (real ENOSPC has full coverage). | 0.5 d | renews 8.5 |
 
-Dependencies: nothing required, but better to ship after v4.36
-so the netsplit chaos infra is already there.
-Risk: medium — file-format bump must keep the v8 read path
-working. Cross-version test (v4.31) is the safety net; add a v4.37
-fixture before merging.
-
----
-
-## v5.0.0 — allocator-level memory cap + OOM survival
-
-This is a SemVer major bump because it changes how Rust panics
-work (process exit behavior) and adds a `#[global_allocator]`
-that's hot-path-relevant.
-
-| # | item | est. | rows fixed |
-|---|------|------|------------|
-| 1 | **Custom global allocator with per-query budget** — `#[global_allocator]` tracks per-thread bytes-allocated; `SPG_MAX_QUERY_BYTES` enforces cap; over → flip the existing CancelToken so the query loop bails at the next checkpoint. | 3 d | 5.5 (fully ✅) |
-| 2 | **OOM survives** — `oom = "abort"` in Cargo.toml is the default; switch to a panic handler that returns clean error to the client when alloc fails, only abort if the panic happens during WAL replay. Stable Rust supports this via `set_alloc_error_hook` (unstable until then; use `oom_hook` or System allocator). | 2 d | 5.6 |
-| 3 | **Perf-regression gate** — allocator hot path adds atomics; re-run latency bench, assert SLO ceiling still holds (the v4.32 ceiling has 6-7× headroom so should survive). | 0.5 d | maintains 10.4/10.5 |
-| 4 | **STABILITY.md v2 contract** — restate frozen surfaces; explicitly note v5 cuts the SPG_FAIL_WAL_QUOTA_BYTES chaos knob now that real ENOSPC has full coverage. | 0.5 d | renews 8.5 |
-
-Dependencies: v4.37 done (so file format v9 is stable before
-v5 ships). Stable Rust feature: `set_alloc_error_hook` is
-stable since 1.59 — fine.
-Risk: high — global allocator change touches every allocation.
-Bench gate is mandatory.
-Why v5 not v4.38: SemVer says "anything that could break a
-client" is major. Switching from `oom = abort` to handler is
-observable from a client (they get an error instead of a closed
-socket).
+Dependencies: v4.41 (binary WAL stable before SemVer major).
+Risk: high — allocator hook + HNSW persistent are both touchy.
+Bench gate is mandatory at this step.
 
 ---
 
@@ -135,49 +148,39 @@ socket).
 - TLS — permanently 🚫 (see `[[spg-out-of-scope]]` memory).
 - Automated failover — 🚫. Manual promotion via
   RESTORE_DRILL.md step 5 stays the supported path.
-- Sharding / multi-master — 🚫. Single-master with read replicas
-  is the architecture; horizontal write scaling is a v6+ topic.
+- Sharding / multi-master — 🚫. Single-master with read replicas;
+  horizontal write scaling is v6+ territory.
 - Migration framework — 🚫. DDL via standard SQL is the model.
-- Multi-tenant isolation — 🚫. Run separate `spg-server`
-  processes.
-- Foreign keys / CHECK constraints / row-level ACL — 🚫. Cited
-  in PROD_READY rows 6.4, 6.5, and out-of-scope memory.
-
-These deferrals are intentional and don't reopen with each
-roadmap pass.
+- Multi-tenant isolation — 🚫. Run separate `spg-server` processes.
+- Foreign keys / CHECK constraints / row-level ACL — 🚫.
+- External crates for persistent data structures (`im`, `rpds`,
+  …) — 🚫. Hard rule: pure Rust, no new deps, no `unsafe`.
 
 ---
 
 ## Effort summary
 
-| version | what                             | est. days |
-|---------|----------------------------------|----------:|
-| v4.33   | ops three-pack                   |       3.0 |
-| v4.34   | ENOSPC rollback                  |       3.0 |
-| v4.35   | per-table metrics                |       1.5 |
-| v4.36   | repl chaos + lag                 |       3.75|
-| v4.37   | file format v9 + CRC             |       3.0 |
-| v5.0.0  | allocator + OOM                  |       6.0 |
-| **total** |                                |    **20.25 d** |
-
-Pace: roughly 4-6 weeks of focused work to take SPG from
-v4.32's prod-ready baseline to a v5.0 release that closes
-every gap PROD_READY.md currently flags. Each checkpoint is
-shippable in isolation.
+| version | what                                            | est. days |
+|---------|-------------------------------------------------|----------:|
+| v4.38   | PersistentVec<T> (BVT)                          |       2.0 |
+| v4.39   | Catalog/Table internals on PV                   |       2.5 |
+| v4.40   | PersistentBTreeMap + Table::indices migration   |       3.25|
+| v4.41   | group commit + binary WAL                       |       3.25|
+| v5.0.0  | HNSW persistent + allocator + OOM               |      10.0 |
+| **total** |                                               |    **21.0 d** |
 
 ---
 
-## How this maps back to PROD_READY.md
+## Perf gate matrix
 
-After v5.0.0 lands, the audit table should look like:
+Each checkpoint must hit its gate before merging. Failure → stop
+and diagnose; do not soften the gate.
 
-| status  | count | notes |
-|---------|------:|-------|
-| ✅ pass | 79    | up from 68 (closed 11 rows across v4.33-v5.0) |
-| ⚠️ partial | 0  | all ⚠️ rows promoted to ✅ |
-| ❌ open    | 0  | all closed |
-| 🚫 out-of-scope | 6 | unchanged — these are forever deferred |
-
-At that point, SPG meets the "external SaaS / open-source user"
-bar declared in the v4.28 sprint kickoff. The next sprint
-target — if there is one — would be horizontal scaling (v6).
+| checkpoint | spg-server INSERT @ 1M r/s | @ 10M | secondary-index @ 1M | sweep position vs PG | sqllogictest 4-corpus |
+|------------|---------------------------:|------:|---------------------:|----------------------|-----------------------|
+| baseline-v4.37 | 9.4K (broken) | bail | n/a | far below | 100% (must hold) |
+| v4.38 | n/a (no Catalog touch) | n/a | n/a | unchanged | 100% |
+| v4.39 | ≥ 50K | no bail | n/a | within 3× of PG | 100% |
+| v4.40 | ≥ 50K | no bail | ≥ 65K | within 2× of PG | 100% |
+| v4.41 | ≥ 200K | ≥ 80K | ≥ 100K | > PG (146K) | 100% |
+| v5.0 | ≥ 200K incl. vector tables | ≥ 80K incl. vector | ≥ 100K | > PG/MySQL/MariaDB | 100% |
