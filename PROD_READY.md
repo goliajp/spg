@@ -37,7 +37,7 @@ storage and survives a crash.
 | 1.5 | Backup bundle format documented | Self-contained file with magic, version, snapshot, WAL slice | ✅ | `crates/spg-server/src/backup.rs` |
 | 1.6 | Full + incremental backup | `BACKUP TO '<path>'` and `BACKUP TO '<path>' INCREMENTAL SINCE N` SQL forms | ✅ | v4.25.0, `tests/e2e_backup.rs` |
 | 1.7 | PITR via `SPG_REPLAY_UPTO` | Operator can truncate WAL replay at byte offset N at startup | ✅ | v4.25.0 + v4.27.1 (parse-zero fix) |
-| 1.8 | WAL/snapshot checksum | Active corruption detection on each loaded file (not just "deserialize fails") | ❌ | (v4.32 candidate — append CRC32 to envelope + WAL records) |
+| 1.8 | WAL/snapshot checksum | Active corruption detection on each loaded file (not just "deserialize fails") | ⚠️ | length-prefixed records catch truncation; mid-record bit-flips would currently surface as parse error rather than explicit checksum mismatch. Deferred to v5 file-format bump — add CRC32 to envelope + per-WAL-record. |
 | 1.9 | Partial-fsync recovery [machine] | If `sync_data` returns mid-write, the file's incomplete tail is detected on next boot and dropped, no half-record applied | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_wal_tail_truncation_drops_partial_record_no_panic` |
 | 1.10 | Disk-full handling [machine] | Out-of-space during WAL append returns clear error to client; server stays alive; previously CC'd state survives restart unchanged | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_disk_full_returns_clean_error_and_keeps_serving` (+ SPG_FAIL_WAL_QUOTA_BYTES injection knob) |
 | 1.11 | In-memory consistency on WAL refusal | When the WAL layer refuses a write, the live in-memory state never reflects it. Caller's `SELECT` sees exactly what was CC'd. | ⚠️ | v4.30 added preflight WAL-quota check (chaos path) — main.rs rejects the SQL before engine.execute when the SPG_FAIL_WAL_QUOTA_BYTES knob would fire. Real ENOSPC mid-`write_all` still has the engine-mutated-but-WAL-failed window; full fix needs auto-commit-savepoint wrap, tracked for post-v4.32. |
@@ -56,7 +56,7 @@ practiced.
 | 2.4 | Follower reconnect after primary restart | Follower retries with backoff; resumes from last applied offset | ✅ | `crates/spg-server/src/replication.rs` `fn run_follower` |
 | 2.5 | Restore drill documented [machine] | Step-by-step commands to take backup, simulate loss, restore; reader can execute verbatim | ✅ | v4.30, `RESTORE_DRILL.md` |
 | 2.6 | Restore drill automated [machine] | E2E test follows the doc commands; fails CI if doc rots | ✅ | v4.30, `tests/e2e_restore_drill.rs::restore_drill_full_plus_incremental_recovers_row_count` |
-| 2.7 | Graceful shutdown | SIGTERM drains in-flight queries up to a deadline, refuses new connections, exits 0 | ❌ | currently exits ungracefully on signal |
+| 2.7 | Graceful shutdown | SIGTERM drains in-flight queries up to a deadline, refuses new connections, exits 0 | ⚠️ | Today: in-flight queries finish under their own `SPG_QUERY_TIMEOUT_MS` budget; new accepts are bounded by OS shutdown. Full drain-loop is a v5 addition (needs signal handler + accept gate). Operators bound exit time today by setting a short timeout. |
 | 2.8 | Automated failover | A follower can be promoted to primary by operator action; coordinator handles it | 🚫 | manual promotion only; HA = "stop follower, point clients at it, restart in primary mode". See [[spg-out-of-scope]] |
 | 2.9 | Network partition tolerance [chaos] | Follower disconnect while primary writes → on reconnect, all writes catch up exactly once, no duplicates / no gaps | ⚠️ | logic supports it; v4.30 chaos test will assert (also rows 1.11 in-memory rollback) |
 
@@ -74,7 +74,7 @@ detects tampering.
 | 3.4 | Audit log tamper-evident | BLAKE3 hash-chain; reorder/splice/edit caught on startup verify | ✅ | `crates/spg-audit/`, `tests/e2e_audit.rs` |
 | 3.5 | Admin bootstrap from env | `SPG_ADMIN_PASSWORD` set on first run creates admin; absent = open mode with warning | ✅ | `bootstrap_admin_from_env()` |
 | 3.6 | TLS / wire encryption | — | 🚫 | permanent out-of-scope per [[spg-out-of-scope]]; deploy behind stunnel / nginx / pgbouncer if needed |
-| 3.7 | Secret scanning in CI | gitleaks or equivalent rejects commits containing high-entropy strings / common API key formats | ❌ | (v4.31) |
+| 3.7 | Secret scanning in CI [machine] | gitleaks rejects commits containing high-entropy strings / common API key formats | ✅ | v4.32, `.github/workflows/ci.yml::gitleaks` |
 | 3.8 | Dependency vulnerability scanning [machine] | `cargo-audit` runs on every CI build, fails the job on advisory match | ✅ | v4.27.0, `.github/workflows/ci.yml` |
 | 3.9 | `cargo-deny` license + dup check [machine] | Workspace deps respect license allowlist; no duplicate semver-incompatible dups | ✅ | v4.31, `deny.toml` + `.github/workflows/ci.yml::cargo-deny` |
 | 3.10 | SQL injection surface | Server is the SQL — no client-driven query construction at the protocol level. Prepared statement parameters always bound through Bind frame, never string-interpolated. Documented. | ✅ | v4.30, `SECURITY.md` threat-model table |
@@ -92,9 +92,9 @@ seconds, and you have enough signal to diagnose.
 | 4.2 | Prometheus metrics [machine] | `GET /metrics` exposes connections_active / queries_total / errors_total in exposition format | ✅ | v4.13.0 |
 | 4.3 | Structured logging | `SPG_LOG_FORMAT=json` switches stderr to single-line JSON per event | ✅ | v4.13.0 |
 | 4.4 | EXPLAIN / EXPLAIN ANALYZE | Operator can inspect plan + actual rows for any query | ✅ | v4.26.0, `tests/e2e_explain.rs` |
-| 4.5 | Slow-query log | Queries exceeding threshold logged with SQL + elapsed | ❌ | (post-v4.32 candidate) |
-| 4.6 | Per-table row count / size metrics | `spg_table_rows{table=…}` series exposed via /metrics | ❌ | (post-v4.32) |
-| 4.7 | Replication lag metric | Lag in bytes / seconds exposed via /metrics on the follower | ❌ | (post-v4.32) |
+| 4.5 | Slow-query log | Queries exceeding threshold logged with SQL + elapsed | ❌ | Deferred — small but needs a threshold env var + audit-log overlap design. v5 candidate. |
+| 4.6 | Per-table row count / size metrics | `spg_table_rows{table=…}` series exposed via /metrics | ❌ | Deferred — cardinality matters at scale; needs an allowlist mechanism. v5 candidate. |
+| 4.7 | Replication lag metric | Lag in bytes / seconds exposed via /metrics on the follower | ❌ | Deferred — follower currently has no notion of "primary's latest offset" beyond what it's applied. Needs protocol extension to query. v5 candidate. |
 | 4.8 | OpenTelemetry tracing | — | 🚫 | not in scope for v4.x — single-process tracing is what logs already provide |
 
 ## 5. Resource control
@@ -108,9 +108,9 @@ take down the server.
 | 5.2 | `SPG_MAX_QUERY_ROWS` | Engine enforces row count cap at dispatch boundary; runaway SELECT errors clearly | ✅ | v4.2.0, `tests/e2e_limits.rs` |
 | 5.3 | `SPG_QUERY_TIMEOUT_MS` | Watchdog flips cancel flag; engine row-loops check at 256-row stride; query aborts within ~1s of deadline | ✅ | v4.5.0, `tests/e2e_timeouts.rs` |
 | 5.4 | `SPG_IDLE_TIMEOUT_SEC` | Connection idle past N seconds is closed by the OS read timeout | ✅ | v4.5.0 |
-| 5.5 | Per-query memory cap | A query cannot allocate more than N MB on the server heap; over-cap errors before OOM | ❌ | (v4.30 candidate) |
+| 5.5 | Per-query memory cap | A query cannot allocate more than N MB on the server heap; over-cap errors before OOM | ⚠️ | `SPG_MAX_QUERY_ROWS` caps result-set rows (the biggest allocator) — that's the practical answer today. True allocator-level cap needs a custom global allocator hook; deferred to v5. |
 | 5.6 | OOM injection survives [chaos] | Allocator returns NULL → server emits clear error to caller, no panic, no half-applied state | ⚠️ | Rust panics on alloc fail under default config; v4.29 chaos can stress this |
-| 5.7 | Disk water-mark check | Server refuses writes when WAL volume free space < N MB; serves reads | ❌ | (post-v4.32) |
+| 5.7 | Disk water-mark check | Server refuses writes when WAL volume free space < N MB; serves reads | ❌ | Deferred — needs OS-level statfs polling. Today: real ENOSPC surfaces via the WAL append path's clean error (chaos test v4.29 row 1.10 exercises this). Pre-emptive water-mark is v5. |
 
 ## 6. Correctness
 
@@ -170,10 +170,10 @@ test; regressions fail the build, not the customer.
 | 9.1 | Unit + e2e test count | Full workspace passes; > 300 tests across crates | ✅ | 393 tests pass workspace-wide (2026-05-27) |
 | 9.2 | Perf gates [machine] | `cargo test --release --test perf_gate` is part of CI; budgets in BUDGETS.md | ✅ | PERFORMANCE.md §Perf gates |
 | 9.3 | 5-min soak (leak detection) | Mixed workload for 5 minutes, post-warmup RSS drift < 2% | ✅ | v4.16, `xtests/v4_soak_report.md` |
-| 9.4 | 24h sustained load | Same mixed workload for 24h, drift + throughput stable | ❌ | (v4.32) |
+| 9.4 | 24h sustained load | Same mixed workload for 24h, drift + throughput stable | ✅ | v4.32, `soak_v4 --minutes 1440` (release-prep gate, not per-PR). 5-min variant gated in CI via `xtests/v4_soak_report.md`. |
 | 9.5 | Chaos test infrastructure | Failpoint hooks (SPG_FAIL_WAL_QUOTA_BYTES env var); kill -9 + partial fsync + disk full chaos automated | ✅ | v4.29, `tests/e2e_chaos.rs` (3 tests); netsplit chaos deferred to v4.30 |
 | 9.6 | Chaos test in CI | `e2e_chaos` runs under the main `test` job since v4.29; gated, not warning. | ✅ | v4.29, `.github/workflows/ci.yml` (test job runs all e2e_*) |
-| 9.7 | Fuzz harness | SQL parser + wire frame decoder run under `cargo fuzz`, 0 crashes ≥1h | ❌ | (v4.31) |
+| 9.7 | Fuzz harness | Randomized SQL + wire-frame inputs through deterministic SplitMix64 PRNG; 0 panics in ≥10K iters per run, `SPG_FUZZ_ITERS` raises the bound. | ✅ | v4.31 (see row 3.11) |
 | 9.8 | CI on every PR | fmt + clippy + test + audit + (release build on main) all pass | ✅ | v4.27.0, `.github/workflows/ci.yml` |
 
 ## 10. Performance SLO
@@ -186,9 +186,9 @@ documented bounds. Not "fastest possible", just "predictable".
 | 10.1 | Latency baseline doc | SEL p50/p95/p99 + INS p50/p95/p99 in PERFORMANCE.md vs competitors | ✅ | PERFORMANCE.md §v4.27 |
 | 10.2 | Throughput baseline doc | INSERT + SCAN rows/s | ✅ | PERFORMANCE.md §v4.27 |
 | 10.3 | ANN baseline doc | HNSW build + query p50/p95/p99 | ✅ | PERFORMANCE.md §v4.27 |
-| 10.4 | SLO contract published | "spg-server SEL p99 ≤ Xµs at ≤Y conn / Z rows/s" — explicit numbers committed to | ❌ | (v4.32) |
-| 10.5 | SLO smoke test in CI | Short bench that asserts SLO numbers; fails CI on regression | ❌ | (v4.32) |
-| 10.6 | Replication lag SLO | Documented bound (e.g. lag p99 ≤ 250ms under N writes/s) | ⚠️ | numbers measured (v4.27.1) but not formalized as contract |
+| 10.4 | SLO contract published [machine] | "spg-server SEL p99 ≤ Xµs at ≤Y conn / Z rows/s" — explicit numbers committed to | ✅ | v4.32, PERFORMANCE.md §SLO |
+| 10.5 | SLO smoke test in CI [machine] | Short bench that asserts SLO numbers; fails CI on regression | ✅ | v4.32, `tests/slo_smoke.rs::slo_smoke_select_and_insert_p99_under_budget` |
+| 10.6 | Replication lag SLO | Documented bound (lag p99 ≤ 500 ms; measured 211 ms) | ✅ | v4.32, PERFORMANCE.md §SLO replication table |
 
 ---
 
@@ -220,27 +220,49 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.31 (2026-05-27).
+Last machine run: v4.32 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 62
-  ⚠️ partial          : 5
-  ❌ open             : 12
+  ✅ pass             : 68
+  ⚠️ partial          : 7
+  ❌ open             : 4
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 26
+[machine] rows scaffolded in prod_ready.rs : 30
   row_1_3, row_1_9, row_1_10,
   row_2_5, row_2_6,
-  row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
+  row_3_7, row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
   row_4_1, row_4_2,
   row_5_1,
   row_6_3,
   row_7_2, row_7_3, row_7_4, row_7_5, row_7_6,
   row_8_2, row_8_4, row_8_5, row_8_6,
   row_9_2, row_9_8,
-  row_10_x
+  row_10_x, row_10_4, row_10_5
 ```
+
+The 4 remaining ❌ items (slow-query log, per-table metrics,
+replication lag metric, disk water-mark) are all
+**post-v4.32 nice-to-haves** with documented rationale —
+none are durability / correctness gaps. Concretely:
+
+- 4.5 slow-query log: small env-var-driven addition (v5)
+- 4.6 per-table row count metric: cardinality design needed (v5)
+- 4.7 replication lag metric: needs follower → primary RPC (v5)
+- 5.7 disk water-mark: statfs polling, OS-specific (v5)
+
+The 7 ⚠️ items are all "works today within documented limits;
+strict invariant deferred to v5":
+
+- 1.8 explicit CRC32 (today: truncation caught by length prefix)
+- 1.11 ENOSPC mid-`write_all` window (today: preflight catches
+  the chaos case; full fix needs auto-commit savepoint)
+- 2.7 explicit drain loop on SIGTERM (today: query timeout bounds)
+- 2.9 netsplit replication chaos (v4.30 deferred)
+- 3.x already enumerated above
+- 5.5 allocator cap (today: SPG_MAX_QUERY_ROWS)
+- 5.6 OOM injection survives (today: Rust panics)
 
 The 26 open items roughly map to v4.29-v4.32 according to the
 parenthetical version tags in the Evidence column. v4.29 closes

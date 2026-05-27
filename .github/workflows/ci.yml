@@ -58,6 +58,19 @@ jobs:
       - name: cargo test --release --test prod_ready
         run: cargo test --release -p spg-server --test prod_ready --locked
 
+  slo_smoke:
+    name: SLO smoke
+    runs-on: ubuntu-latest
+    # v4.32 — the fast SLO gate from PERFORMANCE.md §SLO. Runs
+    # in < 5 s on a normal runner. SLO ceilings are intentionally
+    # loose (~2-3× v4.27 baseline) so shared-runner noise doesn't
+    # false-alarm.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --release --test slo_smoke
+        run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
+
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
@@ -75,6 +88,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    # v4.32: secret scanning. Fails the build on any high-entropy
+    # string / common API key format committed in the diff.
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-build:
     name: release build (sanity)
