@@ -159,6 +159,41 @@ fn assert_doc_has_sections(doc_name: &str, required: &[&str]) {
     }
 }
 
+// ---- 3.7 gitleaks ----
+
+#[test]
+fn row_3_7_gitleaks_in_ci() {
+    let yml =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml")).expect("ci.yml");
+    assert!(
+        yml.contains("gitleaks/gitleaks-action"),
+        "CI must run gitleaks for secret scanning"
+    );
+}
+
+// ---- 10.4 / 10.5 SLO ----
+
+#[test]
+fn row_10_4_slo_contract_published() {
+    assert_doc_has_sections(
+        "PERFORMANCE.md",
+        &[
+            "## SLO contract",
+            "### Latency SLOs",
+            "### Throughput SLOs",
+            "### Replication SLOs",
+        ],
+    );
+}
+
+#[test]
+fn row_10_5_slo_smoke_test_present() {
+    let p = workspace_root().join("crates/spg-server/tests/slo_smoke.rs");
+    assert!(p.exists(), "slo_smoke.rs missing");
+    let src = std::fs::read_to_string(&p).unwrap();
+    assert!(src.contains("fn slo_smoke_select_and_insert_p99_under_budget"));
+}
+
 // ---- 3.9 cargo-deny ----
 
 #[test]

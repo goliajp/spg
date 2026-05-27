@@ -861,6 +861,70 @@ Notes:
   entirely. Mid-WAL byte offsets are supported the same way.
 - Full file: [xtests/v4_25_backup_report.md](xtests/v4_25_backup_report.md).
 
+## SLO contract (v4.32)
+
+The numbers below are what `spg-server` promises under the
+documented workload + setup. They are intentionally **looser
+than the measured baseline** so honest noise (shared CI runner,
+cold container, allocator commit) doesn't false-alarm.
+
+If you observe a true regression past these ceilings, the cause
+is in the hot path — see
+`crates/spg-server/tests/slo_smoke.rs` for the gating test and
+`xbench/competitor/src/bin/{latency,throughput,vector_knn}.rs`
+for the full-resolution numbers to root-cause from.
+
+### Latency SLOs (single connection, in-memory, no WAL)
+
+| metric                     | SLO ceiling | v4.27 measured | headroom |
+|----------------------------|------------:|---------------:|---------:|
+| SEL `count(*)` p99 (µs)    |         500 |             77 |     6.5× |
+| INSERT single-row p99 (µs) |         500 |             70 |     7.1× |
+| ANN `<->` top-10 p99 (µs)  |       1,000 |            341 |     2.9× |
+
+The SLO smoke test
+(`cargo test --release -p spg-server --test slo_smoke`) runs in
+CI under ~5 s and gates SEL + INSERT. The ANN ceiling is
+declared but not yet gated by the smoke test (would need an HNSW
+seed); it's a manual check during release prep via the
+vector_knn bench.
+
+### Throughput SLOs (single connection, in-memory, no WAL)
+
+| metric                          | SLO floor | v4.27 measured | headroom |
+|---------------------------------|----------:|---------------:|---------:|
+| `INSERT` rows/s (100-row batch) |     500 K |         1.47 M |     2.9× |
+| `SCAN` rows/s, full-table       |       3 M |         6.15 M |     2.0× |
+
+Throughput SLOs are not gated by smoke (they need a longer
+warm-up to be stable); they're verified during release prep via
+`cargo run --release -p spg-bench-competitor --bin throughput`.
+
+### Replication SLOs
+
+| metric                                    | SLO ceiling |  measured |
+|-------------------------------------------|------------:|----------:|
+| Snapshot bootstrap, 1K-row seed (ms wall) |         500 |       240 |
+| Replication lag p99 (ms)                  |         500 |       211 |
+| Attach cost vs solo writes                |     ≤ 40 %  |      27 % |
+
+See `xtests/v4_24_repl_report.md` for the source numbers.
+
+### 24-hour sustained soak
+
+There is no CI gate for 24 h (too slow for every PR), but the
+existing `soak_v4` harness scales to it via its `--minutes`
+flag. Operators preparing a release should run:
+
+```bash
+cargo run --release -p spg-bench-competitor --bin soak_v4 -- --minutes 1440
+```
+
+Acceptance criteria, same as the 5-min soak: post-warmup RSS
+drift < 2 % across the full run. The 5-min variant is gated in
+CI (see `xtests/v4_soak_report.md`); the 24-h variant is the
+release-prep gate.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release
