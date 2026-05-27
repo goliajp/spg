@@ -290,3 +290,69 @@ fn every_fixture_restores_and_verifies() {
         }
     }
 }
+
+/// Captures a fixture for the *current* binary into
+/// `xtests/compat-fixtures/v4.41/`. Run once per release as part of
+/// the version-bump checklist:
+///
+///   cargo test --release -p spg-server --test cross_version_compat \
+///       -- --ignored capture_v4_41_fixture
+///
+/// Marked `#[ignore]` so CI doesn't regenerate the fixture on every
+/// run — the captured `full.bkp` / `a.wal` are committed and must
+/// stay byte-stable so future binaries can replay them.
+#[test]
+#[ignore = "release-process capture: regenerates xtests/compat-fixtures/v4.41/"]
+fn capture_v4_41_fixture() {
+    let label = "v4.41";
+    let dest = workspace_root().join("xtests/compat-fixtures").join(label);
+    std::fs::create_dir_all(&dest).expect("mkdir fixture dir");
+
+    let work = unique_tmpdir(&format!("capture-{label}"));
+    let db = work.join("a.db");
+    let wal = work.join("a.wal");
+    let bkp = work.join("full.bkp");
+    let addr = pick_free_addr();
+    let mut child = ChildGuard(spawn(&addr, &db, &wal));
+    let mut s = wait_for_listener(&addr, &mut child.0);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+
+    let stmts = [
+        "CREATE TABLE compat (id INT, name TEXT NOT NULL, score INT)",
+        "INSERT INTO compat VALUES (1, 'alice', 100)",
+        "INSERT INTO compat VALUES (2, 'bob', 90)",
+        "INSERT INTO compat VALUES (3, 'carol', 87)",
+    ];
+    for sql in stmts {
+        send(&mut s, &build_query(sql));
+        let f = read_frame(&mut s);
+        if f.op == Op::ErrorResponse {
+            let msg = spg_wire::parse_error_response(&f).unwrap_or("<undecodable>");
+            panic!("capture: server rejected {sql:?}: {msg}");
+        }
+    }
+
+    // BACKUP TO bundles snapshot+WAL into one file — exactly the
+    // format `apply_bundle()` consumes.
+    send(
+        &mut s,
+        &build_query(&format!("BACKUP TO '{}'", bkp.display())),
+    );
+    let f = read_frame(&mut s);
+    if f.op == Op::ErrorResponse {
+        let msg = spg_wire::parse_error_response(&f).unwrap_or("<undecodable>");
+        panic!("capture: BACKUP TO {bkp:?} failed: {msg}");
+    }
+
+    // The server fsyncs the bundle synchronously inside the BACKUP
+    // handler — once CommandComplete lands the file is on disk.
+    std::fs::copy(&bkp, dest.join("full.bkp")).expect("copy bundle");
+    std::fs::copy(&wal, dest.join("a.wal")).expect("copy raw WAL");
+    std::fs::write(
+        dest.join("expected.txt"),
+        "table=compat\nrows=3\nsum_score=277\nmax_score=100\nfirst_name=alice\n",
+    )
+    .expect("write expected.txt");
+
+    eprintln!("captured fixture: {}", dest.display());
+}

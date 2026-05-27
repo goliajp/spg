@@ -412,12 +412,17 @@ fn follow_once(
                 wal_appender.write_all(&payload)?;
                 wal_appender.sync_data()?;
                 pending.extend_from_slice(&payload);
-                // Drain complete records. v4.37+ records carry an
-                // 8-byte header `[u32 (len | sentinel)][u32 crc32]`
-                // and the CRC is verified; older records use the
-                // bare 4-byte length header. The sentinel bit
-                // distinguishes the two so a follower streams
-                // mixed-format WAL cleanly through a mid-upgrade.
+                // Drain complete records. Three on-disk formats coexist
+                // (same shape `replay_wal_bytes` accepts at startup):
+                //   v1 (≤v4.36): 4-byte len, no CRC, bit 31 = 0.
+                //   v2 (v4.37+): 4-byte (len|0x8000_0000) + 4-byte
+                //                CRC over payload, bit 31 = 1, bit 30 = 0.
+                //   v3 (v4.41+): 4-byte (len|0xC000_0000) + 4-byte CRC
+                //                over [type||payload] + 1-byte type,
+                //                bit 31 = 1, bit 30 = 1. `len` counts
+                //                payload, not the type byte.
+                // The sentinel bits distinguish all three so a follower
+                // streams mixed-format WAL cleanly through a mid-upgrade.
                 let mut cur = 0usize;
                 loop {
                     if pending.len() - cur < 4 {
@@ -426,21 +431,60 @@ fn follow_once(
                     let len_bytes: [u8; 4] = pending[cur..cur + 4].try_into().unwrap();
                     let raw_len = u32::from_le_bytes(len_bytes);
                     let is_v2 = raw_len & crate::WAL_V2_SENTINEL != 0;
-                    let rec_len = (raw_len & !crate::WAL_V2_SENTINEL) as usize;
-                    let header_len = if is_v2 { 8 } else { 4 };
+                    let is_v3 = is_v2 && (raw_len & crate::WAL_V3_FLAG != 0);
+                    let len_mask = if is_v3 {
+                        !(crate::WAL_V2_SENTINEL | crate::WAL_V3_FLAG)
+                    } else {
+                        !crate::WAL_V2_SENTINEL
+                    };
+                    let rec_len = (raw_len & len_mask) as usize;
+                    // v1 = 4-byte header; v2 = 4+4; v3 = 4+4+1 (type byte).
+                    let header_len = if is_v3 {
+                        9
+                    } else if is_v2 {
+                        8
+                    } else {
+                        4
+                    };
                     if pending.len() - cur < header_len + rec_len {
                         break;
                     }
-                    let sql_bytes = &pending[cur + header_len..cur + header_len + rec_len];
+                    let payload_off = cur + header_len;
+                    let sql_bytes = &pending[payload_off..payload_off + rec_len];
                     if is_v2 {
                         let expected =
                             u32::from_le_bytes(pending[cur + 4..cur + 8].try_into().unwrap());
-                        let actual = spg_crypto::crc32::crc32(sql_bytes);
+                        let actual = if is_v3 {
+                            // v3 CRC covers `[type byte || payload]`.
+                            let type_byte = pending[cur + 8];
+                            let mut buf = Vec::with_capacity(1 + sql_bytes.len());
+                            buf.push(type_byte);
+                            buf.extend_from_slice(sql_bytes);
+                            spg_crypto::crc32::crc32(&buf)
+                        } else {
+                            spg_crypto::crc32::crc32(sql_bytes)
+                        };
                         if actual != expected {
                             return Err(std::io::Error::other(format!(
-                                "replicated WAL CRC mismatch at follower offset {} (expected={expected:#010x}, computed={actual:#010x}, sql_len={rec_len})",
+                                "replicated WAL CRC mismatch at follower offset {} (expected={expected:#010x}, computed={actual:#010x}, payload_len={rec_len})",
                                 applied_offset.saturating_add(cur as u64)
                             )));
+                        }
+                    }
+                    if is_v3 {
+                        // v3 dispatches on the type tag. `auto_commit_sql`
+                        // is the only kind v4.41 emits; unknown bytes are
+                        // fatal — never silently skipped (same forward-
+                        // compat fence as `replay_wal_bytes`).
+                        let type_byte = pending[cur + 8];
+                        match type_byte {
+                            crate::WAL_V3_TYPE_AUTO_COMMIT_SQL => {}
+                            other => {
+                                return Err(std::io::Error::other(format!(
+                                    "replicated WAL v3 unknown type byte {other:#04x} at follower offset {} — refusing to apply",
+                                    applied_offset.saturating_add(cur as u64)
+                                )));
+                            }
                         }
                     }
                     let sql = core::str::from_utf8(sql_bytes).map_err(|_| {

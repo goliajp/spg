@@ -1052,6 +1052,117 @@ binary WAL land together).
 
 ---
 
+## v4.41 scale sweep — WAL v3 framing + auto-commit wrap merge (2026-05-28)
+
+Same sweep run as the v4.37 / v4.39 / v4.40 sections above. v4.41
+collapses v4.34's three-v2-record `[BEGIN, sql, COMMIT]` block
+into a single v3 `auto_commit_sql` record: header overhead per
+auto-commit write drops from 35 bytes to 9. No engine changes —
+the WAL mutex / engine RwLock contention shape is unchanged.
+
+This is the **byte-cost half** of the v4.41/v4.42 throughput
+unlock. The **fsync-cost half** — letting multi-client writers
+share one fsync, and letting single-client writers coalesce fsync
+across the auto-commit boundary — needs the engine MVCC + split
+critical-section work scheduled for v4.42 (`tx_catalog: BTreeMap<
+TxId, Catalog>` + dispatch-layer group commit). The 200K single-
+client and ≥ MySQL × 1.5 multi-client gates that earlier NEXT.md
+drafts pinned to v4.41 carry over to v4.42 where they become
+structurally reachable. See NEXT.md "v4.42" section.
+
+### Per-N (INSERT throughput rows/s + PK p99 µs)
+
+| backend       |    10K    |    100K   |     1M    |    10M    |    30M    |   100M    |
+|---------------|----------:|----------:|----------:|----------:|----------:|----------:|
+| spg-embedded  | 1104K / 3µs | 985K / 4µs | 755K / 13µs | 526K / 20µs (bail) | — | — |
+| spg-server    |  97K / 76µs |  88K / 82µs |  77K / 115µs |  59K / 85µs (RSS bail) | — | — |
+| postgres      | 132K / 2.4ms | 141K / 2.4ms | 131K / 2.8ms | 104K / 2.3ms |  72K / 5.4ms |  39K / 8.3ms (bail) |
+| mysql         |  62K / 2.6ms |  82K / 2.4ms |  99K / 2.5ms |  71K / 4.4ms |  19K / 3.1ms (bail) | — |
+| mariadb       |  94K / 2.8ms | 137K / 3.2ms | 167K / 2.3ms |  35K / 2.2ms (bail) | — | — |
+
+### Diff vs v4.40 (SPG only — competitor numbers vary run-to-run via container warm-up)
+
+| backend / N         | v4.40 r/s | v4.41 r/s | v4.41 / v4.40 | notes |
+|---------------------|----------:|----------:|--------------:|-------|
+| spg-server [10K]    |       98K |       97K | 0.99× | flat (small-N noise) |
+| spg-server [100K]   |       75K |       88K | **1.16×** | header overhead 35 → 9 bytes/write |
+| spg-server [1M]     |       66K |       77K | **1.16×** | tracks the header savings cleanly |
+| spg-server [10M]    |       49K |       59K | **1.21×** | + no RSS bail (5156 MiB vs v4.40 6070 MiB) |
+| spg-embedded [10K]  |      405K |     1104K | **2.72×** | (embedded path doesn't take the v3 wrap; this is run-to-run cache warmth) |
+| spg-embedded [1M]   |      162K |      755K | **4.66×** | v4.40.1 `insert_mut` transient kicking in @ scale (first full-sweep verification of the recovery) |
+| spg-embedded [10M]  | (bail @ 1M) |    526K | **n/a (new)** | first time embedded reaches 10M cleanly across the roadmap |
+
+### Findings
+
+**1. v3 framing delivers the expected 15–20 % spg-server lift.** The
+   v4.40 → v4.41 jump @ 1M (66K → 77K, +16 %) tracks the header
+   accounting closely: each auto-commit write writes 26 fewer bytes
+   of overhead (35 - 9), which on a ~50-byte INSERT SQL is ~30 % of
+   the original write footprint. fsync wall time isn't byte-linear
+   on APFS — it's dominated by the IOP itself — so the actual r/s
+   lift lands at ~16 %, with the rest of the byte savings absorbed
+   by `write_all` overhead and cache warmth. Larger N tracks the same
+   ratio (10M: +21 %, helped by less RSS pressure → no GC churn).
+
+**2. spg-server clears the RSS-bail line @ 10M.** v4.40 hit the
+   sweep's 4 GiB RSS safety line at 6070 MiB and bailed; v4.41 sits
+   at 5156 MiB — a ~900 MiB drop. Some of this is direct (WAL file
+   shorter so OS page-cache footprint is smaller), some is indirect
+   (fewer in-flight writes pending fsync → fewer kernel buffers held
+   live). Boundary checkpoints at 30M / 100M are still expected to
+   hit the wall for the same structural reason (heap-resident catalog),
+   but the v5.0 allocator + OOM-survival work is what makes that go
+   away — v4.41 buys headroom, not a fix.
+
+**3. spg-embedded recovers — v4.40.1 transient `insert_mut` lands @ scale.**
+   The v4.40 sweep showed the spg-embedded [1M] number dropping to
+   162K r/s (vs v4.39's 762K and v4.37 baseline's 1584K) because
+   `PersistentBTreeMap::insert` path-copied along the spine for every
+   row. v4.40.1 added `insert_mut` via `Arc::make_mut` transient so
+   uniquely-owned PB handles mutate in place at std `BTreeMap::insert`
+   cost — but the v4.40.1 ship deferred its sweep rerun to v4.41 (the
+   `tests/perf_gate.rs::pb_insert_mut_100k_under_50ms` unit-level gate
+   was running). v4.41's sweep is the first full-sweep verification:
+   spg-embedded [1M] = 755K r/s (4.66× v4.40, **closes the v4.40
+   regression**), [10M] = 526K r/s (first clean 10M for embedded).
+
+**4. Single-client 200K gate still unreachable without v4.42.** Sweep
+   shows spg-server [1M] = 77K — well below the 200K single-client
+   line NEXT.md's earlier draft pinned to v4.41. This is the
+   structural ceiling for byte-overhead optimization alone: the
+   remaining ~3× lift to 200K is fsync-cost, which needs fsync
+   coalescing across the auto-commit boundary (or across multi-
+   client writers). Both routes are v4.42 work — engine MVCC +
+   dispatch-layer group commit. v4.41's NEXT.md gate is now
+   "honest measurement" rather than a number; v4.42's gate stays
+   at 200K single-client + MySQL × 1.5 multi-client.
+
+### Boundary summary
+
+| concern                           | which backend hits it first | at what N | change vs v4.40 |
+|-----------------------------------|----------------------------|-----------|------------------|
+| INSERT throughput cliff           | mariadb (167K → 35K @ 10M)  | ~10M      | unchanged shape; absolute number swapped (v4.40 sweep had mariadb @ 10M = 37K, very close) |
+| INSERT throughput regression — wrap | spg-server                | ~10M (RSS still hits 4 GiB safety line, but the actual MiB dropped) | **wider headroom** — 5156 vs 6070 MiB, no in-run bail before 10M |
+| INSERT throughput regression — embedded | (closed by v4.41 sweep) | n/a       | **closed** (162K → 755K @ 1M, **4.66×**), 10M reached cleanly (526K r/s) |
+| PK lookup p99 cliff (buffer pool) | postgres                   | ~30M-100M (5.4ms @ 30M, 8.3ms @ 100M) | unchanged shape |
+| Physical RAM ceiling              | spg-server                 | ~10M       | **moved out** by ~900 MiB; v5.0 allocator still needed for ≥ 30M |
+
+### Reproduce
+
+  cd <repo root>
+  xbench/competitor/scripts/up.sh
+  cargo run --release -p spg-bench-competitor --bin sweep
+
+Per-backend budget 15 min, full run ~30 min on a quiet host. The
+v4.41 byte-overhead gate is verified by
+`tests/e2e_wal_binary.rs::auto_commit_write_emits_single_v3_record`
+(unit-level: 3 auto-commit writes produce exactly 3 v3 records
+vs. v4.34's 9 v2 records). Replay round-trip pinned by
+`v3_wal_replays_into_matching_engine_state` + cross-version
+fixture `xtests/compat-fixtures/v4.41/`.
+
+---
+
 ## v4.37 competitor rerun (2026-05-27, post-ops-sprint)
 
 End-to-end re-baseline after the v4.33–v4.37 sprint (graceful

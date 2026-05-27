@@ -548,8 +548,8 @@ fn row_1_11_in_memory_consistency_covered_by_e2e() {
         "main.rs must declare the SPG_DISABLE_WAL_PREFLIGHT knob"
     );
     assert!(
-        main_src.contains("append_wal_atomic_block"),
-        "main.rs must use the atomic-block WAL append for the implicit wrap"
+        main_src.contains("append_wal_v3_auto_commit"),
+        "main.rs must use the v4.41 single-record v3 wrap for the implicit auto-commit"
     );
     assert!(
         main_src.contains("needs_wrap"),
