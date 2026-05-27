@@ -178,7 +178,7 @@ impl<'a> CancelToken<'a> {
     }
 }
 
-// ---- snapshot envelope (v4.1) ----
+// ---- snapshot envelope (v4.1, extended with CRC32 in v4.37) ----
 //
 // Wraps a catalog blob + a user blob behind a small header so the
 // server can persist both atomically without inventing a new file.
@@ -186,19 +186,35 @@ impl<'a> CancelToken<'a> {
 // the magic check fails fast and the function falls back to
 // `Catalog::deserialize`.
 //
-// Layout:
+// Layout — v1 (v4.1, no CRC):
 //   [8 bytes magic "SPGENV01"]
 //   [u8 version = 1]
 //   [u32 catalog_len][catalog bytes]
 //   [u32 users_len][users bytes]
+//
+// Layout — v2 (v4.37, CRC32 of body):
+//   [8 bytes magic "SPGENV01"]
+//   [u8 version = 2]
+//   [u32 catalog_len][catalog bytes]
+//   [u32 users_len][users bytes]
+//   [u32 crc32]                      ← CRC32 of every byte before it
+//                                      (magic + version + sections),
+//                                      bit-flip detector for the
+//                                      whole snapshot file.
+//
+// Writers always emit v2 from v4.37 on. Readers accept both: v1
+// loads with no CRC check (pre-v4.37 snapshots stay readable
+// forever per STABILITY); v2 verifies the trailing CRC and refuses
+// on mismatch with a `StorageError::Corrupt`.
 
 const ENVELOPE_MAGIC: &[u8; 8] = b"SPGENV01";
-const ENVELOPE_VERSION: u8 = 1;
+const ENVELOPE_VERSION_V1: u8 = 1;
+const ENVELOPE_VERSION_V2: u8 = 2;
 
 fn build_envelope(catalog: &[u8], users: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 1 + 4 + catalog.len() + 4 + users.len());
+    let mut out = Vec::with_capacity(8 + 1 + 4 + catalog.len() + 4 + users.len() + 4);
     out.extend_from_slice(ENVELOPE_MAGIC);
-    out.push(ENVELOPE_VERSION);
+    out.push(ENVELOPE_VERSION_V2);
     out.extend_from_slice(
         &u32::try_from(catalog.len())
             .expect("≤ 4G catalog")
@@ -211,33 +227,79 @@ fn build_envelope(catalog: &[u8], users: &[u8]) -> Vec<u8> {
             .to_le_bytes(),
     );
     out.extend_from_slice(users);
+    let crc = spg_crypto::crc32::crc32(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
-/// Returns `Some((catalog, users))` if the buffer is a v4.1
-/// envelope; `None` if it's a bare catalog blob (v3.x compat).
-fn split_envelope(buf: &[u8]) -> Option<(&[u8], &[u8])> {
+/// Outcome of envelope parsing: either bare-catalog fallback, a
+/// successfully split (catalog, users) pair from a v1 or v2
+/// envelope, or an explicit corruption error from a v2 CRC
+/// mismatch. `None` (bare-catalog fallback) preserves v3.x
+/// readability; `Err` keeps the CRC contract honest for v2.
+enum EnvelopeParse<'a> {
+    Bare,
+    Pair(&'a [u8], &'a [u8]),
+    CrcMismatch { expected: u32, computed: u32 },
+}
+
+/// Returns `EnvelopeParse::Pair` for a valid v1 or v2 envelope,
+/// `Bare` for a buffer that doesn't look like an envelope (v3.x
+/// bare catalog fallback), and `CrcMismatch` for a v2 envelope
+/// whose trailing CRC32 doesn't match the body.
+fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     if buf.len() < 8 + 1 + 4 || &buf[..8] != ENVELOPE_MAGIC {
-        return None;
+        return EnvelopeParse::Bare;
     }
-    if buf[8] != ENVELOPE_VERSION {
-        return None;
+    let version = buf[8];
+    if version != ENVELOPE_VERSION_V1 && version != ENVELOPE_VERSION_V2 {
+        return EnvelopeParse::Bare;
     }
     let mut p = 9usize;
-    let cat_len = u32::from_le_bytes(buf[p..p + 4].try_into().ok()?) as usize;
+    let Some(cat_len_bytes) = buf.get(p..p + 4) else {
+        return EnvelopeParse::Bare;
+    };
+    let Ok(cat_len_arr) = cat_len_bytes.try_into() else {
+        return EnvelopeParse::Bare;
+    };
+    let cat_len = u32::from_le_bytes(cat_len_arr) as usize;
     p += 4;
     if p + cat_len + 4 > buf.len() {
-        return None;
+        return EnvelopeParse::Bare;
     }
     let catalog = &buf[p..p + cat_len];
     p += cat_len;
-    let user_len = u32::from_le_bytes(buf[p..p + 4].try_into().ok()?) as usize;
+    let Some(user_len_bytes) = buf.get(p..p + 4) else {
+        return EnvelopeParse::Bare;
+    };
+    let Ok(user_len_arr) = user_len_bytes.try_into() else {
+        return EnvelopeParse::Bare;
+    };
+    let user_len = u32::from_le_bytes(user_len_arr) as usize;
     p += 4;
-    if p + user_len != buf.len() {
-        return None;
+    if p + user_len > buf.len() {
+        return EnvelopeParse::Bare;
     }
     let users = &buf[p..p + user_len];
-    Some((catalog, users))
+    p += user_len;
+    if version == ENVELOPE_VERSION_V2 {
+        if p + 4 != buf.len() {
+            return EnvelopeParse::Bare;
+        }
+        let crc_arr = match buf[p..p + 4].try_into() {
+            Ok(a) => a,
+            Err(_) => return EnvelopeParse::Bare,
+        };
+        let expected = u32::from_le_bytes(crc_arr);
+        let computed = spg_crypto::crc32::crc32(&buf[..p]);
+        if expected != computed {
+            return EnvelopeParse::CrcMismatch { expected, computed };
+        }
+    } else if p != buf.len() {
+        // v1: must end exactly at the users section.
+        return EnvelopeParse::Bare;
+    }
+    EnvelopeParse::Pair(catalog, users)
 }
 
 #[derive(Debug, Default)]
@@ -307,22 +369,30 @@ impl Engine {
     /// restore if the envelope magic isn't present (so v3.x snapshot
     /// files still load).
     pub fn restore_envelope(buf: &[u8]) -> Result<Self, EngineError> {
-        if let Some((catalog_bytes, user_bytes)) = split_envelope(buf) {
-            let catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
-            let users = users::deserialize_users(user_bytes)
-                .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
-            Ok(Self {
-                catalog,
-                tx_catalog: None,
-                savepoints: Vec::new(),
-                clock: None,
-                salt_fn: None,
-                max_query_rows: None,
-                users,
-            })
-        } else {
-            let catalog = Catalog::deserialize(buf).map_err(EngineError::Storage)?;
-            Ok(Self::restore(catalog))
+        match split_envelope(buf) {
+            EnvelopeParse::Pair(catalog_bytes, user_bytes) => {
+                let catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
+                let users = users::deserialize_users(user_bytes)
+                    .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
+                Ok(Self {
+                    catalog,
+                    tx_catalog: None,
+                    savepoints: Vec::new(),
+                    clock: None,
+                    salt_fn: None,
+                    max_query_rows: None,
+                    users,
+                })
+            }
+            EnvelopeParse::CrcMismatch { expected, computed } => {
+                Err(EngineError::Storage(StorageError::Corrupt(alloc::format!(
+                    "snapshot envelope CRC32 mismatch (expected={expected:#010x}, computed={computed:#010x})"
+                ))))
+            }
+            EnvelopeParse::Bare => {
+                let catalog = Catalog::deserialize(buf).map_err(EngineError::Storage)?;
+                Ok(Self::restore(catalog))
+            }
         }
     }
 

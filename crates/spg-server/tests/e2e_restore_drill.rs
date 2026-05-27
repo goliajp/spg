@@ -171,7 +171,13 @@ fn wire_to_i64(v: &WireValue) -> i64 {
 /// Decode a bundle (RESTORE_DRILL.md step 0 + helper for step 1).
 /// Returns (kind, since, snap_len, wal_pos, wal_len, wal_slice_start).
 fn parse_bundle_header(bytes: &[u8]) -> (u8, u64, usize, u64, usize, usize) {
-    assert_eq!(&bytes[..8], b"SPGBKUP\x01", "not an SPG bundle");
+    // v4.37: writers emit \x02 (with trailing CRC32). Restorers
+    // accept either.
+    assert!(
+        &bytes[..8] == b"SPGBKUP\x01" || &bytes[..8] == b"SPGBKUP\x02",
+        "not an SPG bundle (magic = {:?})",
+        &bytes[..8]
+    );
     let kind = bytes[8];
     let since = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
     let snap_len = u64::from_le_bytes(bytes[25..33].try_into().unwrap()) as usize;

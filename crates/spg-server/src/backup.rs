@@ -1,10 +1,12 @@
-//! v4.25 backup bundles + PITR helpers.
+//! v4.25 backup bundles + PITR helpers (CRC32 trailer added in
+//! v4.37).
 //!
 //! A backup is a single self-contained file with this layout
 //! (all integers `u64` little-endian):
 //!
 //! ```text
-//! magic:    8 bytes  b"SPGBKUP\x01"
+//! magic:    8 bytes  b"SPGBKUP\x01"  (v4.25, no CRC)
+//!              -or-  b"SPGBKUP\x02"  (v4.37, trailing CRC32)
 //! kind:     1 byte   0 = full, 1 = incremental
 //! since:    8 bytes  WAL byte offset the previous full backup
 //!                    captured up to (0 for full backups)
@@ -16,12 +18,20 @@
 //! wal_len:  8 bytes  length of WAL bytes shipped in this bundle
 //! wal:      wal_len bytes  (for a full backup: WAL[0..wal_pos];
 //!                           for an incremental: WAL[since..wal_pos])
+//! crc32:    4 bytes  CRC32 of every byte before it, present only
+//!                    when magic == SPGBKUP\x02.
 //! ```
 //!
 //! Operators stage a recovery by feeding `snap` into `db_path`
 //! and the concatenated WAL slices into `wal_path`, then starting
 //! spg-server. PITR with mid-bundle truncation uses the
 //! `SPG_REPLAY_UPTO` env var (see main.rs).
+//!
+//! Writers always emit v2 from v4.37 on. Readers accept both: v1
+//! loads unchanged (no CRC check); v2 verifies the trailing CRC32
+//! and returns `BackupError::Corrupt` on mismatch — bit-flips in
+//! the snapshot, WAL slice, or any header field surface as an
+//! explicit error rather than silently corrupting the restore.
 
 use std::io::Write;
 use std::path::Path;
@@ -29,7 +39,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ServerState;
 
-const MAGIC: &[u8; 8] = b"SPGBKUP\x01";
+const MAGIC_V1: &[u8; 8] = b"SPGBKUP\x01";
+const MAGIC_V2: &[u8; 8] = b"SPGBKUP\x02";
 const KIND_FULL: u8 = 0;
 const KIND_INCREMENTAL: u8 = 1;
 
@@ -38,6 +49,13 @@ pub enum BackupError {
     Io(std::io::Error),
     NoWal,
     BadSinceOffset(u64),
+    /// v4.37: v2-format bundle whose trailing CRC32 doesn't match
+    /// the computed checksum of the body. Restoration is refused.
+    #[allow(dead_code)]
+    Corrupt {
+        expected: u32,
+        computed: u32,
+    },
 }
 
 impl core::fmt::Display for BackupError {
@@ -48,6 +66,10 @@ impl core::fmt::Display for BackupError {
             Self::BadSinceOffset(n) => {
                 write!(f, "incremental SINCE offset {n} exceeds current WAL length")
             }
+            Self::Corrupt { expected, computed } => write!(
+                f,
+                "backup bundle CRC32 mismatch (expected={expected:#010x}, computed={computed:#010x})"
+            ),
         }
     }
 }
@@ -127,37 +149,49 @@ fn write_bundle(
             .map_or(0, |d| d.as_micros()),
     )
     .unwrap_or(u64::MAX);
-    let mut f = std::fs::File::create(dest)?;
-    f.write_all(MAGIC)?;
-    f.write_all(&[kind])?;
-    f.write_all(&since.to_le_bytes())?;
-    f.write_all(&ts.to_le_bytes())?;
+    // v4.37: assemble in memory so the CRC32 trailer covers
+    // every header + payload byte before it. Bundles are typically
+    // small (snapshot blob + a WAL slice); the extra Vec doesn't
+    // dominate. The single trailing CRC also lets restorers do
+    // one syscall to read the file and check before applying.
+    let mut body = Vec::with_capacity(
+        MAGIC_V2.len() + 1 + 8 + 8 + 8 + snapshot.len() + 8 + 8 + wal_slice.len(),
+    );
+    body.extend_from_slice(MAGIC_V2);
+    body.push(kind);
+    body.extend_from_slice(&since.to_le_bytes());
+    body.extend_from_slice(&ts.to_le_bytes());
     let snap_len = u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
-    f.write_all(&snap_len.to_le_bytes())?;
-    if !snapshot.is_empty() {
-        f.write_all(snapshot)?;
-    }
-    f.write_all(&wal_pos.to_le_bytes())?;
+    body.extend_from_slice(&snap_len.to_le_bytes());
+    body.extend_from_slice(snapshot);
+    body.extend_from_slice(&wal_pos.to_le_bytes());
     let wal_len = u64::try_from(wal_slice.len()).unwrap_or(u64::MAX);
-    f.write_all(&wal_len.to_le_bytes())?;
-    if !wal_slice.is_empty() {
-        f.write_all(wal_slice)?;
-    }
+    body.extend_from_slice(&wal_len.to_le_bytes());
+    body.extend_from_slice(wal_slice);
+    let crc = spg_crypto::crc32::crc32(&body);
+    let mut f = std::fs::File::create(dest)?;
+    f.write_all(&body)?;
+    f.write_all(&crc.to_le_bytes())?;
     f.sync_data()?;
     Ok(())
 }
 
-/// Inspect a bundle without applying it. Returns
-/// `(kind_byte, since, wal_pos, ts_micros, snap_len, wal_len)`.
+/// Inspect a bundle without applying it. v4.37 also verifies the
+/// trailing CRC32 when the magic is `SPGBKUP\x02`; v1 bundles
+/// inspect identically to before.
 #[allow(dead_code)] // exposed for operator tooling and the e2e PITR test
 pub fn inspect_bundle(path: &Path) -> std::io::Result<BundleHeader> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < 8 + 1 + 8 + 8 + 8 + 8 + 8 {
         return Err(std::io::Error::other("bundle too short"));
     }
-    if &bytes[..8] != MAGIC {
+    let is_v2 = if &bytes[..8] == MAGIC_V1 {
+        false
+    } else if &bytes[..8] == MAGIC_V2 {
+        true
+    } else {
         return Err(std::io::Error::other("bad bundle magic"));
-    }
+    };
     let kind = bytes[8];
     let since = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
     let ts = u64::from_le_bytes(bytes[17..25].try_into().unwrap());
@@ -168,6 +202,21 @@ pub fn inspect_bundle(path: &Path) -> std::io::Result<BundleHeader> {
     }
     let wal_pos = u64::from_le_bytes(bytes[snap_end..snap_end + 8].try_into().unwrap());
     let wal_len = u64::from_le_bytes(bytes[snap_end + 8..snap_end + 16].try_into().unwrap());
+    if is_v2 {
+        let body_end = snap_end + 16 + usize::try_from(wal_len).unwrap_or(usize::MAX);
+        if bytes.len() != body_end + 4 {
+            return Err(std::io::Error::other(
+                "v2 bundle: trailing CRC missing or extra bytes after CRC",
+            ));
+        }
+        let expected = u32::from_le_bytes(bytes[body_end..body_end + 4].try_into().unwrap());
+        let computed = spg_crypto::crc32::crc32(&bytes[..body_end]);
+        if expected != computed {
+            return Err(std::io::Error::other(format!(
+                "backup bundle CRC32 mismatch (expected={expected:#010x}, computed={computed:#010x})"
+            )));
+        }
+    }
     Ok(BundleHeader {
         kind,
         since,

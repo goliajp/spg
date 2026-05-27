@@ -347,6 +347,94 @@ fn chaos_disk_full_returns_clean_error_and_keeps_serving() {
     );
 }
 
+// ---- chaos 5: WAL bit-flip — v4.37 CRC32 catches silent corruption ----
+
+/// v4.37 row 1.8: bit-flip inside a WAL record's payload must be
+/// caught by the CRC32 (not by accident-of-deserialization). After
+/// the flip, restart must REFUSE to replay and return an explicit
+/// "CRC mismatch" error — never silently apply a corrupted record.
+#[test]
+fn chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay() {
+    let dir = unique_tmpdir("crcflip");
+    let db = dir.join("a.db");
+    let wal = dir.join("a.wal");
+    let addr1 = pick_free_addr();
+
+    {
+        let mut c = ChildGuard(spawn_server(&addr1, &db, &wal, &[]));
+        let mut s = wait_for_listener(&addr1, &mut c.0);
+        s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        exec_ok(
+            &mut s,
+            "CREATE TABLE c (id INT NOT NULL, name TEXT NOT NULL)",
+        );
+        // Several rows so the flip can land on the middle of the WAL
+        // (not on the trailing record, which would just be tail-
+        // truncation handling instead of CRC enforcement).
+        for i in 0..6 {
+            exec_ok(
+                &mut s,
+                &format!("INSERT INTO c VALUES ({i}, 'row-{i}-payload')"),
+            );
+        }
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    // Flip a single bit roughly in the middle of the file. v4.37
+    // WAL records carry an 8-byte header (length + CRC) followed
+    // by the SQL bytes; landing in the file's middle lands inside
+    // one of the payloads with high probability.
+    let mut bytes = std::fs::read(&wal).unwrap();
+    let len = bytes.len();
+    assert!(len > 64, "WAL should be substantial; got {len} bytes");
+    let mid = len / 2;
+    bytes[mid] ^= 0x01;
+    std::fs::write(&wal, &bytes).unwrap();
+
+    // Restart with the corrupted WAL. The server must fail to come
+    // up — spg-server exits 1 with the fatal-replay path — rather
+    // than silently apply garbage SQL or skip the record.
+    let addr2 = pick_free_addr();
+    let mut c2 = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_spg-server"))
+            .arg(&addr2)
+            .arg(&db)
+            .arg("-")
+            .arg(&wal)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .env_remove("SPG_PASSWORD")
+            .env_remove("SPG_ADMIN_PASSWORD")
+            .env_remove("SPG_PG_ADDR")
+            .spawn()
+            .unwrap(),
+    );
+    let mut stderr = c2.0.stderr.take().expect("stderr piped");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        match c2.0.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "server didn't exit on corruption"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    assert!(
+        !status.success(),
+        "server must NOT come up successfully on a CRC-corrupted WAL"
+    );
+    let mut msg = String::new();
+    let _ = std::io::Read::read_to_string(&mut stderr, &mut msg);
+    assert!(
+        msg.contains("CRC mismatch") || msg.contains("corruption detected"),
+        "expected explicit CRC-mismatch refusal in stderr; got: {msg:?}"
+    );
+}
+
 // ---- chaos 4: ENOSPC mid-write_all — preflight disabled (v4.34) ----
 
 /// v4.34 fix for PROD_READY row 1.11: disable the v4.30 dispatch-time

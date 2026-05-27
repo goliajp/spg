@@ -398,6 +398,42 @@ fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
     );
 }
 
+// ---- 1.8 v4.37 CRC32 envelope ----
+
+/// 1.8 WAL/snapshot/backup checksum — every storage envelope now
+/// carries a CRC32 and rejects on mismatch. Evidence: the v4.37
+/// bit-flip chaos test plus the format-version constants in
+/// engine + server source.
+#[test]
+fn row_1_8_storage_crc32_present_and_chaos_tested() {
+    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let chaos_src = std::fs::read_to_string(&chaos_path)
+        .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", chaos_path.display()));
+    assert!(
+        chaos_src.contains("fn chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay"),
+        "e2e_chaos.rs must contain the v4.37 bit-flip CRC32 test"
+    );
+    let engine_src = std::fs::read_to_string(workspace_root().join("crates/spg-engine/src/lib.rs"))
+        .expect("spg-engine lib.rs");
+    assert!(
+        engine_src.contains("ENVELOPE_VERSION_V2") && engine_src.contains("spg_crypto::crc32"),
+        "engine envelope must carry a v2 CRC32 trailer"
+    );
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("WAL_V2_SENTINEL") && main_src.contains("encode_wal_record"),
+        "main.rs must encode v2 WAL records with CRC32"
+    );
+    let backup_src =
+        std::fs::read_to_string(workspace_root().join("crates/spg-server/src/backup.rs"))
+            .expect("backup.rs");
+    assert!(
+        backup_src.contains("MAGIC_V2") && backup_src.contains("SPGBKUP\\x02"),
+        "backup bundle writer must emit SPGBKUP\\x02 with CRC32"
+    );
+}
+
 // ---- 2.9 / 4.7 v4.36 replication chaos + lag metric ----
 
 /// 2.9 Network partition tolerance — netsplit chaos test forces a
