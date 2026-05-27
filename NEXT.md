@@ -149,30 +149,124 @@ this explicitly, same precedent as v2's break of v1 readers).
 
 ---
 
-## v4.42 — Engine MVCC + group commit at dispatch
+## v4.41.1 — Engine MVCC mechanical refactor (shipped 2026-05-28 @ `2290265`)
 
-**The hard part of the throughput unlock.** v4.34 made the engine
-`RwLock<Engine>` write guard hold across `BEGIN → execute → WAL →
-COMMIT/ROLLBACK` because at that time `Engine::tx_catalog: Option<Catalog>`
-was a single global slot and `Catalog::clone()` was expensive — there
-was no way to let two implicit TXs be in flight without each one
-seeing the other's mutation. v4.40 (PV + PBTreeMap) makes
-`Catalog::clone()` O(1) at any scale, which removes the cost half
-of that reasoning. v4.42 removes the structural half: the engine
-gets N in-flight TX slots, dispatch lets N writers prepare in
-parallel, and one fsync covers the whole batch.
+Slot-shape change in `spg-engine` to make v4.42's group-commit
+work cheap: `Engine::tx_catalog: Option<Catalog>` →
+`tx_catalogs: BTreeMap<TxId, TxState>` + `current_tx: Option<TxId>`,
+per-TX savepoint stacks moved into `TxState`. New pub API
+`Engine::alloc_tx_id() -> TxId` + `Engine::execute_in(sql, tx_id)`.
+spg-server dispatch's wrap path now allocates a fresh `TxId` per
+implicit BEGIN..stmt..COMMIT. Runtime behavior unchanged
+(`engine.write()` still held across the whole wrap, map carries
+at most one entry at runtime). Workspace test green; no behavior
+regression.
+
+This is the **API-shape half** of v4.42's plan, landed early as
+its own commit so v4.42 doesn't have to refactor + reshape +
+correct concurrently. v4.42 below now starts from this state.
+
+---
+
+## v4.42 — Group commit at the commit barrier (fsync coalescing)
+
+**Throughput unlock for multi-client.** With v4.41.1 the engine
+has the multi-slot interface ready, but the engine `RwLock` is
+still held across the entire wrap (one writer at a time, fsync
+inside the critical section). v4.42 introduces a commit-barrier
+queue so N concurrent writers share a single `fsync` — the
+classic group-commit pattern PostgreSQL implements via
+`commit_delay`.
+
+### Why this is "group commit" not "full MVCC"
+
+Two designs were on the table:
+
+- **Choice A — full MVCC with OCC retry**: writers prepare in
+  parallel under `engine.read()`, each in their own `TxId` slot.
+  Install phase serializes on `engine.write()`; if the install
+  re-apply detects a conflict (PK violation accumulated from a
+  concurrently-committed TX), the writer's TX rolls back. True
+  parallel-prepare.
+- **Choice B — validate-only group commit**: a single elected
+  leader takes `engine.write()`, drains the commit queue, runs
+  each SQL in its own `TxId` slot under the *same* critical
+  section (sequential validate). Then releases the lock, batches
+  the WAL bytes, single `write_all` + single `fsync` for the
+  whole group. Re-acquires the lock, installs each queued TX
+  (or rolls back if fsync failed). No retry — validation was
+  sequential against the same snapshot, no conflicts can appear
+  between validate and install. (PG uses this shape.)
+
+v4.42 picks **Choice B**. Reasoning: simpler (no OCC retry
+machinery), correct by construction, and matches the bench
+workload (4-8 concurrent clients streaming auto-commit INSERTs).
+The multi-slot v4.41.1 interface is used as a transient
+prepare-slot scratch space inside the leader's critical section
+— v4.41.1 still pays off, just not via parallel-prepare. Choice
+A is back on the table when SELECT-under-explicit-TX-with-
+parallel-readers becomes a goal (v5+ territory).
+
+### What this does NOT unlock
+
+Single-client throughput is bounded by per-INSERT fsync latency
+on the storage layer (APFS ~15 µs/fsync today → ~66 K r/s
+ceiling). Group commit needs *multiple* writers to coalesce; one
+client can't coalesce with itself. So **the 200 K single-client
+gate from earlier NEXT.md drafts is structurally out of reach
+for v4.42** — that path needs either async-commit (client
+doesn't wait for fsync, weakens durability semantics) or
+client-side batching (multi-row VALUES per INSERT, not the
+shape of the sweep bench). Both are v4.43+ territory. v4.42's
+honest gate is multi-client only.
 
 | # | item | est. | rows fixed |
 |---|------|------|------------|
-| 1 | **`Engine::tx_catalog: BTreeMap<TxId, Catalog>`** — replace the `Option<Catalog>` slot. `Engine::execute(sql, tx_id)` threads a per-connection `TxId`. `BEGIN` → allocate `TxId`, clone catalog into the map (O(1) by v4.40); `COMMIT` → install map entry over catalog; `ROLLBACK` → drop map entry. Implicit auto-commits get a one-shot `TxId`. | 2 d | structural |
-| 2 | **Dispatch — split engine.write() critical section** — engine `RwLock` guard wraps only the install phase. Writers prepare in parallel under `engine.read()`: each pulls its catalog clone into a `TxId`, runs `engine.execute(sql, tx_id)`, encodes the v3 WAL record. Then they queue on a `commit_seq` channel; the leader drains the queue, single `write_all` + single `fsync` covers the batch, then each entry's install runs under one short `engine.write()`. | 1.5 d | throughput 10.4 |
-| 3 | **Group fsync failure fan-out** — `tests/e2e_chaos.rs` gains a multi-client variant of `chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state`: when the leader's `fsync` errors, every queued writer's `TxId` rolls back. No phantom rows survive. | 0.75 d | 1.11 multi-client |
-| 4 | **Sweep + multi-connection variant** — extend `xbench/competitor/src/bin/sweep.rs` (or new `concurrent_sweep.rs`) to drive 4 / 8 client concurrent INSERT @ 1M against all backends. Gate: spg-server ≥ MySQL × 1.5 at 4 clients; single-client @ 1M ≥ 200K r/s (this is where the 200K gate actually becomes structurally reachable); @ 10M ≥ 80K. PERFORMANCE.md "after v4.42". | 0.5 d | PERFORMANCE.md |
+| 1 | **Commit queue + leader election** — `state.commit_queue: Mutex<VecDeque<CommitTask>>` + `Condvar`. Each dispatch write task pushes its `(sql, ack_channel)` and waits for ack. First task into the queue acquires the leader role; competitors block on the condvar. The leader collects up to `SPG_COMMIT_GROUP_MAX` items (default 16) or waits `SPG_COMMIT_DELAY_US` (default 0 — coalesces only what's already queued). | 1 d | new infra |
+| 2 | **Leader drains under engine.write()** — leader takes `engine.write()`, then for each queued task: `alloc_tx_id`, `execute_in("BEGIN", t)`, `execute_in(sql, t)`. Failed tasks (parse error, type mismatch, etc.) ack with err + `execute_in("ROLLBACK", t)`. WAL bytes for surviving tasks concatenated into one batch. Engine lock released. | 0.75 d | dispatch refactor |
+| 3 | **Batched fsync barrier** — leader writes the concatenated WAL batch (one `write_all`) and fsyncs once. On success, re-acquires `engine.write()` and `execute_in("COMMIT", t)` for each survivor; on failure, `execute_in("ROLLBACK", t)` for each and ack with err. ENOSPC fan-out: all in-batch TXs roll back together — same chaos invariant the v4.34 single-TX wrap pins. | 0.5 d | 1.11 multi-client |
+| 4 | **Chaos coverage extension** — `tests/e2e_chaos.rs` adds `chaos_disk_full_multi_client_group_rollback_all_writers`: 4 client threads issue INSERTs concurrently under `SPG_FAIL_WAL_QUOTA_BYTES`; leader's fsync fails; every client gets the error and no phantom rows survive across restart. Same pattern as the existing single-writer v4.34 test. | 0.5 d | extends 1.11 |
+| 5 | **slo_smoke multi-client gate** — `slo_smoke_wal_insert_multi_client_p99_under_budget` (4 client / 8 client variants, p99 ≤ 5 ms ceiling) + `slo_wal_insert_4client_throughput_above_mysql` (4-client throughput ≥ MySQL × 1.5 at 1M rows). | 0.25 d | new SLO gates |
+| 6 | **Sweep + concurrent variant** — extend `xbench/competitor/src/bin/sweep.rs` (or new `concurrent_sweep.rs`) with 4/8-client concurrent-INSERT @ 1M across all backends. PERFORMANCE.md "after v4.42" with multi-client table. | 0.5 d | PERFORMANCE.md |
 
-Dependencies: v4.41 (v3 framing is the substrate batching writes into).
-Risk: high — engine MVCC touches `execute()` dispatch + the
-implicit-TX path the chaos tests pin. Reuse the v4.37 bit-flip
-chaos infra for fsync failures.
+Dependencies: v4.41.1 (multi-slot interface in place).
+Risk: medium — leader-election + condvar coordination is tricky
+(deadlock + starvation watchpoints); fsync fan-out for ENOSPC
+must keep v4.34's `chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state`
+invariant; single-client p99 must not regress (group of 1 = same
+shape as v4.41.1, no queue-wait latency tax).
+
+### Watchpoints for v4.42
+
+- **Group of 1 = no regression**: when the queue has one item the
+  leader proceeds immediately; group-of-1 latency must match
+  v4.41.1.
+- **Leader fairness**: condvar wake order must not starve any one
+  client (FIFO via `VecDeque`, not LIFO).
+- **`engine.write()` lock acquired twice per group** — once for
+  prepare, once for install — both under the leader. Other
+  groups blocked on `state.commit_queue` lock so no two groups
+  fight for `engine.write()`.
+
+---
+
+## v4.43+ — Async-commit / pipelined commits (single-client unlock)
+
+Out-of-scope sketch for the single-client throughput path that
+v4.42 doesn't address. Two approaches both pure-Rust + 0 deps:
+
+- **`synchronous_commit = off` mode**: client gets CC back as
+  soon as the WAL record is encoded (not after fsync). A
+  background flusher fsyncs every N µs or N records. Durability
+  semantics weaken (window of CC'd-but-not-durable writes). Same
+  trade-off PG offers.
+- **Pipelined wire**: client can issue INSERTs without waiting
+  for CC; server batches multiple INSERTs from same connection
+  into one fsync; sends back batched CCs. Stronger durability
+  than async-commit but needs wire-protocol extension.
+
+Neither is on v4.42's path. Pick after v4.42 lands and the multi-
+client gate is concrete.
 
 ---
 
@@ -218,9 +312,11 @@ Bench gate is mandatory at this step.
 | v4.39   | Catalog/Table internals on PV                   |       2.5 |
 | v4.40   | PersistentBTreeMap + Table::indices migration   |       3.25|
 | v4.41   | WAL v3 framing + auto-commit wrap merge         |       1.75|
-| v4.42   | Engine MVCC + group commit at dispatch          |       4.75|
+| v4.41.1 | Engine MVCC mechanical refactor (TxId map)      |       0.5 |
+| v4.42   | Group commit at commit barrier                  |       3.5 |
+| v4.43+  | Async-commit / pipelined commits                |       ?   |
 | v5.0.0  | HNSW persistent + allocator + OOM               |      10.0 |
-| **total** |                                               |    **24.25 d** |
+| **total** |                                               |    **23.5 d** (+ v4.43 TBD) |
 
 ---
 
@@ -235,8 +331,10 @@ and diagnose; do not soften the gate.
 | v4.38 | n/a (no Catalog touch) | n/a | n/a | unchanged | 100% |
 | v4.39 | ≥ 100K no-index (slo_smoke); ≥ 15K with-index (sweep) | bail @ 1M with-index | indices unchanged | wrap clone O(1) for no-index | 100% |
 | v4.40 | ≥ 50K with-index | no bail | ≥ 65K | within 2× of PG | 100% |
-| v4.41 | honest measurement (see PERFORMANCE.md "after v4.41") | honest measurement | honest measurement | header overhead 35→9 bytes/write | 100% |
-| v4.42 | ≥ 200K (single client); ≥ MySQL × 1.5 (4 clients) | ≥ 80K | ≥ 100K | > PG (146K) | 100% |
+| v4.41 | 77K (single client) | 59K (no RSS bail) | indices held | 59% of PG; latency p99 25× ahead | 100% |
+| v4.41.1 | unchanged (mechanical refactor, behavior-equiv) | unchanged | unchanged | unchanged | 100% |
+| v4.42 | unchanged single-client (fsync-bound); **4-client ≥ MySQL × 1.5** | 4-client ≥ 80K | ≥ 100K | multi-client beats MySQL | 100% |
+| v4.43+ | ≥ 200K single client (async-commit) | ≥ 80K | ≥ 100K | > PG (146K) single client | 100% |
 | v5.0 | ≥ 200K incl. vector tables | ≥ 80K incl. vector | ≥ 100K | > PG/MySQL/MariaDB | 100% |
 
 ### v4.39 ship reality (correction to earlier projection)
@@ -251,7 +349,10 @@ sweep @ 1M = **15K r/s** (1.6× over 9.4K baseline). Index-free
 (12×), proving the wrap-side fix is correct. v4.40 (indices to
 `PersistentBTreeMap`) is required to take sweep all the way to
 the ≥ 50K floor. v4.41 (v3 framing + auto-commit wrap merge)
-trims per-write header overhead from 35 to 9 bytes; v4.42
-(engine MVCC + group commit) is where the ≥ 200K gate
-becomes structurally reachable. See PERFORMANCE.md "v4.39
-scale sweep" section for the full diff.
+trims per-write header overhead from 35 to 9 bytes (66K → 77K
+@ 1M; +16%). v4.41.1 lands the engine MVCC slot interface
+without behavior change. v4.42 (group commit at commit barrier)
+unlocks 4-8 client concurrent throughput; **the single-client
+≥ 200K gate is fsync-bound and requires v4.43+ async-commit**.
+See PERFORMANCE.md "v4.41 scale sweep" section for the full
+trajectory.
