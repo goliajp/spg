@@ -750,6 +750,123 @@ E2E (tests/e2e_pgbouncer_compat.rs, 4 cases):
 - reset_all_returns_cc
 - set_transaction_isolation_returns_cc
 
+## v4.37 competitor rerun (2026-05-27, post-ops-sprint)
+
+End-to-end re-baseline after the v4.33–v4.37 sprint (graceful
+shutdown + slow-query log + disk water-mark + ENOSPC rollback +
+per-table metrics + replication lag + WAL/snapshot/backup CRC32).
+Stack unchanged: `xbench/competitor/docker-compose.yml` →
+PG18 + MySQL9 + MariaDB11 on loopback. Numbers are warm — the
+containers have been up for ~24h, so PG/MySQL/MariaDB are
+comparatively much hotter than they were in the v4.27 rerun.
+
+### latency p50 / p95 / p99 (µs)
+
+`xbench/competitor/src/bin/latency.rs` — 2000 iters per cell,
+200-iter warm-up, 1000-row seed for the SELECT path.
+
+| backend       |  ins p50 | ins p95 | ins p99 | sel p50 | sel p95 | sel p99 |
+|---------------|---------:|--------:|--------:|--------:|--------:|--------:|
+| spg-embedded  |      0.5 |     0.5 |     1.4 |     0.8 |     0.8 |     1.0 |
+| spg-server    |     15.2 |    22.2 |    29.5 |    15.9 |    23.6 |    32.0 |
+| postgres      |    968.9 |  2036.0 |  2488.0 |  1028.4 |  2081.6 |  2634.6 |
+| mysql         |   1256.9 |  2637.5 |  3170.2 |   835.2 |  1742.4 |  2274.5 |
+| mariadb       |    881.8 |  1686.6 |  2176.8 |   879.1 |  2105.5 |  5810.9 |
+
+vs v4.27: SPG-server p99 INSERT 69.5 → 29.5 µs (-58 %; the v4.34
+auto-commit BEGIN..COMMIT wrap was the structural concern and
+clearly didn't cost p99). SPG-server p99 SELECT 76.8 → 32.0 µs
+(-58 %). SLO ceiling stays 500 µs — ~16× headroom now (was ~7×).
+PG / MySQL p99 dropped by ~7× compared to v4.27 (warmer
+containers — same host config, just 24h vs cold boot).
+
+### bulk throughput (10K rows / full scan)
+
+`xbench/competitor/src/bin/throughput.rs` — 100-row multi-VALUES
+INSERTs to insert 10K rows, then a single full SELECT scan.
+
+| backend       | INSERT rows/s | SCAN rows/s |
+|---------------|--------------:|------------:|
+| spg-embedded  |     2,559,973 |   9,521,162 |
+| spg-server    |     2,040,469 |   7,996,271 |
+| postgres      |        91,127 |   3,496,096 |
+| mysql         |        41,830 |   2,976,596 |
+| mariadb       |        62,893 |   3,241,841 |
+
+vs v4.27: SPG-embedded INSERT 1.56 M → 2.56 M r/s (+64 %),
+SPG-server INSERT 1.47 M → 2.04 M r/s (+39 %). Scan throughput
++18 % (embedded) / +30 % (server). The v4.34 wrap path
+(BEGIN..COMMIT around every auto-commit write, with batched
+fsync) didn't slow bulk INSERT — the gain comes from the
+batched-fsync atomic block being one syscall per multi-VALUES
+INSERT statement rather than three.
+
+### vector kNN top-10 over 10K dim-128
+
+`xbench/competitor/src/bin/vector_knn.rs` — HNSW build + 500
+measured queries per backend.
+
+| backend             | build s | q p50 µs | q p95 µs | q p99 µs |
+|---------------------|--------:|---------:|---------:|---------:|
+| spg-embedded        |    0.52 |     25.9 |     33.8 |     41.1 |
+| spg-server          |    0.73 |     77.0 |    113.2 |    133.8 |
+| postgres+pgvector   |    1.84 |   1490.2 |   2285.7 |   2870.2 |
+
+vs v4.27: spg-embedded build 1.44 s → 0.52 s (-64 %), p50 39.5 →
+25.9 µs (-34 %). spg-server p99 361.4 → 133.8 µs (-63 %). pgvector
+in the warm container measures p50 = 1490 µs (was 3402 µs cold).
+SPG vs pgvector ratio: ~57× faster on p50 (was 86× cold).
+
+### read concurrency (SPG-only)
+
+`xbench/competitor/src/bin/concurrent.rs` — 8 reader threads ×
+10 s, each running its own TCP connection + indexed PK lookup
+on a 10K-row table. Goal: confirm the v4.0 `RwLock` read/write
+split scales linearly.
+
+| metric                       |        value |
+|------------------------------|-------------:|
+| total ops                    |    1,650,310 |
+| aggregate throughput         |  164,948 r/s |
+| mean per-thread throughput   |   20,619 r/s |
+| min/max per-thread ops       | 205914/206597|
+| per-thread spread            |         0.3 % |
+
+Spread 0.3 % across 8 threads = effectively linear scaling. No
+competitor row in this table because PG / MySQL / MariaDB use
+their own connection pools + thread-per-connection — the
+comparable PG/MySQL numbers live in §"Concurrency (v4.0)" above.
+
+### Conformance — 4-corpus sqllogictest
+
+`cargo run -q -p sqllogictest --release` regenerates
+`xtests/sqllogictest/report.md`:
+
+| corpus       | pass | fail | skip | % pass |
+|--------------|-----:|-----:|-----:|-------:|
+| `duckdb`     |  148 |    0 |    0 | 100.0 % |
+| `mysql`      |   17 |    0 |    0 | 100.0 % |
+| `pg_regress` |  144 |    0 |    0 | 100.0 % |
+| `pgvector`   |   63 |    0 |    0 | 100.0 % |
+
+Unchanged from prior baseline. v4.33 (ops three-pack), v4.34
+(rollback wrap), v4.35 (per-table metrics), v4.36 (lag metric +
+replication protocol v2), v4.37 (CRC32 envelopes) all added
+behavior without changing the SQL surface, and the
+4-corpus rerun confirms zero regression.
+
+### Verdict
+
+Five v4.x checkpoints landed since v4.27. The latency / throughput
+/ vector hot paths got **faster** across the board (p99 INSERT
+-58 %, bulk INSERT +39 %, kNN build -64 %), so v4.34's
+implicit BEGIN..COMMIT wrap and v4.37's CRC32 envelopes carry no
+visible cost at the bench scale. SLO headroom is now 16× on
+SEL/INS p99 and 7× on ANN p99 — room to absorb future hot-path
+work without re-tightening the contract.
+
+---
+
 ## v4.27 competitor rerun (2026-05-27, sanity)
 
 Re-ran the v3.3.4 baseline harness against the current binary
