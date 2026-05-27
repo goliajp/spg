@@ -398,6 +398,56 @@ fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
     );
 }
 
+// ---- 2.9 / 4.7 v4.36 replication chaos + lag metric ----
+
+/// 2.9 Network partition tolerance — netsplit chaos test forces a
+/// disconnect mid-stream, then heals; follower must converge with
+/// no duplicates and no gaps.
+#[test]
+fn row_2_9_netsplit_chaos_covered_by_e2e() {
+    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos_netsplit.rs");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|_| panic!("e2e_chaos_netsplit.rs missing at {}", p.display()));
+    assert!(
+        src.contains("fn netsplit_disconnect_then_heal_resyncs_without_loss_or_dup"),
+        "e2e_chaos_netsplit.rs must contain the netsplit chaos test"
+    );
+}
+
+/// 4.7 Replication lag metric — follower exposes
+/// `spg_replication_lag_bytes` and `spg_replication_lag_seconds`
+/// via /metrics, driven by the v4.36 status-frame protocol
+/// extension.
+#[test]
+fn row_4_7_replication_lag_metric_covered_by_e2e() {
+    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos_netsplit.rs");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|_| panic!("e2e_chaos_netsplit.rs missing at {}", p.display()));
+    assert!(
+        src.contains("fn follower_metrics_expose_replication_lag_after_status_frame"),
+        "e2e_chaos_netsplit.rs must contain the v4.36 lag-metric test"
+    );
+    let repl_src =
+        std::fs::read_to_string(workspace_root().join("crates/spg-server/src/replication.rs"))
+            .expect("replication.rs");
+    assert!(
+        repl_src.contains("SPGREPL\\x02") || repl_src.contains("MAGIC_V2"),
+        "replication.rs must declare the v2 magic for the status-frame protocol"
+    );
+    assert!(
+        repl_src.contains("FRAME_TYPE_STATUS"),
+        "replication.rs must define the status frame type"
+    );
+    let obs_src =
+        std::fs::read_to_string(workspace_root().join("crates/spg-server/src/observability.rs"))
+            .expect("observability.rs");
+    assert!(
+        obs_src.contains("spg_replication_lag_bytes")
+            && obs_src.contains("spg_replication_lag_seconds"),
+        "observability.rs must emit both lag series"
+    );
+}
+
 // ---- 4.6 v4.35 per-table metrics ----
 
 /// 4.6 Per-table row count / size metrics — `spg_table_rows` and

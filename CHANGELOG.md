@@ -10,6 +10,61 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.36.0] — 2026-05-27 (replication netsplit chaos + lag metric — `SPGREPL\x02`)
+
+### Wire protocol — new minor version `SPGREPL\x02` (backwards-compat)
+
+The master now speaks two negotiable replication wire versions on
+`SPG_REPL_ADDR`; the follower picks via the handshake magic byte:
+
+- `SPGREPL\x01` (v4.24) — raw WAL byte stream. Unchanged.
+- `SPGREPL\x02` (v4.36) — **framed** stream: `[u8 type][u32 LE
+  len][payload]`. Type `0x00` = WAL chunk (payload bytes feed the
+  follower's record accumulator just like v1). Type `0x01` =
+  status frame, payload `[u64 LE primary_wal_pos][u64 LE
+  wall_time_us]`.
+
+New followers always send the v2 magic; old `\x01` followers
+keep working with old behavior. STABILITY.md §"Replication
+protocol" pins both versions.
+
+### Added
+- **Status-frame protocol extension** in `crates/spg-server/src/
+  replication.rs`: master emits a status frame at least every
+  50 ms whether or not there's WAL activity. Follower parses it,
+  stores into `LagState` (three atomics on the new
+  `ServerState::lag_state` field).
+- **Replication lag series** in `/metrics`:
+  `spg_replication_lag_bytes` (primary_pos − follower_applied_pos)
+  + `spg_replication_lag_seconds` (now − master's wall time).
+  Omitted on the primary and on a v1 follower (no status frame
+  seen) so Prometheus doesn't reify a misleading zero.
+- **Netsplit chaos test** in `tests/e2e_chaos_netsplit.rs`:
+  - In-test TCP proxy (stdlib only — `TcpListener` + `TcpStream`)
+    that supports a kill-switch flipped from the test thread.
+  - `netsplit_disconnect_then_heal_resyncs_without_loss_or_dup`
+    spins up primary + follower behind the proxy, cuts the proxy
+    mid-write, lets the master keep writing, restores the proxy.
+    Asserts row count *and* row sum match exactly — no dup, no
+    gap. Closes PROD_READY row 2.9.
+  - `follower_metrics_expose_replication_lag_after_status_frame`
+    confirms both lag series land on the follower's `/metrics`.
+    Closes PROD_READY row 4.7.
+- `prod_ready.rs::row_2_9_*` and `row_4_7_*` machine rows.
+
+### Changed
+- STABILITY.md §"Frozen surfaces" gains a "Replication protocol"
+  section pinning both v1 and v2 wire layouts plus the forward-
+  compat rule (followers MUST tolerate unknown frame types and
+  unknown payload sizes on known types).
+- PROD_READY.md audit snapshot: 73 → 75 ✅ / 5 → 4 ⚠️ / 1 → 0 ❌;
+  [machine] rows 35 → 37.
+
+### Test verification
+  cargo test --release --workspace                              # all green
+  cargo clippy --workspace --all-targets -- -D warnings         # 0 warnings
+  cargo fmt --all -- --check                                    # clean
+
 ## [4.35.0] — 2026-05-27 (per-table metrics — `spg_table_rows` / `spg_table_bytes` + cardinality cap)
 
 ### Added
