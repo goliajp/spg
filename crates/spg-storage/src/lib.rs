@@ -19,6 +19,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use self::persistent::PersistentVec;
+
 /// Runtime type tags. `Vector(dim)` / `Varchar(max)` / `Char(size)` are
 /// parameterised; the parameter travels with both the column schema and
 /// the on-wire serialised representation.
@@ -386,19 +388,23 @@ impl Index {
     }
 }
 
-/// In-memory table: schema + a flat row vector + secondary indices.
+/// In-memory table: schema + a persistent row vector + secondary indices.
+///
+/// v4.39: `rows` is a [`PersistentVec`] (Bitmapped Vector Trie, 32-way) so
+/// `Table::clone()` is `O(1)` — the whole reason for v4.39's existence is
+/// to make `Catalog::clone()` cheap inside the v4.34 auto-commit wrap.
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
-    rows: Vec<Row>,
+    rows: PersistentVec<Row>,
     indices: Vec<Index>,
 }
 
 impl Table {
-    pub const fn new(schema: TableSchema) -> Self {
+    pub fn new(schema: TableSchema) -> Self {
         Self {
             schema,
-            rows: Vec::new(),
+            rows: PersistentVec::new(),
             indices: Vec::new(),
         }
     }
@@ -407,11 +413,14 @@ impl Table {
         &self.schema
     }
 
-    pub fn rows(&self) -> &[Row] {
+    /// v4.39: returns the persistent row vector by reference. Callers that
+    /// used to take `&[Row]` should switch to `.iter()` (via
+    /// `IntoIterator for &PersistentVec`) or `.get(i)` for indexing.
+    pub const fn rows(&self) -> &PersistentVec<Row> {
         &self.rows
     }
 
-    pub fn row_count(&self) -> usize {
+    pub const fn row_count(&self) -> usize {
         self.rows.len()
     }
 
@@ -526,7 +535,7 @@ impl Table {
                 map.entry(key).or_default().push(new_row_idx);
             }
         }
-        self.rows.push(row);
+        self.rows = self.rows.push(row);
         // NSW updates after the push so the new row is visible to the
         // greedy search used during connect.
         let new_row_idx = self.rows.len() - 1;
@@ -607,7 +616,9 @@ impl Table {
         if positions.is_empty() {
             return 0;
         }
-        // Mark positions; sweep + retain in one pass keeps cost O(n).
+        // Mark positions; v4.39: PV has no in-place retain, so we rebuild
+        // a fresh PV by pushing the survivors. Still O(n log₃₂ n); the
+        // structural-sharing win shows up at `Catalog::clone()`, not here.
         let mut to_remove = alloc::vec![false; self.rows.len()];
         let mut removed = 0;
         for &p in positions {
@@ -616,12 +627,13 @@ impl Table {
                 removed += 1;
             }
         }
-        let mut i = 0;
-        self.rows.retain(|_| {
-            let keep = !to_remove[i];
-            i += 1;
-            keep
-        });
+        let mut new_rows: PersistentVec<Row> = PersistentVec::new();
+        for (i, row) in self.rows.iter().enumerate() {
+            if !to_remove[i] {
+                new_rows = new_rows.push(row.clone());
+            }
+        }
+        self.rows = new_rows;
         self.rebuild_indices();
         removed
     }
@@ -685,7 +697,10 @@ impl Table {
                 });
             }
         }
-        self.rows[position] = Row::new(new_values);
+        self.rows = self
+            .rows
+            .set(position, Row::new(new_values))
+            .expect("position bounds-checked above");
         self.rebuild_indices();
         Ok(())
     }
@@ -1755,7 +1770,8 @@ fn deserialize_rows(
     n_cols: usize,
 ) -> Result<(), StorageError> {
     let row_count = cur.read_u32()? as usize;
-    t.rows.reserve(row_count);
+    // v4.39: PV has no `reserve` (the BVT doesn't preallocate a contiguous
+    // buffer); we just push directly and let the trie grow.
     let bitmap_bytes = n_cols.div_ceil(8);
     let col_types: Vec<DataType> = t.schema.columns.iter().map(|c| c.ty).collect();
     let mut bitmap_buf = [0u8; 32];
@@ -1775,7 +1791,7 @@ fn deserialize_rows(
                 values.push(cur.read_value_body(col_types[col_idx])?);
             }
         }
-        t.rows.push(Row { values });
+        t.rows = t.rows.push(Row { values });
     }
     Ok(())
 }
