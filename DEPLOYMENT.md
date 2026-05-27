@@ -62,6 +62,8 @@ modifies anything outside the three explicit paths.
 | `SPG_SHUTDOWN_DEADLINE_SEC`   | v4.33: SIGTERM/SIGINT drain budget before `exit(0)`  | `30`          |
 | `SPG_SLOW_QUERY_LOG_MS`       | v4.33: log queries slower than N ms (one JSON line/stderr) | unset    |
 | `SPG_WAL_MIN_FREE_BYTES`      | v4.33: refuse WAL append when volume free space < N bytes | unset      |
+| `SPG_METRICS_TABLE_TOPN`      | v4.35: cap of per-table /metrics series (top-N by row count) | `50`       |
+| `SPG_METRICS_TABLE_ALLOWLIST` | v4.35: exact comma-separated table allowlist for /metrics  | unset      |
 
 ## Recommended host setup
 

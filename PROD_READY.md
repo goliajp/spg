@@ -18,8 +18,8 @@ Status legend:
 - ❌ — not done; on the roadmap
 - 🚫 — intentional out-of-scope (linked to memory or rationale)
 
-Last refresh: **v4.34 ENOSPC in-memory rollback** (2026-05-27,
-commit hash filled at commit time).
+Last refresh: **v4.35 per-table metrics** (2026-05-27, commit
+hash filled at commit time).
 
 ---
 
@@ -93,7 +93,7 @@ seconds, and you have enough signal to diagnose.
 | 4.3 | Structured logging | `SPG_LOG_FORMAT=json` switches stderr to single-line JSON per event | ✅ | v4.13.0 |
 | 4.4 | EXPLAIN / EXPLAIN ANALYZE | Operator can inspect plan + actual rows for any query | ✅ | v4.26.0, `tests/e2e_explain.rs` |
 | 4.5 | Slow-query log [machine] | Queries exceeding threshold logged with SQL + elapsed | ✅ | v4.33, `SPG_SLOW_QUERY_LOG_MS`; one JSON line per slow query on stderr (`sql`/`elapsed_us`/`role`/`threshold_us`); e2e: `tests/e2e_slow_query_log.rs::slow_query_log_fires_above_threshold_and_silent_below` |
-| 4.6 | Per-table row count / size metrics | `spg_table_rows{table=…}` series exposed via /metrics | ❌ | Deferred — cardinality matters at scale; needs an allowlist mechanism. v5 candidate. |
+| 4.6 | Per-table row count / size metrics [machine] | `spg_table_rows{table=…}` series exposed via /metrics | ✅ | v4.35, `spg_table_rows{table=…}` + `spg_table_bytes{table=…}` in `crates/spg-server/src/observability.rs`. Cardinality cap via `SPG_METRICS_TABLE_TOPN` (default 50) or exact `SPG_METRICS_TABLE_ALLOWLIST=t1,t2`. e2e: `tests/e2e_table_metrics.rs` (default top-N, allowlist filter, cardinality cap). |
 | 4.7 | Replication lag metric | Lag in bytes / seconds exposed via /metrics on the follower | ❌ | Deferred — follower currently has no notion of "primary's latest offset" beyond what it's applied. Needs protocol extension to query. v5 candidate. |
 | 4.8 | OpenTelemetry tracing | — | 🚫 | not in scope for v4.x — single-process tracing is what logs already provide |
 
@@ -220,20 +220,20 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.34 (2026-05-27).
+Last machine run: v4.35 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 72
+  ✅ pass             : 73
   ⚠️ partial          : 5
-  ❌ open             : 2
+  ❌ open             : 1
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 34
+[machine] rows scaffolded in prod_ready.rs : 35
   row_1_3, row_1_9, row_1_10, row_1_11,
   row_2_5, row_2_6, row_2_7,
   row_3_7, row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
-  row_4_1, row_4_2, row_4_5,
+  row_4_1, row_4_2, row_4_5, row_4_6,
   row_5_1, row_5_7,
   row_6_3,
   row_7_2, row_7_3, row_7_4, row_7_5, row_7_6,
@@ -242,19 +242,16 @@ Total rows in checklist : 85
   row_10_x, row_10_4, row_10_5
 ```
 
-v4.34 closed PROD_READY row 1.11 — the last data-correctness gap
-that survived v4.33's ops three-pack. An implicit BEGIN..COMMIT
-wraps every auto-commit write when WAL is on; the [BEGIN, sql,
-COMMIT] block hits the WAL with one atomic `write_all` + `fsync`,
-and a failure rolls the engine back via the existing TX machinery.
-Replay sees the unfinished implicit TX as "BEGIN with no COMMIT"
-and auto-rollbacks per v1's existing logic. Real ENOSPC mid-
-`write_all` is now indistinguishable from a clean refusal.
+v4.35 closes PROD_READY row 4.6. `spg_table_rows{table=…}` +
+`spg_table_bytes{table=…}` are now exposed via `/metrics`.
+Cardinality is bounded by `SPG_METRICS_TABLE_TOPN` (default 50 —
+silently truncates to the largest tables by row count) or, when
+operators want explicit control, `SPG_METRICS_TABLE_ALLOWLIST=
+t1,t2,...` (exact list).
 
-The 2 remaining ❌ items are observability nice-to-haves slotted
-into v4.35 / v4.36 by NEXT.md:
+The 1 remaining ❌ item is the replication observability gap
+slotted into v4.36 by NEXT.md:
 
-- 4.6 per-table row count metric: cardinality allowlist (v4.35)
 - 4.7 replication lag metric: needs follower → primary RPC (v4.36)
 
 The 5 ⚠️ items are all "works today within documented limits;

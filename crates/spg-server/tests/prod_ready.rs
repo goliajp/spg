@@ -398,6 +398,45 @@ fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
     );
 }
 
+// ---- 4.6 v4.35 per-table metrics ----
+
+/// 4.6 Per-table row count / size metrics — `spg_table_rows` and
+/// `spg_table_bytes` exposed via /metrics. Cardinality bounded by
+/// `SPG_METRICS_TABLE_TOPN` (default 50) or, when set,
+/// `SPG_METRICS_TABLE_ALLOWLIST`. Evidence: the v4.35 e2e suite
+/// plus the observability source declaring both series.
+#[test]
+fn row_4_6_per_table_metrics_covered_by_e2e() {
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e_table_metrics.rs");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|_| panic!("e2e_table_metrics.rs missing at {}", test_path.display()));
+    for needle in [
+        "fn table_metrics_default_top_n_emits_rows_and_bytes_per_table",
+        "fn table_metrics_allowlist_filters_and_orders",
+        "fn table_metrics_topn_caps_cardinality_under_load",
+    ] {
+        assert!(
+            src.contains(needle),
+            "e2e_table_metrics.rs must contain the named v4.35 test: {needle}"
+        );
+    }
+    let obs_src =
+        std::fs::read_to_string(workspace_root().join("crates/spg-server/src/observability.rs"))
+            .expect("observability.rs");
+    assert!(
+        obs_src.contains("spg_table_rows{table=\"") && obs_src.contains("spg_table_bytes{table=\""),
+        "observability.rs must emit both spg_table_rows and spg_table_bytes series"
+    );
+    assert!(
+        obs_src.contains("SPG_METRICS_TABLE_ALLOWLIST"),
+        "observability.rs must parse SPG_METRICS_TABLE_ALLOWLIST"
+    );
+    assert!(
+        obs_src.contains("SPG_METRICS_TABLE_TOPN"),
+        "observability.rs must parse SPG_METRICS_TABLE_TOPN"
+    );
+}
+
 // ---- 1.11 v4.34 in-memory consistency on WAL refusal ----
 
 /// 1.11 In-memory consistency on WAL refusal — auto-commit
