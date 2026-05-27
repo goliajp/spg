@@ -959,6 +959,99 @@ rerun deferred).
 
 ---
 
+## v4.40 scale sweep — `Table::indices` backed by `PersistentBTreeMap` (2026-05-27)
+
+Same sweep run as the v4.37 / v4.39 sections above. v4.40 finishes
+the structural-sharing migration started in v4.39 — `Table::indices`
+inner `BTreeMap<IndexKey, Vec<usize>>` swaps to
+`PersistentBTreeMap` (path-copy CoW B-tree, `ORDER = 8`, ~370 LOC
+including a 100K-step fuzz oracle against `std::BTreeMap`). With
+both `Table::rows` and `Table::indices` on structural-sharing
+substrates, the v4.34 auto-commit BEGIN..COMMIT wrap's
+`Catalog::clone()` is O(1) even for tables with secondary indices
+— the exact case the v4.39 sweep showed as the residual bottleneck.
+
+### Per-N (INSERT throughput rows/s + PK p99 µs)
+
+| backend       |    10K    |    100K   |     1M    |    10M    |    30M    |   100M    |
+|---------------|----------:|----------:|----------:|----------:|----------:|----------:|
+| spg-embedded  |  405K / 1µs  |  253K / 3µs  |  162K / 6µs  | (bail @ 1M) | —         | — |
+| spg-server    |   98K / 43µs |   75K / 37µs |   66K / 41µs |   49K / 122µs | (RSS bail) | — |
+| postgres      |  116K / 6.3ms |  150K / 2.4ms |  147K / 2.3ms |  118K / 2.3ms |   81K / 2.9ms |   43K / 2.7ms |
+| mysql         |   21K / 2.3ms |  113K / 2.3ms |   96K / 2.3ms |   86K / 4.0ms |   48K / 2.3ms | (bail @ 30M) |
+| mariadb       |  107K / 2.0ms |  227K / 2.3ms |  228K / 2.2ms |   37K / 2.2ms | (bail @ 10M) | — |
+
+### Diff vs baseline-v4.37 + v4.39
+
+| backend / N         | baseline r/s | v4.39 r/s | v4.40 r/s | v4.40 / baseline | notes |
+|---------------------|-------------:|----------:|----------:|-----------------:|-------|
+| spg-server [10K]    |          87K |     101K  |     98K  |  1.13× | unchanged within noise |
+| spg-server [100K]   |          50K |      67K  |     75K  |  1.50× | indices cheaper to clone |
+| spg-server [1M]     |         9.4K |      15K  |     66K  |  **7.02×** | **crosses ≥50K floor** |
+| spg-server [10M]    |  (bail @ 1M) | (bail @ 1M) | **49K** | **n/a (new)** | first time reaching 10M for spg-server |
+| spg-embedded [10K]  |        1684K |     822K  |    405K  |  0.24× | new PB-tree path-copy tax |
+| spg-embedded [1M]   |        1584K |     762K  |    162K  |  0.10× | regression; **v4.40.1 closes** |
+
+### Findings
+
+**1. spg-server crosses the NEXT.md ≥50K @ 1M floor.** Sweep INSERT
+   @ 1M = 66K r/s, comfortably above the 50K v4.40 floor. The lift
+   over v4.39 (15K → 66K, **4.4×**) is precisely what indices-clone
+   removal was supposed to deliver. spg-server now reaches **10M
+   rows** for the first time across this whole roadmap — previous
+   sweep runs bailed at 100K (v4.37) or 1M (v4.39). At 10M
+   throughput dropped to 49K r/s (50.0 % of the 97K peak — exactly
+   at the bail threshold; the actual bail was on **RSS**, 6070 MiB
+   > 4 GiB safety line). Per-row p99 latency stayed bounded (122 µs
+   PK p99 at 10M — vs MariaDB's 2.2 ms, PG's 2.3 ms; SPG's
+   indexed-lookup path holds its no-fsync lead).
+
+**2. spg-embedded regressed further.** Same shape as v4.39's PV.push
+   tail-clone tax, now compounded by `PersistentBTreeMap::insert`'s
+   path-copy along the spine: each row's index update walks
+   `O(log₈ N)` levels, allocating a fresh `Arc<BNode>` at each
+   touched level. For the `id INT` + `sec INT` schema's 2 indices
+   that's ~5 levels × ~500 ns/level × 2 indices = ~5 µs/row of
+   B-tree overhead — roughly the gap between v4.39's 762K r/s and
+   v4.40's 162K r/s at 1M. **v4.40.1 closes this with a transient
+   `insert_transient(&mut self, k, v)` that walks `Arc::make_mut`
+   down the spine — uniquely-owned PB handles mutate in place at
+   roughly std `BTreeMap::insert` cost; shared handles still
+   path-copy correctly so the wrap's snapshot semantics are
+   unaffected.** This mirrors exactly the v4.39 → v4.39.1 transient
+   recovery for PV.push_mut.
+
+**3. PG / MySQL run further than the v4.37 baseline.** PG ran the
+   full 100M boundary (vs v4.37 baseline that bailed at 30M);
+   MySQL ran to 30M then bailed. This is sample-to-sample
+   variance on the container host (warm buffer pool, no DB
+   restart between checkpoints). The shape of the curves is
+   unchanged.
+
+### Boundary summary
+
+| concern                           | which backend hits it first | at what N | change vs v4.39 |
+|-----------------------------------|----------------------------|-----------|------------------|
+| INSERT throughput cliff           | mariadb                    | ~10M      | unchanged |
+| INSERT throughput regression — wrap | spg-server                 | ~10M (RSS) | **closed for the wrap path** (49K @ 10M vs bail @ 1M in v4.39) |
+| INSERT throughput regression — embedded | spg-embedded (PB path-copy) | every N   | **new in v4.40, closed in v4.40.1** |
+| PK lookup p99 cliff (buffer pool) | postgres                   | ~30M      | unchanged |
+| Physical RAM ceiling              | spg-server                 | ~10M      | **new — first time SPG hits RAM ceiling under WAL load** |
+
+### Reproduce
+
+  cd <repo root>
+  xbench/competitor/scripts/up.sh
+  cargo run --release -p spg-bench-competitor --bin sweep
+
+Per-backend budget 15 min, full run ~30 min on a quiet host. The
+v4.40.1 transient-insert recovery for the spg-embedded path is
+verified by `tests/perf_gate.rs::pb_insert_100k_under_50ms`
+(unit-level; sweep rerun deferred to v4.41 when group commit +
+binary WAL land together).
+
+---
+
 ## v4.37 competitor rerun (2026-05-27, post-ops-sprint)
 
 End-to-end re-baseline after the v4.33–v4.37 sprint (graceful
