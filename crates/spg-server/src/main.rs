@@ -233,7 +233,11 @@ fn run(
         // v4.25 PITR: SPG_REPLAY_UPTO caps replay at a specific
         // byte offset of the WAL. Anything past that offset is
         // ignored on this boot — operator's restore mechanism.
-        if let Some(upto) = parse_env_u64("SPG_REPLAY_UPTO") {
+        // 0 is a meaningful value (= "snapshot only, skip all WAL"),
+        // so this parser doesn't reuse parse_env_u64's `n > 0` filter.
+        if let Ok(s) = env::var("SPG_REPLAY_UPTO")
+            && let Ok(upto) = s.trim().parse::<u64>()
+        {
             let upto_usize = usize::try_from(upto).unwrap_or(usize::MAX);
             if bytes.len() > upto_usize {
                 eprintln!(
