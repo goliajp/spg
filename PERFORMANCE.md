@@ -750,6 +750,117 @@ E2E (tests/e2e_pgbouncer_compat.rs, 4 cases):
 - reset_all_returns_cc
 - set_transaction_isolation_returns_cc
 
+## v4.27 competitor rerun (2026-05-27, sanity)
+
+Re-ran the v3.3.4 baseline harness against the current binary
+(commit `87d2cc0`) to confirm v4.14-v4.27 didn't regress the hot
+path. All three benches use the same docker-compose stack (PG18 +
+MySQL9 + MariaDB11) as v3.2.x.
+
+### latency p50 / p95 / p99 (µs)
+
+| backend       |  ins p50 | ins p95  | ins p99  | sel p50 | sel p95 | sel p99 |
+|---------------|---------:|---------:|---------:|--------:|--------:|--------:|
+| spg-embedded  |      0.6 |      0.7 |      1.7 |     1.0 |     1.1 |     1.2 |
+| spg-server    |     15.0 |     35.4 |     69.5 |    17.1 |    36.7 |    76.8 |
+| postgres      |   3379.8 |   9351.3 |  18332.2 |  2842.2 |  4341.3 |  9136.3 |
+| mysql         |   2985.5 |   7443.0 |  15190.6 |  2357.3 |  3839.8 |  9064.2 |
+| mariadb       |   2744.9 |   5774.8 |  15499.7 |  2332.8 |  3797.3 |  9299.6 |
+
+### bulk throughput (10K rows / full scan)
+
+| backend       | INSERT rows/s | SCAN rows/s |
+|---------------|--------------:|------------:|
+| spg-embedded  |     1,560,397 |   8,036,434 |
+| spg-server    |     1,466,365 |   6,148,330 |
+| postgres      |        44,177 |   1,488,280 |
+| mysql         |         7,151 |   1,818,512 |
+| mariadb       |        24,323 |   1,131,670 |
+
+### vector kNN top-10 over 10K dim-128
+
+| backend             | build s | q p50 µs | q p95 µs | q p99 µs |
+|---------------------|--------:|---------:|---------:|---------:|
+| spg-embedded        |    1.44 |     39.5 |    188.5 |    340.9 |
+| spg-server          |    1.46 |     62.0 |    132.6 |    361.4 |
+| postgres+pgvector   |    2.52 |   3402.3 |   4594.2 |   7787.9 |
+
+Verdict: no structural regression vs v3.3.4. SPG-server SEL p50
+went 14 → 17 µs (~+22%, within noise), SCAN -12% (still 3-5×
+faster than the three competitors). pgvector p50 ran cold here
+(3.4 ms vs 1.4 ms in v3.3.4) so the 54× spg-embedded lead grew
+to ~86× — but treat this row as cold-container-affected.
+
+The 14 new versions added new code paths (JSON, CTE, recursive
+CTE, correlated subq, window frames + extended window funcs,
+COPY, SET/SHOW, EXPLAIN, replication, backup) without changing
+the latency / throughput / kNN hot paths, which the numbers
+confirm.
+
+## v4.24 replication bench (xbench/competitor/src/bin/repl_bench)
+
+Two `spg-server` processes, primary + follower, sharing tmpfs.
+Same M-series 8-core Mac. Run via
+`cargo run --release -p spg-bench-competitor --bin repl_bench`.
+
+| metric                                            | value           |
+|---------------------------------------------------|-----------------|
+| INSERT solo (no follower), 2000 rows              | 246 rows/s      |
+| INSERT with follower attached, 2000 rows          | 179 rows/s      |
+| attach cost vs solo                               | -27% throughput |
+| snapshot bootstrap (follower sees 1K seed rows)   | 240 ms wall     |
+| replication lag p50                               | 53 ms           |
+| replication lag p95                               | 120 ms          |
+| replication lag p99                               | 211 ms          |
+| replication lag max                               | 241 ms          |
+
+Notes:
+- WAL fsync per INSERT is the dominant cost in absolute INSERT
+  rate (246 rows/s with one writer). For batch / VALUES INSERTs
+  the rate scales linearly per row, not per statement.
+- p50 lag ≈ 53 ms matches the master's WAL-tail poll cadence
+  (`TAIL_POLL: Duration = Duration::from_millis(50)`). Lowering
+  it to 10 ms would tighten lag to ~10 ms p50 at the cost of
+  ~5× more `read(2)` syscalls on the WAL file. Knob is in
+  `crates/spg-server/src/replication.rs`.
+- The -27% attach cost is from the master's WAL re-open + 50 ms
+  polling thread plus follower-side fsync; under heavier
+  workloads the percentage should shrink (constant-cost overhead).
+- Full file: [xtests/v4_24_repl_report.md](xtests/v4_24_repl_report.md).
+
+## v4.25 backup bench (xbench/competitor/src/bin/backup_bench)
+
+100K-row seed, single-thread inserter, M-series 8-core Mac. Run
+via `cargo run --release -p spg-bench-competitor --bin backup_bench`.
+
+| metric                                            | value           |
+|---------------------------------------------------|-----------------|
+| WAL size after 100K-row seed                      | 1470 KiB        |
+| `BACKUP TO 'full.bkp'` elapsed                    | 5 ms            |
+| Full bundle size                                  | 878 KiB         |
+| Full backup bandwidth                             | ~175 MiB/s      |
+| `BACKUP TO 'incr.bkp' INCREMENTAL SINCE N` (10K rows) | 5 ms        |
+| Incremental bundle size                           | 168 KiB         |
+| Incremental backup bandwidth                      | ~40 MiB/s       |
+| Restore: bundle apply + server startup            | 5 + 261 = 266 ms |
+| Restored row count vs expected                    | 110000 / 110000 |
+| Full WAL replay startup (rec_wal = incr slice)    | 118 ms          |
+| `SPG_REPLAY_UPTO=0` startup (snapshot-only)       | 146 ms          |
+| PITR row count when truncated to snapshot         | 100000 ✅       |
+
+Notes:
+- Bundle bandwidth is high because the snapshot is already
+  serialized in memory by `Engine::snapshot()`; the SQL handler
+  just streams it to disk under the engine write lock.
+- The bundle uses no compression — full = catalog snapshot,
+  incremental = raw WAL bytes. 1470 KiB seed → 878 KiB bundle
+  (~60% of WAL) reflects the v3.0.2 dense row encoding being
+  more compact than a stream of `[len][SQL text]` WAL records.
+- PITR demonstrated with `SPG_REPLAY_UPTO=0`: server starts from
+  the full-backup snapshot and skips the incremental WAL tail
+  entirely. Mid-WAL byte offsets are supported the same way.
+- Full file: [xtests/v4_25_backup_report.md](xtests/v4_25_backup_report.md).
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release

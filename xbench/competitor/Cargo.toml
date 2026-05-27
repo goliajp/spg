@@ -63,5 +63,13 @@ path = "src/bin/soak.rs"
 name = "concurrent"
 path = "src/bin/concurrent.rs"
 
+[[bin]]
+name = "repl_bench"
+path = "src/bin/repl_bench.rs"
+
+[[bin]]
+name = "backup_bench"
+path = "src/bin/backup_bench.rs"
+
 [lints]
 workspace = true
