@@ -315,19 +315,20 @@ fn chaos_disk_full_returns_clean_error_and_keeps_serving() {
     assert!(rejected, "quota never fired in 100 inserts");
     assert!(accepted > 0, "nothing committed before quota fired");
 
-    // Server is still alive — reconnect (the failed connection
-    // was closed by the handler returning Err). We deliberately do
-    // NOT assert against the live in-memory count: when WAL append
-    // fails AFTER engine.execute has mutated in-memory state, the
-    // live server temporarily diverges from the WAL (a phantom row
-    // shows up that did NOT get CC'd). PROD_READY row 1.10 tracks
-    // this gap. The hard prod invariant — and what this test
-    // gates on — is that POST-RESTART state matches what was CC'd.
+    // v4.30: preflight quota check guarantees the live in-memory
+    // count matches what was CC'd. (Pre-v4.30 a phantom row could
+    // appear because engine.execute mutated state before WAL append
+    // failed; the preflight in main.rs rejects the SQL before any
+    // engine mutation.) Reconnect since the handler closed our
+    // socket on the quota error.
     drop(s);
     let mut s = TcpStream::connect(&addr).expect("server still listening after quota error");
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    // Live count probe just to confirm the server still answers.
-    let _ = select_int(&mut s, "SELECT count(*) FROM q");
+    let live = select_int(&mut s, "SELECT count(*) FROM q");
+    assert_eq!(
+        live, accepted as i64,
+        "live in-memory count must match CC'd count after preflight quota reject"
+    );
 
     // Tear down and restart without the quota. WAL replay must
     // produce exactly `accepted` rows — no phantoms.
