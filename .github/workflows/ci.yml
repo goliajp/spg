@@ -45,6 +45,19 @@ jobs:
         # processes; serial runner keeps port-grabbing tests honest.
         run: cargo test --workspace --locked -- --test-threads=1
 
+  prod_ready:
+    name: prod_ready gate
+    runs-on: ubuntu-latest
+    # The prod_ready test asserts every [machine] row in
+    # PROD_READY.md is backed by a row_X_Y_* test in
+    # crates/spg-server/tests/prod_ready.rs. Failure here means
+    # PROD_READY.md is over-claiming.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --release --test prod_ready
+        run: cargo test --release -p spg-server --test prod_ready --locked
+
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
