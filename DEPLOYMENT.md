@@ -59,6 +59,9 @@ modifies anything outside the three explicit paths.
 | `SPG_LOG_FORMAT`              | `json` to switch stderr to single-line JSON          | text          |
 | `SPG_REPLAY_UPTO`             | PITR: cap WAL replay at byte offset N                | unset         |
 | `SPG_FAIL_WAL_QUOTA_BYTES`    | chaos knob: refuse WAL append past N bytes (test only) | unset       |
+| `SPG_SHUTDOWN_DEADLINE_SEC`   | v4.33: SIGTERM/SIGINT drain budget before `exit(0)`  | `30`          |
+| `SPG_SLOW_QUERY_LOG_MS`       | v4.33: log queries slower than N ms (one JSON line/stderr) | unset    |
+| `SPG_WAL_MIN_FREE_BYTES`      | v4.33: refuse WAL append when volume free space < N bytes | unset      |
 
 ## Recommended host setup
 

@@ -10,6 +10,40 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.33.0] — 2026-05-27 (ops three-pack — graceful shutdown + slow-query log + disk water-mark)
+
+### Added
+- **Graceful shutdown** — SIGTERM/SIGINT installs a handler that
+  flips a global flag; the main accept loop polls it between
+  non-blocking accepts, then drains in-flight connections bounded
+  by `SPG_SHUTDOWN_DEADLINE_SEC` (default 30 s, mirrors
+  systemd's `DefaultTimeoutStopSec`). Exits 0 on clean drain.
+  Closes PROD_READY row 2.7. e2e:
+  `tests/e2e_graceful_shutdown.rs::graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero`.
+- **Slow-query log** — `SPG_SLOW_QUERY_LOG_MS` env var; queries
+  whose dispatch wall-clock exceeds the threshold emit one
+  `{"event":"slow_query","sql":...,"elapsed_us":N,"role":...,"threshold_us":N}`
+  line on stderr. Field layout matches `SPG_LOG_FORMAT=json` so
+  the same ingest pipeline handles both event streams. Default
+  off. Closes PROD_READY row 4.5. e2e:
+  `tests/e2e_slow_query_log.rs::slow_query_log_fires_above_threshold_and_silent_below`.
+- **Disk water-mark** — `SPG_WAL_MIN_FREE_BYTES` env var; before
+  every WAL append, `statvfs(2)` on the WAL volume; if free <
+  threshold, returns `ErrorKind::StorageFull` with an error
+  message that cites the env var by name. Reads keep serving
+  (this is a write-path precheck only). macOS + Linux. Default
+  off. Closes PROD_READY row 5.7. e2e:
+  `tests/e2e_disk_watermark.rs::disk_watermark_refuses_writes_keeps_reads_keeps_server_alive`.
+- `libc = "0.2"` direct dep on `spg-server` for the two FFI
+  shims (`signal(2)` + `statvfs(2)`). Each call site is wrapped
+  in `#[allow(unsafe_code)]` with a SAFETY note.
+- `prod_ready.rs` rows `row_2_7_*` / `row_4_5_*` / `row_5_7_*`.
+
+### Changed
+- PROD_READY.md audit snapshot: 68 → 71 ✅ / 7 → 6 ⚠️ /
+  4 → 2 ❌; 30 → 33 [machine] rows.
+- DEPLOYMENT.md env-var table gains three rows.
+
 ## [4.30.0] — 2026-05-27 (ops docs suite + RESTORE_DRILL + in-memory rollback fix)
 
 ### Added

@@ -35,7 +35,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use spg_audit::AuditLog;
 use spg_engine::{Engine, EngineError, QueryResult, Role};
@@ -51,6 +51,21 @@ const READ_CHUNK: usize = 4096;
 /// Rows per `DataRowBatch` frame (v3.3.0). Caps in-memory frame size
 /// on huge SELECTs while still amortising the per-frame header.
 const BATCH_ROWS_PER_FRAME: usize = 256;
+/// v4.33: cadence at which the accept loop polls the shutdown flag
+/// and the drain loop polls `active_connections`. 50 ms keeps SIGTERM
+/// → process-exit latency under ~100 ms when no in-flight work
+/// remains, without burning a measurable CPU slice when idle.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+/// v4.33: default `SPG_SHUTDOWN_DEADLINE_SEC`. Mirrors systemd's
+/// `DefaultTimeoutStopSec` so operators don't surprise the supervisor.
+const DEFAULT_SHUTDOWN_DEADLINE_SEC: u64 = 30;
+
+/// v4.33 graceful shutdown — flipped by the SIGTERM/SIGINT handler.
+/// The main accept loop polls this between non-blocking accepts so it
+/// can break out, then waits for active connections to drain (bounded
+/// by `SPG_SHUTDOWN_DEADLINE_SEC`) before returning. Async-signal-safe:
+/// the handler only does an atomic store.
+static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// v4.2 + v4.5 resource limits. Each field is `None` = unlimited.
 #[derive(Debug, Default, Clone, Copy)]
@@ -74,6 +89,22 @@ struct Limits {
     /// read timeout on the TCP socket — when `read()` returns
     /// `WouldBlock` the handle loop exits cleanly.
     idle_timeout_sec: Option<u64>,
+    /// v4.33: when set, every query whose dispatch wall-clock
+    /// exceeds this threshold (milliseconds) emits one JSON line
+    /// on stderr. Mirrors `SPG_LOG_FORMAT=json`'s field naming so
+    /// the same log pipeline can ingest both. Defaults off.
+    slow_query_log_ms: Option<u64>,
+    /// v4.33: when set, the WAL appender refuses writes whose
+    /// volume's free space (per `statvfs`) is below this byte
+    /// count. Returns `ErrorKind::StorageFull` with a clear
+    /// message; reads keep serving. Defaults off.
+    wal_min_free_bytes: Option<u64>,
+    /// v4.33: bound the time SIGTERM/SIGINT waits for active
+    /// connections to drain before `process::exit(0)`. None means
+    /// "use `DEFAULT_SHUTDOWN_DEADLINE_SEC`" — there is no
+    /// "wait forever" mode (operators wanting that don't need a
+    /// signal handler at all).
+    shutdown_deadline_sec: Option<u64>,
 }
 
 /// v4.29 chaos: when set, the WAL appender refuses any write that
@@ -149,7 +180,11 @@ fn main() {
         max_query_rows: parse_env_usize("SPG_MAX_QUERY_ROWS"),
         query_timeout_ms: parse_env_u64("SPG_QUERY_TIMEOUT_MS"),
         idle_timeout_sec: parse_env_u64("SPG_IDLE_TIMEOUT_SEC"),
+        slow_query_log_ms: parse_env_u64("SPG_SLOW_QUERY_LOG_MS"),
+        wal_min_free_bytes: parse_env_u64("SPG_WAL_MIN_FREE_BYTES"),
+        shutdown_deadline_sec: parse_env_u64("SPG_SHUTDOWN_DEADLINE_SEC"),
     };
+    install_shutdown_handlers();
     if let Err(e) = run(&addr, db_path, audit_path, wal_path, password, limits) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
@@ -381,7 +416,20 @@ fn run(
         }
     }
 
+    // v4.33 graceful shutdown: keep the blocking accept loop the
+    // original code had (the per-connection timing is sensitive —
+    // a polling listener changed the order in which max_connections
+    // saw probe/handshake handlers release their slots and broke
+    // `tests/e2e_limits::max_connections_*`). A dedicated wake-up
+    // thread watches SHUTDOWN_FLAG and self-connects once when it
+    // fires; that unblocks the next accept() and the loop's own
+    // flag check breaks out cleanly.
+    spawn_shutdown_waker(&listener)?;
     for stream in listener.incoming() {
+        if SHUTDOWN_FLAG.load(Ordering::Acquire) {
+            drop(stream); // close the wake-up socket without handling it
+            break;
+        }
         let mut stream = stream?;
         // v4.2 max_connections: try to claim a slot. On full, emit a
         // clear error frame and drop the socket. Doing the check
@@ -402,16 +450,89 @@ fn run(
             eprintln!("spg-server: rejected {peer:?}: max_connections reached");
             continue;
         };
-        let state = Arc::clone(&state);
+        let state_for_thread = Arc::clone(&state);
         thread::spawn(move || {
             let _guard = guard; // released when this thread exits
             let peer = stream.peer_addr().ok();
-            if let Err(e) = handle(stream, &state) {
+            if let Err(e) = handle(stream, &state_for_thread) {
                 eprintln!("spg-server: conn {peer:?}: {e}");
             }
         });
     }
+    drain_connections(&state);
     Ok(())
+}
+
+/// v4.33: thread that watches `SHUTDOWN_FLAG` and, when it flips,
+/// does a one-shot `connect(local_addr)` to wake the main thread's
+/// blocking `accept()`. The main loop's own `SHUTDOWN_FLAG` check
+/// then sees the flag set and breaks. The self-connection is
+/// dropped immediately by the accept-side branch, so it never
+/// consumes a `ConnectionGuard` slot or runs a handle thread.
+fn spawn_shutdown_waker(listener: &TcpListener) -> std::io::Result<()> {
+    let local = listener.local_addr()?;
+    thread::Builder::new()
+        .name("spg-shutdown-waker".into())
+        .spawn(move || {
+            while !SHUTDOWN_FLAG.load(Ordering::Acquire) {
+                thread::sleep(SHUTDOWN_POLL);
+            }
+            let _ = TcpStream::connect(local);
+        })?;
+    Ok(())
+}
+
+/// v4.33: wait for in-flight connections to finish, bounded by
+/// `SPG_SHUTDOWN_DEADLINE_SEC` (default 30 s). Polled by the main
+/// thread after the accept loop breaks on `SHUTDOWN_FLAG`.
+fn drain_connections(state: &ServerState) {
+    let deadline_sec = state
+        .limits
+        .shutdown_deadline_sec
+        .unwrap_or(DEFAULT_SHUTDOWN_DEADLINE_SEC);
+    let started = Instant::now();
+    let budget = Duration::from_secs(deadline_sec);
+    eprintln!(
+        "spg-server: shutdown signal received — draining {} connection(s), deadline {}s",
+        state.active_connections.load(Ordering::Acquire),
+        deadline_sec,
+    );
+    loop {
+        let active = state.active_connections.load(Ordering::Acquire);
+        if active == 0 {
+            eprintln!("spg-server: drained — exiting 0");
+            return;
+        }
+        if started.elapsed() >= budget {
+            eprintln!(
+                "spg-server: drain deadline hit with {active} connection(s) still active — exiting 0"
+            );
+            return;
+        }
+        thread::sleep(SHUTDOWN_POLL);
+    }
+}
+
+/// v4.33: register SIGTERM/SIGINT handlers that flip the global
+/// shutdown flag. Async-signal-safe: the handler does nothing but a
+/// single relaxed atomic store. `libc::signal` returns the previous
+/// handler; we ignore the result because we deliberately replace the
+/// default `terminate` behavior with a graceful drain.
+#[allow(unsafe_code)]
+fn install_shutdown_handlers() {
+    extern "C" fn handler(_sig: libc::c_int) {
+        SHUTDOWN_FLAG.store(true, Ordering::Release);
+    }
+    // SAFETY: `signal(2)` is async-signal-safe to install. The
+    // handler we register only performs an `AtomicBool::store`,
+    // itself async-signal-safe (single-word atomic; no locks, no
+    // allocation, no reentrancy). Installing the same handler for
+    // SIGTERM + SIGINT means systemd's stop signal and a Ctrl-C in
+    // the foreground both drive the same drain path.
+    unsafe {
+        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+    }
 }
 
 /// RAII slot in the `active_connections` counter. `try_claim`
@@ -670,6 +791,11 @@ fn dispatch(
                     return write_frame(stream, &build_error_response(&e.to_string()));
                 }
             };
+            // v4.33 slow-query log: scoped guard times the entire
+            // dispatch (read-path, write-path, every error branch) and
+            // emits one JSON line on stderr if elapsed exceeds
+            // `SPG_SLOW_QUERY_LOG_MS`. Drop runs on every return below.
+            let _slow_log = SlowLogGuard::new(state, &sql, *role);
             // v4.0 fast path: SELECT / SHOW outside an active TX take
             // the engine *read* lock and run in parallel with other
             // readers. WriteRequired drop-through is rare (only if
@@ -1015,9 +1141,61 @@ fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
             ));
         }
     }
+    // v4.33 disk water-mark: when `SPG_WAL_MIN_FREE_BYTES` is set,
+    // call statvfs on the WAL volume and refuse the append if free
+    // space is below the threshold. Writes return StorageFull; reads
+    // continue (this path is write-only). Defaults off — when unset,
+    // `state.limits.wal_min_free_bytes` is None and we skip the
+    // syscall entirely.
+    if let Some(min_free) = state.limits.wal_min_free_bytes
+        && let Some(wal_path) = state.wal_path.as_deref()
+    {
+        let free = wal_volume_free_bytes(wal_path)?;
+        if free < min_free {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "WAL volume below water-mark: free={free} < SPG_WAL_MIN_FREE_BYTES={min_free}"
+                ),
+            ));
+        }
+    }
     f.write_all(&entry)?;
     f.sync_data()?;
     Ok(())
+}
+
+/// v4.33: free bytes on the filesystem that owns `path`, via
+/// `statvfs(2)`. macOS and Linux both expose `statvfs` with
+/// compatible field semantics (`f_bavail` × `f_frsize`).
+/// `f_bavail` (vs `f_bfree`) excludes blocks reserved for the
+/// superuser, which is what an unprivileged write actually has
+/// access to — the same number `df` shows in its "Avail" column.
+///
+/// The `as u64` casts are widening on every supported platform
+/// (`fsblkcnt_t`/`c_ulong` are u32 on apple, u64 on linux); pin
+/// the lossless-cast lint locally so the same source compiles
+/// cleanly on both without per-cfg branches.
+#[allow(unsafe_code, clippy::cast_lossless, clippy::useless_conversion)]
+fn wal_volume_free_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut c_path = Vec::with_capacity(bytes.len() + 1);
+    c_path.extend_from_slice(bytes);
+    c_path.push(0);
+    // SAFETY: `statvfs` reads a NUL-terminated path and writes into
+    // the provided buffer. We give it both. The buffer is initialized
+    // by the call (the kernel writes every field on success); on
+    // failure we return early via the errno check before reading any
+    // field. macOS + Linux `libc::statvfs` signatures match.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr().cast(), &raw mut stat) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bavail = stat.f_bavail as u64;
+    let frsize = stat.f_frsize as u64;
+    Ok(bavail.saturating_mul(frsize))
 }
 
 /// Replay WAL bytes onto `engine`. Returns the number of entries applied.
@@ -1117,6 +1295,75 @@ fn bootstrap_admin_from_env(engine: &mut Engine, db_path: Option<&Path>) -> std:
         eprintln!("spg-server: warning — failed to persist bootstrap admin: {e}");
     }
     Ok(())
+}
+
+/// v4.33 slow-query log scope. Records the dispatch start `Instant`
+/// at construction and, on `Drop`, emits one JSON line to stderr if
+/// elapsed exceeds the configured `SPG_SLOW_QUERY_LOG_MS` threshold.
+/// Threshold = `None` makes Drop a no-op (zero-cost when the env var
+/// isn't set). Field naming intentionally matches the existing
+/// `SPG_LOG_FORMAT=json` pipeline so both event streams ingest the
+/// same way.
+struct SlowLogGuard<'a> {
+    threshold_us: Option<u64>,
+    sql: &'a str,
+    role: Option<Role>,
+    start: Instant,
+}
+
+impl<'a> SlowLogGuard<'a> {
+    fn new(state: &ServerState, sql: &'a str, role: Option<Role>) -> Self {
+        Self {
+            threshold_us: state
+                .limits
+                .slow_query_log_ms
+                .map(|ms| ms.saturating_mul(1000)),
+            sql,
+            role,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowLogGuard<'_> {
+    fn drop(&mut self) {
+        let Some(threshold_us) = self.threshold_us else {
+            return;
+        };
+        let elapsed_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if elapsed_us < threshold_us {
+            return;
+        }
+        let mut sql_escaped = String::with_capacity(self.sql.len() + 16);
+        json_escape_into(self.sql, &mut sql_escaped);
+        let role_str = self.role.map_or("unauth", Role::as_str);
+        eprintln!(
+            r#"{{"event":"slow_query","sql":"{sql_escaped}","elapsed_us":{elapsed_us},"role":"{role_str}","threshold_us":{threshold_us}}}"#
+        );
+    }
+}
+
+/// Minimal JSON string escaper for the slow-query log line. Handles
+/// the seven escapes JSON requires (\\, \", \b, \f, \n, \r, \t) and
+/// emits `\u00XX` for the remaining control bytes. UTF-8 sequences
+/// pass through verbatim — JSON strings allow raw multibyte UTF-8.
+fn json_escape_into(s: &str, out: &mut String) {
+    use std::fmt::Write as _;
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
 }
 
 /// v4.5: per-query watchdog. Reads `state.limits.query_timeout_ms`;

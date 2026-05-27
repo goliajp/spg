@@ -398,6 +398,84 @@ fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
     );
 }
 
+// ---- 2.7 / 4.5 / 5.7 v4.33 ops three-pack ----
+
+/// 2.7 graceful shutdown — SIGTERM drains in-flight queries and
+/// exits 0. Evidence: the e2e_graceful_shutdown test wires the
+/// real SIGTERM path; main.rs declares the env var + signal install.
+#[test]
+fn row_2_7_graceful_shutdown_covered_by_e2e() {
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e_graceful_shutdown.rs");
+    let src = std::fs::read_to_string(&test_path).unwrap_or_else(|_| {
+        panic!(
+            "e2e_graceful_shutdown.rs missing at {}",
+            test_path.display()
+        )
+    });
+    assert!(
+        src.contains("fn graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero"),
+        "e2e_graceful_shutdown.rs must contain the named drain test"
+    );
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("SPG_SHUTDOWN_DEADLINE_SEC"),
+        "main.rs must declare the SPG_SHUTDOWN_DEADLINE_SEC env var"
+    );
+    assert!(
+        main_src.contains("install_shutdown_handlers"),
+        "main.rs must install signal handlers for SIGTERM/SIGINT"
+    );
+}
+
+/// 4.5 slow-query log — `SPG_SLOW_QUERY_LOG_MS` thresholds and the
+/// dispatch emits one JSON line per slow query. Evidence: the e2e
+/// test asserts both above- and below-threshold paths.
+#[test]
+fn row_4_5_slow_query_log_covered_by_e2e() {
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e_slow_query_log.rs");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|_| panic!("e2e_slow_query_log.rs missing at {}", test_path.display()));
+    assert!(
+        src.contains("fn slow_query_log_fires_above_threshold_and_silent_below"),
+        "e2e_slow_query_log.rs must contain the named threshold test"
+    );
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("SPG_SLOW_QUERY_LOG_MS"),
+        "main.rs must declare the SPG_SLOW_QUERY_LOG_MS env var"
+    );
+    assert!(
+        main_src.contains("\"event\":\"slow_query\""),
+        "main.rs must emit the slow_query JSON event"
+    );
+}
+
+/// 5.7 disk water-mark — `SPG_WAL_MIN_FREE_BYTES` makes the WAL
+/// appender refuse writes when statvfs reports free < threshold,
+/// while reads still serve. Evidence: e2e + statvfs wiring.
+#[test]
+fn row_5_7_disk_watermark_covered_by_e2e() {
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e_disk_watermark.rs");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|_| panic!("e2e_disk_watermark.rs missing at {}", test_path.display()));
+    assert!(
+        src.contains("fn disk_watermark_refuses_writes_keeps_reads_keeps_server_alive"),
+        "e2e_disk_watermark.rs must contain the named water-mark test"
+    );
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("SPG_WAL_MIN_FREE_BYTES"),
+        "main.rs must declare the SPG_WAL_MIN_FREE_BYTES env var"
+    );
+    assert!(
+        main_src.contains("libc::statvfs"),
+        "main.rs must call statvfs for the WAL volume"
+    );
+}
+
 /// 1.10 Disk-full handling — covered by e2e_chaos, asserted here
 /// as a presence check.
 #[test]

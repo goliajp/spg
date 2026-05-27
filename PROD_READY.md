@@ -18,8 +18,8 @@ Status legend:
 - ❌ — not done; on the roadmap
 - 🚫 — intentional out-of-scope (linked to memory or rationale)
 
-Last refresh: **v4.28 baseline** (2026-05-27, commit hash filled
-at commit time).
+Last refresh: **v4.33 ops three-pack** (2026-05-27, commit hash
+filled at commit time).
 
 ---
 
@@ -56,7 +56,7 @@ practiced.
 | 2.4 | Follower reconnect after primary restart | Follower retries with backoff; resumes from last applied offset | ✅ | `crates/spg-server/src/replication.rs` `fn run_follower` |
 | 2.5 | Restore drill documented [machine] | Step-by-step commands to take backup, simulate loss, restore; reader can execute verbatim | ✅ | v4.30, `RESTORE_DRILL.md` |
 | 2.6 | Restore drill automated [machine] | E2E test follows the doc commands; fails CI if doc rots | ✅ | v4.30, `tests/e2e_restore_drill.rs::restore_drill_full_plus_incremental_recovers_row_count` |
-| 2.7 | Graceful shutdown | SIGTERM drains in-flight queries up to a deadline, refuses new connections, exits 0 | ⚠️ | Today: in-flight queries finish under their own `SPG_QUERY_TIMEOUT_MS` budget; new accepts are bounded by OS shutdown. Full drain-loop is a v5 addition (needs signal handler + accept gate). Operators bound exit time today by setting a short timeout. |
+| 2.7 | Graceful shutdown [machine] | SIGTERM drains in-flight queries up to a deadline, refuses new connections, exits 0 | ✅ | v4.33, `SPG_SHUTDOWN_DEADLINE_SEC` (default 30s) + SIGTERM/SIGINT handler in `crates/spg-server/src/main.rs`; e2e: `tests/e2e_graceful_shutdown.rs::graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero` |
 | 2.8 | Automated failover | A follower can be promoted to primary by operator action; coordinator handles it | 🚫 | manual promotion only; HA = "stop follower, point clients at it, restart in primary mode". See [[spg-out-of-scope]] |
 | 2.9 | Network partition tolerance [chaos] | Follower disconnect while primary writes → on reconnect, all writes catch up exactly once, no duplicates / no gaps | ⚠️ | logic supports it; v4.30 chaos test will assert (also rows 1.11 in-memory rollback) |
 
@@ -92,7 +92,7 @@ seconds, and you have enough signal to diagnose.
 | 4.2 | Prometheus metrics [machine] | `GET /metrics` exposes connections_active / queries_total / errors_total in exposition format | ✅ | v4.13.0 |
 | 4.3 | Structured logging | `SPG_LOG_FORMAT=json` switches stderr to single-line JSON per event | ✅ | v4.13.0 |
 | 4.4 | EXPLAIN / EXPLAIN ANALYZE | Operator can inspect plan + actual rows for any query | ✅ | v4.26.0, `tests/e2e_explain.rs` |
-| 4.5 | Slow-query log | Queries exceeding threshold logged with SQL + elapsed | ❌ | Deferred — small but needs a threshold env var + audit-log overlap design. v5 candidate. |
+| 4.5 | Slow-query log [machine] | Queries exceeding threshold logged with SQL + elapsed | ✅ | v4.33, `SPG_SLOW_QUERY_LOG_MS`; one JSON line per slow query on stderr (`sql`/`elapsed_us`/`role`/`threshold_us`); e2e: `tests/e2e_slow_query_log.rs::slow_query_log_fires_above_threshold_and_silent_below` |
 | 4.6 | Per-table row count / size metrics | `spg_table_rows{table=…}` series exposed via /metrics | ❌ | Deferred — cardinality matters at scale; needs an allowlist mechanism. v5 candidate. |
 | 4.7 | Replication lag metric | Lag in bytes / seconds exposed via /metrics on the follower | ❌ | Deferred — follower currently has no notion of "primary's latest offset" beyond what it's applied. Needs protocol extension to query. v5 candidate. |
 | 4.8 | OpenTelemetry tracing | — | 🚫 | not in scope for v4.x — single-process tracing is what logs already provide |
@@ -110,7 +110,7 @@ take down the server.
 | 5.4 | `SPG_IDLE_TIMEOUT_SEC` | Connection idle past N seconds is closed by the OS read timeout | ✅ | v4.5.0 |
 | 5.5 | Per-query memory cap | A query cannot allocate more than N MB on the server heap; over-cap errors before OOM | ⚠️ | `SPG_MAX_QUERY_ROWS` caps result-set rows (the biggest allocator) — that's the practical answer today. True allocator-level cap needs a custom global allocator hook; deferred to v5. |
 | 5.6 | OOM injection survives [chaos] | Allocator returns NULL → server emits clear error to caller, no panic, no half-applied state | ⚠️ | Rust panics on alloc fail under default config; v4.29 chaos can stress this |
-| 5.7 | Disk water-mark check | Server refuses writes when WAL volume free space < N MB; serves reads | ❌ | Deferred — needs OS-level statfs polling. Today: real ENOSPC surfaces via the WAL append path's clean error (chaos test v4.29 row 1.10 exercises this). Pre-emptive water-mark is v5. |
+| 5.7 | Disk water-mark check [machine] | Server refuses writes when WAL volume free space < N MB; serves reads | ✅ | v4.33, `SPG_WAL_MIN_FREE_BYTES`; `statvfs(2)` before each WAL append (macOS + Linux), returns `StorageFull` with explicit env-var citation, reads unaffected; e2e: `tests/e2e_disk_watermark.rs::disk_watermark_refuses_writes_keeps_reads_keeps_server_alive` |
 
 ## 6. Correctness
 
@@ -220,21 +220,21 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.32 (2026-05-27).
+Last machine run: v4.33 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 68
-  ⚠️ partial          : 7
-  ❌ open             : 4
+  ✅ pass             : 71
+  ⚠️ partial          : 6
+  ❌ open             : 2
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 30
+[machine] rows scaffolded in prod_ready.rs : 33
   row_1_3, row_1_9, row_1_10,
-  row_2_5, row_2_6,
+  row_2_5, row_2_6, row_2_7,
   row_3_7, row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
-  row_4_1, row_4_2,
-  row_5_1,
+  row_4_1, row_4_2, row_4_5,
+  row_5_1, row_5_7,
   row_6_3,
   row_7_2, row_7_3, row_7_4, row_7_5, row_7_6,
   row_8_2, row_8_4, row_8_5, row_8_6,
@@ -242,33 +242,36 @@ Total rows in checklist : 85
   row_10_x, row_10_4, row_10_5
 ```
 
-The 4 remaining ❌ items (slow-query log, per-table metrics,
-replication lag metric, disk water-mark) are all
-**post-v4.32 nice-to-haves** with documented rationale —
-none are durability / correctness gaps. Concretely:
+v4.33 closed three rows that had been blocking the "external SaaS
+user" bar:
 
-- 4.5 slow-query log: small env-var-driven addition (v5)
-- 4.6 per-table row count metric: cardinality design needed (v5)
-- 4.7 replication lag metric: needs follower → primary RPC (v5)
-- 5.7 disk water-mark: statfs polling, OS-specific (v5)
+- 2.7 graceful shutdown — previously ⚠️ (bounded by
+  `SPG_QUERY_TIMEOUT_MS`); now ✅ with `SPG_SHUTDOWN_DEADLINE_SEC`
+  + SIGTERM handler.
+- 4.5 slow-query log — previously ❌; now ✅ with
+  `SPG_SLOW_QUERY_LOG_MS` and a JSON-line event on stderr.
+- 5.7 disk water-mark — previously ❌; now ✅ with
+  `SPG_WAL_MIN_FREE_BYTES` and a `statvfs(2)` precheck before
+  every WAL append.
 
-The 7 ⚠️ items are all "works today within documented limits;
-strict invariant deferred to v5":
+All three landed as [machine]-checked e2e tests.
 
-- 1.8 explicit CRC32 (today: truncation caught by length prefix)
+The 2 remaining ❌ items are observability nice-to-haves slotted
+into v4.35 / v4.36 by NEXT.md:
+
+- 4.6 per-table row count metric: cardinality allowlist (v4.35)
+- 4.7 replication lag metric: needs follower → primary RPC (v4.36)
+
+The 6 ⚠️ items are all "works today within documented limits;
+strict invariant deferred per NEXT.md":
+
+- 1.8 explicit CRC32 (today: truncation caught by length prefix; v4.37)
 - 1.11 ENOSPC mid-`write_all` window (today: preflight catches
-  the chaos case; full fix needs auto-commit savepoint)
-- 2.7 explicit drain loop on SIGTERM (today: query timeout bounds)
-- 2.9 netsplit replication chaos (v4.30 deferred)
-- 3.x already enumerated above
-- 5.5 allocator cap (today: SPG_MAX_QUERY_ROWS)
-- 5.6 OOM injection survives (today: Rust panics)
-
-The 26 open items roughly map to v4.29-v4.32 according to the
-parenthetical version tags in the Evidence column. v4.29 closes
-the chaos / disk-full / partial-fsync rows; v4.30 the ops-docs
-rows; v4.31 the API-stability + fuzz rows; v4.32 the SLO + final
-audit pass.
+  the chaos case; full fix needs auto-commit savepoint; v4.34)
+- 2.9 netsplit replication chaos (v4.36)
+- 5.5 per-query memory cap: needs custom global allocator (v5.0)
+- 5.6 OOM injection survives: needs alloc-error hook (v5.0)
+- 7.8 startup config validation (v4.30 candidate; rolled forward)
 
 Each subsequent release should update this snapshot and add new
 `row_X_Y_*` tests for any [machine] rows it lights up.

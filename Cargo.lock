@@ -1219,6 +1219,7 @@ dependencies = [
 name = "spg-server"
 version = "1.0.0"
 dependencies = [
+ "libc",
  "spg-audit",
  "spg-crypto",
  "spg-engine",

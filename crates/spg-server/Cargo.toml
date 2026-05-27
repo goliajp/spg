@@ -17,9 +17,19 @@ spg-engine  = { path = "../spg-engine" }
 spg-storage = { path = "../spg-storage" }
 spg-audit   = { path = "../spg-audit" }
 spg-crypto  = { path = "../spg-crypto" }
+# v4.33 ops three-pack uses POSIX FFI for:
+#   - signal(SIGTERM/SIGINT) to drive graceful shutdown
+#   - statvfs(2) to compute WAL volume free space for the disk water-mark
+# Both are macOS + Linux. Each call site is wrapped in
+# `#[allow(unsafe_code)]` and stays a tight FFI shim.
+libc        = "0.2"
 
 [dev-dependencies]
 spg-audit   = { path = "../spg-audit" }
+# v4.33: e2e_graceful_shutdown sends SIGTERM via kill(2) — the
+# child-process abstraction defaults to SIGKILL which would
+# bypass the drain path under test.
+libc        = "0.2"
 
 [lints]
 workspace = true
