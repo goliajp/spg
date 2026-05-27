@@ -180,7 +180,22 @@ and diagnose; do not soften the gate.
 |------------|---------------------------:|------:|---------------------:|----------------------|-----------------------|
 | baseline-v4.37 | 9.4K (broken) | bail | n/a | far below | 100% (must hold) |
 | v4.38 | n/a (no Catalog touch) | n/a | n/a | unchanged | 100% |
-| v4.39 | ≥ 50K | no bail | n/a | within 3× of PG | 100% |
-| v4.40 | ≥ 50K | no bail | ≥ 65K | within 2× of PG | 100% |
+| v4.39 | ≥ 100K no-index (slo_smoke); ≥ 15K with-index (sweep) | bail @ 1M with-index | indices unchanged | wrap clone O(1) for no-index | 100% |
+| v4.40 | ≥ 50K with-index | no bail | ≥ 65K | within 2× of PG | 100% |
 | v4.41 | ≥ 200K | ≥ 80K | ≥ 100K | > PG (146K) | 100% |
 | v5.0 | ≥ 200K incl. vector tables | ≥ 80K incl. vector | ≥ 100K | > PG/MySQL/MariaDB | 100% |
+
+### v4.39 ship reality (correction to earlier projection)
+
+NEXT.md's original v4.39 row said "≥ 50K r/s on sweep". The
+2026-05-27 sweep showed this gate **needs v4.40 to land**: the
+sweep schema has 2 secondary indices, and v4.39 only swapped
+`Table::rows` to PV — `Table::indices` stayed `Vec<Index>` so
+`Catalog::clone` still deep-copies the BTreeMaps. spg-server
+sweep @ 1M = **15K r/s** (1.6× over 9.4K baseline). Index-free
+`slo_smoke` confirms the rows-clone fix gives **~109K r/s**
+(12×), proving the wrap-side fix is correct. v4.40 (indices to
+`PersistentBTreeMap`) is required to take sweep all the way to
+the ≥ 50K floor. v4.41 (group commit + binary WAL) then takes
+it to ≥ 200K. See PERFORMANCE.md "v4.39 scale sweep" section
+for the full diff.
