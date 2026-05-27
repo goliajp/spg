@@ -897,13 +897,15 @@ fn dispatch(
             }
             // v4.34: when WAL is on and this is an auto-commit write
             // (no client-driven TX in flight, not a TX-control verb),
-            // wrap the engine mutation in an implicit BEGIN..COMMIT
-            // and append the whole [BEGIN, sql, COMMIT] block to the
-            // WAL with one atomic fsync. If the WAL append fails, we
-            // ROLLBACK the implicit TX — the live in-memory state
-            // never sees the half-applied write. Closes the real
-            // ENOSPC mid-`write_all` window that v4.30's preflight
-            // chaos path couldn't fix on its own (PROD_READY 1.11).
+            // wrap the engine mutation in an implicit BEGIN..COMMIT.
+            // v4.41 replaces the original three-v2-record block with
+            // a single v3 `auto_commit_sql` record — same atomicity
+            // (one write_all + one fsync), 35→9 header bytes per
+            // write. If the WAL append fails, we ROLLBACK the
+            // implicit TX — the live in-memory state never sees the
+            // half-applied write. Closes the real ENOSPC mid-
+            // `write_all` window that v4.30's preflight chaos path
+            // couldn't fix on its own (PROD_READY 1.11).
             let needs_wrap = !*in_tx && state.wal.is_some() && !sql_is_tx_control(&sql);
             // v4.30 preflight (chaos path): if SPG_FAIL_WAL_QUOTA_BYTES
             // is set and the block won't fit, reject before any engine
@@ -917,7 +919,7 @@ fn dispatch(
             {
                 let cur = fs::metadata(wal_path).map_or(0, |m| m.len());
                 let needed = if needs_wrap {
-                    wal_block_size(&["BEGIN", &sql, "COMMIT"])
+                    wal_v3_auto_commit_size(&sql)
                 } else {
                     4 + sql.len() as u64
                 };
@@ -961,7 +963,7 @@ fn dispatch(
             // race where in-memory state diverges.
             let wal_result = if was_command_ok && state.wal.is_some() {
                 if needs_wrap {
-                    append_wal_atomic_block(state, &["BEGIN", &sql, "COMMIT"])
+                    append_wal_v3_auto_commit(state, &sql)
                 } else {
                     append_wal(state, &sql)
                 }
@@ -1190,18 +1192,33 @@ fn run_backup_command(
     }
 }
 
-/// v4.37 WAL record format:
-///   v1 (≤ v4.36): `[u32 LE len][len bytes]`
-///   v2 (v4.37+):  `[u32 LE (len | 0x8000_0000)][u32 LE crc32][len bytes]`
+/// WAL record format (sentinel-bit framing across versions):
+///   v1 (≤ v4.36): `[u32 LE len][len bytes]`                                bit 31 = 0
+///   v2 (v4.37+):  `[u32 LE (len | 0x8000_0000)][u32 LE crc32][len bytes]`  bit 31 = 1, bit 30 = 0
+///   v3 (v4.41+):  `[u32 LE (len | 0xC000_0000)][u32 LE crc32][1 byte type][len bytes payload]`
+///                                                                          bit 31 = 1, bit 30 = 1
 ///
-/// Sentinel-bit framing: v1 lengths are constrained to < 2 GiB (in
-/// practice << 64 KiB per SQL), so bit 31 is always clear for v1
-/// records. v4.37+ writers set bit 31 to signal "CRC32 of payload
-/// follows the length"; v4.37+ readers detect and verify. Old v4.x
-/// binaries reading v4.37 WAL crash on the "huge len" — forward-
-/// compat isn't required by STABILITY (clients only need to read
-/// older formats).
+/// v1 lengths are << 2 GiB in practice so bit 31 was free for the
+/// v2 sentinel; v2 lengths are << 1 GiB in practice so bit 30 was
+/// free for v3. `len` in the v3 frame counts only the `payload`
+/// body (the leading type byte is fixed header overhead, kept out
+/// of `len` so the quota math stays simple).
+///
+/// The CRC32 in v3 covers `[type byte || payload]` — the type byte
+/// is integrity-protected too. Unknown type bytes during replay
+/// return a hard error (no silent skip).
+///
+/// Old v4.x binaries reading v3 records crash on the "huge len" —
+/// forward-compat isn't required by STABILITY (clients only need
+/// to read older formats).
 pub(crate) const WAL_V2_SENTINEL: u32 = 0x8000_0000;
+pub(crate) const WAL_V3_FLAG: u32 = 0x4000_0000;
+pub(crate) const WAL_V3_SENTINEL: u32 = WAL_V2_SENTINEL | WAL_V3_FLAG;
+
+/// v4.41 v3 record type tags. Reserve a byte rather than a bit so
+/// future record kinds (binary INSERT, multi-row batch, snapshot
+/// marker) can all share the v3 frame without another sentinel.
+pub(crate) const WAL_V3_TYPE_AUTO_COMMIT_SQL: u8 = 0x01;
 
 fn encode_wal_record(sql: &str) -> std::io::Result<Vec<u8>> {
     let len = u32::try_from(sql.len())
@@ -1219,46 +1236,67 @@ fn encode_wal_record(sql: &str) -> std::io::Result<Vec<u8>> {
     Ok(entry)
 }
 
-/// v4.37+ atomic-block byte total — each v2 record needs 8 bytes
-/// of header (length + CRC32) before the SQL payload. Used by the
-/// preflight quota check so the rejection decision matches what
-/// `append_wal_atomic_block` will actually write.
-fn wal_block_size(sqls: &[&str]) -> u64 {
-    sqls.iter().map(|s| 8u64 + s.len() as u64).sum()
+/// v4.41 v3 encoder. `payload` is the body bytes (semantics
+/// depend on `type_tag`); the returned slice is the framed record
+/// `[sentinel|len][crc32(type||payload)][type][payload]`. The CRC
+/// covers `type` so a corrupted type byte fails the replay check.
+fn encode_wal_v3_record(type_tag: u8, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::other("WAL v3 payload too large"))?;
+    // bit 30 + bit 31 are reserved; payload < 1 GiB in practice
+    // covers any auto-commit SQL or per-INSERT binary batch we ship.
+    if len & (WAL_V2_SENTINEL | WAL_V3_FLAG) != 0 {
+        return Err(std::io::Error::other(
+            "WAL v3 payload size would alias the v4.41 sentinel bits (≥ 1 GiB)",
+        ));
+    }
+    let mut crc_input = Vec::with_capacity(1 + payload.len());
+    crc_input.push(type_tag);
+    crc_input.extend_from_slice(payload);
+    let crc = spg_crypto::crc32::crc32(&crc_input);
+    let mut entry = Vec::with_capacity(9 + payload.len());
+    entry.extend_from_slice(&(len | WAL_V3_SENTINEL).to_le_bytes());
+    entry.extend_from_slice(&crc.to_le_bytes());
+    entry.push(type_tag);
+    entry.extend_from_slice(payload);
+    Ok(entry)
 }
 
-/// v4.34: append several length-prefixed WAL entries with **one**
-/// `write_all` + **one** `fsync`. Used for the auto-commit
-/// BEGIN..COMMIT wrap so the per-write fsync count stays at 1 (vs.
-/// 3 for naive per-statement appends).
-///
-/// Atomic in the operational sense: the OS may still write a torn
-/// suffix if the disk fails partway, but the existing length-prefix
-/// framing + WAL-replay tail-drop (v4.29 row 1.9) handles that —
-/// replay sees zero or more whole entries and stops cleanly at the
-/// first truncated one. The implicit-TX `ROLLBACK` in the dispatch
-/// path then undoes the engine-side state, keeping in-memory and
-/// disk consistent.
-fn append_wal_atomic_block(state: &ServerState, sqls: &[&str]) -> std::io::Result<()> {
+/// v4.41 single-record byte total for the v3 auto-commit wrap.
+/// 9 bytes of header (4 sentinel+len + 4 CRC + 1 type) plus the
+/// SQL payload. Replaces the v4.34 three-v2-record block
+/// (`8+5 BEGIN + 8+sql + 8+6 COMMIT` = 35 + sql bytes) with
+/// 9 + sql bytes — same quota check, smaller footprint.
+fn wal_v3_auto_commit_size(sql: &str) -> u64 {
+    9u64 + sql.len() as u64
+}
+
+/// v4.41 auto-commit wrap, v3 single-record path. Replaces the
+/// v4.34 three-v2-record `[BEGIN, sql, COMMIT]` block with one v3
+/// `type=auto_commit_sql` record. Replay reads the type byte,
+/// runs `engine.execute(sql)` exactly once, and the engine's own
+/// implicit auto-commit moves the catalog forward — semantically
+/// equivalent to BEGIN..stmt..COMMIT at write time, with the
+/// header overhead reduced from 35 bytes (8+5 BEGIN, 8+sql+8+6
+/// COMMIT) to 9 bytes (4+4+1 v3 header) per auto-commit write.
+/// Single `write_all` + single `fsync` — same atomicity story as
+/// the v4.34 block.
+fn append_wal_v3_auto_commit(state: &ServerState, sql: &str) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
-    let total_len: usize = sqls.iter().map(|s| 8 + s.len()).sum();
-    let mut batch = Vec::with_capacity(total_len);
-    for sql in sqls {
-        batch.extend_from_slice(&encode_wal_record(sql)?);
-    }
+    let entry = encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes())?;
     let mut f = wal
         .lock()
         .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
     if let Some(quota) = state.chaos.wal_quota_bytes {
         let current = f.metadata().map_or(0, |m| m.len());
-        if current.saturating_add(batch.len() as u64) > quota {
+        if current.saturating_add(entry.len() as u64) > quota {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
                     "wal quota exceeded: cur={current} + {} > quota={quota} (SPG_FAIL_WAL_QUOTA_BYTES)",
-                    batch.len()
+                    entry.len()
                 ),
             ));
         }
@@ -1276,7 +1314,7 @@ fn append_wal_atomic_block(state: &ServerState, sqls: &[&str]) -> std::io::Resul
             ));
         }
     }
-    f.write_all(&batch)?;
+    f.write_all(&entry)?;
     f.sync_data()?;
     Ok(())
 }
@@ -1362,16 +1400,20 @@ fn wal_volume_free_bytes(path: &Path) -> std::io::Result<u64> {
 }
 
 /// Replay WAL bytes onto `engine`. Returns the number of entries applied.
-/// Handles both record formats:
-///   v1 (≤ v4.36): `[u32 len][len bytes]` — no CRC.
-///   v2 (v4.37+):  `[u32 (len | sentinel)][u32 crc32][len bytes]`.
-/// The format is detected per-record by the sentinel bit; an old
-/// WAL file (v1 records only) replays unchanged, a fresh v4.37 WAL
-/// gets CRC-verified, and a file that interleaves the two (mid-
-/// upgrade) still replays correctly. A truncated trailing entry
-/// (e.g. crash mid-append) is dropped with a warning to stderr.
-/// Non-truncation errors — engine rejected the SQL, bad UTF-8,
-/// CRC mismatch — are fatal: the operator must inspect.
+/// Handles all three record formats:
+///   v1 (≤ v4.36): `[u32 len][len bytes]` — no CRC. bit 31 = 0.
+///   v2 (v4.37+):  `[u32 (len | 0x8000_0000)][u32 crc32][len bytes]`.
+///                 bit 31 = 1, bit 30 = 0.
+///   v3 (v4.41+):  `[u32 (len | 0xC000_0000)][u32 crc32][1 byte type][len bytes payload]`.
+///                 bit 31 = 1, bit 30 = 1. The CRC covers
+///                 `[type byte || payload]`. Unknown type byte is
+///                 fatal — never silently skipped.
+/// The format is detected per-record by the sentinel bits; a WAL
+/// file that interleaves multiple versions (mid-upgrade) still
+/// replays correctly. A truncated trailing entry (e.g. crash mid-
+/// append) is dropped with a warning to stderr. Non-truncation
+/// errors — engine rejected SQL, bad UTF-8, CRC mismatch, unknown
+/// v3 type — are fatal: the operator must inspect.
 fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize> {
     let mut cur = 0;
     let mut applied = 0usize;
@@ -1383,15 +1425,24 @@ fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize>
             );
             break;
         }
+        let frame_off = cur;
         let len_arr: [u8; 4] = bytes[cur..cur + 4].try_into().expect("checked");
         let raw_len = u32::from_le_bytes(len_arr);
         cur += 4;
         let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
-        let len = (raw_len & !WAL_V2_SENTINEL) as usize;
+        let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+        // v3 reuses the v2 sentinel bit + adds bit 30; mask both
+        // when extracting the length so v3 lengths read correctly.
+        let len_mask = if is_v3 {
+            !(WAL_V2_SENTINEL | WAL_V3_FLAG)
+        } else {
+            !WAL_V2_SENTINEL
+        };
+        let len = (raw_len & len_mask) as usize;
         let expected_crc = if is_v2 {
             if bytes.len() - cur < 4 {
                 eprintln!(
-                    "spg-server: v2 WAL truncated at offset {cur} (need 4-byte CRC, have {})",
+                    "spg-server: v2/v3 WAL truncated at offset {cur} (need 4-byte CRC, have {})",
                     bytes.len() - cur
                 );
                 break;
@@ -1402,25 +1453,72 @@ fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize>
         } else {
             None
         };
+        // v3 carries a 1-byte type tag between the CRC and the
+        // payload body. Read it here so the rest of the loop sees
+        // a uniform `payload` slice.
+        let v3_type_tag = if is_v3 {
+            if bytes.len() - cur < 1 {
+                eprintln!(
+                    "spg-server: v3 WAL truncated at offset {cur} (need 1-byte type, have 0)"
+                );
+                break;
+            }
+            let t = bytes[cur];
+            cur += 1;
+            Some(t)
+        } else {
+            None
+        };
         if cur + len > bytes.len() {
-            eprintln!("spg-server: WAL entry truncated (sql_len={len}) — dropping tail");
+            eprintln!("spg-server: WAL entry truncated (payload_len={len}) — dropping tail");
             break;
         }
         let payload = &bytes[cur..cur + len];
         if let Some(expected) = expected_crc {
-            let actual = spg_crypto::crc32::crc32(payload);
+            let actual = if let Some(tag) = v3_type_tag {
+                // CRC covers `[type byte || payload]` in v3 so a
+                // flipped type byte fails the check.
+                let mut buf = Vec::with_capacity(1 + payload.len());
+                buf.push(tag);
+                buf.extend_from_slice(payload);
+                spg_crypto::crc32::crc32(&buf)
+            } else {
+                spg_crypto::crc32::crc32(payload)
+            };
             if actual != expected {
                 return Err(std::io::Error::other(format!(
-                    "WAL CRC mismatch at offset {} (expected={expected:#010x}, computed={actual:#010x}, sql_len={len}) — corruption detected, refusing to replay",
-                    cur - 4
+                    "WAL CRC mismatch at offset {frame_off} (expected={expected:#010x}, computed={actual:#010x}, payload_len={len}) — corruption detected, refusing to replay"
                 )));
             }
         }
-        let sql = core::str::from_utf8(payload)
-            .map_err(|_| std::io::Error::other("WAL entry has non-UTF-8 SQL"))?;
-        engine
-            .execute(sql)
-            .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+        // Dispatch by frame version. v1/v2 payload is the SQL text
+        // directly; v3 routes on the type tag, with `auto_commit_sql`
+        // being the only kind v4.41 emits (engine.execute runs the
+        // statement as an implicit auto-commit, matching the
+        // BEGIN..stmt..COMMIT semantics the writer expressed).
+        if let Some(tag) = v3_type_tag {
+            match tag {
+                WAL_V3_TYPE_AUTO_COMMIT_SQL => {
+                    let sql = core::str::from_utf8(payload).map_err(|_| {
+                        std::io::Error::other("v3 auto_commit_sql payload has non-UTF-8 SQL")
+                    })?;
+                    engine.execute(sql).map_err(|e| {
+                        std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}"))
+                    })?;
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "WAL v3 unknown type byte {other:#04x} at offset {frame_off} — refusing to replay"
+                    )));
+                }
+            }
+        } else {
+            let sql = core::str::from_utf8(payload)
+                .map_err(|_| std::io::Error::other("WAL entry has non-UTF-8 SQL"))?;
+            engine
+                .execute(sql)
+                .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+        }
         cur += len;
         applied += 1;
     }

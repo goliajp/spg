@@ -102,25 +102,77 @@ with the HNSW persistent graph.
 
 ---
 
-## v4.41 — group commit + WAL binary encoding
+## v4.41 — WAL v3 framing + auto-commit wrap merge
 
-Throughput unlock. Once the BEGIN..COMMIT wrap is cheap, the next
-bottleneck is per-statement `fsync`. Group commit batches
-concurrent writers into one fsync; binary WAL drops the text-
-encoded INSERT overhead.
+Cut the per-write WAL header overhead. v4.34 wraps every auto-
+commit write into `[BEGIN, sql, COMMIT]` — three v2 records, three
+8-byte headers, 35 bytes of overhead per write plus the literal
+`"BEGIN"` and `"COMMIT"` SQL bytes. v4.41 introduces a v3 frame
+that carries the same auto-commit semantics in one record:
+
+```
+v3 record:
+  [u32 LE (len | 0xC000_0000)]    ← bit 31 (v2 sentinel kept) + bit 30 (v3 flag)
+  [u32 LE crc32(type_byte || payload)]
+  [1 byte type]
+  [len bytes payload]              ← len counts payload only, not the type byte
+```
+
+`type=0x01 auto_commit_sql` replays via a single `engine.execute(sql)`
+(engine's own implicit auto-commit ≡ the BEGIN..stmt..COMMIT the
+writer expressed). Same atomicity story as v4.34: one `write_all`
++ one `fsync`, identical ENOSPC-rollback chaos coverage. Header
+overhead **35 → 9 bytes per write**.
+
+Group commit / multi-writer batching is **not** in v4.41 — see
+v4.42 for that. v4.34 held the engine `RwLock` write guard across
+WAL append + fsync (Catalog::clone was expensive then), so today
+multi-client writers contend on the *engine* lock, not the WAL
+mutex. Group commit at the WAL layer would have nothing to batch
+without first cutting the engine critical section — which needs
+v4.42's engine MVCC work.
 
 | # | item | est. | rows fixed |
 |---|------|------|------------|
-| 1 | **Group commit at dispatch** — writers contending on the WAL mutex have their bytes batched and `f.sync_data()` runs once for the group. Extend the existing `append_wal_atomic_block` helper to accept N statements. | 1 d | throughput 10.4 |
-| 2 | **WAL binary record** — new type byte (continues the v4.37 sentinel system): `[type=binary][u32 len][u32 crc32][u32 table_id][u32 row_count][packed binary rows...]`. Row body uses the dense schema-driven encoding `Catalog::serialize` already established (FILE_VERSION 8 layout). Replay handles text v1/v2 + binary v3. STABILITY.md documents the new tag. | 1.5 d | 1.8 (WAL extension) |
-| 3 | **Cross-version compat** — `tests/cross_version_compat` gains a v4.41 fixture; v4.31–v4.40 WAL still replays. | 0.5 d | maintains 8.5 |
-| 4 | **Sweep + multi-connection variant** — 4 / 8 client concurrent INSERT @ 1M ≥ MySQL same-conditions × 1.5. Single-client INSERT @ 1M ≥ 200K r/s (target: > PG's 146K). @ 10M ≥ 80K r/s. PERFORMANCE.md "after v4.41". | 0.25 d | PERFORMANCE.md |
+| 1 | **v3 record framing** — `WAL_V3_FLAG = 0x4000_0000`, `WAL_V3_SENTINEL = 0xC000_0000`, `encode_wal_v3_record(type, payload)`, type byte `WAL_V3_TYPE_AUTO_COMMIT_SQL = 0x01`. Replace `append_wal_atomic_block(["BEGIN", sql, "COMMIT"])` with `append_wal_v3_auto_commit(sql)` in dispatch. CRC covers `[type || payload]` so a flipped type byte fails replay. | 0.5 d | 1.8 (WAL extension) |
+| 2 | **Replay three-way dispatch** — v1 (`bit 31 = 0`), v2 (`bit 31 = 1, bit 30 = 0`), v3 (`bit 31 = 1, bit 30 = 1`) in `replay_wal_bytes`. Unknown v3 type byte is fatal — never silently skipped (forward-compat fence). `tests/e2e_wal_binary.rs` covers emit, replay, mixed-version interleave, and unknown-type abort. | 0.5 d | none |
+| 3 | **Cross-version compat fixture** — `xtests/compat-fixtures/v4.41/` captures a v3 WAL (CREATE + 3 INSERT). Run via `cargo test --test cross_version_compat -- --ignored capture_v4_41_fixture` at release time. v4.30 fixture (v1 framing) still replays. | 0.25 d | maintains 8.5 |
+| 4 | **STABILITY.md** — v3 frame + the two sentinel bits + `auto_commit_sql` type tag enter the frozen surface. | 0.25 d | 8.5 |
+| 5 | **Sweep rerun** — `cargo run --release -p spg-bench-competitor --bin sweep`. Honest measurement; spg-server INSERT @ 1M / 10M numbers + diff vs v4.40 land in PERFORMANCE.md "after v4.41". No hard gate this version — the 200K / 80K / multi-client targets carry over to v4.42 where they're structurally addressable. | 0.25 d | PERFORMANCE.md |
 
-Dependencies: v4.40 (so the structural-sharing path is the floor).
-Risk: medium — `fsync` semantics under group commit need a chaos
-test (one writer fails the fsync, the group's failure handling
-fans out correctly). Reuse the v4.37 bit-flip chaos infra for the
-binary-encoding round-trip.
+Dependencies: v4.40.
+Risk: low — framing-only work, no engine changes. The v3 sentinel
+re-uses the bit 30 of the v2 length field; v2 lengths are << 1 GiB
+in practice so the bit was free. Forward-compat for ≤ v4.40
+binaries reading v3 records is not required (STABILITY documents
+this explicitly, same precedent as v2's break of v1 readers).
+
+---
+
+## v4.42 — Engine MVCC + group commit at dispatch
+
+**The hard part of the throughput unlock.** v4.34 made the engine
+`RwLock<Engine>` write guard hold across `BEGIN → execute → WAL →
+COMMIT/ROLLBACK` because at that time `Engine::tx_catalog: Option<Catalog>`
+was a single global slot and `Catalog::clone()` was expensive — there
+was no way to let two implicit TXs be in flight without each one
+seeing the other's mutation. v4.40 (PV + PBTreeMap) makes
+`Catalog::clone()` O(1) at any scale, which removes the cost half
+of that reasoning. v4.42 removes the structural half: the engine
+gets N in-flight TX slots, dispatch lets N writers prepare in
+parallel, and one fsync covers the whole batch.
+
+| # | item | est. | rows fixed |
+|---|------|------|------------|
+| 1 | **`Engine::tx_catalog: BTreeMap<TxId, Catalog>`** — replace the `Option<Catalog>` slot. `Engine::execute(sql, tx_id)` threads a per-connection `TxId`. `BEGIN` → allocate `TxId`, clone catalog into the map (O(1) by v4.40); `COMMIT` → install map entry over catalog; `ROLLBACK` → drop map entry. Implicit auto-commits get a one-shot `TxId`. | 2 d | structural |
+| 2 | **Dispatch — split engine.write() critical section** — engine `RwLock` guard wraps only the install phase. Writers prepare in parallel under `engine.read()`: each pulls its catalog clone into a `TxId`, runs `engine.execute(sql, tx_id)`, encodes the v3 WAL record. Then they queue on a `commit_seq` channel; the leader drains the queue, single `write_all` + single `fsync` covers the batch, then each entry's install runs under one short `engine.write()`. | 1.5 d | throughput 10.4 |
+| 3 | **Group fsync failure fan-out** — `tests/e2e_chaos.rs` gains a multi-client variant of `chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state`: when the leader's `fsync` errors, every queued writer's `TxId` rolls back. No phantom rows survive. | 0.75 d | 1.11 multi-client |
+| 4 | **Sweep + multi-connection variant** — extend `xbench/competitor/src/bin/sweep.rs` (or new `concurrent_sweep.rs`) to drive 4 / 8 client concurrent INSERT @ 1M against all backends. Gate: spg-server ≥ MySQL × 1.5 at 4 clients; single-client @ 1M ≥ 200K r/s (this is where the 200K gate actually becomes structurally reachable); @ 10M ≥ 80K. PERFORMANCE.md "after v4.42". | 0.5 d | PERFORMANCE.md |
+
+Dependencies: v4.41 (v3 framing is the substrate batching writes into).
+Risk: high — engine MVCC touches `execute()` dispatch + the
+implicit-TX path the chaos tests pin. Reuse the v4.37 bit-flip
+chaos infra for fsync failures.
 
 ---
 
@@ -137,7 +189,7 @@ v4.38-v4.40 vector-table carve-out).
 | 4 | **Perf-regression gate** — allocator hot-path atomics + HNSW persistent walk; latency bench must hold SLO ceilings. Sweep at all N including 100M with vector-indexed tables. | 0.5 d | maintains 10.4 / 10.5 |
 | 5 | **STABILITY.md v2 contract** — restate frozen surfaces; v5 cuts `SPG_FAIL_WAL_QUOTA_BYTES` chaos knob (real ENOSPC has full coverage). | 0.5 d | renews 8.5 |
 
-Dependencies: v4.41 (binary WAL stable before SemVer major).
+Dependencies: v4.42 (group commit + MVCC stable before SemVer major).
 Risk: high — allocator hook + HNSW persistent are both touchy.
 Bench gate is mandatory at this step.
 
@@ -165,9 +217,10 @@ Bench gate is mandatory at this step.
 | v4.38   | PersistentVec<T> (BVT)                          |       2.0 |
 | v4.39   | Catalog/Table internals on PV                   |       2.5 |
 | v4.40   | PersistentBTreeMap + Table::indices migration   |       3.25|
-| v4.41   | group commit + binary WAL                       |       3.25|
+| v4.41   | WAL v3 framing + auto-commit wrap merge         |       1.75|
+| v4.42   | Engine MVCC + group commit at dispatch          |       4.75|
 | v5.0.0  | HNSW persistent + allocator + OOM               |      10.0 |
-| **total** |                                               |    **21.0 d** |
+| **total** |                                               |    **24.25 d** |
 
 ---
 
@@ -182,7 +235,8 @@ and diagnose; do not soften the gate.
 | v4.38 | n/a (no Catalog touch) | n/a | n/a | unchanged | 100% |
 | v4.39 | ≥ 100K no-index (slo_smoke); ≥ 15K with-index (sweep) | bail @ 1M with-index | indices unchanged | wrap clone O(1) for no-index | 100% |
 | v4.40 | ≥ 50K with-index | no bail | ≥ 65K | within 2× of PG | 100% |
-| v4.41 | ≥ 200K | ≥ 80K | ≥ 100K | > PG (146K) | 100% |
+| v4.41 | honest measurement (see PERFORMANCE.md "after v4.41") | honest measurement | honest measurement | header overhead 35→9 bytes/write | 100% |
+| v4.42 | ≥ 200K (single client); ≥ MySQL × 1.5 (4 clients) | ≥ 80K | ≥ 100K | > PG (146K) | 100% |
 | v5.0 | ≥ 200K incl. vector tables | ≥ 80K incl. vector | ≥ 100K | > PG/MySQL/MariaDB | 100% |
 
 ### v4.39 ship reality (correction to earlier projection)
@@ -196,6 +250,8 @@ sweep @ 1M = **15K r/s** (1.6× over 9.4K baseline). Index-free
 `slo_smoke` confirms the rows-clone fix gives **~109K r/s**
 (12×), proving the wrap-side fix is correct. v4.40 (indices to
 `PersistentBTreeMap`) is required to take sweep all the way to
-the ≥ 50K floor. v4.41 (group commit + binary WAL) then takes
-it to ≥ 200K. See PERFORMANCE.md "v4.39 scale sweep" section
-for the full diff.
+the ≥ 50K floor. v4.41 (v3 framing + auto-commit wrap merge)
+trims per-write header overhead from 35 to 9 bytes; v4.42
+(engine MVCC + group commit) is where the ≥ 200K gate
+becomes structurally reachable. See PERFORMANCE.md "v4.39
+scale sweep" section for the full diff.

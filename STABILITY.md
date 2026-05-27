@@ -93,6 +93,46 @@ The 4-corpus pass rate is enforced by `cargo run -p sqllogictest
 --release` — `prod_ready` row 6.1 (manual eyeball; CI runs it
 via the workspace test job).
 
+### WAL record format
+
+The WAL is a contiguous byte stream of length-prefixed records.
+Three on-disk formats coexist (writers from a given version emit
+one shape, replay accepts all three):
+
+- **v1** (≤ v4.36): `[u32 LE len][len bytes SQL]`. Bit 31 of the
+  length is always clear in practice — v1 records are < 2 GiB.
+- **v2** (v4.37+): `[u32 LE (len | 0x8000_0000)][u32 LE crc32(payload)][len bytes SQL]`.
+  Bit 31 = 1 is the sentinel; bit 30 = 0. CRC32 covers the SQL
+  payload.
+- **v3** (v4.41+): `[u32 LE (len | 0xC000_0000)][u32 LE crc32(type_byte || payload)][1 byte type][len bytes payload]`.
+  Bit 31 = 1, bit 30 = 1. CRC32 covers `[type byte || payload]` —
+  a flipped type byte fails the check. `len` counts payload only;
+  the type byte is fixed header overhead, kept out of `len` so
+  preflight quota math stays linear.
+
+v3 type tags (assignable byte-wide; the namespace is the v3
+frame's extension point):
+
+- `0x01` — `auto_commit_sql`: payload = SQL bytes. Replay routes
+  through `engine.execute(sql)` — the engine's implicit auto-
+  commit is semantically equivalent to the v4.34 `[BEGIN, sql,
+  COMMIT]` block the writer expressed, with the header overhead
+  reduced from 35 to 9 bytes per write.
+
+Backwards-compat rule: every v4.x release accepts every WAL
+record format ever written. `tests/cross_version_compat.rs`
+holds one fixture per format era (`xtests/compat-fixtures/v4.30/`
+for v1, `xtests/compat-fixtures/v4.41/` for v3). Unknown v3 type
+bytes are **fatal** during replay — never silently skipped. This
+is the forward-compat fence: any new type tag must ship with a
+binary that handles it (or, if the on-disk shape changes, bump to
+a v4 frame).
+
+Forward-compat is not promised: a ≤ v4.36 binary reading v2 (or
+≤ v4.40 reading v3) sees a "huge" length field and aborts. This
+follows the same precedent v2 set when it broke v1 readers — the
+STABILITY contract is one-way (newer reads older).
+
 ### Snapshot file format
 
 - Magic: `SPGDB001` (bare catalog) or `SPGENV01` (envelope with

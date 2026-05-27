@@ -1,0 +1,5 @@
+table=compat
+rows=3
+sum_score=277
+max_score=100
+first_name=alice

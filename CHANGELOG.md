@@ -10,6 +10,136 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.41.0] — 2026-05-28 (WAL v3 framing — auto-commit wrap merge, 35→9 byte header)
+
+### What the v3 frame is
+
+  // NEW constants in crates/spg-server/src/main.rs
+  pub(crate) const WAL_V2_SENTINEL: u32 = 0x8000_0000;   // kept (v2 reader anchor)
+  pub(crate) const WAL_V3_FLAG: u32     = 0x4000_0000;
+  pub(crate) const WAL_V3_SENTINEL: u32 = 0xC000_0000;   // both bits set = v3
+
+  pub(crate) const WAL_V3_TYPE_AUTO_COMMIT_SQL: u8 = 0x01;
+
+v3 record layout:
+
+  [u32 LE (len | 0xC000_0000)]            // bit 31 = v2 sentinel; bit 30 = v3 flag
+  [u32 LE crc32(type_byte || payload)]    // type byte is integrity-protected too
+  [1 byte type]
+  [len bytes payload]                     // len counts payload, not the type byte
+
+v2 (v4.37) lengths are << 1 GiB in practice so bit 30 was free for
+the v3 flag — same trick v2 used to claim bit 31 from v1. ≤ v4.40
+binaries reading v3 records crash on the "huge len"; forward-compat
+isn't promised by STABILITY (newer reads older, never the other way).
+
+### What this closes
+
+  v4.34 wrapped every auto-commit write into three v2 records:
+    [BEGIN]   = 8-byte v2 header + 5 bytes "BEGIN"
+    [sql]     = 8-byte v2 header + sql bytes
+    [COMMIT]  = 8-byte v2 header + 6 bytes "COMMIT"
+    -------- = 35 bytes overhead per auto-commit write
+
+  v4.41 collapses the same semantics into one v3 record:
+    [v3 frame] = 9-byte header (4 sentinel+len, 4 CRC, 1 type) + sql bytes
+    -------- = 9 bytes overhead per auto-commit write
+
+The atomicity story is identical — `append_wal_v3_auto_commit` does
+one `write_all` + one `fsync` under the WAL mutex, same as the v4.34
+block did. Replay reads the type byte, runs `engine.execute(sql)` once,
+and the engine's implicit auto-commit moves the catalog forward —
+semantically equivalent to BEGIN..stmt..COMMIT at write time. v4.34's
+ENOSPC-rollback chaos coverage stays green (`e2e_chaos.rs::chaos_disk_
+full_no_preflight_rolls_back_in_memory_to_match_durable_state` exercises
+the new path end-to-end).
+
+### Group commit is *not* in v4.41
+
+The v4.34 wrap held `engine: RwLock<Engine>` write guard across BEGIN
+→ execute → WAL → COMMIT/ROLLBACK because Catalog::clone was
+expensive then (single `Option<Catalog>` slot, value-copy clone). All
+write-path traffic is still serialized on that engine lock, not on
+the WAL mutex — group commit at the WAL layer would have nothing to
+batch. v4.40 made Catalog::clone O(1) at any scale, removing the
+cost half of v4.34's reasoning. v4.42 will remove the structural
+half: engine MVCC (`tx_catalog: BTreeMap<TxId, Catalog>`) + dispatch
+splits the engine.write() critical section + group commit at install
+phase. See NEXT.md "v4.42" section.
+
+### Replay three-way dispatch
+
+  crates/spg-server/src/main.rs::replay_wal_bytes()
+    if bit 31 == 0                       → v1 (no CRC)
+    if bit 31 == 1 && bit 30 == 0        → v2 (CRC over payload)
+    if bit 31 == 1 && bit 30 == 1        → v3 (CRC over type||payload, type-byte dispatch)
+    unknown v3 type                      → fatal error (no silent skip)
+
+The unknown-type abort is the **forward-compat fence**: any future
+type tag must ship with a binary that knows how to replay it. This
+is enforced by `e2e_wal_binary.rs::unknown_v3_type_byte_aborts_replay`.
+
+### Test coverage
+
+  crates/spg-server/tests/e2e_wal_binary.rs (new, 4 tests):
+    auto_commit_write_emits_single_v3_record       — 3 writes → 3 v3 records (not 9 v2)
+    v3_wal_replays_into_matching_engine_state      — round-trip via restart
+    unknown_v3_type_byte_aborts_replay             — forward-compat fence
+    interleaved_v2_and_v3_records_replay           — mixed WAL (upgrade scenario)
+
+  xtests/compat-fixtures/v4.41/ (new):
+    a.wal       — 4 v3 records (CREATE compat + 3 INSERTs)
+    full.bkp    — SPGBKUP\x02 bundle of the same state
+    expected.txt — table=compat, rows=3, sum_score=277, max_score=100, first_name=alice
+    captured by `cargo test --test cross_version_compat -- --ignored capture_v4_41_fixture`
+
+  cross_version_compat now exercises v4.30 (v1 framing) + v4.41 (v3 framing).
+  Every prior format era stays replayable.
+
+### Sweep delta (vs v4.40)
+
+See PERFORMANCE.md "after v4.41" — spg-server INSERT 1M: 66K → 76.6K r/s
+(+16%), 10M: 49K → 59.4K r/s (+21%, no RSS bail). The 200K single-client
+gate from NEXT.md's earlier projection moves to v4.42 where it becomes
+structurally reachable (engine MVCC + group commit).
+
+### Files touched
+
+  crates/spg-server/src/main.rs:
+    + WAL_V3_FLAG / WAL_V3_SENTINEL / WAL_V3_TYPE_AUTO_COMMIT_SQL
+    + encode_wal_v3_record(type_tag, payload)
+    + wal_v3_auto_commit_size(sql)
+    + append_wal_v3_auto_commit(state, sql)
+    - append_wal_atomic_block() removed (replaced by the v3 path)
+    - wal_block_size() removed (replaced by wal_v3_auto_commit_size)
+    ~ replay_wal_bytes() extended to v1/v2/v3 three-way dispatch
+    ~ dispatch site (Op::Query): uses append_wal_v3_auto_commit + wal_v3_auto_commit_size
+
+  crates/spg-server/src/replication.rs:
+    ~ follower's WAL record accumulator now decodes v1 + v2 + v3 (was v1 + v2).
+      Same dispatch shape as replay_wal_bytes — sentinel bits select format,
+      v3 picks up the 1-byte type tag and verifies CRC over [type||payload].
+      Unknown v3 type bytes abort follower apply (no silent skip).
+
+  crates/spg-server/tests/e2e_wal_binary.rs (new)
+  crates/spg-server/tests/cross_version_compat.rs (+capture_v4_41_fixture)
+  crates/spg-server/tests/prod_ready.rs (static gate now greps for append_wal_v3_auto_commit)
+  crates/spg-server/tests/e2e_chaos_netsplit.rs — no change; pinned the replication fix above.
+
+  xtests/compat-fixtures/v4.41/ (new)
+  STABILITY.md (new ### WAL record format section — v1/v2/v3 frozen surface)
+  NEXT.md (v4.41 rewrite + new v4.42 section + perf gate matrix refresh)
+  PERFORMANCE.md (after v4.41 section)
+  PROD_READY.md (1.11 row reference)
+
+### Test verification
+
+  cargo test --release --workspace                              # all green
+  cargo clippy --workspace --all-targets -- -D warnings         # 0 warnings
+  cargo fmt --all -- --check                                    # clean
+
+---
+
 ## [4.40.0] — 2026-05-27 (persistent B-tree index — cheap clone with secondary indices too)
 
 ### Closes the v4.39 carve-out
