@@ -14,6 +14,7 @@ pub mod users;
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
@@ -301,20 +302,59 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     EnvelopeParse::Pair(catalog, users)
 }
 
+/// v4.41.1 opaque transaction handle. Returned by `Engine::alloc_tx_id`,
+/// threaded through `Engine::execute_in` so dispatch can identify which
+/// in-flight TX a statement belongs to. `IMPLICIT_TX` is the reserved
+/// slot every legacy caller — engine self-tests, spg-cli, spg-embedded,
+/// startup replay — implicitly uses through the unchanged
+/// `Engine::execute(sql)` API. v4.41.1 keeps at most one active slot at
+/// runtime (dispatch holds `engine.write()` across the wrap, same as
+/// v4.34); the map shape is here to let v4.42 turn on N in-flight
+/// implicit TXs without reshuffling the engine internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TxId(pub u64);
+
+/// Reserved slot used by `Engine::execute(sql)` — the legacy single-
+/// global-shadow path. New `alloc_tx_id` handles start at 1.
+pub const IMPLICIT_TX: TxId = TxId(0);
+
+/// Per-slot transaction state. Held inside `tx_catalogs[tx_id]` for the
+/// lifetime of a BEGIN..COMMIT (or BEGIN..ROLLBACK) window. Drops when
+/// the TX commits (its `catalog` is moved over `Engine.catalog`) or
+/// rolls back (slot removed, catalog discarded).
+#[derive(Debug, Default, Clone)]
+struct TxState {
+    /// The TX's shadow copy of the catalog. Started as a clone of
+    /// `Engine.catalog` at BEGIN time; writes flow into it; COMMIT
+    /// installs it over `Engine.catalog`. `Catalog::clone()` is O(1)
+    /// since v4.40 (`PersistentVec` rows + `PersistentBTreeMap` indices).
+    catalog: Catalog,
+    /// Per-TX savepoint stack. Each entry pairs the savepoint name with
+    /// a clone of `catalog` at the moment `SAVEPOINT <name>` fired.
+    /// `ROLLBACK TO <name>` restores from the entry and pops everything
+    /// after it; `RELEASE <name>` discards the entry and everything
+    /// after; COMMIT/ROLLBACK clears the whole stack.
+    savepoints: Vec<(String, Catalog)>,
+}
+
 #[derive(Debug, Default)]
 pub struct Engine {
     /// Committed catalog — what survives `Engine::snapshot()` and what
     /// outside-TX `SELECT`s read.
     catalog: Catalog,
-    /// While `Some(_)`, all writes go into this shadow copy. `COMMIT` swaps
-    /// it into `catalog`; `ROLLBACK` drops it. SELECTs during a TX read the
-    /// shadow so they see uncommitted changes (own-write visibility).
-    tx_catalog: Option<Catalog>,
-    /// Named savepoints captured during the active transaction. Each
-    /// entry holds the catalog snapshot at the moment `SAVEPOINT <name>`
-    /// fired; `ROLLBACK TO <name>` restores from the entry and pops
-    /// every savepoint after it. Empty outside a TX.
-    savepoints: Vec<(String, Catalog)>,
+    /// Active TX slots, keyed by `TxId`. Empty when no TX is in flight.
+    /// v4.41.1 runtime invariant: at most one entry (single-writer
+    /// model unchanged). v4.42 will let dispatch hold multiple entries
+    /// concurrently for group commit + engine MVCC.
+    tx_catalogs: BTreeMap<TxId, TxState>,
+    /// Which slot the next exec_* call should mutate. Set by
+    /// `execute_in(sql, tx_id)` at the entry point; legacy `execute(sql)`
+    /// sets it to `IMPLICIT_TX`. None when no TX is in flight (read /
+    /// write goes straight against `catalog`).
+    current_tx: Option<TxId>,
+    /// Monotonic counter for `alloc_tx_id`. Starts at 1 — slot 0 is
+    /// reserved for `IMPLICIT_TX`.
+    next_tx_id: u64,
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
@@ -340,8 +380,9 @@ impl Engine {
     pub fn new() -> Self {
         Self {
             catalog: Catalog::new(),
-            tx_catalog: None,
-            savepoints: Vec::new(),
+            tx_catalogs: BTreeMap::new(),
+            current_tx: None,
+            next_tx_id: 1,
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -354,8 +395,9 @@ impl Engine {
     pub fn restore(catalog: Catalog) -> Self {
         Self {
             catalog,
-            tx_catalog: None,
-            savepoints: Vec::new(),
+            tx_catalogs: BTreeMap::new(),
+            current_tx: None,
+            next_tx_id: 1,
             clock: None,
             salt_fn: None,
             max_query_rows: None,
@@ -375,8 +417,9 @@ impl Engine {
                     .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
                 Ok(Self {
                     catalog,
-                    tx_catalog: None,
-                    savepoints: Vec::new(),
+                    tx_catalogs: BTreeMap::new(),
+                    current_tx: None,
+                    next_tx_id: 1,
                     clock: None,
                     salt_fn: None,
                     max_query_rows: None,
@@ -489,19 +532,43 @@ impl Engine {
         }
     }
 
-    pub const fn in_transaction(&self) -> bool {
-        self.tx_catalog.is_some()
+    /// True when at least one TX slot is in flight. v4.41.1 runtime
+    /// invariant: at most one slot active at a time (dispatch holds
+    /// `engine.write()` across the entire wrap). v4.42 will let this
+    /// return true with multiple slots concurrently.
+    pub fn in_transaction(&self) -> bool {
+        !self.tx_catalogs.is_empty()
+    }
+
+    /// v4.41.1 allocate a fresh TX handle. Used by spg-server dispatch
+    /// to scope each implicit-wrap BEGIN..stmt..COMMIT to its own slot
+    /// in `tx_catalogs`. v4.42 will let multiple of these be live
+    /// concurrently — for now dispatch still holds `engine.write()` over
+    /// the whole wrap, so the map carries one entry at a time.
+    pub fn alloc_tx_id(&mut self) -> TxId {
+        let id = TxId(self.next_tx_id);
+        self.next_tx_id = self.next_tx_id.saturating_add(1);
+        id
     }
 
     fn active_catalog(&self) -> &Catalog {
-        self.tx_catalog.as_ref().unwrap_or(&self.catalog)
+        match self.current_tx {
+            Some(t) => self
+                .tx_catalogs
+                .get(&t)
+                .map_or(&self.catalog, |s| &s.catalog),
+            None => &self.catalog,
+        }
     }
 
     fn active_catalog_mut(&mut self) -> &mut Catalog {
-        if let Some(tx) = self.tx_catalog.as_mut() {
-            tx
-        } else {
-            &mut self.catalog
+        let tx = self.current_tx;
+        match tx {
+            Some(t) => match self.tx_catalogs.get_mut(&t) {
+                Some(s) => &mut s.catalog,
+                None => &mut self.catalog,
+            },
+            None => &mut self.catalog,
         }
     }
 
@@ -564,15 +631,50 @@ impl Engine {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
-        self.execute_with_cancel(sql, CancelToken::none())
+        self.execute_in_with_cancel(sql, IMPLICIT_TX, CancelToken::none())
     }
 
-    /// v4.5 — write path with cooperative cancellation. Token is
-    /// checked at entry and then by `exec_update` / `exec_delete` /
-    /// `exec_select_cancel` row-loop checkpoints. INSERT, DDL, and
-    /// TX-state ops complete atomically and don't honour the token —
-    /// killing those mid-flight would leave the catalog half-mutated.
+    /// v4.5 — write path with cooperative cancellation. Same dispatch
+    /// as `execute_in_with_cancel(sql, IMPLICIT_TX, cancel)`. Kept as
+    /// a separate entry point for backward-compat with the v4.5
+    /// public API.
     pub fn execute_with_cancel(
+        &mut self,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_in_with_cancel(sql, IMPLICIT_TX, cancel)
+    }
+
+    /// v4.41.1 multi-slot write entry. Routes `sql` through the TX
+    /// slot identified by `tx_id` so spg-server dispatch can scope
+    /// each implicit-wrap BEGIN..stmt..COMMIT to its own slot in
+    /// `tx_catalogs`. `IMPLICIT_TX` is the legacy single-slot path
+    /// every other caller (engine self-tests, replay, spg-embedded)
+    /// implicitly takes via `execute()` / `execute_with_cancel()`.
+    pub fn execute_in(&mut self, sql: &str, tx_id: TxId) -> Result<QueryResult, EngineError> {
+        self.execute_in_with_cancel(sql, tx_id, CancelToken::none())
+    }
+
+    /// v4.41.1 write path with cooperative cancellation + explicit TX
+    /// scope. Sets `self.current_tx` for the duration of the call so
+    /// every `exec_*` helper transparently sees its TX's shadow
+    /// catalog and savepoint stack; restores on exit so the field is
+    /// only valid mid-call (no leakage across calls).
+    pub fn execute_in_with_cancel(
+        &mut self,
+        sql: &str,
+        tx_id: TxId,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let saved = self.current_tx;
+        self.current_tx = Some(tx_id);
+        let result = self.execute_inner_with_cancel(sql, cancel);
+        self.current_tx = saved;
+        result
+    }
+
+    fn execute_inner_with_cancel(
         &mut self,
         sql: &str,
         cancel: CancelToken<'_>,
@@ -866,11 +968,17 @@ impl Engine {
     }
 
     fn exec_begin(&mut self) -> Result<QueryResult, EngineError> {
-        if self.tx_catalog.is_some() {
+        let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        if self.tx_catalogs.contains_key(&tx_id) {
             return Err(EngineError::TransactionAlreadyOpen);
         }
-        self.tx_catalog = Some(self.catalog.clone());
-        self.savepoints.clear();
+        self.tx_catalogs.insert(
+            tx_id,
+            TxState {
+                catalog: self.catalog.clone(),
+                savepoints: Vec::new(),
+            },
+        );
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -878,14 +986,15 @@ impl Engine {
     }
 
     fn exec_commit(&mut self) -> Result<QueryResult, EngineError> {
-        let shadow = self
-            .tx_catalog
-            .take()
+        let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        let state = self
+            .tx_catalogs
+            .remove(&tx_id)
             .ok_or(EngineError::NoActiveTransaction)?;
-        self.catalog = shadow;
+        self.catalog = state.catalog;
         // All savepoints become permanent at COMMIT and the stack
-        // resets for the next TX.
-        self.savepoints.clear();
+        // resets for the next TX (`state.savepoints` is discarded with
+        // `state`).
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: true,
@@ -893,10 +1002,11 @@ impl Engine {
     }
 
     fn exec_rollback(&mut self) -> Result<QueryResult, EngineError> {
-        if self.tx_catalog.take().is_none() {
+        let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        if self.tx_catalogs.remove(&tx_id).is_none() {
             return Err(EngineError::NoActiveTransaction);
         }
-        self.savepoints.clear();
+        // savepoints discarded with the TxState
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -904,19 +1014,17 @@ impl Engine {
     }
 
     fn exec_savepoint(&mut self, name: String) -> Result<QueryResult, EngineError> {
-        if self.tx_catalog.is_none() {
-            return Err(EngineError::NoActiveTransaction);
-        }
+        let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        let state = self
+            .tx_catalogs
+            .get_mut(&tx_id)
+            .ok_or(EngineError::NoActiveTransaction)?;
         // PG re-uses an existing savepoint name by dropping the older
         // entry and pushing a fresh one — match that behaviour so
         // application code can `SAVEPOINT sp; ...; SAVEPOINT sp` freely.
-        self.savepoints.retain(|(n, _)| n != &name);
-        let snapshot = self
-            .tx_catalog
-            .as_ref()
-            .expect("tx_catalog checked above")
-            .clone();
-        self.savepoints.push((name, snapshot));
+        state.savepoints.retain(|(n, _)| n != &name);
+        let snapshot = state.catalog.clone();
+        state.savepoints.push((name, snapshot));
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -924,10 +1032,12 @@ impl Engine {
     }
 
     fn exec_rollback_to_savepoint(&mut self, name: &str) -> Result<QueryResult, EngineError> {
-        if self.tx_catalog.is_none() {
-            return Err(EngineError::NoActiveTransaction);
-        }
-        let pos = self
+        let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        let state = self
+            .tx_catalogs
+            .get_mut(&tx_id)
+            .ok_or(EngineError::NoActiveTransaction)?;
+        let pos = state
             .savepoints
             .iter()
             .rposition(|(n, _)| n == name)
@@ -937,9 +1047,9 @@ impl Engine {
         // The savepoint stays on the stack (PG semantics): a later
         // `RELEASE` or further `ROLLBACK TO` is still allowed. Everything
         // after it is discarded.
-        let snapshot = self.savepoints[pos].1.clone();
-        self.savepoints.truncate(pos + 1);
-        self.tx_catalog = Some(snapshot);
+        let snapshot = state.savepoints[pos].1.clone();
+        state.savepoints.truncate(pos + 1);
+        state.catalog = snapshot;
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -947,10 +1057,12 @@ impl Engine {
     }
 
     fn exec_release_savepoint(&mut self, name: &str) -> Result<QueryResult, EngineError> {
-        if self.tx_catalog.is_none() {
-            return Err(EngineError::NoActiveTransaction);
-        }
-        let pos = self
+        let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        let state = self
+            .tx_catalogs
+            .get_mut(&tx_id)
+            .ok_or(EngineError::NoActiveTransaction)?;
+        let pos = state
             .savepoints
             .iter()
             .rposition(|(n, _)| n == name)
@@ -959,7 +1071,7 @@ impl Engine {
             })?;
         // RELEASE keeps the work since the savepoint, just discards the
         // bookmark plus everything nested under it.
-        self.savepoints.truncate(pos);
+        state.savepoints.truncate(pos);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
