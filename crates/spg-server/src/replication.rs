@@ -236,14 +236,16 @@ fn tail_wal_v1(mut stream: TcpStream, wal_path: &Path, start_offset: u64) -> std
 /// type `0x01` status frame at least every `STATUS_INTERVAL` whether
 /// or not new WAL bytes arrived. Status frames carry the master's
 /// current WAL file size + wall-clock so the follower can compute
-/// both `lag_bytes` (primary_pos − applied_pos) and `lag_seconds`
+/// both `lag_bytes` (`primary_pos` − `applied_pos`) and `lag_seconds`
 /// (now − last status wall time).
 fn tail_wal_v2(mut stream: TcpStream, wal_path: &Path, start_offset: u64) -> std::io::Result<()> {
     let mut f = std::fs::File::open(wal_path)?;
     f.seek(SeekFrom::Start(start_offset))?;
     let mut current_offset = start_offset;
     let mut buf = [0u8; 4096];
-    let mut last_status = std::time::Instant::now() - STATUS_INTERVAL;
+    let mut last_status = std::time::Instant::now()
+        .checked_sub(STATUS_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         let n = f.read(&mut buf)?;
         if n > 0 {
@@ -315,6 +317,7 @@ pub fn run_follower(
     }
 }
 
+#[allow(clippy::too_many_lines)] // tight inline frame parser; splitting would scatter the v2-format branches
 fn follow_once(
     master_addr: &str,
     db_path: &Path,
@@ -465,26 +468,24 @@ fn follow_once(
                     .follower_applied_pos
                     .store(applied_offset, Ordering::Release);
             }
-            FRAME_TYPE_STATUS => {
-                if payload.len() == 16 {
-                    let primary_pos = u64::from_le_bytes(payload[..8].try_into().unwrap());
-                    let wall_time_us = u64::from_le_bytes(payload[8..].try_into().unwrap());
-                    state
-                        .lag_state
-                        .primary_pos
-                        .store(primary_pos, Ordering::Release);
-                    state
-                        .lag_state
-                        .primary_wall_time_us
-                        .store(wall_time_us, Ordering::Release);
-                }
-                // Unknown payload size on a known frame type: ignore.
-                // The frame layout could grow in a future version and
-                // older followers should tolerate the trailing bytes.
+            FRAME_TYPE_STATUS if payload.len() == 16 => {
+                let primary_pos = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                let wall_time_us = u64::from_le_bytes(payload[8..].try_into().unwrap());
+                state
+                    .lag_state
+                    .primary_pos
+                    .store(primary_pos, Ordering::Release);
+                state
+                    .lag_state
+                    .primary_wall_time_us
+                    .store(wall_time_us, Ordering::Release);
             }
             _ => {
-                // Unknown frame type — same forward-compat rule:
-                // skip the payload and keep going.
+                // Two forward-compat cases collapsed:
+                // - FRAME_TYPE_STATUS with a size we don't recognise
+                //   (the layout could grow in a future version)
+                // - completely unknown frame type
+                // Either way: skip the payload and keep going.
             }
         }
     }

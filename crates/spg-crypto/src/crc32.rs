@@ -15,7 +15,12 @@ const POLY: u32 = 0xEDB8_8320;
 
 /// Precomputed table (filled lazily by `ensure_table`). `AtomicU32`
 /// is `Sync` and gives us interior mutability without an
-/// `UnsafeCell` dance.
+/// `UnsafeCell` dance. The `[ZERO; 256]` initialization
+/// deliberately gets 256 distinct atomics — the
+/// declare-interior-mutable-const lint warns about the const-as-
+/// expression footgun (where two readers would share the same
+/// underlying value), which doesn't apply here.
+#[allow(clippy::declare_interior_mutable_const)]
 static TABLE: [AtomicU32; 256] = {
     const ZERO: AtomicU32 = AtomicU32::new(0);
     [ZERO; 256]
