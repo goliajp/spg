@@ -76,6 +76,15 @@ struct Limits {
     idle_timeout_sec: Option<u64>,
 }
 
+/// v4.29 chaos: when set, the WAL appender refuses any write that
+/// would push the on-disk WAL past this byte count. Returns a
+/// clear ENOSPC-like error to the caller; the server stays alive
+/// and previously committed state is intact. Zero cost when unset.
+#[derive(Debug, Default, Clone, Copy)]
+struct ChaosKnobs {
+    wal_quota_bytes: Option<u64>,
+}
+
 pub(crate) struct ServerState {
     /// v4.0: `RwLock` instead of `Mutex` so read-only statements
     /// (SELECT / SHOW outside an active TX) can run in parallel
@@ -102,6 +111,10 @@ pub(crate) struct ServerState {
     /// v4.13: observability counters surfaced via /metrics. Cheap
     /// Relaxed atomics — increment from any dispatch site.
     metrics: Arc<observability::Metrics>,
+    /// v4.29: optional failure-injection knobs used by chaos tests.
+    /// All branches default-off and skip the check entirely when
+    /// the env var wasn't set on startup.
+    chaos: ChaosKnobs,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
@@ -283,6 +296,9 @@ fn run(
     } else {
         ""
     };
+    let chaos = ChaosKnobs {
+        wal_quota_bytes: parse_env_u64("SPG_FAIL_WAL_QUOTA_BYTES"),
+    };
     let state = Arc::new(ServerState {
         engine: RwLock::new(engine),
         db_path,
@@ -294,6 +310,7 @@ fn run(
         limits,
         active_connections: AtomicUsize::new(0),
         metrics: Arc::new(observability::Metrics::default()),
+        chaos,
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -962,6 +979,21 @@ fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
     let mut f = wal
         .lock()
         .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
+    // v4.29 chaos: simulated disk-full. Reject the append before
+    // touching the OS so committed state is unaffected. Returned
+    // error propagates as a clean ErrorResponse to the client.
+    if let Some(quota) = state.chaos.wal_quota_bytes {
+        let current = f.metadata().map_or(0, |m| m.len());
+        if current.saturating_add(entry.len() as u64) > quota {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "wal quota exceeded: cur={current} + {} > quota={quota} (SPG_FAIL_WAL_QUOTA_BYTES)",
+                    entry.len()
+                ),
+            ));
+        }
+    }
     f.write_all(&entry)?;
     f.sync_data()?;
     Ok(())

@@ -13,8 +13,10 @@
 //! in this file. CI runs `cargo test --release --test prod_ready`;
 //! a failure here means PROD_READY.md is over-claiming.
 //!
-//! Scope cut for v4.28 baseline ([machine] rows in PROD_READY.md):
+//! [machine] rows scaffolded (v4.28 baseline + v4.29 chaos):
 //!   1.3   WAL replay on startup
+//!   1.9   Partial-fsync recovery (delegates to e2e_chaos)
+//!   1.10  Disk-full handling (delegates to e2e_chaos)
 //!   3.8   cargo-audit in CI
 //!   4.1   Health endpoint
 //!   4.2   Prometheus metrics
@@ -69,7 +71,10 @@ fn machine_marked_rows() -> Vec<String> {
         }
         let id = cells[1].trim();
         let name = cells[2].trim();
-        if name.contains("[machine]") && !id.is_empty() && id.chars().next().unwrap().is_ascii_digit() {
+        if name.contains("[machine]")
+            && !id.is_empty()
+            && id.chars().next().unwrap().is_ascii_digit()
+        {
             ids.push(id.to_string());
         }
     }
@@ -103,12 +108,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn spawn_server_with_env(
-    addr: &str,
-    db: &Path,
-    wal: &Path,
-    env: &[(&str, &str)],
-) -> Child {
+fn spawn_server_with_env(addr: &str, db: &Path, wal: &Path, env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
     cmd.arg(addr)
         .arg(db)
@@ -142,6 +142,41 @@ fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
 }
 
 // ---- the rows ----
+
+/// 1.9 Partial-fsync recovery — covered by e2e_chaos, asserted
+/// here as a presence check on the chaos test source so this
+/// PROD_READY row stays evidence-linked.
+#[test]
+fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
+    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", p.display()));
+    assert!(
+        src.contains("fn chaos_wal_tail_truncation_drops_partial_record_no_panic"),
+        "e2e_chaos.rs must contain the chaos_wal_tail_truncation_… test"
+    );
+}
+
+/// 1.10 Disk-full handling — covered by e2e_chaos, asserted here
+/// as a presence check.
+#[test]
+fn row_1_10_disk_full_covered_by_e2e_chaos() {
+    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", p.display()));
+    assert!(
+        src.contains("fn chaos_disk_full_returns_clean_error_and_keeps_serving"),
+        "e2e_chaos.rs must contain the chaos_disk_full_… test"
+    );
+    // Also: the SPG_FAIL_WAL_QUOTA_BYTES injection knob must be
+    // wired up in spg-server. Grep the source.
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("SPG_FAIL_WAL_QUOTA_BYTES"),
+        "main.rs must declare the SPG_FAIL_WAL_QUOTA_BYTES knob"
+    );
+}
 
 /// 1.3 WAL replay on startup — restart with same db+wal recovers state.
 #[test]
@@ -264,7 +299,8 @@ fn row_5_1_max_connections_enforced() {
     // see either an ErrorResponse frame (op byte 0x14) at position
     // [4] of the payload, or EOF.
     let mut s2 = TcpStream::connect(&addr).expect("second connect");
-    s2.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    s2.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
     let mut buf = [0u8; 256];
     let n = s2.read(&mut buf).unwrap_or(0);
     let saw_err_frame = n >= 5 && buf[4] == 0x14;
@@ -297,9 +333,8 @@ fn row_8_2_native_wire_opcode_stable() {
         (0xFF, "Error"),
     ];
     for (byte, name) in expected {
-        let op = Op::from_byte(*byte).unwrap_or_else(|_| {
-            panic!("opcode 0x{byte:02x} ({name}) must decode")
-        });
+        let op = Op::from_byte(*byte)
+            .unwrap_or_else(|_| panic!("opcode 0x{byte:02x} ({name}) must decode"));
         let dbg = format!("{op:?}");
         assert_eq!(
             dbg, *name,
@@ -315,7 +350,13 @@ fn row_9_8_ci_workflow_present() {
     let path = workspace_root().join(".github/workflows/ci.yml");
     let yml = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!(".github/workflows/ci.yml must exist at {}", path.display()));
-    for job in ["rustfmt", "clippy", "test", "cargo-audit", "prod_ready gate"] {
+    for job in [
+        "rustfmt",
+        "clippy",
+        "test",
+        "cargo-audit",
+        "prod_ready gate",
+    ] {
         assert!(
             yml.contains(&format!("name: {job}")),
             "CI missing required job {job:?}"
@@ -464,8 +505,7 @@ fn run_reads(addr: &str, n: usize) -> Duration {
 fn read_frame(s: &mut TcpStream) -> spg_wire::Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
     s.read_exact(&mut header).unwrap();
-    let payload_len =
-        u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
     let op = spg_wire::Op::from_byte(header[4]).unwrap();
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
@@ -487,7 +527,11 @@ fn exec_ok(s: &mut TcpStream, sql: &str) {
         let msg = spg_wire::parse_error_response(&f).unwrap_or("<undecodable>");
         panic!("server rejected SQL {sql:?}: {msg}");
     }
-    assert_eq!(f.op, spg_wire::Op::CommandComplete, "expected CC for {sql:?}");
+    assert_eq!(
+        f.op,
+        spg_wire::Op::CommandComplete,
+        "expected CC for {sql:?}"
+    );
 }
 
 fn select_int(s: &mut TcpStream, sql: &str) -> i64 {

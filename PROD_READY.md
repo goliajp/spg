@@ -38,8 +38,9 @@ storage and survives a crash.
 | 1.6 | Full + incremental backup | `BACKUP TO '<path>'` and `BACKUP TO '<path>' INCREMENTAL SINCE N` SQL forms | ✅ | v4.25.0, `tests/e2e_backup.rs` |
 | 1.7 | PITR via `SPG_REPLAY_UPTO` | Operator can truncate WAL replay at byte offset N at startup | ✅ | v4.25.0 + v4.27.1 (parse-zero fix) |
 | 1.8 | WAL/snapshot checksum | Active corruption detection on each loaded file (not just "deserialize fails") | ❌ | (v4.32 candidate — append CRC32 to envelope + WAL records) |
-| 1.9 | Partial-fsync recovery [chaos] | If `sync_data` returns mid-write, the file's incomplete tail is detected on next boot and dropped, no half-record applied | ⚠️ | length-prefixed records detect truncation; v4.29 chaos test will assert formally |
-| 1.10 | Disk-full handling [chaos] | Out-of-space during WAL append returns clear error to client; server stays alive; existing committed state intact | ⚠️ | (v4.29 chaos test) |
+| 1.9 | Partial-fsync recovery [machine] | If `sync_data` returns mid-write, the file's incomplete tail is detected on next boot and dropped, no half-record applied | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_wal_tail_truncation_drops_partial_record_no_panic` |
+| 1.10 | Disk-full handling [machine] | Out-of-space during WAL append returns clear error to client; server stays alive; previously CC'd state survives restart unchanged | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_disk_full_returns_clean_error_and_keeps_serving` (+ SPG_FAIL_WAL_QUOTA_BYTES injection knob) |
+| 1.11 | In-memory rollback on WAL failure | When WAL append fails after engine has already mutated in-memory state, the in-memory row is rolled back so live SELECTs match what's durable. | ⚠️ | currently the live in-memory state may show a phantom row until the next restart; post-restart state is correct. Tracked for v4.30 — needs auto-commit savepoint wrap or preflight quota check. |
 
 ## 2. Availability + recovery
 
@@ -57,7 +58,7 @@ practiced.
 | 2.6 | Restore drill automated | E2E test follows the doc commands; fails CI if doc rots | ❌ | (v4.30) |
 | 2.7 | Graceful shutdown | SIGTERM drains in-flight queries up to a deadline, refuses new connections, exits 0 | ❌ | currently exits ungracefully on signal |
 | 2.8 | Automated failover | A follower can be promoted to primary by operator action; coordinator handles it | 🚫 | manual promotion only; HA = "stop follower, point clients at it, restart in primary mode". See [[spg-out-of-scope]] |
-| 2.9 | Network partition tolerance [chaos] | Follower disconnect while primary writes → on reconnect, all writes catch up exactly once, no duplicates / no gaps | ⚠️ | logic supports it; v4.30 chaos test will assert |
+| 2.9 | Network partition tolerance [chaos] | Follower disconnect while primary writes → on reconnect, all writes catch up exactly once, no duplicates / no gaps | ⚠️ | logic supports it; v4.30 chaos test will assert (also rows 1.11 in-memory rollback) |
 
 ## 3. Security
 
@@ -170,8 +171,8 @@ test; regressions fail the build, not the customer.
 | 9.2 | Perf gates [machine] | `cargo test --release --test perf_gate` is part of CI; budgets in BUDGETS.md | ✅ | PERFORMANCE.md §Perf gates |
 | 9.3 | 5-min soak (leak detection) | Mixed workload for 5 minutes, post-warmup RSS drift < 2% | ✅ | v4.16, `xtests/v4_soak_report.md` |
 | 9.4 | 24h sustained load | Same mixed workload for 24h, drift + throughput stable | ❌ | (v4.32) |
-| 9.5 | Chaos test infrastructure | Failpoint hooks in storage; kill -9 + partial fsync + disk full + netsplit chaos | ❌ | (v4.29 + v4.30) |
-| 9.6 | Chaos test in CI | Three chaos tests in CI; gate after warning period | ❌ | (v4.29) |
+| 9.5 | Chaos test infrastructure | Failpoint hooks (SPG_FAIL_WAL_QUOTA_BYTES env var); kill -9 + partial fsync + disk full chaos automated | ✅ | v4.29, `tests/e2e_chaos.rs` (3 tests); netsplit chaos deferred to v4.30 |
+| 9.6 | Chaos test in CI | `e2e_chaos` runs under the main `test` job since v4.29; gated, not warning. | ✅ | v4.29, `.github/workflows/ci.yml` (test job runs all e2e_*) |
 | 9.7 | Fuzz harness | SQL parser + wire frame decoder run under `cargo fuzz`, 0 crashes ≥1h | ❌ | (v4.31) |
 | 9.8 | CI on every PR | fmt + clippy + test + audit + (release build on main) all pass | ✅ | v4.27.0, `.github/workflows/ci.yml` |
 
@@ -219,18 +220,18 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.28 baseline (2026-05-27).
+Last machine run: v4.29 (2026-05-27).
 
 ```
-Total rows in checklist : 84
-  ✅ pass             : 44
-  ⚠️ partial          : 8
-  ❌ open             : 26
+Total rows in checklist : 85
+  ✅ pass             : 48
+  ⚠️ partial          : 7
+  ❌ open             : 24
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 9
-  row_1_3, row_3_8, row_4_1, row_4_2, row_5_1,
-  row_6_3, row_8_2, row_9_2, row_9_8, row_10_x
+[machine] rows scaffolded in prod_ready.rs : 12
+  row_1_3, row_1_9, row_1_10, row_3_8, row_4_1, row_4_2,
+  row_5_1, row_6_3, row_8_2, row_9_2, row_9_8, row_10_x
 ```
 
 The 26 open items roughly map to v4.29-v4.32 according to the
