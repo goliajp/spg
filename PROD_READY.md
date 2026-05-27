@@ -76,9 +76,9 @@ detects tampering.
 | 3.6 | TLS / wire encryption | — | 🚫 | permanent out-of-scope per [[spg-out-of-scope]]; deploy behind stunnel / nginx / pgbouncer if needed |
 | 3.7 | Secret scanning in CI | gitleaks or equivalent rejects commits containing high-entropy strings / common API key formats | ❌ | (v4.31) |
 | 3.8 | Dependency vulnerability scanning [machine] | `cargo-audit` runs on every CI build, fails the job on advisory match | ✅ | v4.27.0, `.github/workflows/ci.yml` |
-| 3.9 | `cargo-deny` license + dup check | Workspace deps respect license allowlist; no duplicate semver-incompatible dups | ❌ | (v4.31) |
+| 3.9 | `cargo-deny` license + dup check [machine] | Workspace deps respect license allowlist; no duplicate semver-incompatible dups | ✅ | v4.31, `deny.toml` + `.github/workflows/ci.yml::cargo-deny` |
 | 3.10 | SQL injection surface | Server is the SQL — no client-driven query construction at the protocol level. Prepared statement parameters always bound through Bind frame, never string-interpolated. Documented. | ✅ | v4.30, `SECURITY.md` threat-model table |
-| 3.11 | Input fuzz harness | `cargo fuzz` corpus for SQL parser + wire frame decoder, ran ≥1h with 0 crashes | ❌ | (v4.31) |
+| 3.11 | Input fuzz harness [machine] | Randomized SQL + wire-frame input bombards the parser/decoder under a deterministic PRNG; **no panics** allowed. Default 10K iters per run; `SPG_FUZZ_ITERS=N` for longer. | ✅ | v4.31, `crates/spg-sql/tests/fuzz.rs` + `crates/spg-server/tests/e2e_fuzz.rs` |
 | 3.12 | CVE response process [machine] | SECURITY.md says where to report; maintainer commits to 7-day triage | ✅ | v4.30, `SECURITY.md` |
 
 ## 4. Observability
@@ -156,9 +156,9 @@ against v1.x. Backup files captured by v1.x restore on v1.y.
 | 8.1 | SemVer adherence | Major bump for breaking changes; documented | ✅ | v4.x kept compatible since v4.0; pre-v1.0 contract |
 | 8.2 | Native wire opcode stable | Opcodes 0x00-0x17 + 0xFF documented and never changed silently | ✅ | v1-status memory §Wire opcode table |
 | 8.3 | PG-wire SCRAM stable | SCRAM-SHA-256 wire spec (RFC 5802) — by spec, not by SPG | ✅ | RFC reference |
-| 8.4 | Snapshot file backwards-compat | v4.x can load every snapshot ever written (FILE_VERSION 1..8) | ⚠️ | claimed; needs test in CI (v4.31 cross-version compat test) |
-| 8.5 | STABILITY.md | What's frozen, what's not; how to read upgrade notes | ❌ | (v4.31) |
-| 8.6 | Cross-version compat test | CI runs against a corpus of snapshot/WAL files from older minor versions, asserts restore + identical query results | ❌ | (v4.31 will mark this [machine]) |
+| 8.4 | Snapshot file backwards-compat [machine] | v4.x can load every snapshot ever written (FILE_VERSION 1..8) | ✅ | v4.31, `tests/cross_version_compat.rs` walks every directory under `xtests/compat-fixtures/` |
+| 8.5 | STABILITY.md [machine] | What's frozen, what's not; how to read upgrade notes | ✅ | v4.31, `STABILITY.md` |
+| 8.6 | Cross-version compat test [machine] | CI runs against a corpus of snapshot/WAL files from older minor versions, asserts restore + identical query results | ✅ | v4.31, `tests/cross_version_compat.rs` + `xtests/compat-fixtures/v4.30/` |
 
 ## 9. Testing rigor
 
@@ -220,24 +220,24 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.30 (2026-05-27).
+Last machine run: v4.31 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 57
-  ⚠️ partial          : 6
-  ❌ open             : 16
+  ✅ pass             : 62
+  ⚠️ partial          : 5
+  ❌ open             : 12
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 21
+[machine] rows scaffolded in prod_ready.rs : 26
   row_1_3, row_1_9, row_1_10,
   row_2_5, row_2_6,
-  row_3_8, row_3_10, row_3_12,
+  row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
   row_4_1, row_4_2,
   row_5_1,
   row_6_3,
   row_7_2, row_7_3, row_7_4, row_7_5, row_7_6,
-  row_8_2,
+  row_8_2, row_8_4, row_8_5, row_8_6,
   row_9_2, row_9_8,
   row_10_x
 ```

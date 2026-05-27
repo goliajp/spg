@@ -1,0 +1,52 @@
+# SPG cargo-deny config (v4.31).
+# Run locally: cargo install cargo-deny && cargo deny check
+# CI gates this via .github/workflows/ci.yml::cargo-deny
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+
+[licenses]
+# spg-* crates are MIT OR Apache-2.0 (workspace-wide). Bench-only
+# deps may add MPL / ISC / Unicode-3.0 — that's fine.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+
+[[licenses.exceptions]]
+# ring uses a unique combination not represented by a SPDX expr
+name = "ring"
+allow = ["LicenseRef-ring"]
+
+[[licenses.clarify]]
+name = "ring"
+expression = "LicenseRef-ring"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Disallow multiple semver-incompatible versions of the same crate.
+# Bench-only deps (sqlx + tokio) bring some duplication; warn for
+# now, tighten to deny after v5.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

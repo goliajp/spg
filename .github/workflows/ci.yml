@@ -67,6 +67,15 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    # v4.31: license allowlist + duplicate-version check via
+    # cargo-deny. Config in deny.toml.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   release-build:
     name: release build (sanity)
     runs-on: ubuntu-latest
