@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod persistent;
+pub mod persistent_btree;
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -20,6 +21,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use self::persistent::PersistentVec;
+use self::persistent_btree::PersistentBTreeMap;
 
 /// Runtime type tags. `Vector(dim)` / `Varchar(max)` / `Char(size)` are
 /// parameterised; the parameter travels with both the column schema and
@@ -272,8 +274,13 @@ pub const NSW_DEFAULT_M: usize = 16;
 
 #[derive(Debug, Clone)]
 pub enum IndexKind {
-    /// B-tree over `IndexKey` (the legacy equality-lookup index).
-    BTree(BTreeMap<IndexKey, Vec<usize>>),
+    /// v4.40: structural-sharing B-tree over `IndexKey`. Replaces the v0.8
+    /// `BTreeMap<IndexKey, Vec<usize>>` — `Index::clone` is now an `Arc`
+    /// bump regardless of index size, so `Catalog::clone` inside the
+    /// v4.34 auto-commit wrap stays O(1) even for tables with secondary
+    /// indices (the case that bottlenecked v4.39 at 1M rows in the
+    /// sweep).
+    BTree(PersistentBTreeMap<IndexKey, Vec<usize>>),
     /// Navigable-small-world graph for vector kNN search.
     Nsw(NswGraph),
 }
@@ -356,7 +363,7 @@ impl Index {
         Self {
             name,
             column_position,
-            kind: IndexKind::BTree(BTreeMap::new()),
+            kind: IndexKind::BTree(PersistentBTreeMap::new()),
         }
     }
 
@@ -532,7 +539,14 @@ impl Table {
             if let IndexKind::BTree(map) = &mut idx.kind
                 && let Some(key) = IndexKey::from_value(&row.values[idx.column_position])
             {
-                map.entry(key).or_default().push(new_row_idx);
+                // v4.40: PersistentBTreeMap has no in-place entry-or-default.
+                // Clone-then-insert keeps the same semantics — for typical
+                // unique-key schemas the Vec is 1-element so the clone is
+                // O(1). For dup-heavy columns it's O(M) per insert, traded
+                // for the structural-sharing win at clone time.
+                let mut entries = map.get(&key).cloned().unwrap_or_default();
+                entries.push(new_row_idx);
+                map.insert_mut(key, entries);
             }
         }
         // v4.39.1: push_mut keeps streaming inserts at Vec::push speed when
@@ -577,7 +591,9 @@ impl Table {
         if let IndexKind::BTree(map) = &mut idx.kind {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
-                    map.entry(key).or_default().push(i);
+                    let mut entries = map.get(&key).cloned().unwrap_or_default();
+                    entries.push(i);
+                    map.insert_mut(key, entries);
                 }
             }
         }
@@ -743,7 +759,9 @@ impl Table {
                 if let IndexKind::BTree(map) = &mut idx.kind {
                     for (i, row) in self.rows.iter().enumerate() {
                         if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
-                            map.entry(key).or_default().push(i);
+                            let mut entries = map.get(&key).cloned().unwrap_or_default();
+                            entries.push(i);
+                            map.insert_mut(key, entries);
                         }
                     }
                 }

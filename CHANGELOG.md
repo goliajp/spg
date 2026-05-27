@@ -10,6 +10,77 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.40.0] — 2026-05-27 (persistent B-tree index — cheap clone with secondary indices too)
+
+### Closes the v4.39 carve-out
+
+v4.39 switched `Table::rows` to `PersistentVec` so `Catalog::clone()`
+inside the v4.34 auto-commit BEGIN..COMMIT wrap was O(1) **on tables
+without indices** — slo_smoke (no-index) jumped from 9.4K → 109K r/s.
+But `Table::indices` was still `Vec<Index>` and each `Index` wrapped
+an `alloc::collections::BTreeMap<IndexKey, Vec<usize>>`; on tables
+with secondary indices (the sweep schema — `id INT` + `sec INT` +
+two indices) every `Table::clone` still deep-copied the BTreeMaps,
+capping spg-server sweep INSERT at ~15K r/s. v4.40 closes that half.
+
+### What changed
+
+  spg-storage/src/persistent_btree.rs (new, ~370 LOC including tests):
+    pub struct PersistentBTreeMap<K: Ord, V> {
+        root: Arc<BNode<K, V>>,
+        len: usize,
+    }
+    new / get / iter / insert / insert_mut / Clone (O(1)) /
+    IntoIterator / PartialEq.
+
+  Path-copy CoW B-tree, `ORDER = 8` (= MAX_CHILDREN), MAX_ENTRIES = 7,
+  no `unsafe`, no external deps, `no_std`-compatible.
+
+  spg-storage/src/lib.rs:
+    IndexKind::BTree(BTreeMap<IndexKey, Vec<usize>>)
+      → IndexKind::BTree(PersistentBTreeMap<IndexKey, Vec<usize>>)
+
+  `Index::new_btree` / `Table::insert` / `Table::add_index` /
+  `Table::rebuild_indices` rewrite the per-row index update from
+  `map.entry(key).or_default().push(idx)` to the clone-then-insert
+  shape `let v = map.get(&key).cloned().unwrap_or_default(); v.push(idx);
+  map.insert_mut(key, v);` — same semantics, with the structural-sharing
+  property at clone time.
+
+### Correctness gates
+
+  tests/persistent_btree.rs::fuzz_oracle_against_std_btreemap
+    100K-step random insert + replace + get sequence mirrored against
+    `std::collections::BTreeMap`, asserting equal `get` results and
+    equal `len` end to end.
+
+  tests/persistent_btree.rs::fuzz_oracle_clone_isolation
+    Branch A → B and C, mutate each independently — verify each
+    handle returns its own oracle without leaking.
+
+  tests/persistent_btree.rs::partial_eq_compares_by_elements
+    Two PBs built via different insertion orders compare equal iff
+    they hold the same elements. Independent of internal tree shape.
+
+  tests/persistent_btree.rs::insert_grows_through_multiple_internal_splits
+    Forces ≥ 2 internal splits; verifies the trie depth grows
+    cleanly through the second split.
+
+### Carve-outs deferred
+
+- NSW / HNSW topology (`NswGraph`) still uses `Vec<Vec<Vec<usize>>>`.
+  v5.0 makes HNSW persistent + adds a vector cache for the search
+  path. Vector-indexed tables continue to take the v4.34 wrap path
+  on INSERT.
+- Group commit + binary WAL — v4.41.
+
+### Refs
+
+- NEXT.md §v4.40, PROD_READY row 1.11, PERFORMANCE.md "v4.40 scale
+  sweep" section.
+
+---
+
 ## [4.39.0] — 2026-05-27 (catalog backed by PersistentVec — scale-invariant BEGIN/COMMIT)
 
 ### Promotes PROD_READY row 1.11 to "verified @ scale"
