@@ -732,6 +732,27 @@ fn dispatch(
                 }
                 return run_backup_command(stream, state, &backup_intent);
             }
+            // v4.30: preflight WAL-quota check (row 1.11). If the
+            // chaos knob is set and this SQL would push past the
+            // cap, reject *before* mutating engine state — so the
+            // live in-memory state never diverges from what the
+            // client was told. Real ENOSPC mid-write is still
+            // observable at the write_all path; the gap there is
+            // documented in PROD_READY row 1.11.
+            if let Some(quota) = state.chaos.wal_quota_bytes
+                && let Some(wal_path) = &state.wal_path
+            {
+                let cur = fs::metadata(wal_path).map_or(0, |m| m.len());
+                let needed = 4 + sql.len() as u64;
+                if cur.saturating_add(needed) > quota {
+                    return write_frame(
+                        stream,
+                        &build_error_response(&format!(
+                            "wal quota exceeded: cur={cur} + {needed} > quota={quota} (SPG_FAIL_WAL_QUOTA_BYTES)"
+                        )),
+                    );
+                }
+            }
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let watchdog = spawn_query_watchdog(state, &cancel_flag);
             let (result, snapshot) = {

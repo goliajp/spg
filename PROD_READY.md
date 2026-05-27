@@ -40,7 +40,7 @@ storage and survives a crash.
 | 1.8 | WAL/snapshot checksum | Active corruption detection on each loaded file (not just "deserialize fails") | ❌ | (v4.32 candidate — append CRC32 to envelope + WAL records) |
 | 1.9 | Partial-fsync recovery [machine] | If `sync_data` returns mid-write, the file's incomplete tail is detected on next boot and dropped, no half-record applied | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_wal_tail_truncation_drops_partial_record_no_panic` |
 | 1.10 | Disk-full handling [machine] | Out-of-space during WAL append returns clear error to client; server stays alive; previously CC'd state survives restart unchanged | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_disk_full_returns_clean_error_and_keeps_serving` (+ SPG_FAIL_WAL_QUOTA_BYTES injection knob) |
-| 1.11 | In-memory rollback on WAL failure | When WAL append fails after engine has already mutated in-memory state, the in-memory row is rolled back so live SELECTs match what's durable. | ⚠️ | currently the live in-memory state may show a phantom row until the next restart; post-restart state is correct. Tracked for v4.30 — needs auto-commit savepoint wrap or preflight quota check. |
+| 1.11 | In-memory consistency on WAL refusal | When the WAL layer refuses a write, the live in-memory state never reflects it. Caller's `SELECT` sees exactly what was CC'd. | ⚠️ | v4.30 added preflight WAL-quota check (chaos path) — main.rs rejects the SQL before engine.execute when the SPG_FAIL_WAL_QUOTA_BYTES knob would fire. Real ENOSPC mid-`write_all` still has the engine-mutated-but-WAL-failed window; full fix needs auto-commit-savepoint wrap, tracked for post-v4.32. |
 
 ## 2. Availability + recovery
 
@@ -54,8 +54,8 @@ practiced.
 | 2.2 | Replication primary→follower | Follower bootstraps from primary snapshot then tails WAL; e2e test verifies | ✅ | v4.24.0, `tests/e2e_replication.rs` |
 | 2.3 | Replication lag measured | Documented numbers, p50/p95/p99 | ✅ | `xtests/v4_24_repl_report.md`, PERFORMANCE.md §v4.24 |
 | 2.4 | Follower reconnect after primary restart | Follower retries with backoff; resumes from last applied offset | ✅ | `crates/spg-server/src/replication.rs` `fn run_follower` |
-| 2.5 | Restore drill documented | Step-by-step commands to take backup, simulate loss, restore; reader can execute verbatim | ❌ | (v4.30 RESTORE_DRILL.md) |
-| 2.6 | Restore drill automated | E2E test follows the doc commands; fails CI if doc rots | ❌ | (v4.30) |
+| 2.5 | Restore drill documented [machine] | Step-by-step commands to take backup, simulate loss, restore; reader can execute verbatim | ✅ | v4.30, `RESTORE_DRILL.md` |
+| 2.6 | Restore drill automated [machine] | E2E test follows the doc commands; fails CI if doc rots | ✅ | v4.30, `tests/e2e_restore_drill.rs::restore_drill_full_plus_incremental_recovers_row_count` |
 | 2.7 | Graceful shutdown | SIGTERM drains in-flight queries up to a deadline, refuses new connections, exits 0 | ❌ | currently exits ungracefully on signal |
 | 2.8 | Automated failover | A follower can be promoted to primary by operator action; coordinator handles it | 🚫 | manual promotion only; HA = "stop follower, point clients at it, restart in primary mode". See [[spg-out-of-scope]] |
 | 2.9 | Network partition tolerance [chaos] | Follower disconnect while primary writes → on reconnect, all writes catch up exactly once, no duplicates / no gaps | ⚠️ | logic supports it; v4.30 chaos test will assert (also rows 1.11 in-memory rollback) |
@@ -77,9 +77,9 @@ detects tampering.
 | 3.7 | Secret scanning in CI | gitleaks or equivalent rejects commits containing high-entropy strings / common API key formats | ❌ | (v4.31) |
 | 3.8 | Dependency vulnerability scanning [machine] | `cargo-audit` runs on every CI build, fails the job on advisory match | ✅ | v4.27.0, `.github/workflows/ci.yml` |
 | 3.9 | `cargo-deny` license + dup check | Workspace deps respect license allowlist; no duplicate semver-incompatible dups | ❌ | (v4.31) |
-| 3.10 | SQL injection surface | Server is the SQL — no client-driven query construction at the protocol level. Prepared statement parameters always bound through Bind frame, never string-interpolated. Documented. | ⚠️ | PG-wire extended-query uses parameter binding correctly; needs explicit threat-model doc (v4.30 SECURITY.md) |
+| 3.10 | SQL injection surface | Server is the SQL — no client-driven query construction at the protocol level. Prepared statement parameters always bound through Bind frame, never string-interpolated. Documented. | ✅ | v4.30, `SECURITY.md` threat-model table |
 | 3.11 | Input fuzz harness | `cargo fuzz` corpus for SQL parser + wire frame decoder, ran ≥1h with 0 crashes | ❌ | (v4.31) |
-| 3.12 | CVE response process | SECURITY.md says where to report; maintainer commits to 7-day triage | ❌ | (v4.30 SECURITY.md) |
+| 3.12 | CVE response process [machine] | SECURITY.md says where to report; maintainer commits to 7-day triage | ✅ | v4.30, `SECURITY.md` |
 
 ## 4. Observability
 
@@ -138,11 +138,11 @@ without reading the source code.
 | # | Item | Criterion | Status | Evidence |
 |---|------|-----------|:------:|----------|
 | 7.1 | CLI for backup/restore | `spg-cli` covers full backup + restore flows | ✅ | `crates/spg-cli/` |
-| 7.2 | DEPLOYMENT.md | Install (source + binary), env vars table, file layout, port reference, recommended fs/disk | ❌ | (v4.30) |
-| 7.3 | RUNBOOK.md | Common alerts (high error rate / replication lag / disk near full) + how to respond | ❌ | (v4.30) |
-| 7.4 | RESTORE_DRILL.md + e2e | Verbatim commands to take backup → simulate loss → restore → verify; e2e test follows them | ❌ | (v4.30 RESTORE_DRILL.md backed by `tests/e2e_restore_drill.rs`) |
-| 7.5 | SECURITY.md | CVE reporting address, response SLA, secret-handling guidance | ❌ | (v4.30) |
-| 7.6 | CHANGELOG.md | SemVer-organized v4.x history; future PRs must update it (CI check) | ❌ | (v4.30) |
+| 7.2 | DEPLOYMENT.md [machine] | Install (source + binary), env vars table, file layout, port reference, recommended fs/disk | ✅ | v4.30, `DEPLOYMENT.md` |
+| 7.3 | RUNBOOK.md [machine] | Common alerts (high error rate / replication lag / disk near full) + how to respond | ✅ | v4.30, `RUNBOOK.md` |
+| 7.4 | RESTORE_DRILL.md + e2e [machine] | Verbatim commands to take backup → simulate loss → restore → verify; e2e test follows them | ✅ | v4.30, `RESTORE_DRILL.md` + `tests/e2e_restore_drill.rs` |
+| 7.5 | SECURITY.md [machine] | CVE reporting address, response SLA, secret-handling guidance | ✅ | v4.30, `SECURITY.md` |
+| 7.6 | CHANGELOG.md [machine] | SemVer-organized v4.x history; future PRs must update it (CI check) | ✅ | v4.30, `CHANGELOG.md` (CI enforcement is post-v4.32) |
 | 7.7 | Migration framework | Schema migrations beyond raw DDL | 🚫 | not in scope; users run DDL via standard SQL |
 | 7.8 | Config validation on startup | Server refuses to start if env vars conflict (e.g. SPG_FOLLOW_OF + SPG_REPL_ADDR on same node) | ⚠️ | (v4.30 candidate — currently warns but starts anyway) |
 
@@ -220,18 +220,26 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.29 (2026-05-27).
+Last machine run: v4.30 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 48
-  ⚠️ partial          : 7
-  ❌ open             : 24
+  ✅ pass             : 57
+  ⚠️ partial          : 6
+  ❌ open             : 16
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 12
-  row_1_3, row_1_9, row_1_10, row_3_8, row_4_1, row_4_2,
-  row_5_1, row_6_3, row_8_2, row_9_2, row_9_8, row_10_x
+[machine] rows scaffolded in prod_ready.rs : 21
+  row_1_3, row_1_9, row_1_10,
+  row_2_5, row_2_6,
+  row_3_8, row_3_10, row_3_12,
+  row_4_1, row_4_2,
+  row_5_1,
+  row_6_3,
+  row_7_2, row_7_3, row_7_4, row_7_5, row_7_6,
+  row_8_2,
+  row_9_2, row_9_8,
+  row_10_x
 ```
 
 The 26 open items roughly map to v4.29-v4.32 according to the

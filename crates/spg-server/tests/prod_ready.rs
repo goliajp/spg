@@ -143,6 +143,124 @@ fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
 
 // ---- the rows ----
 
+/// Helper: assert a top-level doc exists and contains every
+/// required heading or anchor phrase. Used for the row 7.x ops-docs
+/// machine checks (the docs are the evidence; this just keeps the
+/// row from over-claiming if the file gets deleted or hollowed out).
+fn assert_doc_has_sections(doc_name: &str, required: &[&str]) {
+    let path = workspace_root().join(doc_name);
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("{doc_name} must exist at {}", path.display()));
+    for needle in required {
+        assert!(
+            src.contains(needle),
+            "{doc_name} missing required content: {needle:?}"
+        );
+    }
+}
+
+// ---- 2.5 / 2.6 RESTORE_DRILL ----
+
+#[test]
+fn row_2_5_restore_drill_doc_present() {
+    assert_doc_has_sections(
+        "RESTORE_DRILL.md",
+        &[
+            "Step 0 — establish what you have",
+            "Step 1 — assemble db + WAL from bundles",
+            "Step 2 — point-in-time recovery",
+            "Step 3 — start the recovered server",
+            "Step 4 — verify",
+            "Step 5 — re-bootstrap follower",
+        ],
+    );
+}
+
+#[test]
+fn row_2_6_restore_drill_e2e_test_present() {
+    let p = workspace_root().join("crates/spg-server/tests/e2e_restore_drill.rs");
+    let src = std::fs::read_to_string(&p)
+        .unwrap_or_else(|_| panic!("e2e_restore_drill.rs missing at {}", p.display()));
+    assert!(
+        src.contains("fn restore_drill_full_plus_incremental_recovers_row_count"),
+        "the named restore-drill test must exist"
+    );
+}
+
+// ---- 3.10 / 3.12 SECURITY.md ----
+
+#[test]
+fn row_3_10_threat_model_documented() {
+    assert_doc_has_sections(
+        "SECURITY.md",
+        &["Threat model", "Secret handling", "What's out of scope"],
+    );
+}
+
+#[test]
+fn row_3_12_cve_process_documented() {
+    assert_doc_has_sections(
+        "SECURITY.md",
+        &[
+            "Reporting a vulnerability",
+            "Acknowledge within",
+            "Initial triage within",
+        ],
+    );
+}
+
+// ---- 7.x ops docs ----
+
+#[test]
+fn row_7_2_deployment_doc_present() {
+    assert_doc_has_sections(
+        "DEPLOYMENT.md",
+        &[
+            "## Install",
+            "## File layout",
+            "## Environment variables",
+            "## Ports",
+        ],
+    );
+}
+
+#[test]
+fn row_7_3_runbook_present() {
+    assert_doc_has_sections(
+        "RUNBOOK.md",
+        &[
+            "Alert: high `spg_errors_total`",
+            "Alert: disk full",
+            "Alert: replication lag growing",
+            "Alert: backup taking longer",
+            "Alert: audit log verify fails",
+        ],
+    );
+}
+
+#[test]
+fn row_7_4_restore_drill_doc_plus_e2e() {
+    // Same evidence as 2.5 + 2.6; this row groups them under
+    // "operational tooling" while those live under "availability".
+    assert_doc_has_sections("RESTORE_DRILL.md", &["e2e_restore_drill.rs"]);
+}
+
+#[test]
+fn row_7_5_security_doc_present() {
+    assert_doc_has_sections(
+        "SECURITY.md",
+        &["Reporting a vulnerability", "Secret handling"],
+    );
+}
+
+#[test]
+fn row_7_6_changelog_present() {
+    assert_doc_has_sections(
+        "CHANGELOG.md",
+        &["[4.30.0]", "[4.29.0]", "[4.28.0]", "Format:"],
+    );
+}
+
 /// 1.9 Partial-fsync recovery — covered by e2e_chaos, asserted
 /// here as a presence check on the chaos test source so this
 /// PROD_READY row stays evidence-linked.
