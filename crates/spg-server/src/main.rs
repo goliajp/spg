@@ -943,7 +943,20 @@ fn dispatch(
                 .engine
                 .write()
                 .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-            if needs_wrap && let Err(e) = engine.execute("BEGIN") {
+            // v4.41.1: scope each implicit wrap to its own TxId slot
+            // (engine MVCC mechanical refactor). v4.41.1 still holds
+            // engine.write() across the whole wrap so the map carries
+            // at most one entry at runtime — but the API is ready for
+            // v4.42 to split the critical section and let multiple
+            // implicit TXs prepare in parallel.
+            let wrap_tx_id = if needs_wrap {
+                Some(engine.alloc_tx_id())
+            } else {
+                None
+            };
+            if let Some(t) = wrap_tx_id
+                && let Err(e) = engine.execute_in("BEGIN", t)
+            {
                 drop(engine);
                 watchdog.cancel();
                 return write_frame(
@@ -951,8 +964,15 @@ fn dispatch(
                     &build_error_response(&format!("implicit BEGIN failed: {e}")),
                 );
             }
-            let result =
-                engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
+            let result = if let Some(t) = wrap_tx_id {
+                engine.execute_in_with_cancel(
+                    &sql,
+                    t,
+                    spg_engine::CancelToken::from_flag(&cancel_flag),
+                )
+            } else {
+                engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag))
+            };
             let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
             // v4.34: WAL append happens *under the engine lock* now
             // so the BEGIN..COMMIT atomicity holds without another
@@ -970,13 +990,13 @@ fn dispatch(
             } else {
                 Ok(())
             };
-            if needs_wrap {
+            if let Some(t) = wrap_tx_id {
                 let outcome_sql = if was_command_ok && wal_result.is_ok() {
                     "COMMIT"
                 } else {
                     "ROLLBACK"
                 };
-                if let Err(e) = engine.execute(outcome_sql) {
+                if let Err(e) = engine.execute_in(outcome_sql, t) {
                     drop(engine);
                     watchdog.cancel();
                     return write_frame(
