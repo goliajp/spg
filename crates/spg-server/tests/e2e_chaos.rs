@@ -346,3 +346,86 @@ fn chaos_disk_full_returns_clean_error_and_keeps_serving() {
         "post-restart row count must match what was CC'd before ENOSPC"
     );
 }
+
+// ---- chaos 4: ENOSPC mid-write_all — preflight disabled (v4.34) ----
+
+/// v4.34 fix for PROD_READY row 1.11: disable the v4.30 dispatch-time
+/// preflight and exercise the real path that fails inside
+/// `append_wal*`. Without the implicit BEGIN..COMMIT wrap, the
+/// previous behavior left a phantom row in memory; with the wrap
+/// the engine ROLLBACKs and the live count matches CC'd exactly.
+#[test]
+fn chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state() {
+    let dir = unique_tmpdir("nospc-rollback");
+    let db = dir.join("a.db");
+    let wal = dir.join("a.wal");
+    let addr = pick_free_addr();
+
+    let quota = "300".to_string();
+    let mut c = ChildGuard(spawn_server(
+        &addr,
+        &db,
+        &wal,
+        &[
+            ("SPG_FAIL_WAL_QUOTA_BYTES", quota),
+            ("SPG_DISABLE_WAL_PREFLIGHT", "1".to_string()),
+        ],
+    ));
+    let mut s = wait_for_listener(&addr, &mut c.0);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+
+    exec_ok(&mut s, "CREATE TABLE q (id INT NOT NULL)");
+    let mut accepted = 0i64;
+    let mut rejected = false;
+    for i in 0..100 {
+        match run_query(&mut s, &format!("INSERT INTO q VALUES ({i})")) {
+            Outcome::Ok => accepted += 1,
+            Outcome::Error(msg) => {
+                assert!(
+                    msg.contains("wal quota") || msg.contains("WAL"),
+                    "expected wal-quota error from the real append path, got: {msg:?}"
+                );
+                rejected = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        rejected,
+        "quota never fired in 100 inserts (preflight disable knob wired up?)"
+    );
+    assert!(accepted > 0, "nothing committed before quota fired");
+
+    // Live in-memory count MUST match CC'd count even though the
+    // path went through the real append failure (the implicit
+    // BEGIN..COMMIT wrap rolled the failed write back). This is
+    // the property the v4.30 preflight could only ensure for the
+    // injected path — v4.34 closes it for the real path too.
+    drop(s);
+    let mut s = TcpStream::connect(&addr).expect("server still listening after quota error");
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let live = select_int(&mut s, "SELECT count(*) FROM q");
+    assert_eq!(
+        live, accepted,
+        "v4.34: live count must match CC'd count even when the failure \
+         lands inside append_wal (preflight disabled)"
+    );
+
+    // Restart without the quota or the preflight knob. WAL replay
+    // sees the rolled-back implicit TX as an open transaction at
+    // end-of-stream (BEGIN with no COMMIT) and auto-rollbacks it,
+    // landing on exactly `accepted` rows. No phantoms across reboot.
+    drop(s);
+    let _ = c.0.kill();
+    let _ = c.0.wait();
+    thread::sleep(Duration::from_millis(200));
+    let addr2 = pick_free_addr();
+    let mut c2 = ChildGuard(spawn_server(&addr2, &db, &wal, &[]));
+    let mut s2 = wait_for_listener(&addr2, &mut c2.0);
+    s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let after = select_int(&mut s2, "SELECT count(*) FROM q");
+    assert_eq!(
+        after, accepted,
+        "post-restart count must match what was CC'd before the real ENOSPC"
+    );
+}

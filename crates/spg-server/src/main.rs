@@ -114,6 +114,14 @@ struct Limits {
 #[derive(Debug, Default, Clone, Copy)]
 struct ChaosKnobs {
     wal_quota_bytes: Option<u64>,
+    /// v4.34: when true, the dispatch-time preflight check that
+    /// rejects oversize writes before any engine mutation is
+    /// skipped. The append still fails inside `append_wal*`, which
+    /// is exactly what exercises the implicit-BEGIN..COMMIT
+    /// rollback path end-to-end (chaos test asserts no phantom
+    /// row survives). Test-only — production deployments leave
+    /// this false.
+    disable_wal_preflight: bool,
 }
 
 pub(crate) struct ServerState {
@@ -333,6 +341,10 @@ fn run(
     };
     let chaos = ChaosKnobs {
         wal_quota_bytes: parse_env_u64("SPG_FAIL_WAL_QUOTA_BYTES"),
+        disable_wal_preflight: env::var("SPG_DISABLE_WAL_PREFLIGHT")
+            .ok()
+            .filter(|s| !s.is_empty() && s != "0")
+            .is_some(),
     };
     let state = Arc::new(ServerState {
         engine: RwLock::new(engine),
@@ -679,6 +691,26 @@ fn sql_is_user_mgmt(sql: &str) -> bool {
         || (lower.starts_with("drop ") && lower["drop ".len()..].trim_start().starts_with("user"))
 }
 
+/// v4.34: true when the statement controls transaction boundaries
+/// (`BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` /
+/// `SAVEPOINT` / `RELEASE`). The auto-commit BEGIN..COMMIT wrap
+/// must skip these — wrapping a client `BEGIN` would nest two
+/// transactions; wrapping a `COMMIT`/`ROLLBACK` would tear down the
+/// client's own TX before its body runs. Over-broad matches just
+/// disable the wrap for that one statement (no correctness impact —
+/// the original v4.30 preflight still gates the chaos path).
+fn sql_is_tx_control(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    let first_word = lower
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()
+        .unwrap_or("");
+    matches!(
+        first_word,
+        "begin" | "start" | "commit" | "rollback" | "savepoint" | "release" | "end"
+    )
+}
+
 /// True for statements that mutate no engine state — exactly the set
 /// `Engine::execute_readonly` accepts. Cheap byte peek (skip leading
 /// whitespace, ASCII-case-fold the first alphabetic run); over-broad
@@ -858,18 +890,32 @@ fn dispatch(
                 }
                 return run_backup_command(stream, state, &backup_intent);
             }
-            // v4.30: preflight WAL-quota check (row 1.11). If the
-            // chaos knob is set and this SQL would push past the
-            // cap, reject *before* mutating engine state — so the
-            // live in-memory state never diverges from what the
-            // client was told. Real ENOSPC mid-write is still
-            // observable at the write_all path; the gap there is
-            // documented in PROD_READY row 1.11.
+            // v4.34: when WAL is on and this is an auto-commit write
+            // (no client-driven TX in flight, not a TX-control verb),
+            // wrap the engine mutation in an implicit BEGIN..COMMIT
+            // and append the whole [BEGIN, sql, COMMIT] block to the
+            // WAL with one atomic fsync. If the WAL append fails, we
+            // ROLLBACK the implicit TX — the live in-memory state
+            // never sees the half-applied write. Closes the real
+            // ENOSPC mid-`write_all` window that v4.30's preflight
+            // chaos path couldn't fix on its own (PROD_READY 1.11).
+            let needs_wrap = !*in_tx && state.wal.is_some() && !sql_is_tx_control(&sql);
+            // v4.30 preflight (chaos path): if SPG_FAIL_WAL_QUOTA_BYTES
+            // is set and the block won't fit, reject before any engine
+            // mutation so even without the wrap, the in-memory state
+            // stays in sync. Skipped when the test deliberately turns
+            // it off via SPG_DISABLE_WAL_PREFLIGHT — that path forces
+            // the v4.34 rollback to be exercised end-to-end.
             if let Some(quota) = state.chaos.wal_quota_bytes
                 && let Some(wal_path) = &state.wal_path
+                && !state.chaos.disable_wal_preflight
             {
                 let cur = fs::metadata(wal_path).map_or(0, |m| m.len());
-                let needed = 4 + sql.len() as u64;
+                let needed = if needs_wrap {
+                    wal_block_size(&["BEGIN", &sql, "COMMIT"])
+                } else {
+                    4 + sql.len() as u64
+                };
                 if cur.saturating_add(needed) > quota {
                     return write_frame(
                         stream,
@@ -881,45 +927,75 @@ fn dispatch(
             }
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let watchdog = spawn_query_watchdog(state, &cancel_flag);
-            let (result, snapshot) = {
-                let mut engine = state
-                    .engine
-                    .write()
-                    .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-                let result = engine
-                    .execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
-                // v4.0: sync per-conn TX state from the engine.
-                // Engine.in_transaction() is the authoritative bit
-                // (it knows whether BEGIN succeeded, whether a nested
-                // SAVEPOINT was opened, whether COMMIT/ROLLBACK left
-                // us outside a TX, etc.).
-                *in_tx = engine.in_transaction();
-                // Snapshot only when the committed catalog actually changed —
-                // i.e. for COMMIT and for writes outside a TX. Intra-TX writes
-                // and BEGIN/ROLLBACK never trigger persistence. Additionally,
-                // when WAL is on, we don't update the db snapshot at runtime:
-                // the WAL captures every op and the db file is checkpoint-only.
-                //
-                // v3.4.0 fix: also skip `engine.snapshot()` when
-                // `db_path` is None — the bytes would have been
-                // discarded immediately. Without this gate, every
-                // write allocates+frees a fresh full-catalog
-                // serialisation (catalog 3 MB per snapshot × 110K
-                // writes = ~330 GB of allocator churn, observable as
-                // a 400+ MB RSS spike).
-                let snap = if state.db_path.is_some() && state.wal.is_none() {
-                    match &result {
-                        Ok(QueryResult::CommandOk {
-                            modified_catalog: true,
-                            ..
-                        }) => Some(engine.snapshot()),
-                        _ => None,
-                    }
+            // Hold the engine write lock across the wrap so the
+            // sequence BEGIN → execute → WAL → COMMIT/ROLLBACK is
+            // serialized with other writers. Readers (read lock)
+            // are already blocked while we hold .write(), so the
+            // implicit tx_catalog is never observable.
+            let mut engine = state
+                .engine
+                .write()
+                .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+            if needs_wrap && let Err(e) = engine.execute("BEGIN") {
+                drop(engine);
+                watchdog.cancel();
+                return write_frame(
+                    stream,
+                    &build_error_response(&format!("implicit BEGIN failed: {e}")),
+                );
+            }
+            let result =
+                engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
+            let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
+            // v4.34: WAL append happens *under the engine lock* now
+            // so the BEGIN..COMMIT atomicity holds without another
+            // writer slipping in. Cost: WAL fsync stretches the
+            // write critical section. The previous design dropped the
+            // lock before WAL — but we couldn't roll the implicit TX
+            // back without re-locking, and re-locking re-opens the
+            // race where in-memory state diverges.
+            let wal_result = if was_command_ok && state.wal.is_some() {
+                if needs_wrap {
+                    append_wal_atomic_block(state, &["BEGIN", &sql, "COMMIT"])
                 } else {
-                    None
-                };
-                (result, snap)
+                    append_wal(state, &sql)
+                }
+            } else {
+                Ok(())
             };
+            if needs_wrap {
+                let outcome_sql = if was_command_ok && wal_result.is_ok() {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                };
+                if let Err(e) = engine.execute(outcome_sql) {
+                    drop(engine);
+                    watchdog.cancel();
+                    return write_frame(
+                        stream,
+                        &build_error_response(&format!("implicit {outcome_sql} failed: {e}")),
+                    );
+                }
+            }
+            // v4.0: sync per-conn TX state from the engine.
+            *in_tx = engine.in_transaction();
+            // Snapshot only when the committed catalog actually changed
+            // and WAL is off (snapshot replaces WAL as the durability
+            // surface in that mode). With WAL on, the implicit COMMIT
+            // is already captured in the WAL block above.
+            let snapshot = if state.db_path.is_some() && state.wal.is_none() {
+                match &result {
+                    Ok(QueryResult::CommandOk {
+                        modified_catalog: true,
+                        ..
+                    }) => Some(engine.snapshot()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            drop(engine);
             watchdog.cancel();
             // Snapshot the catalog first; an audit entry that survives a
             // partial flush would be inconsistent.
@@ -932,12 +1008,7 @@ fn dispatch(
                 );
                 return Err(e);
             }
-            // Append every successful CommandOk SQL to the WAL (when WAL is on).
-            // This captures BEGIN/intra-TX/COMMIT/ROLLBACK literally so replay
-            // reconstructs state via engine.execute().
-            if matches!(result, Ok(QueryResult::CommandOk { .. }))
-                && let Err(e) = append_wal(state, &sql)
-            {
+            if let Err(e) = wal_result {
                 let _ = write_frame(
                     stream,
                     &build_error_response(&format!("WAL append failed: {e}")),
@@ -1112,6 +1183,71 @@ fn run_backup_command(
             &build_error_response(&format!("backup failed: {e}")),
         ),
     }
+}
+
+/// v4.34: serialized byte count an atomic block will occupy in the
+/// WAL (`4 + len(sql)` per entry, summed). Used by the preflight
+/// quota check so the rejection decision matches what the actual
+/// `append_wal_atomic_block` would write.
+fn wal_block_size(sqls: &[&str]) -> u64 {
+    sqls.iter().map(|s| 4u64 + s.len() as u64).sum()
+}
+
+/// v4.34: append several length-prefixed WAL entries with **one**
+/// `write_all` + **one** `fsync`. Used for the auto-commit
+/// BEGIN..COMMIT wrap so the per-write fsync count stays at 1 (vs.
+/// 3 for naive per-statement appends).
+///
+/// Atomic in the operational sense: the OS may still write a torn
+/// suffix if the disk fails partway, but the existing length-prefix
+/// framing + WAL-replay tail-drop (v4.29 row 1.9) handles that —
+/// replay sees zero or more whole entries and stops cleanly at the
+/// first truncated one. The implicit-TX `ROLLBACK` in the dispatch
+/// path then undoes the engine-side state, keeping in-memory and
+/// disk consistent.
+fn append_wal_atomic_block(state: &ServerState, sqls: &[&str]) -> std::io::Result<()> {
+    let Some(wal) = state.wal.as_ref() else {
+        return Ok(());
+    };
+    let total_len: usize = sqls.iter().map(|s| 4 + s.len()).sum();
+    let mut batch = Vec::with_capacity(total_len);
+    for sql in sqls {
+        let len = u32::try_from(sql.len())
+            .map_err(|_| std::io::Error::other("SQL too large for WAL entry"))?;
+        batch.extend_from_slice(&len.to_le_bytes());
+        batch.extend_from_slice(sql.as_bytes());
+    }
+    let mut f = wal
+        .lock()
+        .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
+    if let Some(quota) = state.chaos.wal_quota_bytes {
+        let current = f.metadata().map_or(0, |m| m.len());
+        if current.saturating_add(batch.len() as u64) > quota {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "wal quota exceeded: cur={current} + {} > quota={quota} (SPG_FAIL_WAL_QUOTA_BYTES)",
+                    batch.len()
+                ),
+            ));
+        }
+    }
+    if let Some(min_free) = state.limits.wal_min_free_bytes
+        && let Some(wal_path) = state.wal_path.as_deref()
+    {
+        let free = wal_volume_free_bytes(wal_path)?;
+        if free < min_free {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "WAL volume below water-mark: free={free} < SPG_WAL_MIN_FREE_BYTES={min_free}"
+                ),
+            ));
+        }
+    }
+    f.write_all(&batch)?;
+    f.sync_data()?;
+    Ok(())
 }
 
 fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {

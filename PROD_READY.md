@@ -18,8 +18,8 @@ Status legend:
 - ❌ — not done; on the roadmap
 - 🚫 — intentional out-of-scope (linked to memory or rationale)
 
-Last refresh: **v4.33 ops three-pack** (2026-05-27, commit hash
-filled at commit time).
+Last refresh: **v4.34 ENOSPC in-memory rollback** (2026-05-27,
+commit hash filled at commit time).
 
 ---
 
@@ -40,7 +40,7 @@ storage and survives a crash.
 | 1.8 | WAL/snapshot checksum | Active corruption detection on each loaded file (not just "deserialize fails") | ⚠️ | length-prefixed records catch truncation; mid-record bit-flips would currently surface as parse error rather than explicit checksum mismatch. Deferred to v5 file-format bump — add CRC32 to envelope + per-WAL-record. |
 | 1.9 | Partial-fsync recovery [machine] | If `sync_data` returns mid-write, the file's incomplete tail is detected on next boot and dropped, no half-record applied | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_wal_tail_truncation_drops_partial_record_no_panic` |
 | 1.10 | Disk-full handling [machine] | Out-of-space during WAL append returns clear error to client; server stays alive; previously CC'd state survives restart unchanged | ✅ | v4.29, `tests/e2e_chaos.rs::chaos_disk_full_returns_clean_error_and_keeps_serving` (+ SPG_FAIL_WAL_QUOTA_BYTES injection knob) |
-| 1.11 | In-memory consistency on WAL refusal | When the WAL layer refuses a write, the live in-memory state never reflects it. Caller's `SELECT` sees exactly what was CC'd. | ⚠️ | v4.30 added preflight WAL-quota check (chaos path) — main.rs rejects the SQL before engine.execute when the SPG_FAIL_WAL_QUOTA_BYTES knob would fire. Real ENOSPC mid-`write_all` still has the engine-mutated-but-WAL-failed window; full fix needs auto-commit-savepoint wrap, tracked for post-v4.32. |
+| 1.11 | In-memory consistency on WAL refusal [machine] | When the WAL layer refuses a write, the live in-memory state never reflects it. Caller's `SELECT` sees exactly what was CC'd. | ✅ | v4.34, auto-commit BEGIN..COMMIT wrap in `crates/spg-server/src/main.rs` (atomic WAL block + ROLLBACK on append failure); closes both the chaos path (kept v4.30 preflight) and the real ENOSPC mid-`write_all` path. e2e: `tests/e2e_chaos.rs::chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state` (forces failure inside `append_wal*` via `SPG_DISABLE_WAL_PREFLIGHT`); perf gate: `tests/slo_smoke.rs::slo_wal_insert_p99_under_budget`. |
 
 ## 2. Availability + recovery
 
@@ -220,17 +220,17 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.33 (2026-05-27).
+Last machine run: v4.34 (2026-05-27).
 
 ```
 Total rows in checklist : 85
-  ✅ pass             : 71
-  ⚠️ partial          : 6
+  ✅ pass             : 72
+  ⚠️ partial          : 5
   ❌ open             : 2
   🚫 out-of-scope     : 6
 
-[machine] rows scaffolded in prod_ready.rs : 33
-  row_1_3, row_1_9, row_1_10,
+[machine] rows scaffolded in prod_ready.rs : 34
+  row_1_3, row_1_9, row_1_10, row_1_11,
   row_2_5, row_2_6, row_2_7,
   row_3_7, row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
   row_4_1, row_4_2, row_4_5,
@@ -242,19 +242,14 @@ Total rows in checklist : 85
   row_10_x, row_10_4, row_10_5
 ```
 
-v4.33 closed three rows that had been blocking the "external SaaS
-user" bar:
-
-- 2.7 graceful shutdown — previously ⚠️ (bounded by
-  `SPG_QUERY_TIMEOUT_MS`); now ✅ with `SPG_SHUTDOWN_DEADLINE_SEC`
-  + SIGTERM handler.
-- 4.5 slow-query log — previously ❌; now ✅ with
-  `SPG_SLOW_QUERY_LOG_MS` and a JSON-line event on stderr.
-- 5.7 disk water-mark — previously ❌; now ✅ with
-  `SPG_WAL_MIN_FREE_BYTES` and a `statvfs(2)` precheck before
-  every WAL append.
-
-All three landed as [machine]-checked e2e tests.
+v4.34 closed PROD_READY row 1.11 — the last data-correctness gap
+that survived v4.33's ops three-pack. An implicit BEGIN..COMMIT
+wraps every auto-commit write when WAL is on; the [BEGIN, sql,
+COMMIT] block hits the WAL with one atomic `write_all` + `fsync`,
+and a failure rolls the engine back via the existing TX machinery.
+Replay sees the unfinished implicit TX as "BEGIN with no COMMIT"
+and auto-rollbacks per v1's existing logic. Real ENOSPC mid-
+`write_all` is now indistinguishable from a clean refusal.
 
 The 2 remaining ❌ items are observability nice-to-haves slotted
 into v4.35 / v4.36 by NEXT.md:
@@ -262,12 +257,10 @@ into v4.35 / v4.36 by NEXT.md:
 - 4.6 per-table row count metric: cardinality allowlist (v4.35)
 - 4.7 replication lag metric: needs follower → primary RPC (v4.36)
 
-The 6 ⚠️ items are all "works today within documented limits;
+The 5 ⚠️ items are all "works today within documented limits;
 strict invariant deferred per NEXT.md":
 
 - 1.8 explicit CRC32 (today: truncation caught by length prefix; v4.37)
-- 1.11 ENOSPC mid-`write_all` window (today: preflight catches
-  the chaos case; full fix needs auto-commit savepoint; v4.34)
 - 2.9 netsplit replication chaos (v4.36)
 - 5.5 per-query memory cap: needs custom global allocator (v5.0)
 - 5.6 OOM injection survives: needs alloc-error hook (v5.0)

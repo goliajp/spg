@@ -48,6 +48,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SLO_SEL_P99_US: u128 = 500;
 const SLO_INS_P99_US: u128 = 500;
 
+/// v4.34 — WAL-on INSERT p99 ceiling for the implicit-BEGIN..COMMIT
+/// wrap path. fsync per write dominates this number (APFS / ext4
+/// journaling can easily land in the 10-30 ms p99 band even with
+/// a healthy SSD; CI shared runners can briefly spike higher under
+/// I/O contention). The SLO covers the engine-side overhead — the
+/// extra catalog clone the wrap introduces — not the storage device.
+/// Ceiling: 50 ms. A real regression in the wrap (catalog clones
+/// per row, missed batched fsync, extra round-trips) would still
+/// blow it — measured baseline at v4.34 sits ~20 ms p99 on local
+/// APFS.
+const SLO_WAL_INS_P99_US: u128 = 50_000;
+
 fn pick_free_addr() -> String {
     let p = TcpListener::bind("127.0.0.1:0").unwrap();
     let a = p.local_addr().unwrap();
@@ -189,5 +201,71 @@ fn slo_smoke_select_and_insert_p99_under_budget() {
     assert!(
         ins_p99 <= SLO_INS_P99_US,
         "INS p99 {ins_p99} µs blew the SLO ceiling of {SLO_INS_P99_US} µs — see PERFORMANCE.md §SLO and xbench/competitor/src/bin/latency.rs"
+    );
+}
+
+fn spawn_wal(addr: &str, db: &std::path::Path, wal: &std::path::Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_spg-server"))
+        .arg(addr)
+        .arg(db)
+        .arg("-")
+        .arg(wal)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("SPG_PASSWORD")
+        .env_remove("SPG_ADMIN_PASSWORD")
+        .env_remove("SPG_PG_ADDR")
+        .spawn()
+        .unwrap()
+}
+
+/// v4.34: perf gate for the implicit BEGIN..COMMIT wrap. Runs the
+/// same shape of INSERTs as the in-memory smoke above, but against
+/// a server with WAL enabled (so every write goes through the
+/// wrap → atomic WAL block → COMMIT path).
+///
+/// The ceiling is set well above pure-disk fsync latency to keep
+/// CI noise / shared-runner I/O contention from false-alarming. A
+/// real regression in the wrap (e.g. an extra catalog clone, or a
+/// missed batched fsync) would still blow it.
+#[test]
+fn slo_wal_insert_p99_under_budget() {
+    let addr = pick_free_addr();
+    let dir = unique_tmpdir();
+    let db = dir.join("slo.db");
+    let wal = dir.join("slo.wal");
+    let mut child = ChildGuard(spawn_wal(&addr, &db, &wal));
+    let mut s = wait_for_listener(&addr, &mut child.0);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+
+    round_trip(
+        &mut s,
+        "CREATE TABLE slo_wal (id INT NOT NULL, v INT NOT NULL)",
+    );
+    // Warm-up: amortize first-write cost (catalog grow, pagecache
+    // priming, fsync metadata journaling on cold FS).
+    for i in 0..200 {
+        round_trip(
+            &mut s,
+            &format!("INSERT INTO slo_wal VALUES ({i}, {})", i * 7),
+        );
+    }
+
+    const N: usize = 200;
+    let mut ins = Vec::with_capacity(N);
+    for i in 1000..1000 + N {
+        let t = Instant::now();
+        round_trip(
+            &mut s,
+            &format!("INSERT INTO slo_wal VALUES ({i}, {})", i * 7),
+        );
+        ins.push(t.elapsed().as_micros());
+    }
+    let ins_p99 = p99(&mut ins);
+    eprintln!("SLO smoke (WAL-on): INS p99 = {ins_p99} µs (ceiling ≤ {SLO_WAL_INS_P99_US})");
+    assert!(
+        ins_p99 <= SLO_WAL_INS_P99_US,
+        "WAL-mode INS p99 {ins_p99} µs blew the v4.34 ceiling of {SLO_WAL_INS_P99_US} µs — \
+         the implicit BEGIN..COMMIT wrap may have regressed; see PROD_READY row 1.11"
     );
 }
