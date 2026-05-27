@@ -10,6 +10,49 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.34.0] — 2026-05-27 (ENOSPC in-memory rollback — auto-commit BEGIN..COMMIT wrap)
+
+### Added
+- **Implicit BEGIN..COMMIT wrap for auto-commit writes** —
+  when WAL is on and the statement is not a TX-control verb,
+  the dispatch path now wraps the engine mutation in an
+  implicit `BEGIN` / `COMMIT`. The whole `[BEGIN, sql, COMMIT]`
+  triple lands in the WAL with **one** `write_all` + **one**
+  `fsync` via the new `append_wal_atomic_block` helper. On WAL
+  append failure the dispatcher issues `ROLLBACK` and the
+  engine reverts — live in-memory state never reflects a write
+  whose WAL append didn't make it to disk. Closes PROD_READY
+  row 1.11 fully.
+- `tests/e2e_chaos.rs::chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state`
+  — exercises the path through real `append_wal*` failure by
+  disabling the v4.30 preflight (`SPG_DISABLE_WAL_PREFLIGHT`).
+  Asserts live count == CC'd count both pre- and post-restart
+  (no phantom rows in either window).
+- `tests/slo_smoke.rs::slo_wal_insert_p99_under_budget` —
+  WAL-on perf gate for the wrap. Ceiling 50 ms (loose to absorb
+  APFS / ext4 journaling variance; baseline ~20 ms on local
+  APFS); catches gross regressions in the wrap (extra catalog
+  clones, missed batched fsync) without false-alarming on
+  shared-runner I/O noise.
+- `SPG_DISABLE_WAL_PREFLIGHT` env var (test-only) to bypass the
+  v4.30 dispatch-time chaos preflight and force the real
+  append-side failure path.
+- `prod_ready.rs::row_1_11_*` machine row.
+
+### Changed
+- WAL append path: `append_wal` (single-statement, single fsync)
+  is kept for in-TX writes; new `append_wal_atomic_block`
+  multi-statement variant for the implicit-wrap path.
+- v4.30 preflight quota check now sizes for the full
+  `[BEGIN, sql, COMMIT]` block when the wrap is active.
+- PROD_READY.md audit snapshot: 71 → 72 ✅ / 6 → 5 ⚠️;
+  [machine] rows 33 → 34.
+
+### Test verification
+  cargo test --release --workspace                              # all green
+  cargo clippy --workspace --all-targets -- -D warnings         # 0 warnings
+  cargo fmt --all -- --check                                    # clean
+
 ## [4.33.0] — 2026-05-27 (ops three-pack — graceful shutdown + slow-query log + disk water-mark)
 
 ### Added

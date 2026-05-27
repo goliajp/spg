@@ -398,6 +398,46 @@ fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
     );
 }
 
+// ---- 1.11 v4.34 in-memory consistency on WAL refusal ----
+
+/// 1.11 In-memory consistency on WAL refusal — auto-commit
+/// BEGIN..COMMIT wrap in main.rs rolls back the engine if WAL
+/// append fails (real ENOSPC path, not just the preflight chaos
+/// knob). Evidence: the v4.34 chaos test + perf gate are both
+/// present and the dispatch code declares the knobs.
+#[test]
+fn row_1_11_in_memory_consistency_covered_by_e2e() {
+    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let chaos_src = std::fs::read_to_string(&chaos_path)
+        .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", chaos_path.display()));
+    assert!(
+        chaos_src.contains(
+            "fn chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state"
+        ),
+        "e2e_chaos.rs must contain the v4.34 no-preflight rollback test"
+    );
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("SPG_DISABLE_WAL_PREFLIGHT"),
+        "main.rs must declare the SPG_DISABLE_WAL_PREFLIGHT knob"
+    );
+    assert!(
+        main_src.contains("append_wal_atomic_block"),
+        "main.rs must use the atomic-block WAL append for the implicit wrap"
+    );
+    assert!(
+        main_src.contains("needs_wrap"),
+        "main.rs must compute the implicit BEGIN..COMMIT wrap gate"
+    );
+    let slo_path = workspace_root().join("crates/spg-server/tests/slo_smoke.rs");
+    let slo_src = std::fs::read_to_string(&slo_path).expect("slo_smoke.rs");
+    assert!(
+        slo_src.contains("fn slo_wal_insert_p99_under_budget"),
+        "slo_smoke.rs must perf-gate the v4.34 wrap"
+    );
+}
+
 // ---- 2.7 / 4.5 / 5.7 v4.33 ops three-pack ----
 
 /// 2.7 graceful shutdown — SIGTERM drains in-flight queries and
