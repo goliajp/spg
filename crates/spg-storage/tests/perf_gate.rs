@@ -6,7 +6,9 @@
     clippy::cast_sign_loss,
     clippy::doc_markdown,
     clippy::useless_conversion,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::unreadable_literal,
+    clippy::items_after_statements
 )]
 
 //! Regression-catch perf gate for `spg-storage`. Budgets in `BUDGETS.md`.
@@ -15,6 +17,7 @@ use std::time::Instant;
 
 use spg_storage::{
     Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row, TableSchema, Value, nsw_query,
+    persistent::PersistentVec,
 };
 
 fn build_catalog(n_rows: i32) -> Catalog {
@@ -110,5 +113,59 @@ fn hnsw_search_under_budget() {
     assert!(
         mean_secs < budget_secs,
         "hnsw_search_top10_dim8_n200 mean {mean_secs:.6} s exceeds budget {budget_secs:.6} s"
+    );
+}
+
+/// v4.38 BVT push 性能门 — 1M `u64` push 操作 ≤ 200 ms。
+/// 实测在 M-series mac release 模式 ~80-120 ms；200 ms 留 ~2× 余量给 CI / Linux host。
+#[test]
+fn pv_push_1m_under_200ms() {
+    let start = Instant::now();
+    let mut pv: PersistentVec<u64> = PersistentVec::new();
+    for i in 0..1_000_000_u64 {
+        pv = pv.push(i);
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(&pv);
+    let budget_ms: u128 = 200;
+    let elapsed_ms = elapsed.as_millis();
+    assert!(
+        elapsed_ms < budget_ms,
+        "pv_push_1m elapsed {elapsed_ms} ms exceeds budget {budget_ms} ms"
+    );
+    assert_eq!(pv.len(), 1_000_000);
+}
+
+/// v4.38 BVT random `get` 性能门 — 1M 元素的 PV 上随机 `get` 平均 ≤ 100 ns。
+/// 实测 ~30-60 ns；100 ns 同样留 ~2× 余量。100K 次采样平摊掉 Instant 噪声。
+#[test]
+fn pv_get_random_under_100ns_avg() {
+    let mut pv: PersistentVec<u64> = PersistentVec::new();
+    for i in 0..1_000_000_u64 {
+        pv = pv.push(i);
+    }
+    // SplitMix-style scrambler — same shape used in fuzz oracle / NSW level
+    // assignment. Reproducible without `rand`.
+    let mut state: u64 = 0xC0FFEE_u64;
+    const N_PROBES: usize = 100_000;
+    let start = Instant::now();
+    let mut acc: u64 = 0;
+    for _ in 0..N_PROBES {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut x = state;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        let idx = (x as usize) % 1_000_000;
+        let v = pv.get(std::hint::black_box(idx)).unwrap();
+        acc = acc.wrapping_add(*v);
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(acc);
+    let avg_ns = elapsed.as_nanos() / (N_PROBES as u128);
+    let budget_ns: u128 = 100;
+    assert!(
+        avg_ns < budget_ns,
+        "pv_get_random avg {avg_ns} ns exceeds budget {budget_ns} ns"
     );
 }
