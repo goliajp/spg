@@ -224,6 +224,9 @@ fn render_replication_lag(state: &crate::ServerState, out: &mut String) {
     // wall-time deltas can go briefly negative under NTP slew —
     // saturate at 0 so the metric is monotonically meaningful.
     let lag_us = now_us.saturating_sub(primary_wall);
+    // Microseconds-to-seconds cast is precision-safe for any lag
+    // smaller than ~285 years — f64 mantissa covers it.
+    #[allow(clippy::cast_precision_loss)]
     let lag_seconds = (lag_us as f64) / 1_000_000.0;
     out.push_str("# HELP spg_replication_lag_bytes WAL bytes follower is behind primary (v4.36 status frame)\n");
     out.push_str("# TYPE spg_replication_lag_bytes gauge\n");

@@ -286,9 +286,8 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
         if p + 4 != buf.len() {
             return EnvelopeParse::Bare;
         }
-        let crc_arr = match buf[p..p + 4].try_into() {
-            Ok(a) => a,
-            Err(_) => return EnvelopeParse::Bare,
+        let Ok(crc_arr) = buf[p..p + 4].try_into() else {
+            return EnvelopeParse::Bare;
         };
         let expected = u32::from_le_bytes(crc_arr);
         let computed = spg_crypto::crc32::crc32(&buf[..p]);

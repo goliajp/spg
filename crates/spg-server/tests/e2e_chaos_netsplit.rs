@@ -218,12 +218,9 @@ fn spawn_proxy(listen_addr: &str, backend_addr: String) -> ProxyControl {
                 let _ = client.shutdown(Shutdown::Both);
                 continue;
             }
-            let backend = match TcpStream::connect(&backend_addr) {
-                Ok(s) => s,
-                Err(_) => {
-                    let _ = client.shutdown(Shutdown::Both);
-                    continue;
-                }
+            let Ok(backend) = TcpStream::connect(&backend_addr) else {
+                let _ = client.shutdown(Shutdown::Both);
+                continue;
             };
             let _ = client.set_read_timeout(Some(Duration::from_millis(200)));
             let _ = backend.set_read_timeout(Some(Duration::from_millis(200)));
@@ -231,14 +228,14 @@ fn spawn_proxy(listen_addr: &str, backend_addr: String) -> ProxyControl {
             let b1 = backend.try_clone().unwrap();
             let ctrl_a = ctrl_for_thread.clone();
             let ctrl_b = ctrl_for_thread.clone();
-            thread::spawn(move || pump(c1, backend, ctrl_a));
-            thread::spawn(move || pump(b1, client, ctrl_b));
+            thread::spawn(move || pump(c1, backend, &ctrl_a));
+            thread::spawn(move || pump(b1, client, &ctrl_b));
         }
     });
     ctrl
 }
 
-fn pump(mut src: TcpStream, mut dst: TcpStream, ctrl: ProxyControl) {
+fn pump(mut src: TcpStream, mut dst: TcpStream, ctrl: &ProxyControl) {
     let mut buf = [0u8; 4096];
     loop {
         if !ctrl.is_connected() {
@@ -263,8 +260,9 @@ fn pump(mut src: TcpStream, mut dst: TcpStream, ctrl: ProxyControl) {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                // Polling tick — re-check the kill switch.
-                continue;
+                // Polling tick — re-check the kill switch. Loop
+                // header handles continuation; no explicit continue
+                // needed.
             }
             Err(_) => return,
         }

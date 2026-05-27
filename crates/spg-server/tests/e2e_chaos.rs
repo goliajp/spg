@@ -412,16 +412,14 @@ fn chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay() {
     let mut stderr = c2.0.stderr.take().expect("stderr piped");
     let deadline = Instant::now() + Duration::from_secs(8);
     let status = loop {
-        match c2.0.try_wait().expect("try_wait") {
-            Some(s) => break s,
-            None => {
-                assert!(
-                    Instant::now() < deadline,
-                    "server didn't exit on corruption"
-                );
-                thread::sleep(Duration::from_millis(50));
-            }
+        if let Some(s) = c2.0.try_wait().expect("try_wait") {
+            break s;
         }
+        assert!(
+            Instant::now() < deadline,
+            "server didn't exit on corruption"
+        );
+        thread::sleep(Duration::from_millis(50));
     };
     assert!(
         !status.success(),
