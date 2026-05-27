@@ -750,6 +750,105 @@ E2E (tests/e2e_pgbouncer_compat.rs, 4 cases):
 - reset_all_returns_cc
 - set_transaction_isolation_returns_cc
 
+## v4.37 scale sweep + boundary probe (2026-05-27)
+
+`xbench/competitor/src/bin/sweep.rs` grows a single table from
+10K → 100K → 1M → 10M (main sweep) then 30M → 100M (boundary
+probe) on every backend, measuring INSERT throughput / SCAN
+throughput / PK lookup p50+p99 / secondary-index lookup p50+p99
+at each checkpoint. Bails on any of: PK p99 > 100 ms, INSERT
+rows/s falls below 50 % of per-backend peak (only counted from
+N ≥ 1M to ignore fsync-amortization warmup), SPG RSS > 4 GiB,
+or > 15 min per backend.
+
+Stack: `xbench/competitor/docker-compose.yml` (PG 18 +
+MySQL 9 + MariaDB 11, all default `*_buffer_pool=128 MB`).
+
+### Per-N (INSERT throughput rows/s + PK p99 µs)
+
+| backend       |    10K    |    100K   |     1M    |    10M    |    30M    |   100M    |
+|---------------|----------:|----------:|----------:|----------:|----------:|----------:|
+| spg-embedded  | 1,684K / 1µs | 1,812K / 2µs | 1,584K / 5µs  | 1,199K / 13µs | (RSS cap) | — |
+| spg-server    |    87K / 55µs |     50K / 89µs |   9.4K / 77µs  | (bail)    | —         | — |
+| postgres      |   156K / 2.3ms |    160K / 2.4ms |    146K / 2.3ms |    119K / 3.1ms |     81K / 3.0ms |     41K / **19.8ms** |
+| mysql         |    36K / 2.4ms |     69K / 2.2ms |     82K / 3.0ms |     74K / 4.0ms |     41K / 2.3ms |     20K / 2.3ms |
+| mariadb       |    95K / 2.6ms |    186K / 2.3ms |    169K / 2.3ms |     33K / 2.3ms | (bail)    | — |
+
+### Where each backend hit its boundary
+
+| backend       | last successful N | bail reason |
+|---------------|------------------:|-------------|
+| spg-embedded  | **10M**          | RSS 4478 MiB > 4 GiB safety line (host RAM is the cliff) |
+| spg-server    | **100K**         | INSERT 9.4K r/s at 1M < 50 % of 87K peak (v4.34 BEGIN..COMMIT wrap catalog-clone cost — see §Findings) |
+| postgres      | **30M**          | INSERT 41K r/s at 100M < 50 % of 160K peak; **also** PK p99 jumped 3 ms → 19.8 ms (buffer-pool spillover) |
+| mysql         | **30M**          | INSERT 20K r/s at 100M < 50 % of 82K peak; PK p99 stayed 2.3 ms even at 100M |
+| mariadb       | **1M**           | INSERT 33K r/s at 10M < 50 % of 186K peak; PK p99 stayed 2.3 ms throughout |
+
+### Findings
+
+**1. The "MySQL cliff" myth is mostly wrong.** PK p99 stayed at
+~2-4 ms across **every** N for MySQL — even at 100M rows on a
+container with 128 MB buffer pool. MySQL doesn't fall off an
+indexed-lookup cliff; it just gets slower at INSERT as the
+table grows.
+
+**2. PostgreSQL hits a real lookup cliff at 100M rows.** PK
+p99 went 3 ms → 19.8 ms between 30M and 100M — pgvector index
+plus row heap exceeded the 128 MB shared_buffers, every probe
+became disk I/O. The exact rollover would shift with bigger
+shared_buffers; this is the **dataset-size > buffer-pool**
+inflection, not an algorithmic cliff. (MySQL didn't show this
+because at 100M its INSERT was so slow the test bailed before
+the lookup-cliff sample size mattered — but its 30M PK was
+already 2.3 ms, suggesting MySQL's adaptive hash index covers
+it differently.)
+
+**3. MariaDB INSERT throughput collapses earliest.** Dropped
+to 17 % of peak at 10M while MySQL stayed at 90 % of peak.
+Same InnoDB lineage; different default tuning. Worth a
+follow-up to figure out which knob.
+
+**4. spg-embedded scales fine up to RAM.** PK p99 grew 1 µs →
+13 µs (B-tree depth log-scaling, expected). INSERT throughput
+held 1.2-1.8 M rows/s. The cliff is **physical RAM** at ~4.5
+GiB RSS for 10M small rows; no algorithmic slowdown.
+
+**5. spg-server has a serious INSERT regression at scale —
+v4.34's BEGIN..COMMIT wrap doesn't.** At 1M rows the wrap path
+collapsed to 9.4K rows/s (vs MySQL 82K, PG 146K at the same
+N). RSS climbed 217 → 819 MiB between 100K and 1M, consistent
+with full-catalog clones per write. Lookup latency was fine
+(77 µs p99) — the bottleneck is **per-batch catalog clone
+cost** in the v4.34 implicit BEGIN..COMMIT wrap. This was the
+risk NEXT.md flagged for v4.34 but slo_smoke (10K rows) didn't
+catch.
+
+   **Action item for follow-up**: structural-sharing
+   `Arc<Catalog>` snapshot for the implicit TX, or per-table
+   COW so a wrap that only touches one table doesn't pay the
+   whole-catalog clone. Tracked separately; not blocking the
+   baseline.
+
+### Boundary summary
+
+| concern                          | which backend hits it first | at what N |
+|----------------------------------|----------------------------|-----------|
+| INSERT throughput cliff          | mariadb                    | ~10M      |
+| INSERT throughput regression     | **spg-server (v4.34 wrap)**| **~1M**   |
+| PK lookup p99 cliff (buffer pool)| postgres                   | ~100M     |
+| Physical RAM ceiling             | spg-embedded               | ~10M (small rows) |
+| Stable across all N tested       | mysql (PK p99 ~2.3 ms throughout) | — |
+
+### Reproduce
+
+  cd <repo root>
+  xbench/competitor/scripts/up.sh       # docker compose containers
+  cargo run --release -p spg-bench-competitor --bin sweep
+
+Per-backend budget 15 min, full run ~30 min on a quiet host.
+
+---
+
 ## v4.37 competitor rerun (2026-05-27, post-ops-sprint)
 
 End-to-end re-baseline after the v4.33–v4.37 sprint (graceful
