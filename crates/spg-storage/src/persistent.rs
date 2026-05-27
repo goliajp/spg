@@ -32,6 +32,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::Index;
 
 const SHIFT: u32 = 5;
 const BRANCH: usize = 1 << SHIFT; // 32
@@ -72,6 +73,18 @@ impl<T> Clone for PersistentVec<T> {
         }
     }
 }
+
+/// Element-wise equality: two PVs are equal iff they yield the same elements
+/// in the same order. Independent of internal trie shape — two PVs built via
+/// different push / set sequences with the same end state still compare
+/// equal. Used by `Catalog::serialize` round-trip tests in v4.39+.
+impl<T: PartialEq> PartialEq for PersistentVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+
+impl<T: Eq> Eq for PersistentVec<T> {}
 
 impl<T> PersistentVec<T> {
     /// Empty vector. Allocates one empty `Internal` root and one empty `tail`
@@ -139,6 +152,18 @@ impl<'a, T> IntoIterator for &'a PersistentVec<T> {
     type IntoIter = Iter<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+/// `pv[i]` indexing, matching `Vec<T>::index`'s contract: panics on
+/// out-of-bounds. v4.39 lets `table.rows[i]` work unchanged on the new
+/// PV-backed `Table` for the price of one extra `O(log₃₂ N)` walk per
+/// lookup (vs Vec's O(1)). Callers in a hot loop should hoist the trie
+/// walk where possible (`let row = pv.get(i)?;`) instead of re-indexing.
+impl<T> Index<usize> for PersistentVec<T> {
+    type Output = T;
+    fn index(&self, i: usize) -> &T {
+        self.get(i).expect("PersistentVec index out of bounds")
     }
 }
 

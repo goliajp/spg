@@ -25,6 +25,7 @@
 //! `xbench/competitor/src/bin/latency.rs` /
 //! `throughput.rs` for the real story.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -268,5 +269,66 @@ fn slo_wal_insert_p99_under_budget() {
         ins_p99 <= SLO_WAL_INS_P99_US,
         "WAL-mode INS p99 {ins_p99} µs blew the v4.34 ceiling of {SLO_WAL_INS_P99_US} µs — \
          the implicit BEGIN..COMMIT wrap may have regressed; see PROD_READY row 1.11"
+    );
+}
+
+/// v4.39 — 1M-row throughput gate for the implicit BEGIN..COMMIT wrap on a
+/// PV-backed catalog. Mirrors the `xbench/competitor/src/bin/sweep.rs` shape
+/// (multi-VALUES INSERTs of 500 rows / batch) so the gate fires when the
+/// `Catalog::clone()` inside the wrap regresses from O(1) back toward O(N
+/// rows). Baseline-v4.37 sat at 9.4K r/s for this workload; v4.39 should
+/// comfortably clear 50K r/s.
+const SLO_V4_39_INSERT_1M_FLOOR_RPS: f64 = 50_000.0;
+const SLO_V4_39_BATCH_ROWS: usize = 500;
+const SLO_V4_39_TOTAL_ROWS: usize = 1_000_000;
+
+#[test]
+fn slo_wal_insert_1m_rows_throughput() {
+    let addr = pick_free_addr();
+    let dir = unique_tmpdir();
+    let db = dir.join("slo1m.db");
+    let wal = dir.join("slo1m.wal");
+    let mut child = ChildGuard(spawn_wal(&addr, &db, &wal));
+    let mut s = wait_for_listener(&addr, &mut child.0);
+    // The 1M-row loop on a tight quiet box clears comfortably under 30 s
+    // post-v4.39; the read timeout caps a pathological regression instead
+    // of running the whole CI budget out.
+    s.set_read_timeout(Some(Duration::from_mins(2))).unwrap();
+
+    round_trip(
+        &mut s,
+        "CREATE TABLE slo1m (id INT NOT NULL, v INT NOT NULL)",
+    );
+
+    let start = Instant::now();
+    let mut next_id: usize = 0;
+    while next_id < SLO_V4_39_TOTAL_ROWS {
+        let end = (next_id + SLO_V4_39_BATCH_ROWS).min(SLO_V4_39_TOTAL_ROWS);
+        let mut sql = String::with_capacity(SLO_V4_39_BATCH_ROWS * 24);
+        sql.push_str("INSERT INTO slo1m VALUES ");
+        let mut first = true;
+        for i in next_id..end {
+            if !first {
+                sql.push(',');
+            }
+            first = false;
+            write!(sql, "({i}, {})", i * 7).expect("String write never fails");
+        }
+        round_trip(&mut s, &sql);
+        next_id = end;
+    }
+    let elapsed = start.elapsed();
+    let rps = SLO_V4_39_TOTAL_ROWS as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "SLO smoke (WAL-on, 1M rows): {rps:.0} r/s over {:.1} s (floor ≥ {} r/s)",
+        elapsed.as_secs_f64(),
+        SLO_V4_39_INSERT_1M_FLOOR_RPS as u64,
+    );
+    assert!(
+        rps >= SLO_V4_39_INSERT_1M_FLOOR_RPS,
+        "v4.39 1M-row INSERT throughput {rps:.0} r/s blew the floor of {:.0} r/s — \
+         the PersistentVec-backed Catalog::clone may have regressed or the auto-commit \
+         wrap is taking the wrong path; see NEXT.md §v4.39 + PROD_READY row 1.11",
+        SLO_V4_39_INSERT_1M_FLOOR_RPS
     );
 }

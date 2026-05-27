@@ -1444,7 +1444,7 @@ impl Engine {
 
         // Nested-loop join. Starting set: every primary row, padded with
         // (no joined columns yet).
-        let mut working: Vec<Row> = primary_table.rows().to_vec();
+        let mut working: Vec<Row> = primary_table.rows().iter().cloned().collect();
         let mut produced_len = primary_table.schema().columns.len();
         for (t, _, kind, on) in &joined_tables {
             let right_arity = t.schema().columns.len();

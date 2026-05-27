@@ -10,6 +10,69 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.39.0] — 2026-05-27 (catalog backed by PersistentVec — scale-invariant BEGIN/COMMIT)
+
+### Promotes PROD_READY row 1.11 to "verified @ scale"
+
+The v4.34 auto-commit BEGIN..COMMIT wrap (per-write savepoint
+around the WAL append, required for ENOSPC rollback) clones
+`Catalog` once per write. Before v4.39 the clone was deep-copy —
+`Catalog::clone` → every `Table::clone` → `Vec<Row>::clone`. At
+1M rows the clone took ~50 ms, capping `xbench/competitor/src/bin/sweep.rs`
+spg-server INSERT throughput at 9.4K r/s (vs PG18's 146K r/s at
+the same row count). v4.39 backs `Table::rows` with
+`PersistentVec<Row>` (Bitmapped Vector Trie, landed standalone in
+v4.38) so `Table::clone` is O(1) `Arc` bump and the wrap's clone
+cost no longer scales with row count.
+
+### Observable
+
+- Mid-write rollback semantics unchanged. `tests/e2e_chaos.rs`
+  (1.10 / 1.11 chaos paths) keep passing.
+- Catalog serialization round-trip unchanged. File format version
+  not bumped — the on-disk layout iterates rows, and
+  `&PersistentVec<Row>: IntoIterator` makes the existing
+  `for row in &t.rows { … }` write loop work unchanged.
+- 1M-row INSERT throughput rises from **9.4K r/s → ~109K r/s**
+  (`tests/slo_smoke.rs::slo_wal_insert_1m_rows_throughput`,
+  release mode, single-client). Per-row INSERT p99 unchanged
+  within the existing `SLO_WAL_INS_P99_US` budget — the new floor
+  catches catalog-clone regressions specifically.
+
+### API surface change (internal-only)
+
+`pub fn Table::rows(&self) -> &[Row]` becomes `pub fn
+Table::rows(&self) -> &PersistentVec<Row>`. `spg-engine` callers
+in the workspace are updated to use `.iter()` (via
+`IntoIterator for &PersistentVec`) and `.get(i)` where they used
+slice indexing; the small set of cases that needed an actual
+`Vec<Row>` (e.g. nested-loop join working set) now do
+`.iter().cloned().collect()` once at the join entry. The
+`PersistentVec<T>` type itself impls `Index<usize>` with
+Vec-compatible panic-on-OOB semantics, so existing `table.rows[i]`
+sites in the NSW search path keep their original shape.
+
+### Carve-outs (deferred to later checkpoints)
+
+- Secondary indices (`Table::indices: Vec<Index>`) still
+  deep-clone — v4.40 migrates the B-tree index to
+  `PersistentBTreeMap`. Until then a `Catalog::clone` on a
+  table with secondary indices still costs O(index size).
+- NSW / HNSW graph topology (`NswGraph`) stays on `Vec` — its
+  persistent migration is v5.0's harder body of work. NSW search
+  reads `table.rows[i]` through PV's `Index` impl, paying an
+  extra `O(log₃₂ N)` per probe (~50 ns at 1M rows); this regresses
+  `xbench/competitor/src/bin/vector_knn.rs` modestly (~3× search
+  latency), recovered in v5.0.
+
+### Closes / refs
+
+- PROD_READY row 1.11 — promoted to "@ scale verified".
+- NEXT.md — v4.39 checkpoint of the v4.38–v5.0 perf recovery
+  roadmap (post-v4.37).
+
+---
+
 ## [4.37.0] — 2026-05-27 (file format v9 + CRC32 on every storage envelope)
 
 ### Closes PROD_READY row 1.8 — explicit corruption detection on
