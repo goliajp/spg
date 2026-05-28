@@ -11,8 +11,11 @@
 
 extern crate alloc;
 
+pub mod bloom;
 pub mod persistent;
 pub mod persistent_btree;
+
+pub use self::bloom::{BloomError, BloomFilter};
 
 use alloc::collections::BTreeMap;
 use alloc::format;

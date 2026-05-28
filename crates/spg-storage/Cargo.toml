@@ -10,6 +10,9 @@ description  = "In-memory storage primitives for SPG: values, rows, table schema
 [lints]
 workspace = true
 
+[dependencies]
+spg-crypto = { path = "../spg-crypto" }
+
 [dev-dependencies]
 criterion = { workspace = true }
 

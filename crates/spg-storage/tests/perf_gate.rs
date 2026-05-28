@@ -16,8 +16,8 @@
 use std::time::Instant;
 
 use spg_storage::{
-    Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row, TableSchema, Value, nsw_query,
-    persistent::PersistentVec, persistent_btree::PersistentBTreeMap,
+    BloomFilter, Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row, TableSchema,
+    Value, nsw_query, persistent::PersistentVec, persistent_btree::PersistentBTreeMap,
 };
 
 fn build_catalog(n_rows: i32) -> Catalog {
@@ -217,5 +217,92 @@ fn pv_get_random_under_100ns_avg() {
     assert!(
         avg_ns < budget_ns,
         "pv_get_random avg {avg_ns} ns exceeds budget {budget_ns} ns"
+    );
+}
+
+// ---- v5.0 BloomFilter perf gates ----
+
+/// SplitMix64 used by the bloom internals — re-derive here for
+/// deterministic seed streams so the perf gate is reproducible
+/// without `rand`.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// 100K inserts + 100K disjoint probes — observed FP rate must be
+/// ≤ 1.1 × target (tighter than the in-module fuzz oracle which
+/// allows 1.2×). The 10 % margin absorbs finite-sample variance:
+/// bloom FP rate is an asymptotic guarantee, and on 100K probes
+/// observed values typically sit in `[0.95, 1.05]` × target. Gate
+/// fires when the bloom design itself regresses (bad hash mixing
+/// → clustered bit positions, undersized bit table, etc.), not on
+/// statistical noise. Exercises the v5.0 cold-tier prefilter's
+/// worst-case shape (the v5 segment writer feeds Bloom at this
+/// scale).
+#[test]
+fn bloom_fp_rate_under_1pct() {
+    const TARGET_FP: f64 = 0.01;
+    const CEILING_FP: f64 = TARGET_FP * 1.1;
+    const N: usize = 100_000;
+    let mut bf = BloomFilter::with_target_fp_rate(N, TARGET_FP);
+    // Deterministic key streams via SplitMix64.
+    let mut s = 0xfeed_beef_u64;
+    let mut inserted = Vec::with_capacity(N);
+    for _ in 0..N {
+        s = splitmix64(s.wrapping_add(1));
+        inserted.push(s);
+        bf.insert(&s.to_le_bytes());
+    }
+    let inserted_set: std::collections::BTreeSet<u64> = inserted.iter().copied().collect();
+    let mut s2 = 0xbeef_feed_u64;
+    let mut fp = 0u64;
+    let mut tested = 0u64;
+    for _ in 0..N {
+        s2 = splitmix64(s2.wrapping_add(1));
+        if inserted_set.contains(&s2) {
+            continue;
+        }
+        tested += 1;
+        if bf.contains(&s2.to_le_bytes()) {
+            fp += 1;
+        }
+    }
+    let observed = fp as f64 / tested as f64;
+    eprintln!(
+        "bloom_fp_rate: {fp} fp / {tested} tested = {observed:.5} (target {TARGET_FP:.3}, ceiling {CEILING_FP:.3})"
+    );
+    assert!(
+        observed <= CEILING_FP,
+        "observed FP {observed:.5} exceeded ceiling {CEILING_FP:.3} (target {TARGET_FP:.3})"
+    );
+}
+
+/// 1M inserts wall time bound. Each insert is one FNV-1a pass over
+/// 8 bytes + 7 word-mask updates; should clear well under 100 ms
+/// on any modern x86_64 / aarch64. Catches insert-path pessimism
+/// (e.g. accidental quadratic growth, missed inlining of `mix`).
+#[test]
+fn bloom_insert_1m_under_100ms() {
+    const N: usize = 1_000_000;
+    let mut bf = BloomFilter::with_target_fp_rate(N, 0.01);
+    let mut s = 0xdead_beef_u64;
+    let start = Instant::now();
+    for _ in 0..N {
+        s = splitmix64(s.wrapping_add(1));
+        bf.insert(&s.to_le_bytes());
+    }
+    let elapsed = start.elapsed();
+    eprintln!(
+        "bloom_insert_1m: {N} inserts in {:.3} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    let budget_ms: u128 = 100;
+    assert!(
+        elapsed.as_millis() <= budget_ms,
+        "bloom_insert_1m took {} ms, budget {budget_ms} ms",
+        elapsed.as_millis()
     );
 }

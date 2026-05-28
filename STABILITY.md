@@ -186,6 +186,40 @@ v3 magic bump.
 The complete wire layout for both versions lives in
 `crates/spg-server/src/replication.rs`'s module doc.
 
+### Bloom filter v1 (v5.0; on-disk sidecar for cold-tier segments)
+
+The Bloom filter that prefixes a v5 cold-tier segment file (the
+v5.1+ `Segment` envelope embeds one over the segment's PK column
+to reject ~99 % of cross-segment probes before any page read)
+ships in v5.0 as a standalone `spg-storage` module
+(`crates/spg-storage/src/bloom.rs`). Layout, frozen as v1:
+
+  - Magic: `[u32 LE 0xB100_F11E]` — distinct from every envelope
+    kind so a stray `BloomFilter::from_bytes` over the wrong
+    slice fails fast.
+  - Header (after magic): `[u64 LE num_bits][u32 LE num_hashes]
+    [u32 LE crc32_body]`. `num_bits` is a positive multiple of 64
+    (the bitset is u64-packed); `num_hashes` is in `[1, 32]`;
+    `crc32_body` covers `(num_bits || num_hashes || bits...)`
+    using the same `crc32` impl as the v4.37 envelope.
+  - Body: `[u64 LE bits...]`, exactly `num_bits / 64` words.
+
+Hash mixing — frozen as part of v1 because changing it would
+make existing serialised blooms produce different `contains()`
+verdicts post-deserialise. Algorithm:
+
+  - Primary hash: **FNV-1a 64-bit** with the canonical offset
+    basis `0xcbf2_9ce4_8422_2325` and prime `0x0000_0001_0000_01b3`.
+  - Secondary stream: **SplitMix64** scramble of the primary
+    hash (Stafford's variant-13 constants:
+    `0x9e37_79b9_7f4a_7c15`, `0xbf58_476d_1ce4_e5b9`,
+    `0x94d0_49bb_1331_11eb`).
+  - Per-key bit positions: Kirsch–Mitzenmacher double-hashing,
+    `bit_idx_i = (h1 + i * h2) % num_bits` for `i ∈ [0, num_hashes)`.
+
+A v2 Bloom layout (if ever needed) gets a new magic; the v1
+reader rejects unknown magics.
+
 ### Env-var contract
 
 Every env var listed in DEPLOYMENT.md's table is stable. New
