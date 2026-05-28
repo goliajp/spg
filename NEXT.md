@@ -250,42 +250,38 @@ shape as v4.41.1, no queue-wait latency tax).
 
 ---
 
-## v4.43+ — Async-commit / pipelined commits (single-client unlock)
+## v5 — sweep-wide superiority (see `V5_DESIGN.md`)
 
-Out-of-scope sketch for the single-client throughput path that
-v4.42 doesn't address. Two approaches both pure-Rust + 0 deps:
+The earlier draft of this section was a single "v5.0 = HNSW
+persistent + allocator + OOM survival" entry. After the v4.42
+ship and the 2026-05-28 sweep — which showed spg-server still
+71-76 % of PG on INSERT throughput @ 1M-10M and unable to reach
+30M / 100M at all due to the in-memory-only catalog — that
+single-version v5 plan was discarded. The replacement v5 plan
+is a seven-sub-version arc whose goal is **strict sweep-table
+superiority on every cell at every N from 10K to 100M against
+PG / MySQL / MariaDB**. Full design (L1 → L4) lives in
+`V5_DESIGN.md`. Summary:
 
-- **`synchronous_commit = off` mode**: client gets CC back as
-  soon as the WAL record is encoded (not after fsync). A
-  background flusher fsyncs every N µs or N records. Durability
-  semantics weaken (window of CC'd-but-not-durable writes). Same
-  trade-off PG offers.
-- **Pipelined wire**: client can issue INSERTs without waiting
-  for CC; server batches multiple INSERTs from same connection
-  into one fsync; sends back batched CCs. Stronger durability
-  than async-commit but needs wire-protocol extension.
+| ver | scope | ship-gate |
+|-----|-------|-----------|
+| v5.0 | `Segment` file format + bloom + page cache (standalone) | perf gates green; no engine changes |
+| v5.1 | `RowLocator::{Hot, Cold}` + PB index upgrade + two-tier read path | PK p99 ≤ PG on hand-baked 30M corpus |
+| v5.2 | `Freezer` thread (MVCC slot snapshot + atomic swap) + promote-on-write UPDATE/DELETE | 30M INSERT loop completes without RSS bail |
+| v5.3 | `CatalogManifest` v10 + WAL checkpoint + crash recovery | 100M restart wall ≤ 60 s |
+| v5.4 | Async-commit (`SPG_SYNCHRONOUS_COMMIT=off` opt-in) + background flusher | single-client INSERT @ 1M ≥ 200 K r/s with async on |
+| v5.5 | HNSW persistent + global allocator + OOM survival (absorbs legacy v5 plan) | vector sweep + OOM chaos green |
+| v5.6 | Final sweep validation; tag `v5.0.0` | every sweep cell ≥ PG/MySQL/MariaDB at every N |
 
-Neither is on v4.42's path. Pick after v4.42 lands and the multi-
-client gate is concrete.
+Hard-rule conformance: each sub-version stays 0-deps / 0-`unsafe`.
+mmap is explicitly **out** (would force `memmap2` dep or raw
+libc unsafe); cold-segment reads go through `File::seek +
+read_exact` into a bounded LRU page cache. The async-commit
+default stays **on** (synchronous, durability-strict); operators
+opt in to async-off. `SPG_HOT_TIER_BYTES` is the byte-budget
+knob (default 4 GiB).
 
----
-
-## v5.0.0 — HNSW persistent + allocator + OOM survival
-
-SemVer major bump (changes panic / OOM semantics + closes the
-v4.38-v4.40 vector-table carve-out).
-
-| # | item | est. | rows fixed |
-|---|------|------|------------|
-| 1 | **HNSW persistent** — `NswGraph`'s `levels: Vec<u8>` and `layers: Vec<Vec<Vec<usize>>>` migrate to PV-style structural sharing so vector-table INSERT joins the cheap-TX path. Edge mutation = path-copy at the affected node only. | 4 d | seals 1.11 for vector |
-| 2 | **Custom global allocator with per-query budget** — `#[global_allocator]` tracks per-thread bytes-allocated; `SPG_MAX_QUERY_BYTES` enforces cap; over → flip CancelToken so the query bails at the next checkpoint. (From the legacy v5.0 plan; spec unchanged.) | 3 d | 5.5 (fully ✅) |
-| 3 | **OOM survives** — `set_alloc_error_hook` (stable since 1.59) returns a clean error to the client instead of aborting, except during WAL replay where abort is still correct. | 2 d | 5.6 |
-| 4 | **Perf-regression gate** — allocator hot-path atomics + HNSW persistent walk; latency bench must hold SLO ceilings. Sweep at all N including 100M with vector-indexed tables. | 0.5 d | maintains 10.4 / 10.5 |
-| 5 | **STABILITY.md v2 contract** — restate frozen surfaces; v5 cuts `SPG_FAIL_WAL_QUOTA_BYTES` chaos knob (real ENOSPC has full coverage). | 0.5 d | renews 8.5 |
-
-Dependencies: v4.42 (group commit + MVCC stable before SemVer major).
-Risk: high — allocator hook + HNSW persistent are both touchy.
-Bench gate is mandatory at this step.
+Estimated total work: ~25-30 d across v5.0 → v5.6.
 
 ---
 
@@ -314,9 +310,14 @@ Bench gate is mandatory at this step.
 | v4.41   | WAL v3 framing + auto-commit wrap merge         |       1.75|
 | v4.41.1 | Engine MVCC mechanical refactor (TxId map)      |       0.5 |
 | v4.42   | Group commit at commit barrier                  |       3.5 |
-| v4.43+  | Async-commit / pipelined commits                |       ?   |
-| v5.0.0  | HNSW persistent + allocator + OOM               |      10.0 |
-| **total** |                                               |    **23.5 d** (+ v4.43 TBD) |
+| v5.0    | Segment file format + bloom + page cache        |       3.0 |
+| v5.1    | Two-tier catalog read path (RowLocator)         |       4.0 |
+| v5.2    | Freezer thread + promote-on-write               |       4.5 |
+| v5.3    | CatalogManifest + WAL checkpoint                |       3.5 |
+| v5.4    | Async-commit (synchronous_commit=off)           |       3.0 |
+| v5.5    | HNSW persistent + allocator + OOM               |       8.0 |
+| v5.6    | Final sweep validation; tag v5.0.0              |       1.0 |
+| **total** |                                               | **~40 d** (v4.38 → v5.6 = full v4→v5 arc) |
 
 ---
 
@@ -334,8 +335,13 @@ and diagnose; do not soften the gate.
 | v4.41 | 77K (single client) | 59K (no RSS bail) | indices held | 59% of PG; latency p99 25× ahead | 100% |
 | v4.41.1 | unchanged (mechanical refactor, behavior-equiv) | unchanged | unchanged | unchanged | 100% |
 | v4.42 | unchanged single-client (fsync-bound); multi-client scaling 4.2× from 1c → 8c (macOS APFS dev box, fsync-bound) | unchanged single-client; multi-client scaling demonstrated | unchanged | sweep position unchanged (single-client path = group of 1); concurrent_sweep shows 4-8 client coalescing | 100% |
-| v4.43+ | ≥ 200K single client (async-commit) | ≥ 80K | ≥ 100K | > PG (146K) single client | 100% |
-| v5.0 | ≥ 200K incl. vector tables | ≥ 80K incl. vector | ≥ 100K | > PG/MySQL/MariaDB | 100% |
+| v5.0 | unchanged (segment standalone, no engine integration) | unchanged | unchanged | unchanged | 100% |
+| v5.1 | unchanged (hot tier only on real workloads; segments loaded only via test fixture) | unchanged | unchanged | PK p99 ≤ PG on hand-baked 30M corpus | 100% |
+| v5.2 | unchanged-or-better (freezer keeps hot tier bounded) | INSERT loop completes 30M without RSS bail | unchanged | sweep 30M reachable for spg-server | 100% |
+| v5.3 | unchanged | 100M restart wall ≤ 60 s | unchanged | sweep 100M reachable for spg-server | 100% |
+| v5.4 | ≥ 200K single client (async-commit on) | ≥ 80K (async-commit) | ≥ 100K (async) | > PG single client when async | 100% |
+| v5.5 | ≥ 200K incl. vector tables | ≥ 80K incl. vector | ≥ 100K | unchanged | 100% |
+| v5.6 | **strict sweep-table win at every N** | **strict win** | **strict win** | **strict win on every cell** | 100% |
 
 ### v4.39 ship reality (correction to earlier projection)
 
