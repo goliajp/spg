@@ -1,3 +1,10 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args
+)]
+
 //! v5.1: two-tier (hot + cold) read path end-to-end through
 //! `Engine::execute`. Exercises the four corner cases the v5.1
 //! ship gate calls out:
@@ -228,4 +235,134 @@ fn cold_pk_lookup_returns_none_for_missing_key() {
         select_name_by_id(&mut engine, 250).is_none(),
         "stale Cold locator for key not in segment should yield no row"
     );
+}
+
+// --- v5.2.3 promote-on-write / shadow-on-delete ---------------
+
+/// Run `SELECT count(*) FROM users WHERE id = N` and return the
+/// integer. Used by promote/shadow tests to confirm a write
+/// reached the right row through the indexed path.
+fn count_by_id(engine: &mut Engine, id: i64) -> i64 {
+    let q = format!("SELECT count(*) FROM users WHERE id = {id}");
+    let r = engine.execute(&q).expect("count runs");
+    let rows = match r {
+        QueryResult::Rows { rows, .. } => rows,
+        QueryResult::CommandOk { .. } => panic!("expected Rows"),
+    };
+    assert_eq!(rows.len(), 1);
+    match &rows[0].values[0] {
+        Value::BigInt(n) => *n,
+        Value::Int(n) => i64::from(*n),
+        other => panic!("expected integer count, got {other:?}"),
+    }
+}
+
+#[test]
+fn update_promotes_cold_row_to_hot_tier() {
+    // Register a cold row, run UPDATE on it via PK, then verify
+    // the name field was rewritten — proving the promote-on-write
+    // path materialised the row in the hot tier where update_row
+    // could apply the SET.
+    let mut engine = boot_engine_with_users();
+    register_cold_users(&mut engine, &[(100, "ivy"), (200, "joe")]);
+    assert_eq!(
+        engine.catalog().get("users").unwrap().row_count(),
+        0,
+        "hot tier starts empty"
+    );
+
+    let r = engine
+        .execute("UPDATE users SET name = 'IVY' WHERE id = 100")
+        .expect("UPDATE runs");
+    match r {
+        QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 1),
+        QueryResult::Rows { .. } => panic!("UPDATE returns CommandOk"),
+    }
+
+    // After UPDATE: hot tier has one row (the promoted + updated
+    // version), cold tier still holds the *unchanged* original
+    // body for id=100 (compaction reclaims it later), and the
+    // engine's PK lookup must surface the new value.
+    assert_eq!(
+        engine.catalog().get("users").unwrap().row_count(),
+        1,
+        "promoted row landed in hot tier"
+    );
+    assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("IVY"));
+    // The other cold row is unaffected.
+    assert_eq!(select_name_by_id(&mut engine, 200).as_deref(), Some("joe"));
+}
+
+#[test]
+fn delete_shadows_cold_row_without_promoting() {
+    // DELETE on a PK-targeted cold row should retire the Cold
+    // locator (no promote — that would waste a row body the
+    // caller is discarding anyway). Hot tier stays empty; the
+    // shadowed PK no longer resolves.
+    let mut engine = boot_engine_with_users();
+    register_cold_users(&mut engine, &[(100, "ivy"), (200, "joe"), (300, "kim")]);
+    let r = engine
+        .execute("DELETE FROM users WHERE id = 200")
+        .expect("DELETE runs");
+    match r {
+        QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 1),
+        QueryResult::Rows { .. } => panic!("DELETE returns CommandOk"),
+    }
+    assert_eq!(
+        engine.catalog().get("users").unwrap().row_count(),
+        0,
+        "DELETE on a cold row doesn't grow the hot tier"
+    );
+    assert!(
+        select_name_by_id(&mut engine, 200).is_none(),
+        "shadowed key no longer resolves"
+    );
+    // Other cold keys still resolve.
+    assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("ivy"));
+    assert_eq!(select_name_by_id(&mut engine, 300).as_deref(), Some("kim"));
+}
+
+#[test]
+fn update_on_hot_pk_still_works_after_promote_hook_added() {
+    // The promote-on-write hook must not regress the pre-v5.2.3
+    // hot-only UPDATE path: a PK-targeted UPDATE on a hot-only
+    // row still mutates in place via Table::update_row.
+    let mut engine = boot_engine_with_users();
+    engine
+        .execute("INSERT INTO users VALUES (1, 'alice')")
+        .expect("insert");
+    engine
+        .execute("UPDATE users SET name = 'ALICE' WHERE id = 1")
+        .expect("UPDATE runs");
+    assert_eq!(count_by_id(&mut engine, 1), 1);
+    assert_eq!(select_name_by_id(&mut engine, 1).as_deref(), Some("ALICE"));
+    assert_eq!(
+        engine.catalog().get("users").unwrap().row_count(),
+        1,
+        "still one hot row — no accidental duplicate from promote"
+    );
+}
+
+#[test]
+fn delete_with_non_pk_where_does_not_touch_cold_rows() {
+    // A WHERE clause the planner can't push to an index seek
+    // (e.g. `name = ...`) must fall back to the hot-only path —
+    // cold rows are immutable to non-indexed DELETEs in v5.2.3.
+    // Validates the conservative behaviour V5_DESIGN.md spelled
+    // out (cold-tier scan-fanout lands later).
+    let mut engine = boot_engine_with_users();
+    register_cold_users(&mut engine, &[(100, "ivy"), (200, "joe")]);
+    let r = engine
+        .execute("DELETE FROM users WHERE name = 'ivy'")
+        .expect("DELETE runs");
+    match r {
+        QueryResult::CommandOk { affected, .. } => {
+            // Hot tier is empty — `name='ivy'` doesn't match any
+            // hot row, the cold tier is bypassed, affected=0.
+            assert_eq!(affected, 0, "non-PK DELETE doesn't reach cold tier");
+        }
+        QueryResult::Rows { .. } => panic!("DELETE returns CommandOk"),
+    }
+    // Cold row still there.
+    assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("ivy"));
 }

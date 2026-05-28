@@ -953,6 +953,38 @@ impl Table {
     /// shift bookkeeping across B-tree + NSW — would be far more
     /// invasive than the savings justify.
     fn rebuild_indices(&mut self) {
+        // v5.2.3: capture every `Cold` locator on every BTree index
+        // before the rebuild, so the from-rows re-emission below
+        // (which only produces `Hot` locators) doesn't drop cold-
+        // tier entries on keys unrelated to the row that changed.
+        // Pre-v5.2.3 this was a `freeze_oldest_to_cold` worry only
+        // and the freezer did its own capture-then-reregister; v5.2.3
+        // promotes that pattern into the base helper because UPDATE
+        // / DELETE now run rebuild_indices on tables with cold rows.
+        let preserved_cold: Vec<(String, Vec<(IndexKey, RowLocator)>)> = self
+            .indices
+            .iter()
+            .filter_map(|idx| match &idx.kind {
+                IndexKind::BTree(map) => {
+                    let cold: Vec<(IndexKey, RowLocator)> = map
+                        .iter()
+                        .flat_map(|(k, locs)| {
+                            locs.iter()
+                                .filter(|l| l.is_cold())
+                                .copied()
+                                .map(move |l| (k.clone(), l))
+                        })
+                        .collect();
+                    if cold.is_empty() {
+                        None
+                    } else {
+                        Some((idx.name.clone(), cold))
+                    }
+                }
+                IndexKind::Nsw(_) => None,
+            })
+            .collect();
+
         let descriptors: Vec<(String, usize, Option<usize>)> = self
             .indices
             .iter()
@@ -988,6 +1020,17 @@ impl Table {
                 }
                 self.indices.push(idx);
             }
+        }
+
+        // Re-attach preserved cold locators after the from-rows
+        // rebuild. `register_cold_locators` handles the per-key
+        // entries-vec append; no key collisions arise because the
+        // rebuild loop above produced only Hot locators.
+        for (idx_name, locators) in preserved_cold {
+            // Errors here would only fire if the index disappeared
+            // between snapshot and rebuild, which can't happen
+            // because the rebuild restores the same descriptor set.
+            let _ = self.register_cold_locators(&idx_name, locators);
         }
     }
 
