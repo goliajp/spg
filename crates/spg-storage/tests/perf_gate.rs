@@ -16,8 +16,9 @@
 use std::time::Instant;
 
 use spg_storage::{
-    BloomFilter, Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row, TableSchema,
-    Value, nsw_query, persistent::PersistentVec, persistent_btree::PersistentBTreeMap,
+    BloomFilter, Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row,
+    SEGMENT_PAGE_BYTES, SegmentReader, TableSchema, Value, encode_segment, nsw_query,
+    persistent::PersistentVec, persistent_btree::PersistentBTreeMap,
 };
 
 fn build_catalog(n_rows: i32) -> Catalog {
@@ -304,5 +305,84 @@ fn bloom_insert_1m_under_100ms() {
         elapsed.as_millis() <= budget_ms,
         "bloom_insert_1m took {} ms, budget {budget_ms} ms",
         elapsed.as_millis()
+    );
+}
+
+// ---- v5.0 Segment perf gates ----
+
+/// 1M-row segment write within a 2 s wall-time budget. Encodes a
+/// 1M-row segment with 32-byte payloads (~38 bytes/row including
+/// the [u64 key][u32 plen] prefix; about 9100 rows per 4 KiB page
+/// → ~110 pages). Catches encode-path pessimism (e.g. quadratic
+/// offset recomputation, accidental Vec reallocation per row).
+#[test]
+fn segment_write_1m_under_2s() {
+    const N: u64 = 1_000_000;
+    let rows: Vec<(u64, Vec<u8>)> = (0..N)
+        .map(|i| (i, vec![u8::try_from(i & 0xff).unwrap(); 32]))
+        .collect();
+    let start = Instant::now();
+    let (bytes, meta) =
+        encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode succeeds");
+    let elapsed = start.elapsed();
+    eprintln!(
+        "segment_write_1m: {} rows in {:.3} s ({} bytes, {} pages)",
+        meta.num_rows,
+        elapsed.as_secs_f64(),
+        bytes.len(),
+        meta.num_pages,
+    );
+    assert_eq!(meta.num_rows, N);
+    let budget_ms: u128 = 2000;
+    assert!(
+        elapsed.as_millis() <= budget_ms,
+        "segment_write_1m took {} ms, budget {budget_ms} ms",
+        elapsed.as_millis()
+    );
+}
+
+/// p99 lookup latency on a 1M-row segment with warm in-RAM bytes.
+/// 1000 random PK lookups against a freshly-encoded segment;
+/// each lookup runs `might_contain` → page-index binary search →
+/// page-internal binary search. The full-RAM path here is the
+/// upper bound — v5.1's seekable reader will add at most one
+/// 4 KiB read per non-cached page, which on a modern SSD is
+/// ~100-500 µs. 500 µs ceiling on a warm in-RAM run catches a
+/// regression that would push p99 past disk read latency.
+#[test]
+fn segment_lookup_p99_under_500us() {
+    const N: u64 = 1_000_000;
+    let rows: Vec<(u64, Vec<u8>)> = (0..N)
+        .map(|i| (i, vec![u8::try_from(i & 0xff).unwrap(); 32]))
+        .collect();
+    let (bytes, _) =
+        encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode succeeds");
+    let reader = SegmentReader::open(&bytes).expect("open succeeds");
+
+    // Deterministic random probes via SplitMix64.
+    let mut state: u64 = 0xc0ffee;
+    const N_PROBES: usize = 1000;
+    let mut samples_us = Vec::with_capacity(N_PROBES);
+    for _ in 0..N_PROBES {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut x = state;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        let key = x % N;
+        let t = Instant::now();
+        let got = reader.lookup(std::hint::black_box(key));
+        samples_us.push(t.elapsed().as_micros());
+        // Sanity: must find it (key is in [0, N)).
+        assert!(got.is_some(), "lookup({key}) returned None");
+    }
+    samples_us.sort_unstable();
+    let p99_idx = (N_PROBES * 99) / 100;
+    let p99 = samples_us[p99_idx];
+    eprintln!("segment_lookup_p99: {p99} µs (over {N_PROBES} warm-RAM probes)");
+    let budget_us: u128 = 500;
+    assert!(
+        p99 <= budget_us,
+        "segment_lookup p99 {p99} µs exceeds budget {budget_us} µs"
     );
 }

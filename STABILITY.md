@@ -186,6 +186,45 @@ v3 magic bump.
 The complete wire layout for both versions lives in
 `crates/spg-server/src/replication.rs`'s module doc.
 
+### Segment file format v1 (v5.0; on-disk cold-tier rows)
+
+The cold-tier segment file written by `spg_storage::encode_segment`
+holds an immutable, PK-sorted batch of `(u64_key, payload_bytes)`
+rows with sidecar `BloomFilter` + page index for fast probing.
+Frozen as v1; future incompatible versions get a new magic.
+
+Layout (little-endian throughout):
+
+  - Magic: `[8 bytes b"SPGSEG\x01\x00"]` (8-byte to align with the
+    other SPG magics; the trailing `\x00` is a future-version
+    nibble reserved for a v2 bump).
+  - Header: `[u32 num_rows][u32 num_pages][u32 page_size_bytes]
+    [u64 min_pk][u64 max_pk][u32 bloom_len_bytes]
+    [bloom bytes …][u32 page_index_len_bytes][page index bytes …]`.
+    `page_size_bytes` is stored in-band so future versions can
+    tune without bumping magic.
+  - Page index: `[u32 count][(u64 first_pk, u32 file_offset) …]`,
+    one entry per page, sorted by `first_pk`. `file_offset` is
+    relative to the start of the segment file.
+  - Pages: exactly `num_pages × page_size_bytes` bytes. Each
+    page contains `[u32 num_rows_in_page][u32 row_offsets[]]
+    [row payloads concatenated][zero padding]`. Row payload
+    layout: `[u64 key][u32 plen][plen bytes payload]`.
+  - Footer: `[u32 crc32_body]` covering everything from the
+    `num_rows` field through the last page byte. Uses the same
+    `spg_crypto::crc32::crc32` impl as v4.37 envelopes and the
+    Bloom v1 above.
+
+Page size 4096 is the v5.0 default and matches APFS / ext4
+filesystem page sizes (one page read = one disk I/O). Smaller
+than 256 or larger than 65536 is rejected by the writer to keep
+the page-granularity I/O assumption sensible.
+
+Segments are immutable once written. Updates / deletes on cold
+rows in v5.2+ are handled via promote-on-write to the hot tier;
+periodic compaction (v5.x+) merges sparse segments. Neither
+operation modifies an existing segment file in place.
+
 ### Bloom filter v1 (v5.0; on-disk sidecar for cold-tier segments)
 
 The Bloom filter that prefixes a v5 cold-tier segment file (the
