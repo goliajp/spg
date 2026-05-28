@@ -14,8 +14,12 @@ extern crate alloc;
 pub mod bloom;
 pub mod persistent;
 pub mod persistent_btree;
+pub mod segment;
 
 pub use self::bloom::{BloomError, BloomFilter};
+pub use self::segment::{
+    SEGMENT_MAGIC, SEGMENT_PAGE_BYTES, SegmentError, SegmentMeta, SegmentReader, encode_segment,
+};
 
 use alloc::collections::BTreeMap;
 use alloc::format;
