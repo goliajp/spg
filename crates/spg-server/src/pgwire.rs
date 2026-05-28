@@ -359,6 +359,10 @@ fn execute_with_role(
     sql: &str,
     role: Role,
 ) -> Result<QueryResult, EngineError> {
+    // v5.1: cold-tier preload — kept symmetric with the native
+    // Op::Query path so a sweep that drives the server through
+    // PG-wire still triggers `try_lazy_preload_cold`.
+    crate::try_lazy_preload_cold(state);
     // Reuse the same gating ideas as the native wire dispatch:
     // SELECT / SHOW take the read lock; everything else takes the
     // write lock. Role enforcement lives in this helper so the

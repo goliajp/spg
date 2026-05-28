@@ -221,6 +221,26 @@ pub(crate) struct ServerState {
     /// protocol (status frames). On a primary or a v1-only follower
     /// these stay at zero and `/metrics` omits the series.
     pub(crate) lag_state: Arc<replication::LagState>,
+    /// v5.1: cold-tier segments queued for lazy preload. Each spec
+    /// is parsed from `SPG_PRELOAD_COLD_SEGMENT` at startup; the
+    /// first dispatched Op::Query checks each unloaded spec for
+    /// `(table, index)` existence and, when both are present, reads
+    /// the segment file, registers it via `Catalog::load_segment_
+    /// bytes`, and wires every PK in the segment as a Cold locator
+    /// on the named index. `all_done` short-circuits the per-query
+    /// check once every spec has been loaded.
+    cold_preload: Vec<ColdPreloadSpec>,
+    cold_preload_done: AtomicBool,
+}
+
+/// v5.1: one entry in the `SPG_PRELOAD_COLD_SEGMENT` queue —
+/// `table:index:path`. Loaded once and never reloaded; `loaded`
+/// goes from false → true atomically.
+struct ColdPreloadSpec {
+    table: String,
+    index: String,
+    path: PathBuf,
+    loaded: AtomicBool,
 }
 
 fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
@@ -280,6 +300,177 @@ fn parse_env_u64(env_key: &str) -> Option<u64> {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
+}
+
+/// v5.1: parse `SPG_PRELOAD_COLD_SEGMENT` into a list of
+/// `(table, index, path)` specs. Format is a `;`-separated list
+/// of `table:index:path` triples — e.g.
+/// `users:by_id:/tmp/users.spg;orders:by_oid:/tmp/orders.spg`.
+/// Malformed entries are logged and skipped; a fully empty / unset
+/// env yields an empty Vec and the dispatch hot path stays no-op.
+fn parse_cold_preload_env() -> Vec<ColdPreloadSpec> {
+    let Ok(raw) = env::var("SPG_PRELOAD_COLD_SEGMENT") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let parts: Vec<&str> = entry.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            eprintln!(
+                "spg-server: SPG_PRELOAD_COLD_SEGMENT entry {entry:?} \
+                 ignored — expected `table:index:path`"
+            );
+            continue;
+        }
+        let table = parts[0].trim().to_string();
+        let index = parts[1].trim().to_string();
+        let path = PathBuf::from(parts[2].trim());
+        if table.is_empty() || index.is_empty() || path.as_os_str().is_empty() {
+            eprintln!(
+                "spg-server: SPG_PRELOAD_COLD_SEGMENT entry {entry:?} \
+                 ignored — empty table / index / path"
+            );
+            continue;
+        }
+        out.push(ColdPreloadSpec {
+            table,
+            index,
+            path,
+            loaded: AtomicBool::new(false),
+        });
+    }
+    if !out.is_empty() {
+        eprintln!(
+            "spg-server: cold-tier preload queue has {} spec(s); each one \
+             will load on the first Op::Query after its table + index \
+             both exist",
+            out.len()
+        );
+    }
+    out
+}
+
+/// v5.1: lazy cold-tier preload. Walks the spec queue; for each
+/// unloaded spec where the target table + index both already
+/// exist in the catalog, reads the segment bytes, registers the
+/// segment via `Catalog::load_segment_bytes`, and wires every PK
+/// in the segment as a `RowLocator::Cold` on the named index.
+///
+/// Short-circuits via `cold_preload_done` once every spec is
+/// loaded so the dispatch hot path drops to one Relaxed load.
+/// Errors don't fail the calling query — they're logged on
+/// stderr and the spec stays pending for retry.
+pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
+    if state.cold_preload_done.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut still_pending = 0usize;
+    for spec in &state.cold_preload {
+        if spec.loaded.load(Ordering::Relaxed) {
+            continue;
+        }
+        // Quick read-only probe: does (table, index) exist yet?
+        let ready = {
+            let engine = match state.engine.read() {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let cat = engine.catalog();
+            cat.get(&spec.table)
+                .is_some_and(|t| t.indices().iter().any(|i| i.name == spec.index))
+        };
+        if !ready {
+            still_pending += 1;
+            continue;
+        }
+        let bytes = match std::fs::read(&spec.path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "spg-server: cold preload {}:{} from {} failed: {e}; \
+                     marking loaded to avoid retry storm",
+                    spec.table,
+                    spec.index,
+                    spec.path.display()
+                );
+                spec.loaded.store(true, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let mut engine = match state.engine.write() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        // Snapshot the catalog, register the segment, enumerate
+        // its keys, and reinstall under one write lock so a
+        // concurrent reader can't observe a partially-wired index.
+        let mut cat = engine.catalog().clone();
+        let seg_id = match cat.load_segment_bytes(bytes) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!(
+                    "spg-server: cold preload {}:{} parse failed: {e}",
+                    spec.table, spec.index
+                );
+                spec.loaded.store(true, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let pairs: Vec<(spg_storage::IndexKey, spg_storage::RowLocator)> = {
+            let Some(seg) = cat.cold_segment(seg_id) else {
+                eprintln!(
+                    "spg-server: cold preload {}:{} segment_id {seg_id} \
+                     vanished after load — should be impossible",
+                    spec.table, spec.index
+                );
+                spec.loaded.store(true, Ordering::Relaxed);
+                continue;
+            };
+            seg.scan()
+                .map(|(key, _payload)| {
+                    (
+                        spg_storage::IndexKey::Int(key as i64),
+                        spg_storage::RowLocator::Cold {
+                            segment_id: seg_id,
+                            page_offset: 0,
+                        },
+                    )
+                })
+                .collect()
+        };
+        let pairs_count = pairs.len();
+        let table_mut = match cat.get_mut(&spec.table) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "spg-server: cold preload {}:{} table disappeared mid-load",
+                    spec.table, spec.index
+                );
+                spec.loaded.store(true, Ordering::Relaxed);
+                continue;
+            }
+        };
+        if let Err(e) = table_mut.register_cold_locators(&spec.index, pairs) {
+            eprintln!(
+                "spg-server: cold preload {}:{} register_cold_locators failed: {e}",
+                spec.table, spec.index
+            );
+            spec.loaded.store(true, Ordering::Relaxed);
+            continue;
+        }
+        engine.replace_catalog(cat);
+        spec.loaded.store(true, Ordering::Relaxed);
+        eprintln!(
+            "spg-server: cold preload {}:{} loaded {} row(s) from {}",
+            spec.table,
+            spec.index,
+            pairs_count,
+            spec.path.display()
+        );
+    }
+    if still_pending == 0 {
+        state.cold_preload_done.store(true, Ordering::Relaxed);
+    }
 }
 
 #[allow(clippy::too_many_lines)] // startup wires snapshot+audit+WAL+bootstrap; splitting scatters init logic
@@ -412,6 +603,8 @@ fn run(
             .ok()
             .is_some_and(|s| !s.is_empty() && s != "0"),
     };
+    let cold_preload = parse_cold_preload_env();
+    let cold_preload_done = AtomicBool::new(cold_preload.is_empty());
     let state = Arc::new(ServerState {
         engine: RwLock::new(engine),
         db_path,
@@ -429,6 +622,8 @@ fn run(
         metrics: Arc::new(observability::Metrics::default()),
         chaos,
         lag_state: Arc::new(replication::LagState::default()),
+        cold_preload,
+        cold_preload_done,
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -887,6 +1082,10 @@ fn dispatch(
         }
         Op::Query => {
             state.metrics.queries_total.fetch_add(1, Ordering::Relaxed);
+            // v5.1: cold-tier preload — checks each pending spec for
+            // (table, index) existence and loads on the first hit.
+            // No-op once every spec has loaded (Relaxed bool).
+            try_lazy_preload_cold(state);
             let sql = match parse_query(frame) {
                 Ok(s) => s.to_string(),
                 Err(e) => {

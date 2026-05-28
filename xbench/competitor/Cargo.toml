@@ -71,5 +71,9 @@ path = "src/bin/repl_bench.rs"
 name = "backup_bench"
 path = "src/bin/backup_bench.rs"
 
+[[bin]]
+name = "bake_segment"
+path = "src/bin/bake_segment.rs"
+
 [lints]
 workspace = true
