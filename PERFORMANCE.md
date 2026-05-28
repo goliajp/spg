@@ -1580,6 +1580,106 @@ drift < 2 % across the full run. The 5-min variant is gated in
 CI (see `xtests/v4_soak_report.md`); the 24-h variant is the
 release-prep gate.
 
+## v5.4 async commit (single-client INSERT, 2026-05-28)
+
+v5.4 introduces opt-in async-commit mode via
+`SPG_SYNCHRONOUS_COMMIT=off`. In sync mode (the default) every
+WAL write `sync_data`s before the client CC returns — this is the
+v4.42 group-commit semantic, unchanged. In async mode the per-
+write `sync_data` is skipped; a background flusher thread emits
+`durability_checkpoint` markers + fsyncs the WAL on its own
+cadence (`SPG_FLUSHER_INTERVAL_US`, default 200 µs).
+
+### Throughput
+
+Workload: single connection, single-row `INSERT INTO t VALUES
+(i, j)` statements in a tight loop. The bottleneck in sync mode
+is the per-write `fsync` call (~5-7 ms on macOS APFS → ~150 r/s
+single-client max). Async mode lifts that constraint; the cost
+of one INSERT collapses to "encode SQL → engine apply → WAL
+`write_all` (no fsync)".
+
+| Mode | Workload shape | Throughput | Notes |
+|------|----------------|-----------:|-------|
+| sync (default, v4.42), single-row INSERT | 200 rows / 200 µs cadence | ~245 r/s (APFS, fsync-bound) | per-write `sync_data`; source-of-truth `xbench/competitor/src/bin/latency.rs` |
+| async (`SPG_SYNCHRONOUS_COMMIT=off`), single-row INSERT | 200 rows | ~1.3K r/s (APFS, TCP-round-trip bound) | 5.4× speedup ratio over sync (measured); v5.4.4 smoke gate `slo_smoke::slo_wal_insert_async_commit_smoke_speedup_vs_sync` asserts ≥ 3× |
+| sync (default, v4.42), batched VALUES | 1M rows / 500-row batches | ~120K r/s (`slo_wal_insert_1m_rows_throughput` baseline) | group-commit shares one fsync per batch (~5 ms on APFS) |
+| async (`SPG_SYNCHRONOUS_COMMIT=off`), batched VALUES | 1M rows / 500-row batches | **125K r/s measured** on macOS Tahoe APFS dev box; **200K target** on production Linux ext4/xfs (per V5_DESIGN row 5.4) | `slo_smoke::slo_wal_insert_async_commit_above_200k` release-process gate; CI host floor ≥ 100K r/s reflects APFS reality |
+
+Why the gap between APFS-measured (125K) and Linux-target
+(200K): on macOS Tahoe APFS a single `fsync` clocks in at ~5 ms;
+the flusher thread's per-cadence `sync_data` serialises through
+that 5 ms latency regardless of what the client write path does,
+which caps the marker emission rate at ~200/sec and indirectly
+the achievable async throughput. Linux ext4/xfs and NVMe
+hardware push the fsync latency to sub-millisecond, lifting the
+flusher cap and freeing async-commit to hit the V5_DESIGN target.
+The release-process gate's `#[ignore]` marker exists exactly to
+let operators run it on their actual production host and pin
+the number that applies.
+
+### Durability window
+
+Async mode trades durability of in-flight writes for throughput.
+The exact contract:
+
+- The flusher thread runs every `SPG_FLUSHER_INTERVAL_US` µs
+  (default 200 µs).
+- Each tick takes the WAL mutex, appends a
+  `durability_checkpoint` marker (v5.4.0 wire format, 17 bytes),
+  and `sync_data`s. After the call returns, every WAL byte
+  before the marker is on stable storage.
+- A SIGKILL between two ticks loses **only the WAL bytes
+  appended in the current window**. Bytes covered by the most
+  recent marker survive replay.
+- Worst-case loss = one cadence's worth of CC'd writes. At
+  200 µs cadence + 200K r/s throughput that's ~40 records.
+  Operators tune the trade-off via `SPG_FLUSHER_INTERVAL_US`
+  (shorter = tighter window, more fsyncs; longer = looser
+  window, fewer fsyncs).
+
+The chaos test
+`tests/e2e_chaos_async_commit.rs::chaos_kill_during_async_commit_window_loses_only_unflushed`
+pins the structural invariant: post-restart `count(*)` is in
+`[1, N]` for N CC'd inserts, and every PK in `[0, count)`
+resolves (the surviving rows form a contiguous prefix —
+asynchronous loss is suffix-only because the WAL is append-only
+and replay stops at the first truncated tail).
+
+### Observability
+
+`/metrics` adds two gauges (v5.4.3):
+
+- `spg_durability_lag_bytes` — WAL bytes written but not yet
+  covered by a marker. 0 in sync mode (every CC is fsynced).
+- `spg_durability_lag_seconds` — seconds since the most recent
+  flusher `sync_data`. < 1 ms typical under default cadence.
+
+Plus two counters (v5.4.1):
+
+- `spg_flusher_iterations_total` — successful marker emissions.
+- `spg_flusher_errors_total` — failed iterations (WAL quota,
+  ENOSPC, mutex poisoning).
+
+A rising `errors_total` against a flatline `iterations_total` is
+the operator's signal that the WAL volume needs attention.
+
+### When to opt in
+
+Async-commit is for workloads that meet at least one of:
+
+- A replication strategy with a sync-mode follower
+  (`SPG_REPL_ADDR`); the follower's fsync provides durability,
+  the primary trades it for throughput.
+- Bulk-ingest / load-test cycles where the entire data is
+  re-derivable from an external source.
+- Throughput requirements > sync-mode physical floor (~150 r/s
+  on APFS, ~5K r/s on a fast NVMe Linux box) **and** explicit
+  acknowledgement of the loss window.
+
+Defaults stay sync — every v4.x durability invariant is intact
+under the unset / `on` env value.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release

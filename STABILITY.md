@@ -451,6 +451,54 @@ Special case: the `SPG_FAIL_*` chaos knobs are explicitly
 depend on them; future versions may rename or remove them
 without bumping major.
 
+### Async-commit mode (v5.4)
+
+`SPG_SYNCHRONOUS_COMMIT` is the user-facing opt-in for v5.4's
+async-commit write path. Stable wire contract:
+
+- Acceptable values for "stay sync (default)":
+  unset / empty / `on` / `true` / `1` / `yes` / any value not
+  listed below. Sync mode preserves every v4.42 durability
+  invariant byte-for-byte.
+- Acceptable values for "async on": `off` / `false` / `0`
+  (case-insensitive, leading/trailing whitespace trimmed). The
+  opt-in keyword set is deliberately narrow so a typo lands in
+  the safe direction.
+- Companion knob `SPG_FLUSHER_INTERVAL_US` (default 200,
+  minimum 10) tunes the flusher cadence; values < 10 µs are
+  silently clamped to the floor.
+
+In async mode the WAL write path's `sync_data` call is skipped
+on the client's hot path. A background flusher thread emits
+`durability_checkpoint` markers (v3 record kind tag 0x02 — see
+"WAL record format" above) and runs the periodic fsync. Replay
+treats markers as no-ops; the marker's recorded byte offset
+lets crash recovery reason about which prefix of the WAL was
+durable when the marker landed.
+
+Durability contract under async-commit:
+
+- A SIGKILL between two flusher ticks loses **only** the WAL
+  bytes appended in the current window. Bytes covered by the
+  most recent durability_checkpoint marker survive replay.
+- Worst-case loss = one cadence's worth of CC'd writes (~one
+  flusher interval). Operators can shrink the window by
+  lowering `SPG_FLUSHER_INTERVAL_US` at the cost of more
+  fsyncs / second.
+- CHECKPOINT (v5.3.2) continues to force a synchronous fsync
+  regardless of the env knob — it's an explicit durability
+  barrier and bypassing it would defeat the manifest contract.
+- The `durability_checkpoint` wire format is **frozen** as of
+  v5.4: 17-byte v3 frame
+  `[u32 (len=8 | 0xC000_0000)][u32 crc32][type=0x02][u64 LE byte_offset]`.
+
+`/metrics` adds the v5.4.3 gauges
+`spg_durability_lag_bytes` + `spg_durability_lag_seconds` plus
+the v5.4.1 counters `spg_flusher_iterations_total` +
+`spg_flusher_errors_total`. All four are always rendered; zero
+values in sync mode are themselves the "sync confirmed" signal
+for dashboards.
+
 ---
 
 ## Not frozen (free to change in any release)
