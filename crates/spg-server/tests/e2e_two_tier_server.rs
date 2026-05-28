@@ -207,7 +207,10 @@ fn preload_loads_cold_segment_on_first_query_after_index_creation() {
     // outside; any key in that range that we *did* skip would
     // miss). Test the just-below-min key.
     let rows = run_select(&mut s, "SELECT name FROM users WHERE id = 50");
-    assert!(rows.is_empty(), "id=50 must miss (between hot id=1 and cold range)");
+    assert!(
+        rows.is_empty(),
+        "id=50 must miss (between hot id=1 and cold range)"
+    );
 
     drop(s);
     drop(child);

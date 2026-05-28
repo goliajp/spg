@@ -53,11 +53,7 @@ fn sweep_schema() -> TableSchema {
 fn make_sweep_row(id: i32) -> Row {
     let sec = ((id as u64).wrapping_mul(2_654_435_761) % 1_000_000_000) as i32;
     let name = format!("u-{id}");
-    Row::new(vec![
-        Value::Int(id),
-        Value::Int(sec),
-        Value::Text(name),
-    ])
+    Row::new(vec![Value::Int(id), Value::Int(sec), Value::Text(name)])
 }
 
 fn parse_args() -> (u64, PathBuf) {
@@ -143,14 +139,11 @@ fn main() {
         next: 1,
         end,
     };
-    let (bytes, meta) = encode_segment(seg_iter, 0.01, SEGMENT_PAGE_BYTES)
-        .expect("encode_segment");
+    let (bytes, meta) = encode_segment(seg_iter, 0.01, SEGMENT_PAGE_BYTES).expect("encode_segment");
     let encode_secs = t_encode.elapsed().as_secs_f64();
     eprintln!(
         "bake_segment: encoded {} rows in {encode_secs:.2}s = {} pages, {} bytes total",
-        meta.num_rows,
-        meta.num_pages,
-        meta.total_bytes
+        meta.num_rows, meta.num_pages, meta.total_bytes
     );
     let t_write = Instant::now();
     std::fs::write(&output, &bytes).expect("write segment");

@@ -25,9 +25,9 @@ pub use self::segment::{
 };
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -681,9 +681,7 @@ impl Table {
             .indices
             .iter_mut()
             .find(|i| i.name == index_name)
-            .ok_or_else(|| {
-                StorageError::Corrupt(format!("index {index_name:?} not found"))
-            })?;
+            .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
         let map = match &mut idx.kind {
             IndexKind::BTree(map) => map,
             IndexKind::Nsw(_) => {
@@ -1599,7 +1597,9 @@ impl Catalog {
     /// bytes.
     #[must_use]
     pub fn cold_segment(&self, segment_id: u32) -> Option<&OwnedSegment> {
-        self.cold_segments.get(segment_id as usize).map(AsRef::as_ref)
+        self.cold_segments
+            .get(segment_id as usize)
+            .map(AsRef::as_ref)
     }
 
     /// v5.1: resolve a single `RowLocator::Cold` to its underlying
@@ -1641,12 +1641,7 @@ impl Catalog {
     /// segment-decode errors — those would indicate corrupted
     /// cold-tier files and should be caught at
     /// [`Catalog::load_segment_bytes`] time.
-    pub fn lookup_by_pk(
-        &self,
-        table: &str,
-        index_name: &str,
-        key: &IndexKey,
-    ) -> Option<Row> {
+    pub fn lookup_by_pk(&self, table: &str, index_name: &str, key: &IndexKey) -> Option<Row> {
         let t = self.get(table)?;
         let idx = t.indices.iter().find(|i| i.name == index_name)?;
         let locators = idx.lookup_eq(key);
@@ -3190,7 +3185,9 @@ mod tests {
         }
         t.add_index("by_id".into(), "id").unwrap();
         // All locators are Hot; cold_segments is empty.
-        let got = cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2)).unwrap();
+        let got = cat
+            .lookup_by_pk("users", "by_id", &IndexKey::Int(2))
+            .unwrap();
         assert_eq!(got, make_user_row(2, "bob"));
         assert_eq!(cat.cold_segment_count(), 0);
     }
@@ -3319,11 +3316,13 @@ mod tests {
 
         // Hot tier hits.
         assert_eq!(
-            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(1)).unwrap(),
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(1))
+                .unwrap(),
             make_user_row(1, "alice")
         );
         assert_eq!(
-            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2)).unwrap(),
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2))
+                .unwrap(),
             make_user_row(2, "bob")
         );
         // Cold tier hits.
