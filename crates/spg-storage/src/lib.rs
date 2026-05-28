@@ -2202,31 +2202,6 @@ impl Catalog {
     }
 }
 
-/// v5.2.2: pull out every `Cold` locator currently registered on
-/// `table.indices[index_name]`. The freeze flow needs this because
-/// `Table::delete_rows` triggers `rebuild_indices`, which discards
-/// every payload and re-emits only `Hot` locators from `self.rows`
-/// — any pre-existing cold entries would vanish. Capturing them
-/// here lets the freezer re-register them alongside the newly-cold
-/// rows after the swap.
-fn collect_cold_locators(table: &Table, index_name: &str) -> Vec<(IndexKey, RowLocator)> {
-    let Some(idx) = table.indices.iter().find(|i| i.name == index_name) else {
-        return Vec::new();
-    };
-    let IndexKind::BTree(map) = &idx.kind else {
-        return Vec::new();
-    };
-    let mut out: Vec<(IndexKey, RowLocator)> = Vec::new();
-    for (key, locators) in map {
-        for loc in locators {
-            if loc.is_cold() {
-                out.push((key.clone(), *loc));
-            }
-        }
-    }
-    out
-}
-
 /// Coerce an [`IndexKey`] to the `u64` that v5.1 cold-tier
 /// segments use as their on-disk PK. Returns `None` for keys that
 /// aren't representable as `u64` — Text PKs need a hash mapping

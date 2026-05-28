@@ -31,7 +31,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
+use spg_wire::{
+    Frame, Op, WireValue, build_auth_user, build_query, encode, parse_data_row,
+    parse_data_row_batch,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -310,4 +313,179 @@ fn manifest_restores_cold_segments_across_restart() {
     // brings cold segments back, snapshot+WAL handle the rest".
     let post = select_int(&mut s2, "SELECT count(*) FROM big WHERE id = 100");
     assert_eq!(post, 1, "post-freeze hot row also resolves post-restart");
+}
+
+// --- v5.3.2 CHECKPOINT + WAL truncate -----------------------------
+
+/// Server runs with explicit admin password so CHECKPOINT (admin-
+/// gated) is reachable. Returns the spawned child + a client socket
+/// already authenticated as the admin.
+fn spawn_server_with_admin(
+    addr: &str,
+    db: &Path,
+    wal: &Path,
+    http_addr: Option<&str>,
+    extra_env: &[(&str, String)],
+) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
+    cmd.arg(addr)
+        .arg(db)
+        .arg("-")
+        .arg(wal)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("SPG_ADMIN_PASSWORD", "adm-pw")
+        .env_remove("SPG_PASSWORD")
+        .env_remove("SPG_PG_ADDR")
+        .env_remove("SPG_FREEZER_DISABLE");
+    if let Some(h) = http_addr {
+        cmd.env("SPG_HTTP_ADDR", h);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().unwrap()
+}
+
+fn auth_admin(s: &mut TcpStream) {
+    send(s, &build_auth_user("admin", "adm-pw").unwrap());
+    let f = read_frame(s);
+    match f.op {
+        Op::Pong | Op::CommandComplete => {}
+        Op::ErrorResponse | Op::Error => {
+            let msg = spg_wire::parse_error_response(&f).unwrap_or("<undecodable>");
+            panic!("AUTH rejected: {msg}");
+        }
+        other => panic!("unexpected AUTH response: {other:?}"),
+    }
+}
+
+/// `CHECKPOINT` writes a fresh snapshot, updates the manifest, and
+/// truncates the WAL file to 0 bytes. The next boot reads the
+/// manifest (auto-loads cold segments) and replays the empty WAL —
+/// no work. Subsequent writes append to a fresh WAL.
+#[test]
+fn checkpoint_truncates_wal_and_persists_through_restart() {
+    let dir = unique_tmpdir("checkpoint-truncate");
+    let db = dir.join("a.db");
+    let wal = dir.join("a.wal");
+    let manifest_path = dir.join("a.spg").join("manifest.v10");
+
+    let addr1 = pick_free_addr();
+    let env: Vec<(&str, String)> = vec![
+        ("SPG_HOT_TIER_BYTES", "512".to_string()),
+        ("SPG_FREEZER_TICK_MS", "50".to_string()),
+        ("SPG_FREEZER_BATCH_ROWS", "4".to_string()),
+    ];
+
+    let committed: i64;
+    {
+        let mut c = ChildGuard(spawn_server_with_admin(&addr1, &db, &wal, None, &env));
+        let mut s = wait_for_listener(&addr1, &mut c.0);
+        s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        auth_admin(&mut s);
+
+        exec_ok(
+            &mut s,
+            "CREATE TABLE big (id BIGINT NOT NULL, name TEXT NOT NULL)",
+        );
+        exec_ok(&mut s, "CREATE INDEX by_id ON big (id)");
+        let mut written: i64 = 0;
+        for i in 0..30i64 {
+            exec_ok(&mut s, &format!("INSERT INTO big VALUES ({i}, 'u-{i}')"));
+            written += 1;
+        }
+        committed = written;
+
+        // Let the freezer fire so cold segments end up on disk.
+        thread::sleep(Duration::from_millis(300));
+
+        let wal_size_before = std::fs::metadata(&wal).unwrap().len();
+        assert!(
+            wal_size_before > 0,
+            "WAL must have grown past 0 before CHECKPOINT"
+        );
+
+        exec_ok(&mut s, "CHECKPOINT");
+
+        let wal_size_after = std::fs::metadata(&wal).unwrap().len();
+        assert_eq!(
+            wal_size_after, 0,
+            "CHECKPOINT must truncate WAL to 0 (was {wal_size_before}, after {wal_size_after})"
+        );
+        assert!(
+            manifest_path.exists(),
+            "CHECKPOINT must leave a manifest at {}",
+            manifest_path.display()
+        );
+
+        // Post-checkpoint INSERT to confirm the WAL is writable
+        // again. This row gets WAL'd into a fresh file growing
+        // from offset 0.
+        exec_ok(&mut s, "INSERT INTO big VALUES (1000, 'post-cp')");
+        let wal_size_post = std::fs::metadata(&wal).unwrap().len();
+        assert!(
+            wal_size_post > 0,
+            "WAL must accept new appends after truncate (got {wal_size_post})"
+        );
+
+        let _ = c.0.kill();
+        let _ = c.0.wait();
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    // Restart — admin password required because BACKUP/CHECKPOINT
+    // bootstrap a user. Freezer disabled so the post-restart state
+    // is what the manifest + WAL produce, no background tweaks.
+    let addr2 = pick_free_addr();
+    let mut c2 = ChildGuard(spawn_server_with_admin(
+        &addr2,
+        &db,
+        &wal,
+        None,
+        &[("SPG_FREEZER_DISABLE", "1".to_string())],
+    ));
+    let mut s2 = wait_for_listener(&addr2, &mut c2.0);
+    s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    auth_admin(&mut s2);
+
+    // All 30 original rows + the post-checkpoint row = 31. Every
+    // PK must resolve through some tier (the early ones through
+    // the manifest-restored cold tier, the rest through snapshot
+    // + WAL replay of the post-CHECKPOINT INSERT).
+    for id in [0i64, committed / 2, committed - 1, 1000] {
+        let got = select_int(
+            &mut s2,
+            &format!("SELECT count(*) FROM big WHERE id = {id}"),
+        );
+        assert_eq!(got, 1, "PK {id} must resolve post-restart");
+    }
+}
+
+/// CHECKPOINT requires admin role. A bare client (no AUTH) gets
+/// the same permission-denied surface as BACKUP / CREATE USER.
+#[test]
+fn checkpoint_rejects_non_admin_caller() {
+    let dir = unique_tmpdir("checkpoint-rbac");
+    let db = dir.join("a.db");
+    let wal = dir.join("a.wal");
+    let addr = pick_free_addr();
+    let mut c = ChildGuard(spawn_server_with_admin(
+        &addr,
+        &db,
+        &wal,
+        None,
+        &[("SPG_FREEZER_DISABLE", "1".to_string())],
+    ));
+    let mut s = wait_for_listener(&addr, &mut c.0);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    // Skip auth_admin — connect as anonymous. CHECKPOINT must be
+    // rejected before the engine sees it.
+    send(&mut s, &build_query("CHECKPOINT"));
+    let f = read_frame(&mut s);
+    assert!(
+        matches!(f.op, Op::ErrorResponse | Op::Error),
+        "expected error response, got {:?}",
+        f.op
+    );
 }

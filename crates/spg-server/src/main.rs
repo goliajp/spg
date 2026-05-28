@@ -1242,6 +1242,18 @@ fn dispatch(
                 }
                 return run_backup_command(stream, state, &backup_intent);
             }
+            // v5.3.2: intercept CHECKPOINT. Admin-only because it
+            // writes the snapshot + manifest + truncates the WAL —
+            // same surface as BACKUP / user management.
+            if parse_checkpoint_intent(&sql) {
+                if !acting.can_manage_users() {
+                    return write_frame(
+                        stream,
+                        &build_error_response("permission denied: CHECKPOINT requires admin role"),
+                    );
+                }
+                return run_checkpoint_command(stream, state);
+            }
             // v4.34: when WAL is on and this is an auto-commit write
             // (no client-driven TX in flight, not a TX-control verb),
             // wrap the engine mutation in an implicit BEGIN..COMMIT.
@@ -1538,6 +1550,100 @@ fn parse_backup_intent(sql: &str) -> Option<BackupIntent> {
 enum BackupIntent {
     Full { path: String },
     Incremental { path: String, since: u64 },
+}
+
+/// v5.3.2: parse the `CHECKPOINT` keyword. No arguments, no
+/// variations — the SQL form is intentionally minimal because the
+/// operation always means the same thing: snapshot the engine,
+/// write the manifest, truncate the WAL.
+fn parse_checkpoint_intent(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    trimmed.eq_ignore_ascii_case("checkpoint")
+}
+
+/// v5.3.2 — `CHECKPOINT` handler. Writes a fresh snapshot to
+/// `db_path`, an updated manifest to the sibling
+/// `<db>.spg/manifest.v10`, and truncates the WAL file to 0 bytes.
+/// The next boot loads the manifest, preloads every cold segment,
+/// and starts WAL replay from byte 0 (which is now empty until the
+/// next post-checkpoint write).
+///
+/// Single-fsync semantics: snapshot → manifest → WAL truncate is a
+/// strict order. A crash between any two of those leaves the
+/// system in a state the boot path can detect (snapshot CRC vs
+/// manifest's `catalog_crc32`) and falls back to legacy
+/// snapshot+WAL-from-0 replay. v5.3.x intentionally doesn't add a
+/// CHECKPOINT WAL record; v5.4 manifest-with-WAL-coordination is
+/// a separate trigger.
+fn run_checkpoint_command(stream: &mut TcpStream, state: &ServerState) -> std::io::Result<()> {
+    let Some(db_path) = state.db_path.as_deref() else {
+        return write_frame(
+            stream,
+            &build_error_response("CHECKPOINT requires a db_path (server started without one)"),
+        );
+    };
+    // Acquire write lock so no concurrent mutation can land between
+    // snapshot capture and WAL truncate.
+    let snapshot_bytes = {
+        let engine = state
+            .engine
+            .write()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        if engine.in_transaction() {
+            return write_frame(
+                stream,
+                &build_error_response("CHECKPOINT refused: an open transaction is in flight"),
+            );
+        }
+        let bytes = engine.snapshot();
+        drop(engine);
+        bytes
+    };
+    if let Err(e) = write_atomic(db_path, &snapshot_bytes) {
+        return write_frame(
+            stream,
+            &build_error_response(&format!("CHECKPOINT snapshot write failed: {e}")),
+        );
+    }
+    let cold_paths = state
+        .cold_segment_paths
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    // Post-truncate the WAL will start at byte 0, so the manifest's
+    // `wal_baseline_offset` for the *next* boot is also 0 — every
+    // byte after this point is post-checkpoint and must be replayed.
+    write_manifest_alongside(db_path, &snapshot_bytes, &cold_paths, 0);
+    // Truncate WAL last — until the manifest lands, a crash here
+    // would leave the WAL holding old bytes that the manifest CRC
+    // check will detect on the next boot.
+    if let Some(wal_mutex) = state.wal.as_ref() {
+        let wal_lock = wal_mutex
+            .lock()
+            .map_err(|_| std::io::Error::other("WAL mutex poisoned"))?;
+        if let Err(e) = wal_lock.set_len(0) {
+            // Best-effort: log + report. The snapshot + manifest
+            // already landed; on next boot the manifest's CRC will
+            // match and the residual WAL bytes will replay as a
+            // (defensive) no-op idempotency replay. Not a hard
+            // failure.
+            return write_frame(
+                stream,
+                &build_error_response(&format!("CHECKPOINT WAL truncate failed: {e}")),
+            );
+        }
+        if let Err(e) = wal_lock.sync_data() {
+            return write_frame(
+                stream,
+                &build_error_response(&format!("CHECKPOINT WAL sync failed: {e}")),
+            );
+        }
+        drop(wal_lock);
+    }
+    // Return 0 in the affected-rows slot — there's no natural row
+    // count for a checkpoint. Operators can poll `wal_path` size
+    // afterwards to confirm the truncate.
+    write_frame(stream, &build_command_complete(0))
 }
 
 fn run_backup_command(
