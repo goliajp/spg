@@ -21,6 +21,7 @@
 //! Pass `-` (or omit) to skip any positional after the first.
 
 mod backup;
+mod freezer;
 mod observability;
 mod pgwire;
 mod replication;
@@ -708,6 +709,15 @@ fn run(
                  follower mode requires both"
             );
         }
+    }
+
+    // v5.2.2: background freezer. Polls every tick; if hot-tier byte
+    // sum exceeds `SPG_HOT_TIER_BYTES` (default 4 GiB), demotes a
+    // batch of rows from the largest table with a BTree integer-PK
+    // index. Opt-out via `SPG_FREEZER_DISABLE=1` for tests that
+    // don't want background mutations under them.
+    if freezer::spawn(Arc::clone(&state)).is_none() {
+        eprintln!("spg-server: freezer disabled via SPG_FREEZER_DISABLE");
     }
 
     // v4.33 graceful shutdown: keep the blocking accept loop the
