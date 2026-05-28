@@ -653,7 +653,35 @@ impl Table {
         self.add_nsw_index_inner(name, column_name, graph.m, Some(graph))
     }
 
-    /// v5.1: register cold-tier locators on a BTree index. Used
+    /// Restore a `BTree` index from a pre-built `(IndexKey, Vec<RowLocator>)`
+    /// map. Used by [`Catalog::deserialize`] when reading a v9 (or later)
+    /// catalog snapshot — the map travels on disk so cold-tier locators
+    /// survive a round-trip, instead of being rebuilt from `self.rows`
+    /// (which would lose every Cold entry). Same error contract as
+    /// [`Table::add_index`].
+    pub fn restore_btree_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        map: PersistentBTreeMap<IndexKey, Vec<RowLocator>>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        self.indices.push(Index {
+            name,
+            column_position,
+            kind: IndexKind::BTree(map),
+        });
+        Ok(())
+    }
+
+    /// v5.1: register cold-tier locators on a `BTree` index. Used
     /// after [`Catalog::load_segment_bytes`] to wire every cold-
     /// tier row's PK back to its segment so
     /// [`Catalog::lookup_by_pk`] can resolve it. Each call
@@ -1684,7 +1712,12 @@ impl Catalog {
 /// almost never wide enough to be sharded into a cold tier.
 fn index_key_as_u64(key: &IndexKey) -> Option<u64> {
     match key {
-        IndexKey::Int(n) => Some(*n as u64),
+        // Reinterpret the i64 bit pattern as u64. Cold-tier segments
+        // are sorted by this u64 view, so the chosen interpretation
+        // only has to match between insert (bake_segment / freezer)
+        // and lookup — using cast_unsigned keeps both sides honest
+        // and silences clippy::cast_sign_loss.
+        IndexKey::Int(n) => Some(n.cast_unsigned()),
         IndexKey::Text(_) | IndexKey::Bool(_) => None,
     }
 }
@@ -1836,7 +1869,29 @@ impl TableSchema {
 // =========================================================================
 
 const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
-const FILE_VERSION: u8 = 8;
+/// Current catalog snapshot format version emitted by [`Catalog::serialize`].
+///
+/// v9 (v5.2) extends v8 by serialising `BTree` index entries directly — every
+/// `(IndexKey, Vec<RowLocator>)` pair travels on disk with the v5.1
+/// `RowLocator::write_le` tag-prefixed codec. v8 `BTree` indices stored no
+/// entries at all (the map was rebuilt from `Table::rows` on load); v9
+/// preserves on-disk Cold locators so freezer-produced cold-tier index
+/// entries survive a catalog snapshot round-trip. v8 readers are accepted
+/// by version dispatch in [`Catalog::deserialize`] — every entry decodes
+/// as `RowLocator::Hot(_)` via `add_index` rebuild, identical to v5.1
+/// behaviour.
+const FILE_VERSION: u8 = 9;
+/// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
+/// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
+const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
+
+// IndexKey wire format (v9):
+//   tag 0 = Int  → [i64 LE]
+//   tag 1 = Text → [u16 LE len + UTF-8 bytes] (via write_str / read_str)
+//   tag 2 = Bool → [u8 0/1]
+const INDEX_KEY_TAG_INT: u8 = 0;
+const INDEX_KEY_TAG_TEXT: u8 = 1;
+const INDEX_KEY_TAG_BOOL: u8 = 2;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -1896,7 +1951,30 @@ impl Catalog {
                     u16::try_from(idx.column_position).expect("≤ 65k columns/table"),
                 );
                 match &idx.kind {
-                    IndexKind::BTree(_) => out.push(0),
+                    IndexKind::BTree(map) => {
+                        out.push(0);
+                        // v9: serialise the full PB map. Each entry's
+                        // RowLocator list travels with the tag-prefixed
+                        // codec from `row_locator::write_le`, so freezer-
+                        // produced Cold locators survive a snapshot
+                        // round-trip. v8 BTree wrote nothing here and
+                        // rebuilt from rows — v9 readers tolerate v8 by
+                        // version dispatch in `Catalog::deserialize`.
+                        write_u32(
+                            &mut out,
+                            u32::try_from(map.len()).expect("≤ 4G index entries/index"),
+                        );
+                        for (key, locators) in map {
+                            write_index_key(&mut out, key);
+                            write_u32(
+                                &mut out,
+                                u32::try_from(locators.len()).expect("≤ 4G locators/key"),
+                            );
+                            for loc in locators {
+                                loc.write_le(&mut out);
+                            }
+                        }
+                    }
                     IndexKind::Nsw(g) => {
                         out.push(1);
                         write_u16(&mut out, u16::try_from(g.m).expect("≤ 65k NSW neighbours"));
@@ -1919,15 +1997,15 @@ impl Catalog {
             )));
         }
         let version = cur.read_u8()?;
-        if version != FILE_VERSION {
+        if !(MIN_SUPPORTED_FILE_VERSION..=FILE_VERSION).contains(&version) {
             return Err(StorageError::Corrupt(format!(
-                "unsupported file version: {version}"
+                "unsupported file version: {version} (supported: {MIN_SUPPORTED_FILE_VERSION}..={FILE_VERSION})"
             )));
         }
         let table_count = cur.read_u32()? as usize;
         let mut cat = Self::new();
         for _ in 0..table_count {
-            deserialize_table(&mut cur, &mut cat)?;
+            deserialize_table(&mut cur, &mut cat, version)?;
         }
         if cur.pos < buf.len() {
             return Err(StorageError::Corrupt(format!(
@@ -1943,7 +2021,11 @@ impl Catalog {
 /// `Catalog::deserialize` to keep the latter under the line-budget lint
 /// and to give the row hot loop its own scope (so the borrow on `t`
 /// stays scoped here rather than across the whole catalog loop).
-fn deserialize_table(cur: &mut Cursor<'_>, cat: &mut Catalog) -> Result<(), StorageError> {
+fn deserialize_table(
+    cur: &mut Cursor<'_>,
+    cat: &mut Catalog,
+    version: u8,
+) -> Result<(), StorageError> {
     let name = cur.read_str()?;
     let col_count = cur.read_u16()? as usize;
     let mut cols = Vec::with_capacity(col_count);
@@ -1976,7 +2058,7 @@ fn deserialize_table(cur: &mut Cursor<'_>, cat: &mut Catalog) -> Result<(), Stor
     // we skip the map lookup here since we know the position.
     let t = cat.tables.last_mut().expect("create_table just pushed");
     deserialize_rows(cur, t, n_cols)?;
-    deserialize_indices(cur, t)?;
+    deserialize_indices(cur, t, version)?;
     Ok(())
 }
 
@@ -1999,7 +2081,11 @@ fn deserialize_rows(
     Ok(())
 }
 
-fn deserialize_indices(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), StorageError> {
+fn deserialize_indices(
+    cur: &mut Cursor<'_>,
+    t: &mut Table,
+    version: u8,
+) -> Result<(), StorageError> {
     let index_count = cur.read_u16()? as usize;
     for _ in 0..index_count {
         let idx_name = cur.read_str()?;
@@ -2018,7 +2104,20 @@ fn deserialize_indices(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), Storag
         let kind_tag = cur.read_u8()?;
         match kind_tag {
             0 => {
-                t.add_index(idx_name, &column_name)?;
+                if version >= 9 {
+                    // v9+: BTree entries serialised inline (tag-prefixed
+                    // locator codec). Restore the map directly so any
+                    // freezer-produced Cold locators come back exactly
+                    // as they went out.
+                    let map = read_btree_map(cur)?;
+                    t.restore_btree_index(idx_name, &column_name, map)?;
+                } else {
+                    // v8: no entries on disk; rebuild from rows. Every
+                    // entry is materialised as `RowLocator::Hot(i)` —
+                    // semantically identical to the v5.1 in-memory state
+                    // since v8 catalogs never produced Cold locators.
+                    t.add_index(idx_name, &column_name)?;
+                }
             }
             1 => {
                 let m = cur.read_u16()? as usize;
@@ -2033,6 +2132,31 @@ fn deserialize_indices(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), Storag
         }
     }
     Ok(())
+}
+
+/// Parse a v9 `BTree` index payload — `[u32 entry_count]` followed by
+/// `entry_count` `(IndexKey, Vec<RowLocator>)` pairs. The locator list
+/// uses the v5.1 tag-prefixed wire format (`RowLocator::read_le`).
+fn read_btree_map(
+    cur: &mut Cursor<'_>,
+) -> Result<PersistentBTreeMap<IndexKey, Vec<RowLocator>>, StorageError> {
+    let entry_count = cur.read_u32()? as usize;
+    let mut map = PersistentBTreeMap::new();
+    for _ in 0..entry_count {
+        let key = cur.read_index_key()?;
+        let locator_count = cur.read_u32()? as usize;
+        let mut locators = Vec::with_capacity(locator_count);
+        for _ in 0..locator_count {
+            let tail = &cur.buf[cur.pos..];
+            let (loc, consumed) = RowLocator::read_le(tail).map_err(|e| {
+                StorageError::Corrupt(format!("row_locator decode at offset {}: {e}", cur.pos))
+            })?;
+            cur.pos += consumed;
+            locators.push(loc);
+        }
+        map.insert_mut(key, locators);
+    }
+    Ok(map)
 }
 
 // --- low-level binary helpers ---------------------------------------------
@@ -2156,7 +2280,7 @@ impl Cursor<'_> {
     }
 }
 
-/// Encode one row's body in the v3.0.2 dense format (FILE_VERSION
+/// Encode one row's body in the v3.0.2 dense format (`FILE_VERSION`
 /// 8): per-row NULL bitmap (1 bit/col, ceil(cols/8) bytes), then
 /// each non-NULL cell as `write_value_body`. Same wire shape the
 /// catalog snapshot writes per row inside its rows-block. Exposed
@@ -2344,6 +2468,26 @@ fn write_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// Serialise an [`IndexKey`] using the v9 tagged codec. `read_index_key`
+/// is the inverse. v8 catalogs never wrote index keys (`BTree` entries were
+/// rebuilt from `Table::rows`), so this codec is v9+ only.
+fn write_index_key(out: &mut Vec<u8>, key: &IndexKey) {
+    match key {
+        IndexKey::Int(n) => {
+            out.push(INDEX_KEY_TAG_INT);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        IndexKey::Text(s) => {
+            out.push(INDEX_KEY_TAG_TEXT);
+            write_str(out, s);
+        }
+        IndexKey::Bool(b) => {
+            out.push(INDEX_KEY_TAG_BOOL);
+            out.push(u8::from(*b));
+        }
+    }
+}
+
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -2401,6 +2545,21 @@ impl<'a> Cursor<'a> {
         core::str::from_utf8(bytes)
             .map(String::from)
             .map_err(|_| StorageError::Corrupt("invalid UTF-8 in identifier or text".into()))
+    }
+
+    /// Parse an [`IndexKey`] emitted by `write_index_key` (v9 tagged
+    /// codec). Returns `StorageError::Corrupt` on unknown tag or
+    /// truncated payload.
+    fn read_index_key(&mut self) -> Result<IndexKey, StorageError> {
+        let tag = self.read_u8()?;
+        match tag {
+            INDEX_KEY_TAG_INT => Ok(IndexKey::Int(self.read_i64()?)),
+            INDEX_KEY_TAG_TEXT => Ok(IndexKey::Text(self.read_str()?)),
+            INDEX_KEY_TAG_BOOL => Ok(IndexKey::Bool(self.read_u8()? != 0)),
+            other => Err(StorageError::Corrupt(format!(
+                "unknown index key tag: {other}"
+            ))),
+        }
     }
     /// Schema-driven dense value decode (`FILE_VERSION` 8). Caller has
     /// already cleared the NULL bit from the row bitmap; we read the
@@ -3231,7 +3390,7 @@ mod tests {
             .iter()
             .map(|(id, name)| {
                 let row = make_user_row(*id, name);
-                (*id as u64, encode_row_body_dense(&row, &schema))
+                ((*id).cast_unsigned(), encode_row_body_dense(&row, &schema))
             })
             .collect();
         let (seg_bytes, _meta) =
@@ -3291,7 +3450,7 @@ mod tests {
             .iter()
             .map(|(id, name)| {
                 let row = make_user_row(*id, name);
-                (*id as u64, encode_row_body_dense(&row, &schema))
+                ((*id).cast_unsigned(), encode_row_body_dense(&row, &schema))
             })
             .collect();
         let (seg_bytes, _) =
@@ -3390,17 +3549,201 @@ mod tests {
         let mut cat = Catalog::new();
         cat.create_table(bigint_pk_users_schema()).unwrap();
         let schema = cat.get("users").unwrap().schema.clone();
-        for batch in 0..3 {
-            let rows: Vec<(u64, Vec<u8>)> = (0..4)
+        for batch in 0u32..3 {
+            let rows: Vec<(u64, Vec<u8>)> = (0u64..4)
                 .map(|i| {
-                    let id = batch * 100 + i;
-                    let row = make_user_row(id as i64, "x");
+                    let id = u64::from(batch) * 100 + i;
+                    let row = make_user_row(id.cast_signed(), "x");
                     (id, encode_row_body_dense(&row, &schema))
                 })
                 .collect();
             let (bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
-            assert_eq!(cat.load_segment_bytes(bytes).unwrap(), batch as u32);
+            assert_eq!(cat.load_segment_bytes(bytes).unwrap(), batch);
         }
         assert_eq!(cat.cold_segment_count(), 3);
+    }
+
+    // --- v5.2 catalog format v9 ----------------------------------
+
+    /// Hand-craft a v8 catalog byte stream and confirm the v9 reader
+    /// accepts it and surfaces every `BTree` entry as a Hot locator.
+    /// Guards the backward-compat read path: existing v3.0.2 / v4.x
+    /// snapshots on disk must keep loading after the v5.2 bump.
+    #[test]
+    fn v8_catalog_decodes_as_all_hot_under_v9_reader() {
+        // Build a populated catalog in memory, snapshot it with the
+        // v9 serializer, then patch the version byte back to 8 and
+        // strip the v9 BTree payload bytes so the layout matches what
+        // a real v8 snapshot would have produced on disk. The v9
+        // reader's version dispatch path then rebuilds the index
+        // from rows (every locator becomes Hot).
+        let mut cat = populated_users();
+        cat.get_mut("users")
+            .unwrap()
+            .add_index("by_name".into(), "name")
+            .unwrap();
+
+        // To produce a faithful v8 byte stream we re-encode the same
+        // catalog with the v8 layout: identical bytes up to (and
+        // including) the per-index kind tag, but no inline BTree
+        // entries.
+        let v8_bytes = encode_as_v8(&cat);
+        assert_eq!(v8_bytes[FILE_MAGIC.len()], 8, "version byte must be 8");
+
+        let restored = Catalog::deserialize(&v8_bytes).expect("v9 reader accepts v8 stream");
+        let idx = restored
+            .get("users")
+            .unwrap()
+            .index_on(1)
+            .expect("index_on(1) after restore");
+        // v8 path always materialises Hot locators (no cold tier
+        // existed pre-v5.2).
+        assert_eq!(
+            idx.lookup_eq(&IndexKey::Text("alice".into())),
+            &[RowLocator::Hot(0), RowLocator::Hot(2)]
+        );
+        // No accidental Cold leak.
+        for entry in idx.lookup_eq(&IndexKey::Text("alice".into())) {
+            assert!(entry.is_hot(), "v8 → v9 read must yield Hot only");
+        }
+    }
+
+    /// Encode `cat` using the v8 layout (no inline `BTree` entries,
+    /// version byte = 8). Pure test helper — duplicates just enough
+    /// of `Catalog::serialize` to produce a faithful v8 stream that
+    /// real v3.0.2 / v4.x deployments wrote.
+    fn encode_as_v8(cat: &Catalog) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(FILE_MAGIC);
+        out.push(8u8);
+        write_u32(&mut out, u32::try_from(cat.tables.len()).unwrap());
+        for t in &cat.tables {
+            write_str(&mut out, &t.schema.name);
+            write_u16(&mut out, u16::try_from(t.schema.columns.len()).unwrap());
+            for c in &t.schema.columns {
+                write_str(&mut out, &c.name);
+                write_data_type(&mut out, c.ty);
+                out.push(u8::from(c.nullable));
+                match &c.default {
+                    None => out.push(0),
+                    Some(v) => {
+                        out.push(1);
+                        write_value(&mut out, v);
+                    }
+                }
+                out.push(u8::from(c.auto_increment));
+            }
+            write_u32(&mut out, u32::try_from(t.rows.len()).unwrap());
+            for row in &t.rows {
+                out.extend_from_slice(&encode_row_body_dense(row, &t.schema));
+            }
+            write_u16(&mut out, u16::try_from(t.indices.len()).unwrap());
+            for idx in &t.indices {
+                write_str(&mut out, &idx.name);
+                write_u16(&mut out, u16::try_from(idx.column_position).unwrap());
+                match &idx.kind {
+                    // v8 BTree wrote only the kind tag; entries
+                    // rebuild from rows on read.
+                    IndexKind::BTree(_) => out.push(0),
+                    IndexKind::Nsw(g) => {
+                        out.push(1);
+                        write_u16(&mut out, u16::try_from(g.m).unwrap());
+                        write_nsw_graph(&mut out, g);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Build a catalog that carries both hot and cold locators on a
+    /// `BTree` index, snapshot it through `serialize`, then deserialise
+    /// and confirm every Cold locator round-trips byte-identical and
+    /// `lookup_by_pk` resolves through the rebuilt cold-segment
+    /// registry.
+    #[test]
+    fn v9_catalog_round_trip_preserves_cold_locators() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        // Hot rows: 1, 2
+        for (id, name) in [(1i64, "alice"), (2, "bob")] {
+            t.insert(make_user_row(id, name)).unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        let schema = t.schema.clone();
+
+        // Cold rows: 100, 200, 300 — sit in a single segment.
+        let cold_rows: Vec<(i64, &str)> = vec![(100, "ivy"), (200, "joe"), (300, "kim")];
+        let seg_rows: Vec<(u64, Vec<u8>)> = cold_rows
+            .iter()
+            .map(|(id, name)| {
+                let row = make_user_row(*id, name);
+                ((*id).cast_unsigned(), encode_row_body_dense(&row, &schema))
+            })
+            .collect();
+        let (seg_bytes, _) =
+            encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        let seg_id = cat.load_segment_bytes(seg_bytes.clone()).unwrap();
+        let pairs: Vec<(IndexKey, RowLocator)> = cold_rows
+            .iter()
+            .map(|(id, _)| {
+                (
+                    IndexKey::Int(*id),
+                    RowLocator::Cold {
+                        segment_id: seg_id,
+                        page_offset: 0,
+                    },
+                )
+            })
+            .collect();
+        cat.get_mut("users")
+            .unwrap()
+            .register_cold_locators("by_id", pairs)
+            .unwrap();
+
+        // Snapshot + restore via the v9 codec.
+        let bytes = cat.serialize();
+        assert_eq!(bytes[FILE_MAGIC.len()], FILE_VERSION);
+        let mut restored = Catalog::deserialize(&bytes).expect("v9 round-trip parses");
+
+        // Catalog::serialize does not yet emit cold segment file
+        // bytes (v5.3 manifest is the future home for that). For
+        // this v9 test the caller side-loads the segment again so
+        // lookup_by_pk can resolve the Cold locator. The point of
+        // this assertion is that the locator metadata survived the
+        // catalog round-trip.
+        let restored_seg_id = restored.load_segment_bytes(seg_bytes).unwrap();
+        assert_eq!(restored_seg_id, seg_id);
+
+        let idx = restored.get("users").unwrap().index_on(0).unwrap();
+        // Hot locators round-trip.
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(1)), &[RowLocator::Hot(0)]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(2)), &[RowLocator::Hot(1)]);
+        // Cold locators round-trip byte-identical.
+        for (id, _) in &cold_rows {
+            assert_eq!(
+                idx.lookup_eq(&IndexKey::Int(*id)),
+                &[RowLocator::Cold {
+                    segment_id: seg_id,
+                    page_offset: 0,
+                }]
+            );
+        }
+        // End-to-end: lookup_by_pk resolves both tiers.
+        assert_eq!(
+            restored
+                .lookup_by_pk("users", "by_id", &IndexKey::Int(2))
+                .unwrap(),
+            make_user_row(2, "bob")
+        );
+        for (id, name) in &cold_rows {
+            assert_eq!(
+                restored
+                    .lookup_by_pk("users", "by_id", &IndexKey::Int(*id))
+                    .unwrap(),
+                make_user_row(*id, name)
+            );
+        }
     }
 }

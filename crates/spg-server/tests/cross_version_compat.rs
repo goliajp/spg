@@ -5,6 +5,7 @@
     clippy::doc_overindented_list_items,
     clippy::manual_assert,
     clippy::uninlined_format_args,
+    clippy::unnecessary_debug_formatting,
     clippy::unreadable_literal
 )]
 
@@ -304,7 +305,20 @@ fn every_fixture_restores_and_verifies() {
 #[test]
 #[ignore = "release-process capture: regenerates xtests/compat-fixtures/v4.41/"]
 fn capture_v4_41_fixture() {
-    let label = "v4.41";
+    capture_fixture("v4.41");
+}
+
+/// v5.2 fixture capture — first catalog snapshot written with
+/// `FILE_VERSION = 9` (the tagged RowLocator codec). Same workload
+/// as the v4.41 capture so the diff between fixtures isolates the
+/// catalog format bump.
+#[test]
+#[ignore = "release-process capture: regenerates xtests/compat-fixtures/v5.2/"]
+fn capture_v5_2_fixture() {
+    capture_fixture("v5.2");
+}
+
+fn capture_fixture(label: &str) {
     let dest = workspace_root().join("xtests/compat-fixtures").join(label);
     std::fs::create_dir_all(&dest).expect("mkdir fixture dir");
 
