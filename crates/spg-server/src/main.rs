@@ -1706,6 +1706,26 @@ pub(crate) const WAL_V2_SENTINEL: u32 = 0x8000_0000;
 pub(crate) const WAL_V3_FLAG: u32 = 0x4000_0000;
 pub(crate) const WAL_V3_SENTINEL: u32 = WAL_V2_SENTINEL | WAL_V3_FLAG;
 
+/// v5.4.2 — cached `SPG_SYNCHRONOUS_COMMIT` parse. Returns `true`
+/// when async-commit mode is opted in (`SPG_SYNCHRONOUS_COMMIT` ∈
+/// {`off`, `false`, `0`}, case-insensitive). The result is cached
+/// behind `OnceLock` because the env is read once per process; a
+/// benchmark that flips the knob must restart the server.
+///
+/// In async mode the WAL write path skips `sync_data` — the
+/// flusher thread (v5.4.1) handles durability via periodic
+/// `durability_checkpoint` markers. The opt-in keyword set is
+/// the same one `FlusherConfig::from_env` recognises, so a
+/// misread env stays consistent across both modules.
+pub(crate) fn synchronous_commit_disabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("SPG_SYNCHRONOUS_COMMIT")
+            .ok()
+            .is_some_and(|s| matches!(s.trim().to_lowercase().as_str(), "off" | "false" | "0"))
+    })
+}
+
 /// v4.41 v3 record type tags. Reserve a byte rather than a bit so
 /// future record kinds (binary INSERT, multi-row batch, snapshot
 /// marker) can all share the v3 frame without another sentinel.
@@ -1891,7 +1911,13 @@ fn append_wal_v3_group(state: &ServerState, entries: &[Vec<u8>]) -> std::io::Res
         }
     }
     f.write_all(&batched)?;
-    f.sync_data()?;
+    // v5.4.2 — in async-commit mode the flusher thread is
+    // responsible for `sync_data`; the client's CC may return
+    // before the bytes reach disk. v4.42 group-commit semantics
+    // are preserved exactly in sync mode (the default).
+    if !synchronous_commit_disabled() {
+        f.sync_data()?;
+    }
     Ok(())
 }
 
@@ -2247,7 +2273,12 @@ fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
         }
     }
     f.write_all(&entry)?;
-    f.sync_data()?;
+    // v5.4.2 — async-commit mode opts out of the per-write
+    // `sync_data`; durability rides on the flusher thread's
+    // periodic `durability_checkpoint` markers instead.
+    if !synchronous_commit_disabled() {
+        f.sync_data()?;
+    }
     Ok(())
 }
 
