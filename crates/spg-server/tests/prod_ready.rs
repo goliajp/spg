@@ -954,6 +954,215 @@ fn row_6_3_concurrent_reads_dont_serialize() {
     );
 }
 
+// ---- 2.10 v5.3 fast restart at scale (manifest + CHECKPOINT) ----
+
+/// 2.10 Fast restart at scale — after `CHECKPOINT`, a 100M-row
+/// catalog restarts in ≤ 60 s wall-time. The boot path reads the
+/// v10 sidecar manifest, verifies the snapshot CRC, auto-preloads
+/// every cold-tier segment, and skips WAL bytes before
+/// `wal_baseline_offset`. Evidence: manifest module + main.rs
+/// CHECKPOINT handler + e2e_manifest.rs test set including the
+/// `#[ignore]`-marked 100M release-process gate.
+#[test]
+fn row_2_10_fast_restart_at_scale_covered_by_e2e() {
+    // Manifest module ships the v10 wire format.
+    let manifest_path = workspace_root().join("crates/spg-server/src/manifest.rs");
+    let manifest_src = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|_| panic!("manifest.rs missing at {}", manifest_path.display()));
+    assert!(
+        manifest_src.contains("SPGMAN01") && manifest_src.contains("MANIFEST_VERSION"),
+        "manifest.rs must declare the v10 magic + MANIFEST_VERSION constants"
+    );
+
+    // main.rs wires the manifest + CHECKPOINT path + auto-preload.
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("write_manifest_alongside"),
+        "main.rs must call write_manifest_alongside on snapshot writes"
+    );
+    assert!(
+        main_src.contains("load_manifest_and_preload_cold"),
+        "main.rs must call load_manifest_and_preload_cold on boot"
+    );
+    assert!(
+        main_src.contains("run_checkpoint_command") && main_src.contains("parse_checkpoint_intent"),
+        "main.rs must implement the CHECKPOINT SQL command + parser"
+    );
+
+    // e2e_manifest.rs has the CI gate + the #[ignore]-marked 100M release-process gate.
+    let e2e_path = workspace_root().join("crates/spg-server/tests/e2e_manifest.rs");
+    let e2e_src = std::fs::read_to_string(&e2e_path)
+        .unwrap_or_else(|_| panic!("e2e_manifest.rs missing at {}", e2e_path.display()));
+    for fn_name in [
+        "fn manifest_restores_cold_segments_across_restart",
+        "fn checkpoint_truncates_wal_and_persists_through_restart",
+        "fn checkpoint_rejects_non_admin_caller",
+        "fn restart_at_100m_under_60s_after_checkpoint",
+    ] {
+        assert!(
+            e2e_src.contains(fn_name),
+            "e2e_manifest.rs must contain {fn_name}"
+        );
+    }
+}
+
+// ---- 1.12 v5.4 async-commit durability window ----
+
+/// 1.12 Async-commit durability window — when
+/// `SPG_SYNCHRONOUS_COMMIT=off`, per-write `sync_data` is skipped;
+/// the flusher thread emits `durability_checkpoint` markers every
+/// `SPG_FLUSHER_INTERVAL_US` µs. Bounded-loss invariant: a SIGKILL
+/// between two ticks loses only the WAL bytes appended in the
+/// current window. Sync mode (default + `=on`) preserves every
+/// v4.42 invariant byte-for-byte. Evidence: the v5.4.x code chain
+/// (synchronous_commit_disabled / wal_sync_clone /
+/// WAL_V3_TYPE_DURABILITY_CHECKPOINT / flusher module) + the
+/// e2e_async_commit / e2e_flusher / e2e_chaos_async_commit test
+/// trio + the slo_smoke ratio + #[ignore]-marked ship gate.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "many independent contract checks against the v5.4 surface; splitting into sub-tests would obscure the single PROD_READY row this gate corresponds to"
+)]
+fn row_1_12_async_commit_durability_window_covered_by_e2e() {
+    // Code surface — env knob, lock-free fsync clone, v3 marker tag.
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("fn synchronous_commit_disabled"),
+        "main.rs must define synchronous_commit_disabled() OnceLock parser"
+    );
+    assert!(
+        main_src.contains("WAL_V3_TYPE_DURABILITY_CHECKPOINT"),
+        "main.rs must register the v3 0x02 durability_checkpoint kind tag"
+    );
+    assert!(
+        main_src.contains("fn encode_durability_marker")
+            && main_src.contains("fn append_durability_marker"),
+        "main.rs must expose encode_durability_marker + append_durability_marker"
+    );
+    assert!(
+        main_src.contains("wal_sync_clone"),
+        "main.rs must hold a try_clone'd WAL handle for lock-free fsync (v5.4.4)"
+    );
+    assert!(
+        main_src.contains("fn dispatch_v3_record"),
+        "main.rs replay path must dispatch v3 records via dispatch_v3_record (marker = no-op)"
+    );
+
+    // Flusher module ships the env knob + spawn + run loop.
+    let flusher_path = workspace_root().join("crates/spg-server/src/flusher.rs");
+    let flusher_src = std::fs::read_to_string(&flusher_path)
+        .unwrap_or_else(|_| panic!("flusher.rs missing at {}", flusher_path.display()));
+    assert!(
+        flusher_src.contains("SPG_SYNCHRONOUS_COMMIT")
+            && flusher_src.contains("SPG_FLUSHER_INTERVAL_US"),
+        "flusher.rs must reference both env knobs"
+    );
+    assert!(
+        flusher_src.contains("append_durability_marker"),
+        "flusher.rs must call append_durability_marker on each tick"
+    );
+
+    // Observability surface — counters + lag gauges.
+    let obs_src =
+        std::fs::read_to_string(workspace_root().join("crates/spg-server/src/observability.rs"))
+            .expect("observability.rs");
+    for atomic in [
+        "flusher_iterations",
+        "flusher_errors",
+        "last_durable_wal_offset",
+        "last_fsync_us",
+    ] {
+        assert!(
+            obs_src.contains(atomic),
+            "observability.rs must declare the {atomic} atomic for /metrics"
+        );
+    }
+    for series in [
+        "spg_flusher_iterations_total",
+        "spg_flusher_errors_total",
+        "spg_durability_lag_bytes",
+        "spg_durability_lag_seconds",
+    ] {
+        assert!(
+            obs_src.contains(series),
+            "observability.rs must render the {series} Prometheus series"
+        );
+    }
+
+    // e2e_async_commit.rs pins functional invariants (sync vs async visibility).
+    let async_e2e_path = workspace_root().join("crates/spg-server/tests/e2e_async_commit.rs");
+    let async_e2e_src = std::fs::read_to_string(&async_e2e_path).unwrap_or_else(|_| {
+        panic!(
+            "e2e_async_commit.rs missing at {}",
+            async_e2e_path.display()
+        )
+    });
+    for fn_name in [
+        "fn sync_commit_default_writes_apply_and_are_visible",
+        "fn async_commit_off_inserts_visible_immediately",
+        "fn explicit_sync_commit_on_behaves_like_default",
+    ] {
+        assert!(
+            async_e2e_src.contains(fn_name),
+            "e2e_async_commit.rs must contain {fn_name}"
+        );
+    }
+
+    // e2e_flusher.rs pins the env-knob parser + lifecycle + lag metrics.
+    let flusher_e2e_path = workspace_root().join("crates/spg-server/tests/e2e_flusher.rs");
+    let flusher_e2e_src = std::fs::read_to_string(&flusher_e2e_path)
+        .unwrap_or_else(|_| panic!("e2e_flusher.rs missing at {}", flusher_e2e_path.display()));
+    for fn_name in [
+        "fn flusher_metric_zero_in_default_sync_commit_mode",
+        "fn flusher_metric_rises_under_async_commit_off",
+        "fn flusher_env_var_recognizes_off_false_zero",
+        "fn flusher_env_var_treats_on_as_sync",
+        "fn durability_lag_metrics_are_zero_in_sync_mode",
+        "fn durability_lag_seconds_bounded_in_async_mode",
+    ] {
+        assert!(
+            flusher_e2e_src.contains(fn_name),
+            "e2e_flusher.rs must contain {fn_name}"
+        );
+    }
+
+    // e2e_chaos_async_commit.rs pins the bounded-loss invariant.
+    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e_chaos_async_commit.rs");
+    let chaos_src = std::fs::read_to_string(&chaos_path).unwrap_or_else(|_| {
+        panic!(
+            "e2e_chaos_async_commit.rs missing at {}",
+            chaos_path.display()
+        )
+    });
+    assert!(
+        chaos_src.contains("fn chaos_kill_during_async_commit_window_loses_only_unflushed"),
+        "e2e_chaos_async_commit.rs must contain the kill-mid-window prefix-recovery chaos test"
+    );
+
+    // SLO gates: host-noise-tolerant ratio test (CI) + #[ignore]-marked 200K ship gate.
+    let slo_path = workspace_root().join("crates/spg-server/tests/slo_smoke.rs");
+    let slo_src = std::fs::read_to_string(&slo_path).expect("slo_smoke.rs");
+    assert!(
+        slo_src.contains("fn slo_wal_insert_async_commit_smoke_speedup_vs_sync"),
+        "slo_smoke.rs must contain the CI ratio gate"
+    );
+    assert!(
+        slo_src.contains("fn slo_wal_insert_async_commit_above_200k"),
+        "slo_smoke.rs must contain the release-process 200K ship gate"
+    );
+
+    // STABILITY freezes the env-var keyword set + the v3 wire extension.
+    let stability_src =
+        std::fs::read_to_string(workspace_root().join("STABILITY.md")).expect("STABILITY.md");
+    assert!(
+        stability_src.contains("Async-commit mode (v5.4)"),
+        "STABILITY.md must carry the v5.4 async-commit subsection under Env-var contract"
+    );
+}
+
 // ---- meta-test: every [machine] row in the doc has a Rust test ----
 
 /// Meta-check: PROD_READY.md must not promise a [machine] row
