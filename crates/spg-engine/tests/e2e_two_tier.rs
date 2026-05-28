@@ -21,8 +21,7 @@
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::{
-    Catalog, IndexKey, RowLocator, SEGMENT_PAGE_BYTES, Value, encode_row_body_dense,
-    encode_segment,
+    Catalog, IndexKey, RowLocator, SEGMENT_PAGE_BYTES, Value, encode_row_body_dense, encode_segment,
 };
 
 /// CREATE the table the suite uses (BIGINT PK + TEXT label) and
@@ -53,10 +52,7 @@ fn register_cold_users(engine: &mut Engine, rows: &[(i64, &str)]) -> u32 {
     let seg_rows: Vec<(u64, Vec<u8>)> = rows
         .iter()
         .map(|(id, name)| {
-            let row = spg_storage::Row::new(vec![
-                Value::BigInt(*id),
-                Value::Text((*name).into()),
-            ]);
+            let row = spg_storage::Row::new(vec![Value::BigInt(*id), Value::Text((*name).into())]);
             (*id as u64, encode_row_body_dense(&row, &schema))
         })
         .collect();
@@ -112,9 +108,7 @@ fn pk_lookup_finds_row_in_hot_only_table() {
     let mut engine = boot_engine_with_users();
     for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
         engine
-            .execute(&format!(
-                "INSERT INTO users VALUES ({id}, '{name}')"
-            ))
+            .execute(&format!("INSERT INTO users VALUES ({id}, '{name}')"))
             .expect("insert");
     }
     assert_eq!(engine.catalog().cold_segment_count(), 0);
@@ -165,9 +159,7 @@ fn pk_lookup_finds_row_in_either_tier() {
     let hot: Vec<(i64, &str)> = vec![(1, "alice"), (2, "bob"), (3, "carol")];
     for (id, name) in &hot {
         engine
-            .execute(&format!(
-                "INSERT INTO users VALUES ({id}, '{name}')"
-            ))
+            .execute(&format!("INSERT INTO users VALUES ({id}, '{name}')"))
             .expect("insert");
     }
     let cold: Vec<(i64, &str)> = vec![(100, "ivy"), (200, "joe"), (300, "kim")];

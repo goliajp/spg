@@ -1449,8 +1449,7 @@ impl Engine {
                 for cow in rows {
                     let row = cow.as_ref();
                     if let Some(where_expr) = &stmt.where_ {
-                        let cond =
-                            self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
+                        let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
                         if !matches!(cond, Value::Bool(true)) {
                             continue;
                         }
@@ -1461,8 +1460,7 @@ impl Engine {
                 for i in 0..table.row_count() {
                     let row = &table.rows()[i];
                     if let Some(where_expr) = &stmt.where_ {
-                        let cond =
-                            self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
+                        let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
                         if !matches!(cond, Value::Bool(true)) {
                             continue;
                         }

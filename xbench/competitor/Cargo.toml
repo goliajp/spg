@@ -75,5 +75,9 @@ path = "src/bin/backup_bench.rs"
 name = "bake_segment"
 path = "src/bin/bake_segment.rs"
 
+[[bin]]
+name = "cold_tier_pk_bench"
+path = "src/bin/cold_tier_pk_bench.rs"
+
 [lints]
 workspace = true

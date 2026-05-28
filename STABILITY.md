@@ -259,6 +259,59 @@ verdicts post-deserialise. Algorithm:
 A v2 Bloom layout (if ever needed) gets a new magic; the v1
 reader rejects unknown magics.
 
+### Catalog file format v8 (v5.1; unchanged from v4.x)
+
+The cold-tier read path landed in v5.1 (RowLocator, OwnedSegment,
+`Catalog::cold_segments`, `Catalog::lookup_by_pk`,
+`Catalog::resolve_cold_locator`) without changing the catalog
+snapshot wire format. BTree indices still serialise as a single
+`kind=0` tag and rebuild from `Table::rows` on deserialise (see
+`deserialize_indices`), so no `RowLocator` bytes hit disk in a
+v5.1 snapshot. Pre-v5.2 every locator in memory is `Hot(_)` and
+every catalog round-trip reproduces the pre-v5 byte stream
+exactly.
+
+`FILE_VERSION` 9 with on-disk locator encoding is reserved for
+v5.2: the freezer thread is the first producer of `Cold` locators,
+and v5.2 ships the catalog format bump in the same commit that
+makes those locators reachable after a snapshot + restart cycle.
+A v5.1 binary writes v8 snapshots; a v5.0 binary reads v5.1
+snapshots unchanged.
+
+### Cold-tier segments (v5.1; side-loaded, not in the catalog snapshot)
+
+Cold segments are first-class artifacts of the v5 cold-tier
+plan but live **outside** the catalog snapshot. The operator
+(or v5.3's `CatalogManifest`) is responsible for keeping the
+segment files reachable across restarts; the catalog snapshot
+itself does not record their paths.
+
+v5.1 ships two side-loader contracts that are frozen as long
+as the v8 catalog format is in use:
+
+  - `Catalog::load_segment_bytes(Vec<u8>) -> Result<u32, _>`
+    registers a segment from caller-owned bytes, returning the
+    `segment_id` that `RowLocator::Cold { segment_id, .. }`
+    references. Per-segment validation cost (bloom + page-index
+    parse) is paid once; the segment lives behind an `Arc` so
+    `Catalog::clone` stays the O(N segments) Arc-bump it was
+    before v5.1.
+  - `Table::register_cold_locators(index_name, iter)` is the
+    in-memory primitive for adding `RowLocator::Cold` entries to
+    a BTree index — `iter` yields `(IndexKey, RowLocator)`
+    pairs. v5.1 callers (the spg-server preload path) produce
+    one entry per segment row; v5.2's freezer thread runs the
+    same primitive under the engine write lock as part of its
+    atomic swap.
+
+`SPG_PRELOAD_COLD_SEGMENT` is the v5.1 operator surface:
+`table:index:path[;table:index:path …]`. spg-server parses it at
+startup and runs the preload lazily on the first Op::Query
+after each spec's `(table, index)` both exist. The env var is
+stable within v5.x; v5.3+ may add an optional
+`CatalogManifest`-driven autoload that supersedes it for
+production deployments without removing the env-var path.
+
 ### Env-var contract
 
 Every env var listed in DEPLOYMENT.md's table is stable. New
