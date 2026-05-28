@@ -21,6 +21,7 @@
 //! Pass `-` (or omit) to skip any positional after the first.
 
 mod backup;
+mod flusher;
 mod freezer;
 mod manifest;
 mod observability;
@@ -774,6 +775,19 @@ fn run(
     // don't want background mutations under them.
     if freezer::spawn(Arc::clone(&state)).is_none() {
         eprintln!("spg-server: freezer disabled via SPG_FREEZER_DISABLE");
+    }
+
+    // v5.4.1: background flusher. Spawned only when async-commit
+    // mode is opted in via `SPG_SYNCHRONOUS_COMMIT=off` (default is
+    // synchronous — every WAL write already `sync_data`s, so the
+    // flusher would be redundant). In async mode the flusher emits
+    // a v5.4.0 `durability_checkpoint` WAL marker every
+    // `SPG_FLUSHER_INTERVAL_US` µs (default 200 µs) so crash
+    // recovery can identify how much of the async-commit window
+    // had reached fsync at kill time.
+    if flusher::spawn(Arc::clone(&state)).is_none() {
+        // Default sync mode — silent. The opt-in async path logs
+        // its own "async-commit on" banner when it lands in v5.4.2.
     }
 
     // v4.33 graceful shutdown: keep the blocking accept loop the
@@ -1787,10 +1801,6 @@ fn encode_durability_marker(byte_offset: u64) -> std::io::Result<Vec<u8>> {
 /// marker that violates the disk-full chaos contract fails the
 /// same way an INSERT would, so the flusher thread can degrade
 /// gracefully. No-WAL servers return `Ok(0)` (nothing to mark).
-#[expect(
-    dead_code,
-    reason = "v5.4.0 ships the wire format + replay path; first non-test caller lands in v5.4.1 when the flusher thread is introduced. `#[expect]` (not `#[allow]`) so rustc surfaces the attribute as soon as a caller appears, forcing it to be removed."
-)]
 fn append_durability_marker(state: &ServerState) -> std::io::Result<u64> {
     let Some(wal_mutex) = state.wal.as_ref() else {
         return Ok(0);

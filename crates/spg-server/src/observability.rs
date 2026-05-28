@@ -60,6 +60,18 @@ pub struct Metrics {
     /// freezer thread after each successful demotion. Exposed via
     /// `spg_cold_segments_total`.
     pub cold_segments: AtomicU64,
+    /// v5.4.1: total `durability_checkpoint` markers the flusher
+    /// thread has successfully appended in async-commit mode.
+    /// Stays at 0 in sync-commit mode (the flusher isn't spawned).
+    /// Exposed via `spg_flusher_iterations_total`.
+    pub flusher_iterations: AtomicU64,
+    /// v5.4.1: total flusher-thread iterations that failed (WAL
+    /// quota exceeded, ENOSPC, mutex poisoned). Pairs with
+    /// `flusher_iterations`: a rising errors counter against a
+    /// flatline iterations counter is the operator's signal that
+    /// the WAL volume needs attention. Exposed via
+    /// `spg_flusher_errors_total`.
+    pub flusher_errors: AtomicU64,
 }
 
 /// JSON-safe escape: replace `"`, `\\`, and control characters per
@@ -201,7 +213,32 @@ fn render_metrics(state: &crate::ServerState) -> String {
     render_replication_lag(state, &mut out);
     render_hot_tier(state, &mut out);
     render_cold_tier(state, &mut out);
+    render_flusher(state, &mut out);
     out
+}
+
+/// v5.4.1 — async-commit flusher counters. Always rendered (even
+/// in sync-commit mode where both stay at 0) so a Prometheus
+/// dashboard tracking these series doesn't need conditional
+/// queries; the zeros are themselves the "sync mode confirmed"
+/// signal.
+fn render_flusher(state: &crate::ServerState, out: &mut String) {
+    out.push_str(
+        "# HELP spg_flusher_iterations_total Successful durability_checkpoint emissions by the async-commit flusher (v5.4.1)\n",
+    );
+    out.push_str("# TYPE spg_flusher_iterations_total counter\n");
+    out.push_str(&format!(
+        "spg_flusher_iterations_total {}\n",
+        state.metrics.flusher_iterations.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP spg_flusher_errors_total Flusher iterations that failed to append a durability marker (v5.4.1)\n",
+    );
+    out.push_str("# TYPE spg_flusher_errors_total counter\n");
+    out.push_str(&format!(
+        "spg_flusher_errors_total {}\n",
+        state.metrics.flusher_errors.load(Ordering::Relaxed)
+    ));
 }
 
 /// v5.2.2 — cold-tier segment count. Tracked separately from
