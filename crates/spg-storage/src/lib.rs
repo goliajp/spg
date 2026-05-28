@@ -283,6 +283,32 @@ pub struct Index {
 /// time and persisted with the index.
 pub const NSW_DEFAULT_M: usize = 16;
 
+/// v5.2.2: outcome of a successful [`Catalog::freeze_oldest_to_cold`]
+/// call. The catalog state has already been mutated by the time this
+/// is returned (hot rows dropped + segment registered + Cold locators
+/// flipped). The caller's only remaining concern is `segment_bytes` —
+/// persist them to disk under `<db>.spg/segments/seg_<id>.spg` so a
+/// future restart can reload via the v5.1 `SPG_PRELOAD_COLD_SEGMENT`
+/// path. (v5.3's manifest will subsume this manual step.)
+#[derive(Debug, Clone)]
+pub struct FreezeReport {
+    /// Id allocated by [`Catalog::load_segment_bytes`] for the new
+    /// cold-tier segment. Stable across the call's success path.
+    pub segment_id: u32,
+    /// Number of rows that moved hot → cold. Equals the `max_rows`
+    /// the caller asked for (the API is strict on the count).
+    pub frozen_rows: usize,
+    /// Hot-tier bytes reclaimed by the freeze — the
+    /// [`Table::hot_bytes`] delta before vs after. Useful to feed
+    /// back into the freezer's budget check on the next tick.
+    pub bytes_freed: u64,
+    /// Encoded segment bytes, byte-identical to what
+    /// [`encode_segment`] produced. The catalog already owns a
+    /// copy inside `cold_segments`; this hand-off lets the caller
+    /// persist them without re-encoding.
+    pub segment_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub enum IndexKind {
     /// v4.40: structural-sharing B-tree over `IndexKey`. Replaces the v0.8
@@ -1673,6 +1699,187 @@ impl Catalog {
             .fold(0u64, u64::saturating_add)
     }
 
+    /// v5.2.2: freeze the **first** `max_rows` rows of `table_name`'s
+    /// hot tier into a brand-new cold-tier segment. The named `BTree`
+    /// index supplies the per-row PK (its column must be an integer
+    /// type — v5.2.2 only supports `IndexKey::Int` PKs, matching the
+    /// `index_key_as_u64` constraint used by the cold-tier lookup
+    /// path). On success returns a [`FreezeReport`] with the
+    /// freshly-allocated segment id, the count of rows that moved,
+    /// the encoded segment bytes (so the caller can persist them to
+    /// disk for later reload via `SPG_PRELOAD_COLD_SEGMENT`), and the
+    /// hot-tier byte delta that was reclaimed.
+    ///
+    /// **Semantics**:
+    /// 1. The first `max_rows` rows (by hot-tier position — same as
+    ///    insertion order under v4.39 `PersistentVec`) are read.
+    /// 2. Rows are sorted ascending by PK and serialised into a new
+    ///    segment via [`encode_segment`].
+    /// 3. The hot rows are dropped via [`Table::delete_rows`]; the
+    ///    `rebuild_indices` it triggers regenerates `Hot` locators
+    ///    for every remaining row (their positions shift down by
+    ///    `max_rows`). Existing `Cold` locators in this index — from
+    ///    a previous freeze — are also rebuilt **but with empty
+    ///    payload** since rebuild reads only `self.rows`; this
+    ///    routine re-registers them at the end of the call so the
+    ///    user-visible state preserves all prior cold locators.
+    /// 4. The new segment is loaded into `self.cold_segments` via
+    ///    [`Catalog::load_segment_bytes`] (allocating a fresh
+    ///    `segment_id`). New `Cold` locators are registered on the
+    ///    named index — one per frozen row.
+    ///
+    /// **v5.2.2 limits** (relaxed in later sub-versions):
+    /// - INSERT-only flow: subsequent UPDATE/DELETE on a frozen row
+    ///   returns a stale-locator error (no promote-on-write until
+    ///   v5.2.3).
+    /// - Single-table scope: callers iterate tables themselves.
+    /// - All-or-nothing: returns `Err` and leaves catalog unchanged
+    ///   if any step fails before the atomic swap point.
+    ///
+    /// Errors:
+    /// - [`StorageError::Corrupt`] for missing table/index, non-`BTree`
+    ///   index, non-integer PK column, `max_rows == 0`, or
+    ///   `max_rows > row_count`.
+    /// - The encoder's [`SegmentError`] surfaces as `Corrupt` (the
+    ///   only realistic source is "a single row is larger than the
+    ///   page size"; SPG schemas don't hit it in practice).
+    pub fn freeze_oldest_to_cold(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        max_rows: usize,
+    ) -> Result<FreezeReport, StorageError> {
+        // --- validation phase: never mutates ---------------------
+        if max_rows == 0 {
+            return Err(StorageError::Corrupt(
+                "freeze_oldest_to_cold: max_rows must be > 0".into(),
+            ));
+        }
+        let table = self.get(table_name).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "freeze_oldest_to_cold: table {table_name:?} not found"
+            ))
+        })?;
+        if max_rows > table.rows.len() {
+            return Err(StorageError::Corrupt(format!(
+                "freeze_oldest_to_cold: max_rows {max_rows} > row_count {}",
+                table.rows.len()
+            )));
+        }
+        let idx = table
+            .indices
+            .iter()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "freeze_oldest_to_cold: index {index_name:?} not found on {table_name:?}"
+                ))
+            })?;
+        if !matches!(idx.kind, IndexKind::BTree(_)) {
+            return Err(StorageError::Corrupt(format!(
+                "freeze_oldest_to_cold: index {index_name:?} is NSW; only BTree indices may freeze"
+            )));
+        }
+        let column_position = idx.column_position;
+
+        // --- segment build phase: reads only --------------------
+        let schema = table.schema.clone();
+        let mut to_freeze: Vec<(u64, Vec<u8>, IndexKey)> = Vec::with_capacity(max_rows);
+        for row_idx in 0..max_rows {
+            let row = table.rows.get(row_idx).expect("bounds-checked above");
+            let key = IndexKey::from_value(&row.values[column_position]).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "freeze_oldest_to_cold: row {row_idx} has NULL / non-key value in index column"
+                ))
+            })?;
+            let pk_u64 = index_key_as_u64(&key).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "freeze_oldest_to_cold: index {index_name:?} column type is non-integer; \
+                     v5.2.2 cold tier requires IndexKey::Int (Text PK lands in v5.5+)"
+                ))
+            })?;
+            to_freeze.push((pk_u64, encode_row_body_dense(row, &schema), key));
+        }
+        // encode_segment requires ascending u64 keys. Sort by PK
+        // before encoding; the caller's row-position order is not
+        // necessarily PK order (e.g. workloads that insert random
+        // PKs).
+        to_freeze.sort_by_key(|(k, _, _)| *k);
+        // Reject duplicate PKs — encode_segment also rejects them
+        // (`SegmentError::UnsortedKey`), but the resulting error
+        // message there is misleading. Surface a clearer one.
+        for w in to_freeze.windows(2) {
+            if w[0].0 == w[1].0 {
+                return Err(StorageError::Corrupt(format!(
+                    "freeze_oldest_to_cold: duplicate PK {} in freeze batch",
+                    w[0].0
+                )));
+            }
+        }
+        // Snapshot the (key, locator) pairs that will be registered
+        // post-swap. Cloning the IndexKey out before the move makes
+        // the registration loop borrow-free.
+        let post_swap_keys: Vec<IndexKey> = to_freeze.iter().map(|(_, _, k)| k.clone()).collect();
+        // Segment encode is now infallible w.r.t. ordering. Map the
+        // `SegmentError` into a `StorageError::Corrupt` so the
+        // public surface stays one error type.
+        let seg_rows: Vec<(u64, Vec<u8>)> = to_freeze
+            .into_iter()
+            .map(|(k, body, _)| (k, body))
+            .collect();
+        let frozen_rows = seg_rows.len();
+        let (seg_bytes, _meta) = encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES)
+            .map_err(|e| StorageError::Corrupt(format!("freeze_oldest_to_cold: encode: {e}")))?;
+
+        // --- atomic swap phase: mutations only past this point ---
+        // delete_rows triggers rebuild_indices, which clears every
+        // index's payload and re-emits Hot locators from self.rows.
+        // Any pre-existing Cold locators on this index — produced
+        // by a previous freeze call — are lost here. They'll be
+        // re-registered below alongside the new ones.
+        let bytes_before = self.get(table_name).expect("just validated").hot_bytes();
+        let pre_freeze_cold: Vec<(IndexKey, RowLocator)> = {
+            let t = self.get(table_name).expect("just validated");
+            collect_cold_locators(t, index_name)
+        };
+        let positions: Vec<usize> = (0..max_rows).collect();
+        let t_mut = self
+            .get_mut(table_name)
+            .expect("just validated; still present");
+        let removed = t_mut.delete_rows(&positions);
+        debug_assert_eq!(removed, max_rows, "delete_rows count matches request");
+        let bytes_after = t_mut.hot_bytes();
+        let bytes_freed = bytes_before.saturating_sub(bytes_after);
+
+        let segment_id = self
+            .load_segment_bytes(seg_bytes.clone())
+            .map_err(|e| StorageError::Corrupt(format!("freeze_oldest_to_cold: load: {e}")))?;
+        let new_cold = post_swap_keys.into_iter().map(|k| {
+            (
+                k,
+                RowLocator::Cold {
+                    segment_id,
+                    page_offset: 0,
+                },
+            )
+        });
+        // Re-attach pre-existing cold locators first, then add the
+        // brand-new ones from this freeze. Order doesn't change
+        // semantics (the index map is unordered per key), but the
+        // sequence keeps the new entries grouped at the end of any
+        // key's locator list — useful for debugging.
+        let t_mut = self.get_mut(table_name).expect("still present");
+        t_mut.register_cold_locators(index_name, pre_freeze_cold)?;
+        t_mut.register_cold_locators(index_name, new_cold)?;
+
+        Ok(FreezeReport {
+            segment_id,
+            frozen_rows,
+            bytes_freed,
+            segment_bytes: seg_bytes,
+        })
+    }
+
     /// v5.1: borrow the cold segment at `segment_id`. Used by the
     /// spg-server preload path to enumerate (key, locator) pairs
     /// after loading a segment, so it can call
@@ -1758,6 +1965,31 @@ impl Catalog {
         }
         None
     }
+}
+
+/// v5.2.2: pull out every `Cold` locator currently registered on
+/// `table.indices[index_name]`. The freeze flow needs this because
+/// `Table::delete_rows` triggers `rebuild_indices`, which discards
+/// every payload and re-emits only `Hot` locators from `self.rows`
+/// — any pre-existing cold entries would vanish. Capturing them
+/// here lets the freezer re-register them alongside the newly-cold
+/// rows after the swap.
+fn collect_cold_locators(table: &Table, index_name: &str) -> Vec<(IndexKey, RowLocator)> {
+    let Some(idx) = table.indices.iter().find(|i| i.name == index_name) else {
+        return Vec::new();
+    };
+    let IndexKind::BTree(map) = &idx.kind else {
+        return Vec::new();
+    };
+    let mut out: Vec<(IndexKey, RowLocator)> = Vec::new();
+    for (key, locators) in map {
+        for loc in locators {
+            if loc.is_cold() {
+                out.push((key.clone(), *loc));
+            }
+        }
+    }
+    out
 }
 
 /// Coerce an [`IndexKey`] to the `u64` that v5.1 cold-tier
@@ -4008,5 +4240,188 @@ mod tests {
         let restored = Catalog::deserialize(&cat.serialize()).unwrap();
         assert_eq!(restored.hot_tier_bytes(), pre);
         assert_eq!(restored.get("users").unwrap().hot_bytes(), pre);
+    }
+
+    // --- v5.2.2 freezer atomic swap -------------------------------
+
+    /// Happy path: freeze the first half of a populated hot tier,
+    /// confirm row counts shift, `hot_bytes` shrinks, and every frozen
+    /// PK still resolves via `lookup_by_pk` (now through the cold
+    /// segment registered by the freeze).
+    #[test]
+    fn freeze_oldest_to_cold_moves_rows_and_keeps_lookups_working() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..10i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        let total_bytes_before = t.hot_bytes();
+
+        let report = cat
+            .freeze_oldest_to_cold("users", "by_id", 6)
+            .expect("freeze succeeds");
+        assert_eq!(report.frozen_rows, 6);
+        assert_eq!(report.segment_id, 0);
+        assert!(report.bytes_freed > 0);
+        assert!(!report.segment_bytes.is_empty());
+
+        let t = cat.get("users").unwrap();
+        assert_eq!(t.row_count(), 4, "4 hot rows remain (10 - 6 frozen)");
+        assert_eq!(cat.cold_segment_count(), 1);
+        // Hot bytes shrank by exactly the freed amount.
+        assert_eq!(
+            t.hot_bytes(),
+            total_bytes_before - report.bytes_freed,
+            "hot_bytes accounting matches FreezeReport"
+        );
+
+        // Every original PK still resolves — frozen ones via the
+        // cold segment, kept ones via the (renumbered) hot tier.
+        for id in 0..10i64 {
+            let got = cat
+                .lookup_by_pk("users", "by_id", &IndexKey::Int(id))
+                .unwrap_or_else(|| panic!("PK {id} disappeared after freeze"));
+            assert_eq!(got, make_user_row(id, &alloc::format!("u-{id}")));
+        }
+    }
+
+    /// Two successive freezes on the same index must preserve the
+    /// first batch's cold locators when the second freeze runs.
+    /// Catches the `rebuild_indices` wipe-Cold-on-delete bug that
+    /// `collect_cold_locators` / re-register guards against.
+    #[test]
+    fn freeze_twice_preserves_prior_cold_locators() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..12i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+
+        cat.freeze_oldest_to_cold("users", "by_id", 4)
+            .expect("first freeze ok");
+        cat.freeze_oldest_to_cold("users", "by_id", 4)
+            .expect("second freeze ok");
+
+        assert_eq!(cat.get("users").unwrap().row_count(), 4);
+        assert_eq!(cat.cold_segment_count(), 2);
+        // All 12 PKs still resolve — first 4 via segment 0,
+        // next 4 via segment 1, last 4 still hot.
+        for id in 0..12i64 {
+            let got = cat
+                .lookup_by_pk("users", "by_id", &IndexKey::Int(id))
+                .unwrap_or_else(|| panic!("PK {id} not resolvable after two freezes"));
+            assert_eq!(got, make_user_row(id, &alloc::format!("u-{id}")));
+        }
+    }
+
+    /// Validation guard tests. Each must return `Err` and **not
+    /// mutate the catalog** — the API is all-or-nothing.
+    #[test]
+    fn freeze_oldest_to_cold_rejects_invalid_input() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..3i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+
+        // max_rows == 0
+        assert!(matches!(
+            cat.freeze_oldest_to_cold("users", "by_id", 0),
+            Err(StorageError::Corrupt(_))
+        ));
+        // table missing
+        assert!(matches!(
+            cat.freeze_oldest_to_cold("missing", "by_id", 1),
+            Err(StorageError::Corrupt(_))
+        ));
+        // index missing
+        assert!(matches!(
+            cat.freeze_oldest_to_cold("users", "no_such_index", 1),
+            Err(StorageError::Corrupt(_))
+        ));
+        // max_rows > row_count
+        assert!(matches!(
+            cat.freeze_oldest_to_cold("users", "by_id", 999),
+            Err(StorageError::Corrupt(_))
+        ));
+        // Catalog still untouched.
+        assert_eq!(cat.get("users").unwrap().row_count(), 3);
+        assert_eq!(cat.cold_segment_count(), 0);
+    }
+
+    /// Freeze with a non-integer PK column must surface a clear
+    /// error (Text PKs land in v5.5+).
+    #[test]
+    fn freeze_oldest_to_cold_rejects_non_integer_pk() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "by_name",
+            vec![
+                ColumnSchema::new("name", DataType::Text, false),
+                ColumnSchema::new("payload", DataType::BigInt, false),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("by_name").unwrap();
+        t.insert(Row::new(vec![Value::Text("a".into()), Value::BigInt(1)]))
+            .unwrap();
+        t.add_index("by_n".into(), "name").unwrap();
+        let err = cat
+            .freeze_oldest_to_cold("by_name", "by_n", 1)
+            .expect_err("non-integer PK rejected");
+        match err {
+            StorageError::Corrupt(s) => assert!(
+                s.contains("non-integer"),
+                "error message names the constraint: {s}"
+            ),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        // Catalog untouched.
+        assert_eq!(cat.get("by_name").unwrap().row_count(), 1);
+        assert_eq!(cat.cold_segment_count(), 0);
+    }
+
+    /// Hot-tier rows after the freeze must keep their secondary-
+    /// index lookups working — `delete_rows` shifts positions, and
+    /// `rebuild_indices` must regenerate Hot locators at the new
+    /// indices.
+    #[test]
+    fn freeze_keeps_remaining_hot_rows_addressable_via_secondary_index() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..6i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        t.add_index("by_name".into(), "name").unwrap();
+
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+
+        // Remaining hot rows: id 3, 4, 5. They moved to positions
+        // 0, 1, 2 inside `self.rows`; the `by_name` index must now
+        // resolve them via fresh Hot locators.
+        let idx = cat.get("users").unwrap().index_on(1).unwrap();
+        let got = idx.lookup_eq(&IndexKey::Text("u-4".into()));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].is_hot(), "kept-hot rows still surface as Hot");
+        match got[0] {
+            RowLocator::Hot(i) => {
+                // The 4th-inserted row was at position 4; after
+                // dropping positions 0..3 it sits at position 1.
+                assert_eq!(i, 1);
+            }
+            RowLocator::Cold { .. } => unreachable!(),
+        }
     }
 }
