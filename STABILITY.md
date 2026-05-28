@@ -290,6 +290,67 @@ freeze cycle, snapshot to v8, then upgrade. Operators rolling
 forward from v4.x see no migration step — the v9 reader pulls
 their v8 BTree entries through the legacy rebuild path.
 
+### Manifest file format v10 (v5.3; `<db>.spg/manifest.v10`)
+
+The manifest is the v5.3 boot-time recovery contract. v5.0–v5.2
+booted by reading the snapshot at `db_path` and replaying the
+entire WAL from byte 0 — at 100M rows that's a 10-minute
+operation. The manifest captures three pieces of state that let
+the next boot skip the prefix of the WAL that's already been
+incorporated:
+
+  - `catalog_crc32` — CRC32 of the snapshot file at `db_path`.
+    The boot reader verifies it matches a fresh CRC32 over the
+    bytes it just read; a mismatch falls back to legacy
+    snapshot+WAL-from-0 replay (the manifest is treated as
+    "stale, fall through").
+  - `cold_segments[]` — `(segment_id, path, crc32)` per cold
+    segment. Each row is read at boot, its CRC re-verified,
+    and the bytes loaded via `Catalog::load_segment_bytes` so
+    the in-memory `cold_segments` slot is populated before WAL
+    replay begins. Pre-v5.3 the operator had to pass these
+    paths via `SPG_PRELOAD_COLD_SEGMENT`.
+  - `wal_baseline_offset` — byte offset in the WAL where the
+    replay should start. Bytes before this offset have been
+    incorporated into the snapshot at write time and are safe
+    to skip (or `ftruncate` away — `CHECKPOINT` does both).
+
+Wire format (LE; verified by a trailing CRC32 over the body):
+
+```text
+[8  magic         = b"SPGMAN01"]
+[1  version       = 10         ]
+[4  catalog_crc32              ]
+[4  num_segments               ]
+  per segment:
+    [4  segment_id             ]
+    [4  path_byte_len          ]
+    [N  path_bytes (UTF-8)     ]
+    [4  segment_crc32          ]
+[8  wal_baseline_offset        ]
+[4  trailing_crc32             ]
+```
+
+`ManifestError` variants — `BadMagic`, `UnsupportedVersion`,
+`Truncated`, `BadCrc32`, `PathNotUtf8`, `TrailingBytes` — are
+part of the v10 contract; adding a new failure mode is a major
+bump. The byte offsets above are pinned by
+`tests/wire_format_offsets_are_stable` inside the manifest
+module.
+
+The manifest is **best-effort**: every write site logs failures
+to stderr without failing the operation that triggered the write
+(snapshot still lands, CHECKPOINT still truncates WAL). On the
+boot side, a missing or corrupted manifest causes a graceful
+fall-back to legacy snapshot+WAL replay — the only thing lost is
+the boot-time optimisation.
+
+CHECKPOINT (v5.3.2) is the explicit operator surface: admin-only
+SQL command that snapshots the engine, writes a fresh manifest,
+and truncates the WAL to 0 bytes. Documented in
+`PROD_READY.md` row 2.10 alongside its CI gate
+(`tests/e2e_manifest.rs`).
+
 ### Cold-tier segments (v5.1; side-loaded, not in the catalog snapshot)
 
 Cold segments are first-class artifacts of the v5 cold-tier
@@ -333,25 +394,38 @@ as the v9 catalog format is in use:
     (Cold locator retired; row body becomes garbage until a
     future compaction pass reclaims it).
 
-`SPG_PRELOAD_COLD_SEGMENT` is the v5.1 operator surface:
-`table:index:path[;table:index:path …]`. spg-server parses it at
-startup and runs the preload lazily on the first Op::Query
-after each spec's `(table, index)` both exist. The env var is
-stable within v5.x; v5.3+ may add an optional
-`CatalogManifest`-driven autoload that supersedes it for
-production deployments without removing the env-var path.
+Operator surfaces for re-attaching cold segments across a
+restart:
+
+  - **v5.3+ (preferred)**: the manifest at
+    `<db>.spg/manifest.v10` auto-preloads every recorded
+    segment on boot, no operator action required. Snapshot
+    write sites and the `CHECKPOINT` SQL command emit the
+    manifest; see the "Manifest file format v10" section
+    above for the contract.
+  - **v5.1 (still supported)**: `SPG_PRELOAD_COLD_SEGMENT`
+    env var `table:index:path[;table:index:path …]`.
+    spg-server parses it at startup and runs the preload
+    lazily on the first Op::Query after each spec's
+    `(table, index)` both exist. Stable within v5.x; remains
+    a fallback for ops workflows where the manifest is
+    absent (e.g. snapshot copied without the sibling
+    `.spg/` directory).
 
 v5.2.2 freezer-driven segments are written to
 `<db_path>.spg/segments/seg_<id>.spg` via `tmp+rename` after
-each demotion; restoring them across a restart still requires
-an operator-supplied `SPG_PRELOAD_COLD_SEGMENT` entry. v5.2.x
-freezes are intentionally **not** WAL-durable — a crash mid-
-freeze loses the not-yet-reloaded segment on restart (data is
-recovered from the WAL replay back into the hot tier; the
-chaos contract is "rolled back to pre-freeze state, no
-corruption"). The chaos test
-`tests/e2e_chaos_freeze.rs::chaos_kill_during_freeze_recovers_
-clean_state` pins this invariant.
+each demotion. In v5.2.x they relied on
+`SPG_PRELOAD_COLD_SEGMENT` for the next-boot re-attach; in v5.3+
+the freezer also pushes the segment_id → path into the
+in-memory map that the next manifest write reads, so the
+operator no longer has to wire env vars by hand. v5.2.x freezes
+were intentionally **not** WAL-durable — a crash mid-freeze
+loses the not-yet-persisted segment; the chaos contract is
+"rolled back to pre-freeze state, no corruption". v5.3.2's
+`CHECKPOINT` is the explicit operator-side WAL-truncate +
+manifest-update operation. The chaos test
+`tests/e2e_chaos_freeze.rs::chaos_kill_during_freeze_recovers_clean_state`
+pins the bounded-loss invariant.
 
 ### Env-var contract
 

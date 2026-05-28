@@ -345,6 +345,18 @@ Each Cold → Hot upgrade requires a concrete observable, not
   - **v5.3 → v5.4**: 100M INSERT loop completes; restart wall
     time ≤ 60 s (measured); v4.42 + v5.0 + v5.3 fixtures all
     cross-version-replay.
+    Status (v5.3.4 ship): manifest format + CHECKPOINT + auto-
+    preload all shipped (`CatalogManifest` v10 in
+    `crates/spg-server/src/manifest.rs`,
+    `crates/spg-server/src/main.rs::run_checkpoint_command`,
+    boot-time auto-preload via
+    `load_manifest_and_preload_cold`). 100M restart wall-time
+    test machinery shipped under `#[ignore]` at
+    `tests/e2e_manifest.rs::restart_at_100m_under_60s_after_
+    checkpoint`. CI gate exercises the same machinery at small
+    scale via the non-ignored manifest tests. v5.3 fixture and
+    the full 100M sign-off land alongside the release-process
+    invocation.
 
   - **v5.4 → v5.5**: `slo_wal_insert_async_commit_above_200K`
     green (single client, `SPG_SYNCHRONOUS_COMMIT=off`); doc
