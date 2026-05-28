@@ -542,13 +542,39 @@ impl Engine {
 
     /// v4.41.1 allocate a fresh TX handle. Used by spg-server dispatch
     /// to scope each implicit-wrap BEGIN..stmt..COMMIT to its own slot
-    /// in `tx_catalogs`. v4.42 will let multiple of these be live
-    /// concurrently — for now dispatch still holds `engine.write()` over
-    /// the whole wrap, so the map carries one entry at a time.
+    /// in `tx_catalogs`. v4.42 — the commit-barrier leader allocates
+    /// one of these per task in its group, runs `BEGIN`+sql+`COMMIT`
+    /// sequentially under a single `engine.write()` so each task's
+    /// mutations accumulate into shared state, then either keeps the
+    /// accumulated state (fsync OK) or restores the pre-image via
+    /// `replace_catalog` (fsync err).
     pub fn alloc_tx_id(&mut self) -> TxId {
         let id = TxId(self.next_tx_id);
         self.next_tx_id = self.next_tx_id.saturating_add(1);
         id
+    }
+
+    /// v4.42 — atomically replace the live catalog. Used by the
+    /// commit-barrier leader to roll back a group whose batched
+    /// fsync failed: the leader snapshots `engine.catalog().clone()`
+    /// (O(1) Arc bump after the v4.39/v4.40 persistent migration)
+    /// at group start, sequentially applies each task's BEGIN+sql+
+    /// COMMIT under the same write lock to accumulate mutations
+    /// into shared state, batches the WAL bytes, fsyncs once, and
+    /// on failure calls this with the pre-image to undo every
+    /// task in the group at once.
+    ///
+    /// **Does NOT touch `tx_catalogs` / `current_tx`.** Any
+    /// explicit-TX slot from a concurrent client (created via the
+    /// legacy `IMPLICIT_TX`-less dispatch path or via the future
+    /// MVCC-readers v5+ work) has its own snapshot baked into the
+    /// slot — restoring `self.catalog` to the pre-image leaves
+    /// those slots untouched, exactly as they were when the leader
+    /// took the lock. The leader's own implicit-TX slots are all
+    /// already discarded (`exec_commit` removed them as each
+    /// task's COMMIT ran) by the time this is reached.
+    pub fn replace_catalog(&mut self, catalog: Catalog) {
+        self.catalog = catalog;
     }
 
     fn active_catalog(&self) -> &Catalog {

@@ -26,6 +26,7 @@ mod pgwire;
 mod replication;
 mod scram;
 
+use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -33,6 +34,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -59,6 +61,18 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 /// v4.33: default `SPG_SHUTDOWN_DEADLINE_SEC`. Mirrors systemd's
 /// `DefaultTimeoutStopSec` so operators don't surprise the supervisor.
 const DEFAULT_SHUTDOWN_DEADLINE_SEC: u64 = 30;
+/// v4.42: cap on tasks the commit-barrier leader pulls into one
+/// group before fsyncing. A single group is one batched
+/// `write_all` + one `sync_data` regardless of group size, so the
+/// bigger the group the better the fsync amortisation — but the
+/// per-group prepare (sequential `execute_in(sql, t)` under the
+/// engine write lock) is linear in group size, so an unbounded
+/// group would let a single bursty client starve readers behind
+/// `engine.write()`. 16 is the same heuristic PG's `commit_delay`
+/// uses as a sensible upper bound for default workloads; can be
+/// raised via `SPG_COMMIT_GROUP_MAX` for benchmark experiments
+/// where prepare-time is small (single-row INSERTs).
+const DEFAULT_COMMIT_GROUP_MAX: usize = 16;
 
 /// v4.33 graceful shutdown — flipped by the SIGTERM/SIGINT handler.
 /// The main accept loop polls this between non-blocking accepts so it
@@ -124,6 +138,47 @@ struct ChaosKnobs {
     disable_wal_preflight: bool,
 }
 
+/// v4.42 — outcome a `CommitTask` is acked with by the group leader.
+/// `result` is the engine-level outcome from the auto-commit wrap
+/// (prepare → `execute_in(sql)` → install via `execute_in("COMMIT", ...)`);
+/// `wal_outcome` is the leader's batched `write_all` + `sync_data`
+/// result, so each follower can keep the v4.41.1 "WAL append failed:
+/// ..." error shape on the wire. On `wal_outcome` Err the leader has
+/// already issued `execute_in("ROLLBACK", t)` for every survivor —
+/// the dispatch thread reads `wal_outcome` only to surface the error
+/// to the client.
+struct CommitResult {
+    result: Result<QueryResult, EngineError>,
+    wal_outcome: std::io::Result<()>,
+}
+
+/// v4.42 — one entry in the commit-barrier queue. The dispatch thread
+/// pushes `{ sql, cancel_flag, ack }` and waits on its `ack` channel;
+/// the elected leader drains the queue under `engine.write()`, runs
+/// each task's BEGIN+sql in its own `TxId` slot under that task's
+/// `cancel_flag` (so per-query watchdog timeouts still fire even
+/// when the SQL is being executed by another connection's leader
+/// loop), batches the WAL bytes, fsyncs once, then installs
+/// (COMMIT or ROLLBACK per `wal_outcome`) and fans out the
+/// `CommitResult` to every task's `ack`.
+struct CommitTask {
+    sql: String,
+    cancel_flag: Arc<AtomicBool>,
+    ack: SyncSender<CommitResult>,
+}
+
+/// v4.42 — shared commit-barrier state. The mutex serialises queue
+/// pushes against leader drains; `leader_active` is the latch that
+/// decides whether an arriving task drives the group itself (it
+/// becomes the leader) or just waits on its `ack` channel for a
+/// concurrent leader to ack it. Rolling drain: the leader loops
+/// until it observes `pending.is_empty()` under this mutex, then
+/// flips `leader_active` back to false and exits.
+struct CommitQueueState {
+    pending: VecDeque<CommitTask>,
+    leader_active: bool,
+}
+
 pub(crate) struct ServerState {
     /// v4.0: `RwLock` instead of `Mutex` so read-only statements
     /// (SELECT / SHOW outside an active TX) can run in parallel
@@ -137,6 +192,13 @@ pub(crate) struct ServerState {
     /// Kept so the path can be reported in error messages; runtime appends go
     /// through `wal` directly.
     wal_path: Option<PathBuf>,
+    /// v4.42: commit-barrier queue used by the auto-commit wrap path
+    /// (`Op::Query`, `needs_wrap` branch). Dispatch threads push a
+    /// `CommitTask` onto `pending` and wait on its `ack` channel;
+    /// the first arrival flips `leader_active = true` and drives
+    /// the group through `run_leader_commit_round`. Inert when
+    /// `wal` is `None` (the wrap path doesn't exist without WAL).
+    commit_queue: Mutex<CommitQueueState>,
     /// Optional single password — Redis/Valkey style. `Some` means the
     /// server demands `AUTH <password>` before any non-Ping frame; `None`
     /// means open access (the default).
@@ -357,6 +419,10 @@ fn run(
         audit_path,
         wal,
         wal_path,
+        commit_queue: Mutex::new(CommitQueueState {
+            pending: VecDeque::new(),
+            leader_active: false,
+        }),
         password,
         limits,
         active_connections: AtomicUsize::new(0),
@@ -934,95 +1000,80 @@ fn dispatch(
             }
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let watchdog = spawn_query_watchdog(state, &cancel_flag);
-            // Hold the engine write lock across the wrap so the
-            // sequence BEGIN → execute → WAL → COMMIT/ROLLBACK is
-            // serialized with other writers. Readers (read lock)
-            // are already blocked while we hold .write(), so the
-            // implicit tx_catalog is never observable.
-            let mut engine = state
-                .engine
-                .write()
-                .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-            // v4.41.1: scope each implicit wrap to its own TxId slot
-            // (engine MVCC mechanical refactor). v4.41.1 still holds
-            // engine.write() across the whole wrap so the map carries
-            // at most one entry at runtime — but the API is ready for
-            // v4.42 to split the critical section and let multiple
-            // implicit TXs prepare in parallel.
-            let wrap_tx_id = if needs_wrap {
-                Some(engine.alloc_tx_id())
-            } else {
-                None
-            };
-            if let Some(t) = wrap_tx_id
-                && let Err(e) = engine.execute_in("BEGIN", t)
-            {
-                drop(engine);
-                watchdog.cancel();
-                return write_frame(
-                    stream,
-                    &build_error_response(&format!("implicit BEGIN failed: {e}")),
-                );
-            }
-            let result = if let Some(t) = wrap_tx_id {
-                engine.execute_in_with_cancel(
-                    &sql,
-                    t,
-                    spg_engine::CancelToken::from_flag(&cancel_flag),
-                )
-            } else {
-                engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag))
-            };
-            let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
-            // v4.34: WAL append happens *under the engine lock* now
-            // so the BEGIN..COMMIT atomicity holds without another
-            // writer slipping in. Cost: WAL fsync stretches the
-            // write critical section. The previous design dropped the
-            // lock before WAL — but we couldn't roll the implicit TX
-            // back without re-locking, and re-locking re-opens the
-            // race where in-memory state diverges.
-            let wal_result = if was_command_ok && state.wal.is_some() {
-                if needs_wrap {
-                    append_wal_v3_auto_commit(state, &sql)
-                } else {
-                    append_wal(state, &sql)
-                }
-            } else {
-                Ok(())
-            };
-            if let Some(t) = wrap_tx_id {
-                let outcome_sql = if was_command_ok && wal_result.is_ok() {
-                    "COMMIT"
-                } else {
-                    "ROLLBACK"
+            // v4.42 — split the wrap path from the non-wrap path.
+            //
+            // **Wrap path** (auto-commit write, WAL on): push the
+            // SQL onto the commit-barrier queue and wait on the
+            // task's `ack` channel. The first arriving task flips
+            // `leader_active` and drives `run_leader_commit_round`
+            // (drain → batched fsync → install/rollback), then
+            // acks every task in the group. Group of 1 = the
+            // pusher is itself the leader and proceeds without
+            // any condvar wait — same latency shape as v4.41.1.
+            //
+            // **Non-wrap path** (TX-control verbs or writes
+            // inside an explicit client TX): keep the v4.41.1
+            // synchronous flow. These don't fan out, so the
+            // commit barrier would only add coordination cost.
+            // The legacy v2 WAL framing is the right format here
+            // (auto-commit framing assumes there's no client TX
+            // in flight, which this branch contradicts).
+            let (result, wal_result, snapshot) = if needs_wrap {
+                let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
+                let task = CommitTask {
+                    sql: sql.clone(),
+                    cancel_flag: Arc::clone(&cancel_flag),
+                    ack: ack_tx,
                 };
-                if let Err(e) = engine.execute_in(outcome_sql, t) {
-                    drop(engine);
-                    watchdog.cancel();
-                    return write_frame(
-                        stream,
-                        &build_error_response(&format!("implicit {outcome_sql} failed: {e}")),
-                    );
+                let became_leader = enqueue_commit_task(state, task);
+                if became_leader {
+                    run_leader_commit_round(state);
                 }
-            }
-            // v4.0: sync per-conn TX state from the engine.
-            *in_tx = engine.in_transaction();
-            // Snapshot only when the committed catalog actually changed
-            // and WAL is off (snapshot replaces WAL as the durability
-            // surface in that mode). With WAL on, the implicit COMMIT
-            // is already captured in the WAL block above.
-            let snapshot = if state.db_path.is_some() && state.wal.is_none() {
-                match &result {
-                    Ok(QueryResult::CommandOk {
-                        modified_catalog: true,
-                        ..
-                    }) => Some(engine.snapshot()),
-                    _ => None,
-                }
+                let CommitResult {
+                    result,
+                    wal_outcome,
+                } = ack_rx.recv().map_err(|_| {
+                    std::io::Error::other(
+                        "commit barrier: ack channel closed before result arrived",
+                    )
+                })?;
+                // Wrap path always has WAL on (see `needs_wrap`
+                // gate above), so the wal-off snapshot branch is
+                // unreachable here. Auto-commit wraps never leave
+                // a TX open, so `*in_tx` would already be false —
+                // sync it explicitly anyway against the engine
+                // state so a hypothetical engine-internal
+                // mismatch can't drift.
+                *in_tx = state.engine.read().is_ok_and(|e| e.in_transaction());
+                (result, wal_outcome, None)
             } else {
-                None
+                let mut engine = state
+                    .engine
+                    .write()
+                    .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+                let result = engine
+                    .execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
+                let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
+                let wal_result = if was_command_ok && state.wal.is_some() {
+                    append_wal(state, &sql)
+                } else {
+                    Ok(())
+                };
+                *in_tx = engine.in_transaction();
+                let snapshot = if state.db_path.is_some() && state.wal.is_none() {
+                    match &result {
+                        Ok(QueryResult::CommandOk {
+                            modified_catalog: true,
+                            ..
+                        }) => Some(engine.snapshot()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                drop(engine);
+                (result, wal_result, snapshot)
             };
-            drop(engine);
             watchdog.cancel();
             // Snapshot the catalog first; an audit entry that survives a
             // partial flush would be inconsistent.
@@ -1291,32 +1342,40 @@ fn wal_v3_auto_commit_size(sql: &str) -> u64 {
     9u64 + sql.len() as u64
 }
 
-/// v4.41 auto-commit wrap, v3 single-record path. Replaces the
-/// v4.34 three-v2-record `[BEGIN, sql, COMMIT]` block with one v3
-/// `type=auto_commit_sql` record. Replay reads the type byte,
-/// runs `engine.execute(sql)` exactly once, and the engine's own
-/// implicit auto-commit moves the catalog forward — semantically
-/// equivalent to BEGIN..stmt..COMMIT at write time, with the
-/// header overhead reduced from 35 bytes (8+5 BEGIN, 8+sql+8+6
-/// COMMIT) to 9 bytes (4+4+1 v3 header) per auto-commit write.
-/// Single `write_all` + single `fsync` — same atomicity story as
-/// the v4.34 block.
-fn append_wal_v3_auto_commit(state: &ServerState, sql: &str) -> std::io::Result<()> {
+/// v4.42 — concatenate already-framed v3 records for a group of
+/// auto-commit writes and append them in **one** `write_all` +
+/// **one** `sync_data`. The leader calls this between the prepare
+/// and install phases of `run_leader_commit_round` so all writers
+/// in the group share a single fsync. `entries` is the framed
+/// payload sequence (each item is what `encode_wal_v3_record`
+/// produced for one task's SQL). Quota / disk-water-mark checks
+/// happen once for the whole batch, so a leader either commits
+/// the whole group or rolls back every member — same fan-out
+/// invariant `chaos_disk_full_multi_client_group_rollback_all_writers`
+/// pins.
+fn append_wal_v3_group(state: &ServerState, entries: &[Vec<u8>]) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
-    let entry = encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes())?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let total: usize = entries.iter().map(Vec::len).sum();
+    let mut batched = Vec::with_capacity(total);
+    for e in entries {
+        batched.extend_from_slice(e);
+    }
     let mut f = wal
         .lock()
         .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
     if let Some(quota) = state.chaos.wal_quota_bytes {
         let current = f.metadata().map_or(0, |m| m.len());
-        if current.saturating_add(entry.len() as u64) > quota {
+        if current.saturating_add(batched.len() as u64) > quota {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
                     "wal quota exceeded: cur={current} + {} > quota={quota} (SPG_FAIL_WAL_QUOTA_BYTES)",
-                    entry.len()
+                    batched.len()
                 ),
             ));
         }
@@ -1334,9 +1393,318 @@ fn append_wal_v3_auto_commit(state: &ServerState, sql: &str) -> std::io::Result<
             ));
         }
     }
-    f.write_all(&entry)?;
+    f.write_all(&batched)?;
     f.sync_data()?;
     Ok(())
+}
+
+/// v4.42 — `io::Error` is intentionally not `Clone` (the OS error
+/// inside it isn't reproducible by value-copy alone), but the
+/// commit-barrier leader has to fan one fsync outcome out to N
+/// `CommitTask::ack` channels. Reconstruct with the same
+/// `ErrorKind` and the original `Display` representation. The
+/// chaos test asserts the *kind* is `StorageFull` (so quota-
+/// exceeded fan-out is recognisable as ENOSPC by every writer),
+/// which this preserves.
+fn clone_io_err(e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), e.to_string())
+}
+
+/// v4.42 — read `SPG_COMMIT_GROUP_MAX` at queue-pull time so the
+/// bench knob can change between connections without a restart.
+/// Unset / unparseable / zero → fall back to
+/// `DEFAULT_COMMIT_GROUP_MAX`.
+fn commit_group_max() -> usize {
+    parse_env_usize("SPG_COMMIT_GROUP_MAX").unwrap_or(DEFAULT_COMMIT_GROUP_MAX)
+}
+
+/// v4.42 — micro-spin window the leader gives concurrent writers
+/// to populate the queue before forming a group. Read fresh from
+/// the env on every leader iteration so a benchmark can flip it
+/// without a server restart. Mirrors PG's `commit_delay`: zero
+/// means "ship what's already queued" (the honest single-client
+/// default — group of 1 always, no latency tax), positive N means
+/// "spin-wait up to N µs for the queue to fill toward
+/// `SPG_COMMIT_GROUP_MAX`". The sweep + multi-client SLO smoke
+/// set this to ~200 µs because on macOS APFS a single fsync is
+/// ~milliseconds — a 200 µs spin is well under that cost and
+/// pays for itself by letting 4-16 writers share one fsync.
+fn commit_delay_us() -> u64 {
+    parse_env_u64("SPG_COMMIT_DELAY_US").unwrap_or(0)
+}
+
+/// v4.42 — push a `CommitTask` onto the commit-barrier queue and
+/// decide whether the caller becomes the leader. Returns `true`
+/// iff the latching `leader_active` flag flipped from `false` to
+/// `true` on this push (= caller is now responsible for driving
+/// `run_leader_commit_round`). Returns `false` if another writer
+/// is already leading; the caller then waits on its `ack` channel
+/// for that leader to commit (or roll back) its task.
+fn enqueue_commit_task(state: &ServerState, task: CommitTask) -> bool {
+    let mut q = state
+        .commit_queue
+        .lock()
+        .expect("commit queue mutex poisoned");
+    q.pending.push_back(task);
+    if q.leader_active {
+        false
+    } else {
+        q.leader_active = true;
+        true
+    }
+}
+
+/// v4.42 — leader loop. Runs while `leader_active` is true and
+/// pulls one *group* per iteration (up to `commit_group_max()`
+/// tasks). Each iteration runs the classic group commit shape,
+/// but **sequentially** under one engine write lock so per-task
+/// mutations accumulate into shared catalog state (the previous
+/// two-phase prepare/install design lost rows: each task's BEGIN
+/// cloned the *same* pre-group catalog into its slot, so when
+/// COMMIT moved each slot's catalog over `self.catalog` only the
+/// last task's slot survived).
+///
+/// 1. **Snapshot pre-image** — `engine.catalog().clone()`. After
+///    the v4.39/v4.40 persistent migration this is an O(1)
+///    Arc bump, so the pre-image carries no per-row cost.
+///
+/// 2. **Sequential prepare + in-memory commit** — for each task:
+///    `alloc_tx_id` → `BEGIN` → `execute_in(sql)` → encode v3
+///    WAL bytes → `COMMIT` (merges the slot's catalog over
+///    `self.catalog`, so the next task's BEGIN sees this task's
+///    row). Tasks that fail any step are `ROLLBACK`-ed in
+///    isolation and acked with their own error; surviving tasks
+///    collect into a `prepared` list keyed by `wal_bytes`.
+///    Engine lock released.
+///
+/// 3. **Batched fsync barrier** — concat survivors' framed v3
+///    bytes; one `write_all` + one `sync_data` under the WAL
+///    mutex (`append_wal_v3_group`). Quota / disk-water-mark
+///    checks happen once for the whole batch — if the batch
+///    doesn't fit, every survivor in the group is rolled back
+///    together (the multi-client ENOSPC fan-out invariant
+///    `chaos_disk_full_multi_client_group_rollback_all_writers`
+///    pins).
+///
+/// 4. **Fsync-fail rollback** — if fsync returned `Err`,
+///    re-acquire `engine.write()` and `replace_catalog(pre_image)`
+///    to undo every in-memory commit from step 2 at once. Ack
+///    each survivor with `{ Ok(exec_result), Err(wal_outcome) }`
+///    so dispatch's WAL-error short-circuit reports the failure
+///    to the client (and the in-memory state matches the durable
+///    state — no phantom rows survive).
+///
+/// 5. **Ack survivors** — every prepared task is acked here
+///    whether fsync succeeded or failed; the dispatch thread's
+///    `recv` is the durability contract.
+///
+/// Rolling drain: after step 5 (or whenever the queue is empty),
+/// re-check `state.commit_queue.pending` under the mutex; if
+/// new tasks arrived during fsync, loop and form the next group;
+/// if not, flip `leader_active = false` and return.
+///
+/// The function naturally runs >100 lines because group commit's
+/// five stages (drain → prepare/in-memory-commit → batched fsync
+/// → rollback-on-fail → ack) all touch shared state under the
+/// same engine write lock and the same loop iteration; splitting
+/// them into helpers would only scatter the control flow.
+#[allow(clippy::too_many_lines)]
+fn run_leader_commit_round(state: &ServerState) {
+    // Per-task scratch carried through the leader's pipeline:
+    // declared at module-scope shape so clippy doesn't trip on
+    // items-after-statements inside the loop body.
+    struct Prepared {
+        task: CommitTask,
+        result: QueryResult,
+        wal_bytes: Vec<u8>,
+    }
+    let group_max = commit_group_max();
+    let delay_us = commit_delay_us();
+    loop {
+        // ----- 1. Pull one group under the queue lock -----
+        //
+        // First check non-blocking. If pending is already full or
+        // delay_us = 0 (honest single-client default), batch what's
+        // there and run the group immediately — group of 1 in the
+        // common single-client case, exactly matches the v4.41.1
+        // latency shape with no extra wait.
+        //
+        // If pending is short and delay_us > 0, spin-yield up to
+        // `delay_us` microseconds for concurrent writers to push
+        // more tasks. Spinning (not sleeping) keeps the wakeup
+        // latency sub-microsecond — critical on macOS APFS where
+        // a single fsync is multiple milliseconds: a 200 µs spin
+        // is cheap insurance to coalesce 4-16 writers into one
+        // fsync.
+        let group: Vec<CommitTask> = {
+            let mut q = state
+                .commit_queue
+                .lock()
+                .expect("commit queue mutex poisoned");
+            if delay_us > 0 && q.pending.len() < group_max {
+                let deadline = Instant::now() + Duration::from_micros(delay_us);
+                while q.pending.len() < group_max && Instant::now() < deadline {
+                    drop(q);
+                    thread::yield_now();
+                    q = state
+                        .commit_queue
+                        .lock()
+                        .expect("commit queue mutex poisoned");
+                }
+            }
+            if q.pending.is_empty() {
+                // No more work: drop the leader baton inside the
+                // critical section so the next push can claim it
+                // atomically.
+                q.leader_active = false;
+                return;
+            }
+            let take = q.pending.len().min(group_max);
+            q.pending.drain(..take).collect()
+        };
+
+        // ----- 2. Sequential prepare + in-memory commit -----
+        // Tracks every task that successfully made it through
+        // `BEGIN` + sql + `COMMIT` (mutation already merged into
+        // `engine.catalog`). Their WAL bytes are concatenated and
+        // batched-fsync'd in step 3.
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(group.len());
+        let pre_image: Option<spg_storage::Catalog> = {
+            let Ok(mut engine) = state.engine.write() else {
+                // Engine lock poisoned — fatal, server can't make
+                // progress. Drop the group (auto-closes every
+                // task's ack channel; dispatch threads see
+                // `RecvError` and surface a clean io error to
+                // their clients) and release the leader baton so
+                // future arrivals don't deadlock waiting for a
+                // dead leader.
+                drop(group);
+                if let Ok(mut q) = state.commit_queue.lock() {
+                    q.leader_active = false;
+                }
+                return;
+            };
+            // O(1) Arc-bump clone (v4.39/v4.40 persistent
+            // backing). Stays cheap regardless of row count.
+            let pre = engine.catalog().clone();
+            for task in group {
+                let tx_id = engine.alloc_tx_id();
+                if let Err(e) = engine.execute_in("BEGIN", tx_id) {
+                    let _ = task.ack.send(CommitResult {
+                        result: Err(e),
+                        wal_outcome: Ok(()),
+                    });
+                    continue;
+                }
+                let exec_res = engine.execute_in_with_cancel(
+                    &task.sql,
+                    tx_id,
+                    spg_engine::CancelToken::from_flag(&task.cancel_flag),
+                );
+                let was_command_ok = matches!(exec_res, Ok(QueryResult::CommandOk { .. }));
+                if !was_command_ok {
+                    // SQL itself failed (parse / type / cancel) —
+                    // discard the slot via ROLLBACK in isolation
+                    // so other tasks in the group aren't affected,
+                    // ack with the engine error.
+                    let _ = engine.execute_in("ROLLBACK", tx_id);
+                    let _ = task.ack.send(CommitResult {
+                        result: exec_res,
+                        wal_outcome: Ok(()),
+                    });
+                    continue;
+                }
+                // Encode v3 framed bytes. Encoding-time failures
+                // (payload > 1 GiB) abort just this task's slot,
+                // not the group.
+                let wal_bytes =
+                    match encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, task.sql.as_bytes()) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = engine.execute_in("ROLLBACK", tx_id);
+                            let _ = task.ack.send(CommitResult {
+                                result: exec_res,
+                                wal_outcome: Err(e),
+                            });
+                            continue;
+                        }
+                    };
+                // In-memory COMMIT — merges this slot's catalog
+                // over `engine.catalog`. The next task's BEGIN
+                // (above) clones *this* catalog, so per-task
+                // mutations accumulate. If COMMIT itself fails
+                // (rare — would mean `NoActiveTransaction`,
+                // which it isn't since we just BEGIN'd) ROLLBACK
+                // the slot and ack the task with the engine
+                // error; carry on with the rest of the group.
+                if let Err(e) = engine.execute_in("COMMIT", tx_id) {
+                    let _ = engine.execute_in("ROLLBACK", tx_id);
+                    let _ = task.ack.send(CommitResult {
+                        result: Err(e),
+                        wal_outcome: Ok(()),
+                    });
+                    continue;
+                }
+                prepared.push(Prepared {
+                    task,
+                    result: exec_res.unwrap(),
+                    wal_bytes,
+                });
+            }
+            // Hand back the pre-image only if we actually
+            // mutated state; that's the only case where a fsync
+            // failure would need to roll back.
+            if prepared.is_empty() { None } else { Some(pre) }
+        }; // engine write lock released here
+
+        if prepared.is_empty() {
+            // Whole group failed prepare; nothing to fsync, no
+            // rollback needed. Loop to pull the next group.
+            continue;
+        }
+
+        // ----- 3. Batched fsync barrier -----
+        let entries: Vec<Vec<u8>> = prepared.iter().map(|p| p.wal_bytes.clone()).collect();
+        let wal_outcome: std::io::Result<()> = append_wal_v3_group(state, &entries);
+
+        // ----- 4. Fsync-fail rollback -----
+        if wal_outcome.is_err()
+            && let Some(pre) = pre_image
+        {
+            if let Ok(mut engine) = state.engine.write() {
+                engine.replace_catalog(pre);
+            } else {
+                // Poisoned mid-rollback: every survivor's ack
+                // channel will surface the WAL error anyway, but
+                // the catalog now diverges from the durable WAL.
+                // Leader can't fix that; bail and let the next
+                // bootup's WAL replay reconverge.
+                drop(prepared);
+                if let Ok(mut q) = state.commit_queue.lock() {
+                    q.leader_active = false;
+                }
+                return;
+            }
+        }
+
+        // ----- 5. Ack survivors -----
+        // Dispatch checks `wal_outcome` first (the v4.41.1
+        // "WAL append failed: ..." error shape lives in that
+        // branch), so even when the in-memory exec succeeded but
+        // fsync failed, the client sees the WAL error and
+        // recovers to a state consistent with the durable WAL.
+        for p in prepared {
+            let cloned_wal = match &wal_outcome {
+                Ok(()) => Ok(()),
+                Err(e) => Err(clone_io_err(e)),
+            };
+            let _ = p.task.ack.send(CommitResult {
+                result: Ok(p.result),
+                wal_outcome: cloned_wal,
+            });
+        }
+        // loop back to pull the next group (rolling drain).
+    }
 }
 
 fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
