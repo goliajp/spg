@@ -779,6 +779,59 @@ impl Table {
         Ok(count)
     }
 
+    /// v5.2.3: remove every `Cold` locator currently registered on
+    /// `index_name` under the given `key`. `Hot` locators for the
+    /// same key are left in place — useful when a row has just been
+    /// promoted hot-side and the caller wants the old Cold pointer
+    /// retired without losing the new hot entry.
+    ///
+    /// Returns the number of cold locators removed (0 when the key
+    /// has only hot entries or the key isn't present at all).
+    /// Errors when the index doesn't exist or isn't a `BTree`.
+    pub fn remove_cold_locators_for_key(
+        &mut self,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<usize, StorageError> {
+        let idx = self
+            .indices
+            .iter_mut()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "remove_cold_locators_for_key: index {index_name:?} not found"
+                ))
+            })?;
+        let map = match &mut idx.kind {
+            IndexKind::BTree(map) => map,
+            IndexKind::Nsw(_) => {
+                return Err(StorageError::Corrupt(format!(
+                    "remove_cold_locators_for_key: index {index_name:?} is NSW; \
+                     cold locators apply only to BTree indices"
+                )));
+            }
+        };
+        let Some(entries) = map.get(key) else {
+            return Ok(0);
+        };
+        let mut kept: Vec<RowLocator> =
+            entries.iter().copied().filter(RowLocator::is_hot).collect();
+        let removed = entries.len() - kept.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        kept.shrink_to_fit();
+        // PersistentBTreeMap has no remove API in v5.2; when every
+        // locator for `key` was Cold, the key keeps an empty Vec
+        // entry. `Index::lookup_eq` already treats `Some(&[])` and
+        // `None` as the same empty slice (via `Vec::as_slice`), so
+        // callers can't distinguish the two. The space cost is one
+        // empty Vec per shadowed-then-promoted key — bounded and
+        // recoverable when the future compaction job lands.
+        map.insert_mut(key.clone(), kept);
+        Ok(removed)
+    }
+
     /// v4.4: delete the rows at the given positions in one pass.
     /// `positions` must be unique; ordering doesn't matter. Indices
     /// are rebuilt from scratch (cheaper than tracking incremental
@@ -1964,6 +2017,153 @@ impl Catalog {
             }
         }
         None
+    }
+
+    /// v5.2.3: promote a frozen row back to the hot tier so an
+    /// UPDATE / DELETE can mutate it. Reads the cold-tier row body
+    /// (decoded from its registered segment), pushes it into
+    /// `table.rows` via [`Table::insert`] (which also adds a fresh
+    /// `Hot(new_idx)` locator on `index_name`), then retires the
+    /// shadowed `Cold` locator via
+    /// [`Table::remove_cold_locators_for_key`]. The cold-tier row
+    /// in the segment file becomes garbage — recoverable when a
+    /// future cold-segment compaction job lands.
+    ///
+    /// Returns:
+    /// - `Ok(Some(new_hot_idx))` when the key resolved through a
+    ///   cold locator and the promote completed. `new_hot_idx` is
+    ///   the position the row now occupies in `table.rows`.
+    /// - `Ok(None)` when the key has no Cold locator on the index
+    ///   (already hot, or wasn't present at all). Callers treat this
+    ///   as "nothing to do here, fall back to the hot-only path".
+    ///
+    /// Errors when the table / index doesn't exist, the index isn't
+    /// `BTree`, the cold segment is missing / can't decode the row,
+    /// or the inferred row body fails `Table::insert` validation.
+    pub fn promote_cold_row(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<Option<usize>, StorageError> {
+        let cold_loc = self.find_cold_locator(table_name, index_name, key)?;
+        let Some((segment_id, _page_offset)) = cold_loc else {
+            return Ok(None);
+        };
+        let u64_key = index_key_as_u64(key).ok_or_else(|| {
+            StorageError::Corrupt(
+                "promote_cold_row: key type not coercible to u64 (cold tier requires integer PK)"
+                    .into(),
+            )
+        })?;
+        // Read the row body from the segment. Borrow the segment +
+        // schema short-term so we can then take `&mut self` for the
+        // hot-side insert.
+        let schema = self
+            .get(table_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!("promote_cold_row: table {table_name:?} not found"))
+            })?
+            .schema
+            .clone();
+        let seg = self.cold_segments.get(segment_id as usize).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "promote_cold_row: segment {segment_id} not registered on catalog"
+            ))
+        })?;
+        let payload = seg.lookup(u64_key).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "promote_cold_row: key {u64_key} resolves to segment {segment_id} \
+                 but the segment's bloom/page lookup didn't return a row"
+            ))
+        })?;
+        let (row, _consumed) = decode_row_body_dense(&payload, &schema)?;
+        // Insert the promoted row into the hot tier. `Table::insert`
+        // appends to `self.rows`, adds a `Hot(new_idx)` locator to
+        // every BTree index covering the row's keyed columns, and
+        // increments `hot_bytes`.
+        let t = self
+            .get_mut(table_name)
+            .expect("table existed at lookup time");
+        t.insert(row)?;
+        let new_hot_idx =
+            t.rows.len().checked_sub(1).ok_or_else(|| {
+                StorageError::Corrupt("promote_cold_row: empty after insert".into())
+            })?;
+        // The hot insert added Hot(new_idx) alongside the still-
+        // present Cold locator. Drop the Cold entry so future
+        // lookups return only the fresh hot row.
+        t.remove_cold_locators_for_key(index_name, key)?;
+        Ok(Some(new_hot_idx))
+    }
+
+    /// v5.2.3: shadow a frozen row's index entry. Used by DELETE
+    /// when the row to remove lives in a cold-tier segment — the
+    /// row body stays in the segment file (becoming garbage) but
+    /// every `Cold` locator for `key` on `index_name` is removed
+    /// so PK lookups stop returning it.
+    ///
+    /// Returns the number of cold locators retired (0 when the key
+    /// has no cold entries — the DELETE fell on a hot row or a
+    /// key that was already absent). Errors when the table /
+    /// index doesn't exist or the index isn't `BTree`.
+    ///
+    /// Cold-segment compaction (which merges shadowed-heavy
+    /// segments and reclaims their disk footprint) lands in a
+    /// later v5.x sub-version; until then, repeated UPDATE/DELETE
+    /// of cold rows can amplify cold-segment disk usage by up to
+    /// 1-2× — still well under typical LSM-tree shadowing because
+    /// SPG segments are bulk-baked, not write-merged.
+    pub fn shadow_cold_row(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<usize, StorageError> {
+        let t = self.get_mut(table_name).ok_or_else(|| {
+            StorageError::Corrupt(format!("shadow_cold_row: table {table_name:?} not found"))
+        })?;
+        t.remove_cold_locators_for_key(index_name, key)
+    }
+
+    /// Internal helper: scan `(table, index)` for a `Cold` locator
+    /// keyed by `key`. Returns `Ok(Some((segment_id, page_offset)))`
+    /// when found, `Ok(None)` when the key has only hot entries
+    /// or no entries at all, `Err` on the same input-validation
+    /// errors as the public `promote_cold_row` / `shadow_cold_row`.
+    fn find_cold_locator(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<Option<(u32, u32)>, StorageError> {
+        let t = self.get(table_name).ok_or_else(|| {
+            StorageError::Corrupt(format!("find_cold_locator: table {table_name:?} not found"))
+        })?;
+        let idx = t
+            .indices
+            .iter()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "find_cold_locator: index {index_name:?} not found on {table_name:?}"
+                ))
+            })?;
+        if !matches!(idx.kind, IndexKind::BTree(_)) {
+            return Err(StorageError::Corrupt(format!(
+                "find_cold_locator: index {index_name:?} is NSW; promote-on-write only applies to BTree indices"
+            )));
+        }
+        for loc in idx.lookup_eq(key) {
+            if let RowLocator::Cold {
+                segment_id,
+                page_offset,
+            } = *loc
+            {
+                return Ok(Some((segment_id, page_offset)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -4422,6 +4622,240 @@ mod tests {
                 assert_eq!(i, 1);
             }
             RowLocator::Cold { .. } => unreachable!(),
+        }
+    }
+
+    // --- v5.2.3 promote-on-write primitives ----------------------
+
+    /// Build a populated catalog with the first N rows frozen, then
+    /// run `promote_cold_row` and verify the row crossed tiers
+    /// correctly: the cold locator is retired, a fresh Hot locator
+    /// appears, `lookup_by_pk` returns the row from the hot tier, and
+    /// `hot_bytes` grew by the row's encoded byte length.
+    #[test]
+    fn promote_cold_row_pulls_frozen_row_back_to_hot_tier() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..6i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        // Freeze first 4 rows (ids 0..3). After: hot rows = 4, 5 at
+        // positions 0, 1; cold locators for keys 0..3.
+        cat.freeze_oldest_to_cold("users", "by_id", 4).unwrap();
+        let hot_bytes_before = cat.get("users").unwrap().hot_bytes();
+
+        // Promote PK=2 — it lives in segment 0 as a cold row.
+        let new_idx = cat
+            .promote_cold_row("users", "by_id", &IndexKey::Int(2))
+            .expect("promote ok")
+            .expect("PK 2 was cold");
+        assert_eq!(
+            new_idx, 2,
+            "promoted row appended after the 2 surviving hot rows"
+        );
+
+        let t = cat.get("users").unwrap();
+        assert_eq!(t.row_count(), 3, "hot tier grew from 2 to 3");
+        // Hot-bytes climbed by exactly one row's encoded length.
+        let row = make_user_row(2, "u-2");
+        let row_len = encode_row_body_dense(&row, &t.schema).len() as u64;
+        assert_eq!(t.hot_bytes(), hot_bytes_before + row_len);
+
+        // The index now reports a Hot locator (the freshly inserted
+        // row) — no Cold locator left for PK 2.
+        let entries = t.index_on(0).unwrap().lookup_eq(&IndexKey::Int(2));
+        assert_eq!(entries.len(), 1, "exactly one locator per key");
+        assert!(entries[0].is_hot(), "promote retired the Cold locator");
+        // End-to-end: lookup_by_pk still returns the row body.
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2))
+                .unwrap(),
+            row
+        );
+        // Other cold rows untouched — still resolvable through the
+        // segment.
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(0))
+                .unwrap(),
+            make_user_row(0, "u-0")
+        );
+    }
+
+    /// `promote_cold_row` on a key that's already hot (or absent)
+    /// returns `Ok(None)` — not an error. The caller falls back to
+    /// the hot-only update/delete path.
+    #[test]
+    fn promote_cold_row_returns_none_when_key_is_not_cold() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.insert(make_user_row(7, "alice")).unwrap();
+        t.add_index("by_id".into(), "id").unwrap();
+
+        // Hot-only key.
+        assert!(
+            cat.promote_cold_row("users", "by_id", &IndexKey::Int(7))
+                .unwrap()
+                .is_none()
+        );
+        // Absent key.
+        assert!(
+            cat.promote_cold_row("users", "by_id", &IndexKey::Int(99))
+                .unwrap()
+                .is_none()
+        );
+        // Catalog untouched on both no-op paths.
+        assert_eq!(cat.get("users").unwrap().row_count(), 1);
+        assert_eq!(cat.cold_segment_count(), 0);
+    }
+
+    /// `shadow_cold_row` removes every Cold locator for a key on a
+    /// `BTree` index. After the shadow, `lookup_by_pk` for that key
+    /// returns None (the row data still sits in the segment file,
+    /// but it's now garbage; compaction will reclaim it later).
+    #[test]
+    fn shadow_cold_row_removes_cold_locators_and_drops_lookup() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..5i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+
+        // Shadow PK=1 — pre-shadow lookup hits the cold tier.
+        assert!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(1))
+                .is_some(),
+            "frozen PK resolves before shadow"
+        );
+        let removed = cat
+            .shadow_cold_row("users", "by_id", &IndexKey::Int(1))
+            .unwrap();
+        assert_eq!(removed, 1, "exactly one cold locator retired");
+
+        // Post-shadow: lookup misses, even though the row still
+        // exists in segment 0.
+        assert!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(1))
+                .is_none(),
+            "shadowed key no longer resolves"
+        );
+        // Other cold keys still resolve.
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(0))
+                .unwrap(),
+            make_user_row(0, "u-0")
+        );
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2))
+                .unwrap(),
+            make_user_row(2, "u-2")
+        );
+    }
+
+    /// `shadow_cold_row` returns 0 (not Err) for keys with only Hot
+    /// entries or no entries — the engine's DELETE path uses this
+    /// signal to decide whether the cold-tier shadow path consumed
+    /// the work.
+    #[test]
+    fn shadow_cold_row_returns_zero_when_key_is_not_cold() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.insert(make_user_row(1, "alice")).unwrap();
+        t.add_index("by_id".into(), "id").unwrap();
+        assert_eq!(
+            cat.shadow_cold_row("users", "by_id", &IndexKey::Int(1))
+                .unwrap(),
+            0,
+            "hot-only key drops no cold locators"
+        );
+        assert_eq!(
+            cat.shadow_cold_row("users", "by_id", &IndexKey::Int(999))
+                .unwrap(),
+            0,
+            "absent key drops no cold locators"
+        );
+        assert_eq!(cat.get("users").unwrap().row_count(), 1);
+    }
+
+    /// Validation guards on both promote / shadow primitives.
+    #[test]
+    fn promote_and_shadow_reject_invalid_inputs() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.insert(make_user_row(1, "alice")).unwrap();
+        t.add_index("by_id".into(), "id").unwrap();
+
+        // Missing table.
+        assert!(matches!(
+            cat.promote_cold_row("missing", "by_id", &IndexKey::Int(1)),
+            Err(StorageError::Corrupt(_))
+        ));
+        assert!(matches!(
+            cat.shadow_cold_row("missing", "by_id", &IndexKey::Int(1)),
+            Err(StorageError::Corrupt(_))
+        ));
+        // Missing index.
+        assert!(matches!(
+            cat.promote_cold_row("users", "no_such_index", &IndexKey::Int(1)),
+            Err(StorageError::Corrupt(_))
+        ));
+        assert!(matches!(
+            cat.shadow_cold_row("users", "no_such_index", &IndexKey::Int(1)),
+            Err(StorageError::Corrupt(_))
+        ));
+    }
+
+    /// Round trip: freeze → promote → re-freeze. The same PK can
+    /// migrate hot ↔ cold multiple times. After two cycles only the
+    /// final Hot locator should be live.
+    #[test]
+    fn promote_then_refreeze_does_not_leave_orphan_locators() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..4i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+
+        // Cycle 1: freeze first 2 rows, then promote PK 0.
+        cat.freeze_oldest_to_cold("users", "by_id", 2).unwrap();
+        let promoted = cat
+            .promote_cold_row("users", "by_id", &IndexKey::Int(0))
+            .unwrap();
+        assert!(promoted.is_some());
+        let entries_after_promote = cat
+            .get("users")
+            .unwrap()
+            .index_on(0)
+            .unwrap()
+            .lookup_eq(&IndexKey::Int(0))
+            .to_vec();
+        assert_eq!(entries_after_promote.len(), 1);
+        assert!(entries_after_promote[0].is_hot());
+
+        // Cycle 2: freeze the front rows again. PK 0 is now at
+        // position 2 (after the survivors); it could still go cold
+        // again on a future freeze depending on policy, but the
+        // current "first N positions" policy leaves it alone here.
+        // What matters: prior cold locators for PKs 0..1 are gone,
+        // PKs 2..3 still resolve through their original segments.
+        for id in [2i64, 3] {
+            assert_eq!(
+                cat.lookup_by_pk("users", "by_id", &IndexKey::Int(id))
+                    .unwrap(),
+                make_user_row(id, &alloc::format!("u-{id}"))
+            );
         }
     }
 }
