@@ -55,6 +55,11 @@ const DEFAULT_TABLE_METRIC_TOPN: usize = 50;
 pub struct Metrics {
     pub queries_total: AtomicU64,
     pub errors_total: AtomicU64,
+    /// v5.2.2: number of cold-tier segments currently registered on
+    /// the engine catalog (sum across tables). Updated by the
+    /// freezer thread after each successful demotion. Exposed via
+    /// `spg_cold_segments_total`.
+    pub cold_segments: AtomicU64,
 }
 
 /// JSON-safe escape: replace `"`, `\\`, and control characters per
@@ -195,7 +200,23 @@ fn render_metrics(state: &crate::ServerState) -> String {
     render_table_metrics(state, &mut out);
     render_replication_lag(state, &mut out);
     render_hot_tier(state, &mut out);
+    render_cold_tier(state, &mut out);
     out
+}
+
+/// v5.2.2 — cold-tier segment count. Tracked separately from
+/// `render_table_metrics` because segments are catalog-global
+/// (`Catalog::cold_segments`), not per-table; a cardinality concern
+/// doesn't apply.
+fn render_cold_tier(state: &crate::ServerState, out: &mut String) {
+    out.push_str(
+        "# HELP spg_cold_segments_total Cold-tier segments registered on the engine catalog (v5.2.2)\n",
+    );
+    out.push_str("# TYPE spg_cold_segments_total gauge\n");
+    out.push_str(&format!(
+        "spg_cold_segments_total {}\n",
+        state.metrics.cold_segments.load(Ordering::Relaxed)
+    ));
 }
 
 /// v5.2.1 — hot-tier byte counters. `spg_hot_tier_bytes_used` is the
