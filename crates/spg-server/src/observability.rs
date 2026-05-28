@@ -5,6 +5,7 @@
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::doc_markdown,
     clippy::format_push_string,
@@ -72,6 +73,20 @@ pub struct Metrics {
     /// the WAL volume needs attention. Exposed via
     /// `spg_flusher_errors_total`.
     pub flusher_errors: AtomicU64,
+    /// v5.4.3: WAL byte offset confirmed durable by the most
+    /// recent `durability_checkpoint` marker the flusher
+    /// emitted. Updated by the flusher after `sync_data` returns
+    /// `Ok(())`; stays at 0 in sync-commit mode (the flusher
+    /// isn't spawned). Combined with the current WAL file length
+    /// at `/metrics` render time, derives `spg_durability_lag_bytes`.
+    pub last_durable_wal_offset: AtomicU64,
+    /// v5.4.3: wall-clock microseconds-since-epoch the most
+    /// recent successful flusher `sync_data` completed. Updated
+    /// alongside `last_durable_wal_offset`; 0 means "no flush
+    /// has happened in this process lifetime" (either sync mode
+    /// or the flusher hasn't ticked yet). Derives
+    /// `spg_durability_lag_seconds` at render time.
+    pub last_fsync_us: AtomicU64,
 }
 
 /// JSON-safe escape: replace `"`, `\\`, and control characters per
@@ -214,7 +229,64 @@ fn render_metrics(state: &crate::ServerState) -> String {
     render_hot_tier(state, &mut out);
     render_cold_tier(state, &mut out);
     render_flusher(state, &mut out);
+    render_durability_lag(state, &mut out);
     out
+}
+
+/// v5.4.3 — durability lag metrics. In sync-commit mode both
+/// series are reported as 0 (every write is fsynced before the
+/// client ack, so the lag is structurally bounded by one fsync
+/// latency — sub-millisecond — and not worth a per-write atomic
+/// store on the hot path). In async-commit mode the metrics are
+/// derived from `last_durable_wal_offset` + `last_fsync_us`,
+/// which the flusher thread updates after every successful
+/// `sync_data`. Operators can alert on `lag_bytes` growth to
+/// detect a stuck flusher even while `flusher_iterations_total`
+/// keeps counting (a tick that fails to grab the WAL mutex
+/// could spin without making forward progress; not the current
+/// behaviour but defended against by the metric).
+fn render_durability_lag(state: &crate::ServerState, out: &mut String) {
+    let (lag_bytes, lag_seconds) = if crate::synchronous_commit_disabled() {
+        compute_durability_lag(state)
+    } else {
+        (0u64, 0.0f64)
+    };
+    out.push_str(
+        "# HELP spg_durability_lag_bytes WAL bytes written but not yet covered by a durability_checkpoint marker (v5.4.3)\n",
+    );
+    out.push_str("# TYPE spg_durability_lag_bytes gauge\n");
+    out.push_str(&format!("spg_durability_lag_bytes {lag_bytes}\n"));
+    out.push_str(
+        "# HELP spg_durability_lag_seconds Seconds since the flusher's most recent successful sync_data (v5.4.3)\n",
+    );
+    out.push_str("# TYPE spg_durability_lag_seconds gauge\n");
+    out.push_str(&format!("spg_durability_lag_seconds {lag_seconds:.6}\n"));
+}
+
+fn compute_durability_lag(state: &crate::ServerState) -> (u64, f64) {
+    let durable_offset = state
+        .metrics
+        .last_durable_wal_offset
+        .load(Ordering::Relaxed);
+    let current_wal_len = state
+        .wal
+        .as_ref()
+        .and_then(|m| m.lock().ok())
+        .and_then(|f| f.metadata().ok())
+        .map_or(0, |md| md.len());
+    let lag_bytes = current_wal_len.saturating_sub(durable_offset);
+    let last_us = state.metrics.last_fsync_us.load(Ordering::Relaxed);
+    let lag_seconds = if last_us == 0 {
+        0.0
+    } else {
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_micros()).ok())
+            .unwrap_or(last_us);
+        (now_us.saturating_sub(last_us)) as f64 / 1_000_000.0
+    };
+    (lag_bytes, lag_seconds)
 }
 
 /// v5.4.1 — async-commit flusher counters. Always rendered (even

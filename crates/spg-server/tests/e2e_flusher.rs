@@ -70,11 +70,23 @@ fn http_get_body(addr: &str) -> String {
 }
 
 fn flusher_iterations(http: &str) -> u64 {
+    metric_u64(http, "spg_flusher_iterations_total")
+}
+
+fn metric_u64(http: &str, name: &str) -> u64 {
     let body = http_get_body(http);
     body.lines()
-        .find_map(|l| l.strip_prefix("spg_flusher_iterations_total "))
+        .find_map(|l| l.strip_prefix(name).and_then(|tail| tail.strip_prefix(' ')))
         .map(|s| s.trim().parse::<u64>().unwrap_or(0))
         .unwrap_or(0)
+}
+
+fn metric_f64(http: &str, name: &str) -> f64 {
+    let body = http_get_body(http);
+    body.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|tail| tail.strip_prefix(' ')))
+        .map(|s| s.trim().parse::<f64>().unwrap_or(0.0))
+        .unwrap_or(0.0)
 }
 
 struct ChildGuard(Child);
@@ -175,6 +187,79 @@ fn flusher_env_var_recognizes_off_false_zero() {
             "SPG_SYNCHRONOUS_COMMIT={val:?} must enable the flusher; got iterations={v}"
         );
     }
+}
+
+#[test]
+fn durability_lag_metrics_are_zero_in_sync_mode() {
+    // v5.4.3 — `spg_durability_lag_bytes` and
+    // `spg_durability_lag_seconds` must both report 0 in sync-
+    // commit mode (the default). The flusher isn't spawned;
+    // every write is fsynced before the client ack. Render-time
+    // logic short-circuits to 0 instead of leaking
+    // `last_durable_wal_offset = 0` against a growing WAL.
+    let native = pick_free_addr();
+    let http = pick_free_addr();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_spg-server"))
+            .arg(&native)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("SPG_HTTP_ADDR", &http)
+            .env_remove("SPG_PASSWORD")
+            .env_remove("SPG_ADMIN_PASSWORD")
+            .env_remove("SPG_SYNCHRONOUS_COMMIT")
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_listener(&native, &mut child.0);
+    thread::sleep(Duration::from_millis(100));
+    let lag_bytes = metric_u64(&http, "spg_durability_lag_bytes");
+    let lag_seconds = metric_f64(&http, "spg_durability_lag_seconds");
+    assert_eq!(lag_bytes, 0, "sync mode must report 0 lag bytes");
+    assert!(
+        lag_seconds == 0.0,
+        "sync mode must report 0 lag seconds, got {lag_seconds}"
+    );
+}
+
+#[test]
+fn durability_lag_seconds_bounded_in_async_mode() {
+    // v5.4.3 — under async-commit with a 1 ms cadence, the
+    // flusher's most recent `sync_data` is at most a few
+    // milliseconds old when `/metrics` is scraped. Allow 1 s of
+    // headroom for CI scheduler jitter; tighter than that risks
+    // flakes, looser than that defeats the gate's purpose.
+    let native = pick_free_addr();
+    let http = pick_free_addr();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_spg-server"))
+            .arg(&native)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("SPG_HTTP_ADDR", &http)
+            .env("SPG_SYNCHRONOUS_COMMIT", "off")
+            .env("SPG_FLUSHER_INTERVAL_US", "1000")
+            .env_remove("SPG_PASSWORD")
+            .env_remove("SPG_ADMIN_PASSWORD")
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_listener(&native, &mut child.0);
+    // Wait long enough for at least one flusher tick to land.
+    thread::sleep(Duration::from_millis(50));
+    let lag_seconds = metric_f64(&http, "spg_durability_lag_seconds");
+    assert!(
+        lag_seconds < 1.0,
+        "async-commit lag_seconds should be < 1 s under 1 ms cadence, got {lag_seconds}"
+    );
+    // Counter-positive sanity: the flusher must have run at
+    // least once, otherwise lag_seconds being small is
+    // misleading.
+    let iters = metric_u64(&http, "spg_flusher_iterations_total");
+    assert!(
+        iters >= 1,
+        "expected flusher to have ticked at least once before scrape, got {iters}"
+    );
 }
 
 #[test]
