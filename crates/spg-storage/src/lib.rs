@@ -1592,6 +1592,16 @@ impl Catalog {
         self.cold_segments.len()
     }
 
+    /// v5.1: borrow the cold segment at `segment_id`. Used by the
+    /// spg-server preload path to enumerate (key, locator) pairs
+    /// after loading a segment, so it can call
+    /// [`Table::register_cold_locators`] without re-parsing the
+    /// bytes.
+    #[must_use]
+    pub fn cold_segment(&self, segment_id: u32) -> Option<&OwnedSegment> {
+        self.cold_segments.get(segment_id as usize).map(AsRef::as_ref)
+    }
+
     /// v5.1: resolve a single `RowLocator::Cold` to its underlying
     /// `Row`. Decoupled from [`Catalog::lookup_by_pk`] so callers
     /// iterating a multi-locator slice (e.g. the engine's index
