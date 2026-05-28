@@ -489,3 +489,82 @@ fn checkpoint_rejects_non_admin_caller() {
         f.op
     );
 }
+
+// --- v5.3.3 boot-time gate (v5.3 → v5.4 trigger half) -------------
+
+/// v5.3 → v5.4 trigger half 1: 100M INSERT loop completes; after
+/// CHECKPOINT, the server restarts in ≤ 60 s wall time.
+///
+/// Marked `#[ignore]` because the insert side of the gate is ~20-40
+/// minutes on a workstation (SQL-per-row + per-row fsync). The
+/// release-process invocation is:
+///
+/// ```sh
+/// cargo test --release -p spg-server --test e2e_manifest \
+///     -- --ignored restart_at_100m_under_60s_after_checkpoint
+/// ```
+///
+/// CI exercises the same machinery at a smaller scale via the other
+/// (non-ignored) manifest tests; this one's contract is "the boot-
+/// time win actually materialises for the L4 trigger".
+#[test]
+#[ignore = "release-process trigger: ~20-40 min runtime; see file docstring"]
+fn restart_at_100m_under_60s_after_checkpoint() {
+    const TOTAL_ROWS: i64 = 100_000_000;
+    const RESTART_BUDGET: Duration = Duration::from_mins(1);
+
+    let dir = unique_tmpdir("100m-restart");
+    let db = dir.join("a.db");
+    let wal = dir.join("a.wal");
+    let addr1 = pick_free_addr();
+    let env: Vec<(&str, String)> = vec![
+        // 512 MiB hot budget — the freezer keeps the working set
+        // bounded while the loop runs.
+        ("SPG_HOT_TIER_BYTES", (512u64 * 1024 * 1024).to_string()),
+        ("SPG_FREEZER_TICK_MS", "200".to_string()),
+        ("SPG_FREEZER_BATCH_ROWS", "50000".to_string()),
+    ];
+    {
+        let mut c = ChildGuard(spawn_server_with_admin(&addr1, &db, &wal, None, &env));
+        let mut s = wait_for_listener(&addr1, &mut c.0);
+        s.set_read_timeout(Some(Duration::from_mins(1))).unwrap();
+        auth_admin(&mut s);
+
+        exec_ok(
+            &mut s,
+            "CREATE TABLE sweep (id BIGINT NOT NULL, payload TEXT NOT NULL)",
+        );
+        exec_ok(&mut s, "CREATE INDEX sweep_by_id ON sweep (id)");
+        for i in 0..TOTAL_ROWS {
+            exec_ok(
+                &mut s,
+                &format!("INSERT INTO sweep VALUES ({i}, 'p_{:013}')", i),
+            );
+        }
+        // CHECKPOINT moves the entire WAL state into the snapshot
+        // + manifest. Next boot replays only post-CHECKPOINT bytes,
+        // which is what makes the 60 s gate achievable.
+        exec_ok(&mut s, "CHECKPOINT");
+        let _ = c.0.kill();
+        let _ = c.0.wait();
+    }
+
+    // Measure: spawn → wait_for_listener — that's the wall time the
+    // user perceives from "kill" to "next CC'd query is possible".
+    let addr2 = pick_free_addr();
+    let started = Instant::now();
+    let mut c2 = ChildGuard(spawn_server_with_admin(
+        &addr2,
+        &db,
+        &wal,
+        None,
+        &[("SPG_FREEZER_DISABLE", "1".to_string())],
+    ));
+    let _ = wait_for_listener(&addr2, &mut c2.0);
+    let elapsed = started.elapsed();
+    eprintln!("restart-100m: wall time {elapsed:?}");
+    assert!(
+        elapsed <= RESTART_BUDGET,
+        "100M restart {elapsed:?} exceeded 60 s budget"
+    );
+}
