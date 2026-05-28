@@ -192,6 +192,17 @@ pub(crate) struct ServerState {
     audit_log: Mutex<AuditLog>,
     audit_path: Option<PathBuf>,
     wal: Option<Mutex<File>>,
+    /// v5.4.4 — `try_clone`'d handle to the same underlying WAL
+    /// file. The kernel sees both handles as referring to the
+    /// same file, so `sync_data` on either flushes the file's
+    /// data; **but** `sync_data` does not require exclusive
+    /// access, only `&File`. The async-commit flusher uses this
+    /// handle to fsync **without holding `wal` mutex** — under a
+    /// 5 ms APFS fsync latency a per-write client takes the
+    /// mutex for microseconds (`write_all` only) and runs at
+    /// non-fsync-bound throughput. Stays `None` when no WAL is
+    /// configured.
+    wal_sync_clone: Option<Arc<File>>,
     /// Kept so the path can be reported in error messages; runtime appends go
     /// through `wal` directly.
     wal_path: Option<PathBuf>,
@@ -653,13 +664,19 @@ fn run(
 
     bootstrap_admin_from_env(&mut engine, db_path.as_deref())?;
 
-    let wal = match &wal_path {
-        Some(p) => Some(Mutex::new(
-            OpenOptions::new().append(true).open(p).map_err(|e| {
+    let (wal, wal_sync_clone) = match &wal_path {
+        Some(p) => {
+            let file = OpenOptions::new().append(true).open(p).map_err(|e| {
                 std::io::Error::other(format!("open WAL {} for append: {e}", p.display()))
-            })?,
-        )),
-        None => None,
+            })?;
+            // v5.4.4 — clone the handle for lock-free fsync from the
+            // async-commit flusher. `try_clone` failure (extremely
+            // rare; would mean fd exhaustion at startup) degrades
+            // gracefully: the flusher falls back to taking the mutex.
+            let sync_clone = file.try_clone().ok().map(Arc::new);
+            (Some(Mutex::new(file)), sync_clone)
+        }
+        None => (None, None),
     };
 
     let auth_msg = if password.is_some() {
@@ -683,6 +700,7 @@ fn run(
         audit_log: Mutex::new(audit_log),
         audit_path,
         wal,
+        wal_sync_clone,
         wal_path,
         commit_queue: Mutex::new(CommitQueueState {
             pending: VecDeque::new(),
@@ -1821,41 +1839,71 @@ fn encode_durability_marker(byte_offset: u64) -> std::io::Result<Vec<u8>> {
 /// marker that violates the disk-full chaos contract fails the
 /// same way an INSERT would, so the flusher thread can degrade
 /// gracefully. No-WAL servers return `Ok(0)` (nothing to mark).
+///
+/// v5.4.4 — lock-free fsync. The marker bytes are written under
+/// the `wal` mutex (microseconds), then the mutex is released
+/// **before** `sync_data` is called via `wal_sync_clone` (a
+/// `try_clone`'d handle to the same underlying file). The OS sees
+/// both descriptors as the same file; `sync_data` works on the
+/// file's data without needing exclusive access. This decouples
+/// the flusher's fsync latency (~5 ms on macOS APFS) from the
+/// client write path, restoring the v5.4.2 async-commit throughput
+/// promise — without this fix the flusher mutex monopolises the
+/// WAL and client INSERTs back up behind fsync (real bug observed
+/// in the v5.4.4 smoke test: async mode 9× SLOWER than sync).
 fn append_durability_marker(state: &ServerState) -> std::io::Result<u64> {
     let Some(wal_mutex) = state.wal.as_ref() else {
         return Ok(0);
     };
-    let mut wal = wal_mutex
-        .lock()
-        .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
-    let pre_marker_offset = wal.metadata()?.len();
-    let entry = encode_durability_marker(pre_marker_offset)?;
-    if let Some(quota) = state.chaos.wal_quota_bytes
-        && pre_marker_offset.saturating_add(entry.len() as u64) > quota
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            format!(
-                "wal quota exceeded by durability marker: cur={pre_marker_offset} + {} > quota={quota}",
-                entry.len()
-            ),
-        ));
-    }
-    if let Some(min_free) = state.limits.wal_min_free_bytes
-        && let Some(wal_path) = state.wal_path.as_deref()
-    {
-        let free = wal_volume_free_bytes(wal_path)?;
-        if free < min_free {
+    let pre_marker_offset = {
+        let mut wal = wal_mutex
+            .lock()
+            .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
+        let pre_marker_offset = wal.metadata()?.len();
+        let entry = encode_durability_marker(pre_marker_offset)?;
+        if let Some(quota) = state.chaos.wal_quota_bytes
+            && pre_marker_offset.saturating_add(entry.len() as u64) > quota
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
-                    "WAL volume below water-mark for durability marker: free={free} < SPG_WAL_MIN_FREE_BYTES={min_free}"
+                    "wal quota exceeded by durability marker: cur={pre_marker_offset} + {} > quota={quota}",
+                    entry.len()
                 ),
             ));
         }
+        if let Some(min_free) = state.limits.wal_min_free_bytes
+            && let Some(wal_path) = state.wal_path.as_deref()
+        {
+            let free = wal_volume_free_bytes(wal_path)?;
+            if free < min_free {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "WAL volume below water-mark for durability marker: free={free} < SPG_WAL_MIN_FREE_BYTES={min_free}"
+                    ),
+                ));
+            }
+        }
+        wal.write_all(&entry)?;
+        pre_marker_offset
+        // wal mutex guard dropped here
+    };
+    // Fsync without holding the wal mutex. Both `wal_sync_clone`
+    // and `wal` reference the same kernel file; `sync_data` only
+    // needs `&File`. Client INSERTs can re-acquire the mutex
+    // freely during the fsync.
+    if let Some(sync_handle) = state.wal_sync_clone.as_ref() {
+        sync_handle.sync_data()?;
+    } else {
+        // Fallback: `try_clone` failed at startup (very rare). Take
+        // the mutex briefly to sync — the slow case, but at least
+        // correct.
+        let wal = wal_mutex
+            .lock()
+            .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
+        wal.sync_data()?;
     }
-    wal.write_all(&entry)?;
-    wal.sync_data()?;
     Ok(pre_marker_offset)
 }
 

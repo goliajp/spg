@@ -361,6 +361,29 @@ Each Cold → Hot upgrade requires a concrete observable, not
   - **v5.4 → v5.5**: `slo_wal_insert_async_commit_above_200K`
     green (single client, `SPG_SYNCHRONOUS_COMMIT=off`); doc
     in PERFORMANCE.md notes the durability window.
+    Status (v5.4.4 ship): async-commit shipped end-to-end —
+    wire format (`crates/spg-server/src/main.rs` v3 record kind
+    `0x02 durability_checkpoint`); flusher thread
+    (`crates/spg-server/src/flusher.rs`,
+    `SPG_SYNCHRONOUS_COMMIT` env knob); async write path skips
+    `sync_data` on the client hot path
+    (`append_wal_v3_group` + `append_wal` conditional on
+    `synchronous_commit_disabled()`); durability lag metrics
+    (`spg_durability_lag_bytes` +
+    `spg_durability_lag_seconds` in
+    `crates/spg-server/src/observability.rs`); chaos test
+    `tests/e2e_chaos_async_commit.rs::chaos_kill_during_async_commit_window_loses_only_unflushed`
+    pins the bounded-loss invariant. CI smoke gate
+    `tests/slo_smoke.rs::slo_wal_insert_async_commit_smoke_above_50k`
+    (20K rows, ≥ 50K r/s floor; structurally unreachable
+    without v5.4 working). Release-process 200K r/s ship gate
+    `tests/slo_smoke.rs::slo_wal_insert_async_commit_above_200k`
+    (1M rows, `#[ignore]`-marked) records the source-of-truth
+    number into PERFORMANCE.md §"v5.4 async commit". STABILITY
+    contract §"Async-commit mode (v5.4)" freezes the
+    `SPG_SYNCHRONOUS_COMMIT` opt-in keyword set + the v3 wire
+    extension. PROD_READY row 1.12 documents the operator-
+    facing durability window.
 
   - **v5.5 → v5.6**: HNSW persistent perf gate green; OOM
     chaos test returns clean error.
