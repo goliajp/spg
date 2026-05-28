@@ -22,6 +22,7 @@
 
 mod backup;
 mod freezer;
+mod manifest;
 mod observability;
 mod pgwire;
 mod replication;
