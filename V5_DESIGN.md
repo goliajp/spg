@@ -335,6 +335,12 @@ Each Cold → Hot upgrade requires a concrete observable, not
   - **v5.2 → v5.3**: 30M INSERT loop completes without RSS bail
     (RSS stays ≤ 6 GiB throughout) AND
     `chaos_kill_during_freeze_recovers_clean_state` green.
+    Status (v5.2.5 ship): chaos test green in CI
+    (`tests/e2e_chaos_freeze.rs::chaos_kill_during_freeze_recovers_
+    clean_state`); 30M RSS gate test machinery shipped under
+    `#[ignore]` in the same file (`freeze_30m_rss_stays_under_
+    6gib_during_sweep_loop`), release-process invocation records
+    the peak RSS into PROD_READY 1.11.
 
   - **v5.3 → v5.4**: 100M INSERT loop completes; restart wall
     time ≤ 60 s (measured); v4.42 + v5.0 + v5.3 fixtures all

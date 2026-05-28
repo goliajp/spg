@@ -259,35 +259,50 @@ verdicts post-deserialise. Algorithm:
 A v2 Bloom layout (if ever needed) gets a new magic; the v1
 reader rejects unknown magics.
 
-### Catalog file format v8 (v5.1; unchanged from v4.x)
+### Catalog file format v9 (v5.2; tagged `RowLocator` on-disk codec)
 
-The cold-tier read path landed in v5.1 (RowLocator, OwnedSegment,
-`Catalog::cold_segments`, `Catalog::lookup_by_pk`,
-`Catalog::resolve_cold_locator`) without changing the catalog
-snapshot wire format. BTree indices still serialise as a single
-`kind=0` tag and rebuild from `Table::rows` on deserialise (see
-`deserialize_indices`), so no `RowLocator` bytes hit disk in a
-v5.1 snapshot. Pre-v5.2 every locator in memory is `Hot(_)` and
-every catalog round-trip reproduces the pre-v5 byte stream
-exactly.
+`FILE_VERSION = 9` shipped in v5.2.0 alongside the v5.2.2 freezer
+thread that became the first producer of `Cold` locators. The wire
+layout extends v8 by serialising every BTree index entry directly:
 
-`FILE_VERSION` 9 with on-disk locator encoding is reserved for
-v5.2: the freezer thread is the first producer of `Cold` locators,
-and v5.2 ships the catalog format bump in the same commit that
-makes those locators reachable after a snapshot + restart cycle.
-A v5.1 binary writes v8 snapshots; a v5.0 binary reads v5.1
-snapshots unchanged.
+  - Each BTree index payload after its header (`[name str][col_pos
+    u16][kind u8 = 0]`) gains `[u32 entry_count]` followed by
+    `entry_count` `(IndexKey, [u32 locator_count, locator*])`
+    pairs. Each locator is exactly 9 bytes via
+    `RowLocator::write_le` (`[u8 tag][u64 LE]` for `Hot`,
+    `[u8 0x01][u32 LE segment_id][u32 LE page_offset]` for
+    `Cold`). `IndexKey` itself uses a tagged codec — `0 = Int(i64
+    LE)`, `1 = Text(u16 len + UTF-8)`, `2 = Bool(u8 0/1)`.
+  - NSW indices are byte-identical to v8 — they don't carry
+    `RowLocator`s.
+  - v8 catalogs read transparently via the version dispatch in
+    `Catalog::deserialize` (`MIN_SUPPORTED_FILE_VERSION = 8`).
+    Every entry on a v8 BTree decodes as `RowLocator::Hot(_)` via
+    `add_index` rebuild — semantically identical to v5.1 in-memory
+    state since v8 catalogs never produced `Cold` locators.
+    Cross-version replay is gated by `tests/cross_version_compat.
+    rs::every_fixture_restores_and_verifies` across v4.30 (v8) +
+    v4.41 (v8) + v5.2 (v9) fixtures.
+
+A v5.2 binary writes v9 snapshots; a v5.1 binary cannot read them
+(no v9 dispatch). Pre-v5.2 deployments must finish their last
+freeze cycle, snapshot to v8, then upgrade. Operators rolling
+forward from v4.x see no migration step — the v9 reader pulls
+their v8 BTree entries through the legacy rebuild path.
 
 ### Cold-tier segments (v5.1; side-loaded, not in the catalog snapshot)
 
 Cold segments are first-class artifacts of the v5 cold-tier
-plan but live **outside** the catalog snapshot. The operator
-(or v5.3's `CatalogManifest`) is responsible for keeping the
-segment files reachable across restarts; the catalog snapshot
-itself does not record their paths.
+plan but live **outside** the catalog snapshot until v5.3's
+`CatalogManifest` lands. The operator (or, in v5.2+, the
+background freezer thread that writes
+`<db>.spg/segments/seg_<id>.spg` after each demotion) is
+responsible for keeping the segment files reachable across
+restarts; the v9 catalog snapshot itself does not record their
+paths.
 
-v5.1 ships two side-loader contracts that are frozen as long
-as the v8 catalog format is in use:
+v5.1 / v5.2 ship four loader contracts that are frozen as long
+as the v9 catalog format is in use:
 
   - `Catalog::load_segment_bytes(Vec<u8>) -> Result<u32, _>`
     registers a segment from caller-owned bytes, returning the
@@ -303,6 +318,20 @@ as the v8 catalog format is in use:
     one entry per segment row; v5.2's freezer thread runs the
     same primitive under the engine write lock as part of its
     atomic swap.
+  - `Catalog::freeze_oldest_to_cold(table, index, max_rows)`
+    (v5.2.2) is the storage-level atomic-swap primitive: builds a
+    segment from the first `max_rows` of the hot tier, loads it,
+    drops the hot rows, and re-registers their `Cold` locators
+    on the named BTree index. Returns the `FreezeReport`
+    `(segment_id, frozen_rows, bytes_freed, segment_bytes)` so
+    the caller persists `segment_bytes` to disk.
+  - `Catalog::promote_cold_row(table, index, key)` /
+    `Catalog::shadow_cold_row(table, index, key)` (v5.2.3) are
+    the cold-tier write-path primitives. The engine routes PK-
+    targeted UPDATE through `promote_cold_row` (cold → hot for
+    the update) and PK-targeted DELETE through `shadow_cold_row`
+    (Cold locator retired; row body becomes garbage until a
+    future compaction pass reclaims it).
 
 `SPG_PRELOAD_COLD_SEGMENT` is the v5.1 operator surface:
 `table:index:path[;table:index:path …]`. spg-server parses it at
@@ -311,6 +340,18 @@ after each spec's `(table, index)` both exist. The env var is
 stable within v5.x; v5.3+ may add an optional
 `CatalogManifest`-driven autoload that supersedes it for
 production deployments without removing the env-var path.
+
+v5.2.2 freezer-driven segments are written to
+`<db_path>.spg/segments/seg_<id>.spg` via `tmp+rename` after
+each demotion; restoring them across a restart still requires
+an operator-supplied `SPG_PRELOAD_COLD_SEGMENT` entry. v5.2.x
+freezes are intentionally **not** WAL-durable — a crash mid-
+freeze loses the not-yet-reloaded segment on restart (data is
+recovered from the WAL replay back into the hot tier; the
+chaos contract is "rolled back to pre-freeze state, no
+corruption"). The chaos test
+`tests/e2e_chaos_freeze.rs::chaos_kill_during_freeze_recovers_
+clean_state` pins this invariant.
 
 ### Env-var contract
 
