@@ -314,6 +314,21 @@ impl CatalogManifest {
     }
 }
 
+/// v5.3.1 — canonical sibling path for a db's manifest. Given
+/// `<parent>/<stem>` (the catalog snapshot file), returns
+/// `<parent>/<stem>.spg/manifest.v10`. The directory is the same
+/// `.spg` folder the freezer writes cold-tier segments into, so a
+/// single `<db>.spg/` tree captures everything v5.3+ persists
+/// alongside the v9 catalog.
+#[must_use]
+pub fn manifest_path(db_path: &Path) -> PathBuf {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = db_path
+        .file_stem()
+        .map_or_else(|| "db".to_string(), |s| s.to_string_lossy().into_owned());
+    parent.join(format!("{stem}.spg")).join("manifest.v10")
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
         bytes[offset],

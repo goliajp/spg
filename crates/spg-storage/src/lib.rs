@@ -1928,16 +1928,14 @@ impl Catalog {
             .map_err(|e| StorageError::Corrupt(format!("freeze_oldest_to_cold: encode: {e}")))?;
 
         // --- atomic swap phase: mutations only past this point ---
-        // delete_rows triggers rebuild_indices, which clears every
-        // index's payload and re-emits Hot locators from self.rows.
-        // Any pre-existing Cold locators on this index — produced
-        // by a previous freeze call — are lost here. They'll be
-        // re-registered below alongside the new ones.
+        // v5.2.3 made `Table::rebuild_indices` preserve every Cold
+        // locator across the per-table rebuild, so `delete_rows`
+        // below no longer wipes prior-freeze cold entries. The pre-
+        // v5.2.3 capture-then-re-register that used to live here
+        // was removed in v5.3.1 — keeping it would double-count
+        // every prior-frozen key's Cold locator on each subsequent
+        // freeze.
         let bytes_before = self.get(table_name).expect("just validated").hot_bytes();
-        let pre_freeze_cold: Vec<(IndexKey, RowLocator)> = {
-            let t = self.get(table_name).expect("just validated");
-            collect_cold_locators(t, index_name)
-        };
         let positions: Vec<usize> = (0..max_rows).collect();
         let t_mut = self
             .get_mut(table_name)
@@ -1959,13 +1957,7 @@ impl Catalog {
                 },
             )
         });
-        // Re-attach pre-existing cold locators first, then add the
-        // brand-new ones from this freeze. Order doesn't change
-        // semantics (the index map is unordered per key), but the
-        // sequence keeps the new entries grouped at the end of any
-        // key's locator list — useful for debugging.
         let t_mut = self.get_mut(table_name).expect("still present");
-        t_mut.register_cold_locators(index_name, pre_freeze_cold)?;
         t_mut.register_cold_locators(index_name, new_cold)?;
 
         Ok(FreezeReport {
