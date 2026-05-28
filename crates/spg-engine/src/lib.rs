@@ -1911,7 +1911,17 @@ fn try_index_seek(
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
     let key = IndexKey::from_value(&value)?;
-    Some(idx.lookup_eq(&key).to_vec())
+    // v5.1: `lookup_eq` returns `&[RowLocator]`. Pre-v5.2 indices contain
+    // only `Hot(_)` entries (no freezer has run); filter through `as_hot`
+    // here so the downstream `table.rows.get(idx)` call site stays
+    // unchanged. v5.1 step 3 introduces a cold-aware `Catalog::lookup_by_pk`
+    // for the hot/cold dispatching path; this seek stays hot-only.
+    Some(
+        idx.lookup_eq(&key)
+            .iter()
+            .filter_map(spg_storage::RowLocator::as_hot)
+            .collect(),
+    )
 }
 
 fn resolve_col_literal_pair(

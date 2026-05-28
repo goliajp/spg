@@ -289,7 +289,17 @@ pub enum IndexKind {
     /// v4.34 auto-commit wrap stays O(1) even for tables with secondary
     /// indices (the case that bottlenecked v4.39 at 1M rows in the
     /// sweep).
-    BTree(PersistentBTreeMap<IndexKey, Vec<usize>>),
+    ///
+    /// v5.1: value type widened from `Vec<usize>` to `Vec<RowLocator>` so
+    /// a single key can point to a mix of hot-tier rows (`RowLocator::Hot`,
+    /// equivalent to the pre-v5 `usize` row index) and cold-tier rows
+    /// (`RowLocator::Cold { segment_id, page_offset }`) once the v5.2
+    /// freezer starts producing them. Pre-v5.2 only `Hot` entries appear
+    /// — the on-disk encoding stays at `FILE_VERSION` 8 (raw u64 row index)
+    /// because every locator round-trips through `RowLocator::from_legacy_v8_u64`
+    /// without information loss. `FILE_VERSION` 9 with tagged encoding lands
+    /// alongside the first freezer commit (v5.1 step 2b / v5.2).
+    BTree(PersistentBTreeMap<IndexKey, Vec<RowLocator>>),
     /// Navigable-small-world graph for vector kNN search.
     Nsw(NswGraph),
 }
@@ -384,10 +394,15 @@ impl Index {
         }
     }
 
-    /// Look up the row indices stored under `key` (B-tree only). Returns
+    /// Look up the locators stored under `key` (B-tree only). Returns
     /// an empty slice when the key is absent or the index is an NSW
     /// graph — callers can treat both cases uniformly.
-    pub fn lookup_eq(&self, key: &IndexKey) -> &[usize] {
+    ///
+    /// v5.1: return type widened from `&[usize]` to `&[RowLocator]`.
+    /// Pre-v5.2 callers can read the slice and `.as_hot().unwrap()`
+    /// each entry (no `Cold` variants exist until the freezer lands);
+    /// post-v5.2 callers dispatch hot vs. cold per locator.
+    pub fn lookup_eq(&self, key: &IndexKey) -> &[RowLocator] {
         match &self.kind {
             IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
             IndexKind::Nsw(_) => &[][..],
@@ -554,7 +569,7 @@ impl Table {
                 // O(1). For dup-heavy columns it's O(M) per insert, traded
                 // for the structural-sharing win at clone time.
                 let mut entries = map.get(&key).cloned().unwrap_or_default();
-                entries.push(new_row_idx);
+                entries.push(RowLocator::Hot(new_row_idx));
                 map.insert_mut(key, entries);
             }
         }
@@ -601,7 +616,7 @@ impl Table {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
                     let mut entries = map.get(&key).cloned().unwrap_or_default();
-                    entries.push(i);
+                    entries.push(RowLocator::Hot(i));
                     map.insert_mut(key, entries);
                 }
             }
@@ -769,7 +784,7 @@ impl Table {
                     for (i, row) in self.rows.iter().enumerate() {
                         if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
                             let mut entries = map.get(&key).cloned().unwrap_or_default();
-                            entries.push(i);
+                            entries.push(RowLocator::Hot(i));
                             map.insert_mut(key, entries);
                         }
                     }
@@ -2773,8 +2788,8 @@ mod tests {
             .unwrap();
         let t = cat.get("users").unwrap();
         let idx = t.index_on(0).expect("index_on(0)");
-        assert_eq!(idx.lookup_eq(&IndexKey::Int(2)), &[1]);
-        assert_eq!(idx.lookup_eq(&IndexKey::Int(99)), &[] as &[usize]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(2)), &[RowLocator::Hot(1)]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(99)), &[] as &[RowLocator]);
     }
 
     #[test]
@@ -2809,9 +2824,15 @@ mod tests {
         ]))
         .unwrap();
         let idx = t.index_on(1).unwrap();
-        assert_eq!(idx.lookup_eq(&IndexKey::Text("dave".into())), &[3]);
+        assert_eq!(
+            idx.lookup_eq(&IndexKey::Text("dave".into())),
+            &[RowLocator::Hot(3)]
+        );
         // Pre-existing duplicates remain mapped to the two original row idxs.
-        assert_eq!(idx.lookup_eq(&IndexKey::Text("alice".into())), &[0, 2]);
+        assert_eq!(
+            idx.lookup_eq(&IndexKey::Text("alice".into())),
+            &[RowLocator::Hot(0), RowLocator::Hot(2)]
+        );
     }
 
     #[test]
@@ -2824,7 +2845,7 @@ mod tests {
         // Score is Float → the spec says we don't index NaN-prone columns,
         // so even the present scores are absent. Lookups via IndexKey::Int(90)
         // mis-match the column type and trivially find nothing.
-        assert_eq!(idx.lookup_eq(&IndexKey::Int(90)), &[] as &[usize]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(90)), &[] as &[RowLocator]);
     }
 
     // --- v0.11 vector type -------------------------------------------------
@@ -2907,6 +2928,9 @@ mod tests {
             .expect("index_on(1) after restore");
         assert_eq!(idx.name, "by_name");
         // Data was rebuilt from rows, not deserialized directly.
-        assert_eq!(idx.lookup_eq(&IndexKey::Text("alice".into())), &[0, 2]);
+        assert_eq!(
+            idx.lookup_eq(&IndexKey::Text("alice".into())),
+            &[RowLocator::Hot(0), RowLocator::Hot(2)]
+        );
     }
 }
