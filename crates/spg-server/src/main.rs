@@ -28,7 +28,7 @@ mod pgwire;
 mod replication;
 mod scram;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -242,6 +242,15 @@ pub(crate) struct ServerState {
     /// the workload runs to the budget. v5.2.2 wires this as the
     /// freezer wake-up threshold.
     pub(crate) hot_tier_byte_budget: u64,
+    /// v5.3.1: paths every cold-tier segment was loaded or written
+    /// from. Maps `segment_id` (the value
+    /// `Catalog::load_segment_bytes` returned at load time) →
+    /// absolute path on disk. The freezer's `persist_segment` and
+    /// the `try_lazy_preload_cold` env-var path both populate it;
+    /// the manifest writer reads it to build the cold-tier
+    /// registry. Held behind a `Mutex` because freezer + dispatch
+    /// + snapshot-write can hit it concurrently.
+    pub(crate) cold_segment_paths: Mutex<BTreeMap<u32, PathBuf>>,
 }
 
 /// Default `SPG_HOT_TIER_BYTES` when the env var is unset / invalid —
@@ -475,6 +484,13 @@ pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
         }
         engine.replace_catalog(cat);
         spec.loaded.store(true, Ordering::Relaxed);
+        // v5.3.1: record the segment_id → path mapping so a future
+        // CHECKPOINT can emit it into the manifest. Best-effort:
+        // mutex poisoning is logged and the loop continues —
+        // legacy `SPG_PRELOAD_COLD_SEGMENT` still works without it.
+        if let Ok(mut paths) = state.cold_segment_paths.lock() {
+            paths.insert(seg_id, spec.path.clone());
+        }
         eprintln!(
             "spg-server: cold preload {}:{} loaded {} row(s) from {}",
             spec.table,
@@ -497,6 +513,11 @@ fn run(
     password: Option<String>,
     limits: Limits,
 ) -> std::io::Result<()> {
+    // v5.3.1: pre-allocated path map so the manifest reader can
+    // populate it before ServerState is built. After `run` finishes
+    // setup it gets moved into `ServerState::cold_segment_paths`.
+    let mut cold_segment_paths: BTreeMap<u32, PathBuf> = BTreeMap::new();
+    let mut manifest_wal_baseline: u64 = 0;
     let mut engine = match &db_path {
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;
@@ -504,13 +525,20 @@ fn run(
             // v4.1: snapshot may be either a v4.1 envelope (catalog +
             // users) or the bare v3.x catalog blob. `restore_envelope`
             // handles both transparently — v3.x files keep loading.
-            let engine = Engine::restore_envelope(&bytes)
+            let mut engine = Engine::restore_envelope(&bytes)
                 .map_err(|e| std::io::Error::other(format!("restore from {path_str}: {e}")))?;
             eprintln!(
                 "spg-server: restored {} table(s), {} user(s) from {path_str}",
                 engine.catalog().table_count(),
                 engine.users().len()
             );
+            // v5.3.1: load the sidecar manifest, if any. Verifies the
+            // snapshot CRC matches what we just read, then auto-
+            // preloads every recorded cold-tier segment. Returns 0
+            // (= legacy "replay from start") when no usable manifest
+            // exists, so old deployments boot identical to v5.2.
+            manifest_wal_baseline =
+                load_manifest_and_preload_cold(&mut engine, p, &bytes, &mut cold_segment_paths);
             engine
         }
         Some(p) => {
@@ -577,6 +605,32 @@ fn run(
                 bytes.truncate(upto_usize);
             }
         }
+        // v5.3.1: skip WAL bytes before the manifest's recorded
+        // baseline. Those bytes have already been incorporated into
+        // the snapshot we just restored — replaying them would
+        // double-insert. v5.3.2 physically truncates the WAL file
+        // up to the same offset for disk reclaim; v5.3.1 only
+        // optimises replay time.
+        let baseline_usize = usize::try_from(manifest_wal_baseline).unwrap_or(usize::MAX);
+        if baseline_usize > 0 && baseline_usize <= bytes.len() {
+            eprintln!(
+                "spg-server: manifest skip — WAL replay starts at offset {manifest_wal_baseline} \
+                 (of {} total bytes)",
+                bytes.len()
+            );
+            bytes.drain(..baseline_usize);
+        } else if baseline_usize > bytes.len() {
+            // Manifest baseline is past EOF — the WAL file shrank
+            // between checkpoint write and this boot. Defensive
+            // fallback: replay the whole file. Data isn't lost,
+            // just re-applied (and the auto-rollback at end-of-WAL
+            // handles any mid-TX leftover).
+            eprintln!(
+                "spg-server: manifest WAL baseline {manifest_wal_baseline} exceeds file size {}; \
+                 replaying from start as a safety net",
+                bytes.len()
+            );
+        }
         let applied = replay_wal_bytes(&bytes, &mut engine)?;
         eprintln!(
             "spg-server: replayed {} WAL entries from {}",
@@ -642,6 +696,7 @@ fn run(
         cold_preload,
         cold_preload_done,
         hot_tier_byte_budget,
+        cold_segment_paths: Mutex::new(cold_segment_paths),
     });
 
     let listener = TcpListener::bind(addr)?;
@@ -1303,14 +1358,33 @@ fn dispatch(
             watchdog.cancel();
             // Snapshot the catalog first; an audit entry that survives a
             // partial flush would be inconsistent.
-            if let (Some(bytes), Some(path)) = (snapshot, state.db_path.as_deref())
-                && let Err(e) = write_atomic(path, &bytes)
+            if let (Some(bytes), Some(path)) = (snapshot.as_ref(), state.db_path.as_deref())
+                && let Err(e) = write_atomic(path, bytes)
             {
                 let _ = write_frame(
                     stream,
                     &build_error_response(&format!("snapshot write failed: {e}")),
                 );
                 return Err(e);
+            }
+            // v5.3.1 — sidecar manifest write. Best-effort: a
+            // manifest failure here doesn't kill the snapshot (the
+            // WAL is still the durability surface; legacy SPG_PRELOAD
+            // _COLD_SEGMENT keeps working when the manifest is
+            // missing). Only fires when a snapshot was actually
+            // written (no-WAL mode `modified_catalog: true`).
+            if let (Some(bytes), Some(path)) = (snapshot.as_ref(), state.db_path.as_deref()) {
+                let paths_snapshot = state
+                    .cold_segment_paths
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let wal_len = state
+                    .wal_path
+                    .as_deref()
+                    .and_then(|p| fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                write_manifest_alongside(path, bytes, &paths_snapshot, wal_len);
             }
             if let Err(e) = wal_result {
                 let _ = write_frame(
@@ -2197,10 +2271,17 @@ fn bootstrap_admin_from_env(engine: &mut Engine, db_path: Option<&Path>) -> std:
     eprintln!("spg-server: bootstrapped admin user {user:?} from SPG_ADMIN_PASSWORD");
     // Persist immediately so the bootstrap survives without waiting
     // for the first successful DDL/DML to trigger a snapshot.
-    if let Some(p) = db_path
-        && let Err(e) = write_atomic(p, &engine.snapshot())
-    {
-        eprintln!("spg-server: warning — failed to persist bootstrap admin: {e}");
+    if let Some(p) = db_path {
+        let snapshot = engine.snapshot();
+        if let Err(e) = write_atomic(p, &snapshot) {
+            eprintln!("spg-server: warning — failed to persist bootstrap admin: {e}");
+        } else {
+            // v5.3.1 — sidecar manifest. Bootstrap-time call has
+            // an empty cold-segment registry and wal_baseline_offset
+            // = current WAL length (0 for a fresh deploy).
+            // Best-effort.
+            write_manifest_alongside(p, &snapshot, &BTreeMap::new(), 0);
+        }
     }
     Ok(())
 }
@@ -2348,6 +2429,155 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// v5.3.1 — write a `CatalogManifest` for `db_path` alongside the
+/// snapshot. Called after every successful `write_atomic` of a
+/// snapshot. Best-effort: a manifest write failure surfaces as a
+/// stderr log but does NOT fail the snapshot — the WAL is still the
+/// primary durability surface in v5.3.x, and a missing manifest
+/// only loses the boot-time optimisation (legacy
+/// `SPG_PRELOAD_COLD_SEGMENT` keeps working).
+///
+/// `wal_baseline_offset` is the byte offset in the WAL where future
+/// replay should start. In v5.3.1 every snapshot write captures the
+/// current WAL file length; v5.3.2 wires this into the replay-skip
+/// path so 100M boot stays under 60 s.
+fn write_manifest_alongside(
+    db_path: &Path,
+    snapshot_bytes: &[u8],
+    cold_segment_paths: &BTreeMap<u32, PathBuf>,
+    wal_baseline_offset: u64,
+) {
+    let mp = manifest::manifest_path(db_path);
+    if let Some(dir) = mp.parent()
+        && let Err(e) = fs::create_dir_all(dir)
+    {
+        eprintln!(
+            "spg-server: manifest dir {} mkdir failed: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let cold_segments: Vec<manifest::ColdSegmentEntry> = cold_segment_paths
+        .iter()
+        .filter_map(|(&segment_id, path)| match fs::read(path) {
+            Ok(bytes) => Some(manifest::ColdSegmentEntry {
+                segment_id,
+                path: path.clone(),
+                crc32: spg_crypto::crc32::crc32(&bytes),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "spg-server: manifest skip segment {segment_id}: read {} failed: {e}",
+                    path.display()
+                );
+                None
+            }
+        })
+        .collect();
+    let m = manifest::CatalogManifest {
+        catalog_crc32: spg_crypto::crc32::crc32(snapshot_bytes),
+        cold_segments,
+        wal_baseline_offset,
+    };
+    let bytes = m.serialize();
+    if let Err(e) = write_atomic(&mp, &bytes) {
+        eprintln!("spg-server: manifest write to {} failed: {e}", mp.display());
+    }
+}
+
+/// v5.3.1 — boot-side manifest read. Called after the snapshot has
+/// been restored into `engine` but before WAL replay. If the
+/// manifest is present and its `catalog_crc32` matches a fresh
+/// CRC32 over `snapshot_bytes`, every recorded cold segment is
+/// loaded into the engine catalog and the `segment_id` → path map is
+/// populated on the in-flight `cold_segment_paths`. Returns the
+/// `wal_baseline_offset` the WAL replay should start from (or 0
+/// when no usable manifest exists). Mismatches and parse errors
+/// surface as stderr warnings; in every error path the legacy
+/// "no manifest, replay from 0" behaviour wins.
+fn load_manifest_and_preload_cold(
+    engine: &mut Engine,
+    db_path: &Path,
+    snapshot_bytes: &[u8],
+    cold_segment_paths: &mut BTreeMap<u32, PathBuf>,
+) -> u64 {
+    let mp = manifest::manifest_path(db_path);
+    if !mp.exists() {
+        return 0;
+    }
+    let bytes = match fs::read(&mp) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("spg-server: manifest read {} failed: {e}", mp.display());
+            return 0;
+        }
+    };
+    let m = match manifest::CatalogManifest::deserialize(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("spg-server: manifest {} rejected: {e}", mp.display());
+            return 0;
+        }
+    };
+    let snapshot_crc = spg_crypto::crc32::crc32(snapshot_bytes);
+    if snapshot_crc != m.catalog_crc32 {
+        eprintln!(
+            "spg-server: manifest {} catalog CRC mismatch (expected={:#010x}, file={:#010x}); \
+             falling back to WAL-only replay",
+            mp.display(),
+            m.catalog_crc32,
+            snapshot_crc,
+        );
+        return 0;
+    }
+    let mut cat = engine.catalog().clone();
+    let mut loaded: usize = 0;
+    let mut skipped: usize = 0;
+    for entry in &m.cold_segments {
+        match fs::read(&entry.path) {
+            Ok(seg_bytes) => {
+                let computed = spg_crypto::crc32::crc32(&seg_bytes);
+                if computed != entry.crc32 {
+                    eprintln!(
+                        "spg-server: manifest skip segment {}: CRC mismatch ({} != {})",
+                        entry.segment_id, computed, entry.crc32
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                match cat.load_segment_bytes(seg_bytes) {
+                    Ok(new_id) => {
+                        cold_segment_paths.insert(new_id, entry.path.clone());
+                        loaded += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "spg-server: manifest segment {} load failed: {e}",
+                            entry.segment_id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "spg-server: manifest skip segment {}: read {} failed: {e}",
+                    entry.segment_id,
+                    entry.path.display()
+                );
+                skipped += 1;
+            }
+        }
+    }
+    engine.replace_catalog(cat);
+    eprintln!(
+        "spg-server: manifest {} loaded {loaded} cold segment(s), skipped {skipped}; wal_baseline_offset={}",
+        mp.display(),
+        m.wal_baseline_offset,
+    );
+    m.wal_baseline_offset
 }
 
 fn emit_result(

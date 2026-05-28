@@ -197,11 +197,17 @@ fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
         .cold_segments
         .store(u64::from(report.segment_id + 1), Ordering::Relaxed);
     // Persist segment bytes to disk so a restart can reload via
-    // SPG_PRELOAD_COLD_SEGMENT (until v5.3 manifest automates this).
-    if let Some(db_path) = state.db_path.as_deref()
-        && let Err(e) = persist_segment(db_path, &report)
-    {
-        eprintln!("spg-freezer: segment persist failed: {e}");
+    // SPG_PRELOAD_COLD_SEGMENT (or, since v5.3.1, the manifest
+    // sidecar that CHECKPOINT writes).
+    if let Some(db_path) = state.db_path.as_deref() {
+        match persist_segment(db_path, &report) {
+            Ok(written_path) => {
+                if let Ok(mut paths) = state.cold_segment_paths.lock() {
+                    paths.insert(report.segment_id, written_path);
+                }
+            }
+            Err(e) => eprintln!("spg-freezer: segment persist failed: {e}"),
+        }
     }
     eprintln!(
         "spg-freezer: froze {} rows from {}.{} into seg {} ({} B freed; hot {} → {})",
@@ -217,11 +223,14 @@ fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
 }
 
 /// Write a segment to `<parent>/<db_stem>.spg/segments/seg_<id>.spg`
-/// via a `tmp + rename` for atomicity. Returns immediately on
-/// `mkdir_all` / `write` / `rename` failure — the in-memory cold
-/// tier is unaffected; only the disk-persisted reload path is
-/// degraded for this segment.
-fn persist_segment(db_path: &Path, report: &FreezeReport) -> std::io::Result<()> {
+/// via a `tmp + rename` for atomicity. Returns the final path on
+/// success (v5.3.1 — the caller records it on
+/// `ServerState::cold_segment_paths` so a future CHECKPOINT can
+/// emit it into the manifest). Returns immediately on `mkdir_all`
+/// / `write` / `rename` failure — the in-memory cold tier is
+/// unaffected; only the disk-persisted reload path is degraded
+/// for this segment.
+fn persist_segment(db_path: &Path, report: &FreezeReport) -> std::io::Result<std::path::PathBuf> {
     let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = db_path
         .file_stem()
@@ -233,7 +242,7 @@ fn persist_segment(db_path: &Path, report: &FreezeReport) -> std::io::Result<()>
     let tmp_path = seg_dir.join(format!("seg_{}.spg.tmp", report.segment_id));
     std::fs::write(&tmp_path, &report.segment_bytes)?;
     std::fs::rename(&tmp_path, &final_path)?;
-    Ok(())
+    Ok(final_path)
 }
 
 #[cfg(test)]
