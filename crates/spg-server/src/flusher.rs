@@ -111,7 +111,31 @@ fn run(state: &ServerState, config: FlusherConfig) {
         }
         last_tick = Instant::now();
         match append_durability_marker(state) {
-            Ok(_offset) => {
+            Ok(pre_marker_offset) => {
+                // v5.4.3 — update durability barrier metadata so
+                // /metrics can compute lag. `pre_marker_offset` is
+                // the WAL byte position the marker started at; the
+                // 17-byte marker frame itself lands inside the same
+                // `sync_data`, so the post-marker WAL end is the
+                // last byte guaranteed durable. `MARKER_FRAME_BYTES`
+                // mirrors the v5.4.0 wire pin (4 sentinel+len + 4
+                // CRC + 1 type + 8 payload).
+                const MARKER_FRAME_BYTES: u64 = 17;
+                let post_marker_offset = pre_marker_offset.saturating_add(MARKER_FRAME_BYTES);
+                state
+                    .metrics
+                    .last_durable_wal_offset
+                    .store(post_marker_offset, Ordering::Relaxed);
+                // `as_micros()` returns u128; clamp into u64 so a
+                // pathological clock skew can't wrap. Anything
+                // sensible (epoch micros < ~5.8e18) round-trips
+                // exactly.
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| u64::try_from(d.as_micros()).ok())
+                    .unwrap_or(u64::MAX);
+                state.metrics.last_fsync_us.store(now_us, Ordering::Relaxed);
                 state
                     .metrics
                     .flusher_iterations
