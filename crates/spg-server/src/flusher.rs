@@ -61,9 +61,11 @@ pub(crate) struct FlusherConfig {
 
 impl FlusherConfig {
     pub(crate) fn from_env() -> Self {
-        let async_mode = env::var("SPG_SYNCHRONOUS_COMMIT")
-            .ok()
-            .is_some_and(|s| matches!(s.trim().to_lowercase().as_str(), "off" | "false" | "0"));
+        // v5.4.2 — single point of truth for the
+        // SPG_SYNCHRONOUS_COMMIT parse. Keeps the env contract
+        // consistent between this module and the WAL write path
+        // even if the keyword set is widened later.
+        let async_mode = crate::synchronous_commit_disabled();
         let interval_us = env::var("SPG_FLUSHER_INTERVAL_US")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
