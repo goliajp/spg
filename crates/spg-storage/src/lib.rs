@@ -20,10 +20,12 @@ pub mod segment;
 pub use self::bloom::{BloomError, BloomFilter};
 pub use self::row_locator::{RowLocator, RowLocatorError};
 pub use self::segment::{
-    SEGMENT_MAGIC, SEGMENT_PAGE_BYTES, SegmentError, SegmentMeta, SegmentReader, encode_segment,
+    OwnedSegment, SEGMENT_MAGIC, SEGMENT_PAGE_BYTES, SegmentError, SegmentMeta, SegmentReader,
+    encode_segment,
 };
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -649,6 +651,55 @@ impl Table {
         graph: NswGraph,
     ) -> Result<(), StorageError> {
         self.add_nsw_index_inner(name, column_name, graph.m, Some(graph))
+    }
+
+    /// v5.1: register cold-tier locators on a BTree index. Used
+    /// after [`Catalog::load_segment_bytes`] to wire every cold-
+    /// tier row's PK back to its segment so
+    /// [`Catalog::lookup_by_pk`] can resolve it. Each call
+    /// appends to the index — keys that already have hot or cold
+    /// locators keep them. Returns the number of locators
+    /// registered.
+    ///
+    /// Pre-v5.2 (freezer) this is the only path that adds Cold
+    /// variants to a PB; post-freezer the background freezer
+    /// thread produces these as a batch under the engine write
+    /// lock and this API becomes its in-memory primitive.
+    ///
+    /// Errors if `index_name` doesn't exist or names an NSW graph
+    /// (NSW indices don't carry per-key row locators — they're
+    /// vector-search structures).
+    pub fn register_cold_locators<I>(
+        &mut self,
+        index_name: &str,
+        locators: I,
+    ) -> Result<usize, StorageError>
+    where
+        I: IntoIterator<Item = (IndexKey, RowLocator)>,
+    {
+        let idx = self
+            .indices
+            .iter_mut()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!("index {index_name:?} not found"))
+            })?;
+        let map = match &mut idx.kind {
+            IndexKind::BTree(map) => map,
+            IndexKind::Nsw(_) => {
+                return Err(StorageError::Corrupt(format!(
+                    "index {index_name:?} is NSW; cold locators apply only to BTree indices"
+                )));
+            }
+        };
+        let mut count = 0usize;
+        for (key, locator) in locators {
+            let mut entries = map.get(&key).cloned().unwrap_or_default();
+            entries.push(locator);
+            map.insert_mut(key, entries);
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// v4.4: delete the rows at the given positions in one pass.
@@ -1459,6 +1510,19 @@ pub struct Catalog {
     /// `name → tables[index]`. Kept in lock-step with `tables`.
     /// `create_table` is the only write path.
     by_name: BTreeMap<String, usize>,
+    /// v5.1: in-memory cold-tier segments. Side-loaded via
+    /// [`Catalog::load_segment_bytes`] — they live outside the
+    /// catalog snapshot (caller persists them as separate files
+    /// and re-loads on boot, until v5.3's `CatalogManifest` makes
+    /// that wiring automatic). `RowLocator::Cold { segment_id, .. }`
+    /// indexes this `Vec`. Cleared on `Catalog::new` / fresh
+    /// `deserialize`.
+    ///
+    /// `Arc` wrap keeps `Catalog::clone` at O(N segments) bumps
+    /// (rather than O(total segment bytes) memcpy) so the v4.42
+    /// group-commit pre-image rollback invariant — clone is
+    /// effectively free — survives the cold-tier addition.
+    cold_segments: Vec<Arc<OwnedSegment>>,
 }
 
 impl Catalog {
@@ -1466,6 +1530,7 @@ impl Catalog {
         Self {
             tables: Vec::new(),
             by_name: BTreeMap::new(),
+            cold_segments: Vec::new(),
         }
     }
 
@@ -1500,6 +1565,122 @@ impl Catalog {
     /// (= insertion order, matching the on-disk encoding).
     pub fn table_names(&self) -> Vec<String> {
         self.tables.iter().map(|t| t.schema.name.clone()).collect()
+    }
+
+    /// v5.1: register a cold-tier segment that already lives in
+    /// memory (caller did the file read). Returns the
+    /// `segment_id` that `RowLocator::Cold { segment_id, .. }`
+    /// will reference — currently this is just the index into
+    /// `cold_segments`, but treat it as an opaque token.
+    ///
+    /// Storage is `no_std`, so file I/O is the caller's
+    /// responsibility — `spg-server` reads the file and forwards
+    /// the bytes here. The bytes stay resident in the catalog
+    /// for the life of the `Catalog`, parsed only once.
+    pub fn load_segment_bytes(&mut self, bytes: Vec<u8>) -> Result<u32, StorageError> {
+        let id = u32::try_from(self.cold_segments.len()).map_err(|_| {
+            StorageError::Corrupt("cold segment count would exceed u32::MAX".into())
+        })?;
+        let seg = OwnedSegment::from_bytes(bytes)
+            .map_err(|e| StorageError::Corrupt(format!("cold segment parse failed: {e}")))?;
+        self.cold_segments.push(Arc::new(seg));
+        Ok(id)
+    }
+
+    #[must_use]
+    pub fn cold_segment_count(&self) -> usize {
+        self.cold_segments.len()
+    }
+
+    /// v5.1: resolve a single `RowLocator::Cold` to its underlying
+    /// `Row`. Decoupled from [`Catalog::lookup_by_pk`] so callers
+    /// iterating a multi-locator slice (e.g. the engine's index
+    /// seek path) can dispatch per locator instead of getting back
+    /// only the first row for a key. Returns `None` when the
+    /// segment isn't registered, the key isn't `u64`-coercible, or
+    /// the segment doesn't actually carry the key (bloom or page-
+    /// index reject).
+    pub fn resolve_cold_locator(
+        &self,
+        table_name: &str,
+        segment_id: u32,
+        key: &IndexKey,
+    ) -> Option<Row> {
+        let t = self.get(table_name)?;
+        let u64_key = index_key_as_u64(key)?;
+        let seg = self.cold_segments.get(segment_id as usize)?;
+        let payload = seg.lookup(u64_key)?;
+        let (row, _) = decode_row_body_dense(&payload, &t.schema).ok()?;
+        Some(row)
+    }
+
+    /// v5.1: indexed PK lookup that dispatches per locator,
+    /// returning the first matching row from either the hot tier
+    /// (`Table::rows`) or a registered cold segment.
+    ///
+    /// The cold path requires the index column to be coercible to
+    /// a `u64` (the segment's PK type) and the segment payload to
+    /// be a [`encode_row_body_dense`]-encoded row body for the
+    /// same schema. v5.1 ships this for BIGINT / INT / SMALLINT
+    /// PKs; other types fall through to hot-only behavior.
+    ///
+    /// Returns `None` if (a) the table or index doesn't exist,
+    /// (b) the key isn't in the index at all, or (c) the key was
+    /// resolved to a stale locator (Hot index out of range, Cold
+    /// segment id unknown, segment lookup miss). Does not surface
+    /// segment-decode errors — those would indicate corrupted
+    /// cold-tier files and should be caught at
+    /// [`Catalog::load_segment_bytes`] time.
+    pub fn lookup_by_pk(
+        &self,
+        table: &str,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Option<Row> {
+        let t = self.get(table)?;
+        let idx = t.indices.iter().find(|i| i.name == index_name)?;
+        let locators = idx.lookup_eq(key);
+        let cold_u64_key = index_key_as_u64(key);
+        for loc in locators {
+            match *loc {
+                RowLocator::Hot(i) => {
+                    if let Some(row) = t.rows.get(i) {
+                        return Some(row.clone());
+                    }
+                }
+                RowLocator::Cold {
+                    segment_id,
+                    page_offset: _,
+                } => {
+                    let Some(u64_key) = cold_u64_key else {
+                        // Key type not coercible to u64 — cold tier
+                        // only handles BIGINT/INT/SMALLINT in v5.1.
+                        continue;
+                    };
+                    let Some(seg) = self.cold_segments.get(segment_id as usize) else {
+                        continue;
+                    };
+                    let Some(payload) = seg.lookup(u64_key) else {
+                        continue;
+                    };
+                    let (row, _) = decode_row_body_dense(&payload, &t.schema).ok()?;
+                    return Some(row);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Coerce an [`IndexKey`] to the `u64` that v5.1 cold-tier
+/// segments use as their on-disk PK. Returns `None` for keys that
+/// aren't representable as `u64` — Text PKs need a hash mapping
+/// the segment writer baked in (deferred to v5.2+), Bool PKs are
+/// almost never wide enough to be sharded into a cold tier.
+fn index_key_as_u64(key: &IndexKey) -> Option<u64> {
+    match key {
+        IndexKey::Int(n) => Some(*n as u64),
+        IndexKey::Text(_) | IndexKey::Bool(_) => None,
     }
 }
 
@@ -1687,27 +1868,11 @@ impl Catalog {
                 u32::try_from(t.rows.len()).expect("≤ 4G rows/table"),
             );
             // v3.0.2 dense row encoding (FILE_VERSION 8): per-row NULL
-            // bitmap inlined into `out` (no per-row alloc), then a
-            // tightly packed body for each non-NULL cell, decoded by
-            // column type. Saves one tag byte per cell vs the v7
-            // self-describing value format.
-            let bitmap_bytes = t.schema.columns.len().div_ceil(8);
+            // bitmap, then tightly-packed bodies. Identical wire format
+            // as before — extracted into `encode_row_body_dense` so cold-
+            // tier segments (v5.1+) can share the encoding.
             for row in &t.rows {
-                // Reserve the bitmap slot first (zeroed), remember the
-                // offset, OR-in each NULL bit, then write bodies.
-                let bitmap_offset = out.len();
-                out.resize(bitmap_offset + bitmap_bytes, 0);
-                for (i, v) in row.values.iter().enumerate() {
-                    if matches!(v, Value::Null) {
-                        out[bitmap_offset + i / 8] |= 1 << (i % 8);
-                    }
-                }
-                for (col_idx, v) in row.values.iter().enumerate() {
-                    if matches!(v, Value::Null) {
-                        continue;
-                    }
-                    write_value_body(&mut out, v, t.schema.columns[col_idx].ty);
-                }
+                out.extend_from_slice(&encode_row_body_dense(row, &t.schema));
             }
             // Index definitions. Per-index payload:
             //   [name][col_pos u16][kind u8]
@@ -1813,31 +1978,18 @@ fn deserialize_table(cur: &mut Cursor<'_>, cat: &mut Catalog) -> Result<(), Stor
 fn deserialize_rows(
     cur: &mut Cursor<'_>,
     t: &mut Table,
-    n_cols: usize,
+    _n_cols: usize,
 ) -> Result<(), StorageError> {
     let row_count = cur.read_u32()? as usize;
-    // v4.39: PV has no `reserve` (the BVT doesn't preallocate a contiguous
-    // buffer); we just push directly and let the trie grow.
-    let bitmap_bytes = n_cols.div_ceil(8);
-    let col_types: Vec<DataType> = t.schema.columns.iter().map(|c| c.ty).collect();
-    let mut bitmap_buf = [0u8; 32];
+    // v4.39: PV has no `reserve` (the BVT doesn't preallocate a
+    // contiguous buffer); we just push directly and let the trie
+    // grow. v5.1: row decode reuses `decode_row_body_dense` so the
+    // catalog and cold-tier segments share one row codec.
     for _ in 0..row_count {
-        let slice = cur.take(bitmap_bytes)?;
-        if bitmap_bytes > bitmap_buf.len() {
-            return Err(StorageError::Corrupt(format!(
-                "row NULL bitmap {bitmap_bytes} B exceeds 32 B cap"
-            )));
-        }
-        bitmap_buf[..bitmap_bytes].copy_from_slice(slice);
-        let mut values = Vec::with_capacity(n_cols);
-        for col_idx in 0..n_cols {
-            if (bitmap_buf[col_idx / 8] >> (col_idx % 8)) & 1 == 1 {
-                values.push(Value::Null);
-            } else {
-                values.push(cur.read_value_body(col_types[col_idx])?);
-            }
-        }
-        t.rows.push_mut(Row { values });
+        let tail = &cur.buf[cur.pos..];
+        let (row, consumed) = decode_row_body_dense(tail, &t.schema)?;
+        cur.pos += consumed;
+        t.rows.push_mut(row);
     }
     Ok(())
 }
@@ -1997,6 +2149,72 @@ impl Cursor<'_> {
             ))),
         }
     }
+}
+
+/// Encode one row's body in the v3.0.2 dense format (FILE_VERSION
+/// 8): per-row NULL bitmap (1 bit/col, ceil(cols/8) bytes), then
+/// each non-NULL cell as `write_value_body`. Same wire shape the
+/// catalog snapshot writes per row inside its rows-block. Exposed
+/// pub so v5.1+ cold-tier segment writers can produce row payloads
+/// that the catalog [`decode_row_body_dense`] decodes 1:1.
+///
+/// `row.values.len()` must equal `schema.columns.len()` — the row
+/// is expected to have been validated by `Table::insert` (the
+/// engine's INSERT path) before reaching this function.
+pub fn encode_row_body_dense(row: &Row, schema: &TableSchema) -> Vec<u8> {
+    debug_assert_eq!(
+        row.values.len(),
+        schema.columns.len(),
+        "dense encode: row arity must match schema"
+    );
+    let bitmap_bytes = schema.columns.len().div_ceil(8);
+    // 8 B per fixed-width cell is a reasonable average; the buffer
+    // grows past this for variable-width Text/Vector cells.
+    let mut out = Vec::with_capacity(bitmap_bytes + schema.columns.len() * 8);
+    let bitmap_offset = out.len();
+    out.resize(bitmap_offset + bitmap_bytes, 0);
+    for (i, v) in row.values.iter().enumerate() {
+        if matches!(v, Value::Null) {
+            out[bitmap_offset + i / 8] |= 1 << (i % 8);
+        }
+    }
+    for (col_idx, v) in row.values.iter().enumerate() {
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        write_value_body(&mut out, v, schema.columns[col_idx].ty);
+    }
+    out
+}
+
+/// Inverse of [`encode_row_body_dense`]. Reads one row's body from
+/// `bytes` and returns it plus the number of bytes consumed (so a
+/// caller decoding a back-to-back stream of rows can advance its
+/// cursor). Returns `StorageError::Corrupt` on truncation, bad
+/// UTF-8, or unknown cell tags.
+pub fn decode_row_body_dense(
+    bytes: &[u8],
+    schema: &TableSchema,
+) -> Result<(Row, usize), StorageError> {
+    let mut cur = Cursor::new(bytes);
+    let bitmap_bytes = schema.columns.len().div_ceil(8);
+    let mut bitmap_buf = [0u8; 32];
+    if bitmap_bytes > bitmap_buf.len() {
+        return Err(StorageError::Corrupt(format!(
+            "row NULL bitmap {bitmap_bytes} B exceeds 32 B cap"
+        )));
+    }
+    let slice = cur.take(bitmap_bytes)?;
+    bitmap_buf[..bitmap_bytes].copy_from_slice(slice);
+    let mut values = Vec::with_capacity(schema.columns.len());
+    for (col_idx, col) in schema.columns.iter().enumerate() {
+        if (bitmap_buf[col_idx / 8] >> (col_idx % 8)) & 1 == 1 {
+            values.push(Value::Null);
+        } else {
+            values.push(cur.read_value_body(col.ty)?);
+        }
+    }
+    Ok((Row { values }, cur.pos))
 }
 
 /// Schema-driven dense value encoding (`FILE_VERSION` 8). Caller already
@@ -2932,5 +3150,248 @@ mod tests {
             idx.lookup_eq(&IndexKey::Text("alice".into())),
             &[RowLocator::Hot(0), RowLocator::Hot(2)]
         );
+    }
+
+    // --- v5.1 cold-tier integration tests ----------------------
+
+    /// Schema with a BIGINT PK column matching what the v5.1 cold-
+    /// tier path supports (`IndexKey::Int` → `u64` cast).
+    fn bigint_pk_users_schema() -> TableSchema {
+        TableSchema::new(
+            "users",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("name", DataType::Text, false),
+            ],
+        )
+    }
+
+    fn make_user_row(id: i64, name: &str) -> Row {
+        Row::new(vec![Value::BigInt(id), Value::Text(name.into())])
+    }
+
+    #[test]
+    fn lookup_by_pk_finds_row_via_hot_index() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
+            t.insert(make_user_row(id, name)).unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        // All locators are Hot; cold_segments is empty.
+        let got = cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2)).unwrap();
+        assert_eq!(got, make_user_row(2, "bob"));
+        assert_eq!(cat.cold_segment_count(), 0);
+    }
+
+    #[test]
+    fn lookup_by_pk_returns_none_when_key_missing() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.insert(make_user_row(1, "alice")).unwrap();
+        t.add_index("by_id".into(), "id").unwrap();
+        assert!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(999))
+                .is_none()
+        );
+        // Also: unknown table / unknown index name.
+        assert!(
+            cat.lookup_by_pk("other_table", "by_id", &IndexKey::Int(1))
+                .is_none()
+        );
+        assert!(
+            cat.lookup_by_pk("users", "no_such_index", &IndexKey::Int(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lookup_by_pk_resolves_cold_locator_via_loaded_segment() {
+        // Build a cold-tier segment whose payloads are dense-encoded
+        // BIGINT rows. Wire each PK into the BTree index as a Cold
+        // locator. The hot tier carries no rows for those PKs.
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.add_index("by_id".into(), "id").unwrap();
+        let schema = t.schema.clone();
+
+        let cold_rows: Vec<(i64, &str)> =
+            vec![(100, "ivy"), (200, "joe"), (300, "kim"), (400, "lin")];
+        let seg_rows: Vec<(u64, Vec<u8>)> = cold_rows
+            .iter()
+            .map(|(id, name)| {
+                let row = make_user_row(*id, name);
+                (*id as u64, encode_row_body_dense(&row, &schema))
+            })
+            .collect();
+        let (seg_bytes, _meta) =
+            encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        let seg_id = cat.load_segment_bytes(seg_bytes).unwrap();
+        assert_eq!(seg_id, 0);
+        assert_eq!(cat.cold_segment_count(), 1);
+
+        let pairs: Vec<(IndexKey, RowLocator)> = cold_rows
+            .iter()
+            .map(|(id, _)| {
+                (
+                    IndexKey::Int(*id),
+                    RowLocator::Cold {
+                        segment_id: seg_id,
+                        page_offset: 0,
+                    },
+                )
+            })
+            .collect();
+        let registered = cat
+            .get_mut("users")
+            .unwrap()
+            .register_cold_locators("by_id", pairs)
+            .unwrap();
+        assert_eq!(registered, 4);
+
+        for (id, name) in &cold_rows {
+            let got = cat
+                .lookup_by_pk("users", "by_id", &IndexKey::Int(*id))
+                .unwrap_or_else(|| panic!("cold key {id} not found"));
+            assert_eq!(got, make_user_row(*id, name));
+        }
+        // Cold key that isn't in the segment must return None.
+        assert!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(999))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lookup_by_pk_mixes_hot_and_cold_tiers() {
+        // Half the rows live in the hot tier (Table::rows + add_index
+        // produces Hot locators); half live in a cold segment and have
+        // Cold locators wired manually. Each lookup hits the right tier.
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for (id, name) in [(1i64, "alice"), (2, "bob")] {
+            t.insert(make_user_row(id, name)).unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        let schema = t.schema.clone();
+
+        let cold_rows: Vec<(i64, &str)> = vec![(100, "ivy"), (200, "joe")];
+        let seg_rows: Vec<(u64, Vec<u8>)> = cold_rows
+            .iter()
+            .map(|(id, name)| {
+                let row = make_user_row(*id, name);
+                (*id as u64, encode_row_body_dense(&row, &schema))
+            })
+            .collect();
+        let (seg_bytes, _) =
+            encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        let seg_id = cat.load_segment_bytes(seg_bytes).unwrap();
+        let pairs: Vec<(IndexKey, RowLocator)> = cold_rows
+            .iter()
+            .map(|(id, _)| {
+                (
+                    IndexKey::Int(*id),
+                    RowLocator::Cold {
+                        segment_id: seg_id,
+                        page_offset: 0,
+                    },
+                )
+            })
+            .collect();
+        cat.get_mut("users")
+            .unwrap()
+            .register_cold_locators("by_id", pairs)
+            .unwrap();
+
+        // Hot tier hits.
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(1)).unwrap(),
+            make_user_row(1, "alice")
+        );
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2)).unwrap(),
+            make_user_row(2, "bob")
+        );
+        // Cold tier hits.
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(100))
+                .unwrap(),
+            make_user_row(100, "ivy")
+        );
+        assert_eq!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(200))
+                .unwrap(),
+            make_user_row(200, "joe")
+        );
+        // Miss in both tiers.
+        assert!(
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(50))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn register_cold_locators_rejects_nsw_index() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "vecs",
+            vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new("v", DataType::Vector(4), false),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("vecs").unwrap();
+        t.insert(Row::new(vec![
+            Value::Int(1),
+            Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+        ]))
+        .unwrap();
+        t.add_nsw_index("by_v".into(), "v", NSW_DEFAULT_M).unwrap();
+        let err = t
+            .register_cold_locators(
+                "by_v",
+                vec![(
+                    IndexKey::Int(1),
+                    RowLocator::Cold {
+                        segment_id: 0,
+                        page_offset: 0,
+                    },
+                )],
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt(ref s) if s.contains("NSW")));
+    }
+
+    #[test]
+    fn load_segment_bytes_rejects_garbage() {
+        let mut cat = Catalog::new();
+        let err = cat.load_segment_bytes(vec![0u8; 10]).unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt(ref s) if s.contains("segment")));
+        // Loader doesn't mutate state on error.
+        assert_eq!(cat.cold_segment_count(), 0);
+    }
+
+    #[test]
+    fn load_segment_bytes_returns_sequential_ids() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let schema = cat.get("users").unwrap().schema.clone();
+        for batch in 0..3 {
+            let rows: Vec<(u64, Vec<u8>)> = (0..4)
+                .map(|i| {
+                    let id = batch * 100 + i;
+                    let row = make_user_row(id as i64, "x");
+                    (id, encode_row_body_dense(&row, &schema))
+                })
+                .collect();
+            let (bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+            assert_eq!(cat.load_segment_bytes(bytes).unwrap(), batch as u32);
+        }
+        assert_eq!(cat.cold_segment_count(), 3);
     }
 }

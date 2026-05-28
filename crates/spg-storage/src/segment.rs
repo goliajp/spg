@@ -493,118 +493,192 @@ fn parse_page_index(input: &[u8]) -> Result<Vec<PageIndexEntry>, SegmentError> {
     Ok(out)
 }
 
+/// Parsed segment state — meta, bloom, page-index, and the file
+/// offset where the page payloads begin. Shared between
+/// [`SegmentReader`] (borrows bytes) and [`OwnedSegment`] (owns
+/// bytes) so both share a single `parse + lookup` implementation.
+///
+/// Module-private: callers should hold a `SegmentReader` or an
+/// `OwnedSegment` instead of constructing this directly.
+#[derive(Debug, Clone)]
+struct SegmentMetadata {
+    meta: SegmentMeta,
+    bloom: BloomFilter,
+    page_index: Vec<PageIndexEntry>,
+    /// File offset where the first page starts. The metadata hides
+    /// the variable-length bloom + page-index sections behind
+    /// this anchor.
+    pages_start_offset: usize,
+}
+
+/// Parse the segment header + bloom + page-index from `bytes`,
+/// validating magic, CRC32 footer, and structural lengths. The
+/// returned [`SegmentMetadata`] is independent of `bytes`'
+/// lifetime so it can be embedded inside an [`OwnedSegment`] that
+/// owns its own `Vec<u8>`.
+fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError> {
+    if bytes.len() < HEADER_FIXED_LEN + FOOTER_LEN {
+        return Err(SegmentError::TooShort {
+            got: bytes.len(),
+            need: HEADER_FIXED_LEN + FOOTER_LEN,
+        });
+    }
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(&bytes[..8]);
+    if magic != SEGMENT_MAGIC {
+        return Err(SegmentError::BadMagic { got: magic });
+    }
+    // Header parse.
+    let num_rows = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let num_pages = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let page_size_bytes = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let min_pk = u64::from_le_bytes([
+        bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27],
+    ]);
+    let max_pk = u64::from_le_bytes([
+        bytes[28], bytes[29], bytes[30], bytes[31], bytes[32], bytes[33], bytes[34], bytes[35],
+    ]);
+    let bloom_len = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) as usize;
+    let bloom_offset = HEADER_FIXED_LEN;
+    if bytes.len() < bloom_offset + bloom_len + 4 {
+        return Err(SegmentError::TooShort {
+            got: bytes.len(),
+            need: bloom_offset + bloom_len + 4,
+        });
+    }
+    let bloom = BloomFilter::from_bytes(&bytes[bloom_offset..bloom_offset + bloom_len])?;
+    let page_index_len_off = bloom_offset + bloom_len;
+    let page_index_len = u32::from_le_bytes([
+        bytes[page_index_len_off],
+        bytes[page_index_len_off + 1],
+        bytes[page_index_len_off + 2],
+        bytes[page_index_len_off + 3],
+    ]) as usize;
+    let page_index_off = page_index_len_off + 4;
+    if bytes.len() < page_index_off + page_index_len {
+        return Err(SegmentError::TooShort {
+            got: bytes.len(),
+            need: page_index_off + page_index_len,
+        });
+    }
+    let page_index = parse_page_index(&bytes[page_index_off..page_index_off + page_index_len])?;
+    let pages_start_offset = page_index_off + page_index_len;
+    let pages_total_bytes = num_pages as usize * page_size_bytes as usize;
+    let expected_total = pages_start_offset + pages_total_bytes + FOOTER_LEN;
+    if bytes.len() != expected_total {
+        return Err(SegmentError::BadShape(format!(
+            "segment: input is {} bytes, header implies {expected_total}",
+            bytes.len()
+        )));
+    }
+    // CRC footer check (body excludes magic + the CRC itself).
+    let stored_crc_off = expected_total - FOOTER_LEN;
+    let stored_crc = u32::from_le_bytes([
+        bytes[stored_crc_off],
+        bytes[stored_crc_off + 1],
+        bytes[stored_crc_off + 2],
+        bytes[stored_crc_off + 3],
+    ]);
+    let computed_crc = crc32(&bytes[8..stored_crc_off]);
+    if computed_crc != stored_crc {
+        return Err(SegmentError::BadCrc {
+            expected: stored_crc,
+            got: computed_crc,
+        });
+    }
+    let meta = SegmentMeta {
+        num_rows: u64::from(num_rows),
+        num_pages,
+        page_size_bytes,
+        min_pk,
+        max_pk,
+        total_bytes: bytes.len(),
+    };
+    Ok(SegmentMetadata {
+        meta,
+        bloom,
+        page_index,
+        pages_start_offset,
+    })
+}
+
+/// Out-of-range + bloom check. Shared between [`SegmentReader`]
+/// and [`OwnedSegment`] so a single implementation is on the hot
+/// path.
+fn segment_might_contain(metadata: &SegmentMetadata, key: u64) -> bool {
+    if key < metadata.meta.min_pk || key > metadata.meta.max_pk {
+        return false;
+    }
+    metadata.bloom.contains(&key.to_le_bytes())
+}
+
+/// Page-aware lookup. Shared between [`SegmentReader`] and
+/// [`OwnedSegment`] so the single-page-read budget invariant holds
+/// for both. Returns the raw payload bytes (caller decides how to
+/// decode them — for a v5.1 cold-tier read that's the dense Row
+/// body for the cold table).
+fn segment_lookup(metadata: &SegmentMetadata, bytes: &[u8], key: u64) -> Option<Vec<u8>> {
+    if !segment_might_contain(metadata, key) {
+        return None;
+    }
+    // Binary-search the page index for the largest entry with
+    // `first_pk <= key`.
+    let candidate = match metadata
+        .page_index
+        .binary_search_by(|entry| entry.first_pk.cmp(&key))
+    {
+        Ok(i) => i,
+        Err(0) => return None,
+        Err(i) => i - 1,
+    };
+    let entry = metadata.page_index[candidate];
+    let page_off = metadata.pages_start_offset + entry.file_offset as usize;
+    let page_end = page_off + metadata.meta.page_size_bytes as usize;
+    if page_end > bytes.len() - FOOTER_LEN {
+        return None;
+    }
+    let page = &bytes[page_off..page_end];
+    decode_page_lookup(page, key)
+}
+
+/// Sorted-order scan. Shared by both reader flavours.
+fn segment_scan<'a>(
+    metadata: &'a SegmentMetadata,
+    bytes: &'a [u8],
+) -> impl Iterator<Item = (u64, Vec<u8>)> + 'a {
+    let page_size = metadata.meta.page_size_bytes as usize;
+    (0..metadata.meta.num_pages as usize).flat_map(move |i| {
+        let off = metadata.pages_start_offset + i * page_size;
+        let page = &bytes[off..off + page_size];
+        decode_page_iter(page)
+    })
+}
+
 /// Read-side handle. Borrows the segment bytes (the catalog or
 /// test owns the buffer), parses header + bloom + page index up
 /// front, and exposes `lookup(key)` / `scan_keys()` over the rest.
 ///
-/// v5.0 ships only the byte-slice-backed reader; v5.1 adds a
-/// seekable variant that pulls one page at a time so a 100M-row
-/// segment doesn't need to be resident.
+/// For an in-RAM cold-tier segment that the catalog holds across
+/// many lookups, prefer [`OwnedSegment`] — it owns its bytes and
+/// reuses the same parsed metadata across calls without any
+/// lifetime gymnastics.
 #[derive(Debug)]
 pub struct SegmentReader<'a> {
     bytes: &'a [u8],
-    meta: SegmentMeta,
-    bloom: BloomFilter,
-    page_index: Vec<PageIndexEntry>,
-    /// File offset where the first page starts. The reader hides
-    /// the variable-length bloom + page-index sections behind
-    /// this anchor.
-    pages_start_offset: usize,
+    metadata: SegmentMetadata,
 }
 
 impl<'a> SegmentReader<'a> {
     /// Parse a segment from a contiguous byte slice. Validates
     /// magic, CRC32 footer, and structural lengths.
     pub fn open(bytes: &'a [u8]) -> Result<Self, SegmentError> {
-        if bytes.len() < HEADER_FIXED_LEN + FOOTER_LEN {
-            return Err(SegmentError::TooShort {
-                got: bytes.len(),
-                need: HEADER_FIXED_LEN + FOOTER_LEN,
-            });
-        }
-        let mut magic = [0u8; 8];
-        magic.copy_from_slice(&bytes[..8]);
-        if magic != SEGMENT_MAGIC {
-            return Err(SegmentError::BadMagic { got: magic });
-        }
-        // Header parse.
-        let num_rows = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let num_pages = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-        let page_size_bytes = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let min_pk = u64::from_le_bytes([
-            bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27],
-        ]);
-        let max_pk = u64::from_le_bytes([
-            bytes[28], bytes[29], bytes[30], bytes[31], bytes[32], bytes[33], bytes[34], bytes[35],
-        ]);
-        let bloom_len = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) as usize;
-        let bloom_offset = HEADER_FIXED_LEN;
-        if bytes.len() < bloom_offset + bloom_len + 4 {
-            return Err(SegmentError::TooShort {
-                got: bytes.len(),
-                need: bloom_offset + bloom_len + 4,
-            });
-        }
-        let bloom = BloomFilter::from_bytes(&bytes[bloom_offset..bloom_offset + bloom_len])?;
-        let page_index_len_off = bloom_offset + bloom_len;
-        let page_index_len = u32::from_le_bytes([
-            bytes[page_index_len_off],
-            bytes[page_index_len_off + 1],
-            bytes[page_index_len_off + 2],
-            bytes[page_index_len_off + 3],
-        ]) as usize;
-        let page_index_off = page_index_len_off + 4;
-        if bytes.len() < page_index_off + page_index_len {
-            return Err(SegmentError::TooShort {
-                got: bytes.len(),
-                need: page_index_off + page_index_len,
-            });
-        }
-        let page_index = parse_page_index(&bytes[page_index_off..page_index_off + page_index_len])?;
-        let pages_start_offset = page_index_off + page_index_len;
-        let pages_total_bytes = num_pages as usize * page_size_bytes as usize;
-        let expected_total = pages_start_offset + pages_total_bytes + FOOTER_LEN;
-        if bytes.len() != expected_total {
-            return Err(SegmentError::BadShape(format!(
-                "segment: input is {} bytes, header implies {expected_total}",
-                bytes.len()
-            )));
-        }
-        // CRC footer check (body excludes magic + the CRC itself).
-        let stored_crc_off = expected_total - FOOTER_LEN;
-        let stored_crc = u32::from_le_bytes([
-            bytes[stored_crc_off],
-            bytes[stored_crc_off + 1],
-            bytes[stored_crc_off + 2],
-            bytes[stored_crc_off + 3],
-        ]);
-        let computed_crc = crc32(&bytes[8..stored_crc_off]);
-        if computed_crc != stored_crc {
-            return Err(SegmentError::BadCrc {
-                expected: stored_crc,
-                got: computed_crc,
-            });
-        }
-        let meta = SegmentMeta {
-            num_rows: u64::from(num_rows),
-            num_pages,
-            page_size_bytes,
-            min_pk,
-            max_pk,
-            total_bytes: bytes.len(),
-        };
-        Ok(Self {
-            bytes,
-            meta,
-            bloom,
-            page_index,
-            pages_start_offset,
-        })
+        let metadata = parse_segment_metadata(bytes)?;
+        Ok(Self { bytes, metadata })
     }
 
     #[must_use]
     pub fn meta(&self) -> &SegmentMeta {
-        &self.meta
+        &self.metadata.meta
     }
 
     /// Bloom-only check — `false` means the key is definitely not
@@ -613,13 +687,7 @@ impl<'a> SegmentReader<'a> {
     /// target).
     #[must_use]
     pub fn might_contain(&self, key: u64) -> bool {
-        // Out-of-range fast-path: every segment knows its min/max
-        // PK in the header, so an out-of-range probe doesn't even
-        // need to touch the bloom.
-        if key < self.meta.min_pk || key > self.meta.max_pk {
-            return false;
-        }
-        self.bloom.contains(&key.to_le_bytes())
+        segment_might_contain(&self.metadata, key)
     }
 
     /// Look up `key`. Returns `Some(payload)` if found, `None` if
@@ -628,38 +696,67 @@ impl<'a> SegmentReader<'a> {
     /// default), which is the I/O budget the v5.1 catalog
     /// integration relies on.
     pub fn lookup(&self, key: u64) -> Option<Vec<u8>> {
-        if !self.might_contain(key) {
-            return None;
-        }
-        // Binary-search the page index for the largest entry with
-        // `first_pk <= key`.
-        let candidate = match self
-            .page_index
-            .binary_search_by(|entry| entry.first_pk.cmp(&key))
-        {
-            Ok(i) => i,
-            Err(0) => return None,
-            Err(i) => i - 1,
-        };
-        let entry = self.page_index[candidate];
-        let page_off = self.pages_start_offset + entry.file_offset as usize;
-        let page_end = page_off + self.meta.page_size_bytes as usize;
-        if page_end > self.bytes.len() - FOOTER_LEN {
-            return None;
-        }
-        let page = &self.bytes[page_off..page_end];
-        decode_page_lookup(page, key)
+        segment_lookup(&self.metadata, self.bytes, key)
     }
 
     /// Iterate all (key, payload) pairs in sorted order. Used by
     /// `scan`-shaped queries and by compaction.
     pub fn scan(&self) -> impl Iterator<Item = (u64, Vec<u8>)> + '_ {
-        let page_size = self.meta.page_size_bytes as usize;
-        (0..self.meta.num_pages as usize).flat_map(move |i| {
-            let off = self.pages_start_offset + i * page_size;
-            let page = &self.bytes[off..off + page_size];
-            decode_page_iter(page)
-        })
+        segment_scan(&self.metadata, self.bytes)
+    }
+}
+
+/// Owned segment — bytes + parsed metadata in a single struct, no
+/// borrow lifetimes. The catalog (v5.1+) holds a
+/// `Vec<OwnedSegment>` for its cold tier so each lookup parses
+/// nothing fresh; the `lookup` / `might_contain` / `scan` calls
+/// here share the same module-private implementation as
+/// [`SegmentReader`].
+///
+/// File I/O lives outside this struct — `spg-storage` is `no_std`,
+/// so callers (e.g. `spg-server`) load the segment via
+/// `std::fs::read` and hand the resulting `Vec<u8>` to
+/// [`OwnedSegment::from_bytes`].
+#[derive(Debug, Clone)]
+pub struct OwnedSegment {
+    bytes: Vec<u8>,
+    metadata: SegmentMetadata,
+}
+
+impl OwnedSegment {
+    /// Parse and validate a segment from owned bytes. The bytes
+    /// stay resident inside the returned `OwnedSegment` for the
+    /// life of that value. Validation cost is paid once; per-
+    /// lookup cost is identical to [`SegmentReader::lookup`].
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SegmentError> {
+        let metadata = parse_segment_metadata(&bytes)?;
+        Ok(Self { bytes, metadata })
+    }
+
+    #[must_use]
+    pub fn meta(&self) -> &SegmentMeta {
+        &self.metadata.meta
+    }
+
+    #[must_use]
+    pub fn might_contain(&self, key: u64) -> bool {
+        segment_might_contain(&self.metadata, key)
+    }
+
+    pub fn lookup(&self, key: u64) -> Option<Vec<u8>> {
+        segment_lookup(&self.metadata, &self.bytes, key)
+    }
+
+    pub fn scan(&self) -> impl Iterator<Item = (u64, Vec<u8>)> + '_ {
+        segment_scan(&self.metadata, &self.bytes)
+    }
+
+    /// Raw segment bytes — exposed for callers that want to write
+    /// the segment back to disk or hand it to a checksum tool.
+    /// Read-only.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -936,6 +1033,83 @@ mod tests {
         match encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES) {
             Err(SegmentError::BadShape(_)) => {}
             other => panic!("expected BadShape for too-large row, got {other:?}"),
+        }
+    }
+
+    // --- OwnedSegment (v5.1 catalog cold-tier wrapper) -----------
+
+    #[test]
+    fn owned_segment_lookup_matches_reader_for_every_key() {
+        let rows = build_rows(500);
+        let expected: Vec<_> = rows.clone();
+        let (bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        let bytes_len = bytes.len();
+        // Reader sees a borrowed view; collect its outputs before
+        // moving the buffer into the owned variant.
+        let (r_meta_num_rows, r_meta_min_pk, r_meta_max_pk, r_lookups, r_scan) = {
+            let reader = SegmentReader::open(&bytes).unwrap();
+            let lookups: Vec<_> = expected.iter().map(|(k, _)| reader.lookup(*k)).collect();
+            let scan: Vec<_> = reader.scan().collect();
+            (
+                reader.meta().num_rows,
+                reader.meta().min_pk,
+                reader.meta().max_pk,
+                lookups,
+                scan,
+            )
+        };
+        let owned = OwnedSegment::from_bytes(bytes).unwrap();
+        for ((key, expected_payload), reader_payload) in expected.iter().zip(r_lookups.iter()) {
+            assert_eq!(reader_payload.as_ref(), Some(expected_payload));
+            assert_eq!(owned.lookup(*key).as_ref(), Some(expected_payload));
+        }
+        // Reader and owned report identical meta + cover identical scan output.
+        assert_eq!(r_meta_num_rows, owned.meta().num_rows);
+        assert_eq!(r_meta_min_pk, owned.meta().min_pk);
+        assert_eq!(r_meta_max_pk, owned.meta().max_pk);
+        let o_scan: Vec<_> = owned.scan().collect();
+        assert_eq!(r_scan, o_scan);
+        assert_eq!(owned.bytes().len(), bytes_len);
+    }
+
+    #[test]
+    fn owned_segment_might_contain_matches_reader() {
+        let rows = build_rows(64);
+        let (bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        let probes = [0u64, 1, 50, 127, 128, 200];
+        let reader_results: Vec<bool> = {
+            let reader = SegmentReader::open(&bytes).unwrap();
+            probes.iter().map(|k| reader.might_contain(*k)).collect()
+        };
+        let owned = OwnedSegment::from_bytes(bytes).unwrap();
+        for (key, r_hit) in probes.iter().zip(reader_results.iter()) {
+            assert_eq!(*r_hit, owned.might_contain(*key));
+        }
+    }
+
+    #[test]
+    fn owned_segment_rejects_bad_bytes_at_construction() {
+        // Construct + flip header byte → from_bytes should refuse.
+        let rows = build_rows(8);
+        let (mut bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        bytes[0] ^= 0xff; // smash magic
+        match OwnedSegment::from_bytes(bytes) {
+            Err(SegmentError::BadMagic { .. }) => {}
+            other => panic!("expected BadMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owned_segment_lookup_returns_none_for_missing_key() {
+        let rows = build_rows(100); // keys = 2i+1 → 1..199
+        let (bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        let owned = OwnedSegment::from_bytes(bytes).unwrap();
+        // Gap (even) keys + out-of-range keys.
+        for key in [0u64, 2, 50, 198, 200, 9999] {
+            assert!(
+                owned.lookup(key).is_none(),
+                "expected None for non-inserted key {key}, got Some"
+            );
         }
     }
 }

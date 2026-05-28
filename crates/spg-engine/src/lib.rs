@@ -13,6 +13,7 @@ pub mod users;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -1426,27 +1427,48 @@ impl Engine {
         }
 
         // Index seek: if WHERE is `col = literal` (or commuted) and the
-        // referenced column has an index, iterate only the matching row
-        // indices. Otherwise fall back to a full scan.
-        let candidate_rows: Vec<usize> = stmt
+        // referenced column has an index, dispatch each locator through
+        // the catalog (hot tier → borrow, cold tier → page-read +
+        // decode) and iterate just those rows. Otherwise fall back to a
+        // full scan over the hot tier (cold-tier rows are only reached
+        // via index seek in v5.1 — full table scans against cold-tier
+        // data ship in v5.2 with the freezer's per-segment scan API).
+        let indexed_rows: Option<Vec<Cow<'_, Row>>> = stmt
             .where_
             .as_ref()
-            .and_then(|w| try_index_seek(w, schema_cols, table, alias))
-            .unwrap_or_else(|| (0..table.row_count()).collect());
+            .and_then(|w| try_index_seek(w, schema_cols, self.active_catalog(), table, alias));
 
         // Aggregate path: filter rows first, then hand off to the
         // aggregate executor which does its own projection + ORDER BY.
         if aggregate::uses_aggregate(stmt) {
             let mut filtered: Vec<&Row> = Vec::new();
-            for &i in &candidate_rows {
-                let row = &table.rows()[i];
-                if let Some(where_expr) = &stmt.where_ {
-                    let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
-                    if !matches!(cond, Value::Bool(true)) {
-                        continue;
+            // Cold-tier rows are owned inside `indexed_rows`'s `Cow`,
+            // so we keep the Vec alive across the loop and borrow into
+            // it. `filtered` borrows from one of two backing stores.
+            if let Some(rows) = &indexed_rows {
+                for cow in rows {
+                    let row = cow.as_ref();
+                    if let Some(where_expr) = &stmt.where_ {
+                        let cond =
+                            self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
+                        if !matches!(cond, Value::Bool(true)) {
+                            continue;
+                        }
                     }
+                    filtered.push(row);
                 }
-                filtered.push(row);
+            } else {
+                for i in 0..table.row_count() {
+                    let row = &table.rows()[i];
+                    if let Some(where_expr) = &stmt.where_ {
+                        let cond =
+                            self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
+                        if !matches!(cond, Value::Bool(true)) {
+                            continue;
+                        }
+                    }
+                    filtered.push(row);
+                }
             }
             let mut agg = aggregate::run(stmt, &filtered, schema_cols, Some(alias))?;
             apply_offset_and_limit(&mut agg.rows, stmt.offset, stmt.limit);
@@ -1461,16 +1483,16 @@ impl Engine {
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
         let mut tagged: Vec<(Option<f64>, Row)> = Vec::new();
-        for (loop_idx, &i) in candidate_rows.iter().enumerate() {
-            // v4.5: cooperative cancel checkpoint every 256 rows.
+        // Inline the per-row work in a closure so the indexed and full-
+        // scan branches share the body.
+        let mut process_row = |row: &Row, loop_idx: usize| -> Result<(), EngineError> {
             if loop_idx.is_multiple_of(256) {
                 cancel.check()?;
             }
-            let row = &table.rows()[i];
             if let Some(where_expr) = &stmt.where_ {
                 let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
                 if !matches!(cond, Value::Bool(true)) {
-                    continue;
+                    return Ok(());
                 }
             }
             let mut values = Vec::with_capacity(projection.len());
@@ -1484,6 +1506,16 @@ impl Engine {
                 None
             };
             tagged.push((order_key, Row::new(values)));
+            Ok(())
+        };
+        if let Some(rows) = &indexed_rows {
+            for (loop_idx, cow) in rows.iter().enumerate() {
+                process_row(cow.as_ref(), loop_idx)?;
+            }
+        } else {
+            for i in 0..table.row_count() {
+                process_row(&table.rows()[i], i)?;
+            }
         }
 
         if let Some(order) = &stmt.order_by {
@@ -1893,12 +1925,13 @@ fn materialise_in_order(
     })
 }
 
-fn try_index_seek(
+fn try_index_seek<'a>(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],
-    table: &Table,
+    catalog: &'a Catalog,
+    table: &'a Table,
     table_alias: &str,
-) -> Option<Vec<usize>> {
+) -> Option<Vec<Cow<'a, Row>>> {
     let Expr::Binary {
         lhs,
         op: BinOp::Eq,
@@ -1911,17 +1944,31 @@ fn try_index_seek(
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
     let key = IndexKey::from_value(&value)?;
-    // v5.1: `lookup_eq` returns `&[RowLocator]`. Pre-v5.2 indices contain
-    // only `Hot(_)` entries (no freezer has run); filter through `as_hot`
-    // here so the downstream `table.rows.get(idx)` call site stays
-    // unchanged. v5.1 step 3 introduces a cold-aware `Catalog::lookup_by_pk`
-    // for the hot/cold dispatching path; this seek stays hot-only.
-    Some(
-        idx.lookup_eq(&key)
-            .iter()
-            .filter_map(spg_storage::RowLocator::as_hot)
-            .collect(),
-    )
+    let locators = idx.lookup_eq(&key);
+    let table_name = table.schema().name.as_str();
+    // v5.1: each locator dispatches to either the hot tier (zero-
+    // copy borrow of `table.rows()[i]`) or a cold-tier segment
+    // (one page read + dense row decode, ~µs scale). Cold rows are
+    // returned as `Cow::Owned` so the caller's `&Row` iteration
+    // doesn't see a tier distinction; pre-freezer (no cold
+    // segments loaded) every locator is `Hot` and every entry is
+    // `Cow::Borrowed` — identical cost to the pre-v5.1 path.
+    let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(locators.len());
+    for loc in locators {
+        match *loc {
+            spg_storage::RowLocator::Hot(i) => {
+                if let Some(row) = table.rows().get(i) {
+                    out.push(Cow::Borrowed(row));
+                }
+            }
+            spg_storage::RowLocator::Cold { segment_id, .. } => {
+                if let Some(row) = catalog.resolve_cold_locator(table_name, segment_id, &key) {
+                    out.push(Cow::Owned(row));
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 fn resolve_col_literal_pair(
@@ -3140,7 +3187,7 @@ fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &m
         {
             let alias = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
             let cols = &table.schema().columns;
-            if try_index_seek(w, cols, table, alias).is_some() {
+            if try_index_seek(w, cols, engine.active_catalog(), table, alias).is_some() {
                 tag.push_str(" [index seek]");
             } else {
                 tag.push_str(" [full scan]");
