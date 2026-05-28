@@ -548,8 +548,18 @@ fn row_1_11_in_memory_consistency_covered_by_e2e() {
         "main.rs must declare the SPG_DISABLE_WAL_PREFLIGHT knob"
     );
     assert!(
-        main_src.contains("append_wal_v3_auto_commit"),
-        "main.rs must use the v4.41 single-record v3 wrap for the implicit auto-commit"
+        main_src.contains("WAL_V3_TYPE_AUTO_COMMIT_SQL")
+            && main_src.contains("encode_wal_v3_record"),
+        "main.rs must use the v4.41 single-record v3 framing for the implicit auto-commit \
+         (WAL_V3_TYPE_AUTO_COMMIT_SQL + encode_wal_v3_record)"
+    );
+    assert!(
+        main_src.contains("append_wal_v3_group"),
+        "main.rs must batch the v3 auto-commit fsync via append_wal_v3_group (v4.42 group commit)"
+    );
+    assert!(
+        main_src.contains("run_leader_commit_round"),
+        "main.rs must implement the v4.42 commit-barrier leader (run_leader_commit_round)"
     );
     assert!(
         main_src.contains("needs_wrap"),

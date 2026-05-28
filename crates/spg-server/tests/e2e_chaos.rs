@@ -26,6 +26,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -513,5 +515,139 @@ fn chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state() {
     assert_eq!(
         after, accepted,
         "post-restart count must match what was CC'd before the real ENOSPC"
+    );
+}
+
+// ---- chaos 6 (v4.42): multi-client ENOSPC fan-out ----
+
+/// v4.42 group-commit ENOSPC invariant. 4 client threads stream
+/// INSERTs concurrently against a server with a tight WAL quota
+/// (and preflight disabled so the real append path is exercised).
+/// When the elected leader's batched `fsync` overshoots the quota,
+/// the leader calls `replace_catalog(pre_image)` to undo every
+/// task in that group at once and acks each survivor with the WAL
+/// error. Two invariants must hold:
+///
+/// 1. **Every writer in the failed group sees the same ENOSPC**
+///    — clients can't observe a "half-written" group where some
+///    threads got CC and others got `wal quota`. Each thread's
+///    `accepted_count` is bounded by the durable state.
+///
+/// 2. **No phantom rows** — `sum(accepted_count_per_thread) ==
+///    SELECT count(*)` both live and after restart. The
+///    rolled-back group's mutations are gone from `engine.catalog`
+///    and were never durably appended to the WAL, so the v4.34
+///    "durable state matches live state" invariant generalises
+///    from single-client to N-client group commit.
+#[test]
+fn chaos_disk_full_multi_client_group_rollback_all_writers() {
+    const THREADS: usize = 4;
+    const PER_THREAD: usize = 50;
+
+    let dir = unique_tmpdir("nospc-multi");
+    let db = dir.join("a.db");
+    let wal = dir.join("a.wal");
+    let addr = pick_free_addr();
+
+    // Quota: large enough for CREATE TABLE + some inserts, then
+    // ENOSPC. Group commit means many `fsync`s coalesce into one
+    // append, so the cap must clear at least a few rounds of
+    // group commits before tripping. 1500 bytes lets ~80 rows
+    // through (each v3 record is 9-byte header + ~25-byte SQL =
+    // ~34 bytes; plus the CREATE TABLE preamble) and then
+    // refuses the next group atomically.
+    let quota = "1500".to_string();
+    let mut c = ChildGuard(spawn_server(
+        &addr,
+        &db,
+        &wal,
+        &[
+            ("SPG_FAIL_WAL_QUOTA_BYTES", quota),
+            ("SPG_DISABLE_WAL_PREFLIGHT", "1".to_string()),
+        ],
+    ));
+    let mut setup = wait_for_listener(&addr, &mut c.0);
+    setup.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    exec_ok(
+        &mut setup,
+        "CREATE TABLE q (tid INT NOT NULL, i INT NOT NULL)",
+    );
+    drop(setup);
+
+    let accepted_total = Arc::new(AtomicUsize::new(0));
+    let any_rejected = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(THREADS);
+    for t in 0..THREADS {
+        let addr = addr.clone();
+        let accepted_total = Arc::clone(&accepted_total);
+        let any_rejected = Arc::clone(&any_rejected);
+        handles.push(thread::spawn(move || {
+            let mut s = TcpStream::connect(&addr).expect("connect");
+            s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+            let mut local_ok = 0usize;
+            for i in 0..PER_THREAD {
+                match run_query(&mut s, &format!("INSERT INTO q VALUES ({t}, {i})")) {
+                    Outcome::Ok => local_ok += 1,
+                    Outcome::Error(msg) => {
+                        assert!(
+                            msg.contains("wal quota") || msg.contains("WAL"),
+                            "thread {t} insert {i}: expected wal-quota error, got: {msg:?}"
+                        );
+                        any_rejected.fetch_add(1, Ordering::Relaxed);
+                        // The dispatch path returns the WAL
+                        // error to the client and then closes
+                        // the connection (v4.41.1 behaviour
+                        // kept by v4.42 — same as the single-
+                        // client chaos test). Stop pushing more
+                        // INSERTs on this socket; the live
+                        // SELECT below uses a fresh connection.
+                        break;
+                    }
+                }
+            }
+            accepted_total.fetch_add(local_ok, Ordering::Relaxed);
+        }));
+    }
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+    assert!(
+        any_rejected.load(Ordering::Relaxed) > 0,
+        "quota never fired under group commit — multi-client ENOSPC path not exercised",
+    );
+    let accepted = i64::try_from(accepted_total.load(Ordering::Relaxed)).unwrap();
+    assert!(
+        accepted > 0,
+        "no INSERT got CC before the quota tripped — quota was too tight or wiring broke",
+    );
+
+    // Live count must equal the sum of CC'd inserts across all
+    // threads. If any rolled-back group had mutated `self.catalog`
+    // without being undone, `live` would exceed `accepted`.
+    let mut probe = TcpStream::connect(&addr).expect("server still listening");
+    probe.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let live = select_int(&mut probe, "SELECT count(*) FROM q");
+    assert_eq!(
+        live, accepted,
+        "v4.42 multi-client invariant broken: live catalog has {live} rows but only \
+         {accepted} INSERTs received CC. A failed group left phantoms in memory.",
+    );
+
+    // Restart without the quota / preflight knob. WAL replay
+    // should yield exactly `accepted` rows — no phantom from the
+    // rolled-back groups, no double-apply.
+    drop(probe);
+    let _ = c.0.kill();
+    let _ = c.0.wait();
+    thread::sleep(Duration::from_millis(200));
+    let addr2 = pick_free_addr();
+    let mut c2 = ChildGuard(spawn_server(&addr2, &db, &wal, &[]));
+    let mut s2 = wait_for_listener(&addr2, &mut c2.0);
+    s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let after = select_int(&mut s2, "SELECT count(*) FROM q");
+    assert_eq!(
+        after, accepted,
+        "post-restart count must match the sum of multi-client CC'd writes \
+         (durable WAL never saw a rolled-back group)",
     );
 }

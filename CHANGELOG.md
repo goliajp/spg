@@ -10,6 +10,95 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [4.42.0] — 2026-05-28 (group commit at the commit barrier — multi-client throughput unlock)
+
+### What changed
+
+  v4.34..v4.41.1 held `engine.write()` across the entire auto-
+  commit wrap (BEGIN..stmt..WAL..COMMIT), so N concurrent writers
+  serialised on the engine RwLock and each paid their own fsync.
+  v4.42 introduces a commit-barrier queue: dispatch threads push
+  `(sql, cancel_flag, ack)` onto a shared `Mutex<VecDeque>` and
+  wait on the task's ack channel. The first arriving task flips
+  `leader_active = true` and drives a *rolling group commit*:
+
+    1. Snapshot `pre_image = engine.catalog().clone()`           (O(1) PV/PB)
+    2. Drain up to `SPG_COMMIT_GROUP_MAX` (default 16) tasks from
+       the queue (with optional `SPG_COMMIT_DELAY_US` spin window
+       letting more writers arrive before forming a group)
+    3. Under one `engine.write()`, for each task sequentially:
+         alloc_tx_id → BEGIN → execute_in(sql) → COMMIT
+       so per-task mutations accumulate into shared catalog state
+       (each task's BEGIN clones the *previous* task's commit, not
+       the group-start snapshot — fixes a row-loss bug where the
+       last task's slot used to overwrite all preceding ones).
+    4. Release engine lock; batch all survivors' framed v3 WAL
+       bytes into one `write_all` + one `sync_data` via
+       `append_wal_v3_group`. Quota / disk-water-mark checks happen
+       once for the whole batch.
+    5. On fsync error, re-acquire `engine.write()` and call
+       `engine.replace_catalog(pre_image)` — undoes every in-memory
+       commit from step 3 at once, so live state matches durable
+       state. Ack every survivor with `wal_outcome = Err` so each
+       client sees the "WAL append failed: ..." error and SELECT
+       observes zero phantom rows.
+    6. Loop back: re-check queue (rolling drain) until empty, then
+       flip `leader_active = false` and exit.
+
+### Why the SemVer didn't bump
+
+  No frozen-surface change. `commit_queue` is internal to spg-
+  server; the WAL on-disk format stays at v3 (`encode_wal_v3_record`
+  unchanged); the engine adds `Engine::replace_catalog(Catalog)`
+  but every prior API is intact. v4.41 fixtures still replay.
+
+### New env knobs
+
+  SPG_COMMIT_GROUP_MAX  (default 16) — max tasks per group
+  SPG_COMMIT_DELAY_US   (default 0)  — leader spin window for queue
+                                       filling; honest default is 0
+                                       (group of 1 = v4.41.1 latency).
+                                       Multi-client benches set ~200 µs.
+
+### New tests
+
+  crates/spg-server/tests/e2e_group_commit.rs
+    single_client_group_of_one_no_latency_tax     — group-of-1 path
+    four_client_concurrent_inserts_all_durable    — 4 × 25 INSERTs
+
+  crates/spg-server/tests/e2e_chaos.rs
+    chaos_disk_full_multi_client_group_rollback_all_writers
+                                                  — ENOSPC fan-out
+
+  crates/spg-server/tests/slo_smoke.rs
+    slo_wal_insert_multi_client_p99_under_budget       — 4-client p99
+    slo_wal_insert_4client_throughput_above_floor      — aggregate r/s
+
+  xbench/competitor/src/bin/concurrent_sweep.rs    — bench harness
+
+### Watchpoints kept hot
+
+  - **Group of 1 = no latency tax**: when only one task is queued
+    the leader proceeds immediately; group-of-1 wall time matches
+    v4.41.1 (slo_wal_insert_p99_under_budget 1 s ceiling unchanged).
+  - **ENOSPC fan-out**: every writer in the failed group sees the
+    same `wal quota` error; no phantom rows survive.
+  - **Pre-image rollback**: `replace_catalog` only touches
+    `self.catalog`, never `tx_catalogs` / `current_tx`, so a
+    concurrent client's explicit-TX slot is unaffected.
+
+### Files touched
+
+  crates/spg-engine/src/lib.rs            (+25 — alloc_tx_id doc + replace_catalog)
+  crates/spg-server/src/main.rs           (≈ +320 — leader + helpers)
+  crates/spg-server/tests/e2e_group_commit.rs   (new file, 280 lines)
+  crates/spg-server/tests/e2e_chaos.rs          (+100 — multi-client chaos)
+  crates/spg-server/tests/slo_smoke.rs          (+150 — multi-client SLOs)
+  crates/spg-server/tests/prod_ready.rs         (~10 lines — v4.42 evidence)
+  xbench/competitor/src/bin/concurrent_sweep.rs (new file, 270 lines)
+
+---
+
 ## [4.41.0] — 2026-05-28 (WAL v3 framing — auto-commit wrap merge, 35→9 byte header)
 
 ### What the v3 frame is
