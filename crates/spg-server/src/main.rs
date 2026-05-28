@@ -231,7 +231,20 @@ pub(crate) struct ServerState {
     /// check once every spec has been loaded.
     cold_preload: Vec<ColdPreloadSpec>,
     cold_preload_done: AtomicBool,
+    /// v5.2.1: hot-tier byte budget in bytes. Parsed from
+    /// `SPG_HOT_TIER_BYTES` at startup; defaults to 4 GiB
+    /// (`DEFAULT_HOT_TIER_BYTES`). v5.2.1 ships as measurement only —
+    /// the value is exposed via `/metrics` (`spg_hot_tier_bytes_budget`)
+    /// alongside the live `Catalog::hot_tier_bytes()` reading
+    /// (`spg_hot_tier_bytes_used`) so operators can chart how close
+    /// the workload runs to the budget. v5.2.2 wires this as the
+    /// freezer wake-up threshold.
+    pub(crate) hot_tier_byte_budget: u64,
 }
+
+/// Default `SPG_HOT_TIER_BYTES` when the env var is unset / invalid —
+/// 4 GiB, matching the `V5_DESIGN.md` L2 row for v5.2.
+pub(crate) const DEFAULT_HOT_TIER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// v5.1: one entry in the `SPG_PRELOAD_COLD_SEGMENT` queue —
 /// `table:index:path`. Loaded once and never reloaded; `loaded`
@@ -605,6 +618,8 @@ fn run(
     };
     let cold_preload = parse_cold_preload_env();
     let cold_preload_done = AtomicBool::new(cold_preload.is_empty());
+    let hot_tier_byte_budget =
+        parse_env_u64("SPG_HOT_TIER_BYTES").unwrap_or(DEFAULT_HOT_TIER_BYTES);
     let state = Arc::new(ServerState {
         engine: RwLock::new(engine),
         db_path,
@@ -624,6 +639,7 @@ fn run(
         lag_state: Arc::new(replication::LagState::default()),
         cold_preload,
         cold_preload_done,
+        hot_tier_byte_budget,
     });
 
     let listener = TcpListener::bind(addr)?;

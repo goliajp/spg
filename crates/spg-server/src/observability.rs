@@ -194,7 +194,32 @@ fn render_metrics(state: &crate::ServerState) -> String {
     ));
     render_table_metrics(state, &mut out);
     render_replication_lag(state, &mut out);
+    render_hot_tier(state, &mut out);
     out
+}
+
+/// v5.2.1 — hot-tier byte counters. `spg_hot_tier_bytes_used` is the
+/// catalog-wide sum of every table's `hot_bytes()` (the encoded byte
+/// size of currently in-RAM rows). `spg_hot_tier_bytes_budget` is the
+/// configured cap (`SPG_HOT_TIER_BYTES`, default 4 GiB). v5.2.1 ships
+/// these as measurement only — v5.2.2 will use the same `used / budget`
+/// comparison to wake the freezer thread.
+fn render_hot_tier(state: &crate::ServerState, out: &mut String) {
+    let used = match state.engine.read() {
+        Ok(engine) => engine.catalog().hot_tier_bytes(),
+        Err(_) => return,
+    };
+    out.push_str("# HELP spg_hot_tier_bytes_used Encoded byte size of hot-tier rows (v5.2.1)\n");
+    out.push_str("# TYPE spg_hot_tier_bytes_used gauge\n");
+    out.push_str(&format!("spg_hot_tier_bytes_used {used}\n"));
+    out.push_str(
+        "# HELP spg_hot_tier_bytes_budget Hot-tier byte budget configured via SPG_HOT_TIER_BYTES\n",
+    );
+    out.push_str("# TYPE spg_hot_tier_bytes_budget gauge\n");
+    out.push_str(&format!(
+        "spg_hot_tier_bytes_budget {}\n",
+        state.hot_tier_byte_budget
+    ));
 }
 
 /// v4.36 follower-side replication lag. Emits two series:
