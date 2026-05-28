@@ -1239,6 +1239,7 @@ name = "spg-storage"
 version = "1.0.0"
 dependencies = [
  "criterion",
+ "spg-crypto",
 ]
 
 [[package]]

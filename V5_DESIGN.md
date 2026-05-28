@@ -129,27 +129,48 @@ The plan is linear, TDD-style, no branches. Each step ends with
 a verification command; checkpoint to next step only after the
 verify is green.
 
-### Step 1 — `BloomFilter<K: Hash>` standalone
+### Step 1 — `BloomFilter` standalone (byte-keyed)
 
   - File: `crates/spg-storage/src/bloom.rs`
-  - Struct: `pub struct BloomFilter { bits: Vec<u64>, num_hashes: u32 }`
+  - Struct: `pub struct BloomFilter { bits: Vec<u64>, num_bits: u64, num_hashes: u32 }`
   - Constructor: `with_target_fp_rate(num_items: usize, fp_rate: f64) -> Self`
-    sizes `bits.len()` from the standard formula
-    `m = -(n * ln(p)) / (ln(2))^2`; rounds up to next u64.
-  - Methods: `insert(&self, k: &K)`, `contains(&self, k: &K) -> bool`.
-  - Hash mixing: two `DefaultHasher` runs, double-hashing
-    (`h1 + i * h2`) to derive `num_hashes` indices — keeps
-    "no new deps" while giving acceptable distribution.
+    sizes from the standard formula `m = -(n × ln p) / (ln 2)^2`;
+    rounds up to the next u64 boundary; `k = ⌈m/n × ln 2⌉` clamped
+    to `[1, 32]`.
+  - Methods: `insert(&mut self, key: &[u8])`,
+    `contains(&self, key: &[u8]) -> bool`.
+  - Hash mixing: **FNV-1a 64-bit + SplitMix64**. spg-storage is
+    `#![no_std]`, so `std::collections::hash_map::DefaultHasher`
+    is out of reach; pulling `ahash` / `wyhash` would break the
+    0-deps rule. FNV-1a is 0-deps, no_std-safe, deterministic,
+    and acceptable for bloom-filter hashing (hash quality
+    requirements are bounded by the bloom's own FP rate, not by
+    cryptographic distribution). Mixing:
+
+        h1 = fnv1a_64(key)
+        h2 = splitmix64(h1)
+        for i in 0..num_hashes:
+            bit_idx = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % num_bits
+            set bit
+
+    Both functions are `const fn`-compatible u64 arithmetic.
+    Double-hashing via SplitMix64-scrambled secondary is the
+    Kirsch–Mitzenmacher technique — gives independent bit
+    placements with one structural hash, no need for a second
+    hash pass over the key bytes.
+
   - Serialise / deserialise: `to_bytes() -> Vec<u8>`,
     `from_bytes(&[u8]) -> Result<Self, BloomError>` — header
-    (magic + num_bits + num_hashes + crc32 of body) + raw u64 bits.
+    `[magic u32 = 0xB100_F11E][num_bits u64][num_hashes u32]
+    [crc32 u32 over body]` + raw u64 bits (little-endian).
 
   **Verify:**
 
     cargo test -p spg-storage --lib bloom -- --nocapture
 
-  with a `fuzz_oracle` that inserts 100K random `u64` and asserts
-  false-positive rate ≤ 1.2 × target on 100K disjoint probes.
+  with a `fuzz_oracle` that inserts 100K deterministic u64 keys
+  (seeded `splitmix64` rng) and asserts false-positive rate
+  ≤ 1.2 × target on 100K disjoint probe keys.
 
 ### Step 2 — `Segment` file writer
 
