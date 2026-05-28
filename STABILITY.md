@@ -118,6 +118,19 @@ frame's extension point):
   commit is semantically equivalent to the v4.34 `[BEGIN, sql,
   COMMIT]` block the writer expressed, with the header overhead
   reduced from 35 to 9 bytes per write.
+- `0x02` — `durability_checkpoint` (v5.4): payload = `[u64 LE
+  byte_offset]`, the WAL byte position where this marker frame
+  began (i.e. how many WAL bytes preceded it). Semantics: "every
+  WAL byte before this marker had successfully reached `fsync`
+  at the time the marker was written." Emitted by the flusher
+  thread in async-commit mode (`SPG_SYNCHRONOUS_COMMIT=off`,
+  v5.4.1+) every N records or N microseconds. **Replay treats
+  this as a no-op** — engine state is not mutated, the user-
+  SQL `applied` counter does not increment, the recorded offset
+  is cross-checked against the frame's actual position in the
+  WAL (mismatch logs a stderr warning but replay continues).
+  Total frame size = 17 bytes (4 sentinel+len + 4 CRC + 1 type
+  + 8 payload).
 
 Backwards-compat rule: every v4.x release accepts every WAL
 record format ever written. `tests/cross_version_compat.rs`

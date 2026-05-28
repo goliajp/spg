@@ -1696,6 +1696,17 @@ pub(crate) const WAL_V3_SENTINEL: u32 = WAL_V2_SENTINEL | WAL_V3_FLAG;
 /// future record kinds (binary INSERT, multi-row batch, snapshot
 /// marker) can all share the v3 frame without another sentinel.
 pub(crate) const WAL_V3_TYPE_AUTO_COMMIT_SQL: u8 = 0x01;
+/// v5.4.0 — durability checkpoint marker. Payload is `[u64 LE
+/// byte_offset]`, the WAL byte position where this marker frame
+/// starts (i.e. how many bytes of WAL preceded it). Semantics:
+/// "every WAL byte before this marker had successfully reached
+/// `fsync` at the time the marker was written." The flusher
+/// thread in async-commit mode (v5.4.1+) emits one every N
+/// records or N microseconds. Replay treats this as a no-op
+/// (engine state isn't mutated); the marker is purely metadata
+/// for crash-recovery debugging and chaos tests that need to
+/// know how much of an async-commit window was durable on kill.
+pub(crate) const WAL_V3_TYPE_DURABILITY_CHECKPOINT: u8 = 0x02;
 
 fn encode_wal_record(sql: &str) -> std::io::Result<Vec<u8>> {
     let len = u32::try_from(sql.len())
@@ -1746,6 +1757,76 @@ fn encode_wal_v3_record(type_tag: u8, payload: &[u8]) -> std::io::Result<Vec<u8>
 /// 9 + sql bytes — same quota check, smaller footprint.
 fn wal_v3_auto_commit_size(sql: &str) -> u64 {
     9u64 + sql.len() as u64
+}
+
+/// v5.4.0 — encode a `durability_checkpoint` v3 record. Payload
+/// is the 8-byte LE WAL byte offset where this marker frame
+/// starts (i.e. the WAL file length *before* this marker is
+/// appended). The framed wrap is the standard v3 envelope:
+///
+///   `[u32 (len=8 | 0xC000_0000)] [u32 crc32(type || payload)] [type=0x02] [u64 LE byte_offset]`
+///
+/// Total frame size = 17 bytes. CRC covers `[type || payload]`,
+/// matching every other v3 frame.
+fn encode_durability_marker(byte_offset: u64) -> std::io::Result<Vec<u8>> {
+    encode_wal_v3_record(
+        WAL_V3_TYPE_DURABILITY_CHECKPOINT,
+        &byte_offset.to_le_bytes(),
+    )
+}
+
+/// v5.4.0 — append one `durability_checkpoint` marker to the WAL
+/// and `sync_data` so the marker plus every byte preceding it is
+/// confirmed durable. Returns the WAL byte offset where the marker
+/// frame started (= recorded `byte_offset` payload), so callers
+/// (the flusher thread in v5.4.1+) can update durability-lag
+/// metrics by diffing against the WAL's current end-of-file.
+///
+/// Shares the same quota / `wal_min_free_bytes` water-mark check
+/// the auto-commit write path (`append_wal_v3_group`) runs — a
+/// marker that violates the disk-full chaos contract fails the
+/// same way an INSERT would, so the flusher thread can degrade
+/// gracefully. No-WAL servers return `Ok(0)` (nothing to mark).
+#[expect(
+    dead_code,
+    reason = "v5.4.0 ships the wire format + replay path; first non-test caller lands in v5.4.1 when the flusher thread is introduced. `#[expect]` (not `#[allow]`) so rustc surfaces the attribute as soon as a caller appears, forcing it to be removed."
+)]
+fn append_durability_marker(state: &ServerState) -> std::io::Result<u64> {
+    let Some(wal_mutex) = state.wal.as_ref() else {
+        return Ok(0);
+    };
+    let mut wal = wal_mutex
+        .lock()
+        .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
+    let pre_marker_offset = wal.metadata()?.len();
+    let entry = encode_durability_marker(pre_marker_offset)?;
+    if let Some(quota) = state.chaos.wal_quota_bytes
+        && pre_marker_offset.saturating_add(entry.len() as u64) > quota
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            format!(
+                "wal quota exceeded by durability marker: cur={pre_marker_offset} + {} > quota={quota}",
+                entry.len()
+            ),
+        ));
+    }
+    if let Some(min_free) = state.limits.wal_min_free_bytes
+        && let Some(wal_path) = state.wal_path.as_deref()
+    {
+        let free = wal_volume_free_bytes(wal_path)?;
+        if free < min_free {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "WAL volume below water-mark for durability marker: free={free} < SPG_WAL_MIN_FREE_BYTES={min_free}"
+                ),
+            ));
+        }
+    }
+    wal.write_all(&entry)?;
+    wal.sync_data()?;
+    Ok(pre_marker_offset)
 }
 
 /// v4.42 — concatenate already-framed v3 records for a group of
@@ -2208,6 +2289,58 @@ fn wal_volume_free_bytes(path: &Path) -> std::io::Result<u64> {
 /// append) is dropped with a warning to stderr. Non-truncation
 /// errors — engine rejected SQL, bad UTF-8, CRC mismatch, unknown
 /// v3 type — are fatal: the operator must inspect.
+///
+/// v5.4: type-tag dispatch is delegated to `dispatch_v3_record` so
+/// new v3 kinds (like `durability_checkpoint`) extend the namespace
+/// without inflating this function past the per-function line
+/// budget.
+fn dispatch_v3_record(
+    tag: u8,
+    payload: &[u8],
+    frame_off: usize,
+    engine: &mut Engine,
+) -> std::io::Result<bool> {
+    match tag {
+        WAL_V3_TYPE_AUTO_COMMIT_SQL => {
+            let sql = core::str::from_utf8(payload).map_err(|_| {
+                std::io::Error::other("v3 auto_commit_sql payload has non-UTF-8 SQL")
+            })?;
+            engine
+                .execute(sql)
+                .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+            Ok(true)
+        }
+        WAL_V3_TYPE_DURABILITY_CHECKPOINT => {
+            // v5.4.0 — marker is a no-op during replay (engine state
+            // isn't mutated); its purpose is to record "every WAL byte
+            // before this marker was fsynced by the flusher at write
+            // time." Validate payload shape + cross-check the recorded
+            // offset against `frame_off`; a mismatch logs a stderr
+            // warning (would indicate WAL relocation) but replay keeps
+            // going. `Ok(false)` opts the marker out of the user-SQL
+            // applied counter.
+            if payload.len() != 8 {
+                return Err(std::io::Error::other(format!(
+                    "WAL durability_checkpoint at offset {frame_off} has {}-byte payload (expected 8)",
+                    payload.len()
+                )));
+            }
+            let arr: [u8; 8] = payload.try_into().expect("checked len above");
+            let recorded_off = u64::from_le_bytes(arr);
+            let frame_off_u64 = frame_off as u64;
+            if recorded_off != frame_off_u64 {
+                eprintln!(
+                    "spg-server: WAL durability_checkpoint at offset {frame_off} carries recorded_off={recorded_off} — possible WAL relocation; treating marker as no-op"
+                );
+            }
+            Ok(false)
+        }
+        other => Err(std::io::Error::other(format!(
+            "WAL v3 unknown type byte {other:#04x} at offset {frame_off} — refusing to replay"
+        ))),
+    }
+}
+
 fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize> {
     let mut cur = 0;
     let mut applied = 0usize;
@@ -2286,35 +2419,24 @@ fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize>
             }
         }
         // Dispatch by frame version. v1/v2 payload is the SQL text
-        // directly; v3 routes on the type tag, with `auto_commit_sql`
-        // being the only kind v4.41 emits (engine.execute runs the
-        // statement as an implicit auto-commit, matching the
-        // BEGIN..stmt..COMMIT semantics the writer expressed).
-        if let Some(tag) = v3_type_tag {
-            match tag {
-                WAL_V3_TYPE_AUTO_COMMIT_SQL => {
-                    let sql = core::str::from_utf8(payload).map_err(|_| {
-                        std::io::Error::other("v3 auto_commit_sql payload has non-UTF-8 SQL")
-                    })?;
-                    engine.execute(sql).map_err(|e| {
-                        std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}"))
-                    })?;
-                }
-                other => {
-                    return Err(std::io::Error::other(format!(
-                        "WAL v3 unknown type byte {other:#04x} at offset {frame_off} — refusing to replay"
-                    )));
-                }
-            }
+        // directly; v3 routes on the type tag via `dispatch_v3_record`,
+        // which returns `false` only for metadata records (v5.4
+        // `durability_checkpoint`) that shouldn't increment the user-
+        // SQL `applied` counter.
+        let count_as_applied = if let Some(tag) = v3_type_tag {
+            dispatch_v3_record(tag, payload, frame_off, engine)?
         } else {
             let sql = core::str::from_utf8(payload)
                 .map_err(|_| std::io::Error::other("WAL entry has non-UTF-8 SQL"))?;
             engine
                 .execute(sql)
                 .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
-        }
+            true
+        };
         cur += len;
-        applied += 1;
+        if count_as_applied {
+            applied += 1;
+        }
     }
     Ok(applied)
 }
@@ -2802,4 +2924,96 @@ fn write_frame(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
     let mut out = Vec::with_capacity(32);
     encode(frame, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
     stream.write_all(&out)
+}
+
+#[cfg(test)]
+mod wal_v3_durability_marker_tests {
+    use super::{
+        Engine, WAL_V2_SENTINEL, WAL_V3_FLAG, WAL_V3_SENTINEL, WAL_V3_TYPE_AUTO_COMMIT_SQL,
+        WAL_V3_TYPE_DURABILITY_CHECKPOINT, encode_durability_marker, encode_wal_v3_record,
+        replay_wal_bytes,
+    };
+
+    #[test]
+    fn durability_marker_frame_shape_pins_v3_wire() {
+        // Wire-format pin: a marker for byte_offset=0x1234_5678 must
+        // produce the v3 envelope `[sentinel|len=8][crc][type=0x02]
+        // [u64 LE offset]` — 17 bytes total. Any future change to
+        // the frame layout breaks this test, forcing a STABILITY
+        // bump conversation.
+        let bytes = encode_durability_marker(0x1234_5678).unwrap();
+        assert_eq!(bytes.len(), 17, "marker frame must be 17 bytes");
+        let raw_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let len_field = raw_len & !(WAL_V2_SENTINEL | WAL_V3_FLAG);
+        assert_eq!(len_field, 8, "marker payload is 8 bytes (the u64 offset)");
+        assert_eq!(
+            raw_len & WAL_V3_SENTINEL,
+            WAL_V3_SENTINEL,
+            "marker must carry v3 sentinel bits",
+        );
+        assert_eq!(
+            bytes[8], WAL_V3_TYPE_DURABILITY_CHECKPOINT,
+            "type byte must be 0x02",
+        );
+        let offset = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
+        assert_eq!(offset, 0x1234_5678, "payload echoes the offset arg");
+    }
+
+    #[test]
+    fn replay_skips_durability_markers_and_does_not_increment_applied() {
+        // A WAL containing only durability markers replays as a
+        // no-op: applied=0, no engine mutation. Three markers at
+        // different "recorded offsets" — none match the actual
+        // frame_off in this synthetic stream (the first marker is
+        // at byte 0, the others follow), so the consistency check
+        // hits stderr but replay keeps going.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&encode_durability_marker(0).unwrap());
+        stream.extend_from_slice(&encode_durability_marker(17).unwrap());
+        stream.extend_from_slice(&encode_durability_marker(34).unwrap());
+        let mut engine = Engine::new();
+        let applied = replay_wal_bytes(&stream, &mut engine).expect("replay must accept markers");
+        assert_eq!(applied, 0, "markers do not count as applied records");
+    }
+
+    #[test]
+    fn replay_mixes_sql_and_markers_advancing_cursor_correctly() {
+        // Marker interleaved between two CREATE TABLE statements
+        // must not affect cursor accounting: both CREATE TABLEs
+        // apply, marker no-ops, applied=2.
+        let mut stream = Vec::new();
+        let create_a =
+            encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, b"CREATE TABLE a (id INT)").unwrap();
+        let create_b =
+            encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, b"CREATE TABLE b (id INT)").unwrap();
+        let marker_off = create_a.len() as u64;
+        let marker = encode_durability_marker(marker_off).unwrap();
+        stream.extend_from_slice(&create_a);
+        stream.extend_from_slice(&marker);
+        stream.extend_from_slice(&create_b);
+        let mut engine = Engine::new();
+        let applied =
+            replay_wal_bytes(&stream, &mut engine).expect("mixed stream must replay cleanly");
+        assert_eq!(
+            applied, 2,
+            "two CREATE TABLEs applied; marker doesn't count"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_marker_with_wrong_payload_length() {
+        // A v3 frame typed 0x02 but carrying a payload != 8 bytes is
+        // a structural error — replay must surface it, not silently
+        // tolerate it. Forge such a frame via `encode_wal_v3_record`
+        // with a 4-byte payload.
+        let bad =
+            encode_wal_v3_record(WAL_V3_TYPE_DURABILITY_CHECKPOINT, &0u32.to_le_bytes()).unwrap();
+        let mut engine = Engine::new();
+        let err = replay_wal_bytes(&bad, &mut engine).expect_err("4-byte payload must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("durability_checkpoint") && msg.contains("4-byte payload"),
+            "error message should name the malformed marker: got {msg:?}",
+        );
+    }
 }
