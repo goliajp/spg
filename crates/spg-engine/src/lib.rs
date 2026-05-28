@@ -811,6 +811,40 @@ impl Engine {
         stmt: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v5.2.3: if the WHERE is a PK equality and matches a cold-
+        // tier row, promote it back to the hot tier *before* the
+        // hot-row walk. The promote pushes the row to the end of
+        // `table.rows`, where the upcoming SET-evaluation loop will
+        // pick it up and apply the assignments. Lookups for the key
+        // never observe a gap because `promote_cold_row` inserts the
+        // hot row before retiring the cold locator.
+        if let Some(w) = &stmt.where_ {
+            let schema_cols = self
+                .active_catalog()
+                .get(&stmt.table)
+                .ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.table.clone(),
+                    })
+                })?
+                .schema()
+                .columns
+                .clone();
+            if let Some((col_pos, key)) = try_pk_predicate(w, &schema_cols, stmt.table.as_str())
+                && let Some(idx_name) = self
+                    .active_catalog()
+                    .get(&stmt.table)
+                    .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
+            {
+                // Promote may be a no-op (key is hot-only or absent);
+                // we don't care about the return value here — the
+                // subsequent hot walk will either match or not.
+                let _ = self
+                    .active_catalog_mut()
+                    .promote_cold_row(&stmt.table, &idx_name, &key);
+            }
+        }
+
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -879,6 +913,39 @@ impl Engine {
         stmt: &spg_sql::ast::DeleteStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v5.2.3: PK-targeted DELETE → first retire any cold-tier
+        // locator for the key. The cold row body stays in the
+        // segment (becoming shadowed garbage that a future
+        // compaction pass reclaims) but the index no longer
+        // resolves it. The shadow count contributes to the
+        // affected total; the subsequent hot walk handles any hot
+        // rows for the same key.
+        let mut cold_shadow_count: usize = 0;
+        if let Some(w) = &stmt.where_ {
+            let schema_cols = self
+                .active_catalog()
+                .get(&stmt.table)
+                .ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.table.clone(),
+                    })
+                })?
+                .schema()
+                .columns
+                .clone();
+            if let Some((col_pos, key)) = try_pk_predicate(w, &schema_cols, stmt.table.as_str())
+                && let Some(idx_name) = self
+                    .active_catalog()
+                    .get(&stmt.table)
+                    .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
+            {
+                cold_shadow_count = self
+                    .active_catalog_mut()
+                    .shadow_cold_row(&stmt.table, &idx_name, &key)
+                    .unwrap_or(0);
+            }
+        }
+
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -904,7 +971,7 @@ impl Engine {
                 positions.push(i);
             }
         }
-        let affected = table.delete_rows(&positions);
+        let affected = table.delete_rows(&positions) + cold_shadow_count;
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: !self.in_transaction(),
@@ -1967,6 +2034,36 @@ fn try_index_seek<'a>(
         }
     }
     Some(out)
+}
+
+/// v5.2.3: extract `(column_position, IndexKey)` when `where_expr`
+/// is a simple `col = literal` predicate suitable for a `BTree` index
+/// seek. Used by `exec_update_cancel` / `exec_delete_cancel` to
+/// decide whether a write touches a cold-tier row (which requires
+/// promote-on-write / shadow-on-delete) before falling through to
+/// the hot-tier row walk.
+///
+/// Returns `None` for any predicate shape the planner can't push
+/// down to an index seek — complex WHERE clauses always take the
+/// hot-only path (cold rows are immutable to non-indexed writes
+/// until a future scan-fanout sub-version).
+fn try_pk_predicate(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<(usize, IndexKey)> {
+    let Expr::Binary {
+        lhs,
+        op: BinOp::Eq,
+        rhs,
+    } = where_expr
+    else {
+        return None;
+    };
+    let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
+        .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
+    let key = IndexKey::from_value(&value)?;
+    Some((col_pos, key))
 }
 
 fn resolve_col_literal_pair(
