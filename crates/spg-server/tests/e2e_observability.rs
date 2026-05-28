@@ -165,6 +165,112 @@ fn unknown_path_returns_404() {
     assert_eq!(code, 404);
 }
 
+/// v5.2.1 — `/metrics` exposes `spg_hot_tier_bytes_used` (live counter
+/// from `Catalog::hot_tier_bytes()`) and `spg_hot_tier_bytes_budget`
+/// (the configured cap from `SPG_HOT_TIER_BYTES`, default 4 GiB).
+#[test]
+fn metrics_emits_hot_tier_budget_default_4gib() {
+    let native = pick_free_addr();
+    let http = pick_free_addr();
+    let mut child = ChildGuard(spawn_server(&native, &http));
+    let _ = wait_for_listener(&native, &mut child.0);
+    let (code, body) = http_get(&http, "/metrics");
+    assert_eq!(code, 200);
+    let budget_line = body
+        .lines()
+        .find(|l| l.starts_with("spg_hot_tier_bytes_budget "))
+        .expect("budget line emitted");
+    let budget: u64 = budget_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(budget, 4 * 1024 * 1024 * 1024, "default budget is 4 GiB");
+    let used_line = body
+        .lines()
+        .find(|l| l.starts_with("spg_hot_tier_bytes_used "))
+        .expect("used line emitted");
+    let used: u64 = used_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Fresh server, no user tables — empty catalog → used = 0.
+    assert_eq!(used, 0, "fresh server starts with 0 hot bytes");
+}
+
+#[test]
+fn metrics_hot_tier_budget_honors_env_override() {
+    let native = pick_free_addr();
+    let http = pick_free_addr();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
+    cmd.arg(&native)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("SPG_HTTP_ADDR", &http)
+        .env("SPG_HOT_TIER_BYTES", "1048576") // 1 MiB
+        .env_remove("SPG_PASSWORD")
+        .env_remove("SPG_ADMIN_PASSWORD");
+    let mut child = ChildGuard(cmd.spawn().unwrap());
+    let _ = wait_for_listener(&native, &mut child.0);
+    let (code, body) = http_get(&http, "/metrics");
+    assert_eq!(code, 200);
+    let line = body
+        .lines()
+        .find(|l| l.starts_with("spg_hot_tier_bytes_budget "))
+        .expect("budget line emitted");
+    assert!(
+        line.ends_with(" 1048576"),
+        "budget honors SPG_HOT_TIER_BYTES override; got {line:?}"
+    );
+}
+
+#[test]
+fn metrics_hot_tier_used_grows_after_insert() {
+    let native = pick_free_addr();
+    let http = pick_free_addr();
+    let mut child = ChildGuard(spawn_server(&native, &http));
+    let mut s = wait_for_listener(&native, &mut child.0);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    // CREATE TABLE + a handful of INSERTs.
+    let stmts = [
+        "CREATE TABLE hot_growth (id INT NOT NULL, name TEXT NOT NULL)",
+        "INSERT INTO hot_growth VALUES (1, 'alice')",
+        "INSERT INTO hot_growth VALUES (2, 'bob')",
+        "INSERT INTO hot_growth VALUES (3, 'carol-the-longer-name-payload')",
+    ];
+    for sql in stmts {
+        let q = build_query(sql);
+        let mut out = Vec::new();
+        encode(&q, &mut out).unwrap();
+        s.write_all(&out).unwrap();
+        let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
+        s.read_exact(&mut header).unwrap();
+        let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if payload_len > 0 {
+            let mut payload = vec![0u8; payload_len];
+            s.read_exact(&mut payload).unwrap();
+        }
+    }
+    thread::sleep(Duration::from_millis(50));
+    let (code, body) = http_get(&http, "/metrics");
+    assert_eq!(code, 200);
+    let line = body
+        .lines()
+        .find(|l| l.starts_with("spg_hot_tier_bytes_used "))
+        .expect("used line emitted");
+    let used: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+    // Each row is bitmap(1) + int(4) + text(2 + N). With our payloads
+    // that's ~14 + 12 + 36 = ~62 bytes; allow a generous lower bound
+    // for schema-driven variation.
+    assert!(
+        used >= 30,
+        "expected used > 30 B after 3 inserts, got {used}"
+    );
+}
+
 #[test]
 fn structured_json_log_format_can_be_enabled() {
     // We can't easily inspect server stderr without piping it; just

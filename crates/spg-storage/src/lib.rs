@@ -426,11 +426,22 @@ impl Index {
 /// v4.39: `rows` is a [`PersistentVec`] (Bitmapped Vector Trie, 32-way) so
 /// `Table::clone()` is `O(1)` — the whole reason for v4.39's existence is
 /// to make `Catalog::clone()` cheap inside the v4.34 auto-commit wrap.
+///
+/// v5.2.1: `hot_bytes` tracks the encoded byte size of every row currently
+/// in [`Self::rows`], summed over rows. Updated incrementally by `insert`
+/// (+= encoded row size), `delete_rows` (-= removed rows' encoded sizes),
+/// and `update_row` (-= old size, += new size). The value is what the
+/// v5.2 freezer reads to decide when to demote cold rows — when the
+/// catalog-wide sum crosses `SPG_HOT_TIER_BYTES` (default 4 GiB) the
+/// freezer thread wakes. v5.2.1 ships measurement only; the freezer
+/// itself lands in v5.2.2. Stored as `u64` so a single field clone in
+/// `Catalog::clone` stays at the O(1) invariant v4.39 built.
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
     rows: PersistentVec<Row>,
     indices: Vec<Index>,
+    hot_bytes: u64,
 }
 
 impl Table {
@@ -439,7 +450,16 @@ impl Table {
             schema,
             rows: PersistentVec::new(),
             indices: Vec::new(),
+            hot_bytes: 0,
         }
+    }
+
+    /// Total encoded byte size of every row currently in the hot tier
+    /// (`self.rows`). See struct docs for the maintenance contract.
+    /// Returns 0 for an empty table.
+    #[must_use]
+    pub const fn hot_bytes(&self) -> u64 {
+        self.hot_bytes
     }
 
     pub const fn schema(&self) -> &TableSchema {
@@ -575,6 +595,11 @@ impl Table {
                 map.insert_mut(key, entries);
             }
         }
+        // v5.2.1: maintain incremental hot-tier byte counter. Computed
+        // before the move so we don't need to borrow `row` after push.
+        self.hot_bytes = self
+            .hot_bytes
+            .saturating_add(row_body_encoded_len(&row, &self.schema) as u64);
         // v4.39.1: push_mut keeps streaming inserts at Vec::push speed when
         // the table is uniquely owned (the spg-embedded path); inside a TX
         // wrap where a Catalog snapshot exists, push_mut path-copies the
@@ -749,12 +774,17 @@ impl Table {
             }
         }
         let mut new_rows: PersistentVec<Row> = PersistentVec::new();
+        let mut removed_bytes: u64 = 0;
         for (i, row) in self.rows.iter().enumerate() {
-            if !to_remove[i] {
+            if to_remove[i] {
+                removed_bytes =
+                    removed_bytes.saturating_add(row_body_encoded_len(row, &self.schema) as u64);
+            } else {
                 new_rows.push_mut(row.clone());
             }
         }
         self.rows = new_rows;
+        self.hot_bytes = self.hot_bytes.saturating_sub(removed_bytes);
         self.rebuild_indices();
         removed
     }
@@ -818,10 +848,21 @@ impl Table {
                 });
             }
         }
+        let old_row = self
+            .rows
+            .get(position)
+            .expect("position bounds-checked above");
+        let old_bytes = row_body_encoded_len(old_row, &self.schema) as u64;
+        let new_row = Row::new(new_values);
+        let new_bytes = row_body_encoded_len(&new_row, &self.schema) as u64;
         self.rows = self
             .rows
-            .set(position, Row::new(new_values))
+            .set(position, new_row)
             .expect("position bounds-checked above");
+        self.hot_bytes = self
+            .hot_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
         self.rebuild_indices();
         Ok(())
     }
@@ -1618,6 +1659,20 @@ impl Catalog {
         self.cold_segments.len()
     }
 
+    /// v5.2.1: sum of `Table::hot_bytes` across every table. The v5.2
+    /// freezer compares this against `SPG_HOT_TIER_BYTES` (parsed at
+    /// server startup; default 4 GiB) and wakes when the budget is
+    /// crossed. Pre-freezer (v5.2.1) this is measurement-only — the
+    /// counter exposes whether the budget is being approached without
+    /// triggering any demotion.
+    #[must_use]
+    pub fn hot_tier_bytes(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(Table::hot_bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// v5.1: borrow the cold segment at `segment_id`. Used by the
     /// spg-server preload path to enumerate (key, locator) pairs
     /// after loading a segment, so it can call
@@ -2072,12 +2127,20 @@ fn deserialize_rows(
     // contiguous buffer); we just push directly and let the trie
     // grow. v5.1: row decode reuses `decode_row_body_dense` so the
     // catalog and cold-tier segments share one row codec.
+    let mut hot_bytes: u64 = 0;
     for _ in 0..row_count {
         let tail = &cur.buf[cur.pos..];
         let (row, consumed) = decode_row_body_dense(tail, &t.schema)?;
         cur.pos += consumed;
+        // v5.2.1: account for hot bytes as we go; the snapshot's row
+        // block bytes are exactly what `encode_row_body_dense` would
+        // produce, so `consumed` would do too — but going via the
+        // helper keeps the counter's definition coupled to the
+        // encoder rather than the snapshot's row prefix layout.
+        hot_bytes = hot_bytes.saturating_add(row_body_encoded_len(&row, &t.schema) as u64);
         t.rows.push_mut(row);
     }
+    t.hot_bytes = hot_bytes;
     Ok(())
 }
 
@@ -2276,6 +2339,56 @@ impl Cursor<'_> {
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
+        }
+    }
+}
+
+/// Fast computation of the byte length [`encode_row_body_dense`]
+/// would produce, without allocating the output buffer. Mirrors the
+/// encoder's per-column body sizing so the v5.2.1 `Table::hot_bytes`
+/// incremental counter doesn't pay an alloc-per-insert tax. Returns
+/// the exact same `usize` as `encode_row_body_dense(row, schema).len()`.
+pub fn row_body_encoded_len(row: &Row, schema: &TableSchema) -> usize {
+    debug_assert_eq!(
+        row.values.len(),
+        schema.columns.len(),
+        "row_body_encoded_len: row arity must match schema"
+    );
+    let bitmap_bytes = schema.columns.len().div_ceil(8);
+    let mut n = bitmap_bytes;
+    for (col_idx, v) in row.values.iter().enumerate() {
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        n += value_body_encoded_len(v, schema.columns[col_idx].ty);
+    }
+    n
+}
+
+/// Byte length a single cell consumes when written by
+/// `write_value_body`. Used by [`row_body_encoded_len`]; kept in
+/// lock-step with the encoder. The `_ty` slot is reserved for future
+/// type-dependent encodings — every variant currently writes a fixed
+/// body shape regardless of the declared column type.
+fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
+    match v {
+        Value::SmallInt(_) => 2,
+        // 4-byte body: i32 / Date.
+        Value::Int(_) | Value::Date(_) => 4,
+        // 8-byte body: i64 / f64 / Timestamp.
+        Value::BigInt(_) | Value::Float(_) | Value::Timestamp(_) => 8,
+        Value::Bool(_) => 1,
+        // Text/Varchar/Char/Json share the [u16 len][utf-8] layout.
+        Value::Text(s) | Value::Json(s) => 2 + s.len(),
+        // [u32 dim][f32 * dim]
+        Value::Vector(vec) => 4 + 4 * vec.len(),
+        // [i128 scaled][u8 scale]
+        Value::Numeric { .. } => 16 + 1,
+        // NULL is encoded only in the bitmap, never in the body.
+        Value::Null => 0,
+        // INTERVAL has no on-disk encoding (see write_value_body).
+        Value::Interval { .. } => {
+            unreachable!("Value::Interval has no on-disk encoding")
         }
     }
 }
@@ -3745,5 +3858,155 @@ mod tests {
                 make_user_row(*id, name)
             );
         }
+    }
+
+    // --- v5.2.1 hot tier byte tracking ---------------------------
+
+    /// `row_body_encoded_len` is the perf-critical fast path; pin it
+    /// against `encode_row_body_dense(...).len()` for every
+    /// representative cell type so an encoder change can't silently
+    /// desync the counter.
+    #[test]
+    fn row_body_encoded_len_matches_actual_encode_for_all_types() {
+        let schema = TableSchema::new(
+            "wide",
+            vec![
+                ColumnSchema::new("a", DataType::SmallInt, true),
+                ColumnSchema::new("b", DataType::Int, false),
+                ColumnSchema::new("c", DataType::BigInt, false),
+                ColumnSchema::new("d", DataType::Float, false),
+                ColumnSchema::new("e", DataType::Bool, false),
+                ColumnSchema::new("f", DataType::Text, false),
+                ColumnSchema::new("g", DataType::Vector(3), false),
+                ColumnSchema::new(
+                    "h",
+                    DataType::Numeric {
+                        precision: 18,
+                        scale: 2,
+                    },
+                    false,
+                ),
+                ColumnSchema::new("i", DataType::Date, false),
+                ColumnSchema::new("j", DataType::Timestamp, false),
+            ],
+        );
+        let cases: &[Row] = &[
+            Row::new(vec![
+                Value::SmallInt(7),
+                Value::Int(42),
+                Value::BigInt(1_000_000),
+                Value::Float(1.5),
+                Value::Bool(true),
+                Value::Text("hello".into()),
+                Value::Vector(vec![1.0, 2.0, 3.0]),
+                Value::Numeric {
+                    scaled: 12345,
+                    scale: 2,
+                },
+                Value::Date(20_000),
+                Value::Timestamp(1_700_000_000_000_000),
+            ]),
+            // NULL in the bitmap, varied text length.
+            Row::new(vec![
+                Value::Null,
+                Value::Int(0),
+                Value::BigInt(0),
+                Value::Float(0.0),
+                Value::Bool(false),
+                Value::Text(String::new()),
+                Value::Vector(vec![]),
+                Value::Numeric {
+                    scaled: 0,
+                    scale: 2,
+                },
+                Value::Date(0),
+                Value::Timestamp(0),
+            ]),
+            Row::new(vec![
+                Value::SmallInt(-1),
+                Value::Int(-1),
+                Value::BigInt(-1),
+                Value::Float(-0.5),
+                Value::Bool(true),
+                Value::Text("a much longer payload here".into()),
+                Value::Vector(vec![0.1, 0.2, 0.3]),
+                Value::Numeric {
+                    scaled: -999_999_999,
+                    scale: 2,
+                },
+                Value::Date(-1),
+                Value::Timestamp(-1),
+            ]),
+        ];
+        for row in cases {
+            let actual = encode_row_body_dense(row, &schema).len();
+            let fast = row_body_encoded_len(row, &schema);
+            assert_eq!(actual, fast, "row {row:?}");
+        }
+    }
+
+    #[test]
+    fn hot_bytes_grows_on_insert_and_matches_encoded_sum() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        assert_eq!(t.hot_bytes(), 0);
+        let mut expected: u64 = 0;
+        for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
+            let row = make_user_row(id, name);
+            expected += encode_row_body_dense(&row, &t.schema).len() as u64;
+            t.insert(row).unwrap();
+        }
+        assert_eq!(t.hot_bytes(), expected);
+        assert_eq!(cat.hot_tier_bytes(), expected);
+    }
+
+    #[test]
+    fn hot_bytes_shrinks_on_delete() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
+            t.insert(make_user_row(id, name)).unwrap();
+        }
+        let before = t.hot_bytes();
+        // Delete row at position 1 (bob).
+        let bob_row = make_user_row(2, "bob");
+        let bob_bytes = encode_row_body_dense(&bob_row, &t.schema).len() as u64;
+        let removed = t.delete_rows(&[1]);
+        assert_eq!(removed, 1);
+        assert_eq!(t.hot_bytes(), before - bob_bytes);
+    }
+
+    #[test]
+    fn hot_bytes_diffs_on_update_for_variable_width_columns() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        t.insert(make_user_row(1, "alice")).unwrap();
+        let after_insert = t.hot_bytes();
+        // Update with a longer text payload — bytes must grow exactly
+        // by the text-length delta.
+        let new_row = make_user_row(1, "alice-the-longer-name");
+        let old_len = encode_row_body_dense(&make_user_row(1, "alice"), &t.schema).len() as u64;
+        let new_len = encode_row_body_dense(&new_row, &t.schema).len() as u64;
+        t.update_row(0, new_row.values).unwrap();
+        assert_eq!(t.hot_bytes(), after_insert - old_len + new_len);
+        assert!(t.hot_bytes() > after_insert, "longer text grew the counter");
+    }
+
+    #[test]
+    fn hot_bytes_round_trips_through_serialize_deserialize() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for i in 0..10 {
+            t.insert(make_user_row(i, &alloc::format!("name-{i}")))
+                .unwrap();
+        }
+        let pre = cat.hot_tier_bytes();
+        let restored = Catalog::deserialize(&cat.serialize()).unwrap();
+        assert_eq!(restored.hot_tier_bytes(), pre);
+        assert_eq!(restored.get("users").unwrap().hot_bytes(), pre);
     }
 }
