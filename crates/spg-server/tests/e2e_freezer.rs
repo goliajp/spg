@@ -307,3 +307,72 @@ fn freezer_keeps_frozen_rows_addressable_via_pk_lookup() {
     // (PK lookups, the v5.1 → v5.2 gate workload) resolves through
     // both tiers transparently.
 }
+
+/// v5.5.3: a vector table that carries BOTH a BTree PK index (the freeze
+/// target) AND an NSW index over the vector column is freezable. The frozen
+/// vector bytes ride into the cold segment alongside the rest of the row
+/// payload (the dense encoder already handles `Value::Vector`), and the row
+/// stays addressable via PK lookup. The NSW graph is rebuilt over the rows
+/// remaining in the hot tier — kNN search stays on the hot tier (cold vector
+/// rows are reachable by PK, not by NSW; that is the v5.5.3 scope).
+#[test]
+fn freezer_freezes_vector_table_with_nsw_index() {
+    let native = pick_free_addr();
+    let http = pick_free_addr();
+    let mut child = ChildGuard(spawn_server_with_tight_budget(&native, &http));
+    let mut s = wait_for_listener(&native, &mut child.0);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+
+    send_query(
+        &mut s,
+        "CREATE TABLE vemb (id BIGINT NOT NULL, v VECTOR(4) NOT NULL)",
+    );
+    send_query(&mut s, "CREATE INDEX by_id ON vemb (id)");
+    send_query(&mut s, "CREATE INDEX vnsw ON vemb USING n (v)");
+    for i in 0..50i64 {
+        #[allow(clippy::cast_precision_loss)] // 0..50 — exact in f32
+        let b = i as f32;
+        send_query(
+            &mut s,
+            &format!(
+                "INSERT INTO vemb VALUES ({i}, [{b:.1}, {:.1}, {:.1}, {:.1}])",
+                b + 1.0,
+                b + 2.0,
+                b + 3.0
+            ),
+        );
+    }
+
+    // The freezer must fire — pre-v5.5.3 a table with an NSW index was refused.
+    let deadline = Instant::now() + FREEZE_DEADLINE;
+    let mut cold_segs: u64 = 0;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+        let (code, body) = http_get(&http, "/metrics");
+        assert_eq!(code, 200);
+        if let Some(n) = metric_value(&body, "spg_cold_segments_total")
+            && n > 0
+        {
+            cold_segs = n;
+            break;
+        }
+    }
+    assert!(
+        cold_segs > 0,
+        "vector table with an NSW index must be freezable; cold segments stayed 0 within {} s",
+        FREEZE_DEADLINE.as_secs()
+    );
+
+    // A frozen vector row (early id, likely demoted) still resolves via PK —
+    // its vector bytes rode into the cold segment with the rest of the row.
+    let got = select_one(&mut s, "SELECT count(*) FROM vemb WHERE id = 3");
+    assert_eq!(
+        wire_to_i64(&got),
+        1,
+        "frozen vector row must still resolve via PK lookup"
+    );
+    // A still-hot row resolves too — and the server survived the freeze of a
+    // table whose NSW graph had to be rebuilt over the remaining hot rows.
+    let got = select_one(&mut s, "SELECT count(*) FROM vemb WHERE id = 49");
+    assert_eq!(wire_to_i64(&got), 1, "still-hot vector row must resolve");
+}

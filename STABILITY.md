@@ -408,6 +408,18 @@ as the v9 catalog format is in use:
     on the named BTree index. Returns the `FreezeReport`
     `(segment_id, frozen_rows, bytes_freed, segment_bytes)` so
     the caller persists `segment_bytes` to disk.
+
+    **v5.5.3 — vector tables freeze too.** A table carrying an NSW
+    (vector kNN) index alongside its integer BTree PK is freezable.
+    The named freeze index must still be the integer BTree PK (NSW
+    graphs have no `RowLocator`/cold concept), and the vector
+    column's bytes ride into the segment with the rest of the row
+    via the dense encoder, which already handles `Value::Vector`.
+    Frozen vector rows stay addressable by PK lookup; the NSW graph
+    is rebuilt over the rows left in the hot tier, so **kNN search
+    covers the hot tier only** — cold vector rows are reachable by
+    key, not by similarity search. Guarded by
+    `tests/e2e_freezer::freezer_freezes_vector_table_with_nsw_index`.
   - `Catalog::promote_cold_row(table, index, key)` /
     `Catalog::shadow_cold_row(table, index, key)` (v5.2.3) are
     the cold-tier write-path primitives. The engine routes PK-
