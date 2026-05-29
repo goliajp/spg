@@ -387,6 +387,17 @@ Each Cold → Hot upgrade requires a concrete observable, not
 
   - **v5.5 → v5.6**: HNSW persistent perf gate green; OOM
     chaos test returns clean error.
+    **✅ SIGNED OFF (v5.5.4, 2026-05-29).** HNSW persistent perf
+    gate: vector-table sweep variant `xbench/competitor/src/bin/
+    vector_knn` — spg-embedded 29.7 µs / spg-server 70.2 µs p50
+    vs postgres+pgvector 1595.7 µs p50, SPG wins every cell
+    (build + p50/p95/p99); see PERFORMANCE.md §"v5.5". OOM clean
+    error: `tests/e2e_query_budget.rs::chaos_oom_returns_cancelled_
+    not_panic` — the per-query `SPG_MAX_QUERY_BYTES` budget
+    (v5.5.1) cancels a runaway query before OOM; the `panic =
+    "abort"` true-system-OOM boundary is documented in STABILITY.md
+    §"Per-query memory budget (v5.5)". PROD_READY rows 5.5 + 5.6
+    flipped ✅ [machine] (`prod_ready.rs::{row_5_5_*, row_5_6_*}`).
 
   - **v5.6 ship**: sweep table in PERFORMANCE.md "v5 final
     sweep" shows spg-server numerically beats PG / MySQL /
