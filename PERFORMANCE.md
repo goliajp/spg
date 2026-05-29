@@ -1680,6 +1680,41 @@ Async-commit is for workloads that meet at least one of:
 Defaults stay sync — every v4.x durability invariant is intact
 under the unset / `on` env value.
 
+## v5.5 HNSW persistent + per-query memory budget (2026-05-29)
+
+v5.5 makes the HNSW vector index a first-class structural-sharing
+citizen and adds a per-query memory budget.
+
+- **v5.5.0** — `NswGraph::{levels, layers}` move to `PersistentVec`,
+  so `NswGraph::clone` (and the `Catalog::clone` on every group-commit
+  write that touches a vector table) is an O(1) Arc-bump instead of an
+  O(N) per-node copy. Wire format unchanged (`FILE_VERSION` 9).
+- **v5.5.1** — a custom `#[global_allocator]` enforces
+  `SPG_MAX_QUERY_BYTES` (default 256 MiB): a query whose net live
+  allocation crosses the cap is cancelled (`EngineError::Cancelled`)
+  before it can OOM the process.
+- **v5.5.3** — vector tables freeze to the cold tier (vector bytes ride
+  into the segment alongside the row payload); kNN stays on the hot tier.
+
+### Vector kNN — top-10 over 10K dim-128 vectors (HNSW)
+
+The v5.5 → v5.6 ship gate's vector-table sweep variant
+(`xbench/competitor/src/bin/vector_knn`): bulk index build + per-query
+latency from 500 measured queries, SPG vs Postgres pgvector (MySQL /
+MariaDB have no native vector index, so they're skipped).
+
+| backend           | build s | q p50 µs | q p95 µs | q p99 µs |
+|-------------------|--------:|---------:|---------:|---------:|
+| spg-embedded      |    0.71 |     29.7 |     43.0 |     65.9 |
+| spg-server        |    1.00 |     70.2 |    110.3 |    128.9 |
+| postgres+pgvector |   16.86 |   1595.7 |   3391.5 |   5990.9 |
+
+SPG wins every cell: ~17-24× faster index build and ~23-54× lower p50
+query latency (~46-91× at p99) than pgvector. The PV-backed `NswGraph`
+(v5.5.0) keeps the build cheap by avoiding O(N) clones on the group-
+commit insert path. Measured on an M-series Mac, release; competitor
+containers via `xbench/competitor/scripts/up.sh`.
+
 ## Perf gates
 
 Each crate's `tests/perf_gate.rs` runs as part of `cargo test --release

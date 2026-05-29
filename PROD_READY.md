@@ -110,8 +110,8 @@ take down the server.
 | 5.2 | `SPG_MAX_QUERY_ROWS` | Engine enforces row count cap at dispatch boundary; runaway SELECT errors clearly | ✅ | v4.2.0, `tests/e2e_limits.rs` |
 | 5.3 | `SPG_QUERY_TIMEOUT_MS` | Watchdog flips cancel flag; engine row-loops check at 256-row stride; query aborts within ~1s of deadline | ✅ | v4.5.0, `tests/e2e_timeouts.rs` |
 | 5.4 | `SPG_IDLE_TIMEOUT_SEC` | Connection idle past N seconds is closed by the OS read timeout | ✅ | v4.5.0 |
-| 5.5 | Per-query memory cap | A query cannot allocate more than N MB on the server heap; over-cap errors before OOM | ⚠️ | `SPG_MAX_QUERY_ROWS` caps result-set rows (the biggest allocator) — that's the practical answer today. True allocator-level cap needs a custom global allocator hook; deferred to v5. |
-| 5.6 | OOM injection survives [chaos] | Allocator returns NULL → server emits clear error to caller, no panic, no half-applied state | ⚠️ | Rust panics on alloc fail under default config; v4.29 chaos can stress this |
+| 5.5 | Per-query memory cap [machine] | A query cannot allocate more than N bytes on the server heap; over-cap errors before OOM | ✅ | v5.5.1, `SPG_MAX_QUERY_BYTES` (default 256 MiB; `0` = unlimited). Custom `#[global_allocator]` (`crates/spg-server/src/alloc_budget.rs`) tracks per-thread net live bytes; on overshoot it trips the active query's cancel flag and the engine's 256-row checkpoints bail with `EngineError::Cancelled`. e2e: `tests/e2e_query_budget.rs::{over_budget_select_is_cancelled, under_budget_select_succeeds}`. Contract frozen in STABILITY.md §"Per-query memory budget (v5.5)". |
+| 5.6 | Per-query memory exhaustion survives [chaos] [machine] | A query that would exhaust memory is cancelled with a clear error before OOM; the server stays up under repeated pressure, no half-applied state | ✅ | v5.5.1/2 — the per-query budget (row 5.5) is the clean-error path: a runaway query is cancelled (`EngineError::Cancelled`) before a true OOM. e2e: `tests/e2e_query_budget.rs::chaos_oom_returns_cancelled_not_panic` (repeated over-budget pressure → each cancelled, server survives, child never aborts). NOTE: under `panic = "abort"` a *true* system allocation failure still fail-fast aborts (no unwind; `set_alloc_error_hook` is nightly-only) — deliberate, to avoid half-written WAL/catalog state. Since the cap is « system RAM the budget trips first, so a real alloc failure is an ops-level condition (single oversize alloc or cap above RAM). STABILITY.md §"Per-query memory budget (v5.5)". |
 | 5.7 | Disk water-mark check [machine] | Server refuses writes when WAL volume free space < N MB; serves reads | ✅ | v4.33, `SPG_WAL_MIN_FREE_BYTES`; `statvfs(2)` before each WAL append (macOS + Linux), returns `StorageFull` with explicit env-var citation, reads unaffected; e2e: `tests/e2e_disk_watermark.rs::disk_watermark_refuses_writes_keeps_reads_keeps_server_alive` |
 
 ## 6. Correctness
@@ -222,12 +222,12 @@ a summary of pass/fail/skip counts; copy those numbers into the
 
 ## Audit snapshot
 
-Last machine run: v4.37 (2026-05-27).
+Last machine run: v4.37 (2026-05-27); v5.5 incremental (rows 5.5 + 5.6 lit up, 2026-05-29).
 
 ```
-Total rows in checklist : 85
-  ✅ pass             : 76
-  ⚠️ partial          : 3
+Total rows in checklist : 85 (v4.37 baseline; v5.x added rows — counts below are incremental, `meta_every_machine_row_has_a_test` is authoritative)
+  ✅ pass             : 78
+  ⚠️ partial          : 1
   ❌ open             : 0
   🚫 out-of-scope     : 6
 
@@ -236,7 +236,7 @@ Total rows in checklist : 85
   row_2_5, row_2_6, row_2_7, row_2_9,
   row_3_7, row_3_8, row_3_9, row_3_10, row_3_11, row_3_12,
   row_4_1, row_4_2, row_4_5, row_4_6, row_4_7,
-  row_5_1, row_5_7,
+  row_5_1, row_5_5, row_5_6, row_5_7,
   row_6_3,
   row_7_2, row_7_3, row_7_4, row_7_5, row_7_6,
   row_8_2, row_8_4, row_8_5, row_8_6,
@@ -262,21 +262,21 @@ Bit-flips in any of the three surface as an explicit
 operator chooses whether to discard the corrupt record or
 investigate. Covered by `tests/e2e_chaos.rs::chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay`.
 
-The 3 ⚠️ items remaining are strict-invariant rows deferred per
-NEXT.md (allocator cap + OOM in v5.0; config validation rolled
-forward):
+The 1 ⚠️ item remaining is a strict-invariant row deferred per
+NEXT.md:
 
-- 5.5 per-query memory cap: needs custom global allocator (v5.0)
-- 5.6 OOM injection survives: needs alloc-error hook (v5.0)
 - 7.8 startup config validation (v4.30 candidate; rolled forward)
 
-The 5 ⚠️ items are all "works today within documented limits;
-strict invariant deferred per NEXT.md":
+(5.5 per-query memory cap + 5.6 OOM-survives-as-clean-error closed
+in v5.5.1/2 — custom `#[global_allocator]` + `SPG_MAX_QUERY_BYTES`;
+see rows 5.5 / 5.6.)
+
+The remaining historically-tracked ⚠️ items (v4.37 snapshot;
+"works today within documented limits, strict invariant deferred
+per NEXT.md"):
 
 - 1.8 explicit CRC32 (today: truncation caught by length prefix; v4.37)
 - 2.9 netsplit replication chaos (v4.36)
-- 5.5 per-query memory cap: needs custom global allocator (v5.0)
-- 5.6 OOM injection survives: needs alloc-error hook (v5.0)
 - 7.8 startup config validation (v4.30 candidate; rolled forward)
 
 Each subsequent release should update this snapshot and add new

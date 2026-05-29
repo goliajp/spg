@@ -1163,6 +1163,63 @@ fn row_1_12_async_commit_durability_window_covered_by_e2e() {
     );
 }
 
+/// 5.5 Per-query memory cap — a custom `#[global_allocator]` enforces
+/// `SPG_MAX_QUERY_BYTES` per query (v5.5.1). Surface + e2e check.
+#[test]
+fn row_5_5_per_query_memory_cap_covered_by_e2e() {
+    let ab_src =
+        std::fs::read_to_string(workspace_root().join("crates/spg-server/src/alloc_budget.rs"))
+            .expect("alloc_budget.rs");
+    assert!(
+        ab_src.contains("impl GlobalAlloc for BudgetAllocator"),
+        "alloc_budget.rs must implement GlobalAlloc for BudgetAllocator"
+    );
+    assert!(
+        ab_src.contains("fn reset_query_budget") && ab_src.contains("fn clear_query_budget"),
+        "alloc_budget.rs must expose reset/clear_query_budget"
+    );
+    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
+        .expect("main.rs");
+    assert!(
+        main_src.contains("#[global_allocator]") && main_src.contains("BudgetAllocator"),
+        "main.rs must install BudgetAllocator as #[global_allocator]"
+    );
+    assert!(
+        main_src.contains("SPG_MAX_QUERY_BYTES"),
+        "main.rs must parse the SPG_MAX_QUERY_BYTES knob"
+    );
+    let e2e = std::fs::read_to_string(
+        workspace_root().join("crates/spg-server/tests/e2e_query_budget.rs"),
+    )
+    .expect("e2e_query_budget.rs");
+    assert!(
+        e2e.contains("fn over_budget_select_is_cancelled")
+            && e2e.contains("fn under_budget_select_succeeds"),
+        "e2e_query_budget.rs must pin the over/under-budget behaviours"
+    );
+}
+
+/// 5.6 Per-query memory exhaustion survives — the budget cancels a runaway
+/// query before OOM and the server stays up (v5.5.1/2). Under panic=abort a
+/// true alloc failure still fail-fasts; that boundary is the frozen contract.
+#[test]
+fn row_5_6_memory_exhaustion_survives_covered_by_e2e() {
+    let e2e = std::fs::read_to_string(
+        workspace_root().join("crates/spg-server/tests/e2e_query_budget.rs"),
+    )
+    .expect("e2e_query_budget.rs");
+    assert!(
+        e2e.contains("fn chaos_oom_returns_cancelled_not_panic"),
+        "e2e_query_budget.rs must pin the OOM-pressure-survival chaos test"
+    );
+    let stab =
+        std::fs::read_to_string(workspace_root().join("STABILITY.md")).expect("STABILITY.md");
+    assert!(
+        stab.contains("Per-query memory budget (v5.5)") && stab.contains("panic = \"abort\""),
+        "STABILITY.md must document the per-query budget + panic=abort OOM semantics"
+    );
+}
+
 // ---- meta-test: every [machine] row in the doc has a Rust test ----
 
 /// Meta-check: PROD_READY.md must not promise a [machine] row
