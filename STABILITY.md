@@ -527,6 +527,21 @@ contract:
   long series of small writes never accumulates toward the cap,
   and high-churn-low-peak queries (allocate-then-free in a loop)
   are not punished.
+- **OOM semantics under `panic = "abort"`**: the budget *is* the
+  clean-error path for memory exhaustion. A query that would
+  exhaust memory is cancelled (`EngineError::Cancelled`) before it
+  gets there — including unbounded scans like `SELECT * FROM big
+  LIMIT 1`, since LIMIT is applied after materialisation. A *true*
+  system allocation failure (an infallible alloc the OS cannot
+  satisfy) still aborts the process: under `panic = "abort"` it
+  cannot be unwound into an error, and `set_alloc_error_hook` is
+  nightly-only. Because the cap is « system RAM, the budget trips
+  long before a real OOM, so an actual allocation failure means a
+  single oversize allocation or a cap set above available memory —
+  an ops-level condition, not a recoverable query. This is the
+  deliberate fail-fast stance (no half-written WAL/catalog state
+  from an unwind). Guarded by
+  `tests/e2e_query_budget::chaos_oom_returns_cancelled_not_panic`.
 
 ---
 

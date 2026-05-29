@@ -150,3 +150,63 @@ fn under_budget_select_succeeds() {
         "under-budget SELECT should stream normally, not get cancelled"
     );
 }
+
+/// v5.5.2 OOM-as-clean-error invariant. Under `panic = "abort"` a true malloc
+/// failure cannot be unwound into an error, and `set_alloc_error_hook` is
+/// nightly-only — so the per-query budget IS the clean-error path: it cancels a
+/// runaway query *before* it reaches a real OOM. This chaos test applies
+/// repeated over-budget pressure and asserts the invariant the ship gate cares
+/// about: every attempt comes back as a cancellation, and the server process
+/// never aborts/panics — it keeps serving.
+#[test]
+fn chaos_oom_returns_cancelled_not_panic() {
+    let addr = pick_free_addr();
+    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_MAX_QUERY_BYTES", BUDGET)]));
+    let mut s = wait_for_listener(&addr, &mut child.0);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+
+    // ~3.2 MB table — 3× the 1 MiB ceiling.
+    create_and_load(&mut s, 80);
+
+    // A tiny separate table for the survival probe. spg applies LIMIT *after*
+    // materialisation, so `SELECT * FROM t LIMIT 1` would itself scan the whole
+    // 3.2 MB table and get cancelled — not a valid liveness check. Querying a
+    // one-row table never approaches the budget.
+    send(&mut s, &build_query("CREATE TABLE probe (id INT NOT NULL)"));
+    assert_eq!(read_frame(&mut s).op, Op::CommandComplete);
+    send(&mut s, &build_query("INSERT INTO probe VALUES (1)"));
+    assert_eq!(read_frame(&mut s).op, Op::CommandComplete);
+
+    // Repeated OOM pressure: each over-budget SELECT must come back as a clean
+    // cancellation, not crash the server.
+    for i in 0..5 {
+        send(&mut s, &build_query("SELECT * FROM t"));
+        let f = read_frame(&mut s);
+        assert_eq!(
+            f.op,
+            Op::ErrorResponse,
+            "iteration {i}: over-budget SELECT must be cancelled, not stream"
+        );
+        let msg = parse_error_response(&f).unwrap();
+        assert!(
+            msg.to_lowercase().contains("cancel"),
+            "iteration {i}: expected a cancellation error, got {msg:?}"
+        );
+    }
+
+    // Survival proof: a normal query on the same connection still works, so the
+    // process never aborted under the repeated pressure.
+    send(&mut s, &build_query("SELECT * FROM probe"));
+    let f = read_frame(&mut s);
+    assert_eq!(
+        f.op,
+        Op::RowDescription,
+        "server must survive repeated OOM pressure and keep serving"
+    );
+
+    // And the child is still alive (not aborted).
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "server process must not have aborted under OOM pressure"
+    );
+}
