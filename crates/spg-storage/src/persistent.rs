@@ -38,7 +38,11 @@ const SHIFT: u32 = 5;
 const BRANCH: usize = 1 << SHIFT; // 32
 const MASK: usize = BRANCH - 1; // 0x1F
 
-#[derive(Debug)]
+// `Clone` (v5.5.0) backs `Arc::make_mut` in `get_mut_in_trie`: cloning an
+// `Internal` only bumps its children's `Arc`s (shallow), cloning a `Leaf`
+// copies its ≤ BRANCH elements — exactly the path-copy a shared spine needs,
+// matching what `set_in_trie` does by hand.
+#[derive(Debug, Clone)]
 enum Node<T> {
     Internal(Vec<Arc<Node<T>>>),
     Leaf(Vec<T>),
@@ -277,6 +281,31 @@ impl<T: Clone> PersistentVec<T> {
             shift: self.shift,
         })
     }
+
+    /// `O(log₃₂ N)` transient-mut access — the read-side analogue of
+    /// `push_mut` (v5.5.0). Walks the spine with `Arc::make_mut`: when every
+    /// node along the path is uniquely owned (the common streaming case) the
+    /// walk mutates in place at the same cost as `Vec::get_mut`. If a cloned
+    /// handle shares the spine (e.g. a `Catalog` snapshot held by an open TX),
+    /// the touched nodes are path-copied — the snapshot keeps its old value
+    /// and only this handle observes the mutation, exactly like `set`. `None`
+    /// for out-of-bounds (matches `get` / `set`).
+    ///
+    /// Introduced for the v5.5 HNSW `NswGraph` switch to PV-backed layers: the
+    /// insert path needs in-place edits to a node's neighbour list
+    /// (`layers[l].get_mut(node)`) without the `set`-then-write-back round trip
+    /// and its extra path-copy.
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut T> {
+        if i >= self.len {
+            return None;
+        }
+        let trie_size = self.len - self.tail.len();
+        if i >= trie_size {
+            let tail = Arc::make_mut(&mut self.tail);
+            return tail.get_mut(i - trie_size);
+        }
+        get_mut_in_trie(&mut self.root, self.shift, i)
+    }
 }
 
 /// Push a freshly-built `Leaf` into the trie at trie-position `trie_index`.
@@ -356,6 +385,21 @@ fn set_in_trie<T: Clone>(node: &Arc<Node<T>>, shift: u32, i: usize, x: T) -> Arc
     }
 }
 
+/// Copy-on-write `get_mut` walk (v5.5.0). `Arc::make_mut` clones a node only
+/// when it's shared; a uniquely-owned spine is walked in place. Mirrors
+/// `set_in_trie` but hands back a `&mut` to the located cell instead of
+/// rewriting it, so the caller can mutate the element directly.
+fn get_mut_in_trie<T: Clone>(node: &mut Arc<Node<T>>, shift: u32, i: usize) -> Option<&mut T> {
+    match Arc::make_mut(node) {
+        Node::Leaf(elems) => elems.get_mut(i & MASK),
+        Node::Internal(children) => {
+            let sub_idx = (i >> shift) & MASK;
+            let child = children.get_mut(sub_idx)?;
+            get_mut_in_trie(child, shift - SHIFT, i)
+        }
+    }
+}
+
 /// Sequential `&T` iterator. v4.38 implementation is `get(i)`-driven — simple
 /// and correct, but O(N log N) over the whole vector. Profile in v4.39 /
 /// v4.40 and upgrade if it shows up in flamegraphs.
@@ -383,6 +427,17 @@ impl<'a, T> Iterator for Iter<'a, T> {
 }
 
 impl<T> ExactSizeIterator for Iter<'_, T> {}
+
+#[cfg(test)]
+impl<T> PersistentVec<T> {
+    /// Test-only: do two handles share the same root + tail `Arc` — i.e. did
+    /// `clone` bump pointers rather than copy elements? Used by v5.5.0's
+    /// `nsw_clone_is_o1` to prove `NswGraph::clone` is O(1) structural sharing,
+    /// not an O(N) element copy.
+    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.root, &other.root) && Arc::ptr_eq(&self.tail, &other.tail)
+    }
+}
 
 #[cfg(test)]
 #[allow(

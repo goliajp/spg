@@ -287,7 +287,16 @@ layout extends v8 by serialising every BTree index entry directly:
     `Cold`). `IndexKey` itself uses a tagged codec — `0 = Int(i64
     LE)`, `1 = Text(u16 len + UTF-8)`, `2 = Bool(u8 0/1)`.
   - NSW indices are byte-identical to v8 — they don't carry
-    `RowLocator`s.
+    `RowLocator`s. **NswGraph wire format frozen as of v5.5**: the
+    v5.5.0 switch of `NswGraph::{levels, layers}` from plain `Vec`
+    to PV-backed (`PersistentVec`) structural sharing is an in-memory
+    representation change only — `write_nsw_graph` / `read_nsw_graph`
+    still emit and consume the identical byte layout (`[u16 m_max_0]
+    [u32 entry][u8 entry_level][u32 node_count][u8 level]*[u8
+    layer_count]([u32 per_layer_len]([u16 nbr_count][u32 peer]*)*)*`),
+    so `FILE_VERSION` stays at 9 and v5.2–v5.4 snapshots round-trip
+    unchanged (guarded by
+    `tests::nsw_index_topology_persists_through_round_trip`).
   - v8 catalogs read transparently via the version dispatch in
     `Catalog::deserialize` (`MIN_SUPPORTED_FILE_VERSION = 8`).
     Every entry on a v8 BTree decodes as `RowLocator::Hot(_)` via

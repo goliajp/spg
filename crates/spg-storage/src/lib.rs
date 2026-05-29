@@ -354,10 +354,19 @@ pub struct NswGraph {
     pub entry_level: u8,
     /// `levels[i]` = top layer of node `i`. Nodes whose vector cell is
     /// NULL / non-Vector have `levels[i] = 0` and no neighbour entries.
-    pub levels: Vec<u8>,
+    ///
+    /// v5.5.0: backed by `PersistentVec` so `NswGraph::clone` (and the
+    /// `Catalog::clone` on every group-commit write that contains it) is O(1)
+    /// structural-sharing instead of an O(N) element copy.
+    pub levels: PersistentVec<u8>,
     /// `layers[l][i]` = neighbours of node `i` at layer `l`. Inner vec
     /// is empty when node `i` doesn't reach layer `l`.
-    pub layers: Vec<Vec<Vec<usize>>>,
+    ///
+    /// v5.5.0: the per-node middle dimension (the O(N) one) is a
+    /// `PersistentVec`; the outer layer dimension stays a plain `Vec`
+    /// (layer count ≤ 8, so its clone is O(1) in practice) and the inner
+    /// neighbour list stays a `Vec` (bounded by `m_max_0`).
+    pub layers: Vec<PersistentVec<Vec<usize>>>,
 }
 
 impl NswGraph {
@@ -367,8 +376,8 @@ impl NswGraph {
             m_max_0: m.saturating_mul(2),
             entry: None,
             entry_level: 0,
-            levels: Vec::new(),
-            layers: alloc::vec![Vec::new()],
+            levels: PersistentVec::new(),
+            layers: alloc::vec![PersistentVec::new()],
         }
     }
 
@@ -1103,13 +1112,17 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
         if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
             g.entry = Some(new_row_idx);
             g.entry_level = level;
-            g.levels[new_row_idx] = level;
+            *g.levels
+                .get_mut(new_row_idx)
+                .expect("levels slot padded by ensure_node_slot") = level;
         }
         return;
     }
     // Set the node's recorded level.
     if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
-        g.levels[new_row_idx] = level;
+        *g.levels
+            .get_mut(new_row_idx)
+            .expect("levels slot padded by ensure_node_slot") = level;
     }
     let query = match &table.rows[new_row_idx].values[col_pos] {
         Value::Vector(v) => v.clone(),
@@ -1170,14 +1183,14 @@ fn ensure_node_slot(table: &mut Table, idx_pos: usize, new_row_idx: usize, level
         unreachable!("ensure_node_slot on a BTree index");
     };
     while g.layers.len() <= level as usize {
-        g.layers.push(Vec::new());
+        g.layers.push(PersistentVec::new());
     }
     while g.levels.len() <= new_row_idx {
-        g.levels.push(0);
+        g.levels.push_mut(0);
     }
     for layer_vec in &mut g.layers {
         while layer_vec.len() <= new_row_idx {
-            layer_vec.push(Vec::new());
+            layer_vec.push_mut(Vec::new());
         }
     }
 }
@@ -1436,7 +1449,9 @@ fn connect_at_layer(
     };
     if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
         let layer_v = &mut g.layers[layer as usize];
-        layer_v[new_row_idx] = peers.to_vec();
+        if let Some(slot) = layer_v.get_mut(new_row_idx) {
+            *slot = peers.to_vec();
+        }
     }
     for &peer in peers {
         let host_vec = match &table.rows[peer].values[col_pos] {
@@ -1446,8 +1461,10 @@ fn connect_at_layer(
         // 1. add the new node to peer's adjacency
         if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
             let layer_v = &mut g.layers[layer as usize];
-            if !layer_v[peer].contains(&new_row_idx) {
-                layer_v[peer].push(new_row_idx);
+            if let Some(slot) = layer_v.get_mut(peer)
+                && !slot.contains(&new_row_idx)
+            {
+                slot.push(new_row_idx);
             }
         }
         // 2. if peer is over budget, rebuild its adjacency with the
@@ -1475,8 +1492,10 @@ fn connect_at_layer(
                 .collect();
             tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
             let kept = select_neighbours_heuristic(&tagged, cap, table, col_pos);
-            if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
-                g.layers[layer as usize][peer] = kept;
+            if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind
+                && let Some(slot) = g.layers[layer as usize].get_mut(peer)
+            {
+                *slot = kept;
             }
         }
     }
@@ -3213,22 +3232,26 @@ impl<'a> Cursor<'a> {
         };
         let entry_level = self.read_u8()?;
         let node_count = self.read_u32()? as usize;
-        let mut levels: Vec<u8> = Vec::with_capacity(node_count);
+        // v5.5.0: levels/per-layer are PV-backed in memory, but the wire
+        // format is unchanged — decode element-by-element into a PV via
+        // push_mut (transient in-place, no per-element path-copy here since
+        // the freshly-built PV is uniquely owned).
+        let mut levels: PersistentVec<u8> = PersistentVec::new();
         for _ in 0..node_count {
-            levels.push(self.read_u8()?);
+            levels.push_mut(self.read_u8()?);
         }
         let layer_count = self.read_u8()? as usize;
-        let mut layers: Vec<Vec<Vec<usize>>> = Vec::with_capacity(layer_count);
+        let mut layers: Vec<PersistentVec<Vec<usize>>> = Vec::with_capacity(layer_count);
         for _ in 0..layer_count {
             let n = self.read_u32()? as usize;
-            let mut per_layer: Vec<Vec<usize>> = Vec::with_capacity(n);
+            let mut per_layer: PersistentVec<Vec<usize>> = PersistentVec::new();
             for _ in 0..n {
                 let cnt = self.read_u16()? as usize;
                 let mut row = Vec::with_capacity(cnt);
                 for _ in 0..cnt {
                     row.push(self.read_u32()? as usize);
                 }
-                per_layer.push(row);
+                per_layer.push_mut(row);
             }
             layers.push(per_layer);
         }
@@ -3485,6 +3508,65 @@ mod tests {
         let mut cat = Catalog::new();
         cat.create_table(make_users_schema()).unwrap();
         assert_round_trip(&cat);
+    }
+
+    #[test]
+    fn nsw_clone_is_o1() {
+        // v5.5.0: NswGraph::clone must be O(1) structural sharing, not the
+        // pre-v5.5 O(N) element copy — it rides on Catalog::clone for every
+        // group-commit write on a vector table. Build a non-trivial multi-
+        // layer graph, clone it, and prove the clone shares the very same PV
+        // storage (root+tail Arc) for `levels` and every `layers[l]`. Sharing
+        // ⇒ no per-node element copy ⇒ clone cost independent of N (node
+        // count); only the outer layer Vec (len ≤ 8) is copied, O(1) in
+        // practice.
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "docs",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new("v", DataType::Vector(3), true),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("docs").unwrap();
+        for i in 0..1500_i32 {
+            #[allow(clippy::cast_precision_loss)] // 0..1500 — no precision lost
+            let base = (i as f32) * 0.01;
+            t.insert(Row::new(alloc::vec![
+                Value::Int(i),
+                Value::Vector(alloc::vec![base, base + 0.05, base + 0.1]),
+            ]))
+            .unwrap();
+        }
+        t.add_nsw_index("docs_nsw".into(), "v", NSW_DEFAULT_M)
+            .unwrap();
+        let g = match &cat.get("docs").unwrap().indices()[0].kind {
+            IndexKind::Nsw(g) => g,
+            IndexKind::BTree(_) => panic!("expected NSW"),
+        };
+        // Non-trivial graph: one level slot per row, and the geometric level
+        // distribution puts some nodes above layer 0.
+        assert_eq!(g.levels.len(), 1500, "one level slot per inserted row");
+        assert!(
+            g.layers.len() >= 2,
+            "1500 nodes should populate at least two HNSW layers, got {}",
+            g.layers.len()
+        );
+
+        let cloned = g.clone();
+
+        assert!(
+            g.levels.shares_storage_with(&cloned.levels),
+            "levels PV not shared after clone — clone copied elements (O(N))"
+        );
+        assert_eq!(g.layers.len(), cloned.layers.len());
+        for (l, (orig, cl)) in g.layers.iter().zip(cloned.layers.iter()).enumerate() {
+            assert!(
+                orig.shares_storage_with(cl),
+                "layer {l} PV not shared after clone — clone copied elements (O(N))"
+            );
+        }
     }
 
     #[test]
