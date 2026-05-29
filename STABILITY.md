@@ -508,6 +508,26 @@ the v5.4.1 counters `spg_flusher_iterations_total` +
 values in sync mode are themselves the "sync confirmed" signal
 for dashboards.
 
+### Per-query memory budget (v5.5)
+
+`SPG_MAX_QUERY_BYTES` caps the live heap a single query may hold,
+enforced by the v5.5.1 custom `#[global_allocator]`. Stable
+contract:
+
+- Unset → default **256 MiB**. The budget is on by default as a
+  runaway-query safety net.
+- `0` → unlimited (explicit opt-out).
+- Any other value → that many bytes.
+- Enforcement is **per-query, per-thread net live bytes** (alloc
+  minus free). When a query's live allocation crosses the ceiling
+  its cancel flag is tripped and the engine's existing 256-row
+  cancel checkpoints bail with `EngineError::Cancelled` — the same
+  operator-visible surface as a `SPG_QUERY_TIMEOUT_MS` timeout.
+- The load path is unaffected: the budget resets per query, so a
+  long series of small writes never accumulates toward the cap,
+  and high-churn-low-peak queries (allocate-then-free in a loop)
+  are not punished.
+
 ---
 
 ## Not frozen (free to change in any release)

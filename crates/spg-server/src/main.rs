@@ -20,6 +20,7 @@
 //!
 //! Pass `-` (or omit) to skip any positional after the first.
 
+mod alloc_budget;
 mod backup;
 mod flusher;
 mod freezer;
@@ -50,6 +51,16 @@ use spg_wire::{
     build_data_row_batch, build_error_response, build_row_description, build_stats_response,
     decode, encode, parse_auth, parse_auth_user, parse_query,
 };
+
+/// v5.5.1: custom global allocator that enforces the per-query memory budget
+/// (`SPG_MAX_QUERY_BYTES`). See the `alloc_budget` module for the model.
+#[global_allocator]
+static GLOBAL_ALLOC: alloc_budget::BudgetAllocator = alloc_budget::BudgetAllocator;
+
+/// v5.5.1: default `SPG_MAX_QUERY_BYTES` when the env is unset — 256 MiB.
+/// A runaway-query safety net that is on by default; set `SPG_MAX_QUERY_BYTES=0`
+/// to disable (unlimited).
+const DEFAULT_MAX_QUERY_BYTES: u64 = 256 * 1024 * 1024;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
 const READ_CHUNK: usize = 4096;
@@ -95,6 +106,12 @@ struct Limits {
     /// engine so a runaway full-scan can't blow the server's heap
     /// before the result is shaped into wire frames.
     max_query_rows: Option<usize>,
+    /// v5.5.1: per-query memory ceiling in bytes, enforced at the global
+    /// allocator (see `alloc_budget`). `None` = use `DEFAULT_MAX_QUERY_BYTES`
+    /// (256 MiB, on by default); explicit `0` via `SPG_MAX_QUERY_BYTES=0` =
+    /// unlimited. A query whose live allocation crosses the ceiling trips its
+    /// cancel flag and bails with `EngineError::Cancelled`.
+    max_query_bytes: Option<u64>,
     /// v4.5: per-query wall-clock budget (milliseconds). When set, a
     /// watchdog thread starts on each `Query` frame, flips a
     /// `CancelToken` after the budget, and shuts down the TCP stream
@@ -309,6 +326,7 @@ fn main() {
     let limits = Limits {
         max_connections: parse_env_usize("SPG_MAX_CONNECTIONS"),
         max_query_rows: parse_env_usize("SPG_MAX_QUERY_ROWS"),
+        max_query_bytes: parse_env_u64("SPG_MAX_QUERY_BYTES"),
         query_timeout_ms: parse_env_u64("SPG_QUERY_TIMEOUT_MS"),
         idle_timeout_sec: parse_env_u64("SPG_IDLE_TIMEOUT_SEC"),
         slow_query_log_ms: parse_env_u64("SPG_SLOW_QUERY_LOG_MS"),
@@ -1229,10 +1247,19 @@ fn dispatch(
                     .engine
                     .read()
                     .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+                let budget = usize::try_from(
+                    state
+                        .limits
+                        .max_query_bytes
+                        .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
+                )
+                .unwrap_or(usize::MAX);
+                alloc_budget::reset_query_budget(budget, &cancel_flag);
                 let result = engine.execute_readonly_with_cancel(
                     &sql,
                     spg_engine::CancelToken::from_flag(&cancel_flag),
                 );
+                alloc_budget::clear_query_budget();
                 drop(engine);
                 watchdog.cancel();
                 if !matches!(&result, Err(EngineError::WriteRequired)) {
@@ -1376,8 +1403,17 @@ fn dispatch(
                     .engine
                     .write()
                     .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+                let budget = usize::try_from(
+                    state
+                        .limits
+                        .max_query_bytes
+                        .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
+                )
+                .unwrap_or(usize::MAX);
+                alloc_budget::reset_query_budget(budget, &cancel_flag);
                 let result = engine
                     .execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
+                alloc_budget::clear_query_budget();
                 let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
                 let wal_result = if was_command_ok && state.wal.is_some() {
                     append_wal(state, &sql)
