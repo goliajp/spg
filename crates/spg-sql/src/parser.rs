@@ -18,10 +18,10 @@ use core::mem;
 
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreatePublicationStatement, CreateTableStatement, Expr, ExtractField, FrameBound, FrameKind,
-    FromClause, FromJoin, IndexMethod, InsertStatement, JoinKind, Literal, OrderBy,
-    PublicationScope, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
-    VecEncoding, WindowFrame,
+    CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement, Expr,
+    ExtractField, FrameBound, FrameKind, FromClause, FromJoin, IndexMethod, InsertStatement,
+    JoinKind, Literal, OrderBy, PublicationScope, SelectItem, SelectStatement, Statement,
+    TableRef, UnOp, UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -208,6 +208,8 @@ impl Parser {
                     // ident. Returning all publications + their
                     // scope summary.
                     "publications" => Ok(Statement::ShowPublications),
+                    // v6.1.4 — same shape for SUBSCRIPTIONS plural.
+                    "subscriptions" => Ok(Statement::ShowSubscriptions),
                     "columns" => {
                         if !matches!(self.peek(), Token::From) {
                             return Err(self.err(format!(
@@ -237,13 +239,18 @@ impl Parser {
                         let name = self.expect_ident_or_string()?;
                         Ok(Statement::DropPublication(name))
                     }
+                    Token::Subscription => {
+                        self.advance();
+                        let name = self.expect_ident_or_string()?;
+                        Ok(Statement::DropSubscription(name))
+                    }
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("user") => {
                         self.advance();
                         let name = self.expect_ident_or_string()?;
                         Ok(Statement::DropUser(name))
                     }
                     other => Err(self.err(format!(
-                        "expected USER / PUBLICATION after DROP, got {other:?}"
+                        "expected USER / PUBLICATION / SUBSCRIPTION after DROP, got {other:?}"
                     ))),
                 }
             }
@@ -279,6 +286,10 @@ impl Parser {
                 self.advance();
                 self.parse_create_publication_after_keyword()
             }
+            Token::Subscription => {
+                self.advance();
+                self.parse_create_subscription_after_keyword()
+            }
             // v4.1: CREATE USER 'name' WITH PASSWORD 'pw' [ROLE 'role'].
             // USER isn't a reserved keyword — we look for the bare
             // identifier so the lexer doesn't have to grow a token.
@@ -287,7 +298,7 @@ impl Parser {
                 self.parse_create_user_after_keyword()
             }
             other => Err(self.err(format!(
-                "expected TABLE / INDEX / USER / PUBLICATION after CREATE, got {other:?}"
+                "expected TABLE / INDEX / USER / PUBLICATION / SUBSCRIPTION after CREATE, got {other:?}"
             ))),
         }
     }
@@ -353,6 +364,47 @@ impl Parser {
             out.push(self.expect_ident_like()?);
         }
         Ok(out)
+    }
+
+    /// v6.1.4 — `CREATE SUBSCRIPTION <name>
+    ///                 CONNECTION '<conn>'
+    ///                 PUBLICATION <pub> [, <pub> ...]`.
+    ///
+    /// The clause order is fixed (CONNECTION first, then
+    /// PUBLICATION) to match PG. No WITH-options accepted in
+    /// v6.1.4 — `enabled` defaults to true, no other knobs ship.
+    fn parse_create_subscription_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_or_string()?;
+        if !matches!(self.peek(), Token::Connection) {
+            return Err(self.err(format!(
+                "expected CONNECTION after CREATE SUBSCRIPTION <name>, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let conn_str = self.expect_string_literal()?;
+        if !matches!(self.peek(), Token::Publication) {
+            return Err(self.err(format!(
+                "expected PUBLICATION after CONNECTION '<conn>', got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Reuse the publication FOR-list parser shape: at least one
+        // identifier, comma-separated.
+        let first = self.expect_ident_like()?;
+        let mut publications = alloc::vec![first];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            publications.push(self.expect_ident_like()?);
+        }
+        Ok(Statement::CreateSubscription(
+            CreateSubscriptionStatement {
+                name,
+                conn_str,
+                publications,
+            },
+        ))
     }
 
     /// `CREATE USER` body — name + WITH PASSWORD '<pw>' + optional
@@ -2898,6 +2950,75 @@ mod tests {
         // bare ident in this position, NOT a reserved keyword.
         let s = parse("SHOW PUBLICATIONS");
         assert!(matches!(s, Statement::ShowPublications));
+    }
+
+    // ── v6.1.4: CREATE / DROP SUBSCRIPTION + SHOW SUBSCRIPTIONS ─
+
+    #[test]
+    fn parser_recognises_create_subscription_single_publication() {
+        let s = parse("CREATE SUBSCRIPTION sub_a CONNECTION 'host=127.0.0.1 port=20002' PUBLICATION pub_a");
+        let Statement::CreateSubscription(c) = s else {
+            panic!("expected CreateSubscription, got {s:?}")
+        };
+        assert_eq!(c.name, "sub_a");
+        assert_eq!(c.conn_str, "host=127.0.0.1 port=20002");
+        assert_eq!(c.publications, alloc::vec!["pub_a"]);
+    }
+
+    #[test]
+    fn parser_recognises_create_subscription_multi_publication() {
+        let s = parse(
+            "CREATE SUBSCRIPTION sub_a CONNECTION 'host=h' PUBLICATION p1, p2, p3",
+        );
+        let Statement::CreateSubscription(c) = s else {
+            panic!()
+        };
+        assert_eq!(c.publications, alloc::vec!["p1", "p2", "p3"]);
+    }
+
+    #[test]
+    fn parser_rejects_create_subscription_missing_connection() {
+        let err = parse_statement("CREATE SUBSCRIPTION s PUBLICATION p")
+            .expect_err("must error on missing CONNECTION");
+        assert!(err.message.contains("CONNECTION"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn parser_rejects_create_subscription_missing_publication() {
+        let err = parse_statement("CREATE SUBSCRIPTION s CONNECTION 'host=x'")
+            .expect_err("must error on missing PUBLICATION");
+        assert!(err.message.contains("PUBLICATION"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn parser_recognises_drop_subscription() {
+        let s = parse("DROP SUBSCRIPTION sub_a");
+        let Statement::DropSubscription(name) = s else {
+            panic!("expected DropSubscription, got {s:?}")
+        };
+        assert_eq!(name, "sub_a");
+    }
+
+    #[test]
+    fn parser_recognises_show_subscriptions() {
+        let s = parse("SHOW SUBSCRIPTIONS");
+        assert!(matches!(s, Statement::ShowSubscriptions));
+    }
+
+    #[test]
+    fn subscription_ddl_display_roundtrips() {
+        for sql in [
+            "CREATE SUBSCRIPTION sub_a CONNECTION 'host=h port=20002' PUBLICATION pub_a",
+            "CREATE SUBSCRIPTION sub_b CONNECTION 'host=h' PUBLICATION p1, p2",
+            "DROP SUBSCRIPTION sub_a",
+            "SHOW SUBSCRIPTIONS",
+        ] {
+            let s = parse(sql);
+            let printed = s.to_string();
+            let again = parse_statement(&printed)
+                .unwrap_or_else(|e| panic!("re-parse failed for {printed:?}: {e}"));
+            assert_eq!(s, again, "round-trip mismatch for {sql:?}");
+        }
     }
 
     #[test]

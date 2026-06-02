@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod eval;
 pub mod json;
 pub mod publications;
+pub mod subscriptions;
 pub mod users;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
@@ -23,9 +24,10 @@ use core::fmt;
 
 use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreatePublicationStatement, CreateTableStatement, CreateUserStatement, Expr, FrameBound,
-    FrameKind, FromClause, IndexMethod, InsertStatement, JoinKind, Literal, SelectItem,
-    SelectStatement, Statement, UnOp, UnionKind, VecEncoding as SqlVecEncoding, WindowFrame,
+    CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement,
+    CreateUserStatement, Expr, FrameBound, FrameKind, FromClause, IndexMethod, InsertStatement,
+    JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
+    VecEncoding as SqlVecEncoding, WindowFrame,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -183,8 +185,8 @@ impl<'a> CancelToken<'a> {
     }
 }
 
-// ---- snapshot envelope (v4.1, extended with CRC32 in v4.37, ----
-// ----                    publications added in v6.1.2 v3) -------
+// ---- snapshot envelope (v4.1, extended with CRC32 in v4.37,  ----
+// ----   publications in v6.1.2 v3, subscriptions in v6.1.4 v4) ----
 //
 // Wraps a catalog blob + a user blob behind a small header so the
 // server can persist both atomically without inventing a new file.
@@ -203,35 +205,45 @@ impl<'a> CancelToken<'a> {
 //   [u8 version = 2]
 //   [u32 catalog_len][catalog bytes]
 //   [u32 users_len][users bytes]
-//   [u32 crc32]                      ← CRC32 of every byte before it
-//                                      (magic + version + sections),
-//                                      bit-flip detector for the
-//                                      whole snapshot file.
+//   [u32 crc32]                      ← CRC32 of every byte before it.
 //
 // Layout — v3 (v6.1.2, publications trailer):
 //   [8 bytes magic "SPGENV01"]
 //   [u8 version = 3]
 //   [u32 catalog_len][catalog bytes]
 //   [u32 users_len][users bytes]
-//   [u32 pubs_len][publications bytes]   ← NEW
+//   [u32 pubs_len][publications bytes]
 //   [u32 crc32]
 //
-// Writers emit v3 from v6.1.2 on (always — even when publications
-// are empty, the trailer block is present with `pubs_len=2` carrying
-// the encoded empty payload). Readers accept all of {v1, v2, v3}:
-// v1/v2 load with an empty publication table; v3 verifies the
-// trailing CRC and deserialises the publications.
+// Layout — v4 (v6.1.4, subscriptions trailer):
+//   [8 bytes magic "SPGENV01"]
+//   [u8 version = 4]
+//   [u32 catalog_len][catalog bytes]
+//   [u32 users_len][users bytes]
+//   [u32 pubs_len][publications bytes]
+//   [u32 subs_len][subscriptions bytes]    ← NEW
+//   [u32 crc32]
+//
+// Writers emit v4 from v6.1.4 on. Readers accept all of {v1, v2,
+// v3, v4}: v1/v2 load with empty publications + subscriptions;
+// v3 loads with empty subscriptions; v4 deserialises both. Older
+// SPG versions reading a v4 envelope fall through the version
+// match to `EnvelopeParse::Bare`, causing the subsequent
+// catalog-deserialise to fail loudly — pre-v6.1.4 binaries
+// cannot open v6.1.4+ snapshots (matches the v6.1.2 break).
 
 const ENVELOPE_MAGIC: &[u8; 8] = b"SPGENV01";
 const ENVELOPE_VERSION_V1: u8 = 1;
 const ENVELOPE_VERSION_V2: u8 = 2;
 const ENVELOPE_VERSION_V3: u8 = 3;
+const ENVELOPE_VERSION_V4: u8 = 4;
 
-fn build_envelope(catalog: &[u8], users: &[u8], pubs: &[u8]) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(8 + 1 + 4 + catalog.len() + 4 + users.len() + 4 + pubs.len() + 4);
+fn build_envelope(catalog: &[u8], users: &[u8], pubs: &[u8], subs: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        8 + 1 + 4 + catalog.len() + 4 + users.len() + 4 + pubs.len() + 4 + subs.len() + 4,
+    );
     out.extend_from_slice(ENVELOPE_MAGIC);
-    out.push(ENVELOPE_VERSION_V3);
+    out.push(ENVELOPE_VERSION_V4);
     out.extend_from_slice(
         &u32::try_from(catalog.len())
             .expect("≤ 4G catalog")
@@ -250,6 +262,12 @@ fn build_envelope(catalog: &[u8], users: &[u8], pubs: &[u8]) -> Vec<u8> {
             .to_le_bytes(),
     );
     out.extend_from_slice(pubs);
+    out.extend_from_slice(
+        &u32::try_from(subs.len())
+            .expect("≤ 4G subscriptions")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(subs);
     let crc = spg_crypto::crc32::crc32(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     out
@@ -267,6 +285,7 @@ enum EnvelopeParse<'a> {
         catalog: &'a [u8],
         users: &'a [u8],
         publications: Option<&'a [u8]>,
+        subscriptions: Option<&'a [u8]>,
     },
     CrcMismatch {
         expected: u32,
@@ -285,7 +304,7 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     let version = buf[8];
     if !matches!(
         version,
-        ENVELOPE_VERSION_V1 | ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3
+        ENVELOPE_VERSION_V1 | ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4
     ) {
         return EnvelopeParse::Bare;
     }
@@ -316,7 +335,7 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     }
     let users = &buf[p..p + user_len];
     p += user_len;
-    let publications = if version == ENVELOPE_VERSION_V3 {
+    let publications = if matches!(version, ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4) {
         // [u32 pubs_len][publications bytes]
         let Some(pubs_len_bytes) = buf.get(p..p + 4) else {
             return EnvelopeParse::Bare;
@@ -335,7 +354,29 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     } else {
         None
     };
-    if matches!(version, ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3) {
+    let subscriptions = if version == ENVELOPE_VERSION_V4 {
+        // [u32 subs_len][subscriptions bytes]
+        let Some(subs_len_bytes) = buf.get(p..p + 4) else {
+            return EnvelopeParse::Bare;
+        };
+        let Ok(subs_len_arr) = subs_len_bytes.try_into() else {
+            return EnvelopeParse::Bare;
+        };
+        let subs_len = u32::from_le_bytes(subs_len_arr) as usize;
+        p += 4;
+        if p + subs_len > buf.len() {
+            return EnvelopeParse::Bare;
+        }
+        let subs_slice = &buf[p..p + subs_len];
+        p += subs_len;
+        Some(subs_slice)
+    } else {
+        None
+    };
+    if matches!(
+        version,
+        ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4
+    ) {
         if p + 4 != buf.len() {
             return EnvelopeParse::Bare;
         }
@@ -355,6 +396,7 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
         catalog,
         users,
         publications,
+        subscriptions,
     }
 }
 
@@ -434,6 +476,10 @@ pub struct Engine {
     /// `CREATE PUBLICATION` runs. Persistence rides the v3 envelope
     /// trailer (see `build_envelope`).
     publications: publications::Publications,
+    /// v6.1.4 logical-replication subscription catalog. Empty until
+    /// `CREATE SUBSCRIPTION` runs. Persistence rides the v4 envelope
+    /// trailer.
+    subscriptions: subscriptions::Subscriptions,
 }
 
 impl Engine {
@@ -448,6 +494,7 @@ impl Engine {
             max_query_rows: None,
             users: UserStore::new(),
             publications: publications::Publications::new(),
+            subscriptions: subscriptions::Subscriptions::new(),
         }
     }
 
@@ -464,6 +511,7 @@ impl Engine {
             max_query_rows: None,
             users: UserStore::new(),
             publications: publications::Publications::new(),
+            subscriptions: subscriptions::Subscriptions::new(),
         }
     }
 
@@ -479,6 +527,7 @@ impl Engine {
                 catalog: catalog_bytes,
                 users: user_bytes,
                 publications: pub_bytes,
+                subscriptions: sub_bytes,
             } => {
                 let catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
                 let users = users::deserialize_users(user_bytes)
@@ -488,6 +537,12 @@ impl Engine {
                         EngineError::Unsupported(alloc::format!("publications restore: {e:?}"))
                     })?,
                     None => publications::Publications::new(),
+                };
+                let subscriptions = match sub_bytes {
+                    Some(b) => subscriptions::Subscriptions::deserialize(b).map_err(|e| {
+                        EngineError::Unsupported(alloc::format!("subscriptions restore: {e:?}"))
+                    })?,
+                    None => subscriptions::Subscriptions::new(),
                 };
                 Ok(Self {
                     catalog,
@@ -499,6 +554,7 @@ impl Engine {
                     max_query_rows: None,
                     users,
                     publications,
+                    subscriptions,
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -599,13 +655,14 @@ impl Engine {
     /// adds publications to the envelope condition: either non-empty
     /// users OR non-empty publications now triggers the envelope path.
     pub fn snapshot(&self) -> Vec<u8> {
-        if self.users.is_empty() && self.publications.is_empty() {
+        if self.users.is_empty() && self.publications.is_empty() && self.subscriptions.is_empty() {
             self.catalog.serialize()
         } else {
             build_envelope(
                 &self.catalog.serialize(),
                 &users::serialize_users(&self.users),
                 &self.publications.serialize(),
+                &self.subscriptions.serialize(),
             )
         }
     }
@@ -714,6 +771,7 @@ impl Engine {
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
+            Statement::ShowSubscriptions => Ok(self.exec_show_subscriptions()),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
             _ => Err(EngineError::WriteRequired),
         };
@@ -851,12 +909,15 @@ impl Engine {
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
+            Statement::ShowSubscriptions => Ok(self.exec_show_subscriptions()),
             Statement::CreateUser(s) => self.exec_create_user(&s),
             Statement::DropUser(name) => self.exec_drop_user(&name),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
             Statement::AlterIndex(s) => self.exec_alter_index(s),
             Statement::CreatePublication(s) => self.exec_create_publication(s),
             Statement::DropPublication(name) => self.exec_drop_publication(&name),
+            Statement::CreateSubscription(s) => self.exec_create_subscription(s),
+            Statement::DropSubscription(name) => self.exec_drop_subscription(&name),
         };
         self.enforce_row_limit(result)
     }
@@ -872,11 +933,11 @@ impl Engine {
         &mut self,
         s: CreatePublicationStatement,
     ) -> Result<QueryResult, EngineError> {
-        if self.in_transaction() {
-            return Err(EngineError::Unsupported(
-                "CREATE PUBLICATION is not allowed inside a transaction".into(),
-            ));
-        }
+        // v6.1.4 — the v6.1.2 "no DDL inside a transaction" guard
+        // was over-cautious: it also blocked the auto-commit wrap
+        // path (which begins an internal TX around every WAL-
+        // logged statement). PG itself allows CREATE PUBLICATION
+        // inside a transaction (it rolls back with the TX).
         self.publications
             .create(s.name, s.scope)
             .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE PUBLICATION: {e:?}")))?;
@@ -891,11 +952,6 @@ impl Engine {
     /// in that case so the wire-level command tag distinguishes
     /// "dropped" from "no-op", though both succeed).
     fn exec_drop_publication(&mut self, name: &str) -> Result<QueryResult, EngineError> {
-        if self.in_transaction() {
-            return Err(EngineError::Unsupported(
-                "DROP PUBLICATION is not allowed inside a transaction".into(),
-            ));
-        }
         let removed = self.publications.drop(name);
         Ok(QueryResult::CommandOk {
             affected: usize::from(removed),
@@ -909,6 +965,93 @@ impl Engine {
     /// going through the wire.
     pub const fn publications(&self) -> &publications::Publications {
         &self.publications
+    }
+
+    /// v6.1.4 — `CREATE SUBSCRIPTION` runtime path. Defaults
+    /// `enabled = true` and `last_received_pos = 0` for a freshly-
+    /// created subscription. The actual worker thread is spawned
+    /// by spg-server once the engine returns success.
+    fn exec_create_subscription(
+        &mut self,
+        s: CreateSubscriptionStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // See exec_create_publication — the in_transaction gate
+        // was over-cautious; the auto-commit wrap path holds an
+        // internal TX that this check was incorrectly blocking.
+        let sub = subscriptions::Subscription {
+            conn_str: s.conn_str,
+            publications: s.publications,
+            enabled: true,
+            last_received_pos: 0,
+        };
+        self.subscriptions
+            .create(s.name, sub)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE SUBSCRIPTION: {e:?}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    /// v6.1.4 — `DROP SUBSCRIPTION`. Silent no-op when the name
+    /// doesn't exist (PG-compatible). The associated worker is
+    /// torn down by spg-server when it observes the catalog
+    /// change at the next snapshot or via the engine's
+    /// subscriptions accessor (the worker polls the catalog on
+    /// reconnect; v6.1.5's filter-side will tighten this to an
+    /// explicit signal).
+    fn exec_drop_subscription(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        let removed = self.subscriptions.drop(name);
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    /// v6.1.4 — read access to the subscription catalog. Used by
+    /// the subscription worker (read its own row to find its
+    /// publications + last applied position), by SHOW SUBSCRIPTIONS,
+    /// and by e2e tests asserting state directly.
+    pub const fn subscriptions(&self) -> &subscriptions::Subscriptions {
+        &self.subscriptions
+    }
+
+    /// v6.1.4 — write access to `last_received_pos`. Worker
+    /// calls this after each apply batch (under the engine's
+    /// write-lock). Returns `false` when the subscription was
+    /// dropped between when the worker received the record and
+    /// when this call landed.
+    pub fn subscription_advance(&mut self, name: &str, pos: u64) -> bool {
+        self.subscriptions.update_last_received_pos(name, pos)
+    }
+
+    /// v6.1.4 — `SHOW SUBSCRIPTIONS` row materialisation. Returns
+    /// `(name, conn_str, publications, enabled, last_received_pos)`
+    /// ordered by subscription name. The `publications` column is
+    /// the comma-joined list ("p1, p2") for ergonomic SHOW output;
+    /// callers wanting structured access read `Engine::subscriptions`.
+    fn exec_show_subscriptions(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("conn_str", DataType::Text, false),
+            ColumnSchema::new("publications", DataType::Text, false),
+            ColumnSchema::new("enabled", DataType::Bool, false),
+            ColumnSchema::new("last_received_pos", DataType::BigInt, false),
+        ];
+        let rows: Vec<Row> = self
+            .subscriptions
+            .iter()
+            .map(|(name, sub)| {
+                Row::new(alloc::vec![
+                    Value::Text(name.clone()),
+                    Value::Text(sub.conn_str.clone()),
+                    Value::Text(sub.publications.join(", ")),
+                    Value::Bool(sub.enabled),
+                    Value::BigInt(i64::try_from(sub.last_received_pos).unwrap_or(i64::MAX)),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
     }
 
     /// v6.1.3 — `SHOW PUBLICATIONS` row materialisation. Returns
@@ -5953,14 +6096,15 @@ mod tests {
     }
 
     #[test]
-    fn create_publication_blocked_inside_transaction() {
+    fn create_publication_allowed_inside_transaction() {
+        // v6.1.4 dropped the v6.1.2 in-TX guard — PG allows
+        // CREATE PUBLICATION inside a TX and the auto-commit
+        // wrap path needs the same allowance.
         let mut e = Engine::new();
         e.execute("BEGIN").unwrap();
-        let err = e.execute("CREATE PUBLICATION pub_a").unwrap_err();
-        assert!(
-            alloc::format!("{err:?}").contains("not allowed inside a transaction"),
-            "got {err:?}"
-        );
+        e.execute("CREATE PUBLICATION pub_a").unwrap();
+        e.execute("COMMIT").unwrap();
+        assert!(e.publications().contains("pub_a"));
     }
 
     // ── v6.1.3: SHOW PUBLICATIONS + FOR-list variants ───────
@@ -6071,6 +6215,152 @@ mod tests {
             panic!("p2 scope lost: {p2:?}")
         };
         assert_eq!(ts, alloc::vec!["bad".to_string(), "worse".to_string()]);
+    }
+
+    // ── v6.1.4: CREATE / DROP SUBSCRIPTION + SHOW + envelope v4 ─
+
+    #[test]
+    fn create_subscription_lands_in_catalog_with_defaults() {
+        let mut e = Engine::new();
+        e.execute(
+            "CREATE SUBSCRIPTION sub_a CONNECTION 'host=127.0.0.1 port=20002' PUBLICATION pub_a",
+        )
+        .unwrap();
+        let s = e.subscriptions().get("sub_a").cloned().expect("present");
+        assert_eq!(s.conn_str, "host=127.0.0.1 port=20002");
+        assert_eq!(s.publications, alloc::vec!["pub_a".to_string()]);
+        assert!(s.enabled);
+        assert_eq!(s.last_received_pos, 0);
+    }
+
+    #[test]
+    fn create_subscription_duplicate_name_errors() {
+        let mut e = Engine::new();
+        e.execute("CREATE SUBSCRIPTION s CONNECTION 'host=x' PUBLICATION p")
+            .unwrap();
+        let err = e
+            .execute("CREATE SUBSCRIPTION s CONNECTION 'host=y' PUBLICATION p")
+            .unwrap_err();
+        assert!(
+            alloc::format!("{err:?}").contains("DuplicateName"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn drop_subscription_silent_when_absent() {
+        let mut e = Engine::new();
+        let r = e.execute("DROP SUBSCRIPTION never").unwrap();
+        match r {
+            QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 0),
+            other => panic!("expected CommandOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscription_advance_updates_last_pos_monotone() {
+        let mut e = Engine::new();
+        e.execute("CREATE SUBSCRIPTION s CONNECTION 'h=x' PUBLICATION p")
+            .unwrap();
+        assert!(e.subscription_advance("s", 100));
+        assert_eq!(e.subscriptions().get("s").unwrap().last_received_pos, 100);
+        assert!(e.subscription_advance("s", 50)); // stale → ignored
+        assert_eq!(e.subscriptions().get("s").unwrap().last_received_pos, 100);
+        assert!(e.subscription_advance("s", 200));
+        assert_eq!(e.subscriptions().get("s").unwrap().last_received_pos, 200);
+        assert!(!e.subscription_advance("missing", 1));
+    }
+
+    #[test]
+    fn show_subscriptions_returns_rows_ordered_by_name() {
+        let mut e = Engine::new();
+        e.execute("CREATE SUBSCRIPTION z_sub CONNECTION 'h=x' PUBLICATION p1, p2")
+            .unwrap();
+        e.execute("CREATE SUBSCRIPTION a_sub CONNECTION 'h=y' PUBLICATION p3")
+            .unwrap();
+        let r = e.execute_readonly("SHOW SUBSCRIPTIONS").unwrap();
+        let QueryResult::Rows { rows, columns } = r else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(columns.len(), 5);
+        assert_eq!(columns[0].name, "name");
+        assert_eq!(columns[4].name, "last_received_pos");
+        // Alphabetical: a_sub, z_sub.
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|r| {
+                if let Value::Text(s) = &r.values[0] {
+                    s.as_str()
+                } else {
+                    panic!()
+                }
+            })
+            .collect();
+        assert_eq!(names, alloc::vec!["a_sub", "z_sub"]);
+        // Row 0: a_sub
+        assert_eq!(rows[0].values[1], Value::Text("h=y".to_string()));
+        assert_eq!(rows[0].values[2], Value::Text("p3".to_string()));
+        assert_eq!(rows[0].values[3], Value::Bool(true));
+        assert_eq!(rows[0].values[4], Value::BigInt(0));
+        // Row 1: z_sub — publications join with ", "
+        assert_eq!(rows[1].values[2], Value::Text("p1, p2".to_string()));
+    }
+
+    #[test]
+    fn subscriptions_persist_across_snapshot_envelope_v4() {
+        let mut e = Engine::new();
+        e.execute("CREATE SUBSCRIPTION s1 CONNECTION 'h=A' PUBLICATION p1, p2")
+            .unwrap();
+        e.execute("CREATE SUBSCRIPTION s2 CONNECTION 'h=B' PUBLICATION p3")
+            .unwrap();
+        e.subscription_advance("s2", 42);
+        let snap = e.snapshot();
+        let e2 = Engine::restore_envelope(&snap).unwrap();
+        assert_eq!(e2.subscriptions().len(), 2);
+        let s1 = e2.subscriptions().get("s1").unwrap();
+        assert_eq!(s1.conn_str, "h=A");
+        assert_eq!(s1.publications, alloc::vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(s1.last_received_pos, 0);
+        let s2 = e2.subscriptions().get("s2").unwrap();
+        assert_eq!(s2.last_received_pos, 42);
+    }
+
+    #[test]
+    fn v3_envelope_loads_with_empty_subscriptions() {
+        // v3 snapshot (publications-only). Forge it by hand so we
+        // verify v6.1.4 readers don't panic — they must surface
+        // empty subscriptions and a populated publication table.
+        let mut e = Engine::new();
+        e.execute("CREATE PUBLICATION pub_legacy").unwrap();
+        let catalog = e.catalog.serialize();
+        let users = crate::users::serialize_users(&e.users);
+        let pubs = e.publications.serialize();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"SPGENV01");
+        buf.push(3u8); // v3
+        buf.extend_from_slice(&u32::try_from(catalog.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&catalog);
+        buf.extend_from_slice(&u32::try_from(users.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&users);
+        buf.extend_from_slice(&u32::try_from(pubs.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&pubs);
+        let crc = spg_crypto::crc32::crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        let e2 = Engine::restore_envelope(&buf).expect("v3 envelope restores under v4 reader");
+        assert!(e2.subscriptions().is_empty());
+        assert!(e2.publications().contains("pub_legacy"));
+    }
+
+    #[test]
+    fn create_subscription_allowed_inside_transaction() {
+        let mut e = Engine::new();
+        e.execute("BEGIN").unwrap();
+        e.execute("CREATE SUBSCRIPTION s CONNECTION 'h=x' PUBLICATION p")
+            .unwrap();
+        e.execute("COMMIT").unwrap();
+        assert!(e.subscriptions().contains("s"));
     }
 
     #[test]
