@@ -262,7 +262,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             // statement; reply ParseComplete (no ReadyForQuery — that
             // waits for Sync).
             b'P' => {
-                if let Err(msg) = handle_parse(&body, &mut prepared) {
+                if let Err(msg) = handle_parse(&body, &mut prepared, state) {
                     send_error(&mut stream, "42601", &msg)?;
                 } else {
                     send_msg(&mut stream, b'1', &[])?;
@@ -303,9 +303,15 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             }
             // Execute (E): portal name + max-rows (0 = all).
             b'E' => {
-                if let Err(msg) =
-                    handle_execute(&body, &portals, &mut stream, state, role, &mut tx_state)
-                {
+                if let Err(msg) = handle_execute(
+                    &body,
+                    &portals,
+                    &prepared,
+                    &mut stream,
+                    state,
+                    role,
+                    &mut tx_state,
+                ) {
                     send_error(&mut stream, "42000", &msg)?;
                 }
             }
@@ -720,22 +726,41 @@ fn pg_tables_response(state: &Arc<ServerState>) -> CannedResponse {
 }
 
 // ---- v4.7 extended-query protocol ----
+//
+// v6.1.1 — the Parse → Bind → Execute path now runs the engine's
+// real prepared-statement API: `Engine::prepare(sql)` parses the
+// SQL ONCE into a `Statement` AST (with clock rewrites + ORDER BY
+// position resolution applied), and `Engine::execute_prepared(ast,
+// params)` substitutes `$N` placeholders inline before dispatch.
+// The pre-v6.1.1 implementation re-parsed the SQL on every Execute
+// after textual substitution of placeholders — a hack that gave
+// pgwire prepared-statement support its on-the-wire shape but
+// missed the actual perf win the extended-query protocol exists to
+// deliver.
 
 #[derive(Debug, Clone)]
 struct PreparedStmt {
-    sql: String,
-    /// Number of `$N` placeholders we expect in the SQL. PG drivers
-    /// declare param types in the Parse message; we ignore the
-    /// declared types and accept whatever the Bind hands over,
-    /// substituting via text-format conversion.
+    /// Pre-parsed AST. `Engine::prepare` returns this; we clone it
+    /// per Execute (cheap — `Statement` is mostly small owned
+    /// String / Vec fields).
+    ast: spg_sql::ast::Statement,
+    /// Number of `$N` placeholders the parsed AST contains. Cached
+    /// here so `Bind` can validate the client's parameter count
+    /// before constructing the portal.
     placeholder_count: u16,
 }
 
 #[derive(Debug, Clone)]
 struct Portal {
-    /// SQL with parameter placeholders already substituted (text
-    /// format only; binary params are rejected at Bind time).
-    bound_sql: String,
+    /// Reference back to the prepared statement by name. Execute
+    /// looks up the AST through `prepared[stmt_name]` rather than
+    /// cloning the AST into every portal — most portals are
+    /// short-lived (one Execute and then Sync).
+    stmt_name: String,
+    /// Bound parameter values, already decoded from text format
+    /// into typed `spg_storage::Value`s. Empty when the prepared
+    /// statement has no `$N` placeholders.
+    params: Vec<spg_storage::Value>,
 }
 
 /// Parse a null-terminated C string starting at `pos` of `body`.
@@ -757,6 +782,7 @@ fn read_cstring<'a>(body: &'a [u8], cursor: &mut usize) -> Option<&'a str> {
 fn handle_parse(
     body: &[u8],
     prepared: &mut std::collections::HashMap<String, PreparedStmt>,
+    state: &Arc<ServerState>,
 ) -> Result<(), String> {
     let mut cur = 0;
     let name = read_cstring(body, &mut cur)
@@ -768,17 +794,26 @@ fn handle_parse(
         .trim()
         .to_string();
     // Trailing u16 = param-type count, then that many u32 OIDs. We
-    // ignore the declared types; placeholder_count is sourced from
-    // the SQL by counting $N occurrences (cheap, robust).
+    // ignore the declared types; the AST itself carries the
+    // placeholder count we'll validate against the Bind.
     if cur + 2 > body.len() {
         return Err("Parse: missing parameter type count".into());
     }
-    let _declared = u16::from_be_bytes([body[cur], body[cur + 1]]);
+    // v6.1.1: real Engine::prepare path — parse + clock-rewrite +
+    // ORDER-BY position resolution once, here. Bind/Execute below
+    // reuse the AST. Surfaces parser errors as a wire-level Parse
+    // failure instead of deferring to the first Execute.
+    let eng = state
+        .engine
+        .read()
+        .map_err(|_| "Parse: engine lock poisoned".to_string())?;
+    let ast = eng.prepare(&sql).map_err(|e| format!("Parse: {e}"))?;
+    drop(eng);
     let placeholder_count = count_placeholders(&sql);
     prepared.insert(
         name,
         PreparedStmt {
-            sql,
+            ast,
             placeholder_count,
         },
     );
@@ -825,7 +860,7 @@ fn handle_bind(
         .get(&stmt_name)
         .ok_or_else(|| format!("Bind: prepared statement {stmt_name:?} not found"))?;
     // Param-format-codes count (u16), then that many u16 codes:
-    // 0 = text, 1 = binary. We only support text for v4.7.
+    // 0 = text, 1 = binary. We only support text for v6.1.1.
     if cur + 2 > body.len() {
         return Err("Bind: truncated format-code count".into());
     }
@@ -839,8 +874,6 @@ fn handle_bind(
         formats.push(u16::from_be_bytes([body[cur], body[cur + 1]]));
         cur += 2;
     }
-    // Param values count (u16), then for each: [i32 len][bytes...].
-    // -1 = SQL NULL.
     if cur + 2 > body.len() {
         return Err("Bind: truncated parameter count".into());
     }
@@ -852,7 +885,14 @@ fn handle_bind(
             stmt.placeholder_count
         ));
     }
-    let mut params: Vec<Option<String>> = Vec::with_capacity(param_count);
+    // v6.1.1: decode text params into typed `Value`s on the spot.
+    // SQL NULL → `Value::Null`. Anything numeric-looking → the
+    // narrowest fitting numeric variant (Int / BigInt / Float).
+    // Boolean tokens land as `Value::Bool`. Everything else stays
+    // `Value::Text`; the engine's `coerce_value` path turns Text
+    // into the column's declared type at row-insert time, same as
+    // simple-query INSERT VALUES would.
+    let mut params: Vec<spg_storage::Value> = Vec::with_capacity(param_count);
     for i in 0..param_count {
         if cur + 4 > body.len() {
             return Err("Bind: truncated parameter length".into());
@@ -860,111 +900,118 @@ fn handle_bind(
         let len = i32::from_be_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]);
         cur += 4;
         if len < 0 {
-            params.push(None);
+            params.push(spg_storage::Value::Null);
             continue;
         }
         let len = len as usize;
         if cur + len > body.len() {
             return Err("Bind: parameter value truncated".into());
         }
-        // Format: 0 = text (default if formats empty), 1 = binary.
-        // If only one format code provided, it applies to all params.
         let fmt = match formats.len() {
             0 => 0,
             1 => formats[0],
             _ => formats.get(i).copied().unwrap_or(0),
         };
         if fmt != 0 {
-            return Err("Bind: binary parameter format not supported (v4.7 text-only)".into());
+            return Err("Bind: binary parameter format not supported (v6.1.1 text-only)".into());
         }
         let s = std::str::from_utf8(&body[cur..cur + len])
-            .map_err(|_| "Bind: text parameter not valid UTF-8".to_string())?
-            .to_string();
-        params.push(Some(s));
+            .map_err(|_| "Bind: text parameter not valid UTF-8".to_string())?;
+        params.push(text_param_to_value(s));
         cur += len;
     }
-    // Trailing result-format-codes — we always return text, so ignore.
-    let bound_sql = substitute_placeholders(&stmt.sql, &params);
-    Ok((portal_name, Portal { bound_sql }))
+    // Trailing result-format-codes — we always return text on the
+    // wire, so ignore them here.
+    Ok((
+        portal_name,
+        Portal {
+            stmt_name,
+            params,
+        },
+    ))
 }
 
-/// Replace `$1`, `$2`, etc. in `sql` with the corresponding params.
-/// String parameters are SQL-quoted (`'...'` with `''` escape).
-/// NULL parameters render as the literal `NULL`. Numeric-looking
-/// strings keep their text form — the engine's parser coerces them
-/// per the column types.
-fn substitute_placeholders(sql: &str, params: &[Option<String>]) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(
-        sql.len()
-            + params
-                .iter()
-                .map(|p| p.as_ref().map_or(4, |s| s.len() + 2))
-                .sum::<usize>(),
-    );
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-            let mut j = i + 1;
-            let mut n: usize = 0;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                n = n * 10 + (bytes[j] - b'0') as usize;
-                j += 1;
-            }
-            if n >= 1 && n <= params.len() {
-                match &params[n - 1] {
-                    None => out.push_str("NULL"),
-                    Some(v) => {
-                        // Numeric-looking values render bare so the
-                        // engine sees an `INT` literal rather than a
-                        // `TEXT` literal it would then refuse to
-                        // coerce into an INT column. Booleans get the
-                        // same treatment.
-                        if looks_numeric(v)
-                            || matches!(v.as_str(), "true" | "false" | "TRUE" | "FALSE")
-                        {
-                            out.push_str(v);
-                        } else {
-                            // Quote + escape `'` as `''` per SQL.
-                            out.push('\'');
-                            for ch in v.chars() {
-                                if ch == '\'' {
-                                    out.push('\'');
-                                }
-                                out.push(ch);
-                            }
-                            out.push('\'');
-                        }
-                    }
-                }
-                i = j;
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
+/// v6.1.1 — convert a pgwire text-format bind parameter into a
+/// typed `Value`. Numeric / boolean tokens narrow to the matching
+/// scalar so the engine sees a `Literal::Integer(123)` rather
+/// than `Literal::String("123")` after the substitute walk (which
+/// would then fail to compare against an INT column without an
+/// explicit cast). The narrowing is conservative: only inputs
+/// that round-trip cleanly to text get the typed treatment.
+fn text_param_to_value(s: &str) -> spg_storage::Value {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("true") {
+        return spg_storage::Value::Bool(true);
     }
-    out
+    if trimmed.eq_ignore_ascii_case("false") {
+        return spg_storage::Value::Bool(false);
+    }
+    if let Ok(n) = trimmed.parse::<i32>() {
+        return spg_storage::Value::Int(n);
+    }
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return spg_storage::Value::BigInt(n);
+    }
+    if let Ok(x) = trimmed.parse::<f64>() {
+        return spg_storage::Value::Float(x);
+    }
+    // v6.1.1: PG-vector text format `[f1,f2,...]` — matches pgvector's
+    // wire-text representation. A real Vector param avoids parsing
+    // the 128-float text literal through the SQL lexer when the same
+    // prepared statement runs across many embeddings.
+    if let Some(v) = parse_vector_text(trimmed) {
+        return spg_storage::Value::Vector(v);
+    }
+    spg_storage::Value::Text(s.to_string())
 }
 
-/// True when `s` parses as a decimal integer or float — matching the
-/// grammar `[+-]?[0-9]+(.[0-9]+)?([eE][+-]?[0-9]+)?`. Used to decide
-/// whether to substitute a bind parameter as a bare literal vs a
-/// quoted string. We deliberately keep this narrow to avoid letting
-/// SQL fragments slip through unquoted.
+/// Parse `[f1,f2,...,fn]` into `Vec<f32>`. Returns None on any
+/// shape mismatch (no brackets, malformed float, trailing junk) —
+/// caller falls back to `Value::Text` so non-vector strings
+/// containing `[` still round-trip.
+fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'[' || bytes[bytes.len() - 1] != b']' {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(inner.split(',').count());
+    for tok in inner.split(',') {
+        let t = tok.trim();
+        let f: f32 = t.parse().ok()?;
+        if !f.is_finite() {
+            return None;
+        }
+        out.push(f);
+    }
+    Some(out)
+}
+
+// v6.1.1 removed the SQL-textual `substitute_placeholders` helper.
+// The Extended Query path now substitutes `Expr::Placeholder(n)`
+// nodes into the AST inside the engine — no SQL re-parse per
+// Execute. See `Engine::execute_prepared`.
+
+/// True when `s` parses as a decimal integer or float. Used by
+/// `handle_copy_from_stdin`'s row-construction path to decide
+/// whether to emit a bind parameter as a bare literal vs a
+/// SQL-quoted string. (The Extended Query Bind path no longer
+/// uses this — it builds typed `Value`s directly.)
 fn looks_numeric(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
         return false;
     }
-    // Reject anything with non-numeric punctuation that an integer
-    // or float parser would reject.
     s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
 }
 
 fn handle_execute(
     body: &[u8],
     portals: &std::collections::HashMap<String, Portal>,
+    prepared: &std::collections::HashMap<String, PreparedStmt>,
     stream: &mut TcpStream,
     state: &Arc<ServerState>,
     role: Role,
@@ -975,23 +1022,57 @@ fn handle_execute(
         .ok_or("Execute: portal name not UTF-8")?
         .to_string();
     // Max-rows (i32, 0 = unlimited). We always return everything;
-    // SELECT result sets in SPG are typically bounded, and respecting
-    // a partial cursor would mean keeping the result Vec around
-    // across Execute calls. Future work.
+    // partial-cursor support is future work.
     if cur + 4 > body.len() {
         return Err("Execute: missing max-rows".into());
     }
     let portal = portals
         .get(&portal_name)
         .ok_or_else(|| format!("Execute: portal {portal_name:?} not found"))?;
-    // Allow the canned (pg_catalog etc.) path to handle the bound SQL
-    // too, so an ORM that always prepares `SELECT version()` still
-    // gets the right reply.
-    if let Some(canned) = canned_response(&portal.bound_sql, state) {
-        send_canned(stream, &canned).map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    let result = execute_with_role(state, &portal.bound_sql, role);
+    let stmt = prepared.get(&portal.stmt_name).ok_or_else(|| {
+        format!(
+            "Execute: prepared statement {:?} dropped while a portal held a reference",
+            portal.stmt_name
+        )
+    })?;
+    // v6.1.1: dispatch through `Engine::execute_prepared` — the
+    // AST is reused from Parse; only the substitute walk + dispatch
+    // happen here. No SQL re-parse, no canned-response check (the
+    // canned probes are simple-query shape only; an ORM that
+    // PREPAREs `SELECT version()` doesn't need the canned path
+    // because the engine itself will satisfy it).
+    let needs_write = !matches!(&stmt.ast, spg_sql::ast::Statement::Select(_));
+    let result = {
+        let mut eng = if needs_write {
+            // Same lock-tier shape as `execute_with_role`'s
+            // write path. We hold `engine.write()` for the
+            // duration of execute_prepared so transactional
+            // state (in_transaction, savepoints) stays
+            // single-writer.
+            state
+                .engine
+                .write()
+                .map_err(|_| "Execute: engine lock poisoned".to_string())?
+        } else {
+            // SELECT-only path could take a read lock today —
+            // but execute_prepared takes &mut self for symmetry
+            // with the simple-query path. Leave the write lock
+            // for the v6.1.1 commit; v6.2 can introduce a
+            // dedicated read-only execute_prepared_readonly()
+            // and avoid the upgrade. Hot kNN reads still benefit
+            // from the parse caching, which is the load-bearing
+            // win.
+            state
+                .engine
+                .write()
+                .map_err(|_| "Execute: engine lock poisoned".to_string())?
+        };
+        // Role gate — same shape as `execute_with_role`.
+        if needs_write && matches!(role, Role::ReadOnly) {
+            return Err("permission denied: readonly role".into());
+        }
+        eng.execute_prepared(stmt.ast.clone(), &portal.params)
+    };
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
             send_row_description(stream, &columns).map_err(|e| e.to_string())?;
@@ -1002,7 +1083,12 @@ fn handle_execute(
             send_command_complete(stream, &format!("SELECT {n}")).map_err(|e| e.to_string())?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
-            let tag = command_tag(&portal.bound_sql, affected);
+            // Synthesise a command tag from the statement kind so
+            // drivers see e.g. "INSERT 0 1" rather than the
+            // simple-query path's per-SQL synthesis. We re-derive
+            // the tag from the AST root, not the original SQL
+            // text — text is owned by Parse, not Execute.
+            let tag = command_tag_for_ast(&stmt.ast, affected);
             send_command_complete(stream, &tag).map_err(|e| e.to_string())?;
             *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
                 b'T'
@@ -1013,6 +1099,32 @@ fn handle_execute(
         Err(e) => return Err(e.to_string()),
     }
     Ok(())
+}
+
+/// v6.1.1 — command-tag lookup that consumes the AST root directly,
+/// avoiding the simple-query path's text-based heuristics. PG's
+/// "tag" string is what shows up in psql as "INSERT 0 1" / "UPDATE
+/// 3" — most drivers parse it, so the shape matters.
+fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> String {
+    use spg_sql::ast::Statement;
+    match stmt {
+        Statement::Insert(_) => format!("INSERT 0 {affected}"),
+        Statement::Update(_) => format!("UPDATE {affected}"),
+        Statement::Delete(_) => format!("DELETE {affected}"),
+        Statement::CreateTable(_) => "CREATE TABLE".to_string(),
+        Statement::CreateIndex(_) => "CREATE INDEX".to_string(),
+        Statement::AlterIndex(_) => "ALTER INDEX".to_string(),
+        Statement::Begin => "BEGIN".to_string(),
+        Statement::Commit => "COMMIT".to_string(),
+        Statement::Rollback => "ROLLBACK".to_string(),
+        Statement::Savepoint(_) => "SAVEPOINT".to_string(),
+        Statement::RollbackToSavepoint(_) => "ROLLBACK".to_string(),
+        Statement::ReleaseSavepoint(_) => "RELEASE".to_string(),
+        Statement::CreateUser(_) => "CREATE USER".to_string(),
+        Statement::DropUser(_) => "DROP USER".to_string(),
+        // Select / Show / Explain go through the Rows path above.
+        _ => "OK".to_string(),
+    }
 }
 
 // ---- v4.19 SET / SHOW session-variable helpers ----

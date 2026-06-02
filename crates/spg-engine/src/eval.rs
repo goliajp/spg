@@ -29,6 +29,11 @@ use spg_storage::{ColumnSchema, DataType, Row, Value};
 pub struct EvalContext<'a> {
     pub columns: &'a [ColumnSchema],
     pub table_alias: Option<&'a str>,
+    /// v6.1.1 — bound parameters for `$N` placeholders inside the
+    /// expression tree. Empty for simple queries; populated by the
+    /// prepared-statement Execute path with Bind values converted
+    /// to `Value`. Index N (1-based per PG) hits `params[N-1]`.
+    pub params: &'a [Value],
 }
 
 impl<'a> EvalContext<'a> {
@@ -36,7 +41,17 @@ impl<'a> EvalContext<'a> {
         Self {
             columns,
             table_alias,
+            params: &[],
         }
+    }
+
+    /// v6.1.1 — attach a parameter buffer for `$N` placeholder
+    /// resolution. The slice must outlive the context; callers
+    /// construct it from the prepared statement's Bind values.
+    #[must_use]
+    pub const fn with_params(mut self, params: &'a [Value]) -> Self {
+        self.params = params;
+        self
     }
 }
 
@@ -46,6 +61,10 @@ pub enum EvalError {
     UnknownQualifier { qualifier: String },
     DivisionByZero,
     TypeMismatch { detail: String },
+    /// v6.1.1 — `$N` reference past the number of bound parameters.
+    /// Either the client sent too few in Bind, or the SQL has a
+    /// placeholder the prepared statement didn't account for.
+    PlaceholderOutOfRange { n: u16, bound: u16 },
 }
 
 impl core::fmt::Display for EvalError {
@@ -57,6 +76,10 @@ impl core::fmt::Display for EvalError {
             }
             Self::DivisionByZero => f.write_str("division by zero"),
             Self::TypeMismatch { detail } => write!(f, "type mismatch: {detail}"),
+            Self::PlaceholderOutOfRange { n, bound } => write!(
+                f,
+                "parameter ${n} referenced but only {bound} bound by client"
+            ),
         }
     }
 }
@@ -65,6 +88,16 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
     match expr {
         Expr::Literal(l) => Ok(literal_to_value(l)),
         Expr::Column(c) => resolve_column(c, row, ctx),
+        Expr::Placeholder(n) => {
+            let idx = usize::from(*n).saturating_sub(1);
+            ctx.params
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| EvalError::PlaceholderOutOfRange {
+                    n: *n,
+                    bound: u16::try_from(ctx.params.len()).unwrap_or(u16::MAX),
+                })
+        }
         Expr::Unary { op, expr } => {
             let v = eval_expr(expr, row, ctx)?;
             apply_unary(*op, v)

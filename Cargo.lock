@@ -1223,6 +1223,7 @@ dependencies = [
  "spg-audit",
  "spg-crypto",
  "spg-engine",
+ "spg-sql",
  "spg-storage",
  "spg-wire",
 ]

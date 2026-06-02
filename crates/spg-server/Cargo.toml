@@ -13,6 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 spg-wire    = { path = "../spg-wire" }
+# v6.1.1: pgwire's Extended Query path stores the parsed AST in
+# the prepared-statement cache (`spg_sql::ast::Statement`), so
+# spg-server depends on spg-sql directly. Pre-v6.1.1 only used
+# the engine's opaque `execute(sql)` API.
+spg-sql     = { path = "../spg-sql" }
 spg-engine  = { path = "../spg-engine" }
 spg-storage = { path = "../spg-storage" }
 spg-audit   = { path = "../spg-audit" }
