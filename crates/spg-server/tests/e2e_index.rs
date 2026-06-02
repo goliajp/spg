@@ -1,3 +1,4 @@
+#![allow(unused_mut, unused_variables)]
 //! B-tree index end-to-end:
 //! - CREATE INDEX over the wire registers the index server-side.
 //! - SELECT WHERE col = X returns the same row(s) as a full-scan would.
@@ -6,16 +7,23 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_command_complete, parse_data_row};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
+
+fn local_spawn(db: Option<&std::path::Path>) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new();
+    if let Some(path) = db {
+        b = b.arg_path(path);
+    }
+    b.spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29,49 +37,6 @@ fn unique_tmpdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("spg-idx-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
     dir
-}
-
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str, db: Option<&PathBuf>) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr);
-    if let Some(d) = db {
-        cmd.arg(d);
-    }
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn spg-server")
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -132,9 +97,9 @@ fn populate_and_index(stream: &mut TcpStream) {
 
 #[test]
 fn select_eq_returns_correct_row_via_index() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, None));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(None);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     populate_and_index(&mut s);
@@ -152,9 +117,9 @@ fn select_eq_returns_correct_row_via_index() {
 fn index_seek_and_full_scan_return_same_rows() {
     // Build two daemons: same data, one with index, one without. Same WHERE
     // → same row set.
-    let addr_a = pick_free_addr();
-    let mut child_a = ChildGuard(spawn_server(&addr_a, None));
-    let mut sa = wait_for_listener(&addr_a, &mut child_a.0);
+    let (raw, addrs) = local_spawn(None);
+    let mut child_a = common::ChildGuard(raw);
+    let mut sa = common::connect_to(&addrs.native);
     sa.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(
         &mut sa,
@@ -166,10 +131,9 @@ fn index_seek_and_full_scan_return_same_rows() {
         expect_cc(&mut sa);
     }
     let scan_rows = run_select(&mut sa, "SELECT * FROM t WHERE id = 4");
-
-    let addr_b = pick_free_addr();
-    let mut child_b = ChildGuard(spawn_server(&addr_b, None));
-    let mut sb = wait_for_listener(&addr_b, &mut child_b.0);
+    let (raw, addrs) = local_spawn(None);
+    let mut child_b = common::ChildGuard(raw);
+    let mut sb = common::connect_to(&addrs.native);
     sb.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(
         &mut sb,
@@ -196,18 +160,18 @@ fn index_definition_survives_daemon_restart() {
 
     // Phase 1: build the schema + populate + create the index.
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server(&addr, Some(&db)));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw, addrs) = local_spawn(Some(&db));
+        let mut child = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         populate_and_index(&mut s);
     }
 
     // Phase 2: restart and verify SELECT WHERE id = 4 still hits exactly one
     // row — the index was rebuilt from the rows on startup.
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, Some(&db)));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(Some(&db));
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let rows = run_select(&mut s, "SELECT * FROM accounts WHERE id = 4");
     assert_eq!(rows.len(), 1);

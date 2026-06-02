@@ -1,3 +1,4 @@
+#![allow(unused_mut, unused_variables)]
 //! BLAKE3 hash-chain audit log end-to-end:
 //! - Every successful DML appears in the on-disk audit file in order.
 //! - A fresh daemon started against an unmodified audit file accepts it.
@@ -5,9 +6,8 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,7 +15,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use spg_audit::AuditLog;
 use spg_wire::{Frame, Op, build_query, encode, parse_command_complete};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
+
+fn local_spawn(
+    db: &std::path::Path,
+    audit: &std::path::Path,
+) -> (std::process::Child, common::ServerAddrs) {
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .arg_path(audit)
+        .spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29,48 +40,6 @@ fn unique_tmpdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("spg-audit-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
     dir
-}
-
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str, db: &PathBuf, audit: &PathBuf) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
-        .arg(db)
-        .arg(audit)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn spg-server")
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -105,10 +74,9 @@ fn audit_chain_grows_with_each_writeful_query() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     let audit = dir.join("audit.log");
-
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &db, &audit));
-    let mut stream = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, &audit);
+    let mut child = common::ChildGuard(raw);
+    let mut stream = common::connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(&mut stream, "CREATE TABLE t (v INT)");
     expect_cc(&mut stream);
@@ -144,9 +112,9 @@ fn fresh_daemon_accepts_intact_audit_log_on_restart() {
 
     // Phase 1: produce.
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server(&addr, &db, &audit));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw, addrs) = local_spawn(&db, &audit);
+        let mut child = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         send_query(&mut s, "CREATE TABLE t (v INT)");
         expect_cc(&mut s);
@@ -155,9 +123,9 @@ fn fresh_daemon_accepts_intact_audit_log_on_restart() {
     }
 
     // Phase 2: restart, sanity-ping.
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &db, &audit));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, &audit);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let mut out = Vec::new();
     encode(&Frame::ping(), &mut out).unwrap();
@@ -176,9 +144,9 @@ fn tampered_audit_log_makes_daemon_fail_startup() {
 
     // Phase 1: produce a valid 2-entry log.
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server(&addr, &db, &audit));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw, addrs) = local_spawn(&db, &audit);
+        let mut child = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         send_query(&mut s, "CREATE TABLE t (v INT)");
         expect_cc(&mut s);
@@ -194,8 +162,10 @@ fn tampered_audit_log_makes_daemon_fail_startup() {
     fs::write(&audit, &bytes).unwrap();
 
     // Phase 3: spawn fresh daemon, expect it to exit non-zero within timeout.
-    let addr = pick_free_addr();
-    let mut child = spawn_server(&addr, &db, &audit);
+    let mut child = common::ServerBuilder::new()
+        .arg_path(&db)
+        .arg_path(&audit)
+        .spawn_expecting_startup_failure();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(status) = child.try_wait().unwrap() {

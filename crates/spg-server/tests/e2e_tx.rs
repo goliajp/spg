@@ -1,3 +1,4 @@
+#![allow(unused_mut, unused_variables)]
 //! Transaction end-to-end:
 //! - BEGIN / COMMIT applies + persists.
 //! - BEGIN / ROLLBACK doesn't persist and the db file is untouched.
@@ -6,17 +7,27 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spg_audit::AuditLog;
 use spg_wire::{Frame, Op, build_query, encode, parse_command_complete};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
+
+fn local_spawn(
+    db: &std::path::Path,
+    audit: Option<&std::path::PathBuf>,
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new().arg_path(db);
+    if let Some(a) = audit {
+        b = b.arg_path(a);
+    }
+    b.spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -30,49 +41,6 @@ fn unique_tmpdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("spg-tx-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
     dir
-}
-
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str, db: &PathBuf, audit: Option<&PathBuf>) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr).arg(db);
-    if let Some(a) = audit {
-        cmd.arg(a);
-    }
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn spg-server")
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -108,9 +76,9 @@ fn begin_insert_commit_persists() {
     let db = dir.join("spg.db");
 
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server(&addr, &db, None));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw, addrs) = local_spawn(&db, None);
+        let mut child = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         send_query(&mut s, "CREATE TABLE t (v INT NOT NULL)");
         expect_cc(&mut s);
@@ -125,9 +93,9 @@ fn begin_insert_commit_persists() {
     }
 
     // Restart and verify both rows survived.
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &db, None));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, None);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(&mut s, "SELECT * FROM t");
     assert_eq!(read_frame(&mut s).op, Op::RowDescription);
@@ -150,10 +118,9 @@ fn begin_insert_commit_persists() {
 fn begin_insert_rollback_leaves_db_file_unchanged() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &db, None));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, None);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(&mut s, "CREATE TABLE t (v INT NOT NULL)");
@@ -201,9 +168,9 @@ fn audit_records_commit_only_not_intra_tx_or_rollback() {
     let audit = dir.join("audit.log");
 
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server(&addr, &db, Some(&audit)));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw, addrs) = local_spawn(&db, Some(&audit));
+        let mut child = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         // Outside TX → 1 audit entry per write.

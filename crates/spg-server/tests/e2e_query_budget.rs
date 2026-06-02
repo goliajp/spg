@@ -1,3 +1,4 @@
+#![allow(unused_mut, unused_variables)]
 //! v5.5.1 per-query memory budget (`SPG_MAX_QUERY_BYTES`) end-to-end:
 //! - a SELECT whose result materialises past the ceiling is cancelled with a
 //!   clear error instead of driving the process toward the OOM killer;
@@ -6,60 +7,25 @@
 //!   though their cumulative bytes dwarf the ceiling.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, build_query, encode, parse_error_response};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
+
+fn local_spawn(envs: &[(&str, &str)]) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new();
+    for (k, v) in envs {
+        b = b.env(*k, *v);
+    }
+    b.spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// 1 MiB ceiling: small enough that a few thousand padded rows blow past it,
 /// large enough that parsing/planning a normal query stays well under.
 const BUDGET: &str = "1048576";
-
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str, envs: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr).stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.env_remove("SPG_PASSWORD");
-    cmd.env_remove("SPG_ADMIN_PASSWORD");
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
 
 fn read_frame(s: &mut TcpStream) -> Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
@@ -110,9 +76,9 @@ fn create_and_load(s: &mut TcpStream, batches: usize) {
 
 #[test]
 fn over_budget_select_is_cancelled() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_MAX_QUERY_BYTES", BUDGET)]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&[("SPG_MAX_QUERY_BYTES", BUDGET)]);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // 8000 rows × 400-char payload ≈ 3.2 MB of result data — ~3× the 1 MiB
@@ -135,9 +101,9 @@ fn over_budget_select_is_cancelled() {
 
 #[test]
 fn under_budget_select_succeeds() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_MAX_QUERY_BYTES", BUDGET)]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&[("SPG_MAX_QUERY_BYTES", BUDGET)]);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // 200 rows × 400 char ≈ 80 KB ≪ 1 MiB — comfortably under budget.
@@ -161,9 +127,9 @@ fn under_budget_select_succeeds() {
 /// never aborts/panics — it keeps serving.
 #[test]
 fn chaos_oom_returns_cancelled_not_panic() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_MAX_QUERY_BYTES", BUDGET)]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&[("SPG_MAX_QUERY_BYTES", BUDGET)]);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // ~3.2 MB table — 3× the 1 MiB ceiling.

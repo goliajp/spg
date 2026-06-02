@@ -6,30 +6,32 @@
     clippy::doc_markdown,
     clippy::similar_names,
     clippy::uninlined_format_args,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.8 SCRAM-SHA-256 e2e — hand-rolled client running the same
 //! protocol modern PG drivers run by default.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use spg_crypto::{base64, hmac, pbkdf2, sha256};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(3);
+mod common;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+fn local_spawn(db: &std::path::Path, admin_pw: &str) -> (std::process::Child, common::ServerAddrs) {
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .env("SPG_ADMIN_PASSWORD", admin_pw)
+        .spawn()
 }
+
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn unique_tmpdir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -39,43 +41,6 @@ fn unique_tmpdir() -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-e2e-scram-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-fn spawn_server(native_addr: &str, pg_addr: &str, db: &PathBuf, admin_pw: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(native_addr)
-        .arg(db)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("SPG_PG_ADDR", pg_addr)
-        .env("SPG_ADMIN_PASSWORD", admin_pw)
-        .env_remove("SPG_PASSWORD")
-        .spawn()
-        .unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 struct PgMessage {
@@ -121,14 +86,12 @@ fn send_msg(s: &mut TcpStream, ty: u8, body: &[u8]) {
 
 #[test]
 fn full_scram_handshake_with_admin_user() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
 
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db, "hunter2"));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = wait_for_listener(&pg, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, "hunter2");
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(addrs.pgwire.as_ref().unwrap());
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Startup → server should advertise SCRAM-SHA-256 (the bootstrap
@@ -225,14 +188,12 @@ fn full_scram_handshake_with_admin_user() {
 
 #[test]
 fn wrong_password_scram_rejected() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
 
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db, "hunter2"));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = wait_for_listener(&pg, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, "hunter2");
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(addrs.pgwire.as_ref().unwrap());
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_startup(&mut s, "admin");

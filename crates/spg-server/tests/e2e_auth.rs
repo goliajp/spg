@@ -1,64 +1,27 @@
+#![allow(unused_mut, unused_variables)]
 //! Auth model: optional single password via `SPG_PASSWORD`. Mirrors the
 //! Valkey/Redis surface — no password means open, a configured password
 //! means every non-`Ping` frame is gated behind a successful `AUTH`.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
 
 use spg_wire::{
     Frame, FrameError, Op, build_auth, build_query, decode, encode, parse_error_response,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+mod common;
 
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    let addr = probe.local_addr().expect("probe addr");
-    drop(probe);
-    addr.to_string()
-}
-
-fn spawn_server_with_password(addr: &str, password: Option<&str>) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr).stdout(Stdio::null()).stderr(Stdio::null());
+fn local_spawn(password: Option<&str>) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new();
     if let Some(pw) = password {
-        cmd.env("SPG_PASSWORD", pw);
-    } else {
-        cmd.env_remove("SPG_PASSWORD");
+        b = b.env("SPG_PASSWORD", pw).keep_env("SPG_PASSWORD");
     }
-    cmd.spawn().expect("spawn spg-server")
+    b.spawn()
 }
 
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early with {status:?} (last connect err: {e})");
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "server never accepted connections after {STARTUP_TIMEOUT:?}: {e}"
-                );
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn read_frame(stream: &mut TcpStream) -> Frame {
     let mut buf = Vec::new();
@@ -84,9 +47,9 @@ fn send(stream: &mut TcpStream, frame: &Frame) {
 
 #[test]
 fn query_without_auth_is_rejected_when_password_is_set() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_password(&addr, Some("hunter2")));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(Some("hunter2"));
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send(&mut s, &build_query("SELECT 1"));
@@ -98,9 +61,9 @@ fn query_without_auth_is_rejected_when_password_is_set() {
 
 #[test]
 fn ping_always_allowed_even_without_auth() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_password(&addr, Some("hunter2")));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(Some("hunter2"));
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send(&mut s, &Frame::ping());
@@ -110,9 +73,9 @@ fn ping_always_allowed_even_without_auth() {
 
 #[test]
 fn wrong_password_keeps_connection_unauthenticated() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_password(&addr, Some("hunter2")));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(Some("hunter2"));
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send(&mut s, &build_auth("nope"));
@@ -127,9 +90,9 @@ fn wrong_password_keeps_connection_unauthenticated() {
 
 #[test]
 fn correct_password_unlocks_queries() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_password(&addr, Some("hunter2")));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(Some("hunter2"));
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send(&mut s, &build_auth("hunter2"));
@@ -146,9 +109,9 @@ fn open_server_accepts_auth_no_op() {
     // Open instances (no SPG_PASSWORD set) should still accept AUTH
     // frames gracefully so clients with auth wired in keep working
     // against unauthenticated deployments.
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_password(&addr, None));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(None);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send(&mut s, &build_auth("anything"));
