@@ -1,7 +1,12 @@
 #![allow(
     clippy::doc_markdown,
     clippy::manual_assert,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables,
+    clippy::needless_borrow,
+    clippy::needless_pass_by_value,
+    clippy::empty_line_after_doc_comments
 )]
 
 //! v4.24 single-master / multi-follower WAL streaming replication.
@@ -11,24 +16,48 @@
 //! made on the master are visible on the follower.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+mod common;
+
+fn spawn_master(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    extra_env: Vec<(&str, String)>,
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal)
+        .with_repl();
+    for (k, v) in &extra_env {
+        if *k != "SPG_REPL_ADDR" {
+            b = b.env(*k, v);
+        }
+    }
+    b.spawn()
+}
+
+fn spawn_follower(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    follow_of: &str,
+) -> (std::process::Child, common::ServerAddrs) {
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal)
+        .env("SPG_FOLLOW_OF", follow_of)
+        .spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLICATION_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
 
 fn unique_tmpdir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -38,47 +67,6 @@ fn unique_tmpdir() -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-e2e-repl-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-fn spawn(addr: &str, db: &PathBuf, wal: &PathBuf, extra_env: Vec<(&str, String)>) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .arg("-") // audit path off
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
 }
 
 fn read_frame(s: &mut TcpStream) -> Frame {
@@ -149,23 +137,16 @@ fn wire_to_i64(v: &WireValue) -> i64 {
 
 #[test]
 fn follower_bootstraps_from_master_snapshot_and_tails_writes() {
-    let master_addr = pick_free_addr();
-    let repl_addr = pick_free_addr();
-    let follower_addr = pick_free_addr();
-
     let dir = unique_tmpdir();
     let master_db = dir.join("master.db");
     let master_wal = dir.join("master.wal");
     let follower_db = dir.join("follower.db");
     let follower_wal = dir.join("follower.wal");
 
-    let mut master = ChildGuard(spawn(
-        &master_addr,
-        &master_db,
-        &master_wal,
-        vec![("SPG_REPL_ADDR", repl_addr.clone())],
-    ));
-    let mut ms = wait_for_listener(&master_addr, &mut master.0);
+    let (raw, master_addrs) = spawn_master(&master_db, &master_wal, vec![]);
+
+    let mut master = common::ChildGuard(raw);
+    let mut ms = common::connect_to(&master_addrs.native);
     ms.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Pre-bootstrap data on master so the snapshot already has rows.
@@ -182,13 +163,14 @@ fn follower_bootstraps_from_master_snapshot_and_tails_writes() {
     assert_eq!(select_count(&mut ms, "SELECT count(*) FROM rep"), 3);
 
     // Start follower. It will connect to master, fetch snapshot, then tail.
-    let mut follower = ChildGuard(spawn(
-        &follower_addr,
+    let (raw, follower_addrs) = spawn_follower(
         &follower_db,
         &follower_wal,
-        vec![("SPG_FOLLOW_OF", repl_addr.clone())],
-    ));
-    let mut fs = wait_for_listener(&follower_addr, &mut follower.0);
+        master_addrs.repl.as_ref().unwrap(),
+    );
+
+    let mut follower = common::ChildGuard(raw);
+    let mut fs = common::connect_to(&follower_addrs.native);
     fs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Poll follower until snapshot is applied (table appears AND

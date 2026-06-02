@@ -2,7 +2,9 @@
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.33 slow-query log — `SPG_SLOW_QUERY_LOG_MS` thresholds when
@@ -14,7 +16,7 @@
 //! under threshold produces nothing.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -26,11 +28,21 @@ use spg_wire::{Frame, Op, build_query, encode};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+/// v6.0.x — race-free port allocation. Pass `127.0.0.1:0` to the
+/// child, parse the actual bound address from the captured stderr
+/// buffer. See `tests/common/mod.rs` for the broader rationale.
+fn extract_listen_addr_from_buf(buf: &Arc<Mutex<String>>) -> String {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        let snap = buf.lock().unwrap().clone();
+        if let Some(after) = snap.find("listening on ") {
+            let tail = &snap[after + "listening on ".len()..];
+            let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
+            return tail[..end].to_string();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("server didn't publish listen addr in stderr buffer");
 }
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
@@ -91,22 +103,6 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-}
-
 fn read_frame(s: &mut TcpStream) -> Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
     s.read_exact(&mut header).unwrap();
@@ -143,7 +139,6 @@ fn drain_to_cc(s: &mut TcpStream) {
 /// query stays silent. JSON line carries sql/elapsed_us/role.
 #[test]
 fn slow_query_log_fires_above_threshold_and_silent_below() {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir("th");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
@@ -152,13 +147,14 @@ fn slow_query_log_fires_above_threshold_and_silent_below() {
     // (tens of ms in release at N=90000). The threshold has to
     // straddle the *release-build* timings since CI runs --release.
     let (child, stderr_buf) = spawn_server_capture_stderr(
-        &addr,
+        "127.0.0.1:0",
         &db,
         &wal,
         &[("SPG_SLOW_QUERY_LOG_MS", "5".to_string())],
     );
     let mut c = ChildGuard(child);
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    let addr = extract_listen_addr_from_buf(&stderr_buf);
+    let mut s = TcpStream::connect(&addr).expect("connect");
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Bootstrap (DDL — should NOT count as slow because trivial).

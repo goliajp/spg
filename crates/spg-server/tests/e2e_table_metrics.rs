@@ -2,7 +2,12 @@
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables,
+    clippy::needless_borrow,
+    clippy::needless_pass_by_value,
+    clippy::empty_line_after_doc_comments
 )]
 
 //! v4.35 per-table metrics — `spg_table_rows{table=...}` +
@@ -11,68 +16,24 @@
 //! exact `SPG_METRICS_TABLE_ALLOWLIST`.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::net::TcpStream;
 use std::thread;
 use std::time::{Duration, Instant};
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 use spg_wire::{Frame, Op, build_query, encode};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str, http_addr: &str, envs: &[(&str, String)]) -> Child {
-    // In-memory only: no db_path / no WAL. The /metrics path reads
-    // the live catalog regardless of persistence mode, and skipping
-    // WAL fsync keeps the test parallelism-friendly (the suite runs
-    // three tests concurrently — three real WAL volumes would slug
-    // each other on shared CI disks).
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR")
-        .env_remove("SPG_DB")
-        .env_remove("SPG_WAL")
-        .env("SPG_HTTP_ADDR", http_addr);
+fn local_spawn(envs: &[(&str, String)]) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new().with_http();
     for (k, v) in envs {
-        cmd.env(k, v);
+        b = b.env(*k, v);
     }
-    cmd.spawn().unwrap()
+    b.spawn()
 }
 
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-}
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn read_frame(s: &mut TcpStream) -> Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
@@ -129,10 +90,9 @@ fn fetch_metrics(http_addr: &str) -> String {
 /// emitted with stable, non-zero values that reflect inserts.
 #[test]
 fn table_metrics_default_top_n_emits_rows_and_bytes_per_table() {
-    let addr = pick_free_addr();
-    let http = pick_free_addr();
-    let mut c = ChildGuard(spawn_server(&addr, &http, &[]));
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    let (raw, addrs) = local_spawn(&[]);
+    let mut c = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     exec_ok(
@@ -153,7 +113,7 @@ fn table_metrics_default_top_n_emits_rows_and_bytes_per_table() {
         exec_ok(&mut s, &format!("INSERT INTO beta VALUES ({i}, 'b-{i}')"));
     }
 
-    let body = fetch_metrics(&http);
+    let body = fetch_metrics(&addrs.http.as_ref().unwrap());
     assert!(
         body.starts_with("HTTP/1.1 200"),
         "/metrics not 200:\n{body}"
@@ -180,14 +140,10 @@ fn table_metrics_default_top_n_emits_rows_and_bytes_per_table() {
 /// smaller. Tables not in the list are dropped.
 #[test]
 fn table_metrics_allowlist_filters_and_orders() {
-    let addr = pick_free_addr();
-    let http = pick_free_addr();
-    let mut c = ChildGuard(spawn_server(
-        &addr,
-        &http,
-        &[("SPG_METRICS_TABLE_ALLOWLIST", "kept,also_kept".to_string())],
-    ));
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    let (raw, addrs) =
+        local_spawn(&[("SPG_METRICS_TABLE_ALLOWLIST", "kept,also_kept".to_string())]);
+    let mut c = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     exec_ok(&mut s, "CREATE TABLE kept (id INT NOT NULL)");
@@ -199,7 +155,7 @@ fn table_metrics_allowlist_filters_and_orders() {
         exec_ok(&mut s, &format!("INSERT INTO dropped VALUES ({i})"));
     }
 
-    let body = fetch_metrics(&http);
+    let body = fetch_metrics(&addrs.http.as_ref().unwrap());
     assert!(body.contains("spg_table_rows{table=\"kept\"} 2"));
     assert!(body.contains("spg_table_rows{table=\"also_kept\"} 2"));
     assert!(
@@ -212,14 +168,9 @@ fn table_metrics_allowlist_filters_and_orders() {
 /// top-N largest by row count are exported.
 #[test]
 fn table_metrics_topn_caps_cardinality_under_load() {
-    let addr = pick_free_addr();
-    let http = pick_free_addr();
-    let mut c = ChildGuard(spawn_server(
-        &addr,
-        &http,
-        &[("SPG_METRICS_TABLE_TOPN", "3".to_string())],
-    ));
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    let (raw, addrs) = local_spawn(&[("SPG_METRICS_TABLE_TOPN", "3".to_string())]);
+    let mut c = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     for t in 0..6 {
@@ -230,7 +181,7 @@ fn table_metrics_topn_caps_cardinality_under_load() {
         }
     }
 
-    let body = fetch_metrics(&http);
+    let body = fetch_metrics(&addrs.http.as_ref().unwrap());
     let lines: Vec<&str> = body
         .lines()
         .filter(|l| l.starts_with("spg_table_rows{table="))
