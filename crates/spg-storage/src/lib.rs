@@ -2919,13 +2919,13 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::Text(s) | Value::Json(s) => 2 + s.len(),
         // [u32 dim][f32 * dim]
         Value::Vector(vec) => 4 + 4 * vec.len(),
-        // v6.0.1: SQ8 cell body lands in step 6 (new tag 7 row
-        // payload). Until then, INSERT path rejects SQ8 columns
-        // at the engine layer, so an Sq8Vector cell can never
-        // reach the row encoder.
-        Value::Sq8Vector(_) => {
-            unreachable!("Value::Sq8Vector on-disk encoding lands in v6.0.1 step 6")
-        }
+        // v6.0.1: SQ8 cell on-disk shape — [u32 dim][f32 min]
+        // [f32 max][u8 * dim] = 12 + dim bytes. `hot_bytes`
+        // tracking on `Table::insert` calls this every row, so
+        // returning the real size now (even though the actual
+        // `write_value_body` writer lands in step 6) keeps the
+        // sizing arithmetic honest for in-memory benches.
+        Value::Sq8Vector(q) => 4 + 4 + 4 + q.bytes.len(),
         // [i128 scaled][u8 scale]
         Value::Numeric { .. } => 16 + 1,
         // NULL is encoded only in the bitmap, never in the body.

@@ -4453,22 +4453,6 @@ fn apply_offset_and_limit(rows: &mut Vec<Row>, offset: Option<u32>, limit: Optio
 
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
-    // v6.0.1 step 1 fence: parser + AST accept `VECTOR(N) USING SQ8`,
-    // but the write path / HNSW / on-disk row payload land in
-    // subsequent v6.0.1 steps (3–6). Until then, CREATE TABLE
-    // rejects SQ8 columns so the catalog can never hold a schema
-    // whose INSERT path would silently coerce f32 cells into the
-    // SQ8 slot. Removed when step 3 lands.
-    if let DataType::Vector {
-        encoding: VecEncoding::Sq8,
-        ..
-    } = ty
-    {
-        return Err(EngineError::Unsupported(alloc::format!(
-            "VECTOR USING SQ8 is parsed but not yet executable — lands in v6.0.1 step 3 (column: {})",
-            c.name
-        )));
-    }
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
     if let Some(default_expr) = c.default {
         // DEFAULT must be a literal expression — evaluated at CREATE TABLE
@@ -4692,6 +4676,22 @@ fn coerce_value(
                     )));
                 }
             }
+            // v6.0.1: f32 → SQ8 INSERT-time quantisation. Triggered
+            // when the column declares `VECTOR(N) USING SQ8` and
+            // the INSERT VALUES expression yields a raw f32 vector
+            // (the normal pgvector-shape literal). Dim mismatch
+            // falls through the `_ => None` arm and surfaces as
+            // `TypeMismatch` with the expected SQ8 column type —
+            // matching the F32 path's existing error.
+            (
+                Value::Vector(v),
+                DataType::Vector {
+                    dim,
+                    encoding: VecEncoding::Sq8,
+                },
+            ) if v.len() == dim as usize => {
+                Some(Value::Sq8Vector(spg_storage::quantize::quantize(&v)))
+            }
             // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
             // is already longer we reject (PG truncates trailing-space-only;
             // staying strict for v1).
@@ -4761,19 +4761,61 @@ mod tests {
     }
 
     #[test]
-    fn create_table_vector_using_sq8_is_fenced_in_step_1() {
-        // v6.0.1 step 1 lands AST + DDL plumbing only. The write
-        // path (step 3) and on-disk row payload (step 6) aren't
-        // hooked yet, so CREATE TABLE must reject SQ8 columns
-        // until those steps land. When step 3 ships, this test
-        // should be flipped to assert success (the fence is
-        // removed inside `column_def_to_schema`).
+    fn create_table_vector_using_sq8_succeeds() {
+        // v6.0.1 step 3: the step-1 fence in `column_def_to_schema`
+        // is lifted. CREATE TABLE persists an SQ8 column type in
+        // the catalog; INSERT (next test) quantises raw f32 input.
         let mut e = Engine::new();
-        let err = e
-            .execute("CREATE TABLE t (v VECTOR(8) USING SQ8)")
-            .unwrap_err();
+        e.execute("CREATE TABLE t (v VECTOR(8) USING SQ8)").unwrap();
+        let t = e.catalog().get("t").unwrap();
+        assert_eq!(
+            t.schema().columns[0].ty,
+            DataType::Vector {
+                dim: 8,
+                encoding: VecEncoding::Sq8,
+            },
+        );
+    }
+
+    #[test]
+    fn insert_into_sq8_column_quantises_f32_payload() {
+        // v6.0.1 step 3: INSERT-time `coerce_value` rewrites a raw
+        // `Value::Vector(Vec<f32>)` literal into the column's
+        // quantised representation. The row that lands in the
+        // catalog must therefore hold a `Value::Sq8Vector`, not the
+        // original f32 buffer — that's the bit that delivers the
+        // 4× compression target.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v VECTOR(4) USING SQ8)").unwrap();
+        e.execute("INSERT INTO t VALUES ([0.0, 0.25, 0.5, 1.0])")
+            .unwrap();
+        let t = e.catalog().get("t").unwrap();
+        assert_eq!(t.rows().len(), 1);
+        match &t.rows()[0].values[0] {
+            Value::Sq8Vector(q) => {
+                assert_eq!(q.bytes.len(), 4);
+                // min/max are derived from the payload: min=0.0, max=1.0.
+                assert!((q.min - 0.0).abs() < 1e-6);
+                assert!((q.max - 1.0).abs() < 1e-6);
+            }
+            other => panic!("expected Sq8Vector cell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_into_sq8_column_dim_mismatch_errors() {
+        // Dim mismatch falls through the `coerce_value` Vector→Sq8
+        // arm's guard and surfaces as `TypeMismatch` — the same
+        // error the F32 path produces today, so client error
+        // handling stays uniform across encodings.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v VECTOR(4) USING SQ8)").unwrap();
+        let err = e.execute("INSERT INTO t VALUES ([1.0, 2.0])").unwrap_err();
         assert!(
-            matches!(&err, EngineError::Unsupported(msg) if msg.contains("VECTOR USING SQ8")),
+            matches!(
+                &err,
+                EngineError::Storage(StorageError::TypeMismatch { .. })
+            ),
             "got: {err}",
         );
     }
