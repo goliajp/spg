@@ -779,6 +779,203 @@ Verification at each todo via the `cargo test` commands listed
 in the L3a-v6.0.2 steps. Anything red → stop and diagnose; do
 not soften the test.
 
+## L3a-v6.0.3 — Hot plan for v6.0.3 (halfvec / `VECTOR(N) HALF`)
+
+v6.0.3 adds the second alternative cell encoding: IEEE-754
+binary16 (half-precision). 2× memory compression vs the pre-v6
+f32 baseline (≤ 260 MiB target for 1M dim-128, vs 488 MiB raw
+f32), at the cost of f32→f16 precision loss bounded by the
+half-precision mantissa.
+
+### Architectural deviation from V6_DESIGN L2 (stable-Rust constraint)
+
+The L2 row promised "f32 ↔ f16 conversion via aarch64 native f16
+(`fcvt`); NEON SIMD `l2 / cosine / inner_product` on f16."
+Stable Rust 1.96 (this workspace's toolchain) does **not** yet
+have a stable `f16` primitive or stable `core::arch::aarch64`
+f16 intrinsics — both gated behind unstable feature flags
+(rust-lang/rust#116909, rust-lang/rust#125606). v6.0.3 ships
+with:
+
+- **Manual IEEE-754 binary16 codec** in `crates/spg-storage/
+  src/halfvec.rs` (~30 lines of bit manipulation). Bit-exact
+  reference output verified against test fixtures matching the
+  IEEE 754-2008 examples + `0.0 / -0.0 / ±∞ / NaN` edge cases.
+- **Storage:** `HalfVector { bytes: Vec<u8> }` carrying raw u16
+  little-endian half-precision bits. Dim = `bytes.len() / 2`.
+- **Distance path:** HNSW search dequantises cells to f32
+  in-loop and reuses the v6.0.2 f32 NEON paths
+  (`inner_product_neon` / `cosine_dot_norms_neon` /
+  `l2_distance_sq_neon`). Per-pair cost stays in the same ns
+  budget as f32 because the dequantise step is amortised
+  against the FMA loop body. No `f32 rerank` pass needed —
+  f16 dequantisation is bit-exact to the storage, so the
+  beam-search result IS the exact f16-precision answer
+  (unlike SQ8 where ADC is approximate).
+
+NEON f16 SIMD lands as v6.0.6 or a stable-Rust-toolchain bump,
+whichever comes first. The on-disk format and DDL surface are
+designed to accept that future change without a `FILE_VERSION`
+bump (same dispatch fence as v6.0.2 NEON dispatch).
+
+### Step 1 — `VecEncoding::F16` + DDL parser `USING HALF`
+
+- `crates/spg-sql/src/ast.rs`: extend `VecEncoding` with `F16`
+  variant. `Display` emits `F16` → `"HALF"` (PG / pgvector
+  convention; `HALF` is what users type in DDL, not `F16`).
+- `crates/spg-sql/src/parser.rs::parse_optional_vector_encoding`:
+  accept `"half"` (case-insensitive) → `F16`. The error message
+  is updated to list both `SQ8` and `HALF`.
+- `crates/spg-storage/src/lib.rs`: mirror `VecEncoding::F16`,
+  same Display ("HALF").
+- `crates/spg-engine/src/lib.rs::column_type_to_data_type`:
+  bridge `SqlVecEncoding::F16` → `VecEncoding::F16`.
+- `crates/spg-engine/src/lib.rs::column_def_to_schema`: lift the
+  USING-SQ8 fence's mirror to USING-HALF (which we won't have
+  here because Step 3 lands the write path in the same commit
+  as Step 1).
+
+**Verify:**
+```
+cargo test -p spg-sql --lib parser::create_table_vector_using_half
+cargo test --workspace --lib    # ensure no callsite of VecEncoding broke
+```
+
+### Step 2 — `Value::HalfVector` + f32 ↔ f16 codec
+
+- New file `crates/spg-storage/src/halfvec.rs`:
+  - `pub struct HalfVector { pub bytes: Vec<u8> }`. Invariant:
+    `bytes.len() % 2 == 0`. Constructor `HalfVector::from_f32_slice(&[f32]) -> Self`.
+    Inverse `HalfVector::to_f32_vec(&self) -> Vec<f32>`.
+  - `f16_from_f32_bits(bits: u32) -> u16`: round-to-nearest-
+    even, handles ±∞, NaN, denormals, overflow → ±∞,
+    underflow → ±0.
+  - `f16_to_f32_bits(bits: u16) -> u32`: inverse, exact for
+    every finite f16 (denormals normalised).
+- `crates/spg-storage/src/lib.rs::Value` gains
+  `HalfVector(crate::halfvec::HalfVector)` variant. `data_type()`
+  reports `Vector { dim: bytes.len() / 2, encoding: F16 }`.
+- All match arms updated (same pattern as v6.0.1 step 2: rendering
+  paths dequantise to f32; on-disk write_value_body lands in
+  step 4).
+- Unit tests in `halfvec.rs`:
+  - Roundtrip f32 → f16 → f32 within (2 ^ -10) × |x| for finite
+    normals; bit-exact for representable values
+    (`{0.0, 0.25, 0.5, 1.0, 1.5}` etc.).
+  - Special-value handling: `±0.0`, `±∞`, `NaN`.
+  - `from_f32_slice([])` returns empty `HalfVector`.
+
+**Verify:**
+```
+cargo test -p spg-storage --lib halfvec::f16_codec_roundtrip
+cargo test -p spg-storage --lib halfvec::f16_special_values
+cargo test --workspace --lib   # exhaustiveness fan-out
+```
+
+### Step 3 — INSERT path + HNSW dispatch
+
+- `crates/spg-engine/src/lib.rs::coerce_value`: new arm
+  `(Value::Vector, DataType::Vector { encoding: F16, dim }) if v.len() == dim`
+  → `Value::HalfVector(HalfVector::from_f32_slice(&v))`.
+- `crates/spg-storage/src/lib.rs::vec_l2_sq` /
+  `cell_l2_sq` / `cell_to_query_metric_distance`: add
+  `Value::HalfVector(h)` arms that dequantise the cell to f32
+  inline then route through the existing f32 distance functions.
+  No new NEON kernels — the dequantise loop is what we save when
+  stable Rust gets f16 SIMD.
+- `crates/spg-storage/src/lib.rs::nsw_search`: F16 columns skip
+  the `sq8_rerank` over-fetch — f16 dequantisation is exact at
+  storage precision, so the ADC beam IS the exact answer.
+  Schema check `encoding == F16` short-circuits the over-fetch
+  bump.
+- `crates/spg-engine/src/eval.rs::unwrap_vec_pair`: extend
+  `to_f32` closure with a `Value::HalfVector` arm (dequant to
+  f32 via `to_f32_vec()`).
+- `crates/spg-engine/src/aggregate.rs::encode_key`: add
+  `Value::HalfVector` arm (similar to the SQ8 arm — emits a
+  byte-identical group key).
+- `crates/spg-server/src/main.rs::value_to_wire`,
+  `pgwire.rs::value_to_pg_text` / `encode_copy_cell`,
+  `eval.rs::value_to_text`, `xtests/sqllogictest/src/runner.rs::
+  render_cell`: dequantise HalfVector to f32 on output (same
+  pattern as SQ8).
+
+**Verify:**
+```
+cargo test -p spg-engine --lib eval::insert_half_column_converts_f32
+cargo test -p spg-storage --lib hnsw_half_recall_at_10_matches_f32_groundtruth
+```
+The recall test asserts ≥ 0.95 overlap with f32 ground truth
+(stricter than SQ8 — half-precision retains ~3 decimal digits).
+
+### Step 4 — On-disk row + DataType / Value tags
+
+- `write_data_type` / `read_data_type`: new tag 15 for
+  `DataType::Vector { encoding: F16 }`. Layout `[u32 dim]` (same
+  as F32 / SQ8 type-tag side; the encoding lives in the tag
+  byte itself).
+- `write_value_body` / `read_value_body` dense row path: new
+  arm for `Value::HalfVector` →
+  `[u32 dim][u16 LE × dim]` body (`2 + 2 * dim` bytes; matches
+  the v6.0.0 `2× compression` guarantee at the storage layer).
+- `write_value` / `read_value` tag-prefixed catalog DEFAULT
+  path: tag 12 for `Value::HalfVector`.
+- Pre-v6 readers hit tags 12 / 15 in the catch-all and surface
+  `Corrupt("unknown … tag")` — same forward-compat fence as
+  v6.0.1 step 6.
+- `value_body_encoded_len`: 4 + 2 × dim.
+
+**Verify:**
+```
+cargo test -p spg-storage --lib half_catalog_serialise_roundtrip_preserves_cells_and_index
+```
+
+### Step 5 — e2e + perf gate harness + STABILITY + CHANGELOG + ship
+
+- `crates/spg-server/tests/e2e_half.rs` (new): two tests under
+  the `tests/common::ServerBuilder` pattern:
+  1. `half_create_insert_select_roundtrip_preserves_topk_order`
+     — `CREATE TABLE … USING HALF`, INSERT five rows, assert
+     `ORDER BY <-> LIMIT 3` returns the f32 ground-truth IDs.
+  2. `half_select_dequantises_to_pgvector_wire_shape` — verify
+     dequant precision (≤ 2^-10 × |x| max relative error).
+- `crates/spg-server/tests/perf_gate_half.rs` (new,
+  `#[ignore]`-marked):
+  1. `half_kNN_1m_dim128_p50_under_50us_server`
+  2. `half_rss_1m_dim128_under_260mib`
+- STABILITY.md: extend the v6.0.1 SQ8 row with HALF — new DDL
+  grammar (`USING HALF`), new DataType tag 15, new Value tag 12,
+  dense-row body shape.
+- CHANGELOG `[Unreleased]`/`[6.0.3]` entry.
+- `cargo fmt`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo test --release --workspace`, sqllogictest
+  4-corpus 100%.
+- Commit: `v6.0.3-halfvec-f16-integration`.
+
+## L4-v6.0.3 — v6.0.3 todos (execution order)
+
+1. `VecEncoding::F16` in spg-sql + spg-storage + engine bridge
+2. parser `USING HALF` (case-insensitive)
+3. `crates/spg-storage/src/halfvec.rs` — `HalfVector` + f32 ↔
+   f16 codec
+4. unit tests: f16 roundtrip + special values
+5. `Value::HalfVector` variant + match-arm exhaustiveness
+6. INSERT path `coerce_value` arm for `(Vector, Vector { F16 })`
+7. HNSW dispatch helpers handle `Value::HalfVector` via dequant
+8. unit test: HNSW half recall@10 ≥ 0.95 vs f32 ground truth
+9. dense row body + DataType tag 15 + value tag 12
+10. catalog roundtrip test
+11. e2e_half via ServerBuilder
+12. perf_gate_half harness (`#[ignore]`)
+13. STABILITY.md row update
+14. CHANGELOG entry
+15. fmt + clippy + workspace test + sqllogictest 4-corpus 100%
+16. commit `v6.0.3-halfvec-f16-integration`
+
+Verification at each todo via the `cargo test` commands listed
+in the L3a-v6.0.3 steps. Anything red → stop and diagnose; do
+not soften the test.
+
 ## Risk register
 
 | risk | mitigation |
@@ -793,8 +990,9 @@ not soften the test.
 
 - v6.0.1 hot plan: see L3a-v6.0.1 above (drafted 2026-06-02 after v6.0.0 shipped).
 - v6.0.2 hot plan: see L3a-v6.0.2 above (drafted 2026-06-02 after v6.0.1 shipped).
-- v6.0.3 (halfvec) design lands in this file as a new L3a-v6.0.3
-  section after v6.0.2 ships.
+- v6.0.3 hot plan: see L3a-v6.0.3 above (drafted 2026-06-02 after v6.0.2 shipped).
+- v6.0.4 (live rebuild) design lands in this file as a new
+  L3a-v6.0.4 section after v6.0.3 ships.
 - v6.1 (logical replication) design starts fresh as `V6_1_DESIGN.md` after v6.0.5 tags.
 - Next-version trigger for v6.0.1 → v6.0.2 is: all v6.0.1 perf
   gates green + `xtests/sqllogictest` 4-corpus still 100% +
