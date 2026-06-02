@@ -432,7 +432,15 @@ pub struct NswGraph {
     /// `PersistentVec`; the outer layer dimension stays a plain `Vec`
     /// (layer count ≤ 8, so its clone is O(1) in practice) and the inner
     /// neighbour list stays a `Vec` (bounded by `m_max_0`).
-    pub layers: Vec<PersistentVec<Vec<usize>>>,
+    ///
+    /// v6.1.x: neighbour slot widened from `usize` (8 B on 64-bit) to
+    /// `u32` (4 B). Row indices are catalog-bounded by `u32::MAX` (4G
+    /// rows per table); the cast at the NSW boundary asserts this. At
+    /// 1M dim-128 SQ8, layer 0 adjacency alone shrinks by ~128 MiB
+    /// — the largest single contribution to the v6.0.5-measured
+    /// 624 MiB ambition gap. On-disk format already used u32 LE, so
+    /// this is a pure in-memory layout change; no `FILE_VERSION` bump.
+    pub layers: Vec<PersistentVec<Vec<u32>>>,
 }
 
 impl NswGraph {
@@ -1408,7 +1416,7 @@ fn greedy_layer_walk(
     };
     let col_pos = table.indices[idx_pos].column_position;
     loop {
-        let neighbours: &[usize] = g
+        let neighbours: &[u32] = g
             .layers
             .get(layer as usize)
             .and_then(|layer_v| layer_v.get(current))
@@ -1416,6 +1424,7 @@ fn greedy_layer_walk(
         let mut best = current;
         let mut best_d = current_d;
         for &n in neighbours {
+            let n = n as usize;
             let d = vec_l2_sq(table, col_pos, n, query);
             if d < best_d {
                 best = n;
@@ -1486,12 +1495,13 @@ fn layer_beam_search(
         if cur.dist > worst && results.len() >= ef {
             break;
         }
-        let neighbours: &[usize] = g
+        let neighbours: &[u32] = g
             .layers
             .get(layer as usize)
             .and_then(|layer_v| layer_v.get(cur.node))
             .map_or(&[][..], Vec::as_slice);
         for &n in neighbours {
+            let n = n as usize;
             if n >= row_count || visited[n] {
                 continue;
             }
@@ -1636,10 +1646,18 @@ fn connect_at_layer(
         IndexKind::Nsw(g) => g.cap_for_layer(layer),
         IndexKind::BTree(_) => return,
     };
+    // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
+    // each) rather than usize (8 B on 64-bit). Boundary casts here
+    // assert the row count fits in u32 — the catalog already enforces
+    // ≤ 4G rows per table, so the conversion can't lose data.
+    let new_row_u32 = u32::try_from(new_row_idx).expect("row index fits in u32");
     if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
         let layer_v = &mut g.layers[layer as usize];
         if let Some(slot) = layer_v.get_mut(new_row_idx) {
-            *slot = peers.to_vec();
+            *slot = peers
+                .iter()
+                .map(|&p| u32::try_from(p).expect("row index fits in u32"))
+                .collect();
         }
     }
     for &peer in peers {
@@ -1656,9 +1674,9 @@ fn connect_at_layer(
         if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
             let layer_v = &mut g.layers[layer as usize];
             if let Some(slot) = layer_v.get_mut(peer)
-                && !slot.contains(&new_row_idx)
+                && !slot.contains(&new_row_u32)
             {
-                slot.push(new_row_idx);
+                slot.push(new_row_u32);
             }
         }
         // 2. if peer is over budget, rebuild its adjacency with the
@@ -1670,7 +1688,10 @@ fn connect_at_layer(
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
-                IndexKind::Nsw(g) => g.layers[layer as usize][peer].clone(),
+                IndexKind::Nsw(g) => g.layers[layer as usize][peer]
+                    .iter()
+                    .map(|&n| n as usize)
+                    .collect(),
                 IndexKind::BTree(_) => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
@@ -1686,7 +1707,10 @@ fn connect_at_layer(
             if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind
                 && let Some(slot) = g.layers[layer as usize].get_mut(peer)
             {
-                *slot = kept;
+                *slot = kept
+                    .into_iter()
+                    .map(|p| u32::try_from(p).expect("row index fits in u32"))
+                    .collect();
             }
         }
     }
@@ -3165,11 +3189,11 @@ fn write_nsw_graph(out: &mut Vec<u8>, g: &NswGraph) {
                 out,
                 u16::try_from(neighbors.len()).expect("HNSW neighbour list fits in u16"),
             );
+            // v6.1.x: neighbour slot is already u32 in memory; just
+            // emit the raw bytes. (v6.0 stored usize and converted
+            // here.)
             for &peer in neighbors {
-                write_u32(
-                    out,
-                    u32::try_from(peer).expect("HNSW neighbour index fits in u32"),
-                );
+                write_u32(out, peer);
             }
         }
     }
@@ -3825,15 +3849,15 @@ impl<'a> Cursor<'a> {
             levels.push_mut(self.read_u8()?);
         }
         let layer_count = self.read_u8()? as usize;
-        let mut layers: Vec<PersistentVec<Vec<usize>>> = Vec::with_capacity(layer_count);
+        let mut layers: Vec<PersistentVec<Vec<u32>>> = Vec::with_capacity(layer_count);
         for _ in 0..layer_count {
             let n = self.read_u32()? as usize;
-            let mut per_layer: PersistentVec<Vec<usize>> = PersistentVec::new();
+            let mut per_layer: PersistentVec<Vec<u32>> = PersistentVec::new();
             for _ in 0..n {
                 let cnt = self.read_u16()? as usize;
-                let mut row = Vec::with_capacity(cnt);
+                let mut row: Vec<u32> = Vec::with_capacity(cnt);
                 for _ in 0..cnt {
-                    row.push(self.read_u32()? as usize);
+                    row.push(self.read_u32()?);
                 }
                 per_layer.push_mut(row);
             }

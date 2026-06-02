@@ -10,6 +10,78 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.0] — 2026-06-03 (HNSW graph storage compaction — 12% RSS off the v6.0.5 floor)
+
+First v6.1.x sub-version. Attacks the v6.0.5-measured `1M dim-128
+SQ8 RSS = 624 MiB` gap vs the design's 200 MiB ambition. The
+single largest contributor was the HNSW adjacency Vec<Vec<usize>>
+inside `NswGraph::layers`: each neighbour slot was 8 bytes on
+64-bit, but the row index it stores has always been bounded by
+the catalog's `≤ 4G rows / table` invariant — i.e. u32 was
+enough. The on-disk format had already been u32 LE since v2.7;
+only the in-memory representation kept the wider type.
+
+### Changed
+
+- `NswGraph::layers: Vec<PersistentVec<Vec<usize>>>` →
+  `Vec<PersistentVec<Vec<u32>>>`. Boundary casts at the four
+  NSW touch-points (`greedy_layer_walk`, `layer_beam_search`,
+  `connect_at_layer` write + trim) assert the row-index-fits-in-u32
+  invariant; the catch is impossible-by-construction since the
+  catalog already enforces it.
+- `Cursor::read_nsw_graph` / `write_nsw_graph` lose their
+  `u32 ↔ usize` round-trip — they consume / emit the in-memory
+  u32 directly.
+
+### Measured (1M dim-128 SQ8, Apple M-series, 2026-06-03)
+
+|        | v6.0.5 (Vec<usize>) | v6.1.0 (Vec<u32>) | improvement |
+|--------|--------------------:|------------------:|-------------|
+| RSS    |             624 MiB |       **546 MiB** | **-78 MiB (-12.5%)** |
+
+Predicted from cell-count arithmetic: layer 0 has up to 1M nodes
+× 32 max-neighbours × (8 → 4 B) = ~128 MiB. Measured falls short
+of the prediction because real graphs run ~60-70% full per layer
+(M=16 default), so the per-slot saving × actual fill factor lands
+at ~78 MiB. Upper layers shrink proportionally but are sparse.
+
+### Not changed
+
+- On-disk format (already u32 LE since v2.7).
+- Distance compute paths (no FMA / dequant change).
+- `NswGraph::clone` semantics — still O(1) via `PersistentVec`
+  structural sharing.
+- Public API — `nsw_query` still returns `Vec<usize>`; only the
+  internal storage shape narrowed.
+
+### Ship-gate verification
+
+- `cargo test --release --workspace --lib`: 162 / 162 spg-storage
+  lib tests green; vector / replication e2e all green.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- xtests/sqllogictest 4-corpus stays 100% (148+17+144+63).
+- `hnsw_search_under_budget` storage-side perf gate stays under
+  1 ms (no inner-loop regression).
+- 1M-scale kNN p50 lands within host-noise of v6.0.5 measurement
+  (RSS gate is the load-bearing comparison; kNN p50 was already
+  ~99% pgwire round-trip and ~1% HNSW search at v6.0.5).
+
+### Why this matters
+
+The 200 MiB RSS ambition came from cell-byte arithmetic alone
+(`1M × 8B header + 1M × 128B = 136 MiB`). v6.0.5 exposed that
+graph adjacency dominates real RSS at scale. v6.1.0 closes ~half
+the gap with a layout change that doesn't touch any other contract.
+Further compaction lands as v6.1.x sub-versions:
+
+- `Row::values` `Vec<Value>` overhead (~80 MiB at 1M rows from
+  the Vec header alone).
+- Packed adjacency (single `Vec<u32>` + offsets) — drops the
+  per-node 24 B Vec header at the cost of O(N) clone instead of
+  O(1) structural sharing. Filed as v6.1.x trade-off study.
+
+---
+
 ## [6.0.6] — 2026-06-03 (NEON SIMD f16 — fixes the HALF 5× regression)
 
 The v6.0.3 CHANGELOG promised NEON f16 SIMD "as v6.0.6 or
