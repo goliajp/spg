@@ -1425,6 +1425,16 @@ fn encode_copy_cell(v: &spg_storage::Value) -> String {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
             escape_copy_cell(&format!("[{}]", parts.join(", ")))
         }
+        // v6.0.1: COPY OUT a `VECTOR(N) USING SQ8` column —
+        // dequantise to f32 so the COPY text stream stays
+        // pgvector-compatible.
+        Value::Sq8Vector(q) => {
+            let parts: Vec<String> = spg_storage::quantize::dequantize(q)
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            escape_copy_cell(&format!("[{}]", parts.join(", ")))
+        }
     }
 }
 
@@ -1851,6 +1861,16 @@ fn value_to_pg_text(v: &Value, _ty: Option<DataType>) -> Option<String> {
         Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
         Value::Vector(v) => {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        // v6.0.1: pgwire text-format render for SQ8 cells —
+        // dequantise so clients see the pgvector-style
+        // `[x, y, z]` payload.
+        Value::Sq8Vector(q) => {
+            let parts: Vec<String> = spg_storage::quantize::dequantize(q)
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             format!("[{}]", parts.join(", "))
         }
     })

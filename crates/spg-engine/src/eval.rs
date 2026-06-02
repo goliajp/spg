@@ -705,6 +705,17 @@ fn value_to_text(v: &Value) -> String {
             let cells: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
             format!("[{}]", cells.join(", "))
         }
+        // v6.0.1: render SQ8 cells dequantised, so SELECT output
+        // matches the pgvector wire shape clients expect. The
+        // recall envelope already absorbs the ≤ (max-min)/255/2
+        // dequantisation error.
+        Value::Sq8Vector(q) => {
+            let cells: Vec<String> = spg_storage::quantize::dequantize(q)
+                .iter()
+                .map(|x| format!("{x}"))
+                .collect();
+            format!("[{}]", cells.join(", "))
+        }
         Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),

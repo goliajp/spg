@@ -1849,7 +1849,7 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
             #[allow(clippy::cast_precision_loss)]
             Ok(key as f64)
         }
-        Value::Vector(_) => Err(EngineError::Unsupported(
+        Value::Vector(_) | Value::Sq8Vector(_) => Err(EngineError::Unsupported(
             "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
         )),
         Value::Interval { .. } => Err(EngineError::Unsupported(

@@ -3032,6 +3032,12 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Text(s) | Value::Json(s) => WireValue::Text(s.clone()),
         Value::Bool(b) => WireValue::Bool(*b),
         Value::Vector(v) => WireValue::Vector(v.clone()),
+        // v6.0.1: SQ8 cells dequantise to f32 on the wire so
+        // pgwire clients (psql, drivers, the conformance corpora)
+        // see the same `WireValue::Vector` shape regardless of
+        // the column's storage encoding. Recall envelope absorbs
+        // the ≤ (max-min)/255/2 dequantisation error.
+        Value::Sq8Vector(q) => WireValue::Vector(spg_storage::quantize::dequantize(q)),
         // NUMERIC / DATE / TIMESTAMP render as their canonical
         // text form on the wire. Drivers receive plain UTF-8,
         // identical to what `value_to_text` produces in the engine.

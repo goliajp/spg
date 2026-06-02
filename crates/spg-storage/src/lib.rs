@@ -159,6 +159,13 @@ pub enum Value {
     Text(String),
     Bool(bool),
     Vector(Vec<f32>),
+    /// v6.0.1: 8-bit scalar-quantised vector cell. Lives in
+    /// columns declared `VECTOR(N) USING SQ8`. Layout per cell:
+    /// `Sq8Vector { min: f32, max: f32, bytes: Vec<u8> }` —
+    /// 4× compression vs `Vector(Vec<f32>)`. The wire layer
+    /// dequantises to `f32` on SELECT; INSERT path quantises
+    /// incoming `Vector(Vec<f32>)` cells into this variant.
+    Sq8Vector(crate::quantize::Sq8Vector),
     /// Exact fixed-point decimal. `scaled` holds the value as
     /// `actual * 10^scale` so the storage type is always integral —
     /// arithmetic never falls back to floating-point.
@@ -198,6 +205,10 @@ impl Value {
             Self::Vector(v) => Some(DataType::Vector {
                 dim: u32::try_from(v.len()).expect("vector dim ≤ u32"),
                 encoding: VecEncoding::F32,
+            }),
+            Self::Sq8Vector(q) => Some(DataType::Vector {
+                dim: u32::try_from(q.bytes.len()).expect("vector dim ≤ u32"),
+                encoding: VecEncoding::Sq8,
             }),
             // `Value::Numeric` doesn't carry its precision (the column
             // schema does); we surface precision=0 as "unknown" and let
@@ -298,6 +309,7 @@ impl IndexKey {
             Value::Null
             | Value::Float(_)
             | Value::Vector(_)
+            | Value::Sq8Vector(_)
             | Value::Numeric { .. }
             | Value::Interval { .. }
             | Value::Json(_) => None,
@@ -2907,6 +2919,13 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::Text(s) | Value::Json(s) => 2 + s.len(),
         // [u32 dim][f32 * dim]
         Value::Vector(vec) => 4 + 4 * vec.len(),
+        // v6.0.1: SQ8 cell body lands in step 6 (new tag 7 row
+        // payload). Until then, INSERT path rejects SQ8 columns
+        // at the engine layer, so an Sq8Vector cell can never
+        // reach the row encoder.
+        Value::Sq8Vector(_) => {
+            unreachable!("Value::Sq8Vector on-disk encoding lands in v6.0.1 step 6")
+        }
         // [i128 scaled][u8 scale]
         Value::Numeric { .. } => 16 + 1,
         // NULL is encoded only in the bitmap, never in the body.
@@ -3069,6 +3088,13 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             for x in v {
                 out.extend_from_slice(&x.to_le_bytes());
             }
+        }
+        // v6.0.1: Sq8Vector value-tag encoding lands in step 6
+        // (new tag 11 = SQ8 row payload). Until then the INSERT
+        // path is fenced at the engine layer so no `Value::Sq8Vector`
+        // can reach `write_value`.
+        Value::Sq8Vector(_) => {
+            unreachable!("Value::Sq8Vector on-disk encoding lands in v6.0.1 step 6")
         }
         Value::Numeric { scaled, scale } => {
             out.push(8);
@@ -3394,6 +3420,23 @@ mod tests {
         assert_eq!(Value::Null.data_type(), None);
         assert!(Value::Null.is_null());
         assert!(!Value::Int(0).is_null());
+    }
+
+    #[test]
+    fn sq8_value_reports_sq8_data_type() {
+        // v6.0.1: a `Value::Sq8Vector` cell surfaces its dim
+        // (= bytes.len()) and encoding through `data_type()` so
+        // INSERT-time column type-checks (step 3) can route on
+        // both shape and encoding.
+        let q = crate::quantize::quantize(&[0.0, 0.25, 0.5, 0.75, 1.0]);
+        let v = Value::Sq8Vector(q);
+        assert_eq!(
+            v.data_type(),
+            Some(DataType::Vector {
+                dim: 5,
+                encoding: VecEncoding::Sq8,
+            }),
+        );
     }
 
     #[test]

@@ -566,6 +566,23 @@ fn encode_key(vals: &[Value]) -> String {
                 }
                 out.push('|');
             }
+            // v6.0.1: GROUP BY on a `VECTOR(N) USING SQ8` column.
+            // Two cells with byte-identical `(min, max, bytes)`
+            // share the same group; equivalence is byte-equality
+            // (same as f32 grouping today — neither path tries to
+            // normalise nan/-0).
+            Value::Sq8Vector(q) => {
+                out.push('Q');
+                out.push_str(&q.min.to_string());
+                out.push('@');
+                out.push_str(&q.max.to_string());
+                out.push(':');
+                for b in &q.bytes {
+                    out.push_str(&b.to_string());
+                    out.push(',');
+                }
+                out.push('|');
+            }
             Value::Numeric { scaled, scale } => {
                 out.push('D');
                 out.push_str(&scaled.to_string());
