@@ -603,6 +603,182 @@ soften the test. If a recall@K assertion is failing, *first* check
 the rerank path is actually engaged — soft-fail-by-disabling-rerank
 is exactly what the gate is meant to catch.
 
+## L3a-v6.0.2 — Hot plan for v6.0.2 (NEON SIMD for cosine / IP + SQ8 ADC)
+
+v6.0.2 closes the SIMD gap left by v6.0.0/v6.0.1: today only
+`l2_distance_sq` has a NEON path; `inner_product` and `cosine`
+fall back to the scalar loop, and SQ8 ADC distances dequantise
+element-by-element through scalar f32 arithmetic. v6.0.2 adds
+aarch64 NEON paths for both the f32 non-L2 metrics and the SQ8
+asymmetric ADC variants (the kNN-scan hot path), with x86_64
+keeping the scalar fallback (no SSE/AVX in v6.0 series — deferred
+to v7).
+
+Plan is linear, TDD, no branches. Each step ends with a verify
+command; checkpoint to next step only after the verify is green.
+
+### Architectural recap
+
+- **NEON intrinsics safety boundary unchanged** (V6_DESIGN
+  deliberation #7). The existing crate-level
+  `#![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]`
+  scope covers the new functions; no new `unsafe` outside that
+  scope.
+- **dim ≥ 16 and multiple of 16** is the NEON pre-condition for
+  SQ8 ADC (one 128-bit lane group = 16× u8 = 4× f32). dim ≥ 4 +
+  multiple of 4 stays the f32 pre-condition (matching the
+  existing L2 path's contract). Any other shape falls back to
+  the scalar loop — same `vec_l2_sq`-style dispatch.
+- **Asymmetric SQ8 first, symmetric optional.** Asymmetric ADC
+  (stored SQ8 vs f32 query) is the kNN-scan hot path and gets
+  every metric (L2 / cosine / IP). Symmetric ADC (stored vs
+  stored, used during HNSW build / neighbour heuristic) is
+  scalar in v6.0.2 — build-time cost is dominated by graph
+  topology work, not distance ns. Revisit in v6.0.5 if profiling
+  flags it.
+- **No dotprod / FEAT_DotProd dependency.** The 16-wide
+  u8 → u16 → f32 widening pattern stays portable across all
+  ARMv8.0+ NEON hosts. `vdotq_u32` (FEAT_DotProd, ARMv8.2-A)
+  would shave the symmetric SQ8 path further; left for v7 once
+  the baseline target is locked.
+
+### Step 1 — f32 NEON: `inner_product_neon` + `cosine_dot_norms_neon`
+
+- File: `crates/spg-storage/src/lib.rs` (add next to
+  `l2_distance_sq_neon`).
+- `unsafe fn inner_product_neon(a: &[f32], b: &[f32]) -> f32` —
+  two parallel `vfmaq_f32` accumulators, same shape as
+  `l2_distance_sq_neon`. Caller checks `len % 4 == 0 && len >= 4`.
+  Returns `Σ a[i] * b[i]` (positive dot — negation lives in
+  `metric_distance`).
+- `unsafe fn cosine_dot_norms_neon(a: &[f32], b: &[f32]) ->
+  (f32, f32, f32)` — three parallel accumulators for `dot`,
+  `na`, `nb`. Same lane-count discipline as the L2 path.
+  Caller handles `na == 0 || nb == 0 → INFINITY` and the
+  `sqrt_newton_f32(na) * sqrt_newton_f32(nb)` denominator.
+- Update `metric_distance(metric, a, b)` to dispatch:
+  - `NswMetric::L2` → `l2_distance_sq` (unchanged).
+  - `NswMetric::InnerProduct` → `inner_product_neon` /
+    `_scalar` via the same `#[cfg(target_arch = "aarch64")]`
+    fence as `l2_distance_sq`.
+  - `NswMetric::Cosine` → `cosine_dot_norms` (NEON/scalar) +
+    norm-sqrt + ratio.
+
+**Verify:**
+```
+cargo test -p spg-storage --lib metric_neon_matches_scalar
+```
+Asserts NEON and scalar agree to within ε = 1e-5 across `dim ∈
+{64, 128, 256, 512, 1024}` on Gaussian random pairs.
+
+### Step 2 — SQ8 ADC NEON: L2 asymmetric
+
+- File: `crates/spg-storage/src/quantize.rs`.
+- `unsafe fn sq8_l2_distance_sq_asymmetric_neon(a: &Sq8Vector,
+  q: &[f32]) -> f32`:
+  - Loop over 16-u8 chunks of `a.bytes` (4× 4-lane f32x4 of
+    `q`).
+  - Per chunk: `vld1q_u8` load → `vmovl_u8` widen to 2× u16x8
+    → `vmovl_u16` widen each half to 2× u32x4 (4 total) →
+    `vcvtq_f32_u32` → multiply by `vdupq_n_f32(step_a)` + add
+    `vdupq_n_f32(a.min)` → 4× f32x4 reconstructed `xa`.
+  - 4× `vld1q_f32(q.ptr.add(...))` → 4× `diff = vsubq_f32(xa,
+    q)` → 2 alternating `vfmaq_f32` accumulators.
+  - Final `vaddvq_f32` of summed accumulators.
+- Update `sq8_l2_distance_sq_asymmetric` to dispatch via
+  `#[cfg(target_arch = "aarch64")]` when `a.bytes.len() >= 16
+  && a.bytes.len() % 16 == 0 && a.bytes.len() == q.len()`.
+  Scalar path stays for arbitrary dims.
+
+**Verify:**
+```
+cargo test -p spg-storage --lib sq8_adc_neon_matches_scalar
+```
+Asserts the new NEON path agrees with the existing scalar
+implementation to within ε = 1e-5 across dim ∈ {32, 64, 128,
+256, 512, 1024} on 1000 random Gaussian SQ8/query pairs.
+
+### Step 3 — SQ8 ADC NEON: cosine + inner-product asymmetric
+
+- Same file. Same 16-wide widening pattern as step 2 for the
+  inner loop; metric-specific tail handles the negation
+  (`-dot` for `<#>`) or norm + ratio (`1 - dot / (sqrt(na) *
+  sqrt(nq))` for `<=>`).
+- `sq8_inner_product_asymmetric_neon`: one accumulator for `dot`.
+- `sq8_cosine_distance_asymmetric_neon`: three accumulators —
+  `dot`, `na` (reconstructed-squared), `nq` (query-squared).
+  Norm-sqrt + zero-guard lives in the safe wrapper, same way
+  the scalar version handles it.
+- Update both `sq8_inner_product_asymmetric` and
+  `sq8_cosine_distance_asymmetric` to dispatch to the NEON path
+  under the same pre-condition fence as step 2.
+
+**Verify:**
+```
+cargo test -p spg-storage --lib sq8_adc_neon_cosine_matches_scalar
+cargo test -p spg-storage --lib sq8_adc_neon_ip_matches_scalar
+```
+
+### Step 4 — Perf gates
+
+- File: `crates/spg-storage/tests/perf_gate.rs` (extend
+  existing).
+- New gates:
+  - `cosine_dim128_under_50ns` — `cosine_dot_norms_neon` ≤ 50 ns
+    per call on dim 128.
+  - `inner_product_dim128_under_50ns` — same for IP.
+  - `sq8_adc_l2_asymmetric_neon_dim128_under_25ns` — SQ8 ADC L2
+    asymmetric ≤ 25 ns/pair (down from the v6.0.0 scalar 200 ns
+    floor; the design's L1 goal-numbers row predicted ≥ 2×, the
+    25 ns target is ~8× on the assumption of cache-resident
+    inputs).
+  - All gates are non-`#[ignore]` (each is a 1M-call inner
+    loop; the existing `sq8_adc_l2_under_200ns_per_pair` runs in
+    the same harness in ~200 ms and stays).
+
+**Verify:**
+```
+cargo test --release -p spg-storage --test perf_gate -- cosine_dim128 inner_product_dim128 sq8_adc_l2_asymmetric_neon
+```
+
+### Step 5 — STABILITY + CHANGELOG + ship
+
+- STABILITY.md: NEON dispatch is implementation-internal; no
+  new frozen surface (the function signatures `metric_distance`
+  / `sq8_*_asymmetric` are not in the public stability contract).
+  Skipped unless step 4 reveals an envelope change — none
+  expected.
+- `xtests/sqllogictest` 4-corpus stays 100% (no SQL-surface
+  change).
+- CHANGELOG `[Unreleased]` `### Added`:
+  - aarch64 NEON paths for `inner_product`, `cosine`,
+    `sq8_l2_distance_sq_asymmetric`,
+    `sq8_inner_product_asymmetric`,
+    `sq8_cosine_distance_asymmetric`.
+  - Three new perf gates: cosine_dim128, inner_product_dim128,
+    sq8_adc_l2_asymmetric_neon_dim128.
+- `cargo fmt`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo test --release --workspace`.
+- Commit: `v6.0.2-neon-cosine-ip-sq8-adc`.
+
+## L4-v6.0.2 — v6.0.2 todos (execution order)
+
+1. `inner_product_neon` + `metric_distance` dispatch
+2. `cosine_dot_norms_neon` + `metric_distance` dispatch
+3. unit test: `metric_neon_matches_scalar`
+4. `sq8_l2_distance_sq_asymmetric_neon` + dispatch
+5. unit test: `sq8_adc_neon_matches_scalar`
+6. `sq8_inner_product_asymmetric_neon` + dispatch
+7. `sq8_cosine_distance_asymmetric_neon` + dispatch
+8. unit tests: SQ8 IP / cosine NEON matches scalar
+9. 3 perf gates in `tests/perf_gate.rs`
+10. fmt + clippy + workspace test green + sqllogictest 4-corpus 100%
+11. CHANGELOG + commit `v6.0.2-neon-cosine-ip-sq8-adc`
+
+Verification at each todo via the `cargo test` commands listed
+in the L3a-v6.0.2 steps. Anything red → stop and diagnose; do
+not soften the test.
+
 ## Risk register
 
 | risk | mitigation |
@@ -616,8 +792,9 @@ is exactly what the gate is meant to catch.
 ## Forward links
 
 - v6.0.1 hot plan: see L3a-v6.0.1 above (drafted 2026-06-02 after v6.0.0 shipped).
-- v6.0.2 (NEON SIMD for cosine/IP + SQ8 ADC) design lands in this
-  file as a new L3a-v6.0.2 section after v6.0.1 ships.
+- v6.0.2 hot plan: see L3a-v6.0.2 above (drafted 2026-06-02 after v6.0.1 shipped).
+- v6.0.3 (halfvec) design lands in this file as a new L3a-v6.0.3
+  section after v6.0.2 ships.
 - v6.1 (logical replication) design starts fresh as `V6_1_DESIGN.md` after v6.0.5 tags.
 - Next-version trigger for v6.0.1 → v6.0.2 is: all v6.0.1 perf
   gates green + `xtests/sqllogictest` 4-corpus still 100% +
