@@ -1704,13 +1704,11 @@ fn vec_l2_sq(table: &Table, col_pos: usize, row: usize, query: &[f32]) -> f32 {
         Some(Value::Sq8Vector(q)) if q.bytes.len() == query.len() => {
             quantize::sq8_l2_distance_sq_asymmetric(q, query)
         }
-        // v6.0.3: halfvec dequantises bit-exactly to f32 in-loop;
-        // the cost of dequant is amortised into the FMA body of
-        // the v6.0.2 NEON `l2_distance_sq` path. NEON f16 SIMD
-        // lands once stable Rust ships the intrinsics.
+        // v6.0.6: halfvec → fused NEON SIMD kernel; no Vec<f32>
+        // allocation. v6.0.3 used `to_f32_vec()` + f32 NEON which
+        // was correct but allocated per call (5× slower than F32).
         Some(Value::HalfVector(h)) if h.dim() == query.len() => {
-            let deq = h.to_f32_vec();
-            l2_distance_sq(&deq, query)
+            halfvec::half_l2_distance_sq_asymmetric(h, query)
         }
         _ => f32::INFINITY,
     }
@@ -1734,14 +1732,12 @@ fn cell_l2_sq(table: &Table, col_pos: usize, row_a: usize, row_b: usize) -> f32 
         (Value::Sq8Vector(a), Value::Sq8Vector(b)) if a.bytes.len() == b.bytes.len() => {
             quantize::sq8_l2_distance_sq(a, b)
         }
-        // v6.0.3: halfvec — dequant both sides to f32 then run the
-        // standard NEON L2 path. Single-encoding-per-column is a
-        // schema invariant so mixed shapes are impossible by
-        // construction.
+        // v6.0.6: halfvec symmetric NEON — fused SIMD kernel that
+        // loads both cells' raw u16 bits, expands to f32 lanes
+        // inline, FMA-accumulates the squared diff. No Vec<f32>
+        // allocation per call.
         (Value::HalfVector(a), Value::HalfVector(b)) if a.dim() == b.dim() => {
-            let af = a.to_f32_vec();
-            let bf = b.to_f32_vec();
-            l2_distance_sq(&af, &bf)
+            halfvec::half_l2_distance_sq(a, b)
         }
         _ => f32::INFINITY,
     }
@@ -1765,12 +1761,13 @@ fn cell_to_query_metric_distance(
             NswMetric::InnerProduct => quantize::sq8_inner_product_asymmetric(q, query),
             NswMetric::Cosine => quantize::sq8_cosine_distance_asymmetric(q, query),
         },
-        // v6.0.3: halfvec dequant-in-loop, then route through the
-        // existing v6.0.2 f32 NEON `metric_distance`.
-        Some(Value::HalfVector(h)) if h.dim() == query.len() => {
-            let deq = h.to_f32_vec();
-            metric_distance(metric, &deq, query)
-        }
+        // v6.0.6: halfvec dispatches by metric to fused NEON
+        // kernels — no Vec<f32> allocation per call.
+        Some(Value::HalfVector(h)) if h.dim() == query.len() => match metric {
+            NswMetric::L2 => halfvec::half_l2_distance_sq_asymmetric(h, query),
+            NswMetric::InnerProduct => halfvec::half_inner_product_asymmetric(h, query),
+            NswMetric::Cosine => halfvec::half_cosine_distance_asymmetric(h, query),
+        },
         _ => f32::INFINITY,
     }
 }

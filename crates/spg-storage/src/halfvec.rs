@@ -207,6 +207,363 @@ pub fn f16_to_f32_bits(bits: u16) -> u32 {
     (sign << 31) | (exp32 << 23) | (mant16 << 13)
 }
 
+// ===========================================================================
+// v6.0.6 — NEON SIMD f16 → f32 conversion (fused into distance kernels).
+//
+// stable Rust 1.96 still gates `core::arch::aarch64::vcvt_f32_f16` behind
+// the unstable `stdarch_neon_f16` feature. Bit-manipulation in SIMD lanes
+// stays on stable NEON (`vshl`, `vand`, `vceq`, `vbsl`) and produces the
+// same f32 bit pattern for the cases ML embeddings actually hit:
+//
+//   * NaN / ±∞ (exp_h == 0x1f) — bit-exact.
+//   * ±0       (exp_h == 0 && mant_h == 0) — bit-exact.
+//   * Normal   (exp_h ∈ 1..=30) — bit-exact.
+//   * Subnormal (exp_h == 0 && mant_h != 0) — **flushed to ±0**. The
+//     scalar codec renormalises subnormals into f32 normals; SIMD path
+//     flushes them. f16 subnormals are |value| < 2^-14 ≈ 6.1e-5, which
+//     is below the precision of natural embeddings anyway. Distance
+//     queries on those values are dominated by other lanes.
+//
+// Public distance functions below dispatch the SIMD kernel under
+// `#[cfg(target_arch = "aarch64")]` when `dim ≥ 8 && dim % 8 == 0`,
+// falling back to scalar otherwise — same pre-condition shape as the
+// SQ8 / f32 NEON paths.
+// ===========================================================================
+
+/// L2² distance between an f16 cell and an f32 query, fused so no
+/// `Vec<f32>` ever materialises. Dispatches to NEON for production-
+/// shaped dims (multiples of 8); scalar fallback otherwise.
+#[must_use]
+pub fn half_l2_distance_sq_asymmetric(a: &HalfVector, q: &[f32]) -> f32 {
+    if a.dim() != q.len() {
+        return f32::INFINITY;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = a.dim();
+        if n >= 8 && n.is_multiple_of(8) {
+            // SAFETY: NEON is baseline aarch64; preconditions
+            // (matching lengths, ≥ 1 full 8-lane chunk) checked above.
+            return unsafe { half_l2_distance_sq_asymmetric_neon(a, q) };
+        }
+    }
+    half_l2_distance_sq_asymmetric_scalar(a, q)
+}
+
+/// Negated dot product (pgvector `<#>` convention). Fused SIMD path.
+#[must_use]
+pub fn half_inner_product_asymmetric(a: &HalfVector, q: &[f32]) -> f32 {
+    if a.dim() != q.len() {
+        return f32::INFINITY;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = a.dim();
+        if n >= 8 && n.is_multiple_of(8) {
+            // SAFETY: see `half_l2_distance_sq_asymmetric_neon`.
+            return -unsafe { half_dot_asymmetric_neon(a, q) };
+        }
+    }
+    -half_dot_asymmetric_scalar(a, q)
+}
+
+/// Cosine distance `1 - dot / (||a|| * ||q||)`. Fused SIMD path;
+/// norm-sqrt + zero-guard live in the safe wrapper.
+#[must_use]
+pub fn half_cosine_distance_asymmetric(a: &HalfVector, q: &[f32]) -> f32 {
+    if a.dim() != q.len() {
+        return f32::INFINITY;
+    }
+    let (dot, na, nq);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = a.dim();
+        if n >= 8 && n.is_multiple_of(8) {
+            // SAFETY: see `half_l2_distance_sq_asymmetric_neon`.
+            let (d, a2, q2) = unsafe { half_cosine_accumulators_asymmetric_neon(a, q) };
+            dot = d;
+            na = a2;
+            nq = q2;
+        } else {
+            let (d, a2, q2) = half_cosine_accumulators_asymmetric_scalar(a, q);
+            dot = d;
+            na = a2;
+            nq = q2;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let (d, a2, q2) = half_cosine_accumulators_asymmetric_scalar(a, q);
+        dot = d;
+        na = a2;
+        nq = q2;
+    }
+    if na == 0.0 || nq == 0.0 {
+        return f32::INFINITY;
+    }
+    1.0 - dot / (sqrt_finite(na) * sqrt_finite(nq))
+}
+
+/// Symmetric L2² between two f16 cells. Used during HNSW build.
+#[must_use]
+pub fn half_l2_distance_sq(a: &HalfVector, b: &HalfVector) -> f32 {
+    if a.dim() != b.dim() {
+        return f32::INFINITY;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = a.dim();
+        if n >= 8 && n.is_multiple_of(8) {
+            // SAFETY: see `half_l2_distance_sq_asymmetric_neon`.
+            return unsafe { half_l2_distance_sq_symmetric_neon(a, b) };
+        }
+    }
+    half_l2_distance_sq_symmetric_scalar(a, b)
+}
+
+// ---------------------------------------------------------------------------
+// Scalar references — used as fallback + for SIMD parity tests below.
+
+fn half_l2_distance_sq_asymmetric_scalar(a: &HalfVector, q: &[f32]) -> f32 {
+    let mut acc: f32 = 0.0;
+    let mut i = 0usize;
+    while i + 2 <= a.bytes.len() {
+        let bits = u16::from_le_bytes([a.bytes[i], a.bytes[i + 1]]);
+        let xa = f32::from_bits(f16_to_f32_bits(bits));
+        let d = xa - q[i / 2];
+        acc += d * d;
+        i += 2;
+    }
+    acc
+}
+
+fn half_dot_asymmetric_scalar(a: &HalfVector, q: &[f32]) -> f32 {
+    let mut dot: f32 = 0.0;
+    let mut i = 0usize;
+    while i + 2 <= a.bytes.len() {
+        let bits = u16::from_le_bytes([a.bytes[i], a.bytes[i + 1]]);
+        let xa = f32::from_bits(f16_to_f32_bits(bits));
+        dot += xa * q[i / 2];
+        i += 2;
+    }
+    dot
+}
+
+fn half_cosine_accumulators_asymmetric_scalar(a: &HalfVector, q: &[f32]) -> (f32, f32, f32) {
+    let (mut dot, mut na, mut nq) = (0.0_f32, 0.0_f32, 0.0_f32);
+    let mut i = 0usize;
+    while i + 2 <= a.bytes.len() {
+        let bits = u16::from_le_bytes([a.bytes[i], a.bytes[i + 1]]);
+        let xa = f32::from_bits(f16_to_f32_bits(bits));
+        let qx = q[i / 2];
+        dot += xa * qx;
+        na += xa * xa;
+        nq += qx * qx;
+        i += 2;
+    }
+    (dot, na, nq)
+}
+
+fn half_l2_distance_sq_symmetric_scalar(a: &HalfVector, b: &HalfVector) -> f32 {
+    let mut acc: f32 = 0.0;
+    let mut i = 0usize;
+    while i + 2 <= a.bytes.len() {
+        let av = u16::from_le_bytes([a.bytes[i], a.bytes[i + 1]]);
+        let bv = u16::from_le_bytes([b.bytes[i], b.bytes[i + 1]]);
+        let xa = f32::from_bits(f16_to_f32_bits(av));
+        let xb = f32::from_bits(f16_to_f32_bits(bv));
+        let d = xa - xb;
+        acc += d * d;
+        i += 2;
+    }
+    acc
+}
+
+fn sqrt_finite(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut y = if x >= 1.0 { x * 0.5 } else { (x + 1.0) * 0.5 };
+    for _ in 0..6 {
+        y = 0.5 * (y + x / y);
+    }
+    y
+}
+
+// ---------------------------------------------------------------------------
+// NEON kernels — bit-manipulation f16 → f32 in u32 lanes, then standard
+// f32 SIMD arithmetic (subtract / FMA / dot / norm).
+
+/// Convert eight half-precision lanes (loaded via `vld1q_u16` from raw
+/// `bytes`) into two `float32x4_t` registers. Bit-exact for normal /
+/// zero / inf / nan; subnormals flush to `±0` (see module docstring).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)]
+#[inline]
+unsafe fn half_to_f32x8_neon(
+    h: core::arch::aarch64::uint16x8_t,
+) -> [core::arch::aarch64::float32x4_t; 2] {
+    use core::arch::aarch64::{
+        vaddq_u32, vandq_u32, vbslq_u32, vceqq_u32, vdupq_n_u32, vget_high_u16, vget_low_u16,
+        vmovl_u16, vorrq_u32, vreinterpretq_f32_u32, vshlq_n_u32, vshrq_n_u32,
+    };
+    // Widen u16x8 → 2× u32x4.
+    let lo = vmovl_u16(vget_low_u16(h));
+    let hi = vmovl_u16(vget_high_u16(h));
+
+    // Helper: convert one u32x4 of raw f16 bits → f32x4.
+    // Bit-exact for normal / zero / inf / nan; subnormals → ±0 via
+    // the `exp == 0` mask. ML embeddings never trip the latter.
+    let convert = |w: core::arch::aarch64::uint32x4_t| -> core::arch::aarch64::float32x4_t {
+        let sign = vshlq_n_u32::<16>(vandq_u32(w, vdupq_n_u32(0x8000)));
+        let mant = vandq_u32(w, vdupq_n_u32(0x3ff));
+        let exp = vandq_u32(vshrq_n_u32::<10>(w), vdupq_n_u32(0x1f));
+        let mant_f32 = vshlq_n_u32::<13>(mant);
+        let exp_plus_bias = vaddq_u32(exp, vdupq_n_u32(112));
+        let exp_f32_shifted = vshlq_n_u32::<23>(exp_plus_bias);
+        let normal = vorrq_u32(vorrq_u32(sign, exp_f32_shifted), mant_f32);
+        let inf_nan = vorrq_u32(vorrq_u32(sign, vdupq_n_u32(0x7f80_0000)), mant_f32);
+        let is_inf_nan = vceqq_u32(exp, vdupq_n_u32(0x1f));
+        let is_zero_or_subnormal = vceqq_u32(exp, vdupq_n_u32(0));
+        let result = vbslq_u32(is_inf_nan, inf_nan, normal);
+        let result = vbslq_u32(is_zero_or_subnormal, sign, result);
+        vreinterpretq_f32_u32(result)
+    };
+
+    [convert(lo), convert(hi)]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)]
+unsafe fn half_l2_distance_sq_asymmetric_neon(a: &HalfVector, q: &[f32]) -> f32 {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vld1q_u8,
+        vreinterpretq_u16_u8, vsubq_f32,
+    };
+    unsafe {
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc0 = zero;
+        let mut acc1 = zero;
+        let n = a.dim();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            // 16 bytes from a.bytes → 8 u16 raw bits → 2× f32x4.
+            // Load 16 u8 then reinterpret as 8 u16 lanes. Avoids
+            // the cast-alignment lint and stays correct on hosts
+            // where `Vec<u8>`'s buffer alignment isn't a multiple
+            // of 2 (it always is in practice, but the lint is
+            // right to flag the unsafe assumption).
+            let h = vreinterpretq_u16_u8(vld1q_u8(a.bytes.as_ptr().add(i * 2)));
+            let [xa0, xa1] = half_to_f32x8_neon(h);
+            let q0 = vld1q_f32(q.as_ptr().add(i));
+            let q1 = vld1q_f32(q.as_ptr().add(i + 4));
+            let d0 = vsubq_f32(xa0, q0);
+            let d1 = vsubq_f32(xa1, q1);
+            acc0 = vfmaq_f32(acc0, d0, d0);
+            acc1 = vfmaq_f32(acc1, d1, d1);
+            i += 8;
+        }
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)]
+unsafe fn half_dot_asymmetric_neon(a: &HalfVector, q: &[f32]) -> f32 {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vld1q_u8,
+        vreinterpretq_u16_u8,
+    };
+    unsafe {
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc0 = zero;
+        let mut acc1 = zero;
+        let n = a.dim();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            // Load 16 u8 then reinterpret as 8 u16 lanes. Avoids
+            // the cast-alignment lint and stays correct on hosts
+            // where `Vec<u8>`'s buffer alignment isn't a multiple
+            // of 2 (it always is in practice, but the lint is
+            // right to flag the unsafe assumption).
+            let h = vreinterpretq_u16_u8(vld1q_u8(a.bytes.as_ptr().add(i * 2)));
+            let [xa0, xa1] = half_to_f32x8_neon(h);
+            acc0 = vfmaq_f32(acc0, xa0, vld1q_f32(q.as_ptr().add(i)));
+            acc1 = vfmaq_f32(acc1, xa1, vld1q_f32(q.as_ptr().add(i + 4)));
+            i += 8;
+        }
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+unsafe fn half_cosine_accumulators_asymmetric_neon(a: &HalfVector, q: &[f32]) -> (f32, f32, f32) {
+    use core::arch::aarch64::{
+        float32x4_t, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vld1q_u8, vreinterpretq_u16_u8,
+    };
+    unsafe {
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc_dot = zero;
+        let mut acc_na = zero;
+        let mut acc_nq = zero;
+        let n = a.dim();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            // Load 16 u8 then reinterpret as 8 u16 lanes. Avoids
+            // the cast-alignment lint and stays correct on hosts
+            // where `Vec<u8>`'s buffer alignment isn't a multiple
+            // of 2 (it always is in practice, but the lint is
+            // right to flag the unsafe assumption).
+            let h = vreinterpretq_u16_u8(vld1q_u8(a.bytes.as_ptr().add(i * 2)));
+            let [xa0, xa1] = half_to_f32x8_neon(h);
+            let q0 = vld1q_f32(q.as_ptr().add(i));
+            let q1 = vld1q_f32(q.as_ptr().add(i + 4));
+            acc_dot = vfmaq_f32(acc_dot, xa0, q0);
+            acc_dot = vfmaq_f32(acc_dot, xa1, q1);
+            acc_na = vfmaq_f32(acc_na, xa0, xa0);
+            acc_na = vfmaq_f32(acc_na, xa1, xa1);
+            acc_nq = vfmaq_f32(acc_nq, q0, q0);
+            acc_nq = vfmaq_f32(acc_nq, q1, q1);
+            i += 8;
+        }
+        (vaddvq_f32(acc_dot), vaddvq_f32(acc_na), vaddvq_f32(acc_nq))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)]
+unsafe fn half_l2_distance_sq_symmetric_neon(a: &HalfVector, b: &HalfVector) -> f32 {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_u8, vreinterpretq_u16_u8,
+        vsubq_f32,
+    };
+    unsafe {
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc0 = zero;
+        let mut acc1 = zero;
+        let n = a.dim();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let ha = vreinterpretq_u16_u8(vld1q_u8(a.bytes.as_ptr().add(i * 2)));
+            let hb = vreinterpretq_u16_u8(vld1q_u8(b.bytes.as_ptr().add(i * 2)));
+            let [xa0, xa1] = half_to_f32x8_neon(ha);
+            let [xb0, xb1] = half_to_f32x8_neon(hb);
+            let d0 = vsubq_f32(xa0, xb0);
+            let d1 = vsubq_f32(xa1, xb1);
+            acc0 = vfmaq_f32(acc0, d0, d0);
+            acc1 = vfmaq_f32(acc1, d1, d1);
+            i += 8;
+        }
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,
@@ -330,5 +687,126 @@ mod tests {
         assert!(h.bytes.is_empty());
         let back = h.to_f32_vec();
         assert!(back.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // v6.0.6 — NEON SIMD f16 → f32 + fused distance kernels.
+
+    /// Generate a deterministic dim-N f32 vector of small finite
+    /// values so the f16 round-trip stays inside the normal range
+    /// (avoids subnormal flush-to-zero divergence between scalar
+    /// and SIMD paths).
+    #[allow(clippy::cast_precision_loss)]
+    fn random_normal_vec(seed: u64, dim: usize) -> alloc::vec::Vec<f32> {
+        let mut state = seed | 1;
+        let mut out = alloc::vec::Vec::with_capacity(dim);
+        for _ in 0..dim {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            // 24 high bits of state → [0, 2^24) → /2^24 → [0, 1).
+            // The cast is safe (lossless) because the mask leaves
+            // at most 24 bits, which fits f32's mantissa.
+            let u = ((state >> 32) & 0x00FF_FFFF) as f32 / (0x80_0000_u32 as f32);
+            // Range (-1, 1) — well inside f16 normal range; no subnormals
+            // emerge from the round-trip.
+            out.push(2.0 * u - 1.0);
+        }
+        out
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn half_l2_asymmetric_neon_matches_scalar() {
+        // NEON SIMD path must agree with the scalar reference on
+        // every production-shaped dim. Tolerance reflects FMA
+        // rounding + the f32→f16→f32 round-trip noise; the lanes
+        // are normal floats so subnormal flush-to-zero in the SIMD
+        // path is a no-op.
+        for &d in &[8_usize, 16, 32, 64, 128, 256, 512, 1024] {
+            for trial in 0..8_u64 {
+                let v = random_normal_vec(0xA5A5_F160_F160_0001 ^ trial ^ (d as u64), d);
+                let q = random_normal_vec(0xC0FE_F160_F160_0002 ^ trial ^ (d as u64), d);
+                let h = HalfVector::from_f32_slice(&v);
+                let scalar = half_l2_distance_sq_asymmetric_scalar(&h, &q);
+                let neon = unsafe { half_l2_distance_sq_asymmetric_neon(&h, &q) };
+                let tol = (scalar.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-5;
+                assert!(
+                    (scalar - neon).abs() <= tol,
+                    "L2 asym dim={d} trial={trial}: scalar={scalar} neon={neon}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn half_dot_asymmetric_neon_matches_scalar() {
+        for &d in &[8_usize, 16, 32, 64, 128, 256, 512, 1024] {
+            for trial in 0..8_u64 {
+                let v = random_normal_vec(0xBEEF_F160_F160_0003 ^ trial ^ (d as u64), d);
+                let q = random_normal_vec(0xDEAD_F160_F160_0004 ^ trial ^ (d as u64), d);
+                let h = HalfVector::from_f32_slice(&v);
+                let scalar = half_dot_asymmetric_scalar(&h, &q);
+                let neon = unsafe { half_dot_asymmetric_neon(&h, &q) };
+                let tol = (scalar.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-5;
+                assert!(
+                    (scalar - neon).abs() <= tol,
+                    "dot dim={d} trial={trial}: scalar={scalar} neon={neon}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(clippy::similar_names, clippy::cast_precision_loss)]
+    fn half_cosine_accumulators_neon_matches_scalar() {
+        for &d in &[8_usize, 16, 32, 64, 128, 256, 512, 1024] {
+            for trial in 0..8_u64 {
+                let v = random_normal_vec(0xC051_F160_F160_0005 ^ trial ^ (d as u64), d);
+                let q = random_normal_vec(0xF00D_F160_F160_0006 ^ trial ^ (d as u64), d);
+                let h = HalfVector::from_f32_slice(&v);
+                let (dot_s, na_s, nq_s) = half_cosine_accumulators_asymmetric_scalar(&h, &q);
+                let (dot_n, na_n, nq_n) =
+                    unsafe { half_cosine_accumulators_asymmetric_neon(&h, &q) };
+                let tol = |x: f32| (x.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-5;
+                assert!(
+                    (dot_s - dot_n).abs() <= tol(dot_s),
+                    "cos dot dim={d}: scalar={dot_s} neon={dot_n}"
+                );
+                assert!(
+                    (na_s - na_n).abs() <= tol(na_s),
+                    "cos na dim={d}: scalar={na_s} neon={na_n}"
+                );
+                assert!(
+                    (nq_s - nq_n).abs() <= tol(nq_s),
+                    "cos nq dim={d}: scalar={nq_s} neon={nq_n}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn half_l2_symmetric_neon_matches_scalar() {
+        for &d in &[8_usize, 16, 32, 64, 128, 256, 512, 1024] {
+            for trial in 0..8_u64 {
+                let va = random_normal_vec(0x1234_F160_F160_0007 ^ trial ^ (d as u64), d);
+                let vb = random_normal_vec(0x5678_F160_F160_0008 ^ trial ^ (d as u64), d);
+                let ha = HalfVector::from_f32_slice(&va);
+                let hb = HalfVector::from_f32_slice(&vb);
+                let scalar = half_l2_distance_sq_symmetric_scalar(&ha, &hb);
+                let neon = unsafe { half_l2_distance_sq_symmetric_neon(&ha, &hb) };
+                let tol = (scalar.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-5;
+                assert!(
+                    (scalar - neon).abs() <= tol,
+                    "L2 sym dim={d}: scalar={scalar} neon={neon}"
+                );
+            }
+        }
     }
 }

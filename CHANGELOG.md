@@ -10,6 +10,101 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.0.6] — 2026-06-03 (NEON SIMD f16 — fixes the HALF 5× regression)
+
+The v6.0.3 CHANGELOG promised NEON f16 SIMD "as v6.0.6 or
+whenever the stable toolchain catches up". The v6.0.5.1
+competitor sweep then documented a ~5× HALF regression vs F32:
+`HalfVector::to_f32_vec()` allocated a fresh `Vec<f32>` per
+distance call, dominating wall-clock at HNSW build + kNN query.
+
+v6.0.6 closes the gap. Stable Rust 1.96 still gates the `f16`
+primitive + `core::arch::aarch64` f16 intrinsics behind unstable
+features (`rust-lang/rust#116909, #125606`), but the conversion
+itself doesn't need them: f16 → f32 is a deterministic bit-
+manipulation, which composes cleanly with the stable NEON `u32`
+lane ops (`vshl`, `vand`, `vceq`, `vbsl`). The fused-kernel
+distance functions never materialise a `Vec<f32>` — f16 lanes
+expand to f32 in NEON registers, distance accumulates with
+`vfmaq_f32`, and the result is reduced via `vaddvq_f32`.
+
+### Measured (10K dim-128, Apple M-series, 2026-06-03)
+
+| backend             |  build s |  q p50 µs |  q p95 µs |  q p99 µs |
+|---------------------|---------:|----------:|----------:|----------:|
+| spg-embedded        |     0.67 |      35.6 |      44.4 |      58.0 |
+| spg-embedded (SQ8)  |     1.35 |      44.9 |      68.5 |     117.9 |
+| spg-embedded (HALF) |  **2.05** |   **61.9** |      82.5 |     112.4 |
+| spg-server          |     0.98 |      83.3 |     147.7 |     179.7 |
+| spg-server (SQ8)    |     1.66 |      80.5 |     133.2 |     167.5 |
+| spg-server (HALF)   |  **2.21** |   **92.9** |     135.0 |     172.0 |
+| postgres+pgvector   |     3.39 |    1494.0 |    2557.8 |    3122.0 |
+
+Side-by-side with the v6.0.5.1 baseline:
+
+| metric            | v6.0.5.1 | v6.0.6 | improvement |
+|-------------------|---------:|-------:|-------------|
+| HALF embed build  |   9.12 s | 2.05 s | **4.4×**    |
+| HALF embed p50    |  175 µs  |  62 µs | **2.8×**    |
+| HALF server build |   9.75 s | 2.21 s | **4.4×**    |
+| HALF server p50   |  235 µs  |  93 µs | **2.5×**    |
+
+HALF is now only ~1.7× over F32 (down from ~5.2×) and still
+~24× ahead of pgvector at the same shape. The remaining gap to
+F32 is the dequant work itself (one widen + multiply + add per
+lane); closing that further needs FCVTL hardware which stable
+Rust can't reach yet without `f16` intrinsics.
+
+### Added
+
+- `spg_storage::halfvec::half_to_f32x8_neon` — internal helper
+  that converts one `uint16x8_t` (8 f16 lanes) to 2× `float32x4_t`
+  via bit manipulation. Bit-exact for normal / zero / inf / nan;
+  subnormals flush to ±0 (documented in the module header, no
+  measurable effect on ML embeddings).
+- Public fused distance functions on `HalfVector`:
+  - `half_l2_distance_sq_asymmetric(a, q)` — stored vs f32 query.
+  - `half_inner_product_asymmetric(a, q)` — same shape, negated dot.
+  - `half_cosine_distance_asymmetric(a, q)` — three-accumulator
+    SIMD; norm-sqrt + zero-guard stay in the safe wrapper.
+  - `half_l2_distance_sq(a, b)` — symmetric, used during HNSW
+    build.
+- Four NEON-vs-scalar parity tests covering every kernel across
+  `dim ∈ {8, 16, …, 1024}`.
+
+### Changed
+
+- `vec_l2_sq` / `cell_l2_sq` / `cell_to_query_metric_distance`
+  in `spg_storage::lib` dispatch `Value::HalfVector` to the new
+  fused kernels. Previous path went through `to_f32_vec()` +
+  the f32 NEON distance — correct but allocating per call.
+
+### Ship-gate verification
+
+- `cargo test --release --workspace --lib` 162 / 162 spg-storage
+  lib tests green (up from 158 in v6.0.5 — 4 new NEON parity
+  tests).
+- `cargo test --release -p spg-server --test e2e_half`,
+  `--test e2e_sq8`, `--test e2e_vector`,
+  `--test e2e_chaos_netsplit`, `--test e2e_alter_rebuild` all
+  green.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- xtests/sqllogictest 4-corpus stays 100% (148+17+144+63).
+- `slo_smoke` shows host-noise transients post-1M-bench (unchanged
+  from v6.0.5 release-time observation); rerun in isolation
+  passes.
+
+### Why this matters
+
+The v6.0.3 design called out subnormal flush-to-zero + the
+scalar codec's allocation as the planned trade-offs. v6.0.5.1
+exposed how much performance that scalar path was costing at
+real ML-embedding scale. v6.0.6 delivers the missing piece —
+the f16 cell encoding is now fully competitive with raw f32
+for HNSW workloads, at half the storage footprint.
+
+---
+
 ## [6.0.5.1] — 2026-06-02 (post-tag follow-ups: replication sidecar + competitor sweep)
 
 Two post-v6.0.0-tag cleanups bundled because they share the same
