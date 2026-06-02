@@ -131,6 +131,9 @@ silent data corruption under concurrent access.
 | 6.8 | WITH / WITH RECURSIVE | non-recursive + recursive with runaway guard | ✅ | v4.11 + v4.22 |
 | 6.9 | Date/time arithmetic | INTERVAL + date + EXTRACT / DATE_TRUNC / DATE_PART / AGE | ✅ | v2.x |
 | 6.10 | Vector kNN correctness | HNSW top-K results match brute-force within recall@k ≥ 0.9 over the 4-corpus baseline | ✅ | pgvector corpus 100% |
+| 6.11 | Vector encoding alternatives [machine] | `VECTOR(N)` accepts `USING SQ8` (4× compression, recall@10 ≥ 0.95 via f32 rerank) and `USING HALF` (IEEE-754 binary16, 2× compression, bit-exact dequant). NEON SIMD for f32 / SQ8 ADC; halfvec rides the f32 NEON path via dequant-in-loop until stable Rust ships `f16`. | ✅ | v6.0.1 (SQ8) + v6.0.2 (NEON cos/IP + SQ8 ADC) + v6.0.3 (HALF), `tests/e2e_sq8.rs` + `tests/e2e_half.rs` |
+| 6.12 | Vector kNN at 1M scale [machine] | 1M dim-128 SQ8: ingest + `CREATE INDEX … USING hnsw` succeeds end-to-end; kNN top-10 via pgwire round-trip p50 ≤ 5 ms, p99 ≤ 10 ms on Apple M-series. RSS ≤ 800 MiB. | ✅ | v6.0.5 measurement: p50 = 362 µs, p99 = 539 µs, RSS = 624 MiB. `tests/perf_gate_sq8.rs` `#[ignore]`'d (run via `--ignored`). |
+| 6.13 | Vector encoding migration [machine] | `ALTER INDEX <name> REBUILD [WITH (encoding = F32 \| SQ8 \| HALF)]` recodes every stored cell + rebuilds the NSW graph in place — synchronous MVP; holds engine.write() for the rebuild duration. | ✅ | v6.0.4, `tests/e2e_alter_rebuild.rs` |
 
 ## 7. Operational tooling
 

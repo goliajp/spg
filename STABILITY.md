@@ -678,6 +678,45 @@ bit-for-bit reproducible across hosts. `f16_from_f32_bits` /
 `f16_to_f32_bits` (raw u32 ↔ u16) are public surface kept
 stable for serialisation parity.
 
+### v6.0 series — release roll-up (v6.0.5)
+
+The v6.0 series ships four alternative vector-cell paths + an
+in-place encoding-migration DDL. Frozen surfaces, all listed
+above, are recapped here for release lookup:
+
+- **DDL grammar**: `VECTOR(N) [USING SQ8 | USING HALF]` (v6.0.1,
+  v6.0.3); `ALTER INDEX <name> REBUILD [WITH (encoding = …)]`
+  (v6.0.4).
+- **Catalog DataType tags**: `14` = SQ8 (v6.0.1), `15` = HALF
+  (v6.0.3). Both `[u32 dim]` payload.
+- **Value tags** (catalog DEFAULT path): `11` = SQ8 (v6.0.1),
+  `12` = HALF (v6.0.3).
+- **Dense-row bodies**: SQ8 → `[u32 dim][f32 min][f32 max]
+  [u8 × dim]`; HALF → `[u32 dim][u16 LE × dim]`.
+- **No FILE_VERSION bump.** Pre-v6 binaries reading any of the
+  new tags surface `Corrupt("unknown … tag")` — the forward-
+  compat fence declared in V6_DESIGN deliberation #5.
+- **NSW graph block layout** is encoding-agnostic and unchanged
+  from v5.5.
+- **f16 codec** in `spg_storage::halfvec`: `f16_from_f32_bits`
+  / `f16_to_f32_bits` produce bit-for-bit reproducible IEEE
+  754-2008 binary16 across every host (round-to-nearest-even,
+  subnormal flush-to-zero, ±∞ saturation).
+- **ALTER INDEX REBUILD** is synchronous in v6.0.4. A future
+  sub-version may relax it to a non-blocking ("live") path
+  without breaking the grammar.
+
+Implementation-internal surfaces NOT in the contract:
+
+- NEON dispatch shape (`inner_product_f32`, `cosine_dot_norms_f32`,
+  the SQ8 ADC asymmetric paths). v6.0.2 ships these but they're
+  `#[doc(hidden)]` — internal arithmetic can evolve in any
+  release.
+- HNSW adjacency storage. `Vec<Vec<usize>>` per layer today; may
+  pack to `Vec<u32>` with offsets in v6.1.x. Snapshot format
+  carries the topology shape, so callers don't observe the
+  change.
+
 ### ALTER INDEX REBUILD (v6.0.4)
 
 v6.0.4 adds a DDL surface for synchronous index rebuild. The
