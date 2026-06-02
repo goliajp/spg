@@ -298,6 +298,311 @@ Verification at each todo via the `cargo test` commands listed in
 the L3a steps. Anything red → stop and diagnose; do not soften the
 test.
 
+## L3a-v6.0.1 — Hot plan for v6.0.1 (DDL + write/read integration)
+
+v6.0.1 wires the v6.0.0 standalone quantizer into the actual engine
+surface. End state: `CREATE TABLE t (v VECTOR(128) USING SQ8)` —
+INSERTs quantize at the write path, HNSW stores quantized
+neighbours, kNN searches via ADC + f32 rerank, on-disk rows + NSW
+graph carry the new sub-tag, and SELECT dequantizes on the wire.
+**No `FILE_VERSION` bump** (the new row-tag + NSW encoding sub-tag
+fit under the v4.37 envelope, per L1 deliberation #5).
+
+Plan is linear, TDD, no branches. Each step ends with a verify
+command; checkpoint to next step only after the verify is green.
+
+### Architectural recap (decisions inherited from L1)
+
+- **`Sq8Vector` is the in-memory cell representation, not a wire
+  thing.** Row cells for `USING SQ8` columns store
+  `Value::Sq8Vector(Sq8Vector)`; the PG wire protocol still
+  sends/receives `Vec<f32>` (OID for vector unchanged). The
+  4× compression target is in-memory + on-disk, not on the wire.
+- **f32 rerank reads from dequantized SQ8, not a second copy.** v6.0
+  stores ONLY the quantized form (deliberation #3). Rerank step
+  dequantizes the top-`K*3` SQ8 candidates inline and runs exact
+  f32 distance against the f32 query.
+- **Encoding is schema-time, never query-time.** No `CAST` /
+  `::sq8`. The column type carries the encoding; INSERTs accept
+  `Value::Vector(Vec<f32>)` and the write path quantizes
+  per-column.
+- **NEON paths stay scalar in v6.0.1.** v6.0.2 owns SIMD. v6.0.1
+  validates correctness + memory + functional perf at the scalar
+  ADC speed already proven in v6.0.0 perf gates (≤ 200 ns/pair).
+
+### Step 1 — `VecEncoding` enum + DDL parser
+
+- `crates/spg-sql/src/ast.rs`:
+  - New enum `pub enum VecEncoding { F32, Sq8 }` (`Copy + Eq`).
+  - `ColumnTypeName::Vector(u32)` →
+    `ColumnTypeName::Vector { dim: u32, encoding: VecEncoding }`.
+  - `Display`: `VECTOR(N)` for `F32` (back-compat); `VECTOR(N) USING SQ8` for `Sq8`.
+- `crates/spg-sql/src/parser.rs:660`: after `parse_paren_size("VECTOR")`,
+  peek for ident `USING`; if present, require `SQ8` (case-insensitive,
+  any other ident → `ParseError::UnknownVectorEncoding { found }`).
+- `crates/spg-storage/src/lib.rs:59`: `DataType::Vector(u32)` →
+  `DataType::Vector { dim: u32, encoding: VecEncoding }`. Re-export
+  `VecEncoding` from `spg-storage` (`spg-sql` stays storage-free —
+  define the enum twice, one per crate, with a `From` bridge in
+  `spg-engine`).
+- `crates/spg-engine/src/eval.rs:4482`: `ColumnTypeName::Vector { dim, encoding }`
+  → `DataType::Vector { dim, encoding: encoding.into() }`.
+
+**Verify:**
+```
+cargo test -p spg-sql --lib parser::parses_vector_using_sq8
+cargo test -p spg-sql --lib parser::vector_default_is_f32
+cargo test -p spg-sql --lib parser::rejects_unknown_vector_encoding
+cargo test --workspace --lib   # ensure no callsite of DataType::Vector(_) broke
+```
+Parser tests must round-trip `CREATE TABLE t (v VECTOR(128) USING SQ8)`
+through `Display` to the same text.
+
+### Step 2 — `Value::Sq8Vector` variant + helpers
+
+- `crates/spg-storage/src/lib.rs:118` (`enum Value`): add
+  `Sq8Vector(Sq8Vector)` variant. Place after `Vector(Vec<f32>)`.
+- `impl Value`:
+  - `pub fn quantize_to_sq8(&self) -> Option<Value>` — `Value::Vector(v)` →
+    `Value::Sq8Vector(quantize(v))`; other variants return `None`.
+  - `pub fn dequantize_to_vec(&self) -> Option<Vec<f32>>` — symmetric.
+- `impl Value::data_type` (line 163): `Value::Sq8Vector(q)` →
+  `Some(DataType::Vector { dim: q.bytes.len() as u32, encoding: Sq8 })`.
+- Update `IndexKey` skip (line 264) + every match arm in
+  `crates/spg-storage/src/lib.rs` and `crates/spg-engine/src/eval.rs`
+  that pattern-matches `Value` — add `Value::Sq8Vector(_)` arms.
+  Most behave identically to `Value::Vector` (display, JSON output,
+  null-handling); the points that diverge are listed in steps 3–7.
+
+**Verify:**
+```
+cargo test --workspace --lib
+cargo clippy --workspace --all-targets -- -D warnings
+```
+No new behaviour exercised yet — this step is mechanical exhaustiveness.
+
+### Step 3 — INSERT write path quantizes f32 → SQ8
+
+- `crates/spg-engine/src/eval.rs` INSERT execute path: before
+  appending the row, scan column schemas; for each
+  `DataType::Vector { encoding: Sq8, dim }` column, replace the
+  incoming `Value::Vector(v)` cell with `Value::Sq8Vector(quantize(&v))`.
+- Type-check: at insert-time, reject `dim` mismatch
+  (`v.len() != dim`) with `EngineError::VectorDimMismatch { expected, got }`
+  — same error path as f32 columns; encoding mismatch raised here.
+- COPY / parameterised INSERT (pgwire bind path) flows through the
+  same point; no separate quantize hook needed.
+
+**Verify:**
+```
+cargo test -p spg-engine --lib eval::insert_sq8_column_quantizes
+cargo test -p spg-engine --lib eval::insert_sq8_dim_mismatch_rejected
+```
+Both via in-process `Engine::execute`, no server boot.
+
+### Step 4 — HNSW build/insert uses SQ8 ADC
+
+- `crates/spg-storage/src/lib.rs:1271` (`metric_distance` / kNN
+  candidate evaluation): dispatch on cell type.
+  - `Value::Vector(v)` + `Value::Vector(other)` → existing f32 path.
+  - `Value::Sq8Vector(q)` + `Value::Sq8Vector(other)` →
+    `sq8_l2_distance_sq` / `sq8_cosine_distance` / `sq8_inner_product`
+    per `NswMetric`.
+  - Mixed cells (different encoding) within one column should be
+    impossible (insert-time enforced) — assert and panic with a
+    clear message if reached, do NOT silently dequantize.
+- `crates/spg-storage/src/lib.rs:1407` / `:1488` (graph traversal
+  during INSERT): same dispatch. Neighbour distance is between two
+  stored Sq8Vectors → symmetric ADC.
+- `crates/spg-storage/src/lib.rs:1129` / `:1459` (cell clone for
+  graph operations): support `Value::Sq8Vector` clone.
+
+**Verify:**
+```
+cargo test -p spg-storage --lib hnsw_sq8_insert_recall_at_10_above_0_95
+```
+In-process: insert 10K dim-128 random vectors into a fresh Catalog
+with `encoding: Sq8`, query 100 random vectors, recall@10 ≥ 0.95
+vs an `encoding: F32` Catalog built from the same corpus.
+
+### Step 5 — kNN query path: ADC beam + f32 rerank
+
+- Query path entry: `eval::execute_select` ordering by `<->` /
+  `<#>` / `<=>` on an SQ8 column.
+  - Beam search: for each candidate neighbour `n`, distance is
+    `sq8_l2_distance_sq_asymmetric(n.sq8, query_f32)` (and the
+    cosine / inner-product asymmetric analogues — add to
+    `quantize.rs` if not already there; v6.0.0 only landed L2
+    asymmetric).
+  - Result candidate set carries `(row_id, adc_distance)`.
+- Rerank step (configurable, default ON):
+  - Take top-`K*3` candidates by ADC.
+  - For each: `dequantize(stored_sq8) → Vec<f32>`, then `l2_distance_sq(deq, query)`.
+  - Reorder by exact distance; truncate to top-K. Emit.
+  - Opt-out path: HNSW search option `rerank: bool` (already lives on
+    the HNSW search params struct? if not, add). Default `true`.
+- The session-level GUC for rerank is OUT of scope — schema/index-level
+  knob only in v6.0.1. (Session GUCs land in v6.0.5 sweep work.)
+
+**Verify:**
+```
+cargo test -p spg-engine --lib eval::sq8_knn_topk_matches_f32_within_recall
+cargo test -p spg-engine --lib eval::sq8_knn_rerank_off_is_pure_adc
+```
+Both in-process. Topk-match test: 10K dim-128 corpus, 100 queries,
+top-10 overlap with f32 ground truth ≥ 0.97 with rerank on, ≥ 0.93
+with rerank off.
+
+### Step 6 — On-disk row segment + NSW envelope sub-tag
+
+- `crates/spg-storage/src/lib.rs:2355`-area (row encoding tag table):
+  - Tag 6 (Vector) — unchanged: `[u32 LE dim][dim×f32 LE]`.
+  - **NEW tag 7 (VectorSq8)**: `[u32 LE dim][f32 LE min][f32 LE max][dim×u8]`.
+    Reader for tag 7 reconstructs `Value::Sq8Vector(Sq8Vector { min, max, bytes })`.
+- `crates/spg-storage/src/lib.rs:2749`-area (`write_data_type`):
+  - `DataType::Vector { encoding: F32, dim }` → existing tag-6 type prefix (back-compat).
+  - `DataType::Vector { encoding: Sq8, dim }` → new type-prefix byte
+    (encoded inline with dim; see below). Forward-compat fence:
+    pre-v6 reader hits this byte and raises `UnknownVectorEncoding`,
+    matching the v3 WAL unknown-type abort behaviour.
+- NSW graph block (`kind=NSW_GRAPH` envelope payload): add a 1-byte
+  `encoding` sub-tag at the front of each block. `F32 = 0` (default
+  for back-compat: missing → F32 via length check), `SQ8 = 1`.
+  No version field bump — readers detect by NSW block size +
+  presence of sub-tag header.
+
+  *Back-compat concern*: existing v5 NSW blocks were written
+  without the sub-tag byte. Resolution: NSW block header gains a
+  2-byte magic `0xQ8` prefix to disambiguate; absent → assume F32
+  (old format). The new prefix is the fence for "this is a v6
+  NSW block".
+- `crates/spg-storage/src/lib.rs:2447`-area row decoder (`FILE_VERSION 8`):
+  handle tag 7 in the dense-row path. Unknown row-tag = hard abort
+  (same as today).
+
+**Verify:**
+```
+cargo test -p spg-storage --lib segment::sq8_row_roundtrip
+cargo test -p spg-storage --lib segment::sq8_nsw_block_roundtrip
+cargo test -p spg-storage --lib segment::pre_v6_nsw_block_decodes_as_f32
+```
+Third test guards back-compat: synthesise a v5-shape NSW block
+(no `0xQ8` prefix) → decoder yields `encoding: F32`.
+
+### Step 7 — e2e SQ8 roundtrip via `tests/common::ServerBuilder`
+
+- File: `crates/spg-server/tests/e2e_sq8.rs` (new).
+- Uses `mod common; use common::*;` (per [[tests-common-pattern]]).
+- Test: `insert_select_roundtrip_preserves_topk`:
+  1. `ServerBuilder::new().with_pgwire().spawn()`.
+  2. `CREATE TABLE vecs (id INT PRIMARY KEY, v VECTOR(128) USING SQ8);`
+  3. Insert 1024 deterministic dim-128 vectors (splitmix64 seed).
+  4. `SELECT id FROM vecs ORDER BY v <-> $1 LIMIT 10;` with `$1`
+     a known query → assert ID set matches f32-ground-truth top-10
+     with ≥ 8/10 overlap (recall ≥ 0.8 at small N is acceptable;
+     stricter recall is in the perf gate).
+  5. Read one row back, dequantize on the client side
+     (vector type comes through as f32), check max abs error
+     ≤ `(max - min) / 255 / 2 + 1e-6`.
+
+**Verify:**
+```
+cargo test --release -p spg-server --test e2e_sq8 -- --nocapture
+```
+
+### Step 8 — Perf gates: SQ8 kNN p50 + RSS
+
+- File: `crates/spg-server/tests/perf_gate.rs` (extend; this is the
+  server-side perf gate file, separate from the storage-side one
+  that owns the v6.0.0 gates).
+- New gates (both `#[ignore]` by default — they take minutes; run
+  via `cargo test --release -p spg-server --test perf_gate -- --ignored`):
+  - `sq8_kNN_1m_dim128_p50_under_50us_server`:
+    spawn a `ServerBuilder` server, `CREATE TABLE … USING SQ8`,
+    bulk insert 1M dim-128 (splitmix64), run 1024 distinct kNN
+    queries through pgwire, capture per-query latency, assert
+    p50 ≤ 50 µs.
+  - `sq8_rss_1m_dim128_under_200mib`:
+    same setup, after ingest + a `SELECT` warmup, sample
+    `rss_kib_of(pid)` 5× spaced 1 s, assert max ≤ 204_800 KiB.
+    Helper `rss_kib_of` lives in `e2e_chaos_freeze.rs:335` —
+    promote it to `tests/common/mod.rs` so the perf gate can
+    reuse it without duplicating.
+
+**Verify:**
+```
+cargo test --release -p spg-server --test perf_gate -- --ignored sq8_
+```
+
+### Step 9 — STABILITY.md + sqllogictest + workspace green
+
+- `STABILITY.md` — add three new frozen rows:
+  1. **DDL grammar**: `VECTOR(N) USING SQ8` (case-insensitive `USING`/`SQ8`).
+     Other encodings reserved (`HALF` lands in v6.0.3; `F32` is the
+     omit-clause default).
+  2. **Row segment tag 7 (VectorSq8)**: layout `[u32 LE dim][f32 LE min][f32 LE max][u8 × dim]`.
+  3. **NSW_GRAPH encoding sub-tag**: 2-byte magic `0xQ8` prefix gates
+     the encoding byte. Encoding values: `0 = F32`, `1 = SQ8`.
+     Reserved: `2 = F16` (v6.0.3).
+- Run `xtests/sqllogictest`: `cargo run -q -p sqllogictest --release`.
+  Expectation: 4-corpus stays 100% (SQ8 is a new opt-in feature; no
+  existing corpus test references it).
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --release --workspace` — full workspace including
+  e2e_sq8 (non-ignored). Perf gates stay ignored.
+
+### Step 10 — Commit v6.0.1 + CHANGELOG
+
+```
+v6.0.1-sq8-integration: VECTOR(N) USING SQ8 — DDL, write/read path, on-disk
+```
+
+CHANGELOG `[Unreleased]` entries:
+- **Added**:
+  - DDL `VECTOR(N) USING SQ8` (parser + AST + `DataType::Vector { dim, encoding }`).
+  - Write path quantizes f32 → SQ8 at INSERT for `USING SQ8` columns.
+  - HNSW build + kNN search use SQ8 ADC distances; default-on f32
+    rerank pass on top-`K*3` candidates.
+  - On-disk: row-tag 7 (VectorSq8) + NSW_GRAPH encoding sub-tag.
+- **Changed**:
+  - `Value` gains `Sq8Vector(Sq8Vector)` variant.
+  - `ColumnTypeName::Vector` / `DataType::Vector` now carry `encoding`.
+  - Pre-v6 binaries reading a v6 SQ8 segment now raise `UnknownVectorEncoding`
+    (same fence as v3 WAL unknown-type abort).
+
+## L4-v6.0.1 — v6.0.1 todos (execution order)
+
+1. `VecEncoding` enum + `ColumnTypeName::Vector { dim, encoding }` in spg-sql
+2. parser `USING SQ8` after `VECTOR(N)` paren close
+3. mirror in `DataType::Vector { dim, encoding }` + engine bridge
+4. workspace compiles green (mechanical match-arm fan-out)
+5. `Value::Sq8Vector(Sq8Vector)` variant + helpers + match arms
+6. INSERT path quantizes when column encoding is Sq8
+7. unit test: insert quantizes; dim mismatch rejected
+8. HNSW build/insert uses SQ8 ADC (cell-type dispatch)
+9. unit test: hnsw SQ8 recall ≥ 0.95 vs f32 graph
+10. kNN search: asymmetric ADC beam + f32 rerank (rerank default ON)
+11. add `sq8_cosine_distance_asymmetric` + `sq8_inner_product_asymmetric` to `quantize.rs` if missing
+12. unit test: topk overlap with f32 ground truth (rerank on / off)
+13. on-disk row-tag 7 (VectorSq8) + reader/writer
+14. NSW_GRAPH encoding sub-tag with `0xQ8` magic prefix
+15. unit tests: row roundtrip + nsw block roundtrip + pre-v6 block decodes as F32
+16. e2e: `tests/e2e_sq8::insert_select_roundtrip_preserves_topk` via ServerBuilder
+17. promote `rss_kib_of` from `e2e_chaos_freeze.rs` to `tests/common/mod.rs`
+18. perf gate: `sq8_kNN_1m_dim128_p50_under_50us_server` (ignored by default)
+19. perf gate: `sq8_rss_1m_dim128_under_200mib` (ignored by default)
+20. STABILITY.md — three new frozen rows
+21. sqllogictest 4-corpus stays 100%
+22. fmt + clippy + workspace test green
+23. commit `v6.0.1-sq8-integration` + CHANGELOG `[Unreleased]` entries
+
+Verification at each todo via the `cargo test` commands listed in
+the L3a-v6.0.1 steps. Anything red → stop and diagnose; do not
+soften the test. If a recall@K assertion is failing, *first* check
+the rerank path is actually engaged — soft-fail-by-disabling-rerank
+is exactly what the gate is meant to catch.
+
 ## Risk register
 
 | risk | mitigation |
@@ -310,8 +615,10 @@ test.
 
 ## Forward links
 
-- v6.0.1 design lands in this file as a new L3a section after v6.0.0 ships.
+- v6.0.1 hot plan: see L3a-v6.0.1 above (drafted 2026-06-02 after v6.0.0 shipped).
+- v6.0.2 (NEON SIMD for cosine/IP + SQ8 ADC) design lands in this
+  file as a new L3a-v6.0.2 section after v6.0.1 ships.
 - v6.1 (logical replication) design starts fresh as `V6_1_DESIGN.md` after v6.0.5 tags.
-- The next-version trigger for v6.0.0 → v6.0.1 is: all v6.0.0 perf
-  gates green + `xtests/sqllogictest` 4-corpus still 100% + workspace
-  test green.
+- Next-version trigger for v6.0.1 → v6.0.2 is: all v6.0.1 perf
+  gates green + `xtests/sqllogictest` 4-corpus still 100% +
+  workspace test green + e2e_sq8 green.
