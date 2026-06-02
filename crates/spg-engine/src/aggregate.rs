@@ -583,6 +583,17 @@ fn encode_key(vals: &[Value]) -> String {
                 }
                 out.push('|');
             }
+            // v6.0.3: GROUP BY on a `VECTOR(N) USING HALF` column.
+            // Byte-equality over the raw u16 bits; matches the SQ8
+            // path's byte-key model.
+            Value::HalfVector(h) => {
+                out.push('H');
+                for b in &h.bytes {
+                    out.push_str(&b.to_string());
+                    out.push(',');
+                }
+                out.push('|');
+            }
             Value::Numeric { scaled, scale } => {
                 out.push('D');
                 out.push_str(&scaled.to_string());

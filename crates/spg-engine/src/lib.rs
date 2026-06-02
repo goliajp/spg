@@ -1849,9 +1849,11 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
             #[allow(clippy::cast_precision_loss)]
             Ok(key as f64)
         }
-        Value::Vector(_) | Value::Sq8Vector(_) => Err(EngineError::Unsupported(
-            "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
-        )),
+        Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
+            Err(EngineError::Unsupported(
+                "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
+            ))
+        }
         Value::Interval { .. } => Err(EngineError::Unsupported(
             "ORDER BY of an INTERVAL is not supported in v2.11 \
              (months vs micros has no single canonical ordering)"
@@ -4489,6 +4491,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
             encoding: match encoding {
                 SqlVecEncoding::F32 => VecEncoding::F32,
                 SqlVecEncoding::Sq8 => VecEncoding::Sq8,
+                SqlVecEncoding::F16 => VecEncoding::F16,
             },
         },
         ColumnTypeName::Numeric(precision, scale) => DataType::Numeric { precision, scale },
@@ -4692,6 +4695,19 @@ fn coerce_value(
             ) if v.len() == dim as usize => {
                 Some(Value::Sq8Vector(spg_storage::quantize::quantize(&v)))
             }
+            // v6.0.3: f32 → f16 INSERT-time conversion for HALF
+            // columns. Bit-exact at the storage layer (modulo
+            // half-precision rounding); no rerank pass needed at
+            // search time.
+            (
+                Value::Vector(v),
+                DataType::Vector {
+                    dim,
+                    encoding: VecEncoding::F16,
+                },
+            ) if v.len() == dim as usize => Some(Value::HalfVector(
+                spg_storage::halfvec::HalfVector::from_f32_slice(&v),
+            )),
             // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
             // is already longer we reject (PG truncates trailing-space-only;
             // staying strict for v1).
@@ -4800,6 +4816,49 @@ mod tests {
             }
             other => panic!("expected Sq8Vector cell, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_table_vector_using_half_succeeds_and_insert_converts_to_f16() {
+        // v6.0.3: CREATE TABLE accepts USING HALF; INSERT path
+        // converts the incoming `Value::Vector(Vec<f32>)` cell
+        // into `Value::HalfVector(HalfVector)` via the new
+        // `coerce_value` arm. The dequantised round-trip is
+        // bit-exact for f16-representable values, so 0.0 / 0.25
+        // / 0.5 / 1.0 hit their grid points exactly.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v VECTOR(4) USING HALF)")
+            .unwrap();
+        e.execute("INSERT INTO t VALUES ([0.0, 0.25, 0.5, 1.0])")
+            .unwrap();
+        let t = e.catalog().get("t").unwrap();
+        assert_eq!(t.rows().len(), 1);
+        match &t.rows()[0].values[0] {
+            Value::HalfVector(h) => {
+                assert_eq!(h.dim(), 4);
+                let back = h.to_f32_vec();
+                let expected = alloc::vec![0.0_f32, 0.25, 0.5, 1.0];
+                for (g, e) in back.iter().zip(expected.iter()) {
+                    assert!(
+                        (g - e).abs() < 1e-6,
+                        "{g} vs {e} should be exact on f16 grid"
+                    );
+                }
+            }
+            other => panic!("expected HalfVector cell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_into_half_column_dim_mismatch_errors() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v VECTOR(4) USING HALF)")
+            .unwrap();
+        let err = e.execute("INSERT INTO t VALUES ([1.0, 2.0])").unwrap_err();
+        assert!(matches!(
+            &err,
+            EngineError::Storage(StorageError::TypeMismatch { .. })
+        ));
     }
 
     #[test]

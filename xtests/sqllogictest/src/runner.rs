@@ -201,6 +201,16 @@ fn render_cell(v: &Value, ty: char) -> String {
                 .collect();
             format!("[{}]", cells.join(", "))
         }
+        // v6.0.3: HalfVector cells also render dequantised on the
+        // sqllogictest grid.
+        Value::HalfVector(h) => {
+            let cells: Vec<String> = h
+                .to_f32_vec()
+                .iter()
+                .map(|x| format_real(f64::from(*x)))
+                .collect();
+            format!("[{}]", cells.join(", "))
+        }
         Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),

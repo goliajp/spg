@@ -1435,6 +1435,16 @@ fn encode_copy_cell(v: &spg_storage::Value) -> String {
                 .collect();
             escape_copy_cell(&format!("[{}]", parts.join(", ")))
         }
+        // v6.0.3: COPY OUT for `VECTOR(N) USING HALF` — bit-exact
+        // dequantise to f32.
+        Value::HalfVector(h) => {
+            let parts: Vec<String> = h
+                .to_f32_vec()
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            escape_copy_cell(&format!("[{}]", parts.join(", ")))
+        }
     }
 }
 
@@ -1868,6 +1878,15 @@ fn value_to_pg_text(v: &Value, _ty: Option<DataType>) -> Option<String> {
         // `[x, y, z]` payload.
         Value::Sq8Vector(q) => {
             let parts: Vec<String> = spg_storage::quantize::dequantize(q)
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
+        // v6.0.3: pgwire text-format render for HALF cells.
+        Value::HalfVector(h) => {
+            let parts: Vec<String> = h
+                .to_f32_vec()
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect();

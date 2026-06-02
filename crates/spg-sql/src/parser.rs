@@ -817,7 +817,12 @@ impl Parser {
         };
         match enc_ident.to_ascii_lowercase().as_str() {
             "sq8" => Ok(VecEncoding::Sq8),
-            other => Err(self.err(format!("unknown vector encoding {other:?}; supported: SQ8"))),
+            // v6.0.3: `HALF` (pgvector convention) selects IEEE-754
+            // binary16 per-element storage.
+            "half" => Ok(VecEncoding::F16),
+            other => Err(self.err(format!(
+                "unknown vector encoding {other:?}; supported: SQ8, HALF"
+            ))),
         }
     }
 
