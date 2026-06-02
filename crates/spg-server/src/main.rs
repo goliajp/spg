@@ -1289,6 +1289,66 @@ fn sql_is_read_only(sql: &str) -> bool {
     }
 }
 
+/// v6.1.7 — cheap prefix-match for `WAIT FOR`. The wire-layer
+/// intercept only re-parses the SQL when this returns true, so
+/// the cost on every non-WAIT query is a tiny first-word scan.
+fn sql_looks_like_wait_for(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if trimmed.len() < 4 {
+        return false;
+    }
+    trimmed.as_bytes()[..4]
+        .iter()
+        .zip(b"WAIT")
+        .all(|(a, b)| a.to_ascii_uppercase() == *b)
+        && trimmed
+            .as_bytes()
+            .get(4)
+            .is_some_and(u8::is_ascii_whitespace)
+}
+
+/// v6.1.7 — WAIT FOR WAL POSITION handler. Polls
+/// `lag_state.follower_applied_pos` at 5 ms cadence until the
+/// target is reached or the optional timeout elapses. Returns
+/// CommandComplete with `affected=1` on reach, `affected=0` on
+/// timeout — clients distinguish the two via the count.
+fn handle_wait_for_wal_position(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    target: u64,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<()> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    let deadline = timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    loop {
+        let current = state
+            .lag_state
+            .follower_applied_pos
+            .load(Ordering::Acquire);
+        if current >= target {
+            return emit_result(
+                stream,
+                Ok(spg_engine::QueryResult::CommandOk {
+                    affected: 1,
+                    modified_catalog: false,
+                }),
+            );
+        }
+        if let Some(d) = deadline
+            && std::time::Instant::now() >= d
+        {
+            return emit_result(
+                stream,
+                Ok(spg_engine::QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                }),
+            );
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 #[allow(clippy::too_many_lines)] // big dispatch table, splitting would scatter the per-op gates
 fn dispatch(
     stream: &mut TcpStream,
@@ -1381,6 +1441,16 @@ fn dispatch(
             // emits one JSON line on stderr if elapsed exceeds
             // `SPG_SLOW_QUERY_LOG_MS`. Drop runs on every return below.
             let _slow_log = SlowLogGuard::new(state, &sql, *role);
+            // v6.1.7 — server-layer intercept for WAIT FOR WAL POSITION.
+            // The engine refuses this statement; we read `lag_state`
+            // (which the engine has no access to) and poll until the
+            // target is reached or the optional timeout fires.
+            if sql_looks_like_wait_for(&sql)
+                && let Ok(stmt) = spg_sql::parser::parse_statement(&sql)
+                && let spg_sql::ast::Statement::WaitForWalPosition { pos, timeout_ms } = stmt
+            {
+                return handle_wait_for_wal_position(stream, state, pos, timeout_ms);
+            }
             // v4.0 fast path: SELECT / SHOW outside an active TX take
             // the engine *read* lock and run in parallel with other
             // readers. WriteRequired drop-through is rare (only if

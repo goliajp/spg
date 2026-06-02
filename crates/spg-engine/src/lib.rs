@@ -772,6 +772,9 @@ impl Engine {
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
             Statement::ShowSubscriptions => Ok(self.exec_show_subscriptions()),
+            Statement::WaitForWalPosition { .. } => Err(EngineError::Unsupported(
+                "WAIT FOR WAL POSITION must be handled by the server layer".into(),
+            )),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
             _ => Err(EngineError::WriteRequired),
         };
@@ -918,6 +921,15 @@ impl Engine {
             Statement::DropPublication(name) => self.exec_drop_publication(&name),
             Statement::CreateSubscription(s) => self.exec_create_subscription(s),
             Statement::DropSubscription(name) => self.exec_drop_subscription(&name),
+            // v6.1.7 — WAIT FOR WAL POSITION needs `lag_state`,
+            // which lives in spg-server's ServerState. The engine
+            // surfaces a clear error; the server-layer dispatch
+            // intercepts the SQL before it reaches the engine on
+            // a server build, so this arm only fires for
+            // engine-only callers (spg-embedded, lib tests).
+            Statement::WaitForWalPosition { .. } => Err(EngineError::Unsupported(
+                "WAIT FOR WAL POSITION must be handled by the server layer".into(),
+            )),
         };
         self.enforce_row_limit(result)
     }
