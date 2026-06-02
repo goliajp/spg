@@ -1667,7 +1667,22 @@ fn nsw_search(
         return Vec::new();
     };
     let col_pos = table.indices[idx_pos].column_position;
-    let ef = ef.max(k);
+    // v6.0.1 step 5: SQ8 columns over-fetch by `SQ8_RERANK_OVER_FETCH`
+    // so the rerank pass below sees enough candidates to recover
+    // recall after the ADC re-ordering. F32 columns skip the
+    // over-fetch (exact distances already, nothing to rerank).
+    let sq8 = matches!(
+        table.schema.columns.get(col_pos).map(|c| c.ty),
+        Some(DataType::Vector {
+            encoding: VecEncoding::Sq8,
+            ..
+        })
+    );
+    let ef = if sq8 {
+        ef.max(k).max(k * SQ8_RERANK_OVER_FETCH)
+    } else {
+        ef.max(k)
+    };
     // Descend by L2 (the topology metric) so layers prune consistently.
     let entry_d = vec_l2_sq(table, col_pos, entry, query);
     let mut current = entry;
@@ -1677,9 +1692,51 @@ fn nsw_search(
     }
     // Final beam search on layer 0 under the caller's metric.
     let mut results = layer_beam_search(table, idx_pos, 0, current, current_d, query, ef, metric);
+    if sq8 {
+        results = sq8_rerank(table, col_pos, &results, query, metric);
+    }
     results.truncate(k);
     results
 }
+
+/// v6.0.1 step 5: re-score ADC top-`K*3` candidates with the
+/// dequantised cell vs the f32 query, then re-sort. Recovers the
+/// recall the SQ8 ADC sacrifices for 4× compression — the design's
+/// "f32 rerank step is on by default" path (deliberation #3).
+/// `metric` is the same metric the beam search used; the rerank
+/// arithmetic re-derives the exact distance under that metric.
+fn sq8_rerank(
+    table: &Table,
+    col_pos: usize,
+    candidates: &[(f32, usize)],
+    query: &[f32],
+    metric: NswMetric,
+) -> Vec<(f32, usize)> {
+    let mut out: Vec<(f32, usize)> = candidates
+        .iter()
+        .filter_map(|&(adc_d, row)| {
+            let cell = table.rows.get(row).and_then(|r| r.values.get(col_pos))?;
+            let Value::Sq8Vector(q) = cell else {
+                // F32 cells shouldn't reach this path (sq8 fence
+                // above), but stay defensive: pass through with
+                // the ADC distance unchanged.
+                return Some((adc_d, row));
+            };
+            let deq = quantize::dequantize(q);
+            if deq.len() != query.len() {
+                return None;
+            }
+            Some((metric_distance(metric, &deq, query), row))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+    out
+}
+
+/// Multiplier applied to `k` so the SQ8 rerank pass sees a wider
+/// candidate set. 3× is the design-stage value; v6.0.5 sweep work
+/// can re-tune once full corpus profiling is in.
+const SQ8_RERANK_OVER_FETCH: usize = 3;
 
 fn metric_distance(metric: NswMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
@@ -3746,14 +3803,13 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_sq8_recall_at_10_above_0_85_vs_f32_groundtruth() {
-        // v6.0.1 step 4 verify: build TWO catalogs over the same
-        // corpus — one F32, one SQ8 — and confirm the SQ8 NSW
-        // graph still retrieves a high-overlap top-10 vs the F32
-        // exact-arithmetic ground truth. 0.85 floor leaves head-
-        // room for the inserted-cell dequant step + 4× compression
-        // noise; the step-5 perf gate tightens it to ≥ 0.95 once
-        // the f32 rerank pass is in.
+    fn hnsw_sq8_recall_at_10_above_0_95_vs_f32_groundtruth() {
+        // v6.0.1 step 5 verify: build TWO catalogs over the same
+        // corpus — one F32, one SQ8 — and confirm SQ8 NSW + f32
+        // rerank retrieves ≥ 95% top-10 overlap vs brute-force F32
+        // ground truth. The rerank pass (sq8_rerank) re-scores ADC
+        // candidates with dequantised cells, recovering recall the
+        // raw ADC sacrifices for 4× compression.
         use crate::quantize;
         // Deterministic Gaussian-ish corpus via splitmix64. Vectors
         // get normalised so SQ8's per-vector `(min, max)` lives in
@@ -3829,9 +3885,9 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let recall = total_overlap as f32 / (10.0 * queries.len() as f32);
         assert!(
-            recall >= 0.85,
-            "SQ8 HNSW recall@10 = {recall:.3}, below floor 0.85 — \
-             check `cell_to_query_metric_distance` / `cell_l2_sq` dispatch"
+            recall >= 0.95,
+            "SQ8 HNSW recall@10 = {recall:.3}, below floor 0.95 — \
+             check `sq8_rerank` is wired in `nsw_search` for SQ8 columns"
         );
     }
 
