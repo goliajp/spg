@@ -1,30 +1,27 @@
+#![allow(unused_mut, unused_variables)]
 //! Cross-process persistence:
 //! spawn the daemon with a db-path arg → CREATE/INSERT via wire → kill →
 //! spawn a fresh daemon on the same db-path → verify SELECT sees the rows.
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spg_wire::{
     Frame, Op, WireValue, build_query, encode, parse_command_complete, parse_data_row,
     parse_row_description,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(3);
+mod common;
 
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
+fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
+    common::ServerBuilder::new().arg_path(db).spawn()
 }
+
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -37,40 +34,6 @@ fn unique_tmpdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("spg-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
     dir
-}
-
-fn spawn_server(addr: &str, db: &PathBuf) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
-        .arg(db)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn spg-server")
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -107,9 +70,9 @@ fn rows_survive_a_full_daemon_restart() {
 
     // Phase 1: fresh daemon, populate, kill.
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server(&addr, &db));
-        let mut stream = wait_for_listener(&addr, &mut child.0);
+        let (raw, addrs) = local_spawn(&db);
+        let mut child = common::ChildGuard(raw);
+        let mut stream = common::connect_to(&addrs.native);
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         send_query(
@@ -132,9 +95,9 @@ fn rows_survive_a_full_daemon_restart() {
     assert!(db.exists(), "db file should exist after first run");
 
     // Phase 2: fresh daemon, restored from db, query.
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &db));
-    let mut stream = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut stream = common::connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(&mut stream, "SELECT * FROM accounts");
     let rd = read_frame(&mut stream);
@@ -171,10 +134,9 @@ fn missing_db_file_starts_fresh_and_creates_it() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     assert!(!db.exists(), "db should NOT exist at start");
-
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &db));
-    let mut stream = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut stream = common::connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(&mut stream, "CREATE TABLE t (v INT)");
     expect_cc(&mut stream);
@@ -190,10 +152,9 @@ fn missing_db_file_starts_fresh_and_creates_it() {
 fn read_only_select_does_not_touch_the_db_file() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &db));
-    let mut stream = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut stream = common::connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(&mut stream, "CREATE TABLE t (v INT)");

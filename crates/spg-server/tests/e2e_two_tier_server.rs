@@ -1,3 +1,4 @@
+#![allow(unused_mut, unused_variables)]
 //! v5.1: end-to-end validation that spg-server's lazy cold-tier
 //! preload hook actually wires a hand-baked segment into the
 //! catalog and routes PK SELECTs through it. Sanity-tests the
@@ -12,19 +13,24 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spg_storage::{
     Row, SEGMENT_PAGE_BYTES, TableSchema, Value, encode_row_body_dense, encode_segment,
 };
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_command_complete, parse_data_row};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
+
+fn local_spawn(preload_spec: &str) -> (std::process::Child, common::ServerAddrs) {
+    common::ServerBuilder::new()
+        .env("SPG_PRELOAD_COLD_SEGMENT", preload_spec)
+        .spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,47 +44,6 @@ fn unique_tmpdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("spg-coldtier-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
     dir
-}
-
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server_with_preload(addr: &str, preload_spec: &str) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr);
-    cmd.env("SPG_PRELOAD_COLD_SEGMENT", preload_spec);
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn spg-server")
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -157,11 +122,10 @@ fn preload_loads_cold_segment_on_first_query_after_index_creation() {
     // from the cold segment.
     let cold: Vec<(i64, &str)> = (100..356).map(|i| (i, "cold-row")).collect();
     fs::write(&seg_path, bake_users_segment(&cold)).expect("write segment");
-
-    let addr = pick_free_addr();
     let spec = format!("users:by_id:{}", seg_path.display());
-    let mut child = ChildGuard(spawn_server_with_preload(&addr, &spec));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&spec);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // CREATE TABLE + INDEX. The preload spec sits idle until both

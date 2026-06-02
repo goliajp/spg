@@ -4,27 +4,28 @@
     clippy::cast_sign_loss,
     clippy::doc_markdown,
     clippy::uninlined_format_args,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.19 PG-wire SET / SHOW session variables.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(3);
+mod common;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
+
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn unique_tmpdir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -34,43 +35,6 @@ fn unique_tmpdir() -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-e2e-set-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-fn spawn_server(native_addr: &str, pg_addr: &str, db: &PathBuf) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(native_addr)
-        .arg(db)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("SPG_PG_ADDR", pg_addr)
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .spawn()
-        .unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 struct PgMessage {
@@ -165,13 +129,11 @@ fn open(addr: &str) -> TcpStream {
 
 #[test]
 fn set_then_show_round_trips() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = open(&pg);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
 
     send_query(&mut s, "SET application_name = 'myapp'");
     let msgs = drain_until_ready(&mut s);
@@ -184,13 +146,11 @@ fn set_then_show_round_trips() {
 
 #[test]
 fn set_to_variant_also_works() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = open(&pg);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
 
     send_query(&mut s, "SET search_path TO 'public,extra'");
     let msgs = drain_until_ready(&mut s);
@@ -203,13 +163,11 @@ fn set_to_variant_also_works() {
 
 #[test]
 fn show_returns_default_when_never_set() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = open(&pg);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
 
     send_query(&mut s, "SHOW client_encoding");
     let msgs = drain_until_ready(&mut s);
@@ -222,13 +180,11 @@ fn show_returns_default_when_never_set() {
 
 #[test]
 fn show_all_lists_known_settings() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = open(&pg);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
 
     send_query(&mut s, "SHOW ALL");
     let msgs = drain_until_ready(&mut s);
@@ -241,13 +197,11 @@ fn show_all_lists_known_settings() {
 
 #[test]
 fn set_session_local_prefix_accepted() {
-    let native = pick_free_addr();
-    let pg = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let mut child = ChildGuard(spawn_server(&native, &pg, &db));
-    let _ = wait_for_listener(&native, &mut child.0);
-    let mut s = open(&pg);
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
 
     send_query(&mut s, "SET SESSION client_encoding = 'UTF8'");
     let msgs = drain_until_ready(&mut s);

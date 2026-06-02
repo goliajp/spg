@@ -1,4 +1,9 @@
-#![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
+)]
 
 //! v4.5 end-to-end:
 //! - SPG_QUERY_TIMEOUT_MS: a long-running scan is cancelled and the
@@ -8,57 +13,22 @@
 //!   error frame + EOF).
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::thread;
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use spg_wire::{Frame, Op, build_query, encode, parse_error_response};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str, envs: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr).stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.env_remove("SPG_PASSWORD");
-    cmd.env_remove("SPG_ADMIN_PASSWORD");
+fn local_spawn(envs: &[(&str, &str)]) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new();
     for (k, v) in envs {
-        cmd.env(k, v);
+        b = b.env(*k, *v);
     }
-    cmd.spawn().unwrap()
+    b.spawn()
 }
 
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn read_frame(s: &mut TcpStream) -> Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
@@ -91,11 +61,11 @@ fn exec_ok(s: &mut TcpStream, sql: &str) {
 
 #[test]
 fn query_timeout_cancels_long_scan() {
-    let addr = pick_free_addr();
     // 50 ms budget — well under what scanning 50k rows + per-row
     // WHERE eval takes in debug build.
-    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_QUERY_TIMEOUT_MS", "50")]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&[("SPG_QUERY_TIMEOUT_MS", "50")]);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     exec_ok(&mut s, "CREATE TABLE t (id INT NOT NULL)");
@@ -144,9 +114,9 @@ fn query_timeout_cancels_long_scan() {
 
 #[test]
 fn idle_timeout_closes_silent_connection() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_IDLE_TIMEOUT_SEC", "1")]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&[("SPG_IDLE_TIMEOUT_SEC", "1")]);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     // Generous client-side read timeout so we observe the server's
     // budget, not ours.
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
