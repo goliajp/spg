@@ -269,6 +269,13 @@ impl Parser {
                 self.advance();
                 self.parse_alter_after_keyword()
             }
+            // v6.1.7: WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>].
+            // WAIT / POSITION / TIMEOUT are bare idents — no lexer
+            // additions needed.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("wait") => {
+                self.advance();
+                self.parse_wait_after_keyword()
+            }
             other => Err(self.err(format!(
                 "expected SELECT / CREATE / DROP / INSERT / UPDATE / DELETE / ALTER / BEGIN / COMMIT / \
                  ROLLBACK / SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
@@ -405,6 +412,52 @@ impl Parser {
                 publications,
             },
         ))
+    }
+
+    /// v6.1.7 — `WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>]`.
+    /// All keywords after `WAIT` are bare idents in v6.1.x; no
+    /// lexer churn. Both `<pos>` and `<ms>` are positive integers
+    /// that fit `u64`.
+    fn parse_wait_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        // FOR is a v6.1.2-reserved keyword (Token::For). The
+        // other two are bare idents — they've never needed lexer
+        // support and we keep it that way.
+        if !matches!(self.peek(), Token::For) {
+            return Err(self.err(format!(
+                "expected FOR after WAIT, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        self.expect_keyword_ident("wal")?;
+        self.expect_keyword_ident("position")?;
+        let pos = self.expect_u64_literal()?;
+        let timeout_ms = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with"))
+        {
+            self.advance();
+            self.expect_keyword_ident("timeout")?;
+            Some(self.expect_u64_literal()?)
+        } else {
+            None
+        };
+        Ok(Statement::WaitForWalPosition { pos, timeout_ms })
+    }
+
+    /// v6.1.7 helper — consume a `Token::Integer` and check it
+    /// fits `u64`. WAL positions and millisecond timeouts are
+    /// non-negative.
+    fn expect_u64_literal(&mut self) -> Result<u64, ParseError> {
+        match self.advance() {
+            Token::Integer(n) if n >= 0 => Ok(n as u64),
+            Token::Integer(n) => Err(ParseError {
+                message: format!("expected non-negative integer, got {n}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+            other => Err(ParseError {
+                message: format!("expected integer literal, got {other:?}"),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+        }
     }
 
     /// `CREATE USER` body — name + WITH PASSWORD '<pw>' + optional
@@ -3003,6 +3056,51 @@ mod tests {
     fn parser_recognises_show_subscriptions() {
         let s = parse("SHOW SUBSCRIPTIONS");
         assert!(matches!(s, Statement::ShowSubscriptions));
+    }
+
+    #[test]
+    fn parser_recognises_wait_for_wal_position_no_timeout() {
+        let s = parse("WAIT FOR WAL POSITION 12345");
+        let Statement::WaitForWalPosition { pos, timeout_ms } = s else {
+            panic!("expected WaitForWalPosition, got {s:?}")
+        };
+        assert_eq!(pos, 12345);
+        assert!(timeout_ms.is_none());
+    }
+
+    #[test]
+    fn parser_recognises_wait_for_wal_position_with_timeout() {
+        let s = parse("WAIT FOR WAL POSITION 67890 WITH TIMEOUT 5000");
+        let Statement::WaitForWalPosition { pos, timeout_ms } = s else {
+            panic!()
+        };
+        assert_eq!(pos, 67890);
+        assert_eq!(timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn parser_rejects_wait_with_negative_position() {
+        // The lexer treats `-` as a token; `expect_u64_literal`
+        // only sees the Integer that follows, so the negative
+        // arrives as a unary-minus expression at higher levels.
+        // Bare `WAIT FOR WAL POSITION -1` thus surfaces as a
+        // parse error one way or another.
+        let err = parse_statement("WAIT FOR WAL POSITION -1").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn wait_for_display_roundtrips() {
+        for sql in [
+            "WAIT FOR WAL POSITION 12345",
+            "WAIT FOR WAL POSITION 67890 WITH TIMEOUT 5000",
+        ] {
+            let s = parse(sql);
+            let printed = s.to_string();
+            let again = parse_statement(&printed)
+                .unwrap_or_else(|e| panic!("re-parse failed for {printed:?}: {e}"));
+            assert_eq!(s, again, "round-trip mismatch for {sql:?}");
+        }
     }
 
     #[test]

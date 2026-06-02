@@ -10,6 +10,72 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.7] — 2026-06-03 (WAIT FOR WAL POSITION)
+
+Sixth v6.1.x sub-version on the logical-replication path. Adds
+a consistent-read barrier so clients can write on a primary,
+note the WAL position, then `WAIT FOR WAL POSITION <pos>` on a
+follower before reading — guaranteed to see at least that write.
+
+### Added
+
+- SQL surface
+  - `WAIT FOR WAL POSITION <pos>` — blocks until the local
+    server's `lag_state.follower_applied_pos >= pos`.
+  - `WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>` — returns
+    after `<ms>` even if the target hasn't been reached.
+  Result: CommandComplete with `affected = 1` (reached) or
+  `affected = 0` (timed out). Clients distinguish the two via
+  the count.
+- AST: `Statement::WaitForWalPosition { pos: u64, timeout_ms:
+  Option<u64> }`.
+- Parser dispatches via the bare `wait` ident (no new lexer
+  tokens). The `FOR` keyword reuses v6.1.2's `Token::For`.
+- Server-layer intercept in spg-server's Op::Query handler.
+  Cheap `sql_looks_like_wait_for` prefix check on every query
+  (first 4 bytes); on a hit, re-parse and call
+  `handle_wait_for_wal_position`, which polls
+  `lag_state.follower_applied_pos` at 5 ms cadence under
+  `Acquire` ordering.
+- Engine refuses the statement with `EngineError::Unsupported`
+  ("WAIT FOR WAL POSITION must be handled by the server
+  layer") — safety net for engine-only callers (spg-embedded,
+  lib tests).
+
+### Tests
+
+- `spg-sql` lib (4 new) — parser shapes (no timeout, with
+  timeout, negative integer rejection, Display round-trip).
+- `spg-server::e2e_wait_pos` (5):
+    - `wait_for_position_zero_returns_immediately`
+    - `wait_for_position_timeout_returns_zero` (300 ms target,
+      observed in [280, 1000) ms window)
+    - `wait_for_position_resolves_when_follower_catches_up`
+      (master writes 10 rows; follower's `WAIT FOR 50` returns
+      reached=1 in <200 ms after the connection)
+    - `wait_for_resolves_after_target_is_reached` (target ahead
+      of current pos; background writer pushes past during the
+      wait; resolves under 5 s)
+    - `wait_for_no_timeout_with_zero_target_does_not_block`
+
+### Not changed
+
+- WAL on-disk format, replication protocol, snapshot envelope.
+- Existing v6.1.x SQL surface (publications / subscriptions).
+- Lexer — `WAIT` / `POSITION` / `TIMEOUT` stay bare idents.
+
+### Out of v6.1.7 (deferred)
+
+- `SHOW WAL POSITION` — the current local WAL apply position
+  isn't exposed via SQL yet. Clients can use `/metrics` (when
+  configured) or read `state.lag_state.follower_applied_pos`
+  via a future SHOW command.
+- Returning the actual position reached (vs just a boolean) —
+  could be done by returning a single-row result, but breaking
+  CommandComplete's count semantics is worse than the gain.
+
+---
+
 ## [6.1.6] — 2026-06-03 (cascading replication + cycle detection)
 
 Fifth v6.1.x sub-version on the logical-replication path. Lands

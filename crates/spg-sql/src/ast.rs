@@ -88,6 +88,17 @@ pub enum Statement {
     /// subscription ordered by name with `(name, conn_str,
     /// publications, enabled, last_received_pos)`.
     ShowSubscriptions,
+    /// v6.1.7 — `WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>]`.
+    /// Blocks until the local server's apply position reaches
+    /// `<pos>` or `<ms>` elapses. Server-layer command: the
+    /// engine refuses it (`EngineError::Unsupported`) since
+    /// `lag_state` lives in `spg-server`'s `ServerState`.
+    WaitForWalPosition {
+        pos: u64,
+        /// `None` → wait forever; `Some(ms)` → return after `ms`
+        /// milliseconds even if the target isn't reached.
+        timeout_ms: Option<u64>,
+    },
 }
 
 /// v6.1.4 — `CREATE SUBSCRIPTION` AST node. v6.1.4 ships a
@@ -728,6 +739,13 @@ impl fmt::Display for Statement {
             }
             Self::DropSubscription(name) => {
                 write!(f, "DROP SUBSCRIPTION {}", quote_ident(name))
+            }
+            Self::WaitForWalPosition { pos, timeout_ms } => {
+                write!(f, "WAIT FOR WAL POSITION {pos}")?;
+                if let Some(ms) = timeout_ms {
+                    write!(f, " WITH TIMEOUT {ms}")?;
+                }
+                Ok(())
             }
             Self::Explain(e) => {
                 if e.analyze {

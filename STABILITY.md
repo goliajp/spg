@@ -745,6 +745,30 @@ No new on-disk surfaces — the rebuilt catalog uses the existing
 DataType / Value / dense-row tags established in v6.0.1 /
 v6.0.3.
 
+### WAIT FOR WAL POSITION (v6.1.7)
+
+Consistent-read barrier for follower-based read-after-write.
+The grammar is frozen; future v6.1.x sub-versions may add
+companions (`SHOW WAL POSITION`, etc.) without changing this
+form.
+
+```text
+WAIT FOR WAL POSITION <pos>
+WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>
+```
+
+- `<pos>` and `<ms>` are non-negative integers that fit `u64`.
+- The CommandComplete response carries `affected = 1` when the
+  target was reached, `affected = 0` when the optional timeout
+  fired before the target. Clients distinguish via the count.
+- Implementation polls `lag_state.follower_applied_pos` at
+  5 ms cadence under `Acquire` ordering. Server-layer command
+  — engine refuses it because `lag_state` lives on
+  `ServerState`, not the engine.
+- On a server with no follower configured, the apply position
+  stays at 0 and `WAIT FOR WAL POSITION 0` returns immediately.
+  Larger targets block until the optional timeout fires.
+
 ### Subscription DDL (v6.1.4)
 
 v6.1.4 adds the receive side of logical replication. The grammar
