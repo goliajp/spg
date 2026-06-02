@@ -494,7 +494,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::Text | DataType::Json => 64,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
-                DataType::Vector(dim) => u64::from(dim).saturating_mul(4),
+                DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),
             }
         })
         .sum()

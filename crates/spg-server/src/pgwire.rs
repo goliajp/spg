@@ -1816,7 +1816,7 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Int => 23,
         DataType::BigInt => 20,
         DataType::Float => 701,
-        DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::Vector(_) => 25,
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::Vector { .. } => 25,
         DataType::Timestamp => 1114,
         DataType::Date => 1082,
         DataType::Interval => 1186,

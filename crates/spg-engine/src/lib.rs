@@ -23,11 +23,13 @@ use core::fmt;
 use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement,
     CreateUserStatement, Expr, FrameBound, FrameKind, FromClause, IndexMethod, InsertStatement,
-    JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind, WindowFrame,
+    JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
+    VecEncoding as SqlVecEncoding, WindowFrame,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
     Catalog, ColumnSchema, DataType, IndexKey, Row, StorageError, Table, TableSchema, Value,
+    VecEncoding,
 };
 
 use crate::eval::{EvalContext, EvalError};
@@ -3210,7 +3212,10 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
                 Value::BigInt(_) => DataType::BigInt,
                 Value::Float(_) => DataType::Float,
                 Value::Bool(_) => DataType::Bool,
-                Value::Vector(_) => DataType::Vector(0),
+                Value::Vector(_) => DataType::Vector {
+                    dim: 0,
+                    encoding: VecEncoding::F32,
+                },
                 _ => DataType::Text,
             };
             all_null = false;
@@ -4448,6 +4453,22 @@ fn apply_offset_and_limit(rows: &mut Vec<Row>, offset: Option<u32>, limit: Optio
 
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
+    // v6.0.1 step 1 fence: parser + AST accept `VECTOR(N) USING SQ8`,
+    // but the write path / HNSW / on-disk row payload land in
+    // subsequent v6.0.1 steps (3–6). Until then, CREATE TABLE
+    // rejects SQ8 columns so the catalog can never hold a schema
+    // whose INSERT path would silently coerce f32 cells into the
+    // SQ8 slot. Removed when step 3 lands.
+    if let DataType::Vector {
+        encoding: VecEncoding::Sq8,
+        ..
+    } = ty
+    {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "VECTOR USING SQ8 is parsed but not yet executable — lands in v6.0.1 step 3 (column: {})",
+            c.name
+        )));
+    }
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
     if let Some(default_expr) = c.default {
         // DEFAULT must be a literal expression — evaluated at CREATE TABLE
@@ -4479,7 +4500,13 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Varchar(n) => DataType::Varchar(n),
         ColumnTypeName::Char(n) => DataType::Char(n),
         ColumnTypeName::Bool => DataType::Bool,
-        ColumnTypeName::Vector(n) => DataType::Vector(n),
+        ColumnTypeName::Vector { dim, encoding } => DataType::Vector {
+            dim,
+            encoding: match encoding {
+                SqlVecEncoding::F32 => VecEncoding::F32,
+                SqlVecEncoding::Sq8 => VecEncoding::Sq8,
+            },
+        },
         ColumnTypeName::Numeric(precision, scale) => DataType::Numeric { precision, scale },
         ColumnTypeName::Date => DataType::Date,
         ColumnTypeName::Timestamp => DataType::Timestamp,
@@ -4717,6 +4744,38 @@ mod tests {
         assert_eq!(t.schema().columns[0].ty, DataType::Int);
         assert!(!t.schema().columns[0].nullable);
         assert_eq!(t.schema().columns[1].ty, DataType::Text);
+    }
+
+    #[test]
+    fn create_table_vector_default_is_f32_encoded() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (v VECTOR(8))").unwrap();
+        let t = e.catalog().get("t").unwrap();
+        assert_eq!(
+            t.schema().columns[0].ty,
+            DataType::Vector {
+                dim: 8,
+                encoding: VecEncoding::F32,
+            },
+        );
+    }
+
+    #[test]
+    fn create_table_vector_using_sq8_is_fenced_in_step_1() {
+        // v6.0.1 step 1 lands AST + DDL plumbing only. The write
+        // path (step 3) and on-disk row payload (step 6) aren't
+        // hooked yet, so CREATE TABLE must reject SQ8 columns
+        // until those steps land. When step 3 ships, this test
+        // should be flipped to assert success (the fence is
+        // removed inside `column_def_to_schema`).
+        let mut e = Engine::new();
+        let err = e
+            .execute("CREATE TABLE t (v VECTOR(8) USING SQ8)")
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Unsupported(msg) if msg.contains("VECTOR USING SQ8")),
+            "got: {err}",
+        );
     }
 
     #[test]

@@ -18,7 +18,8 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use spg_storage::{
-    Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row, TableSchema, Value, nsw_query,
+    Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row, TableSchema, Value,
+    VecEncoding, nsw_query,
 };
 
 fn build_catalog(n_rows: usize) -> Catalog {
@@ -50,7 +51,14 @@ fn build_vector_catalog(n_rows: usize) -> Catalog {
         "vecs",
         vec![
             ColumnSchema::new("id", DataType::Int, false),
-            ColumnSchema::new("v", DataType::Vector(8), false),
+            ColumnSchema::new(
+                "v",
+                DataType::Vector {
+                    dim: 8,
+                    encoding: VecEncoding::F32,
+                },
+                false,
+            ),
         ],
     ))
     .unwrap();
@@ -131,7 +139,14 @@ fn bench_hnsw_build(c: &mut Criterion) {
                     "vecs",
                     vec![
                         ColumnSchema::new("id", DataType::Int, false),
-                        ColumnSchema::new("v", DataType::Vector(8), false),
+                        ColumnSchema::new(
+                            "v",
+                            DataType::Vector {
+                                dim: 8,
+                                encoding: VecEncoding::F32,
+                            },
+                            false,
+                        ),
                     ],
                 ))
                 .unwrap();

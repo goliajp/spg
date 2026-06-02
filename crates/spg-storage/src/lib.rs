@@ -35,9 +35,34 @@ use core::fmt;
 use self::persistent::PersistentVec;
 use self::persistent_btree::PersistentBTreeMap;
 
-/// Runtime type tags. `Vector(dim)` / `Varchar(max)` / `Char(size)` are
-/// parameterised; the parameter travels with both the column schema and
-/// the on-wire serialised representation.
+/// In-cell encoding for `DataType::Vector`. Mirrors
+/// `spg_sql::ast::VecEncoding` — kept here so storage stays
+/// dep-free of `spg-sql`. The engine bridges between the two
+/// at DDL-execution time.
+///
+/// `F32` is the pre-v6 default: each cell holds a raw `Vec<f32>`.
+/// `Sq8` (v6.0.1) stores `Sq8Vector { min, max, bytes: Vec<u8> }`
+/// per cell; 4× compression vs `F32` with recall@10 ≥ 0.95 on
+/// natural embeddings (Gaussian / unit-sphere corpora).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VecEncoding {
+    #[default]
+    F32,
+    Sq8,
+}
+
+impl fmt::Display for VecEncoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::F32 => f.write_str("F32"),
+            Self::Sq8 => f.write_str("SQ8"),
+        }
+    }
+}
+
+/// Runtime type tags. `Vector { dim, encoding }` / `Varchar(max)` /
+/// `Char(size)` are parameterised; the parameter travels with both
+/// the column schema and the on-wire serialised representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     /// 16-bit signed. Backed by `Value::SmallInt(i16)`; arithmetic that
@@ -55,8 +80,15 @@ pub enum DataType {
     /// the input is already longer).
     Char(u32),
     Bool,
-    /// pgvector-style fixed-dimension float32 vector.
-    Vector(u32),
+    /// pgvector-style fixed-dimension vector. `encoding` selects
+    /// the in-cell representation (`F32` = pre-v6 raw f32 buffer;
+    /// `Sq8` = v6.0.1 8-bit scalar-quantised). The DDL grammar
+    /// surfaces encoding via the optional `USING <encoding>`
+    /// clause: `VECTOR(128) USING SQ8`.
+    Vector {
+        dim: u32,
+        encoding: VecEncoding,
+    },
     /// `NUMERIC(precision, scale)` — exact fixed-point decimal stored as
     /// a scaled `i128`. `precision` caps total decimal digits, `scale`
     /// fixes digits after the decimal point. v1.12 supports up to
@@ -96,7 +128,10 @@ impl fmt::Display for DataType {
             Self::Varchar(n) => write!(f, "VARCHAR({n})"),
             Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
-            Self::Vector(n) => write!(f, "VECTOR({n})"),
+            Self::Vector { dim, encoding } => match encoding {
+                VecEncoding::F32 => write!(f, "VECTOR({dim})"),
+                VecEncoding::Sq8 => write!(f, "VECTOR({dim}) USING SQ8"),
+            },
             Self::Numeric { precision, scale } => {
                 if *scale == 0 {
                     write!(f, "NUMERIC({precision})")
@@ -160,9 +195,10 @@ impl Value {
             // — the constraint lives on the column schema, not the value.
             Self::Text(_) => Some(DataType::Text),
             Self::Bool(_) => Some(DataType::Bool),
-            Self::Vector(v) => Some(DataType::Vector(
-                u32::try_from(v.len()).expect("vector dim ≤ u32"),
-            )),
+            Self::Vector(v) => Some(DataType::Vector {
+                dim: u32::try_from(v.len()).expect("vector dim ≤ u32"),
+                encoding: VecEncoding::F32,
+            }),
             // `Value::Numeric` doesn't carry its precision (the column
             // schema does); we surface precision=0 as "unknown" and let
             // the engine reconcile against the column type at coercion
@@ -1059,10 +1095,16 @@ impl Table {
                 column: column_name.into(),
             }
         })?;
-        if !matches!(self.schema.columns[column_position].ty, DataType::Vector(_)) {
+        if !matches!(
+            self.schema.columns[column_position].ty,
+            DataType::Vector { .. }
+        ) {
             return Err(StorageError::TypeMismatch {
                 column: column_name.into(),
-                expected: DataType::Vector(0),
+                expected: DataType::Vector {
+                    dim: 0,
+                    encoding: VecEncoding::F32,
+                },
                 actual: self.schema.columns[column_position].ty,
                 position: column_position,
             });
@@ -2746,10 +2788,24 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Float => out.push(3),
         DataType::Text => out.push(4),
         DataType::Bool => out.push(5),
-        DataType::Vector(dim) => {
-            out.push(6);
-            out.extend_from_slice(&dim.to_le_bytes());
-        }
+        DataType::Vector { dim, encoding } => match encoding {
+            // Tag 6: pre-v6 F32 vector. Layout unchanged; pre-v6
+            // binaries continue to deserialise this exactly as
+            // before.
+            VecEncoding::F32 => {
+                out.push(6);
+                out.extend_from_slice(&dim.to_le_bytes());
+            }
+            // v6.0.1: new tag 14 for `VECTOR(N) USING SQ8` column
+            // type. Pre-v6 readers fall through `read_data_type`'s
+            // catch-all and surface `Corrupt("unknown data type tag")`
+            // — the explicit forward-compat fence called out in
+            // V6_DESIGN deliberation #5.
+            VecEncoding::Sq8 => {
+                out.push(14);
+                out.extend_from_slice(&dim.to_le_bytes());
+            }
+        },
         DataType::SmallInt => out.push(7),
         DataType::Varchar(max) => {
             out.push(8);
@@ -2786,7 +2842,10 @@ impl Cursor<'_> {
             3 => Ok(DataType::Float),
             4 => Ok(DataType::Text),
             5 => Ok(DataType::Bool),
-            6 => Ok(DataType::Vector(self.read_u32()?)),
+            6 => Ok(DataType::Vector {
+                dim: self.read_u32()?,
+                encoding: VecEncoding::F32,
+            }),
             7 => Ok(DataType::SmallInt),
             8 => Ok(DataType::Varchar(self.read_u32()?)),
             9 => Ok(DataType::Char(self.read_u32()?)),
@@ -2798,6 +2857,10 @@ impl Cursor<'_> {
             11 => Ok(DataType::Date),
             12 => Ok(DataType::Timestamp),
             13 => Ok(DataType::Json),
+            14 => Ok(DataType::Vector {
+                dim: self.read_u32()?,
+                encoding: VecEncoding::Sq8,
+            }),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -2939,7 +3002,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         (Value::Text(s), DataType::Text | DataType::Varchar(_) | DataType::Char(_)) => {
             write_str(out, s);
         }
-        (Value::Vector(v), DataType::Vector(_)) => {
+        (Value::Vector(v), DataType::Vector { .. }) => {
             let dim = u32::try_from(v.len()).expect("vector dim fits in u32");
             out.extend_from_slice(&dim.to_le_bytes());
             for x in v {
@@ -3154,7 +3217,7 @@ impl<'a> Cursor<'a> {
             DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
                 Ok(Value::Text(self.read_str()?))
             }
-            DataType::Vector(_) => {
+            DataType::Vector { .. } => {
                 let dim = self.read_u32()? as usize;
                 let mut v = Vec::with_capacity(dim);
                 for _ in 0..dim {
@@ -3526,7 +3589,14 @@ mod tests {
             "docs",
             alloc::vec![
                 ColumnSchema::new("id", DataType::Int, false),
-                ColumnSchema::new("v", DataType::Vector(3), true),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim: 3,
+                        encoding: VecEncoding::F32
+                    },
+                    true
+                ),
             ],
         ))
         .unwrap();
@@ -3582,7 +3652,14 @@ mod tests {
             "docs",
             alloc::vec![
                 ColumnSchema::new("id", DataType::Int, false),
-                ColumnSchema::new("v", DataType::Vector(3), true),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim: 3,
+                        encoding: VecEncoding::F32
+                    },
+                    true
+                ),
             ],
         ))
         .unwrap();
@@ -3645,7 +3722,14 @@ mod tests {
             "vecs",
             alloc::vec![
                 ColumnSchema::new("id", DataType::Int, false),
-                ColumnSchema::new("v", DataType::Vector(3), true),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim: 3,
+                        encoding: VecEncoding::F32
+                    },
+                    true
+                ),
             ],
         ))
         .unwrap();
@@ -3873,7 +3957,13 @@ mod tests {
     #[test]
     fn vector_value_data_type_carries_dim() {
         let v = Value::Vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(v.data_type(), Some(DataType::Vector(3)));
+        assert_eq!(
+            v.data_type(),
+            Some(DataType::Vector {
+                dim: 3,
+                encoding: VecEncoding::F32
+            })
+        );
     }
 
     #[test]
@@ -3881,7 +3971,14 @@ mod tests {
         let mut cat = Catalog::new();
         cat.create_table(TableSchema::new(
             "emb",
-            vec![ColumnSchema::new("v", DataType::Vector(3), false)],
+            vec![ColumnSchema::new(
+                "v",
+                DataType::Vector {
+                    dim: 3,
+                    encoding: VecEncoding::F32,
+                },
+                false,
+            )],
         ))
         .unwrap();
         cat.get_mut("emb")
@@ -3895,7 +3992,14 @@ mod tests {
         let mut cat = Catalog::new();
         cat.create_table(TableSchema::new(
             "emb",
-            vec![ColumnSchema::new("v", DataType::Vector(3), false)],
+            vec![ColumnSchema::new(
+                "v",
+                DataType::Vector {
+                    dim: 3,
+                    encoding: VecEncoding::F32,
+                },
+                false,
+            )],
         ))
         .unwrap();
         let err = cat
@@ -3913,7 +4017,14 @@ mod tests {
             "emb",
             vec![
                 ColumnSchema::new("id", DataType::Int, false),
-                ColumnSchema::new("v", DataType::Vector(4), false),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim: 4,
+                        encoding: VecEncoding::F32,
+                    },
+                    false,
+                ),
             ],
         ))
         .unwrap();
@@ -3926,7 +4037,13 @@ mod tests {
             .unwrap();
         let restored = Catalog::deserialize(&cat.serialize()).expect("round-trip");
         let table = restored.get("emb").unwrap();
-        assert_eq!(table.schema().columns[1].ty, DataType::Vector(4));
+        assert_eq!(
+            table.schema().columns[1].ty,
+            DataType::Vector {
+                dim: 4,
+                encoding: VecEncoding::F32
+            }
+        );
         assert_eq!(
             table.rows()[0].values[1],
             Value::Vector(vec![0.5, -1.25, 3.0, 7.0])
@@ -4147,7 +4264,14 @@ mod tests {
             "vecs",
             vec![
                 ColumnSchema::new("id", DataType::Int, false),
-                ColumnSchema::new("v", DataType::Vector(4), false),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim: 4,
+                        encoding: VecEncoding::F32,
+                    },
+                    false,
+                ),
             ],
         ))
         .unwrap();
@@ -4402,7 +4526,14 @@ mod tests {
                 ColumnSchema::new("d", DataType::Float, false),
                 ColumnSchema::new("e", DataType::Bool, false),
                 ColumnSchema::new("f", DataType::Text, false),
-                ColumnSchema::new("g", DataType::Vector(3), false),
+                ColumnSchema::new(
+                    "g",
+                    DataType::Vector {
+                        dim: 3,
+                        encoding: VecEncoding::F32,
+                    },
+                    false,
+                ),
                 ColumnSchema::new(
                     "h",
                     DataType::Numeric {

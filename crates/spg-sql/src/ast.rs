@@ -118,6 +118,33 @@ pub struct ColumnDef {
     pub auto_increment: bool,
 }
 
+/// In-cell encoding for a `VECTOR(N)` column. v6.0.1 added the
+/// optional `USING <encoding>` clause; omitting it keeps the
+/// pre-v6 `F32` default. `Sq8` quantises each cell to a per-vector
+/// affine `(min, max, [u8; dim])` triple (4× compression). `F16`
+/// is reserved for v6.0.3 (`USING HALF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VecEncoding {
+    /// IEEE-754 binary32. Pre-v6 default; matches pgvector's
+    /// uncompressed `vector` type wire / storage layout.
+    #[default]
+    F32,
+    /// v6.0.1 SQ8 — per-vector affine 8-bit quantisation. See
+    /// `spg_storage::quantize::Sq8Vector` for the math + recall
+    /// envelope (≥ 0.95 on Gaussian / unit-sphere corpora at
+    /// dim ≥ 32).
+    Sq8,
+}
+
+impl fmt::Display for VecEncoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::F32 => f.write_str("F32"),
+            Self::Sq8 => f.write_str("SQ8"),
+        }
+    }
+}
+
 /// SQL-level type names. The mapping to the storage runtime's `DataType`
 /// happens in `spg-engine` — keeping `spg-sql` free of storage deps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,8 +159,13 @@ pub enum ColumnTypeName {
     /// `CHAR(N)` — TEXT right-padded with spaces to exactly N characters.
     Char(u32),
     Bool,
-    /// pgvector fixed-dimension `VECTOR(N)`.
-    Vector(u32),
+    /// pgvector fixed-dimension `VECTOR(N)`. v6.0.1 added the
+    /// `USING <encoding>` clause; omitting it surfaces as
+    /// `encoding = VecEncoding::F32` (the pre-v6 default).
+    Vector {
+        dim: u32,
+        encoding: VecEncoding,
+    },
     /// `NUMERIC` / `NUMERIC(p)` / `NUMERIC(p, s)` — exact decimal.
     /// Bare `NUMERIC` and `NUMERIC(p)` both surface with `scale=0`.
     Numeric(u8, u8),
@@ -158,7 +190,10 @@ impl fmt::Display for ColumnTypeName {
             Self::Varchar(n) => write!(f, "VARCHAR({n})"),
             Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
-            Self::Vector(n) => write!(f, "VECTOR({n})"),
+            Self::Vector { dim, encoding } => match encoding {
+                VecEncoding::F32 => write!(f, "VECTOR({dim})"),
+                VecEncoding::Sq8 => write!(f, "VECTOR({dim}) USING SQ8"),
+            },
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
