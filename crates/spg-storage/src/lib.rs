@@ -1143,16 +1143,25 @@ impl Table {
 }
 
 /// Insert one row into the HNSW graph held by index slot `idx_pos`.
-/// No-op when the row's value at the indexed column isn't a Vector.
+/// No-op when the row's value at the indexed column isn't a vector.
+/// v6.0.1: handles `Value::Sq8Vector` by dequantising into an f32
+/// "query" surface — the existing greedy + beam-search machinery
+/// then uses `cell_to_query_metric_distance` to route every
+/// distance call through the cell's actual encoding.
 fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     let col_pos = table.indices[idx_pos].column_position;
-    let Value::Vector(v) = &table.rows[new_row_idx].values[col_pos] else {
+    let cell_dim: Option<usize> = match &table.rows[new_row_idx].values[col_pos] {
+        Value::Vector(v) => Some(v.len()),
+        Value::Sq8Vector(q) => Some(q.bytes.len()),
+        _ => None,
+    };
+    let Some(dim) = cell_dim else {
         // Even non-vector rows occupy a level slot so per-node Vec
         // lengths stay aligned with `table.rows.len()`.
         ensure_node_slot(table, idx_pos, new_row_idx, 0);
         return;
     };
-    if v.is_empty() {
+    if dim == 0 {
         ensure_node_slot(table, idx_pos, new_row_idx, 0);
         return;
     }
@@ -1181,6 +1190,12 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     }
     let query = match &table.rows[new_row_idx].values[col_pos] {
         Value::Vector(v) => v.clone(),
+        // v6.0.1: dequantise the inserted SQ8 cell into an f32 query
+        // surface so the existing greedy / beam machinery can route
+        // distances through `cell_to_query_metric_distance`. The
+        // small dequantisation error is what the recall@10 ≥ 0.95
+        // envelope already accounts for (V6_DESIGN deliberation #3).
+        Value::Sq8Vector(q) => quantize::dequantize(q),
         _ => return,
     };
     // Phase 1: greedy descend from `entry` down to `level + 1`, keeping
@@ -1321,10 +1336,7 @@ fn layer_beam_search(
     let d0 = if matches!(metric, NswMetric::L2) {
         entry_d
     } else {
-        match &table.rows[entry_node].values[col_pos] {
-            Value::Vector(v) => metric_distance(metric, v, query),
-            _ => return Vec::new(),
-        }
+        cell_to_query_metric_distance(table, col_pos, entry_node, query, metric)
     };
     let row_count = table.rows.len();
     let mut visited: Vec<bool> = alloc::vec![false; row_count];
@@ -1360,13 +1372,13 @@ fn layer_beam_search(
                 continue;
             }
             visited[n] = true;
-            let Value::Vector(nv) = &table.rows[n].values[col_pos] else {
-                continue;
-            };
-            if nv.len() != query.len() {
+            // v6.0.1: cell-aware distance — F32 cells take the
+            // existing scalar metric, SQ8 cells route through
+            // the asymmetric ADC variant for the same metric.
+            let dn = cell_to_query_metric_distance(table, col_pos, n, query, metric);
+            if !dn.is_finite() {
                 continue;
             }
-            let dn = metric_distance(metric, nv, query);
             let worst = results.peek().map_or(f32::INFINITY, |c| c.dist);
             if results.len() < ef || dn < worst {
                 results.push(NodeFurthest { dist: dn, node: n });
@@ -1458,24 +1470,22 @@ fn select_neighbours_heuristic(
         if chosen.len() >= m {
             break;
         }
-        let Some(Value::Vector(e_vec)) = table.rows.get(e).and_then(|r| r.values.get(col_pos))
-        else {
+        // v6.0.1: works on either `Value::Vector` (F32) or
+        // `Value::Sq8Vector` (Sq8) cells — `cell_l2_sq` dispatches
+        // on encoding. A non-vector cell yields `f32::INFINITY`
+        // which the `< d_q` test will never accept.
+        if !matches!(
+            table.rows.get(e).and_then(|r| r.values.get(col_pos)),
+            Some(Value::Vector(_) | Value::Sq8Vector(_))
+        ) {
             continue;
-        };
+        }
         let mut covered = false;
         for &r in &chosen {
-            let Some(Value::Vector(r_vec)) =
-                table.rows.get(r).and_then(|row| row.values.get(col_pos))
-            else {
-                continue;
-            };
-            if e_vec.len() != r_vec.len() {
-                continue;
-            }
             // dist(e, r) measured in the same metric the topology was
             // built with (L2). If a chosen `r` is closer to `e` than
             // the query is, `r` already "covers" `e` for navigation.
-            if l2_distance_sq(e_vec, r_vec) < d_q {
+            if cell_l2_sq(table, col_pos, e, r) < d_q {
                 covered = true;
                 break;
             }
@@ -1509,10 +1519,15 @@ fn connect_at_layer(
         }
     }
     for &peer in peers {
-        let host_vec = match &table.rows[peer].values[col_pos] {
-            Value::Vector(v) => v.clone(),
-            _ => continue,
-        };
+        // Skip peers whose indexed cell isn't a vector — same fence
+        // as the F32 path; SQ8 cells flow through `cell_l2_sq`
+        // below without dequantising.
+        if !matches!(
+            &table.rows[peer].values[col_pos],
+            Value::Vector(_) | Value::Sq8Vector(_)
+        ) {
+            continue;
+        }
         // 1. add the new node to peer's adjacency
         if let IndexKind::Nsw(g) = &mut table.indices[idx_pos].kind {
             let layer_v = &mut g.layers[layer as usize];
@@ -1534,16 +1549,13 @@ fn connect_at_layer(
                 IndexKind::Nsw(g) => g.layers[layer as usize][peer].clone(),
                 IndexKind::BTree(_) => continue,
             };
-            // Sort by distance to `host_vec` ascending so the heuristic
-            // receives candidates closest-first.
+            // Sort by distance from `peer`'s cell ascending so the
+            // heuristic receives candidates closest-first. `cell_l2_sq`
+            // dispatches on encoding so SQ8 columns trim using
+            // symmetric ADC.
             let mut tagged: Vec<(f32, usize)> = current_peers
                 .iter()
-                .map(|&p| {
-                    let Value::Vector(pv) = &table.rows[p].values[col_pos] else {
-                        return (f32::INFINITY, p);
-                    };
-                    (l2_distance_sq(&host_vec, pv), p)
-                })
+                .map(|&p| (cell_l2_sq(table, col_pos, peer, p), p))
                 .collect();
             tagged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
             let kept = select_neighbours_heuristic(&tagged, cap, table, col_pos);
@@ -1556,12 +1568,62 @@ fn connect_at_layer(
     }
 }
 
-/// Squared L2 distance from `query` to the vector at `(row, col_pos)`.
-/// Returns `f32::INFINITY` when the cell isn't a Vector (so the caller
-/// can compare uniformly without an Option ladder).
+/// Squared L2 distance from `query` (raw f32) to the cell at
+/// `(row, col_pos)`. Dispatches on cell encoding: `Value::Vector`
+/// (F32) uses `l2_distance_sq`; `Value::Sq8Vector` uses
+/// `sq8_l2_distance_sq_asymmetric` (the v6.0.1 quantised path).
+/// Returns `f32::INFINITY` for any non-vector cell so callers can
+/// compare uniformly.
 fn vec_l2_sq(table: &Table, col_pos: usize, row: usize, query: &[f32]) -> f32 {
     match table.rows.get(row).and_then(|r| r.values.get(col_pos)) {
         Some(Value::Vector(v)) if v.len() == query.len() => l2_distance_sq(v, query),
+        Some(Value::Sq8Vector(q)) if q.bytes.len() == query.len() => {
+            quantize::sq8_l2_distance_sq_asymmetric(q, query)
+        }
+        _ => f32::INFINITY,
+    }
+}
+
+/// Squared L2 distance between two stored cells (no f32 query in
+/// sight). Used during HNSW graph build — both endpoints are
+/// rows already in the table, so symmetric ADC applies for SQ8
+/// columns. Mixed-encoding cells within one column are a
+/// schema-level impossibility (INSERT-time coercion enforces
+/// uniform encoding), so the catch-all is an abort.
+fn cell_l2_sq(table: &Table, col_pos: usize, row_a: usize, row_b: usize) -> f32 {
+    let Some(cell_a) = table.rows.get(row_a).and_then(|r| r.values.get(col_pos)) else {
+        return f32::INFINITY;
+    };
+    let Some(cell_b) = table.rows.get(row_b).and_then(|r| r.values.get(col_pos)) else {
+        return f32::INFINITY;
+    };
+    match (cell_a, cell_b) {
+        (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => l2_distance_sq(a, b),
+        (Value::Sq8Vector(a), Value::Sq8Vector(b)) if a.bytes.len() == b.bytes.len() => {
+            quantize::sq8_l2_distance_sq(a, b)
+        }
+        _ => f32::INFINITY,
+    }
+}
+
+/// kNN-search-time distance: stored cell → f32 query under the
+/// caller's metric. Dispatches on cell encoding so SQ8 columns
+/// take the ADC path with the right asymmetric variant. NaN /
+/// dim-mismatch / non-vector → `f32::INFINITY`.
+fn cell_to_query_metric_distance(
+    table: &Table,
+    col_pos: usize,
+    row: usize,
+    query: &[f32],
+    metric: NswMetric,
+) -> f32 {
+    match table.rows.get(row).and_then(|r| r.values.get(col_pos)) {
+        Some(Value::Vector(v)) if v.len() == query.len() => metric_distance(metric, v, query),
+        Some(Value::Sq8Vector(q)) if q.bytes.len() == query.len() => match metric {
+            NswMetric::L2 => quantize::sq8_l2_distance_sq_asymmetric(q, query),
+            NswMetric::InnerProduct => quantize::sq8_inner_product_asymmetric(q, query),
+            NswMetric::Cosine => quantize::sq8_cosine_distance_asymmetric(q, query),
+        },
         _ => f32::INFINITY,
     }
 }
@@ -3681,6 +3743,96 @@ mod tests {
                 "layer {l} PV not shared after clone — clone copied elements (O(N))"
             );
         }
+    }
+
+    #[test]
+    fn hnsw_sq8_recall_at_10_above_0_85_vs_f32_groundtruth() {
+        // v6.0.1 step 4 verify: build TWO catalogs over the same
+        // corpus — one F32, one SQ8 — and confirm the SQ8 NSW
+        // graph still retrieves a high-overlap top-10 vs the F32
+        // exact-arithmetic ground truth. 0.85 floor leaves head-
+        // room for the inserted-cell dequant step + 4× compression
+        // noise; the step-5 perf gate tightens it to ≥ 0.95 once
+        // the f32 rerank pass is in.
+        use crate::quantize;
+        // Deterministic Gaussian-ish corpus via splitmix64. Vectors
+        // get normalised so SQ8's per-vector `(min, max)` lives in
+        // a sensible range; matches the v6.0.0 fuzz harness.
+        fn next(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_add(0x9E37_79B9_7F4A_7C15)
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            #[allow(clippy::cast_precision_loss)]
+            let u = ((*state >> 32) as u32 as f32) / (u32::MAX as f32);
+            2.0 * u - 1.0
+        }
+        let dim: u32 = 32;
+        let n: usize = 512;
+        let dim_us = dim as usize;
+        let mut seed: u64 = 0xCAFE_BABE_DEAD_BEEFu64;
+        let corpus: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim_us).map(|_| next(&mut seed)).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..32)
+            .map(|_| (0..dim_us).map(|_| next(&mut seed)).collect())
+            .collect();
+        // F32 ground truth — pure exact arithmetic, brute force.
+        let exact_top10: Vec<Vec<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut scored: Vec<(f32, usize)> = corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (l2_distance_sq(v, q), i))
+                    .collect();
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+                scored.into_iter().take(10).map(|(_, i)| i).collect()
+            })
+            .collect();
+        // SQ8 catalog — INSERTs land as `Value::Sq8Vector` cells;
+        // HNSW build uses the ADC path verified in step 4.
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "vecs",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim,
+                        encoding: VecEncoding::Sq8,
+                    },
+                    false,
+                ),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("vecs").unwrap();
+        for (i, v) in corpus.iter().enumerate() {
+            t.insert(Row::new(alloc::vec![
+                Value::Int(i32::try_from(i).unwrap()),
+                Value::Sq8Vector(quantize::quantize(v)),
+            ]))
+            .unwrap();
+        }
+        t.add_nsw_index("v_idx".into(), "v", NSW_DEFAULT_M).unwrap();
+        let table = cat.get("vecs").unwrap();
+        let mut total_overlap = 0_usize;
+        for (q, exact) in queries.iter().zip(exact_top10.iter()) {
+            let hits = nsw_query(table, "v_idx", q, 10, NswMetric::L2);
+            for h in &hits {
+                if exact.contains(h) {
+                    total_overlap += 1;
+                }
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let recall = total_overlap as f32 / (10.0 * queries.len() as f32);
+        assert!(
+            recall >= 0.85,
+            "SQ8 HNSW recall@10 = {recall:.3}, below floor 0.85 — \
+             check `cell_to_query_metric_distance` / `cell_l2_sq` dispatch"
+        );
     }
 
     #[test]
