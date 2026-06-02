@@ -42,7 +42,7 @@ const DEFAULT_ROWS: u64 = 30_000_000;
 const DEFAULT_SAMPLES: usize = 10_000;
 const SERVER_ADDR: &str = "127.0.0.1:25561";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
-const PRELOAD_WAIT: Duration = Duration::from_secs(180);
+const PRELOAD_WAIT: Duration = Duration::from_mins(3);
 
 fn parse_args() -> (u64, PathBuf, usize) {
     let mut rows = DEFAULT_ROWS;

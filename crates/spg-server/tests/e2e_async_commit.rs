@@ -181,7 +181,7 @@ fn async_commit_off_inserts_visible_immediately() {
     // Flusher cadence kept short (500 µs) so any pending writes
     // hit durability quickly, but the test does not depend on
     // durability — just on in-memory visibility.
-    let env = vec![
+    let env = [
         ("SPG_SYNCHRONOUS_COMMIT".to_owned(), "off".to_owned()),
         ("SPG_FLUSHER_INTERVAL_US".to_owned(), "500".to_owned()),
     ];
