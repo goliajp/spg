@@ -1,3 +1,5 @@
+#![allow(unused_mut, unused_variables)]
+
 //! v4.2 resource limits end-to-end:
 //! - `SPG_MAX_CONNECTIONS` rejects the (N+1)-th client with a clear
 //!   error and lets existing clients keep working.

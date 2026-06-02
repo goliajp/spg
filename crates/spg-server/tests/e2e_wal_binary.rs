@@ -1,7 +1,10 @@
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    clippy::doc_markdown,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.41 — verify the v3 WAL record path.

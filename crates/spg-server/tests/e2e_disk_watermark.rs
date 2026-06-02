@@ -2,7 +2,9 @@
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.33 disk water-mark — `SPG_WAL_MIN_FREE_BYTES`. When the WAL
@@ -17,10 +19,11 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::Child;
 use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
+
+use std::process::Child;
 
 mod common;
 

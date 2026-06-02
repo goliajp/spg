@@ -4,7 +4,9 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::doc_markdown,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v5.4.3 — chaos validation of the async-commit durability
@@ -46,26 +48,20 @@
 //! contract holds across SIGKILL.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use spg_wire::{
     FRAME_HEADER_LEN, Frame, Op, WireValue, build_query, encode, parse_command_complete,
     parse_data_row, parse_data_row_batch,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+use std::process::Child;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
+use std::thread;
+
+mod common;
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -77,48 +73,19 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     p
 }
 
-fn spawn_server(addr: &str, db: &Path, wal: &Path, env: &[(&str, String)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
+fn spawn_db_wal(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, String)],
+) -> (Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
         .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
+        .arg_path(wal);
     for (k, v) in env {
-        cmd.env(k, v);
+        b = b.env(*k, v);
     }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => {
-                s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-                return s;
-            }
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    b.spawn()
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -187,8 +154,6 @@ fn chaos_kill_during_async_commit_window_loses_only_unflushed() {
     let dir = unique_tmpdir("kill-mid-async");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let addr1 = pick_free_addr();
-
     // Wide-ish flusher cadence (5 ms) so there's a non-trivial
     // window of in-flight writes when the kill lands — too
     // tight and every INSERT happens to be inside one sync
@@ -204,8 +169,9 @@ fn chaos_kill_during_async_commit_window_loses_only_unflushed() {
     let attempted: i64 = 200;
     let ack_count: i64;
     {
-        let mut c = ChildGuard(spawn_server(&addr1, &db, &wal, &env));
-        let mut s = wait_for_listener(&addr1, &mut c.0);
+        let (raw, addrs1) = spawn_db_wal(&db, &wal, &env);
+        let mut c = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs1.native);
 
         assert!(exec_ok(
             &mut s,
@@ -250,9 +216,9 @@ fn chaos_kill_during_async_commit_window_loses_only_unflushed() {
     //   - Apply every auto_commit_sql INSERT it sees up to the
     //     point WAL bytes were durable.
     //   - Stop cleanly if the tail is truncated by the SIGKILL.
-    let addr2 = pick_free_addr();
-    let mut c2 = ChildGuard(spawn_server(&addr2, &db, &wal, &[]));
-    let mut s2 = wait_for_listener(&addr2, &mut c2.0);
+    let (raw2, addrs2) = spawn_db_wal(&db, &wal, &[]);
+    let _c2 = common::ChildGuard(raw2);
+    let mut s2 = common::connect_to(&addrs2.native);
 
     let after = select_count(&mut s2, "SELECT count(*) FROM big");
     assert!(
