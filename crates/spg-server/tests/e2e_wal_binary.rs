@@ -18,10 +18,10 @@
 //!      type tags must bump the version or the binary won't load.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,26 +48,80 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server_wal(addr: &str, db: &Path, wal: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
+/// Spawn an spg-server bound to an OS-chosen port and return both the
+/// child + the actual bind address parsed from the server's "listening
+/// on 127.0.0.1:PORT" stderr line.
+///
+/// **Why not `TcpListener::bind("127.0.0.1:0"); drop; pass port`?** That
+/// pattern is racy: between dropping the probe and the child calling
+/// `bind`, a parallel test's probe + drop + spawn cycle can grab the
+/// same port (the kernel hands the freed port back to the ephemeral
+/// pool). Two children then both try to bind, one fails; or worse, a
+/// client connects to the wrong child's listener and the protocol
+/// state diverges (manifests as `read header: Connection reset`).
+///
+/// Passing `127.0.0.1:0` directly to the child lets the kernel atomic-
+/// ally allocate + reserve the port for that child's lifetime. The
+/// child prints the bound address to stderr; we tail until we see it.
+fn spawn_server_on_ephemeral_port(db: &Path, wal: &Path) -> (Child, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_spg-server"))
+        .arg("127.0.0.1:0")
         .arg(db)
         .arg("-")
         .arg(wal)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .env_remove("SPG_PASSWORD")
         .env_remove("SPG_ADMIN_PASSWORD")
         .env_remove("SPG_PG_ADDR")
         .spawn()
-        .expect("spawn spg-server")
+        .expect("spawn spg-server");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let addr = read_listening_addr(&mut child, stderr);
+    (child, addr)
+}
+
+/// Read the child's stderr until a `spg-server: listening on 127.0.0.1:PORT`
+/// line appears, then return the address. Remaining stderr is drained
+/// off-thread so the pipe doesn't backpressure the server.
+fn read_listening_addr(child: &mut Child, stderr: ChildStderr) -> String {
+    let mut reader = BufReader::new(stderr);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("server exited before printing listen addr: {status:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(_) => {
+                if let Some(addr) = extract_listen_addr(&line) {
+                    thread::spawn(move || {
+                        let mut sink = String::new();
+                        let _ = BufReader::new(reader).read_to_string(&mut sink);
+                    });
+                    return addr;
+                }
+            }
+            Err(e) => panic!("read stderr: {e}"),
+        }
+    }
+    let _ = child.kill();
+    panic!("server didn't print listen addr within {STARTUP_TIMEOUT:?}");
+}
+
+/// Parse `spg-server: listening on 127.0.0.1:38291` (auth-msg suffix
+/// optional) → `"127.0.0.1:38291"`. None if the line shape doesn't
+/// match — caller keeps reading.
+fn extract_listen_addr(line: &str) -> Option<String> {
+    let after = line.find("listening on ")?;
+    let tail = &line[after + "listening on ".len()..];
+    // tail might be "127.0.0.1:38291\n" or "127.0.0.1:38291 (auth msg)\n"
+    let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
+    Some(tail[..end].to_string())
 }
 
 struct ChildGuard(Child);
@@ -78,20 +132,39 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
+/// Connect to the (already-known-bound) server address with a short
+/// retry window — the listener is up by the time stderr printed but
+/// the OS may need a tick to accept(2). No race against parallel
+/// tests since the port was allocated by the server itself.
+fn connect_to(addr: &str) -> TcpStream {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         match TcpStream::connect(addr) {
             Ok(s) => return s,
             Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
+                assert!(Instant::now() < deadline, "connect {addr}: {e}");
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
+}
+
+/// Spawn an spg-server that is **expected to exit early** during
+/// startup (e.g. replay-failure tests). Does not wait for a listen
+/// line — the caller polls `try_wait` and asserts a non-zero exit.
+fn spawn_server_expecting_replay_failure(db: &Path, wal: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_spg-server"))
+        .arg("127.0.0.1:0")
+        .arg(db)
+        .arg("-")
+        .arg(wal)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("SPG_PASSWORD")
+        .env_remove("SPG_ADMIN_PASSWORD")
+        .env_remove("SPG_PG_ADDR")
+        .spawn()
+        .expect("spawn spg-server")
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -182,9 +255,9 @@ fn auto_commit_write_emits_single_v3_record() {
     let wal = dir.join("wal.log");
 
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server_wal(&addr, &db, &wal));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw_child, addr) = spawn_server_on_ephemeral_port(&db, &wal);
+        let _child = ChildGuard(raw_child);
+        let mut s = connect_to(&addr);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         // Three auto-commit writes: one DDL + two DML. v4.34 would
@@ -217,9 +290,9 @@ fn v3_wal_replays_into_matching_engine_state() {
     let wal = dir.join("wal.log");
 
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server_wal(&addr, &db, &wal));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw_child, addr) = spawn_server_on_ephemeral_port(&db, &wal);
+        let _child = ChildGuard(raw_child);
+        let mut s = connect_to(&addr);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         send_query(&mut s, "CREATE TABLE t (id INT, name TEXT)");
         expect_cc(&mut s);
@@ -229,9 +302,9 @@ fn v3_wal_replays_into_matching_engine_state() {
         }
     }
 
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_wal(&addr, &db, &wal));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server_on_ephemeral_port(&db, &wal);
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&addr);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     assert_eq!(count_select_rows(&mut s, "SELECT * FROM t"), 3);
     fs::remove_dir_all(&dir).ok();
@@ -249,9 +322,9 @@ fn unknown_v3_type_byte_aborts_replay() {
 
     // Phase 1: write a valid record so the WAL isn't empty.
     {
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn_server_wal(&addr, &db, &wal));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw_child, addr) = spawn_server_on_ephemeral_port(&db, &wal);
+        let _child = ChildGuard(raw_child);
+        let mut s = connect_to(&addr);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         send_query(&mut s, "CREATE TABLE t (v INT)");
         expect_cc(&mut s);
@@ -282,8 +355,7 @@ fn unknown_v3_type_byte_aborts_replay() {
     }
 
     // Phase 3: server must exit non-zero (replay refuses).
-    let addr = pick_free_addr();
-    let mut child = spawn_server_wal(&addr, &db, &wal);
+    let mut child = spawn_server_expecting_replay_failure(&db, &wal);
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut got_status = None;
     while Instant::now() < deadline {
@@ -351,9 +423,9 @@ fn interleaved_v2_and_v3_records_replay() {
     all.extend_from_slice(&v3_record("INSERT INTO mix VALUES (30)"));
     fs::write(&wal, &all).expect("write mixed WAL");
 
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_wal(&addr, &db, &wal));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server_on_ephemeral_port(&db, &wal);
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&addr);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     assert_eq!(count_select_rows(&mut s, "SELECT * FROM mix"), 3);
     fs::remove_dir_all(&dir).ok();

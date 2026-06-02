@@ -6,9 +6,9 @@
 
 //! v4.13 observability: /healthz + /metrics + structured logging.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,23 +17,79 @@ use spg_wire::{Op, build_query, encode};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+/// Spawn an spg-server with both native + http listeners on OS-chosen
+/// ports. Returns `(child, native_addr, http_addr)` parsed from the
+/// "listening on" / "http listening on" stderr lines.
+///
+/// See e2e_wal_binary's `spawn_server_on_ephemeral_port` for why the
+/// old `pick_free_addr` (probe + drop + pass-port) pattern is racy
+/// across parallel test binaries.
+fn spawn_server() -> (Child, String, String) {
+    spawn_server_with_env(&[])
 }
 
-fn spawn_server(addr: &str, http_addr: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
+fn spawn_server_with_env(extra: &[(&str, &str)]) -> (Child, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
+    cmd.arg("127.0.0.1:0")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("SPG_HTTP_ADDR", http_addr)
+        .stderr(Stdio::piped())
+        .env("SPG_HTTP_ADDR", "127.0.0.1:0")
         .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .spawn()
-        .unwrap()
+        .env_remove("SPG_ADMIN_PASSWORD");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (native, http) = read_native_and_http_addrs(&mut child, stderr);
+    (child, native, http)
+}
+
+fn read_native_and_http_addrs(child: &mut Child, stderr: ChildStderr) -> (String, String) {
+    let mut reader = BufReader::new(stderr);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut native: Option<String> = None;
+    let mut http: Option<String> = None;
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        if native.is_some() && http.is_some() {
+            break;
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("server exited before printing addrs: {status:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(_) => {
+                if let Some(addr) = extract_addr(&line, "http listening on ") {
+                    http = Some(addr);
+                } else if let Some(addr) = extract_addr(&line, "listening on ") {
+                    native = Some(addr);
+                }
+            }
+            Err(e) => panic!("read stderr: {e}"),
+        }
+    }
+    let (Some(n), Some(h)) = (native, http) else {
+        let _ = child.kill();
+        panic!("server didn't print both native + http listen addrs within {STARTUP_TIMEOUT:?}");
+    };
+    // Drain the rest of stderr so the pipe doesn't backpressure.
+    thread::spawn(move || {
+        let mut sink = String::new();
+        let _ = reader.read_to_string(&mut sink);
+    });
+    (n, h)
+}
+
+fn extract_addr(line: &str, marker: &str) -> Option<String> {
+    let after = line.find(marker)?;
+    let tail = &line[after + marker.len()..];
+    let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
+    Some(tail[..end].to_string())
 }
 
 struct ChildGuard(Child);
@@ -44,17 +100,15 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
+/// Connect to a known-bound server address with a short retry window.
+fn connect_to(addr: &str) -> TcpStream {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         match TcpStream::connect(addr) {
             Ok(s) => return s,
             Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
+                assert!(Instant::now() < deadline, "connect {addr}: {e}");
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -92,10 +146,8 @@ fn http_get(addr: &str, path: &str) -> (u16, String) {
 
 #[test]
 fn healthz_returns_200() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&native, &http));
-    let _ = wait_for_listener(&native, &mut child.0);
+    let (raw_child, _native, http) = spawn_server();
+    let _child = ChildGuard(raw_child);
     let (code, body) = http_get(&http, "/healthz");
     assert_eq!(code, 200);
     assert!(body.starts_with("ok"));
@@ -103,10 +155,8 @@ fn healthz_returns_200() {
 
 #[test]
 fn metrics_emits_prometheus_text() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&native, &http));
-    let _ = wait_for_listener(&native, &mut child.0);
+    let (raw_child, _native, http) = spawn_server();
+    let _child = ChildGuard(raw_child);
     let (code, body) = http_get(&http, "/metrics");
     assert_eq!(code, 200);
     assert!(body.contains("# TYPE spg_server_info gauge"));
@@ -118,10 +168,9 @@ fn metrics_emits_prometheus_text() {
 
 #[test]
 fn metrics_counter_increments_per_query() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&native, &http));
-    let mut s = wait_for_listener(&native, &mut child.0);
+    let (raw_child, native, http) = spawn_server();
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Run 3 queries to bump the counter.
@@ -157,10 +206,8 @@ fn metrics_counter_increments_per_query() {
 
 #[test]
 fn unknown_path_returns_404() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&native, &http));
-    let _ = wait_for_listener(&native, &mut child.0);
+    let (raw_child, _native, http) = spawn_server();
+    let _child = ChildGuard(raw_child);
     let (code, _body) = http_get(&http, "/does-not-exist");
     assert_eq!(code, 404);
 }
@@ -170,10 +217,8 @@ fn unknown_path_returns_404() {
 /// (the configured cap from `SPG_HOT_TIER_BYTES`, default 4 GiB).
 #[test]
 fn metrics_emits_hot_tier_budget_default_4gib() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&native, &http));
-    let _ = wait_for_listener(&native, &mut child.0);
+    let (raw_child, _native, http) = spawn_server();
+    let _child = ChildGuard(raw_child);
     let (code, body) = http_get(&http, "/metrics");
     assert_eq!(code, 200);
     let budget_line = body
@@ -203,18 +248,8 @@ fn metrics_emits_hot_tier_budget_default_4gib() {
 
 #[test]
 fn metrics_hot_tier_budget_honors_env_override() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(&native)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("SPG_HTTP_ADDR", &http)
-        .env("SPG_HOT_TIER_BYTES", "1048576") // 1 MiB
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD");
-    let mut child = ChildGuard(cmd.spawn().unwrap());
-    let _ = wait_for_listener(&native, &mut child.0);
+    let (raw_child, _native, http) = spawn_server_with_env(&[("SPG_HOT_TIER_BYTES", "1048576")]);
+    let _child = ChildGuard(raw_child);
     let (code, body) = http_get(&http, "/metrics");
     assert_eq!(code, 200);
     let line = body
@@ -229,10 +264,9 @@ fn metrics_hot_tier_budget_honors_env_override() {
 
 #[test]
 fn metrics_hot_tier_used_grows_after_insert() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&native, &http));
-    let mut s = wait_for_listener(&native, &mut child.0);
+    let (raw_child, native, http) = spawn_server();
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     // CREATE TABLE + a handful of INSERTs.
     let stmts = [
@@ -273,21 +307,13 @@ fn metrics_hot_tier_used_grows_after_insert() {
 
 #[test]
 fn structured_json_log_format_can_be_enabled() {
-    // We can't easily inspect server stderr without piping it; just
-    // boot with SPG_LOG_FORMAT=json and verify it still serves
-    // requests (no panic on the new code path).
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(&native)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("SPG_HTTP_ADDR", &http)
-        .env("SPG_LOG_FORMAT", "json")
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD");
-    let mut child = ChildGuard(cmd.spawn().unwrap());
-    let _ = wait_for_listener(&native, &mut child.0);
+    // Boot with SPG_LOG_FORMAT=json and verify it still serves
+    // requests (no panic on the new code path). Since v6.0.0+ our
+    // spawn helper already pipes + drains stderr, the JSON log lines
+    // get drained into the test's stderr alongside the "listening on"
+    // sentinels — useful for failure debugging but not asserted here.
+    let (raw_child, _native, http) = spawn_server_with_env(&[("SPG_LOG_FORMAT", "json")]);
+    let _child = ChildGuard(raw_child);
     let (code, _body) = http_get(&http, "/healthz");
     assert_eq!(code, 200);
 }

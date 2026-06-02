@@ -5,9 +5,9 @@
 //!   surface `query exceeded max_query_rows=N` instead of streaming
 //!   millions of rows.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,22 +16,59 @@ use spg_wire::{Frame, Op, build_query, encode, parse_error_response};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str, envs: &[(&str, &str)]) -> Child {
+/// Spawn an spg-server on an OS-chosen port with extra env vars. Returns
+/// `(child, addr)` from stderr's "listening on" line. See `e2e_wal_binary`
+/// for the race-avoidance rationale vs the old probe-and-drop pattern.
+fn spawn_server(envs: &[(&str, &str)]) -> (Child, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.arg("127.0.0.1:0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     cmd.env_remove("SPG_PASSWORD");
     cmd.env_remove("SPG_ADMIN_PASSWORD");
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.spawn().unwrap()
+    let mut child = cmd.spawn().unwrap();
+    let stderr = child.stderr.take().expect("piped stderr");
+    let addr = read_listening_addr(&mut child, stderr);
+    (child, addr)
+}
+
+fn read_listening_addr(child: &mut Child, stderr: ChildStderr) -> String {
+    let mut reader = BufReader::new(stderr);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("server exited before printing listen addr: {status:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(_) => {
+                if let Some(addr) = extract_addr(&line) {
+                    thread::spawn(move || {
+                        let mut sink = String::new();
+                        let _ = reader.read_to_string(&mut sink);
+                    });
+                    return addr;
+                }
+            }
+            Err(e) => panic!("read stderr: {e}"),
+        }
+    }
+    let _ = child.kill();
+    panic!("server didn't print listen addr within {STARTUP_TIMEOUT:?}");
+}
+
+fn extract_addr(line: &str) -> Option<String> {
+    let after = line.find("listening on ")?;
+    let tail = &line[after + "listening on ".len()..];
+    let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
+    Some(tail[..end].to_string())
 }
 
 struct ChildGuard(Child);
@@ -42,17 +79,14 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
+fn connect_to(addr: &str) -> TcpStream {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         match TcpStream::connect(addr) {
             Ok(s) => return s,
             Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
+                assert!(Instant::now() < deadline, "connect {addr}: {e}");
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -78,9 +112,8 @@ fn send(s: &mut TcpStream, f: &Frame) {
 
 #[test]
 fn max_connections_rejects_overflow_with_clear_error() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_MAX_CONNECTIONS", "2")]));
-    let _ = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server(&[("SPG_MAX_CONNECTIONS", "2")]);
+    let _child = ChildGuard(raw_child);
 
     // Two long-lived clients claim the slots.
     let s1 = TcpStream::connect(&addr).unwrap();
@@ -125,9 +158,9 @@ fn max_connections_rejects_overflow_with_clear_error() {
 
 #[test]
 fn max_query_rows_caps_select_result() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr, &[("SPG_MAX_QUERY_ROWS", "3")]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server(&[("SPG_MAX_QUERY_ROWS", "3")]);
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&addr);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send(&mut s, &build_query("CREATE TABLE t (id INT NOT NULL)"));

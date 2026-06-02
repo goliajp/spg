@@ -18,9 +18,9 @@
 //! 3. The frozen rows still resolve via PK lookup (cold-tier read
 //!    path stays consistent with the freezer's atomic swap).
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,18 +30,14 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const FREEZE_DEADLINE: Duration = Duration::from_secs(10);
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
-fn spawn_server_with_tight_budget(addr: &str, http_addr: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
+/// Spawn freezer server with native + http listeners on OS-chosen ports.
+/// Returns `(child, native_addr, http_addr)` — see e2e_wal_binary's
+/// `spawn_server_on_ephemeral_port` for the race-avoidance rationale.
+fn spawn_server_with_tight_budget() -> (Child, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_spg-server"))
+        .arg("127.0.0.1:0")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         // Budget = 512 B; sweep-style schema rows are ~25-40 B each
         // (id INT + name TEXT), so ~20 rows cross the threshold.
         .env("SPG_HOT_TIER_BYTES", "512")
@@ -50,12 +46,61 @@ fn spawn_server_with_tight_budget(addr: &str, http_addr: &str) -> Child {
         // Single-row batches so the freeze granularity is small;
         // the test inserts in waves and checks the metric climbs.
         .env("SPG_FREEZER_BATCH_ROWS", "8")
-        .env("SPG_HTTP_ADDR", http_addr)
+        .env("SPG_HTTP_ADDR", "127.0.0.1:0")
         .env_remove("SPG_PASSWORD")
         .env_remove("SPG_ADMIN_PASSWORD")
         .env_remove("SPG_FREEZER_DISABLE")
         .spawn()
-        .unwrap()
+        .unwrap();
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (native, http) = read_native_and_http_addrs(&mut child, stderr);
+    (child, native, http)
+}
+
+fn read_native_and_http_addrs(child: &mut Child, stderr: ChildStderr) -> (String, String) {
+    let mut reader = BufReader::new(stderr);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut native: Option<String> = None;
+    let mut http: Option<String> = None;
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        if native.is_some() && http.is_some() {
+            break;
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("server exited before printing addrs: {status:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(_) => {
+                if let Some(addr) = extract_addr(&line, "http listening on ") {
+                    http = Some(addr);
+                } else if let Some(addr) = extract_addr(&line, "listening on ") {
+                    native = Some(addr);
+                }
+            }
+            Err(e) => panic!("read stderr: {e}"),
+        }
+    }
+    let (Some(n), Some(h)) = (native, http) else {
+        let _ = child.kill();
+        panic!("server didn't print both addrs within {STARTUP_TIMEOUT:?}");
+    };
+    thread::spawn(move || {
+        let mut sink = String::new();
+        let _ = reader.read_to_string(&mut sink);
+    });
+    (n, h)
+}
+
+fn extract_addr(line: &str, marker: &str) -> Option<String> {
+    let after = line.find(marker)?;
+    let tail = &line[after + marker.len()..];
+    let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
+    Some(tail[..end].to_string())
 }
 
 struct ChildGuard(Child);
@@ -66,17 +111,14 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
+fn connect_to(addr: &str) -> TcpStream {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         match TcpStream::connect(addr) {
             Ok(s) => return s,
             Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
+                assert!(Instant::now() < deadline, "connect {addr}: {e}");
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -198,10 +240,9 @@ fn wire_to_i64(v: &WireValue) -> i64 {
 /// well past the budget and confirm `spg_cold_segments_total` climbs.
 #[test]
 fn freezer_creates_cold_segment_when_hot_exceeds_budget() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_tight_budget(&native, &http));
-    let mut s = wait_for_listener(&native, &mut child.0);
+    let (raw_child, native, http) = spawn_server_with_tight_budget();
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Set up a table with an integer PK and a BTree index — the
@@ -261,10 +302,9 @@ fn freezer_creates_cold_segment_when_hot_exceeds_budget() {
 /// read path consistent.
 #[test]
 fn freezer_keeps_frozen_rows_addressable_via_pk_lookup() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_tight_budget(&native, &http));
-    let mut s = wait_for_listener(&native, &mut child.0);
+    let (raw_child, native, http) = spawn_server_with_tight_budget();
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(
@@ -317,10 +357,9 @@ fn freezer_keeps_frozen_rows_addressable_via_pk_lookup() {
 /// rows are reachable by PK, not by NSW; that is the v5.5.3 scope).
 #[test]
 fn freezer_freezes_vector_table_with_nsw_index() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(spawn_server_with_tight_budget(&native, &http));
-    let mut s = wait_for_listener(&native, &mut child.0);
+    let (raw_child, native, http) = spawn_server_with_tight_budget();
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(
