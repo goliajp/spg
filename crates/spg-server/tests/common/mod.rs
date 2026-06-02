@@ -357,6 +357,30 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Process RSS in KiB via `ps -o rss= -p <pid>` (works on macOS +
+/// Linux; portable across the platforms SPG tests run on). Returns
+/// 0 on parse failure rather than panicking — the test owns the
+/// failure assertion with a clearer message.
+///
+/// v6.0.1 step 8: promoted from `e2e_chaos_freeze.rs` so the SQ8
+/// perf gate can share the helper.
+pub fn rss_kib_of(pid: u32) -> u64 {
+    let out = Command::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output();
+    let Ok(out) = out else { return 0 };
+    if !out.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+}
+
 /// Connect to a known-bound server addr. Retries briefly because the
 /// listener is up by the time stderr printed `listening on …`, but
 /// the OS may need a tick to register the bind in the accept queue.

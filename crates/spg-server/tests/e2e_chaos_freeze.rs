@@ -37,10 +37,10 @@
 //!        -- --ignored freeze_30m_rss_stays_under_6gib_during_sweep_loop
 //!    ```
 
+use common::rss_kib_of;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
@@ -328,23 +328,7 @@ fn freeze_30m_rss_stays_under_6gib_during_sweep_loop() {
     }
 }
 
-/// Process RSS in KiB via `ps -o rss= -p <pid>` (works on macOS +
-/// Linux; portable across the platforms SPG tests run on). Returns
-/// 0 on parse failure rather than panicking — the test owns the
-/// failure assertion with a clearer message.
-fn rss_kib_of(pid: u32) -> u64 {
-    let out = Command::new("ps")
-        .arg("-o")
-        .arg("rss=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output();
-    let Ok(out) = out else { return 0 };
-    if !out.status.success() {
-        return 0;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0)
-}
+// v6.0.1 step 8: `rss_kib_of` was promoted to
+// `tests/common/mod.rs::rss_kib_of`. Callers in this file
+// take it from `common::*` via the existing `use common::*`
+// at the top of the spawn block.
