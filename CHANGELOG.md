@@ -10,6 +10,87 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.5] — 2026-06-03 (publisher-side WAL filtering by publication)
+
+Fourth v6.1.x sub-version on the logical-replication path. v6.1.4
+recorded the `PUBLICATION pub_a` clause on a subscription but the
+publisher still streamed every WAL record; v6.1.5 enforces the
+filter at the source. Records that don't match the requested
+publication's scope (or DDL / session-control SQL, which logical
+replication never propagates per PG semantics) are dropped before
+they hit the wire.
+
+### Added
+
+- Replication protocol — `FRAME_TYPE_SKIP` (`0x02`). Master
+  emits this on a MAGIC_SUB stream when a contiguous run of
+  records didn't match the filter. Payload is
+  `[u64 LE skipped_bytes]`; the subscriber advances its
+  `applied_offset` and `last_received_pos` by that count
+  without applying anything, keeping the publisher and
+  subscriber in byte-position lock-step so reconnect from
+  `last_received_pos` doesn't re-stream filtered records.
+  Followers using MAGIC_V1 / MAGIC_V2 never receive this frame.
+- MAGIC_SUB handshake grows a publication-name tail —
+  `[u16 num_pubs] for each: [u16 len][name bytes]` — after the
+  start offset. v6.1.4 subscribers (which sent only the magic +
+  offset) are still supported: `num_pubs = 0` falls back to the
+  legacy fan-out-all behaviour, so a mixed-version cluster
+  keeps working through the upgrade.
+- `replication::extract_owner_from_sql` — lightweight first-
+  verb scanner. Recognises `INSERT INTO <t>`, `UPDATE <t>`,
+  `DELETE FROM <t>`; everything else (DDL, session-control,
+  catalog mutation) maps to `OwnerKind::Skip`. Measured
+  **41 ns/call** on Apple-M (release), well inside the 200 ns
+  budget from V6_1_DESIGN.md L2 row 5.
+- `replication::PublicationFilter` — OR-combines requested
+  publications' scopes. `AllTables` short-circuits. `ForTables`
+  goes through a deduped `HashSet`; `AllTablesExcept` is checked
+  per-scope.
+- `replication::tail_wal_v2_filtered` — v2 tail variant that
+  parses records out of WAL chunks, decides forward-vs-skip per
+  record, and coalesces consecutive skipped records into one
+  SKIP frame.
+
+### Tests
+
+- `spg-server` lib (9 new) — owner scanner correctness across
+  DML / DDL / quoted ident / no-space-before-paren / garbage
+  + the 200 ns perf gate; PublicationFilter accept-all /
+  for-tables / except / OR-combine.
+- `spg-server::e2e_replication_filter` (3 new) —
+    - `for_table_filter_propagates_only_published_tables`:
+      publisher writes t1 + t2; subscription `FOR TABLE t1`
+      sees 5 rows in t1, 0 in t2.
+    - `for_all_tables_except_blocks_only_excepted`:
+      `FOR ALL TABLES EXCEPT drop_me` propagates keep_a +
+      keep_b, blocks drop_me.
+    - `skip_frame_advances_subscriber_offset`: writes only to
+      the filtered-out table; subscriber row count stays 0
+      but `last_received_pos` advances (proving SKIP frames
+      flow end-to-end).
+
+### Not changed
+
+- WAL on-disk record format / framing.
+- MAGIC_V1 / MAGIC_V2 follower path (full snapshot + raw WAL
+  tail) — unchanged. Filter only fires on MAGIC_SUB.
+- Subscription catalog, snapshot envelope, AST, parser, SHOW
+  surface.
+
+### Out of v6.1.5 (deferred)
+
+- Per-row publication predicates (PG's `WHERE` clause on
+  publications) — v6.x discussion topic; out of v6.1.
+- DDL propagation under logical replication — v6.1 explicitly
+  doesn't propagate DDL; subscriber-side schema drift remains
+  the operator's problem (V6_1_DESIGN.md design point 3).
+- Cascading (follower exposing its own replication endpoint) —
+  v6.1.6.
+- WAIT FOR WAL POSITION — v6.1.7.
+
+---
+
 ## [6.1.4] — 2026-06-03 (CREATE SUBSCRIPTION + subscriber worker)
 
 Third v6.1.x sub-version on the logical-replication path — and
