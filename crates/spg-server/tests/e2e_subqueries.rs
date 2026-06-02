@@ -3,57 +3,15 @@
 //! v4.10 subqueries — scalar / EXISTS / IN.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
+use common::{ChildGuard, ServerBuilder, connect_to};
+
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .spawn()
-        .unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
 
 fn read_frame(s: &mut TcpStream) -> Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
@@ -111,9 +69,9 @@ fn seed(s: &mut TcpStream) {
 
 #[test]
 fn scalar_subquery_returns_count() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed(&mut s);
 
@@ -129,9 +87,9 @@ fn scalar_subquery_returns_count() {
 
 #[test]
 fn exists_subquery_filters_rows() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed(&mut s);
 
@@ -154,9 +112,9 @@ fn exists_subquery_filters_rows() {
 
 #[test]
 fn in_subquery_filters_to_intersection() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed(&mut s);
 
@@ -176,9 +134,9 @@ fn in_subquery_filters_to_intersection() {
 
 #[test]
 fn not_in_subquery_returns_complement() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     seed(&mut s);
 

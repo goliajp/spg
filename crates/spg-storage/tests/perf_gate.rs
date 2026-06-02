@@ -12,8 +12,31 @@
 )]
 
 //! Regression-catch perf gate for `spg-storage`. Budgets in `BUDGETS.md`.
+//!
+//! Every `#[test]` here measures wall-clock cost (push throughput,
+//! distance ns/pair, segment lookup p99, …) and so must NOT run
+//! concurrently with another perf measurement on the same host: the
+//! second test ends up CPU-starved by the first, blowing budgets for
+//! a reason that isn't a real regression. v6.0.x adds `perf_lock()`,
+//! a process-global `Mutex<()>` every test acquires at top of body —
+//! parallel `cargo test` invocations still launch all the threads
+//! but they queue on the lock instead of fighting for the same CPU.
+//! 500 ms cool-down after acquisition gives the OS time to drain
+//! pending I/O from the prior test before the next one measures.
 
-use std::time::Instant;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn perf_lock() -> MutexGuard<'static, ()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = L
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    thread::sleep(Duration::from_millis(500));
+    guard
+}
 
 use spg_storage::{
     BloomFilter, Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row,
@@ -48,6 +71,7 @@ fn build_catalog(n_rows: i32) -> Catalog {
 
 #[test]
 fn catalog_roundtrip_100rows_under_budget() {
+    let _perf = perf_lock();
     let cat = build_catalog(100);
     let bytes = cat.serialize();
     let iters: u32 = 100;
@@ -68,6 +92,7 @@ fn catalog_roundtrip_100rows_under_budget() {
 
 #[test]
 fn hnsw_search_under_budget() {
+    let _perf = perf_lock();
     let mut cat = Catalog::new();
     cat.create_table(TableSchema::new(
         "vecs",
@@ -123,6 +148,7 @@ fn hnsw_search_under_budget() {
 /// 实测在 M-series mac release 模式 ~80-120 ms；200 ms 留 ~2× 余量给 CI / Linux host。
 #[test]
 fn pv_push_1m_under_200ms() {
+    let _perf = perf_lock();
     let start = Instant::now();
     let mut pv: PersistentVec<u64> = PersistentVec::new();
     for i in 0..1_000_000_u64 {
@@ -147,6 +173,7 @@ fn pv_push_1m_under_200ms() {
 /// (~5 levels × 100 ns/level — 跟 std BTreeMap 持平的目标)。
 #[test]
 fn pb_insert_mut_100k_under_50ms() {
+    let _perf = perf_lock();
     let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
     // Pre-build a small workload key range to mix inserts + replaces, matching
     // the secondary-index access pattern (most keys 1 entry, some replacements
@@ -173,6 +200,7 @@ fn pb_insert_mut_100k_under_50ms() {
 /// 这是 spg-embedded 流式 INSERT 路径恢复 baseline 吞吐的关键。
 #[test]
 fn pv_push_mut_1m_under_50ms() {
+    let _perf = perf_lock();
     let start = Instant::now();
     let mut pv: PersistentVec<u64> = PersistentVec::new();
     for i in 0..1_000_000_u64 {
@@ -193,6 +221,7 @@ fn pv_push_mut_1m_under_50ms() {
 /// 实测 ~30-60 ns；100 ns 同样留 ~2× 余量。100K 次采样平摊掉 Instant 噪声。
 #[test]
 fn pv_get_random_under_100ns_avg() {
+    let _perf = perf_lock();
     let mut pv: PersistentVec<u64> = PersistentVec::new();
     for i in 0..1_000_000_u64 {
         pv = pv.push(i);
@@ -247,6 +276,7 @@ fn splitmix64(mut x: u64) -> u64 {
 /// scale).
 #[test]
 fn bloom_fp_rate_under_1pct() {
+    let _perf = perf_lock();
     const TARGET_FP: f64 = 0.01;
     const CEILING_FP: f64 = TARGET_FP * 1.1;
     const N: usize = 100_000;
@@ -289,6 +319,7 @@ fn bloom_fp_rate_under_1pct() {
 /// (e.g. accidental quadratic growth, missed inlining of `mix`).
 #[test]
 fn bloom_insert_1m_under_100ms() {
+    let _perf = perf_lock();
     const N: usize = 1_000_000;
     let mut bf = BloomFilter::with_target_fp_rate(N, 0.01);
     let mut s = 0xdead_beef_u64;
@@ -319,6 +350,7 @@ fn bloom_insert_1m_under_100ms() {
 /// offset recomputation, accidental Vec reallocation per row).
 #[test]
 fn segment_write_1m_under_2s() {
+    let _perf = perf_lock();
     const N: u64 = 1_000_000;
     let rows: Vec<(u64, Vec<u8>)> = (0..N)
         .map(|i| (i, vec![u8::try_from(i & 0xff).unwrap(); 32]))
@@ -353,6 +385,7 @@ fn segment_write_1m_under_2s() {
 /// regression that would push p99 past disk read latency.
 #[test]
 fn segment_lookup_p99_under_500us() {
+    let _perf = perf_lock();
     const N: u64 = 1_000_000;
     let rows: Vec<(u64, Vec<u8>)> = (0..N)
         .map(|i| (i, vec![u8::try_from(i & 0xff).unwrap(); 32]))
@@ -416,6 +449,7 @@ fn random_unit_vec_f32(rng_state: &mut u64, dim: usize) -> Vec<f32> {
 /// path even at saturation.
 #[test]
 fn sq8_quantize_1m_under_500ms() {
+    let _perf = perf_lock();
     const N: usize = 1_000_000;
     const DIM: usize = 128;
 
@@ -453,6 +487,7 @@ fn sq8_quantize_1m_under_500ms() {
 /// shadow.
 #[test]
 fn sq8_adc_l2_under_200ns_per_pair() {
+    let _perf = perf_lock();
     const DIM: usize = 128;
     const N_PAIRS: usize = 1_000_000;
 
@@ -487,6 +522,7 @@ fn sq8_adc_l2_under_200ns_per_pair() {
 /// either way, asymmetric saves a tiny multiply per element).
 #[test]
 fn sq8_adc_l2_asymmetric_under_200ns_per_pair() {
+    let _perf = perf_lock();
     const DIM: usize = 128;
     const N_PAIRS: usize = 1_000_000;
 
@@ -523,6 +559,7 @@ fn sq8_adc_l2_asymmetric_under_200ns_per_pair() {
 /// quality breaks the release build (not just `cargo test --lib`).
 #[test]
 fn sq8_recall_at_10_above_0_95_perf_gate() {
+    let _perf = perf_lock();
     const N: usize = 10_000;
     const Q: usize = 100;
     const K: usize = 10;

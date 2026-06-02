@@ -4,58 +4,18 @@
 //! have `CARGO_BIN_EXE_spg-server` injected by cargo.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
+
+mod common;
+use common::{ChildGuard, ServerBuilder, connect_to};
 
 use spg_wire::{
     Frame, Op, WireType, WireValue, build_query, encode, parse_command_complete, parse_data_row,
     parse_error_response, parse_row_description,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn spg-server")
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
     let mut out = Vec::new();
@@ -79,9 +39,9 @@ fn read_frame(stream: &mut TcpStream) -> Frame {
 
 #[test]
 fn create_insert_select_full_cycle() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut stream = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut stream = connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(
@@ -129,9 +89,9 @@ fn create_insert_select_full_cycle() {
 
 #[test]
 fn select_with_where_via_wire() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut stream = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut stream = connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(&mut stream, "CREATE TABLE nums (x INT NOT NULL)");
@@ -161,9 +121,9 @@ fn select_with_where_via_wire() {
 
 #[test]
 fn syntax_error_returns_error_response() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut stream = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut stream = connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(&mut stream, "DROP TABLE foo"); // not in parser scope yet
@@ -178,16 +138,16 @@ fn syntax_error_returns_error_response() {
 
 #[test]
 fn second_connection_sees_first_connection_writes() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut a = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut a = connect_to(&addrs.native);
     a.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(&mut a, "CREATE TABLE shared (v INT)");
     assert_eq!(read_frame(&mut a).op, Op::CommandComplete);
     send_query(&mut a, "INSERT INTO shared VALUES (42)");
     assert_eq!(read_frame(&mut a).op, Op::CommandComplete);
 
-    let mut b = TcpStream::connect(&addr).unwrap();
+    let mut b = TcpStream::connect(&addrs.native).unwrap();
     b.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(&mut b, "SELECT * FROM shared");
     assert_eq!(read_frame(&mut b).op, Op::RowDescription);
