@@ -777,20 +777,64 @@ SHOW SUBSCRIPTIONS
 - `CONNECTION` and `SUBSCRIPTION` are reserved keywords from
   v6.1.4 (v6.1.2 reserved `SUBSCRIPTION` ahead of time).
 
-### Replication MAGIC_SUB protocol (v6.1.4)
+### Replication MAGIC_SUB protocol (v6.1.4 — v6.1.5)
 
 Subscriber-side connect handshake:
 ```text
-→  [b"SPGSUB\x01\x00"]   ← 8 bytes magic
-   [u64 LE start_offset]  ← 0 = "tail from current end"
-←  [u64 LE effective_start]   ← master's WAL position the
-                                subscriber should record as its
-                                baseline last_received_pos
+→  [b"SPGSUB\x01\x00"]        ← 8 bytes magic
+   [u64 LE start_offset]       ← 0 = "tail from current end"
+   [u16 LE num_publications]   ← v6.1.5 (0 = legacy v6.1.4 fan-out-all)
+   for each publication:
+     [u16 LE name_len][name bytes]
+←  [u64 LE effective_start]    ← master's WAL position the
+                                 subscriber records as baseline
+                                 last_received_pos
 ```
+
+A v6.1.4 subscriber emits only the first 16 bytes (magic +
+offset) and the master reads `num_publications = 0` from the
+next two bytes the client sends in its first real frame… no.
+v6.1.4 subscribers DID write only 16 bytes; v6.1.5 masters
+expect the publication list immediately after, so a v6.1.5
+master + v6.1.4 subscriber pairing is NOT compatible — the
+master will block on the read. Operators upgrading should
+upgrade subscribers before masters; the reverse breaks. Pre-
+v6.1.4 followers using MAGIC_V1 / MAGIC_V2 are unaffected.
+
 The frame stream from this point uses the v2 framing:
 `[u8 type][u32 len][payload]`. Subscribers never receive an
 initial snapshot — target tables must exist on the subscriber
 side before the worker starts.
+
+#### Frame types on a MAGIC_SUB stream (v6.1.5)
+
+```text
+0x00 = FRAME_TYPE_WAL    — raw WAL bytes for one or more records
+                           the master is forwarding. Subscriber
+                           parses records and applies SQL.
+0x01 = FRAME_TYPE_STATUS — 16-byte advisory `[primary_pos|wall_us]`.
+                           Subscriber ignores in v6.1.4/v6.1.5.
+0x02 = FRAME_TYPE_SKIP   — 8-byte `[skipped_bytes u64 LE]` payload.
+                           Master emits one per contiguous run of
+                           records that the publication filter
+                           rejected (or DDL/session-control SQL
+                           that v6.1.x never propagates).
+                           Subscriber advances applied_offset by
+                           skipped_bytes without applying. Lets
+                           reconnect from the same last_received_pos
+                           skip past already-filtered records.
+```
+
+Logical-replication policy (v6.1.5):
+- DML (`INSERT INTO …`, `UPDATE …`, `DELETE FROM …`) is filtered
+  by the publication's scope.
+- DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER INDEX`, `TRUNCATE`,
+  `CREATE PUBLICATION`, `CREATE SUBSCRIPTION`, `CREATE USER`,
+  …), session control (`BEGIN`, `COMMIT`, `ROLLBACK`,
+  `SAVEPOINT`, `SET`), and catalog mutations are never
+  propagated — subscriber-side schema drift is the operator's
+  problem (V6_1_DESIGN.md design point 3). PG-compatible — PG
+  logical decoders also drop DDL.
 
 ### Snapshot envelope v4 (v6.1.4)
 
