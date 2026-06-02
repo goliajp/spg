@@ -3,57 +3,15 @@
 //! v4.14 JSON path operators — -> and ->>.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
+use common::{ChildGuard, ServerBuilder, connect_to};
+
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
-fn spawn_server(addr: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .spawn()
-        .unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
 
 fn read_frame(s: &mut TcpStream) -> Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
@@ -103,9 +61,9 @@ fn select_first_cell(s: &mut TcpStream, sql: &str) -> WireValue {
 
 #[test]
 fn arrow_get_text_unwraps_string_value() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s, "CREATE TABLE d (body JSON NOT NULL)");
     exec_ok(
@@ -122,9 +80,9 @@ fn arrow_get_text_unwraps_string_value() {
 
 #[test]
 fn arrow_get_returns_quoted_json() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s, "CREATE TABLE d (body JSON NOT NULL)");
     exec_ok(&mut s, r#"INSERT INTO d VALUES ('{"name":"alice"}')"#);
@@ -139,9 +97,9 @@ fn arrow_get_returns_quoted_json() {
 
 #[test]
 fn arrow_into_nested_object_returns_subtree() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s, "CREATE TABLE d (body JSON NOT NULL)");
     exec_ok(
@@ -160,9 +118,9 @@ fn arrow_into_nested_object_returns_subtree() {
 
 #[test]
 fn arrow_into_array_index_returns_element() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s, "CREATE TABLE d (body JSON NOT NULL)");
     exec_ok(&mut s, "INSERT INTO d VALUES ('[10,20,30]')");
@@ -175,9 +133,9 @@ fn arrow_into_array_index_returns_element() {
 
 #[test]
 fn arrow_missing_key_returns_null() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s, "CREATE TABLE d (body JSON NOT NULL)");
     exec_ok(&mut s, r#"INSERT INTO d VALUES ('{"a":1}')"#);
@@ -187,9 +145,9 @@ fn arrow_missing_key_returns_null() {
 
 #[test]
 fn arrow_works_in_where_clause() {
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = ServerBuilder::new().spawn();
+    let _child = ChildGuard(raw);
+    let mut s = connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(
         &mut s,

@@ -28,26 +28,19 @@
 //! v5.4.4's `slo_wal_insert_async_commit_above_200K` ship gate.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::process::Child;
+use std::time::Duration;
+
+mod common;
 
 use spg_wire::{
     FRAME_HEADER_LEN, Frame, Op, WireValue, build_query, encode, parse_command_complete,
     parse_data_row, parse_data_row_batch,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -59,48 +52,19 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     p
 }
 
-fn spawn_server(addr: &str, db: &Path, wal: &Path, env: &[(&str, String)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
+fn spawn_server(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, String)],
+) -> (Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
         .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
+        .arg_path(wal);
     for (k, v) in env {
-        cmd.env(k, v);
+        b = b.env(*k, v);
     }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => {
-                s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-                return s;
-            }
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    b.spawn()
 }
 
 fn send_query(stream: &mut TcpStream, sql: &str) {
@@ -146,12 +110,13 @@ fn run_select(stream: &mut TcpStream, sql: &str) -> Vec<Vec<WireValue>> {
 }
 
 fn exercise_writes_under(env: &[(&str, String)], tag: &str) -> usize {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir(tag);
     let db = dir.join("data.spgdb");
     let wal = dir.join("data.wal");
-    let mut guard = ChildGuard(spawn_server(&addr, &db, &wal, env));
-    let mut s = wait_for_listener(&addr, &mut guard.0);
+    let (raw, addrs) = spawn_server(&db, &wal, env);
+    let _guard = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     send_query(&mut s, "CREATE TABLE rows (id BIGINT, name TEXT)");
     expect_cc(&mut s);
     for i in 0..5_i64 {
