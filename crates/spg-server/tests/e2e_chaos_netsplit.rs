@@ -427,6 +427,130 @@ fn netsplit_disconnect_then_heal_resyncs_without_loss_or_dup() {
     );
 }
 
+/// v6.0.x — cross-process follower restart resumes from the
+/// `.applied_pos` sidecar file rather than going through a full
+/// snapshot resync. Kill the follower, write more rows on master,
+/// then respawn the follower against the same db/wal/pos paths.
+/// The follower must converge to the full row count without
+/// duplicates — proving the sidecar told master the right resume
+/// offset (and proving the engine's local-WAL replay rebuilds
+/// the same logical state).
+#[test]
+fn follower_restart_resumes_from_persisted_sidecar() {
+    let dir_p = unique_tmpdir("rspri");
+    let dir_f = unique_tmpdir("rsfol");
+    let db_p = dir_p.join("a.db");
+    let wal_p = dir_p.join("a.wal");
+    let db_f = dir_f.join("a.db");
+    let wal_f = dir_f.join("a.wal");
+    let sidecar_f = dir_f.join("a.wal.applied_pos");
+
+    let (raw, primary_addrs) = spawn_primary(&db_p, &wal_p, &[]);
+    let mut primary = common::ChildGuard(raw);
+    let mut prim_client = common::connect_to(&primary_addrs.native);
+    prim_client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    wait_for_addr(primary_addrs.repl.as_ref().unwrap());
+
+    // First-life follower: ingest 10 rows.
+    let (raw_f, follower_addrs_a) = spawn_follower(
+        &db_f,
+        &wal_f,
+        primary_addrs.repl.as_ref().unwrap(),
+        false,
+        &[],
+    );
+    let mut follower = common::ChildGuard(raw_f);
+    exec_ok(
+        &mut prim_client,
+        "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)",
+    );
+    for i in 0..10 {
+        exec_ok(
+            &mut prim_client,
+            &format!("INSERT INTO t VALUES ({i}, {})", i * 7),
+        );
+    }
+    let pre_kill = wait_for_count(
+        &follower_addrs_a.native,
+        "SELECT count(*) FROM t",
+        10,
+        Instant::now() + CATCHUP_TIMEOUT,
+    );
+    assert_eq!(pre_kill, 10);
+    assert!(
+        sidecar_f.exists(),
+        "sidecar .applied_pos must exist before follower restart"
+    );
+    let sidecar_before = std::fs::read(&sidecar_f).unwrap();
+    assert_eq!(
+        sidecar_before.len(),
+        8,
+        "sidecar must hold exactly 8 LE bytes"
+    );
+    let pos_before = u64::from_le_bytes(sidecar_before.as_slice().try_into().unwrap());
+    assert!(
+        pos_before > 0,
+        "sidecar should hold a positive offset, got {pos_before}"
+    );
+
+    // Kill the follower process. ChildGuard's Drop sends SIGKILL +
+    // waits. The db_path + wal_path + sidecar all live on disk
+    // unchanged.
+    drop(follower);
+    // Belt and braces: the listener bind+connect lifecycle can hold
+    // a port in TIME_WAIT briefly; sleep a tick before respawn so
+    // the second follower's `127.0.0.1:0` allocation doesn't
+    // accidentally race on the same ephemeral port the first
+    // follower used.
+    thread::sleep(Duration::from_millis(50));
+
+    // Master keeps writing while no follower is connected.
+    for i in 10..25 {
+        exec_ok(
+            &mut prim_client,
+            &format!("INSERT INTO t VALUES ({i}, {})", i * 7),
+        );
+    }
+
+    // Restart follower against the same paths. This is the cross-
+    // process case: `state.lag_state.follower_applied_pos` starts
+    // fresh-zero. The sidecar lookup at `follow_once` entry must
+    // seed it from disk.
+    let (raw_f2, follower_addrs_b) = spawn_follower(
+        &db_f,
+        &wal_f,
+        primary_addrs.repl.as_ref().unwrap(),
+        false,
+        &[],
+    );
+    let _follower2 = common::ChildGuard(raw_f2);
+    let post_restart = wait_for_count(
+        &follower_addrs_b.native,
+        "SELECT count(*) FROM t",
+        25,
+        Instant::now() + CATCHUP_TIMEOUT,
+    );
+    assert_eq!(
+        post_restart, 25,
+        "restarted follower must converge to exactly 25 rows — no dup, no gap"
+    );
+    // Sidecar must have advanced past the pre-kill value.
+    let sidecar_after = std::fs::read(&sidecar_f).unwrap();
+    let pos_after = u64::from_le_bytes(sidecar_after.as_slice().try_into().unwrap());
+    assert!(
+        pos_after > pos_before,
+        "sidecar should have advanced post-restart ({pos_before} → {pos_after})"
+    );
+
+    // Row contents must be intact — guards against the "count
+    // happens to land at 25 but with wrong values" failure mode.
+    let mut s = TcpStream::connect(&follower_addrs_b.native).unwrap();
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let sum = select_int(&mut s, "SELECT sum(v) FROM t");
+    let expected_sum: i64 = (0..25).map(|i| (i * 7) as i64).sum();
+    assert_eq!(sum, expected_sum);
+}
+
 /// v4.36 status-frame protocol gives the follower visibility into
 /// the master's WAL position. `/metrics` on the follower exposes
 /// both `spg_replication_lag_bytes` and `spg_replication_lag_seconds`

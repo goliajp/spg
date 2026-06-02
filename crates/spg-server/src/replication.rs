@@ -201,6 +201,52 @@ enum Protocol {
 /// lock is held only long enough to serialize the catalog and read
 /// the WAL file size; the network send happens after release so a
 /// slow follower can't block writers.
+/// v6.0.x — sidecar `.applied_pos` file living next to the
+/// follower's WAL. Holds 8 bytes LE = the master-WAL position
+/// up to which the follower has applied records. Read at
+/// `follow_once` entry to seed the in-memory atomic on a fresh
+/// process; written atomically (temp + rename) after each frame's
+/// apply batch.
+fn applied_pos_sidecar_path(wal_path: &Path) -> PathBuf {
+    let mut name = wal_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".applied_pos");
+    wal_path
+        .parent()
+        .map_or_else(|| PathBuf::from(&name), |p| p.join(&name))
+}
+
+fn applied_pos_sidecar_tmp_path(wal_path: &Path) -> PathBuf {
+    let mut name = wal_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".applied_pos.tmp");
+    wal_path
+        .parent()
+        .map_or_else(|| PathBuf::from(&name), |p| p.join(&name))
+}
+
+fn read_applied_pos_sidecar(wal_path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(applied_pos_sidecar_path(wal_path)).ok()?;
+    let arr: [u8; 8] = bytes.as_slice().try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
+}
+
+fn write_applied_pos_sidecar(wal_path: &Path, pos: u64) -> std::io::Result<()> {
+    let tmp = applied_pos_sidecar_tmp_path(wal_path);
+    let dst = applied_pos_sidecar_path(wal_path);
+    std::fs::write(&tmp, pos.to_le_bytes())?;
+    // POSIX rename within the same directory is atomic; Windows
+    // tolerates this too. Either both files coexist briefly or only
+    // `dst` does — no corrupted intermediate state visible to a
+    // restarting follower reader.
+    std::fs::rename(&tmp, &dst)?;
+    Ok(())
+}
+
 fn capture_snapshot(state: &ServerState) -> std::io::Result<(Vec<u8>, u64)> {
     let engine_guard = state
         .engine
@@ -327,35 +373,53 @@ fn follow_once(
     let mut stream = TcpStream::connect(master_addr)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
-    // Determine our starting offset: 0 if no db yet, else current WAL length.
     // v6.0.5+: start_offset is a position in MASTER's WAL file
     // (master `f.seek(SeekFrom::Start(start_offset))`), not a count
-    // of bytes the follower has received. Those two diverged the
-    // moment the master picked a non-zero wal_position at the
-    // initial handshake (i.e. master had pre-existing WAL data
-    // before the follower's first connect).
+    // of bytes the follower has received locally. The right source
+    // of truth for "next master-WAL byte to ship" is the AtomicU64
+    // the apply loop maintains — and, for cross-process restart
+    // where the in-memory atomic is fresh-zero, the sidecar
+    // `.applied_pos` file written alongside the WAL. The sidecar
+    // is updated after every apply batch (within the FRAME_TYPE_WAL
+    // arm below), so on restart we recover the master-position from
+    // disk and seed the atomic before the handshake.
     //
-    // The previous fallback — `std::fs::metadata(wal_path).len()`
-    // — accidentally agreed with master's offset ONLY when the
-    // master's wal_position at first handshake was 0. Otherwise
-    // reconnect resumed from the wrong byte and the drain loop
-    // silently misaligned on the next record header.
-    //
-    // The right source of truth for "next master-WAL byte to ship"
-    // is the AtomicU64 the apply loop already maintains. Same-
-    // process reconnects (chaos netsplit, leader handoff in v4.42
-    // group commit, etc.) read it for free. Cross-process restart
-    // still falls back to `wal_path` length — at that point the
-    // engine reload from snapshot has reset state, so a fresh
-    // start_offset=0 path with a re-applied snapshot is the only
-    // safe handshake. (Persisting `follower_applied_pos` to a
-    // sidecar file would let cross-process resumes too — filed
-    // for a future replication sub-version.)
+    // Caveat (filed for a future sub-version): the sidecar write
+    // is NOT atomic with apply. If the process crashes between
+    // apply and sidecar update, on restart the sidecar will lag
+    // by ≤ one frame's records, master will re-send those, and
+    // the follower will re-apply them. Non-idempotent SQL (no-PK
+    // INSERTs) sees duplicate rows. Idempotent SQL (PK INSERTs,
+    // CREATE TABLE IF NOT EXISTS) is unaffected.
+    if state.lag_state.follower_applied_pos.load(Ordering::Acquire) == 0
+        && let Some(persisted) = read_applied_pos_sidecar(wal_path)
+        && persisted > 0
+    {
+        state
+            .lag_state
+            .follower_applied_pos
+            .store(persisted, Ordering::Release);
+    }
     let stored_applied = state.lag_state.follower_applied_pos.load(Ordering::Acquire);
     let start_offset: u64 = if db_path.exists() && stored_applied > 0 {
         stored_applied
     } else if db_path.exists() && wal_path.exists() {
-        std::fs::metadata(wal_path).map_or(0, |m| m.len())
+        // Last-ditch fallback for the very-rare case where the
+        // sidecar got lost but db + wal survived. Resume from
+        // local WAL length; works only when master's wal_position
+        // was 0 at the first handshake. Otherwise master will
+        // seek mid-record and the drain loop will misalign — the
+        // exact v6.0.5 bug we just fixed. Logged loud so ops can
+        // spot it.
+        let n = std::fs::metadata(wal_path).map_or(0, |m| m.len());
+        if n > 0 {
+            eprintln!(
+                "spg-server: follower sidecar .applied_pos missing — \
+                 falling back to wal length {n}; this is byte-exact \
+                 only if master's wal_position was 0 at first handshake"
+            );
+        }
+        n
     } else {
         0
     };
@@ -406,6 +470,14 @@ fn follow_once(
         .lag_state
         .follower_applied_pos
         .store(applied_offset, Ordering::Release);
+    // v6.0.x: persist the post-snapshot applied_pos so that even a
+    // restart immediately after the initial handshake (before any
+    // tail frames arrive) recovers without a full re-snapshot.
+    if let Err(e) = write_applied_pos_sidecar(wal_path, applied_offset) {
+        eprintln!(
+            "spg-server: follower sidecar write failed at handshake offset {applied_offset}: {e}"
+        );
+    }
 
     // Tail: parse [u8 type][u32 len][payload] frames. WAL chunks
     // feed the existing record accumulator; status frames update
@@ -537,6 +609,18 @@ fn follow_once(
                     .lag_state
                     .follower_applied_pos
                     .store(applied_offset, Ordering::Release);
+                // v6.0.x: persist applied_pos to sidecar so cross-
+                // process restart resumes from the right master-WAL
+                // byte without going through a fresh snapshot. One
+                // sidecar write per frame's apply batch keeps the
+                // disk-cost amortised; the apply / sidecar gap is
+                // bounded by the bytes in `pending` after the drain
+                // (which is ≤ one record header + payload).
+                if let Err(e) = write_applied_pos_sidecar(wal_path, applied_offset) {
+                    eprintln!(
+                        "spg-server: follower sidecar write failed at offset {applied_offset}: {e}"
+                    );
+                }
             }
             FRAME_TYPE_STATUS if payload.len() == 16 => {
                 let primary_pos = u64::from_le_bytes(payload[..8].try_into().unwrap());
