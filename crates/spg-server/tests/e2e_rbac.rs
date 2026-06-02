@@ -11,10 +11,10 @@
 //! `SHOW USERS`) and the readonly / readwrite enforcement tests
 //! live below the bootstrap-restart ones.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,13 +22,6 @@ use spg_wire::{Frame, Op, build_auth, build_auth_user, build_query, encode, pars
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn pick_free_addr() -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = probe.local_addr().unwrap();
-    drop(probe);
-    a.to_string()
-}
 
 fn unique_tmpdir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -40,19 +33,72 @@ fn unique_tmpdir() -> PathBuf {
     p
 }
 
-fn spawn_server(addr: &str, db: &PathBuf, admin_pw: Option<&str>) -> Child {
+/// Spawn an spg-server with an OS-chosen port and return the child +
+/// the actual bind address parsed from stderr. See `e2e_wal_binary`'s
+/// `spawn_server_on_ephemeral_port` for the race-avoidance rationale.
+fn spawn_server(db: &Path, admin_pw: Option<&str>) -> (Child, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
+    cmd.arg("127.0.0.1:0")
         .arg(db)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     if let Some(pw) = admin_pw {
         cmd.env("SPG_ADMIN_PASSWORD", pw);
     } else {
         cmd.env_remove("SPG_ADMIN_PASSWORD");
     }
     cmd.env_remove("SPG_PASSWORD");
-    cmd.spawn().unwrap()
+    let mut child = cmd.spawn().unwrap();
+    let stderr = child.stderr.take().expect("piped stderr");
+    let addr = read_listening_addr(&mut child, stderr);
+    (child, addr)
+}
+
+fn read_listening_addr(child: &mut Child, stderr: ChildStderr) -> String {
+    let mut reader = BufReader::new(stderr);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("server exited before printing listen addr: {status:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(_) => {
+                // Echo lines so existing test-output behaviour is preserved.
+                eprint!("{line}");
+                if let Some(addr) = extract_listen_addr(&line) {
+                    thread::spawn(move || {
+                        // Drain the rest of stderr to the test's stderr so
+                        // server logs after startup still surface on
+                        // failure-path debugging.
+                        let mut buf = String::new();
+                        while let Ok(n) = reader.read_line(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            eprint!("{buf}");
+                            buf.clear();
+                        }
+                    });
+                    return addr;
+                }
+            }
+            Err(e) => panic!("read stderr: {e}"),
+        }
+    }
+    let _ = child.kill();
+    panic!("server didn't print listen addr within {STARTUP_TIMEOUT:?}");
+}
+
+fn extract_listen_addr(line: &str) -> Option<String> {
+    let after = line.find("listening on ")?;
+    let tail = &line[after + "listening on ".len()..];
+    let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
+    Some(tail[..end].to_string())
 }
 
 struct ChildGuard(Child);
@@ -63,17 +109,16 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
+/// Connect to the already-bound server address. The listener exists
+/// (stderr confirmed it) but the OS may need a tick to `accept(2)`.
+fn connect_to(addr: &str) -> TcpStream {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         match TcpStream::connect(addr) {
             Ok(s) => return s,
             Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
+                assert!(Instant::now() < deadline, "connect {addr}: {e}");
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -108,12 +153,12 @@ fn send(s: &mut TcpStream, f: &Frame) {
 fn admin_bootstrap_survives_restart_and_authuser_works() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let addr = pick_free_addr();
 
     // First boot: SPG_ADMIN_PASSWORD creates admin.
     {
-        let mut child = ChildGuard(spawn_server(&addr, &db, Some("hunter2")));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw_child, addr) = spawn_server(&db, Some("hunter2"));
+        let _child = ChildGuard(raw_child);
+        let mut s = connect_to(&addr);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         // Unauthed query rejected.
@@ -139,9 +184,9 @@ fn admin_bootstrap_survives_restart_and_authuser_works() {
     // Second boot: snapshot must carry the admin user across restart.
     // Re-spawn without SPG_ADMIN_PASSWORD to prove it's not re-creating
     // — restoration came from the on-disk envelope.
-    let addr2 = pick_free_addr();
-    let mut child = ChildGuard(spawn_server(&addr2, &db, None));
-    let mut s = wait_for_listener(&addr2, &mut child.0);
+    let (raw_child, addr2) = spawn_server(&db, None);
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&addr2);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Connection still gated on auth (user table is non-empty).
@@ -157,10 +202,10 @@ fn admin_bootstrap_survives_restart_and_authuser_works() {
 fn legacy_auth_op_rejected_once_user_table_exists() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let addr = pick_free_addr();
 
-    let mut child = ChildGuard(spawn_server(&addr, &db, Some("admin-pw")));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server(&db, Some("admin-pw"));
+    let _child = ChildGuard(raw_child);
+    let mut s = connect_to(&addr);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // RBAC is active because bootstrap created the admin. Legacy
@@ -205,10 +250,10 @@ fn drain_until_complete(s: &mut TcpStream) -> Vec<Frame> {
 fn readonly_user_cannot_write_but_can_select() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let addr = pick_free_addr();
-
-    let mut child = ChildGuard(spawn_server(&addr, &db, Some("admin-pw")));
-    let _ = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server(&db, Some("admin-pw"));
+    let _child = ChildGuard(raw_child);
+    // Drain accept(2) latency before tests call login_admin.
+    drop(connect_to(&addr));
 
     // Admin sets up a table + a readonly user.
     {
@@ -262,10 +307,10 @@ fn readonly_user_cannot_write_but_can_select() {
 fn readwrite_user_can_write_but_not_manage_users() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let addr = pick_free_addr();
-
-    let mut child = ChildGuard(spawn_server(&addr, &db, Some("admin-pw")));
-    let _ = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server(&db, Some("admin-pw"));
+    let _child = ChildGuard(raw_child);
+    // Drain accept(2) latency before tests call login_admin.
+    drop(connect_to(&addr));
 
     {
         let mut s = login_admin(&addr, "admin-pw");
@@ -294,10 +339,10 @@ fn readwrite_user_can_write_but_not_manage_users() {
 fn show_users_lists_admin_plus_created_users() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let addr = pick_free_addr();
-
-    let mut child = ChildGuard(spawn_server(&addr, &db, Some("admin-pw")));
-    let _ = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server(&db, Some("admin-pw"));
+    let _child = ChildGuard(raw_child);
+    // Drain accept(2) latency before tests call login_admin.
+    drop(connect_to(&addr));
 
     let mut s = login_admin(&addr, "admin-pw");
     send(
@@ -325,10 +370,10 @@ fn show_users_lists_admin_plus_created_users() {
 fn drop_user_revokes_access() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
-    let addr = pick_free_addr();
-
-    let mut child = ChildGuard(spawn_server(&addr, &db, Some("admin-pw")));
-    let _ = wait_for_listener(&addr, &mut child.0);
+    let (raw_child, addr) = spawn_server(&db, Some("admin-pw"));
+    let _child = ChildGuard(raw_child);
+    // Drain accept(2) latency before tests call login_admin.
+    drop(connect_to(&addr));
 
     {
         let mut s = login_admin(&addr, "admin-pw");
