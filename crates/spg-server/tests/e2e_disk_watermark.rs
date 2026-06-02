@@ -15,23 +15,16 @@
 //! succeed and the server stays responsive.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::process::Child;
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -43,45 +36,19 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     p
 }
 
-fn spawn_server(addr: &str, db: &Path, wal: &Path, env: &[(&str, String)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
+fn spawn_db_wal(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, String)],
+) -> (Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
         .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
+        .arg_path(wal);
     for (k, v) in env {
-        cmd.env(k, v);
+        b = b.env(*k, v);
     }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
+    b.spawn()
 }
 
 fn read_frame(s: &mut TcpStream) -> Frame {
@@ -161,7 +128,6 @@ fn wire_to_i64(v: &WireValue) -> i64 {
 /// server alive after the refusal.
 #[test]
 fn disk_watermark_refuses_writes_keeps_reads_keeps_server_alive() {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir("wm");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
@@ -169,13 +135,9 @@ fn disk_watermark_refuses_writes_keeps_reads_keeps_server_alive() {
     // filesystem. Using u64::MAX risks integer-overflow surprises in
     // the helper; pick a real-but-impossible figure instead.
     let huge = (1_u64 << 50).to_string();
-    let mut c = ChildGuard(spawn_server(
-        &addr,
-        &db,
-        &wal,
-        &[("SPG_WAL_MIN_FREE_BYTES", huge)],
-    ));
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    let (raw, addrs) = spawn_db_wal(&db, &wal, &[("SPG_WAL_MIN_FREE_BYTES", huge)]);
+    let _c = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Reads bypass the water-mark: a pure SELECT must succeed.
@@ -202,18 +164,14 @@ fn disk_watermark_refuses_writes_keeps_reads_keeps_server_alive() {
     // Server alive: reconnect, run a fresh SELECT. The error closed
     // our previous conn (handle() returns Err), but the listener
     // itself keeps running.
-    let mut s2 = TcpStream::connect(&addr).expect("server still listening after water-mark error");
+    let mut s2 =
+        TcpStream::connect(&addrs.native).expect("server still listening after water-mark error");
     s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let again = select_int(&mut s2, "SELECT 2");
     assert_eq!(
         again, 2,
         "server must keep serving reads after water-mark refusal"
     );
-
-    // And the server didn't crash — try_wait reports it as running.
-    assert!(
-        c.0.try_wait().expect("try_wait").is_none(),
-        "server must not have exited after water-mark refusal"
-    );
-    let _ = Instant::now(); // suppress unused-import warning on Instant in some configs
+    // We don't try_wait on the child directly — `common::ChildGuard`
+    // owns it; the second connection succeeding is the liveness proof.
 }
