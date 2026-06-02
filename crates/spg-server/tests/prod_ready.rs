@@ -4,7 +4,9 @@
     clippy::doc_markdown,
     clippy::manual_assert,
     clippy::uninlined_format_args,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.28 PROD_READY.md machine-checkable gate.
@@ -33,13 +35,46 @@
 //! function — so the doc and the gate cannot drift apart.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::net::TcpStream;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+mod common;
+
+fn local_spawn_with_http(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, &str)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal)
+        .with_http();
+    for (k, v) in env {
+        b = b.env(*k, *v);
+    }
+    b.spawn()
+}
+
+fn local_spawn(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, &str)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal);
+    for (k, v) in env {
+        b = b.env(*k, *v);
+    }
+    b.spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn workspace_root() -> PathBuf {
@@ -83,13 +118,6 @@ fn machine_marked_rows() -> Vec<String> {
 
 // ---- helpers shared by behavior tests ----
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -98,47 +126,6 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-prod-ready-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn_server_with_env(addr: &str, db: &Path, wal: &Path, env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
 }
 
 // ---- the rows ----
@@ -675,23 +662,25 @@ fn row_1_10_disk_full_covered_by_e2e_chaos() {
 /// 1.3 WAL replay on startup — restart with same db+wal recovers state.
 #[test]
 fn row_1_3_wal_replay_on_startup() {
-    let addr1 = pick_free_addr();
     let dir = unique_tmpdir("wal");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
 
     {
-        let mut c = ChildGuard(spawn_server_with_env(&addr1, &db, &wal, &[]));
-        let mut s = wait_for_listener(&addr1, &mut c.0);
+        let (raw, addrs) = local_spawn(&db, &wal, &[]);
+
+        let mut c = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         exec_ok(&mut s, "CREATE TABLE t (id INT NOT NULL)");
         exec_ok(&mut s, "INSERT INTO t VALUES (1)");
         exec_ok(&mut s, "INSERT INTO t VALUES (2)");
     }
     // Restart on a fresh port; same db+wal.
-    let addr2 = pick_free_addr();
-    let mut c = ChildGuard(spawn_server_with_env(&addr2, &db, &wal, &[]));
-    let mut s = wait_for_listener(&addr2, &mut c.0);
+    let (raw, addrs) = local_spawn(&db, &wal, &[]);
+
+    let mut c = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     assert_eq!(select_int(&mut s, "SELECT count(*) FROM t"), 2);
 }
@@ -699,22 +688,15 @@ fn row_1_3_wal_replay_on_startup() {
 /// 4.1 Health endpoint — GET /healthz returns 200.
 #[test]
 fn row_4_1_health_endpoint() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
     let dir = unique_tmpdir("hz");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let mut c = ChildGuard(spawn_server_with_env(
-        &native,
-        &db,
-        &wal,
-        &[("SPG_HTTP_ADDR", &http)],
-    ));
-    let _ = wait_for_listener(&native, &mut c.0);
-    // Wait for HTTP listener too.
+    let (raw, addrs) = local_spawn_with_http(&db, &wal, &[]);
+
+    let mut c = common::ChildGuard(raw); // Wait for HTTP listener too.
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut s = loop {
-        match TcpStream::connect(&http) {
+        match TcpStream::connect(addrs.http.as_ref().unwrap()) {
             Ok(s) => break s,
             Err(_) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50));
@@ -735,21 +717,15 @@ fn row_4_1_health_endpoint() {
 /// 4.2 Prometheus metrics — /metrics exposes required series.
 #[test]
 fn row_4_2_prometheus_metrics() {
-    let native = pick_free_addr();
-    let http = pick_free_addr();
     let dir = unique_tmpdir("mx");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let mut c = ChildGuard(spawn_server_with_env(
-        &native,
-        &db,
-        &wal,
-        &[("SPG_HTTP_ADDR", &http)],
-    ));
-    let _ = wait_for_listener(&native, &mut c.0);
+    let (raw, addrs) = local_spawn_with_http(&db, &wal, &[]);
+
+    let mut c = common::ChildGuard(raw);
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut s = loop {
-        match TcpStream::connect(&http) {
+        match TcpStream::connect(addrs.http.as_ref().unwrap()) {
             Ok(s) => break s,
             Err(_) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50));
@@ -777,22 +753,18 @@ fn row_4_2_prometheus_metrics() {
 /// 5.1 SPG_MAX_CONNECTIONS — overflow gets clean error.
 #[test]
 fn row_5_1_max_connections_enforced() {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir("mc");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let mut c = ChildGuard(spawn_server_with_env(
-        &addr,
-        &db,
-        &wal,
-        &[("SPG_MAX_CONNECTIONS", "1")],
-    ));
-    let _hold = wait_for_listener(&addr, &mut c.0);
+    let (raw, addrs) = local_spawn(&db, &wal, &[("SPG_MAX_CONNECTIONS", "1")]);
+
+    let mut c = common::ChildGuard(raw);
+    let _hold = common::connect_to(&addrs.native);
     // The second connection is accepted by the OS, then the server
     // sends ErrorResponse and closes the socket. We just need to
     // see either an ErrorResponse frame (op byte 0x14) at position
     // [4] of the payload, or EOF.
-    let mut s2 = TcpStream::connect(&addr).expect("second connect");
+    let mut s2 = TcpStream::connect(&addrs.native).expect("second connect");
     s2.set_read_timeout(Some(Duration::from_millis(500)))
         .unwrap();
     let mut buf = [0u8; 256];
@@ -916,12 +888,13 @@ fn row_10_x_performance_doc_has_v4_27_baseline() {
 /// PERFORMANCE.md §Concurrency; this is the regression gate.)
 #[test]
 fn row_6_3_concurrent_reads_dont_serialize() {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir("cc");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let mut c = ChildGuard(spawn_server_with_env(&addr, &db, &wal, &[]));
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    let (raw, addrs) = local_spawn(&db, &wal, &[]);
+
+    let mut c = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s, "CREATE TABLE r (id INT NOT NULL, v INT NOT NULL)");
     for i in 0..200 {
@@ -929,11 +902,12 @@ fn row_6_3_concurrent_reads_dont_serialize() {
     }
     drop(s);
 
-    let serial = run_reads(&addr, 200);
+    let serial = run_reads(&addrs.native, 200);
 
+    let server_addr = addrs.native.clone();
     let handles: Vec<_> = (0..4)
         .map(|_| {
-            let a = addr.clone();
+            let a = server_addr.clone();
             thread::spawn(move || run_reads(&a, 200))
         })
         .collect();

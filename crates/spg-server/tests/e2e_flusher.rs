@@ -1,7 +1,9 @@
 #![allow(
     clippy::doc_markdown,
     clippy::cast_possible_truncation,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v5.4.1: end-to-end validation that the async-commit flusher
@@ -17,34 +19,22 @@
 //! it should and reports progress."
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::net::TcpStream;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+
+fn local_spawn(envs: &[(&str, &str)]) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new().with_http();
+    for (k, v) in envs {
+        b = b.env(*k, *v);
+    }
+    b.spawn()
+}
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("server exited early: {status:?}");
-        }
-        assert!(Instant::now() < deadline, "server at {addr} never came up");
-        thread::sleep(Duration::from_millis(20));
-    }
-}
 
 fn http_get_body(addr: &str) -> String {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -87,14 +77,6 @@ fn metric_f64(http: &str, name: &str) -> f64 {
         .map_or(0.0, |s| s.trim().parse::<f64>().unwrap_or(0.0))
 }
 
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[test]
 fn flusher_metric_zero_in_default_sync_commit_mode() {
     // Default mode: SPG_SYNCHRONOUS_COMMIT unset → sync semantics
@@ -102,23 +84,10 @@ fn flusher_metric_zero_in_default_sync_commit_mode() {
     // the counter must still read 0; non-zero would mean a spurious
     // spawn that breaks the v5.4 contract (sync mode preserves
     // every v4.42 durability invariant exactly).
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_spg-server"))
-            .arg(&native)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env("SPG_HTTP_ADDR", &http)
-            .env_remove("SPG_PASSWORD")
-            .env_remove("SPG_ADMIN_PASSWORD")
-            .env_remove("SPG_SYNCHRONOUS_COMMIT")
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_listener(&native, &mut child.0);
+    let (raw, addrs) = local_spawn(&[]);
+    let mut child = common::ChildGuard(raw);
     thread::sleep(Duration::from_millis(150));
-    let v = flusher_iterations(&http);
+    let v = flusher_iterations(addrs.http.as_ref().unwrap());
     assert_eq!(
         v, 0,
         "sync-commit (the default) must not spawn the flusher; got iterations={v}"
@@ -133,24 +102,13 @@ fn flusher_metric_rises_under_async_commit_off() {
     // wall time should yield ≥ 50 iterations even on a busy CI
     // host. The assertion uses ">= 10" to keep the test green on
     // a heavily-loaded scheduler.
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_spg-server"))
-            .arg(&native)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env("SPG_HTTP_ADDR", &http)
-            .env("SPG_SYNCHRONOUS_COMMIT", "off")
-            .env("SPG_FLUSHER_INTERVAL_US", "1000")
-            .env_remove("SPG_PASSWORD")
-            .env_remove("SPG_ADMIN_PASSWORD")
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_listener(&native, &mut child.0);
+    let (raw, addrs) = local_spawn(&[
+        ("SPG_SYNCHRONOUS_COMMIT", "off"),
+        ("SPG_FLUSHER_INTERVAL_US", "1000"),
+    ]);
+    let mut child = common::ChildGuard(raw);
     thread::sleep(Duration::from_millis(200));
-    let v = flusher_iterations(&http);
+    let v = flusher_iterations(addrs.http.as_ref().unwrap());
     assert!(
         v >= 10,
         "expected flusher_iterations_total >= 10 after 200ms at 1ms cadence, got {v}"
@@ -162,24 +120,13 @@ fn flusher_env_var_recognizes_off_false_zero() {
     // The opt-in keyword set is {off, false, 0}. Run three
     // separate spawns to confirm each lights up the flusher.
     for val in ["off", "false", "0"] {
-        let native = pick_free_addr();
-        let http = pick_free_addr();
-        let mut child = ChildGuard(
-            Command::new(env!("CARGO_BIN_EXE_spg-server"))
-                .arg(&native)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .env("SPG_HTTP_ADDR", &http)
-                .env("SPG_SYNCHRONOUS_COMMIT", val)
-                .env("SPG_FLUSHER_INTERVAL_US", "500")
-                .env_remove("SPG_PASSWORD")
-                .env_remove("SPG_ADMIN_PASSWORD")
-                .spawn()
-                .unwrap(),
-        );
-        wait_for_listener(&native, &mut child.0);
+        let (raw, addrs) = local_spawn(&[
+            ("SPG_SYNCHRONOUS_COMMIT", val),
+            ("SPG_FLUSHER_INTERVAL_US", "500"),
+        ]);
+        let mut child = common::ChildGuard(raw);
         thread::sleep(Duration::from_millis(100));
-        let v = flusher_iterations(&http);
+        let v = flusher_iterations(addrs.http.as_ref().unwrap());
         assert!(
             v >= 5,
             "SPG_SYNCHRONOUS_COMMIT={val:?} must enable the flusher; got iterations={v}"
@@ -195,24 +142,11 @@ fn durability_lag_metrics_are_zero_in_sync_mode() {
     // every write is fsynced before the client ack. Render-time
     // logic short-circuits to 0 instead of leaking
     // `last_durable_wal_offset = 0` against a growing WAL.
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_spg-server"))
-            .arg(&native)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env("SPG_HTTP_ADDR", &http)
-            .env_remove("SPG_PASSWORD")
-            .env_remove("SPG_ADMIN_PASSWORD")
-            .env_remove("SPG_SYNCHRONOUS_COMMIT")
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_listener(&native, &mut child.0);
+    let (raw, addrs) = local_spawn(&[]);
+    let mut child = common::ChildGuard(raw);
     thread::sleep(Duration::from_millis(100));
-    let lag_bytes = metric_u64(&http, "spg_durability_lag_bytes");
-    let lag_seconds = metric_f64(&http, "spg_durability_lag_seconds");
+    let lag_bytes = metric_u64(addrs.http.as_ref().unwrap(), "spg_durability_lag_bytes");
+    let lag_seconds = metric_f64(addrs.http.as_ref().unwrap(), "spg_durability_lag_seconds");
     assert_eq!(lag_bytes, 0, "sync mode must report 0 lag bytes");
     assert!(
         lag_seconds == 0.0,
@@ -227,25 +161,14 @@ fn durability_lag_seconds_bounded_in_async_mode() {
     // milliseconds old when `/metrics` is scraped. Allow 1 s of
     // headroom for CI scheduler jitter; tighter than that risks
     // flakes, looser than that defeats the gate's purpose.
-    let native = pick_free_addr();
-    let http = pick_free_addr();
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_spg-server"))
-            .arg(&native)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env("SPG_HTTP_ADDR", &http)
-            .env("SPG_SYNCHRONOUS_COMMIT", "off")
-            .env("SPG_FLUSHER_INTERVAL_US", "1000")
-            .env_remove("SPG_PASSWORD")
-            .env_remove("SPG_ADMIN_PASSWORD")
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_listener(&native, &mut child.0);
+    let (raw, addrs) = local_spawn(&[
+        ("SPG_SYNCHRONOUS_COMMIT", "off"),
+        ("SPG_FLUSHER_INTERVAL_US", "1000"),
+    ]);
+    let mut child = common::ChildGuard(raw);
     // Wait long enough for at least one flusher tick to land.
     thread::sleep(Duration::from_millis(50));
-    let lag_seconds = metric_f64(&http, "spg_durability_lag_seconds");
+    let lag_seconds = metric_f64(addrs.http.as_ref().unwrap(), "spg_durability_lag_seconds");
     assert!(
         lag_seconds < 1.0,
         "async-commit lag_seconds should be < 1 s under 1 ms cadence, got {lag_seconds}"
@@ -253,7 +176,7 @@ fn durability_lag_seconds_bounded_in_async_mode() {
     // Counter-positive sanity: the flusher must have run at
     // least once, otherwise lag_seconds being small is
     // misleading.
-    let iters = metric_u64(&http, "spg_flusher_iterations_total");
+    let iters = metric_u64(addrs.http.as_ref().unwrap(), "spg_flusher_iterations_total");
     assert!(
         iters >= 1,
         "expected flusher to have ticked at least once before scrape, got {iters}"
@@ -267,23 +190,10 @@ fn flusher_env_var_treats_on_as_sync() {
     // an explicit `on`. This pins the parser so a future tweak
     // doesn't silently widen the opt-in set.
     for val in ["on", "true", "1", "yes", ""] {
-        let native = pick_free_addr();
-        let http = pick_free_addr();
-        let mut child = ChildGuard(
-            Command::new(env!("CARGO_BIN_EXE_spg-server"))
-                .arg(&native)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .env("SPG_HTTP_ADDR", &http)
-                .env("SPG_SYNCHRONOUS_COMMIT", val)
-                .env_remove("SPG_PASSWORD")
-                .env_remove("SPG_ADMIN_PASSWORD")
-                .spawn()
-                .unwrap(),
-        );
-        wait_for_listener(&native, &mut child.0);
+        let (raw, addrs) = local_spawn(&[("SPG_SYNCHRONOUS_COMMIT", val)]);
+        let mut child = common::ChildGuard(raw);
         thread::sleep(Duration::from_millis(100));
-        let v = flusher_iterations(&http);
+        let v = flusher_iterations(addrs.http.as_ref().unwrap());
         assert_eq!(
             v, 0,
             "SPG_SYNCHRONOUS_COMMIT={val:?} must keep sync semantics; got iterations={v}"

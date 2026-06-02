@@ -5,7 +5,12 @@
     clippy::doc_markdown,
     clippy::manual_assert,
     clippy::uninlined_format_args,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables,
+    clippy::needless_borrow,
+    clippy::needless_pass_by_value,
+    clippy::empty_line_after_doc_comments
 )]
 
 //! v5.3.1 — CatalogManifest end-to-end through the server lifecycle.
@@ -25,9 +30,8 @@
 //! still resolve via SQL.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::net::TcpStream;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,16 +40,47 @@ use spg_wire::{
     parse_data_row_batch,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+mod common;
+
+fn local_spawn(
+    db: &std::path::Path,
+    want_http: bool,
+    extra_env: &[(&str, String)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new().arg_path(db);
+    if want_http {
+        b = b.with_http();
+    }
+    for (k, v) in extra_env {
+        b = b.env(*k, v);
+    }
+    b.spawn()
+}
+
+fn local_spawn_admin(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    want_http: bool,
+    extra_env: &[(&str, String)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal)
+        .env("SPG_ADMIN_PASSWORD", "adm-pw");
+    if want_http {
+        b = b.with_http();
+    }
+    for (k, v) in extra_env {
+        b = b.env(*k, v);
+    }
+    b.spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const FREEZE_DEADLINE: Duration = Duration::from_secs(10);
-
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -55,49 +90,6 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-manifest-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-fn spawn_server(addr: &str, db: &Path, http_addr: Option<&str>, env: &[(&str, String)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR")
-        .env_remove("SPG_FREEZER_DISABLE");
-    if let Some(h) = http_addr {
-        cmd.env("SPG_HTTP_ADDR", h);
-    }
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
 }
 
 fn read_frame(s: &mut TcpStream) -> Frame {
@@ -212,9 +204,6 @@ fn manifest_restores_cold_segments_across_restart() {
     let dir = unique_tmpdir("roundtrip");
     let db = dir.join("a.db");
     let manifest_path = dir.join("a.spg").join("manifest.v10");
-
-    let addr1 = pick_free_addr();
-    let http1 = pick_free_addr();
     let env: Vec<(&str, String)> = vec![
         ("SPG_HOT_TIER_BYTES", "512".to_string()),
         ("SPG_FREEZER_TICK_MS", "50".to_string()),
@@ -224,8 +213,10 @@ fn manifest_restores_cold_segments_across_restart() {
     // ---- session 1: insert, freeze, ensure manifest captured ----
     let frozen_pks_to_probe: Vec<i64>;
     {
-        let mut c = ChildGuard(spawn_server(&addr1, &db, Some(&http1), &env));
-        let mut s = wait_for_listener(&addr1, &mut c.0);
+        let (raw, addrs) = local_spawn(&db, true, &env);
+
+        let mut c = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         exec_ok(
@@ -246,7 +237,7 @@ fn manifest_restores_cold_segments_across_restart() {
         let mut cold: u64 = 0;
         while Instant::now() < deadline {
             thread::sleep(Duration::from_millis(100));
-            let (_code, body) = http_get(&http1, "/metrics");
+            let (_code, body) = http_get(addrs.http.as_ref().unwrap(), "/metrics");
             cold = metric_value(&body, "spg_cold_segments_total").unwrap_or(0);
             if cold > 0 {
                 break;
@@ -285,11 +276,11 @@ fn manifest_restores_cold_segments_across_restart() {
     thread::sleep(Duration::from_millis(200));
 
     // ---- session 2: same db file, freezer disabled, manifest preloads ----
-    let addr2 = pick_free_addr();
-    let http2 = pick_free_addr();
     let env2: Vec<(&str, String)> = vec![("SPG_FREEZER_DISABLE", "1".to_string())];
-    let mut c2 = ChildGuard(spawn_server(&addr2, &db, Some(&http2), &env2));
-    let mut s2 = wait_for_listener(&addr2, &mut c2.0);
+    let (raw, addrs) = local_spawn(&db, true, &env2);
+
+    let mut c2 = common::ChildGuard(raw);
+    let mut s2 = common::connect_to(&addrs.native);
     s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Frozen PKs must resolve through the manifest-restored cold
@@ -320,32 +311,6 @@ fn manifest_restores_cold_segments_across_restart() {
 /// Server runs with explicit admin password so CHECKPOINT (admin-
 /// gated) is reachable. Returns the spawned child + a client socket
 /// already authenticated as the admin.
-fn spawn_server_with_admin(
-    addr: &str,
-    db: &Path,
-    wal: &Path,
-    http_addr: Option<&str>,
-    extra_env: &[(&str, String)],
-) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("SPG_ADMIN_PASSWORD", "adm-pw")
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_PG_ADDR")
-        .env_remove("SPG_FREEZER_DISABLE");
-    if let Some(h) = http_addr {
-        cmd.env("SPG_HTTP_ADDR", h);
-    }
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
 
 fn auth_admin(s: &mut TcpStream) {
     send(s, &build_auth_user("admin", "adm-pw").unwrap());
@@ -370,8 +335,6 @@ fn checkpoint_truncates_wal_and_persists_through_restart() {
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
     let manifest_path = dir.join("a.spg").join("manifest.v10");
-
-    let addr1 = pick_free_addr();
     let env: Vec<(&str, String)> = vec![
         ("SPG_HOT_TIER_BYTES", "512".to_string()),
         ("SPG_FREEZER_TICK_MS", "50".to_string()),
@@ -380,8 +343,10 @@ fn checkpoint_truncates_wal_and_persists_through_restart() {
 
     let committed: i64;
     {
-        let mut c = ChildGuard(spawn_server_with_admin(&addr1, &db, &wal, None, &env));
-        let mut s = wait_for_listener(&addr1, &mut c.0);
+        let (raw, addrs) = local_spawn_admin(&db, &wal, false, &env);
+
+        let mut c = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         auth_admin(&mut s);
 
@@ -437,15 +402,15 @@ fn checkpoint_truncates_wal_and_persists_through_restart() {
     // Restart — admin password required because BACKUP/CHECKPOINT
     // bootstrap a user. Freezer disabled so the post-restart state
     // is what the manifest + WAL produce, no background tweaks.
-    let addr2 = pick_free_addr();
-    let mut c2 = ChildGuard(spawn_server_with_admin(
-        &addr2,
+    let (raw, addrs) = local_spawn_admin(
         &db,
         &wal,
-        None,
+        false,
         &[("SPG_FREEZER_DISABLE", "1".to_string())],
-    ));
-    let mut s2 = wait_for_listener(&addr2, &mut c2.0);
+    );
+
+    let mut c2 = common::ChildGuard(raw);
+    let mut s2 = common::connect_to(&addrs.native);
     s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     auth_admin(&mut s2);
 
@@ -469,15 +434,15 @@ fn checkpoint_rejects_non_admin_caller() {
     let dir = unique_tmpdir("checkpoint-rbac");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let addr = pick_free_addr();
-    let mut c = ChildGuard(spawn_server_with_admin(
-        &addr,
+    let (raw, addrs) = local_spawn_admin(
         &db,
         &wal,
-        None,
+        false,
         &[("SPG_FREEZER_DISABLE", "1".to_string())],
-    ));
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    );
+
+    let mut c = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     // Skip auth_admin — connect as anonymous. CHECKPOINT must be
     // rejected before the engine sees it.
@@ -516,7 +481,6 @@ fn restart_at_100m_under_60s_after_checkpoint() {
     let dir = unique_tmpdir("100m-restart");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let addr1 = pick_free_addr();
     let env: Vec<(&str, String)> = vec![
         // 512 MiB hot budget — the freezer keeps the working set
         // bounded while the loop runs.
@@ -525,8 +489,10 @@ fn restart_at_100m_under_60s_after_checkpoint() {
         ("SPG_FREEZER_BATCH_ROWS", "50000".to_string()),
     ];
     {
-        let mut c = ChildGuard(spawn_server_with_admin(&addr1, &db, &wal, None, &env));
-        let mut s = wait_for_listener(&addr1, &mut c.0);
+        let (raw, addrs) = local_spawn_admin(&db, &wal, false, &env);
+
+        let mut c = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(Duration::from_mins(1))).unwrap();
         auth_admin(&mut s);
 
@@ -551,16 +517,15 @@ fn restart_at_100m_under_60s_after_checkpoint() {
 
     // Measure: spawn → wait_for_listener — that's the wall time the
     // user perceives from "kill" to "next CC'd query is possible".
-    let addr2 = pick_free_addr();
     let started = Instant::now();
-    let mut c2 = ChildGuard(spawn_server_with_admin(
-        &addr2,
+    let (raw, addrs) = local_spawn_admin(
         &db,
         &wal,
-        None,
+        false,
         &[("SPG_FREEZER_DISABLE", "1".to_string())],
-    ));
-    let _ = wait_for_listener(&addr2, &mut c2.0);
+    );
+
+    let mut c2 = common::ChildGuard(raw);
     let elapsed = started.elapsed();
     eprintln!("restart-100m: wall time {elapsed:?}");
     assert!(
