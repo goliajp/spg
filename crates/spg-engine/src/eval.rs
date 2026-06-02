@@ -716,6 +716,12 @@ fn value_to_text(v: &Value) -> String {
                 .collect();
             format!("[{}]", cells.join(", "))
         }
+        // v6.0.3: HalfVector cells dequantise bit-exactly to f32
+        // for SELECT output.
+        Value::HalfVector(h) => {
+            let cells: Vec<String> = h.to_f32_vec().iter().map(|x| format!("{x}")).collect();
+            format!("[{}]", cells.join(", "))
+        }
         Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
@@ -1656,6 +1662,8 @@ fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>),
         match v {
             Value::Vector(a) => Some(a),
             Value::Sq8Vector(q) => Some(spg_storage::quantize::dequantize(&q)),
+            // v6.0.3: bit-exact dequant for halfvec cells.
+            Value::HalfVector(h) => Some(h.to_f32_vec()),
             _ => None,
         }
     };

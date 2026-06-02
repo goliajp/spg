@@ -3038,6 +3038,8 @@ fn value_to_wire(v: &Value) -> WireValue {
         // the column's storage encoding. Recall envelope absorbs
         // the ≤ (max-min)/255/2 dequantisation error.
         Value::Sq8Vector(q) => WireValue::Vector(spg_storage::quantize::dequantize(q)),
+        // v6.0.3: HalfVector cells decode bit-exactly back to f32.
+        Value::HalfVector(h) => WireValue::Vector(h.to_f32_vec()),
         // NUMERIC / DATE / TIMESTAMP render as their canonical
         // text form on the wire. Drivers receive plain UTF-8,
         // identical to what `value_to_text` produces in the engine.

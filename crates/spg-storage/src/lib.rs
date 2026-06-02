@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod bloom;
+pub mod halfvec;
 pub mod persistent;
 pub mod persistent_btree;
 pub mod quantize;
@@ -44,11 +45,14 @@ use self::persistent_btree::PersistentBTreeMap;
 /// `Sq8` (v6.0.1) stores `Sq8Vector { min, max, bytes: Vec<u8> }`
 /// per cell; 4× compression vs `F32` with recall@10 ≥ 0.95 on
 /// natural embeddings (Gaussian / unit-sphere corpora).
+/// `F16` (v6.0.3, DDL keyword `HALF`) stores each element as
+/// IEEE-754 binary16; 2× compression and bit-exact dequantise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VecEncoding {
     #[default]
     F32,
     Sq8,
+    F16,
 }
 
 impl fmt::Display for VecEncoding {
@@ -56,6 +60,7 @@ impl fmt::Display for VecEncoding {
         match self {
             Self::F32 => f.write_str("F32"),
             Self::Sq8 => f.write_str("SQ8"),
+            Self::F16 => f.write_str("HALF"),
         }
     }
 }
@@ -131,6 +136,7 @@ impl fmt::Display for DataType {
             Self::Vector { dim, encoding } => match encoding {
                 VecEncoding::F32 => write!(f, "VECTOR({dim})"),
                 VecEncoding::Sq8 => write!(f, "VECTOR({dim}) USING SQ8"),
+                VecEncoding::F16 => write!(f, "VECTOR({dim}) USING HALF"),
             },
             Self::Numeric { precision, scale } => {
                 if *scale == 0 {
@@ -166,6 +172,12 @@ pub enum Value {
     /// dequantises to `f32` on SELECT; INSERT path quantises
     /// incoming `Vector(Vec<f32>)` cells into this variant.
     Sq8Vector(crate::quantize::Sq8Vector),
+    /// v6.0.3: IEEE-754 binary16 vector cell. Lives in columns
+    /// declared `VECTOR(N) USING HALF`. Stores raw u16 LE bits
+    /// (2× compression vs `Vector(Vec<f32>)`). Wire / display
+    /// paths dequantise to f32 bit-exactly; INSERT path converts
+    /// incoming f32 vectors at the engine boundary.
+    HalfVector(crate::halfvec::HalfVector),
     /// Exact fixed-point decimal. `scaled` holds the value as
     /// `actual * 10^scale` so the storage type is always integral —
     /// arithmetic never falls back to floating-point.
@@ -209,6 +221,10 @@ impl Value {
             Self::Sq8Vector(q) => Some(DataType::Vector {
                 dim: u32::try_from(q.bytes.len()).expect("vector dim ≤ u32"),
                 encoding: VecEncoding::Sq8,
+            }),
+            Self::HalfVector(h) => Some(DataType::Vector {
+                dim: u32::try_from(h.dim()).expect("vector dim ≤ u32"),
+                encoding: VecEncoding::F16,
             }),
             // `Value::Numeric` doesn't carry its precision (the column
             // schema does); we surface precision=0 as "unknown" and let
@@ -310,6 +326,7 @@ impl IndexKey {
             | Value::Float(_)
             | Value::Vector(_)
             | Value::Sq8Vector(_)
+            | Value::HalfVector(_)
             | Value::Numeric { .. }
             | Value::Interval { .. }
             | Value::Json(_) => None,
@@ -1153,6 +1170,7 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     let cell_dim: Option<usize> = match &table.rows[new_row_idx].values[col_pos] {
         Value::Vector(v) => Some(v.len()),
         Value::Sq8Vector(q) => Some(q.bytes.len()),
+        Value::HalfVector(h) => Some(h.dim()),
         _ => None,
     };
     let Some(dim) = cell_dim else {
@@ -1196,6 +1214,9 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
         // small dequantisation error is what the recall@10 ≥ 0.95
         // envelope already accounts for (V6_DESIGN deliberation #3).
         Value::Sq8Vector(q) => quantize::dequantize(q),
+        // v6.0.3: halfvec dequant is bit-exact at the storage layer,
+        // so the inserted query is a faithful representation.
+        Value::HalfVector(h) => h.to_f32_vec(),
         _ => return,
     };
     // Phase 1: greedy descend from `entry` down to `level + 1`, keeping
@@ -1476,7 +1497,7 @@ fn select_neighbours_heuristic(
         // which the `< d_q` test will never accept.
         if !matches!(
             table.rows.get(e).and_then(|r| r.values.get(col_pos)),
-            Some(Value::Vector(_) | Value::Sq8Vector(_))
+            Some(Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_))
         ) {
             continue;
         }
@@ -1524,7 +1545,7 @@ fn connect_at_layer(
         // below without dequantising.
         if !matches!(
             &table.rows[peer].values[col_pos],
-            Value::Vector(_) | Value::Sq8Vector(_)
+            Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_)
         ) {
             continue;
         }
@@ -1580,6 +1601,14 @@ fn vec_l2_sq(table: &Table, col_pos: usize, row: usize, query: &[f32]) -> f32 {
         Some(Value::Sq8Vector(q)) if q.bytes.len() == query.len() => {
             quantize::sq8_l2_distance_sq_asymmetric(q, query)
         }
+        // v6.0.3: halfvec dequantises bit-exactly to f32 in-loop;
+        // the cost of dequant is amortised into the FMA body of
+        // the v6.0.2 NEON `l2_distance_sq` path. NEON f16 SIMD
+        // lands once stable Rust ships the intrinsics.
+        Some(Value::HalfVector(h)) if h.dim() == query.len() => {
+            let deq = h.to_f32_vec();
+            l2_distance_sq(&deq, query)
+        }
         _ => f32::INFINITY,
     }
 }
@@ -1601,6 +1630,15 @@ fn cell_l2_sq(table: &Table, col_pos: usize, row_a: usize, row_b: usize) -> f32 
         (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => l2_distance_sq(a, b),
         (Value::Sq8Vector(a), Value::Sq8Vector(b)) if a.bytes.len() == b.bytes.len() => {
             quantize::sq8_l2_distance_sq(a, b)
+        }
+        // v6.0.3: halfvec — dequant both sides to f32 then run the
+        // standard NEON L2 path. Single-encoding-per-column is a
+        // schema invariant so mixed shapes are impossible by
+        // construction.
+        (Value::HalfVector(a), Value::HalfVector(b)) if a.dim() == b.dim() => {
+            let af = a.to_f32_vec();
+            let bf = b.to_f32_vec();
+            l2_distance_sq(&af, &bf)
         }
         _ => f32::INFINITY,
     }
@@ -1624,6 +1662,12 @@ fn cell_to_query_metric_distance(
             NswMetric::InnerProduct => quantize::sq8_inner_product_asymmetric(q, query),
             NswMetric::Cosine => quantize::sq8_cosine_distance_asymmetric(q, query),
         },
+        // v6.0.3: halfvec dequant-in-loop, then route through the
+        // existing v6.0.2 f32 NEON `metric_distance`.
+        Some(Value::HalfVector(h)) if h.dim() == query.len() => {
+            let deq = h.to_f32_vec();
+            metric_distance(metric, &deq, query)
+        }
         _ => f32::INFINITY,
     }
 }
@@ -1669,8 +1713,10 @@ fn nsw_search(
     let col_pos = table.indices[idx_pos].column_position;
     // v6.0.1 step 5: SQ8 columns over-fetch by `SQ8_RERANK_OVER_FETCH`
     // so the rerank pass below sees enough candidates to recover
-    // recall after the ADC re-ordering. F32 columns skip the
-    // over-fetch (exact distances already, nothing to rerank).
+    // recall after the ADC re-ordering. F32 + F16 columns skip the
+    // over-fetch — F32 distances are exact, F16 dequant is
+    // bit-exact at the storage layer so the beam search already
+    // ranks under the column's full precision.
     let sq8 = matches!(
         table.schema.columns.get(col_pos).map(|c| c.ty),
         Some(DataType::Vector {
@@ -3033,6 +3079,12 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
                 out.push(6);
                 out.extend_from_slice(&dim.to_le_bytes());
             }
+            // v6.0.3: tag 15 for `VECTOR(N) USING HALF`. Same
+            // forward-compat fence story as SQ8 below.
+            VecEncoding::F16 => {
+                out.push(15);
+                out.extend_from_slice(&dim.to_le_bytes());
+            }
             // v6.0.1: new tag 14 for `VECTOR(N) USING SQ8` column
             // type. Pre-v6 readers fall through `read_data_type`'s
             // catch-all and surface `Corrupt("unknown data type tag")`
@@ -3098,6 +3150,13 @@ impl Cursor<'_> {
                 dim: self.read_u32()?,
                 encoding: VecEncoding::Sq8,
             }),
+            // v6.0.3: tag 15 for `VECTOR(N) USING HALF`. Same
+            // [u32 dim] type-tag payload as F32 / SQ8; the encoding
+            // lives in the tag byte itself.
+            15 => Ok(DataType::Vector {
+                dim: self.read_u32()?,
+                encoding: VecEncoding::F16,
+            }),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -3151,6 +3210,9 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         // `write_value_body` writer lands in step 6) keeps the
         // sizing arithmetic honest for in-memory benches.
         Value::Sq8Vector(q) => 4 + 4 + 4 + q.bytes.len(),
+        // v6.0.3: halfvec on-disk shape — [u32 dim][u16 LE * dim]
+        // = 4 + 2 * dim bytes.
+        Value::HalfVector(h) => 4 + h.bytes.len(),
         // [i128 scaled][u8 scale]
         Value::Numeric { .. } => 16 + 1,
         // NULL is encoded only in the bitmap, never in the body.
@@ -3277,6 +3339,20 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
             out.extend_from_slice(&q.max.to_le_bytes());
             out.extend_from_slice(&q.bytes);
         }
+        // v6.0.3: halfvec dense body — [u32 dim][u16 LE * dim].
+        // The raw u16 bytes already live in `h.bytes` little-
+        // endian, so we just splat them.
+        (
+            Value::HalfVector(h),
+            DataType::Vector {
+                encoding: VecEncoding::F16,
+                ..
+            },
+        ) => {
+            let dim = u32::try_from(h.dim()).expect("vector dim fits in u32");
+            out.extend_from_slice(&dim.to_le_bytes());
+            out.extend_from_slice(&h.bytes);
+        }
         (Value::Numeric { scaled, .. }, DataType::Numeric { scale, .. }) => {
             out.extend_from_slice(&scaled.to_le_bytes());
             out.push(scale);
@@ -3349,6 +3425,16 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.extend_from_slice(&q.min.to_le_bytes());
             out.extend_from_slice(&q.max.to_le_bytes());
             out.extend_from_slice(&q.bytes);
+        }
+        // v6.0.3: tag 12 for a HalfVector cell.
+        // Layout: `[u32 dim][u16 LE × dim]` — bit-identical to the
+        // dense row body so `write_value` / `read_value` bit-equal
+        // the original `Value::HalfVector`.
+        Value::HalfVector(h) => {
+            out.push(12);
+            let dim = u32::try_from(h.dim()).expect("vector dim fits in u32");
+            out.extend_from_slice(&dim.to_le_bytes());
+            out.extend_from_slice(&h.bytes);
         }
         Value::Numeric { scaled, scale } => {
             out.push(8);
@@ -3523,6 +3609,14 @@ impl<'a> Cursor<'a> {
                 let bytes = self.take(dim)?.to_vec();
                 Ok(Value::Sq8Vector(quantize::Sq8Vector { min, max, bytes }))
             }
+            DataType::Vector {
+                encoding: VecEncoding::F16,
+                ..
+            } => {
+                let dim = self.read_u32()? as usize;
+                let bytes = self.take(dim * 2)?.to_vec();
+                Ok(Value::HalfVector(halfvec::HalfVector { bytes }))
+            }
             DataType::Numeric { .. } => {
                 let s = self.take(16)?;
                 let arr: [u8; 16] = s.try_into().expect("checked");
@@ -3586,6 +3680,13 @@ impl<'a> Cursor<'a> {
                 let max = self.read_f32()?;
                 let bytes = self.take(dim)?.to_vec();
                 Ok(Value::Sq8Vector(quantize::Sq8Vector { min, max, bytes }))
+            }
+            // v6.0.3: tag 12 — HalfVector. Same forward-compat
+            // fence story as tag 11.
+            12 => {
+                let dim = self.read_u32()? as usize;
+                let bytes = self.take(dim * 2)?.to_vec();
+                Ok(Value::HalfVector(halfvec::HalfVector { bytes }))
             }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
@@ -4107,6 +4208,151 @@ mod tests {
         assert_eq!(rt.rows()[5].values[1], before_cell);
         let after_hits = nsw_query(rt, "v_idx", &query, 5, NswMetric::L2);
         assert_eq!(before_hits, after_hits);
+    }
+
+    #[test]
+    fn half_catalog_serialise_roundtrip_preserves_cells_and_index() {
+        // v6.0.3 step 4 verify: a catalog with a `VECTOR(N) USING
+        // HALF` column + NSW index survives a full serialise →
+        // deserialise cycle. Cells re-decode bit-identically (raw
+        // u16 LE bytes), the NSW topology stays intact, and kNN
+        // search still returns the same hit IDs against the
+        // restored catalog.
+        use crate::halfvec;
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "vecs",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim: 8,
+                        encoding: VecEncoding::F16,
+                    },
+                    false,
+                ),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("vecs").unwrap();
+        for i in 0..32_i32 {
+            #[allow(clippy::cast_precision_loss)]
+            let base = (i as f32) * 0.03;
+            let v: Vec<f32> = (0..8_i32)
+                .map(|j| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let off = (j as f32) * 0.01;
+                    base + off
+                })
+                .collect();
+            t.insert(Row::new(alloc::vec![
+                Value::Int(i),
+                Value::HalfVector(halfvec::HalfVector::from_f32_slice(&v)),
+            ]))
+            .unwrap();
+        }
+        t.add_nsw_index("v_idx".into(), "v", NSW_DEFAULT_M).unwrap();
+        let query = alloc::vec![0.15_f32, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22];
+        let (before_cell, before_ty, before_hits) = {
+            let t_ref = cat.get("vecs").unwrap();
+            (
+                t_ref.rows()[5].values[1].clone(),
+                t_ref.schema().columns[1].ty,
+                nsw_query(t_ref, "v_idx", &query, 5, NswMetric::L2),
+            )
+        };
+        let bytes = cat.serialize();
+        let restored = Catalog::deserialize(&bytes).expect("deserialize ok");
+        let rt = restored.get("vecs").unwrap();
+        assert_eq!(rt.schema().columns[1].ty, before_ty);
+        assert_eq!(rt.rows()[5].values[1], before_cell);
+        let after_hits = nsw_query(rt, "v_idx", &query, 5, NswMetric::L2);
+        assert_eq!(before_hits, after_hits);
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn hnsw_half_recall_at_10_matches_f32_groundtruth() {
+        // v6.0.3 step 3 verify: HALF column NSW retrieves ≥ 95%
+        // top-10 overlap vs brute-force F32 ground truth.
+        // Half-precision dequantises bit-exactly at the storage
+        // layer (no rerank pass), so the recall floor is tighter
+        // than the SQ8 case — only the rounding noise from f32 →
+        // f16 quantisation contributes.
+        use crate::halfvec;
+        fn next(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_add(0x9E37_79B9_7F4A_7C15)
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            #[allow(clippy::cast_precision_loss)]
+            let u = ((*state >> 32) as u32 as f32) / (u32::MAX as f32);
+            2.0 * u - 1.0
+        }
+        let dim: u32 = 32;
+        let n: usize = 512;
+        let dim_us = dim as usize;
+        let mut seed: u64 = 0xF16_F16_F16_F16_u64;
+        let corpus: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim_us).map(|_| next(&mut seed)).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..32)
+            .map(|_| (0..dim_us).map(|_| next(&mut seed)).collect())
+            .collect();
+        let exact_top10: Vec<Vec<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut scored: Vec<(f32, usize)> = corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (l2_distance_sq(v, q), i))
+                    .collect();
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+                scored.into_iter().take(10).map(|(_, i)| i).collect()
+            })
+            .collect();
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "vecs",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim,
+                        encoding: VecEncoding::F16,
+                    },
+                    false,
+                ),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("vecs").unwrap();
+        for (i, v) in corpus.iter().enumerate() {
+            t.insert(Row::new(alloc::vec![
+                Value::Int(i32::try_from(i).unwrap()),
+                Value::HalfVector(halfvec::HalfVector::from_f32_slice(v)),
+            ]))
+            .unwrap();
+        }
+        t.add_nsw_index("v_idx".into(), "v", NSW_DEFAULT_M).unwrap();
+        let table = cat.get("vecs").unwrap();
+        let mut total_overlap = 0_usize;
+        for (q, exact) in queries.iter().zip(exact_top10.iter()) {
+            let hits = nsw_query(table, "v_idx", q, 10, NswMetric::L2);
+            for h in &hits {
+                if exact.contains(h) {
+                    total_overlap += 1;
+                }
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let recall = total_overlap as f32 / (10.0 * queries.len() as f32);
+        assert!(
+            recall >= 0.95,
+            "HALF HNSW recall@10 = {recall:.3}, below floor 0.95 — \
+             check halfvec dispatch in `cell_to_query_metric_distance`"
+        );
     }
 
     #[test]

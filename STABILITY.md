@@ -635,6 +635,49 @@ stores adjacency lists by row index), and the cell encoding is
 carried by the per-column type tag above. The `kind=NSW_GRAPH`
 block byte layout is unchanged from v5.5.
 
+### halfvec — `VECTOR(N) USING HALF` (v6.0.3)
+
+v6.0.3 adds the second alternative encoding: IEEE-754 binary16
+(half-precision). Each of the following is frozen.
+
+**1. DDL grammar extension.** `USING <encoding>` learns the
+keyword `HALF` (pgvector convention). Case-insensitive on both
+`USING` and `HALF`. `HALF` selects `VecEncoding::F16`; omitting
+the clause keeps the pre-v6 `F32` default.
+
+**2. Catalog DataType tag (catalog v9, deserialise side).**
+`write_data_type` / `read_data_type` gain:
+
+| tag | payload     | meaning                       |
+|----:|-------------|-------------------------------|
+|  15 | `[u32 dim]` | `VECTOR(N) USING HALF` column |
+
+Pre-v6 binaries reading tag 15 fail with `Corrupt("unknown data
+type tag: 15")` — same forward-compat fence as tag 14 (SQ8).
+
+**3. Tag-prefixed value codec.** `write_value` / `read_value`
+gain:
+
+| tag | payload                              | maps to                |
+|----:|--------------------------------------|------------------------|
+|  12 | `[u32 dim][u16 LE × dim]`            | `Value::HalfVector`    |
+
+Body shape: dimension followed by raw little-endian IEEE-754
+binary16 bits — `4 + 2 × dim` bytes total.
+
+**4. Dense-row body.** Schema-driven by the column's encoding:
+
+- `DataType::Vector { encoding: F32, dim }` → unchanged.
+- `DataType::Vector { encoding: Sq8, dim }` → unchanged.
+- `DataType::Vector { encoding: F16, dim }` →
+  `[u32 dim][u16 LE × dim]` (`4 + 2 × dim` bytes).
+
+**5. f16 codec.** The IEEE 754-2008 binary16 round-to-nearest-
+even codec in `spg_storage::halfvec` is part of the contract —
+bit-for-bit reproducible across hosts. `f16_from_f32_bits` /
+`f16_to_f32_bits` (raw u32 ↔ u16) are public surface kept
+stable for serialisation parity.
+
 ---
 
 ## Not frozen (free to change in any release)

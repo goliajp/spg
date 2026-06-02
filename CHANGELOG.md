@@ -10,6 +10,103 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.0.3] — 2026-06-02 (halfvec — `VECTOR(N) USING HALF`)
+
+### What changed
+
+v6.0.3 adds the second alternative cell encoding: IEEE-754
+binary16 (half-precision). 2× memory compression vs the pre-v6
+f32 baseline at the cost of bounded mantissa precision (~3
+decimal digits). Storage `Value::HalfVector { bytes: Vec<u8> }`
+carries raw little-endian u16 bits. Distance computation
+dequantises bit-exactly to f32 in-loop and reuses the v6.0.2 f32
+NEON paths — no rerank pass is needed because dequant has no
+approximation error at the storage layer (unlike SQ8 ADC).
+
+### Stable-Rust constraint
+
+V6_DESIGN L2 originally promised "NEON SIMD `l2 / cosine /
+inner_product` on f16" via aarch64 `fcvt`. Stable Rust 1.96
+(this workspace's toolchain) gates both `f16` and the
+`core::arch::aarch64` f16 intrinsics behind unstable feature
+flags (rust-lang/rust#116909, #125606). v6.0.3 ships with a
+hand-rolled IEEE 754-2008 binary16 codec instead; native f16
+SIMD lands as v6.0.6 or whenever the toolchain catches up. The
+DDL surface + on-disk format are forward-compatible with that
+future change.
+
+### Added
+
+- `VecEncoding::F16` variant in `spg_sql::ast::VecEncoding` +
+  `spg_storage::VecEncoding`. `Display` emits `HALF` (pgvector
+  convention).
+- Parser `USING HALF` (case-insensitive) — rejected unknown
+  encodings now list both `SQ8` and `HALF` in the error.
+- `spg_storage::halfvec` module with `HalfVector` + bit-twiddle
+  codec functions `f16_from_f32_bits` / `f16_to_f32_bits` (raw
+  u32 ↔ u16). Matches IEEE 754-2008 §7.4 round-to-nearest-even
+  + subnormal flush-to-zero on underflow + saturation to ±∞ on
+  overflow. 7 unit tests cover roundtrip, special values, and
+  bounded relative error.
+- `Value::HalfVector(HalfVector)` cell variant. `data_type()`
+  reports `Vector { dim: bytes.len() / 2, encoding: F16 }`.
+- INSERT path `coerce_value` arm `(Value::Vector,
+  DataType::Vector { encoding: F16, dim })` → quantises raw f32
+  literals into halfvec cells. Dim mismatch surfaces as
+  `TypeMismatch`.
+- HNSW build + kNN search dispatch: `vec_l2_sq` / `cell_l2_sq`
+  / `cell_to_query_metric_distance` learn `Value::HalfVector`
+  arms that dequant to f32 and route through the v6.0.2 NEON
+  paths. `nsw_insert_at` extracts the inserted cell's f32 form
+  via `HalfVector::to_f32_vec()`.
+- `nsw_search` skips the SQ8 over-fetch for HALF columns —
+  dequant is bit-exact, so the beam result IS the exact answer.
+- On-disk catalog tag 15 for `DataType::Vector { encoding: F16 }`
+  + tag-prefixed value tag 12 for `Value::HalfVector`. Pre-v6
+  readers fail with `Corrupt("unknown … tag")` (forward-compat
+  fence).
+- Lib tests: `hnsw_half_recall_at_10_matches_f32_groundtruth`
+  (≥ 0.95 recall vs brute-force f32 ground truth on 512 × dim-32
+  splitmix64 corpus), `half_catalog_serialise_roundtrip_
+  preserves_cells_and_index` (catalog snapshot roundtrip
+  preserves cells + NSW topology).
+- e2e tests `crates/spg-server/tests/e2e_half.rs::*` — full
+  pgwire roundtrip + dequant-on-wire check.
+- Engine lib tests: `create_table_vector_using_half_succeeds_
+  and_insert_converts_to_f16`, `insert_into_half_column_dim_
+  mismatch_errors`.
+
+### Changed
+
+- Renderers (`value_to_text`, `value_to_pg_text`,
+  `encode_copy_cell`, `value_to_wire`, sqllogictest
+  `render_cell`) accept the new variant and dequantise to f32
+  on output. SELECT / COPY / GROUP BY on `USING HALF` columns
+  produce pgvector-shape `[x, y, z, ...]` text.
+- `Cargo.toml` storage crate gains the `halfvec` module
+  (`pub mod halfvec`).
+
+### Ship-gate verification
+
+- Workspace `cargo test --release` 102 / 102 test groups green;
+  158 lib tests in spg-storage (up from 149 in v6.0.2).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+  (bit-twiddle module gets a scoped allow-list).
+- `cargo fmt --all -- --check` clean.
+- xtests/sqllogictest 4-corpus stays 100% (148 + 17 + 144 + 63).
+
+### Why this matters
+
+PG 19 audit-derived v6.0 plan called out alternative encodings
+to close the storage-size gap vs competitors. SQ8 (v6.0.1)
+hits 4× compression at recall@10 ≥ 0.95; HALF hits 2×
+compression at bit-exact dequant. Two complementary points on
+the precision/compression trade-off; clients pick per-column.
+At 1M dim-128 the storage RSS target is ≤ 260 MiB (vs raw f32
+488 MiB + pgvector halfvec ~300 MiB).
+
+---
+
 ## [6.0.2] — 2026-06-02 (NEON SIMD for f32 cosine/IP + SQ8 ADC)
 
 ### What changed

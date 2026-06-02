@@ -122,7 +122,8 @@ pub struct ColumnDef {
 /// optional `USING <encoding>` clause; omitting it keeps the
 /// pre-v6 `F32` default. `Sq8` quantises each cell to a per-vector
 /// affine `(min, max, [u8; dim])` triple (4× compression). `F16`
-/// is reserved for v6.0.3 (`USING HALF`).
+/// (v6.0.3, DDL keyword `HALF`) stores each element as IEEE-754
+/// binary16 (2× compression, ~3 decimal digits of precision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VecEncoding {
     /// IEEE-754 binary32. Pre-v6 default; matches pgvector's
@@ -134,6 +135,11 @@ pub enum VecEncoding {
     /// envelope (≥ 0.95 on Gaussian / unit-sphere corpora at
     /// dim ≥ 32).
     Sq8,
+    /// v6.0.3 halfvec — IEEE-754 binary16 (half-precision)
+    /// per-element. DDL keyword `HALF` (pgvector convention).
+    /// Bit-exact dequantise to f32 at the storage layer; no
+    /// rerank pass needed for kNN search.
+    F16,
 }
 
 impl fmt::Display for VecEncoding {
@@ -141,6 +147,8 @@ impl fmt::Display for VecEncoding {
         match self {
             Self::F32 => f.write_str("F32"),
             Self::Sq8 => f.write_str("SQ8"),
+            // pgvector convention: DDL keyword is `HALF`, not `F16`.
+            Self::F16 => f.write_str("HALF"),
         }
     }
 }
@@ -193,6 +201,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Vector { dim, encoding } => match encoding {
                 VecEncoding::F32 => write!(f, "VECTOR({dim})"),
                 VecEncoding::Sq8 => write!(f, "VECTOR({dim}) USING SQ8"),
+                VecEncoding::F16 => write!(f, "VECTOR({dim}) USING HALF"),
             },
             Self::Numeric(p, s) => {
                 if *s == 0 {
