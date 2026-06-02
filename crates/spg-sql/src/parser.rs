@@ -1205,6 +1205,10 @@ impl Parser {
             Token::True => Ok(Expr::Literal(Literal::Bool(true))),
             Token::False => Ok(Expr::Literal(Literal::Bool(false))),
             Token::Null => Ok(Expr::Literal(Literal::Null)),
+            // v6.1.1 — `$N` placeholder. The actual Value lookup
+            // happens in the engine eval path against the prepared-
+            // statement bind buffer.
+            Token::Placeholder(n) => Ok(Expr::Placeholder(n)),
             Token::LParen => {
                 // v4.10: `(SELECT ...)` in expression position is a
                 // scalar subquery; otherwise it's a parenthesised
@@ -2388,6 +2392,53 @@ mod tests {
             panic!()
         };
         assert_eq!(c.columns[0].ty.to_string(), "VECTOR(64) USING SQ8");
+    }
+
+    #[test]
+    fn parser_recognises_placeholders() {
+        use crate::ast::{Expr, SelectItem, Statement};
+        // $N in expression position parses as Expr::Placeholder(N).
+        let s = parse("SELECT $1, $2 + 1 FROM t WHERE x = $3");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            sel.items[0],
+            SelectItem::Expr {
+                expr: Expr::Placeholder(1),
+                alias: None
+            }
+        ));
+        // $2 + 1
+        let SelectItem::Expr {
+            expr: Expr::Binary { lhs, rhs, .. },
+            ..
+        } = &sel.items[1]
+        else {
+            panic!()
+        };
+        assert!(matches!(**lhs, Expr::Placeholder(2)));
+        assert!(matches!(**rhs, Expr::Literal(Literal::Integer(1))));
+        // WHERE x = $3
+        let Some(Expr::Binary { rhs, .. }) = sel.where_.as_ref() else {
+            panic!()
+        };
+        assert!(matches!(**rhs, Expr::Placeholder(3)));
+    }
+
+    #[test]
+    fn parser_rejects_dollar_zero() {
+        // $0 is not valid in PG; the lexer rejects it.
+        assert!(parse_statement("SELECT $0").is_err());
+    }
+
+    #[test]
+    fn placeholder_display_roundtrips() {
+        // The Display impl must produce text that re-lexes to the
+        // same Placeholder token.
+        let s = parse("SELECT $42 FROM t");
+        let printed = s.to_string();
+        assert!(printed.contains("$42"));
+        let again = parse(&printed);
+        assert_eq!(s, again);
     }
 
     #[test]

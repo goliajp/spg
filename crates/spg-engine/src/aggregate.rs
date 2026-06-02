@@ -76,6 +76,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         | Expr::InSubquery { .. }
         | Expr::WindowFunction { .. }
         | Expr::Literal(_)
+        | Expr::Placeholder(_)
         | Expr::Column(_) => false,
     }
 }
@@ -327,6 +328,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
         | Expr::InSubquery { .. }
         | Expr::WindowFunction { .. }
         | Expr::Literal(_)
+        | Expr::Placeholder(_)
         | Expr::Column(_) => {}
     }
 }
@@ -519,6 +521,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         | Expr::InSubquery { .. }
         | Expr::WindowFunction { .. }
         | Expr::Literal(_)
+        | Expr::Placeholder(_)
         | Expr::Column(_) => e.clone(),
     }
 }

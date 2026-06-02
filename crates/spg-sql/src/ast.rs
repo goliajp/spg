@@ -369,6 +369,12 @@ pub enum JoinKind {
 pub enum Expr {
     Literal(Literal),
     Column(ColumnName),
+    /// v6.1.1 — `$N` parameter placeholder for the extended query
+    /// protocol. The number is 1-based per PostgreSQL convention.
+    /// Evaluation looks up `params[N-1]` from the prepared-statement
+    /// bind buffer; out-of-range indices raise a runtime error
+    /// (same shape as a column-not-found miss).
+    Placeholder(u16),
     Binary {
         lhs: Box<Expr>,
         op: BinOp,
@@ -884,6 +890,7 @@ impl fmt::Display for Expr {
         match self {
             Self::Literal(l) => write!(f, "{l}"),
             Self::Column(c) => write!(f, "{c}"),
+            Self::Placeholder(n) => write!(f, "${n}"),
             Self::Binary { lhs, op, rhs } => write!(f, "({lhs} {op} {rhs})"),
             Self::Unary { op, expr } => match op {
                 UnOp::Not => write!(f, "(NOT {expr})"),

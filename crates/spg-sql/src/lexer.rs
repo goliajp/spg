@@ -112,6 +112,10 @@ pub enum Token {
     /// `INTERVAL` — followed by a string literal carrying the span text
     /// (e.g. `INTERVAL '1 day 2 hours'`).
     Interval,
+    /// v6.1.1 — `$N` parameter placeholder for the extended query
+    /// protocol. The number N is 1-based per PostgreSQL convention.
+    /// `0` and `$0` are not valid; the lexer rejects them.
+    Placeholder(u16),
 
     Eof,
 }
@@ -301,6 +305,28 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             b'!' if peek_eq(bytes, i + 1, b'=') => {
                 out.push(Token::NotEq);
                 i += 2;
+            }
+            // v6.1.1: `$N` parameter placeholder for the extended
+            // query protocol. PG numbers them 1..=N; we reject $0
+            // and a bare `$` not followed by a digit. Dollar-quoted
+            // strings ($$ ... $$) are not supported here — they're
+            // a separate lexer feature filed for a future release.
+            b'$' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() => {
+                let mut j = i + 1;
+                let mut n: u32 = 0;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    n = n.saturating_mul(10).saturating_add(u32::from(bytes[j] - b'0'));
+                    j += 1;
+                }
+                if n == 0 || n > u32::from(u16::MAX) {
+                    return Err(LexError {
+                        kind: LexErrorKind::BadNumber(input[i..j].to_string()),
+                        pos: i,
+                    });
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                out.push(Token::Placeholder(n as u16));
+                i = j;
             }
             _ => {
                 let ch = input[i..].chars().next().unwrap_or('?');

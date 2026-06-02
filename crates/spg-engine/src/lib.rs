@@ -703,18 +703,61 @@ impl Engine {
         result
     }
 
-    fn execute_inner_with_cancel(
-        &mut self,
-        sql: &str,
-        cancel: CancelToken<'_>,
-    ) -> Result<QueryResult, EngineError> {
-        cancel.check()?;
+    /// v6.1.1 — parse and pre-process a SQL string ONCE so the
+    /// resulting [`Statement`] can be cached and re-executed via
+    /// [`Engine::execute_prepared`]. Returns the same `Statement`
+    /// the simple-query path would synthesise internally (clock
+    /// rewrites + ORDER BY position-ref resolution applied at
+    /// prepare time, since both are session-independent). The
+    /// `$N` placeholders in the SQL stay as `Expr::Placeholder(n)`
+    /// nodes; they're resolved to concrete values per-call by
+    /// `execute_prepared`'s substitution walk.
+    ///
+    /// Pgwire's `Parse` (P) message lands here.
+    pub fn prepare(&self, sql: &str) -> Result<Statement, ParseError> {
         let mut stmt = parser::parse_statement(sql)?;
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
         }
+        Ok(stmt)
+    }
+
+    /// v6.1.1 — execute a [`Statement`] previously returned by
+    /// [`Engine::prepare`], substituting `Expr::Placeholder(n)`
+    /// nodes for the corresponding [`Value`] in `params` (1-based
+    /// per PG: `$1` → `params[0]`). Bind-time string parameters
+    /// are decoded into typed `Value`s by the pgwire layer before
+    /// this call so the resulting AST hits the same execution
+    /// path as a simple query — no SQL re-parse.
+    ///
+    /// Pgwire's `Execute` (E) message after a `Bind` (B) lands here.
+    pub fn execute_prepared(
+        &mut self,
+        mut stmt: Statement,
+        params: &[Value],
+    ) -> Result<QueryResult, EngineError> {
+        substitute_placeholders(&mut stmt, params)?;
+        self.execute_stmt_with_cancel(stmt, CancelToken::none())
+    }
+
+    fn execute_inner_with_cancel(
+        &mut self,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
+        let stmt = self.prepare(sql)?;
+        self.execute_stmt_with_cancel(stmt, cancel)
+    }
+
+    fn execute_stmt_with_cancel(
+        &mut self,
+        stmt: Statement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
         let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::CreateIndex(s) => self.exec_create_index(s),
@@ -2931,6 +2974,7 @@ impl Engine {
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
             | Expr::Literal(_)
+            | Expr::Placeholder(_)
             | Expr::Column(_) => {}
         }
         Ok(())
@@ -3059,7 +3103,7 @@ impl Engine {
             Expr::Extract { source, .. } => {
                 self.resolve_correlated_in_expr(source, row, ctx, cancel)?;
             }
-            Expr::WindowFunction { .. } | Expr::Literal(_) | Expr::Column(_) => {}
+            Expr::WindowFunction { .. } | Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
         }
         Ok(())
     }
@@ -3242,7 +3286,7 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
                 || partition_by.iter().any(|p| expr_refers_to(p, target))
                 || order_by.iter().any(|(o, _)| expr_refers_to(o, target))
         }
-        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
     }
 }
 
@@ -3535,7 +3579,7 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
         Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
             substitute_in_select(subquery, row, ctx, outer_alias);
         }
-        Expr::Literal(_) | Expr::Column(_) => {}
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
     }
 }
 
@@ -3576,6 +3620,7 @@ fn expr_has_window(e: &Expr) -> bool {
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
         | Expr::Literal(_)
+        | Expr::Placeholder(_)
         | Expr::Column(_) => false,
     }
 }
@@ -4249,7 +4294,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
                 || partition_by.iter().any(expr_has_subquery)
                 || order_by.iter().any(|(e, _)| expr_has_subquery(e))
         }
-        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
     }
 }
 
@@ -4276,6 +4321,170 @@ fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         }
     };
     Ok(Expr::Literal(lit))
+}
+
+/// v6.1.1 — walk the prepared `Statement` AST and replace every
+/// `Expr::Placeholder(n)` with `Expr::Literal(value_to_literal(
+/// params[n-1]))`. The dispatch downstream sees a `Statement`
+/// indistinguishable from a simple-query parse, so the exec path
+/// stays unchanged.
+///
+/// Errors fall into one shape: a `$N` references past the bound
+/// `params.len()`. Out-of-range happens when the Bind didn't
+/// supply enough values; pgwire surfaces this as a protocol error
+/// to the client.
+fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result<(), EngineError> {
+    match stmt {
+        Statement::Select(s) => substitute_select(s, params)?,
+        Statement::Insert(ins) => {
+            for row in &mut ins.rows {
+                for e in row {
+                    substitute_expr(e, params)?;
+                }
+            }
+        }
+        Statement::Update(u) => {
+            for (_, e) in &mut u.assignments {
+                substitute_expr(e, params)?;
+            }
+            if let Some(w) = &mut u.where_ {
+                substitute_expr(w, params)?;
+            }
+        }
+        Statement::Delete(d) => {
+            if let Some(w) = &mut d.where_ {
+                substitute_expr(w, params)?;
+            }
+        }
+        Statement::Explain(e) => substitute_select(&mut e.inner, params)?,
+        // Other statements (CREATE / BEGIN / SHOW / …) have no
+        // expression slots; no walk needed.
+        _ => {}
+    }
+    Ok(())
+}
+
+fn substitute_select(
+    s: &mut SelectStatement,
+    params: &[Value],
+) -> Result<(), EngineError> {
+    for item in &mut s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            substitute_expr(expr, params)?;
+        }
+    }
+    if let Some(w) = &mut s.where_ {
+        substitute_expr(w, params)?;
+    }
+    if let Some(gs) = &mut s.group_by {
+        for g in gs {
+            substitute_expr(g, params)?;
+        }
+    }
+    if let Some(h) = &mut s.having {
+        substitute_expr(h, params)?;
+    }
+    if let Some(o) = &mut s.order_by {
+        substitute_expr(&mut o.expr, params)?;
+    }
+    for (_, peer) in &mut s.unions {
+        substitute_select(peer, params)?;
+    }
+    Ok(())
+}
+
+fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
+    if let Expr::Placeholder(n) = e {
+        let idx = usize::from(*n).saturating_sub(1);
+        let v = params.get(idx).ok_or_else(|| {
+            EngineError::Eval(EvalError::PlaceholderOutOfRange {
+                n: *n,
+                bound: u16::try_from(params.len()).unwrap_or(u16::MAX),
+            })
+        })?;
+        *e = Expr::Literal(value_to_literal(v.clone()));
+        return Ok(());
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            substitute_expr(lhs, params)?;
+            substitute_expr(rhs, params)?;
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            substitute_expr(expr, params)?;
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                substitute_expr(a, params)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            substitute_expr(expr, params)?;
+            substitute_expr(pattern, params)?;
+        }
+        Expr::Extract { source, .. } => substitute_expr(source, params)?,
+        Expr::ScalarSubquery(s) => substitute_select(s, params)?,
+        Expr::Exists { subquery, .. } => substitute_select(subquery, params)?,
+        Expr::InSubquery { expr, subquery, .. } => {
+            substitute_expr(expr, params)?;
+            substitute_select(subquery, params)?;
+        }
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                substitute_expr(a, params)?;
+            }
+            for p in partition_by {
+                substitute_expr(p, params)?;
+            }
+            for (e, _) in order_by {
+                substitute_expr(e, params)?;
+            }
+        }
+        Expr::Literal(_) | Expr::Column(_) => {}
+        // Already handled above.
+        Expr::Placeholder(_) => unreachable!("Placeholder handled at top of fn"),
+    }
+    Ok(())
+}
+
+/// v6.1.1 — convert a runtime `Value` into the closest matching
+/// `Literal` for the substitute walker. Lossless for the simple
+/// scalars (Int / Float / Text / Bool); Numeric / Date / Timestamp
+/// / Json / Interval render as their canonical text form so the
+/// downstream coerce_value can re-parse against the target column
+/// type. SQ8 / HalfVector cells are NOT expected as bind params;
+/// pgwire's Bind decodes vector params to the f32 representation
+/// before they reach this helper.
+fn value_to_literal(v: Value) -> Literal {
+    match v {
+        Value::Null => Literal::Null,
+        Value::SmallInt(n) => Literal::Integer(i64::from(n)),
+        Value::Int(n) => Literal::Integer(i64::from(n)),
+        Value::BigInt(n) => Literal::Integer(n),
+        Value::Float(x) => Literal::Float(x),
+        Value::Text(s) | Value::Json(s) => Literal::String(s),
+        Value::Bool(b) => Literal::Bool(b),
+        Value::Vector(v) => Literal::Vector(v),
+        Value::Numeric { scaled, scale } => {
+            Literal::String(eval::format_numeric(scaled, scale))
+        }
+        Value::Date(d) => Literal::String(eval::format_date(d)),
+        Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
+        Value::Interval { months, micros } => Literal::Interval {
+            months,
+            micros,
+            text: eval::format_interval(months, micros),
+        },
+        // SQ8 / halfvec cells dequantise to f32 before reaching the
+        // substitute walker; pgwire's Bind path handles that.
+        Value::Sq8Vector(q) => Literal::Vector(spg_storage::quantize::dequantize(&q)),
+        Value::HalfVector(h) => Literal::Vector(h.to_f32_vec()),
+    }
 }
 
 fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>) {
@@ -4380,7 +4589,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
                 rewrite_expr_clock(e, now);
             }
         }
-        Expr::Literal(_) | Expr::Column(_) => {}
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
     }
 }
 
@@ -4985,6 +5194,70 @@ mod tests {
         let err = e.execute("ALTER INDEX t_idx REBUILD").unwrap_err();
         assert!(
             matches!(&err, EngineError::Storage(StorageError::Unsupported(_))),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn prepared_insert_substitutes_placeholders() {
+        // v6.1.1: prepare() parses once; execute_prepared() walks the
+        // AST and replaces $1/$2 with the param Values BEFORE the
+        // dispatch sees them. Same logical result as a simple-query
+        // INSERT, but parse happens once per *statement*, not per
+        // execution.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+        let stmt = e.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+        for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {
+            e.execute_prepared(
+                stmt.clone(),
+                &[Value::Int(id), Value::Text(name.into())],
+            )
+            .unwrap();
+        }
+        // Read back via simple-query SELECT.
+        let rows_result = e.execute("SELECT id, name FROM t").unwrap();
+        let QueryResult::Rows { rows, .. } = rows_result else {
+            panic!("expected Rows")
+        };
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn prepared_select_with_placeholder_filters_rows() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
+            .unwrap();
+        for i in 0..10_i32 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i}, {})", i * 7))
+                .unwrap();
+        }
+        let stmt = e
+            .prepare("SELECT id FROM t WHERE v = $1")
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = e
+            .execute_prepared(stmt, &[Value::Int(35)])
+            .unwrap()
+        else {
+            panic!("expected Rows")
+        };
+        // v = 35 means i*7 = 35 → i = 5.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(5));
+    }
+
+    #[test]
+    fn prepared_too_few_params_errors() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        let stmt = e.prepare("INSERT INTO t VALUES ($1)").unwrap();
+        let err = e.execute_prepared(stmt, &[]).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EngineError::Eval(EvalError::PlaceholderOutOfRange { n: 1, bound: 0 })
+            ),
             "got: {err}"
         );
     }
