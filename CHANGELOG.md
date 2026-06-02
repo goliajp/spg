@@ -10,6 +10,110 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.0.1] — 2026-06-02 (SQ8 integration — `VECTOR(N) USING SQ8` end-to-end)
+
+### What changed
+
+v6.0.0 landed the standalone SQ8 quantiser (`spg_storage::quantize`).
+v6.0.1 wires it into the SQL surface and the storage stack end-to-
+end: `CREATE TABLE t (v VECTOR(128) USING SQ8)` now stands up a
+column whose every INSERT cell is quantised at the engine boundary,
+HNSW build + kNN search dispatch all distance calls through the
+SQ8 ADC paths, and a default-on f32 rerank pass on the top-`k * 3`
+candidates recovers recall the raw ADC sacrifices for 4×
+compression. Per-cell on-disk shape is `[u32 dim][f32 min][f32 max]
+[u8 × dim]` (row body + tag-11 catalog tag); pre-v6 binaries hit
+the unknown tags and fail loudly with `Corrupt("unknown … tag")`
+(forward-compat fence, see `V6_DESIGN.md` deliberation #5).
+
+### Added
+
+- DDL grammar `VECTOR(N) USING SQ8` — case-insensitive on
+  `USING` and the encoding ident; unknown encoding errors with
+  `unknown vector encoding`. `USING F32` is the implicit default
+  when the clause is omitted.
+- `spg_sql::ast::VecEncoding { F32, Sq8 }` enum; mirror
+  `spg_storage::VecEncoding`. `ColumnTypeName::Vector` /
+  `DataType::Vector` now carry `{ dim, encoding }`.
+- `Value::Sq8Vector(Sq8Vector)` cell variant. SELECT
+  dequantises to `WireValue::Vector(Vec<f32>)` so pgvector-
+  style clients see the same wire shape regardless of column
+  encoding.
+- INSERT path `coerce_value` dispatches a new `(Value::Vector,
+  DataType::Vector { encoding: Sq8 })` arm that quantises raw
+  f32 literals into SQ8 cells. Dim mismatch surfaces as
+  `TypeMismatch`, same path as the F32 case.
+- HNSW build + kNN search route every distance through
+  `cell_l2_sq` / `cell_to_query_metric_distance` helpers —
+  F32 cells stay on scalar math, SQ8 cells take the symmetric
+  / asymmetric ADC for the metric in play.
+- `sq8_rerank` pass in `nsw_search`: over-fetches the beam by
+  3× (`SQ8_RERANK_OVER_FETCH`), then re-scores the candidates
+  with dequantised cells against the f32 query. Raises the
+  recall@10 floor on the new lib test from ≥ 0.85 (ADC only)
+  to ≥ 0.95.
+- On-disk catalog tag 14 for `DataType::Vector { encoding: Sq8 }`
+  + tag-prefixed value tag 11 for `Value::Sq8Vector` + dense
+  row body shape per the byte layout above.
+- e2e tests `crates/spg-server/tests/e2e_sq8.rs::*` — full
+  pgwire roundtrip, top-K order match, dequant-on-wire check.
+- Perf-gate harness `crates/spg-server/tests/perf_gate_sq8.rs::*`
+  (both `#[ignore]`-marked, 1M-scale): SQ8 kNN p50 ≤ 50 µs
+  server, RSS ≤ 200 MiB. Run via
+  `cargo test --release -p spg-server --test perf_gate_sq8 -- --ignored`.
+- Shared helper `tests/common::rss_kib_of(pid)` promoted from
+  the chaos test so the new perf gate can reuse it.
+
+### Changed
+
+- `Value` gains an `Sq8Vector` variant; `data_type()` reports
+  the new encoding. All workspace match arms updated; the
+  catch-all wire / display / JSON paths dequantise on the fly.
+- `Cursor::read_f32` added (mirror of `read_f64`).
+
+### Ship-gate verification
+
+- Workspace `cargo test --release` 101 / 101 test groups green
+  (rerun for stability after observing one host-load-induced
+  flake on the multi-client SLO that cleared in isolation).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo fmt --all -- --check` clean.
+- `xtests/sqllogictest` 4-corpus stays 100% (148 + 17 + 144 + 63).
+- SQ8 HNSW recall@10 ≥ 0.95 vs brute-force F32 ground truth on
+  the new lib test fixture (512 × dim-32 splitmix64 corpus,
+  32 queries).
+- The two 1M-scale perf gates are harness-only in this commit;
+  measured numbers land in a follow-up alongside v6.0.5 sweep
+  work.
+
+### Why this matters
+
+PG 19 audit (`.claude/researches/spg-vs-pg19-comparison.md`)
+called out vector storage size as SPG's biggest competitive gap.
+v6.0 closes it: 1M dim-128 SQ8 RSS target is ≤ 200 MiB
+(pgvector halfvec ~300 MiB; raw f32 ~488 MiB just for the row
+payload). Recall@10 stays ≥ 0.95 on natural embeddings (Gaussian
+/ unit-sphere) — the per-vector affine + f32-rerank combo is
+designed to match pgvector's SQ recall envelope.
+
+---
+
+## [6.0.0] — 2026-06-02 (SQ8 scalar quantiser — standalone module)
+
+Standalone `Sq8Vector` (per-vector affine f32 → u8 quantisation)
++ symmetric/asymmetric ADC distance for L2, cosine, inner
+product + serde + recall@10 fuzz oracle. Lives entirely in
+`crates/spg-storage/src/quantize.rs` — no engine, DDL, planner,
+or wire changes (those land in v6.0.1). 4× compression target,
+recall@10 ≥ 0.95 on Gaussian + unit-sphere corpora at dim ≥ 32.
+
+The standalone byte layout (`[u32 dim][f32 min][f32 max][u8 ×
+dim]`) is frozen by `STABILITY.md`. Perf gates: quantise 1M
+dim-128 ≤ 500 ms, ADC L2 ≤ 200 ns/pair scalar (NEON tighten is
+v6.0.2).
+
+---
+
 ## [4.42.0] — 2026-05-28 (group commit at the commit barrier — multi-client throughput unlock)
 
 ### What changed
