@@ -53,6 +53,26 @@ pub enum Statement {
     /// for `inner`. `analyze` triggers an actual exec to attach
     /// observed row counts and elapsed micros to each node.
     Explain(ExplainStatement),
+    /// v6.0.4 — `ALTER INDEX <name> REBUILD [WITH (encoding = ...)]`.
+    /// Synchronous rebuild of an NSW index. With the optional
+    /// encoding clause, every stored cell at the indexed column is
+    /// also re-encoded through `coerce_value` before the new graph
+    /// builds.
+    AlterIndex(AlterIndexStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterIndexStatement {
+    pub name: String,
+    pub target: AlterIndexTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterIndexTarget {
+    /// `REBUILD [WITH (encoding = <enc>)]`. `encoding = None`
+    /// rebuilds the existing graph in place without touching the
+    /// column encoding; `Some(enc)` re-encodes every cell first.
+    Rebuild { encoding: Option<VecEncoding> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -617,6 +637,18 @@ impl fmt::Display for Statement {
                     write!(f, "EXPLAIN ANALYZE {}", e.inner)
                 } else {
                     write!(f, "EXPLAIN {}", e.inner)
+                }
+            }
+            Self::AlterIndex(a) => {
+                write!(f, "ALTER INDEX {} ", quote_ident(&a.name))?;
+                match a.target {
+                    AlterIndexTarget::Rebuild { encoding } => {
+                        f.write_str("REBUILD")?;
+                        if let Some(enc) = encoding {
+                            write!(f, " WITH (encoding = {enc})")?;
+                        }
+                        Ok(())
+                    }
                 }
             }
         }

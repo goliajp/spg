@@ -224,8 +224,15 @@ impl Parser {
                 self.advance();
                 self.parse_delete_after_keyword()
             }
+            // v6.0.4: ALTER INDEX <name> REBUILD [WITH (encoding = ...)].
+            // ALTER is not a reserved keyword in the lexer — handled
+            // as a bare ident here.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("alter") => {
+                self.advance();
+                self.parse_alter_after_keyword()
+            }
             other => Err(self.err(format!(
-                "expected SELECT / CREATE / DROP / INSERT / UPDATE / DELETE / BEGIN / COMMIT / \
+                "expected SELECT / CREATE / DROP / INSERT / UPDATE / DELETE / ALTER / BEGIN / COMMIT / \
                  ROLLBACK / SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
             ))),
         }
@@ -326,6 +333,79 @@ impl Parser {
         Ok(Statement::Delete(crate::ast::DeleteStatement {
             table,
             where_,
+        }))
+    }
+
+    /// v6.0.4 — parse the tail of an ALTER statement after the
+    /// leading `ALTER` keyword has been consumed. Only one form is
+    /// supported in v6.0.4:
+    ///
+    /// ```text
+    /// ALTER INDEX <name> REBUILD [WITH (encoding = <enc>)]
+    /// ```
+    fn parse_alter_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        // ALTER INDEX <name>. `INDEX` is a reserved Token::Index in
+        // the lexer (used by CREATE INDEX); accept either the
+        // tokenised keyword or the bare ident spelling for symmetry
+        // with the rest of the parser.
+        match self.advance() {
+            Token::Index => {}
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("index") => {}
+            other => {
+                return Err(self.err(format!("expected INDEX after ALTER, got {other:?}")));
+            }
+        }
+        let name = self.expect_ident_like()?;
+        // REBUILD
+        self.expect_keyword_ident("rebuild")?;
+        // Optional: WITH (encoding = <enc>)
+        let encoding = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(format!(
+                    "expected '(' after WITH in ALTER INDEX REBUILD, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            self.expect_keyword_ident("encoding")?;
+            if !matches!(self.peek(), Token::Eq) {
+                return Err(self.err(format!(
+                    "expected '=' after encoding in ALTER INDEX REBUILD, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let enc_ident = match self.advance() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s,
+                other => {
+                    return Err(self.err(format!("expected encoding name after =, got {other:?}")));
+                }
+            };
+            let enc = match enc_ident.to_ascii_lowercase().as_str() {
+                "f32" => VecEncoding::F32,
+                "sq8" => VecEncoding::Sq8,
+                "half" => VecEncoding::F16,
+                other => {
+                    return Err(self.err(format!(
+                        "unknown vector encoding {other:?} in ALTER INDEX REBUILD; supported: F32, SQ8, HALF"
+                    )));
+                }
+            };
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(format!(
+                    "expected ')' after encoding value, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            Some(enc)
+        } else {
+            None
+        };
+        Ok(Statement::AlterIndex(crate::ast::AlterIndexStatement {
+            name,
+            target: crate::ast::AlterIndexTarget::Rebuild { encoding },
         }))
     }
 
@@ -2308,6 +2388,77 @@ mod tests {
             panic!()
         };
         assert_eq!(c.columns[0].ty.to_string(), "VECTOR(64) USING SQ8");
+    }
+
+    #[test]
+    fn alter_index_rebuild_bare() {
+        use crate::ast::{AlterIndexTarget, Statement};
+        let s = parse("ALTER INDEX my_idx REBUILD");
+        let Statement::AlterIndex(a) = s else {
+            panic!("expected AlterIndex, got {s:?}")
+        };
+        assert_eq!(a.name, "my_idx");
+        assert_eq!(a.target, AlterIndexTarget::Rebuild { encoding: None });
+    }
+
+    #[test]
+    fn alter_index_rebuild_with_encoding() {
+        use crate::ast::{AlterIndexTarget, Statement};
+        for (sql, want) in [
+            (
+                "ALTER INDEX my_idx REBUILD WITH (encoding = F32)",
+                VecEncoding::F32,
+            ),
+            (
+                "ALTER INDEX my_idx REBUILD WITH (encoding = sq8)",
+                VecEncoding::Sq8,
+            ),
+            (
+                "ALTER INDEX my_idx REBUILD WITH (encoding = HALF)",
+                VecEncoding::F16,
+            ),
+        ] {
+            let s = parse(sql);
+            let Statement::AlterIndex(a) = s else {
+                panic!("{sql}: expected AlterIndex")
+            };
+            assert_eq!(a.name, "my_idx");
+            assert_eq!(
+                a.target,
+                AlterIndexTarget::Rebuild {
+                    encoding: Some(want)
+                },
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn alter_index_rebuild_unknown_encoding_errors() {
+        let err = parse_statement("ALTER INDEX my_idx REBUILD WITH (encoding = PQ8)").unwrap_err();
+        assert!(
+            err.message.contains("unknown vector encoding"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn alter_index_rebuild_display_roundtrips() {
+        for (input, want) in [
+            ("ALTER INDEX my_idx REBUILD", "ALTER INDEX my_idx REBUILD"),
+            (
+                "ALTER INDEX my_idx REBUILD WITH (encoding = SQ8)",
+                "ALTER INDEX my_idx REBUILD WITH (encoding = SQ8)",
+            ),
+            (
+                "ALTER INDEX my_idx REBUILD WITH (encoding = HALF)",
+                "ALTER INDEX my_idx REBUILD WITH (encoding = HALF)",
+            ),
+        ] {
+            let s = parse(input);
+            assert_eq!(s.to_string(), want);
+        }
     }
 
     #[test]

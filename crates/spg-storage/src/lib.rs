@@ -766,6 +766,76 @@ impl Table {
         self.add_nsw_index_inner(name, column_name, m, None)
     }
 
+    /// v6.0.4 — synchronous rebuild of the named NSW index. If
+    /// `new_encoding` is `Some(target)` and differs from the column's
+    /// current encoding, every stored cell at the indexed column is
+    /// re-coded into the target encoding before the new graph
+    /// builds. Returns `IndexNotFound` if no index by that name exists
+    /// and `Unsupported` for non-NSW indexes (`BTree` REBUILD is a no-op
+    /// the engine layer rejects, not a storage-level concept).
+    ///
+    /// Holds the caller's `&mut self` for the duration — no
+    /// concurrency / staging / WAL-replay machinery in v6.0.4. The
+    /// "live" optimisation lands as v6.0.4.1.
+    pub fn rebuild_nsw_index(
+        &mut self,
+        name: &str,
+        new_encoding: Option<VecEncoding>,
+    ) -> Result<(), StorageError> {
+        let idx_pos = self
+            .indices
+            .iter()
+            .position(|i| i.name == name)
+            .ok_or_else(|| StorageError::IndexNotFound {
+                name: String::from(name),
+            })?;
+        let col_pos = self.indices[idx_pos].column_position;
+        let m = match &self.indices[idx_pos].kind {
+            IndexKind::Nsw(g) => g.m,
+            IndexKind::BTree(_) => {
+                return Err(StorageError::Unsupported(format!(
+                    "ALTER INDEX REBUILD on BTree index {name:?} — only NSW indexes can rebuild"
+                )));
+            }
+        };
+        let col_name = self.schema.columns[col_pos].name.clone();
+        // 1. Optional re-encoding pass. Done first so the cells
+        //    match the schema before the graph rebuild walks them.
+        if let Some(target) = new_encoding {
+            let current = match self.schema.columns[col_pos].ty {
+                DataType::Vector { encoding, .. } => encoding,
+                ref other => {
+                    return Err(StorageError::Unsupported(format!(
+                        "ALTER INDEX REBUILD WITH (encoding=…) on non-vector column type {other:?}"
+                    )));
+                }
+            };
+            if target != current {
+                let DataType::Vector { dim, .. } = self.schema.columns[col_pos].ty else {
+                    unreachable!("checked above")
+                };
+                let n = self.rows.len();
+                for i in 0..n {
+                    let row = self
+                        .rows
+                        .get_mut(i)
+                        .expect("row index in bounds (we iterated up to len())");
+                    let cell = core::mem::replace(&mut row.values[col_pos], Value::Null);
+                    let recoded = recode_vector_cell(cell, target)?;
+                    row.values[col_pos] = recoded;
+                }
+                self.schema.columns[col_pos].ty = DataType::Vector {
+                    dim,
+                    encoding: target,
+                };
+            }
+        }
+        // 2. Drop the existing index slot + rebuild from row payload.
+        self.indices.remove(idx_pos);
+        self.add_nsw_index_inner(String::from(name), &col_name, m, None)?;
+        Ok(())
+    }
+
     /// Restore an NSW index from a pre-built graph (used on
     /// deserialize). Skips the bulk-build pass since the topology is
     /// already known. Returns `DuplicateIndex` or `ColumnNotFound` on
@@ -1157,6 +1227,39 @@ impl Table {
         }
         Ok(())
     }
+}
+
+/// v6.0.4 — re-encode a single cell to the target `VecEncoding`.
+/// Used by `Table::rebuild_nsw_index` when ALTER INDEX REBUILD
+/// includes the optional `WITH (encoding = …)` clause. Round-trip
+/// goes through f32: `current → Vec<f32> → target`, leaving NULL
+/// cells untouched. Returns `Unsupported` on a non-vector cell —
+/// the caller should have rejected the schema before reaching this.
+fn recode_vector_cell(cell: Value, target: VecEncoding) -> Result<Value, StorageError> {
+    if matches!(cell, Value::Null) {
+        return Ok(cell);
+    }
+    // Step 1 — extract the f32 representation of the source cell.
+    let as_f32: Vec<f32> = match &cell {
+        Value::Vector(v) => v.clone(),
+        Value::Sq8Vector(q) => quantize::dequantize(q),
+        Value::HalfVector(h) => h.to_f32_vec(),
+        other => {
+            return Err(StorageError::Unsupported(format!(
+                "ALTER INDEX REBUILD: cannot recode non-vector cell {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    // Step 2 — encode into the target shape. `F32` is the identity
+    // path (saves one alloc round-trip when the source is already
+    // F32 — but `Value::Vector(as_f32)` is the right answer
+    // regardless).
+    Ok(match target {
+        VecEncoding::F32 => Value::Vector(as_f32),
+        VecEncoding::Sq8 => Value::Sq8Vector(quantize::quantize(&as_f32)),
+        VecEncoding::F16 => Value::HalfVector(halfvec::HalfVector::from_f32_slice(&as_f32)),
+    })
 }
 
 /// Insert one row into the HNSW graph held by index slot `idx_pos`.
@@ -2596,6 +2699,15 @@ pub enum StorageError {
     /// On-disk format failed to parse — corrupted file, wrong magic, truncated
     /// payload, or unknown tag bytes.
     Corrupt(String),
+    /// v6.0.4 — ALTER INDEX targeted an index name that doesn't
+    /// exist on any table in this catalog.
+    IndexNotFound {
+        name: String,
+    },
+    /// v6.0.4 — operation requested isn't supported on this index
+    /// kind / column type (e.g. ALTER INDEX REBUILD on a `BTree`
+    /// index, or REBUILD WITH (encoding=…) on a non-vector column).
+    Unsupported(String),
 }
 
 impl fmt::Display for StorageError {
@@ -2622,6 +2734,8 @@ impl fmt::Display for StorageError {
             Self::DuplicateIndex { name } => write!(f, "index already exists: {name}"),
             Self::ColumnNotFound { column } => write!(f, "column not found: {column}"),
             Self::Corrupt(detail) => write!(f, "corrupt on-disk format: {detail}"),
+            Self::IndexNotFound { name } => write!(f, "index not found: {name}"),
+            Self::Unsupported(detail) => write!(f, "unsupported: {detail}"),
         }
     }
 }

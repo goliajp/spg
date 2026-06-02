@@ -10,6 +10,90 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.0.4] — 2026-06-02 (ALTER INDEX REBUILD — synchronous MVP)
+
+### What changed
+
+v6.0.4 lands the user-visible DDL `ALTER INDEX <name> REBUILD
+[WITH (encoding = ...)]`. Two use cases the v6.0 series needs:
+
+1. **Rebuild without changing encoding** — refresh a NSW graph
+   after a large insert sweep or corpus drift, without dropping
+   + re-creating the index (which would orphan reads for the
+   gap).
+2. **Switch encoding in place** — migrate an existing
+   `VECTOR(N)` column from F32 to SQ8 (4× compression) or HALF
+   (2×), or roll back to F32 — without DROP+CREATE TABLE.
+
+### Scope-narrowing vs. V6_DESIGN L2
+
+V6_DESIGN L2 originally promised a **live** rebuild: background
+worker takes a long-lived `TxId` snapshot, builds the new graph
+in `.spg/staging/`, atomic swap under brief `engine.write()`
+with dual-write to old + new during the build. The
+chaos-recovery path replays WAL ALTER REBUILD markers on
+startup. v6.0.4 ships the **synchronous MVP** instead: hold
+`engine.write()` for the rebuild duration. No background worker,
+no staging dir, no WAL replay machinery. The async optimisation
+lands as v6.0.4.1 / v6.1.x.
+
+Same scope-narrowing pattern as v6.0.3 (NEON f16 SIMD → scalar
+codec): deliver the user-visible feature on the stable codepath;
+defer the perf optimisation to a follow-up.
+
+### Added
+
+- `Statement::AlterIndex(AlterIndexStatement)` AST variant with
+  `AlterIndexTarget::Rebuild { encoding: Option<VecEncoding> }`.
+- Parser accepts `ALTER INDEX <name> REBUILD [WITH (encoding =
+  F32 | SQ8 | HALF)]`. Case-insensitive on `ALTER` / `INDEX` /
+  `REBUILD` / `WITH` / `ENCODING` / encoding values. Four
+  parser tests pin: bare REBUILD, three-way encoding switch,
+  unknown encoding rejection, Display roundtrip.
+- `Engine::exec_alter_index` — linear-scan-by-index-name to
+  find the host table, then delegate to
+  `Table::rebuild_nsw_index`.
+- `Table::rebuild_nsw_index(name, new_encoding)` in
+  `spg-storage`:
+    1. Re-encode every stored cell at the indexed column to the
+       target encoding via the new internal
+       `recode_vector_cell(cell, target)` helper (round-trip
+       through f32: source → `Vec<f32>` → target).
+    2. Update `schema.columns[col].ty.encoding`.
+    3. Drop the existing NSW index slot.
+    4. Call `add_nsw_index_inner` to rebuild the graph from
+       row payload.
+- `StorageError::IndexNotFound { name }` and
+  `StorageError::Unsupported(detail)` variants — emitted by
+  the new path; the rest of the codebase doesn't construct them.
+- Four engine lib tests + three e2e tests via
+  `tests/common::ServerBuilder`:
+    * `alter_index_rebuild_in_place_succeeds`
+    * `alter_index_rebuild_with_encoding_switches_cell_type`
+    * `alter_index_rebuild_unknown_index_errors`
+    * `alter_index_rebuild_on_btree_index_errors`
+    * `alter_rebuild_in_place_preserves_topk_order` (e2e)
+    * `alter_rebuild_with_encoding_switch_f32_to_sq8_recodes_cells` (e2e)
+    * `alter_rebuild_unknown_index_errors_on_wire` (e2e)
+
+### Ship-gate verification
+
+- `cargo test --release --workspace` 104 / 104 test groups
+  green.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo fmt --all -- --check` clean.
+- xtests/sqllogictest 4-corpus stays 100% (148 + 17 + 144 + 63).
+
+### Why this matters
+
+Closes the v6.0 storage-migration story: a deployment can ship
+`VECTOR(N)` columns as F32, observe RSS pressure under load, and
+migrate in place to SQ8 / HALF without a DROP+CREATE downtime
+window. The "live" non-blocking rebuild is a perf optimisation
+on top of this — the v6.0.4 commit unlocks the workflow.
+
+---
+
 ## [6.0.3] — 2026-06-02 (halfvec — `VECTOR(N) USING HALF`)
 
 ### What changed
