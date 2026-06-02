@@ -734,6 +734,7 @@ impl Engine {
             Statement::CreateUser(s) => self.exec_create_user(&s),
             Statement::DropUser(name) => self.exec_drop_user(&name),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
+            Statement::AlterIndex(s) => self.exec_alter_index(s),
         };
         self.enforce_row_limit(result)
     }
@@ -1171,6 +1172,61 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
+        })
+    }
+
+    /// v6.0.4 — synchronous `ALTER INDEX <name> REBUILD [WITH
+    /// (encoding = …)]`. Walks every table in the active catalog
+    /// looking for an index matching `stmt.name`, then delegates the
+    /// rebuild (including any encoding switch) to
+    /// `Table::rebuild_nsw_index`. The "live" non-blocking
+    /// optimisation is v6.0.4.1 / v6.1.x territory.
+    fn exec_alter_index(
+        &mut self,
+        stmt: spg_sql::ast::AlterIndexStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Translate the optional SQL-side encoding choice into the
+        // storage-side enum; the same SqlVecEncoding -> VecEncoding
+        // bridge `column_type_to_data_type` uses.
+        let spg_sql::ast::AlterIndexStatement {
+            name: idx_name,
+            target,
+        } = stmt;
+        let spg_sql::ast::AlterIndexTarget::Rebuild { encoding } = target;
+        let target = encoding.map(|e| match e {
+            SqlVecEncoding::F32 => VecEncoding::F32,
+            SqlVecEncoding::Sq8 => VecEncoding::Sq8,
+            SqlVecEncoding::F16 => VecEncoding::F16,
+        });
+        // Linear scan: index names are globally unique within a
+        // catalog (enforced by add_nsw_index_inner) so the first
+        // match is the only one. Save the table name to avoid
+        // borrowing while we then take a mut borrow.
+        let table_name = {
+            let cat = self.active_catalog();
+            let mut found: Option<String> = None;
+            for tname in cat.table_names() {
+                if let Some(t) = cat.get(&tname)
+                    && t.indices().iter().any(|i| i.name == idx_name)
+                {
+                    found = Some(tname);
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                EngineError::Storage(StorageError::IndexNotFound {
+                    name: idx_name.clone(),
+                })
+            })?
+        };
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&table_name)
+            .expect("table found above");
+        table.rebuild_nsw_index(&idx_name, target)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
         })
     }
 
@@ -4847,6 +4903,90 @@ mod tests {
             }
             other => panic!("expected HalfVector cell, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn alter_index_rebuild_in_place_succeeds() {
+        // v6.0.4: bare REBUILD (no encoding switch) walks every
+        // row again to rebuild the NSW graph. Verifies the engine
+        // dispatch + storage helper plumbing without changing any
+        // cell encoding.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, v VECTOR(3) NOT NULL)")
+            .unwrap();
+        for i in 0..8_i32 {
+            #[allow(clippy::cast_precision_loss)]
+            let base = (i as f32) * 0.1;
+            e.execute(&alloc::format!(
+                "INSERT INTO t VALUES ({i}, [{base}, {b1}, {b2}])",
+                b1 = base + 0.01,
+                b2 = base + 0.02,
+            ))
+            .unwrap();
+        }
+        e.execute("CREATE INDEX t_idx ON t USING hnsw (v)").unwrap();
+        e.execute("ALTER INDEX t_idx REBUILD").unwrap();
+        // Schema encoding stays F32 (no encoding clause).
+        assert_eq!(
+            e.catalog().get("t").unwrap().schema().columns[1].ty,
+            DataType::Vector {
+                dim: 3,
+                encoding: VecEncoding::F32,
+            },
+        );
+    }
+
+    #[test]
+    fn alter_index_rebuild_with_encoding_switches_cell_type() {
+        // v6.0.4: REBUILD WITH (encoding = SQ8) recodes every
+        // stored cell from F32 → SQ8 + rebuilds the graph atop the
+        // new encoding. Post-rebuild, cells must be Sq8Vector and
+        // the schema must report encoding = Sq8.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, v VECTOR(4) NOT NULL)")
+            .unwrap();
+        e.execute("INSERT INTO t VALUES (1, [0.0, 0.25, 0.5, 1.0])")
+            .unwrap();
+        e.execute("CREATE INDEX t_idx ON t USING hnsw (v)").unwrap();
+        e.execute("ALTER INDEX t_idx REBUILD WITH (encoding = SQ8)")
+            .unwrap();
+        let t = e.catalog().get("t").unwrap();
+        assert_eq!(
+            t.schema().columns[1].ty,
+            DataType::Vector {
+                dim: 4,
+                encoding: VecEncoding::Sq8,
+            },
+        );
+        assert!(matches!(t.rows()[0].values[1], Value::Sq8Vector(_)));
+    }
+
+    #[test]
+    fn alter_index_rebuild_unknown_index_errors() {
+        let mut e = Engine::new();
+        let err = e.execute("ALTER INDEX nope REBUILD").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EngineError::Storage(StorageError::IndexNotFound { name }) if name == "nope"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn alter_index_rebuild_on_btree_index_errors() {
+        // REBUILD on a B-tree index has no semantic meaning in
+        // v6.0.4 — rejected at the storage layer with `Unsupported`.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        e.execute("INSERT INTO t VALUES (1)").unwrap();
+        e.execute("CREATE INDEX t_idx ON t (id)").unwrap();
+        let err = e.execute("ALTER INDEX t_idx REBUILD").unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Storage(StorageError::Unsupported(_))),
+            "got: {err}"
+        );
     }
 
     #[test]

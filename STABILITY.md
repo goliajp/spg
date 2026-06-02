@@ -678,6 +678,34 @@ bit-for-bit reproducible across hosts. `f16_from_f32_bits` /
 `f16_to_f32_bits` (raw u32 ↔ u16) are public surface kept
 stable for serialisation parity.
 
+### ALTER INDEX REBUILD (v6.0.4)
+
+v6.0.4 adds a DDL surface for synchronous index rebuild. The
+grammar is frozen; the implementation strategy (synchronous
+vs. "live" async) is not part of the stability contract — v6.0.4
+holds the engine write-lock for the rebuild duration, but a
+later sub-version may relax this to a non-blocking path without
+breaking the grammar.
+
+```text
+ALTER INDEX <name> REBUILD [WITH (encoding = <enc>)]
+```
+
+- `<name>` is the NSW index name as declared by `CREATE INDEX …
+  USING hnsw`.
+- `<enc>` is one of `F32` / `SQ8` / `HALF` (case-insensitive),
+  same set the v6.0.1 / v6.0.3 `USING <encoding>` clause
+  recognises.
+- Omitting the encoding clause rebuilds the graph in place
+  without re-encoding cells.
+- The grammar accepts only NSW indexes — BTree indexes return
+  `Unsupported` (the operator has no rebuild semantics for a
+  B-tree).
+
+No new on-disk surfaces — the rebuilt catalog uses the existing
+DataType / Value / dense-row tags established in v6.0.1 /
+v6.0.3.
+
 ---
 
 ## Not frozen (free to change in any release)
