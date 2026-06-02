@@ -203,6 +203,11 @@ impl Parser {
                 match target.as_str() {
                     "tables" => Ok(Statement::ShowTables),
                     "users" => Ok(Statement::ShowUsers),
+                    // v6.1.3 — PUBLICATIONS plural is NOT a reserved
+                    // keyword on its own; it lands here as a bare
+                    // ident. Returning all publications + their
+                    // scope summary.
+                    "publications" => Ok(Statement::ShowPublications),
                     "columns" => {
                         if !matches!(self.peek(), Token::From) {
                             return Err(self.err(format!(
@@ -215,7 +220,7 @@ impl Parser {
                         Ok(Statement::ShowColumns(table))
                     }
                     other => Err(self.err(format!(
-                        "unknown SHOW target {other:?}; supported: TABLES, COLUMNS, USERS"
+                        "unknown SHOW target {other:?}; supported: TABLES, COLUMNS, USERS, PUBLICATIONS"
                     ))),
                 }
             }
@@ -287,25 +292,18 @@ impl Parser {
         }
     }
 
-    /// v6.1.2 — `CREATE PUBLICATION <name> [FOR ALL TABLES]`.
-    /// `FOR TABLE …` and `FOR ALL TABLES EXCEPT …` parse-error
-    /// here with a "v6.1.3" hint: the AST shape already supports
-    /// them ([`PublicationScope::ForTables`] /
-    /// [`PublicationScope::AllTablesExcept`]); only the parser
-    /// gate is held back so the v6.1.3 diff is single-file.
+    /// v6.1.2 → v6.1.3 — `CREATE PUBLICATION <name>` body. Accepts:
+    ///   - (no clause) → implicit `FOR ALL TABLES`
+    ///   - `FOR ALL TABLES`
+    ///   - `FOR ALL TABLES EXCEPT t1, t2, …` (v6.1.3)
+    ///   - `FOR TABLE t1, t2, …` (v6.1.3) — `FOR TABLES …` also
+    ///     accepted (PG accepts both forms in PG 19).
     fn parse_create_publication_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let name = self.expect_ident_or_string()?;
-        // Default scope is FOR ALL TABLES when the FOR clause is
-        // omitted — PG semantics for `CREATE PUBLICATION p` with
-        // no body is "publish nothing", but SPG's v6.1.x intent is
-        // that "nothing" makes no operational sense for the
-        // single-publisher cluster (a publication you can't
-        // subscribe to anything from is dead state). Until v6.1.3
-        // lands the per-table form, treat the bare DDL as the
-        // FOR-ALL-TABLES form.
+        // Bare DDL maps to FOR ALL TABLES — matches the v6.1.2
+        // shape so existing publications keep parsing identically.
         let scope = if matches!(self.peek(), Token::For) {
             self.advance();
-            // FOR ALL TABLES [EXCEPT …]
             if matches!(self.peek(), Token::All) {
                 self.advance();
                 if !matches!(self.peek(), Token::Tables) {
@@ -316,21 +314,18 @@ impl Parser {
                 }
                 self.advance();
                 if matches!(self.peek(), Token::Except) {
-                    return Err(self.err(
-                        "FOR ALL TABLES EXCEPT … is reserved for v6.1.3; \
-                         use plain FOR ALL TABLES for now"
-                            .into(),
-                    ));
+                    self.advance();
+                    let tables = self.parse_publication_table_list()?;
+                    PublicationScope::AllTablesExcept(tables)
+                } else {
+                    PublicationScope::AllTables
                 }
-                PublicationScope::AllTables
             } else if matches!(self.peek(), Token::Table | Token::Tables) {
-                // PG accepts `FOR TABLE t1, t2` (singular) — that's
-                // the table-list form. v6.1.3 ships it; for v6.1.2
-                // emit the deliberate parse-error so callers see
-                // the version hint instead of a generic surprise.
-                return Err(self.err(
-                    "FOR TABLE <list> is reserved for v6.1.3; use FOR ALL TABLES for now".into(),
-                ));
+                // PG 19 accepts both `FOR TABLE …` (singular) and
+                // `FOR TABLES …` (plural); SPG matches.
+                self.advance();
+                let tables = self.parse_publication_table_list()?;
+                PublicationScope::ForTables(tables)
             } else {
                 return Err(self.err(format!(
                     "expected ALL TABLES or TABLE <list> after FOR, got {:?}",
@@ -344,6 +339,20 @@ impl Parser {
             name,
             scope,
         }))
+    }
+
+    /// v6.1.3 — Comma-separated identifier list for the publication
+    /// FOR-clause. Requires at least one entry; empty list is a
+    /// parse error (PG behaviour). Quoted idents are accepted; the
+    /// names round-trip through `Display` as `quote_ident(name)`.
+    fn parse_publication_table_list(&mut self) -> Result<Vec<String>, ParseError> {
+        let first = self.expect_ident_like()?;
+        let mut out = alloc::vec![first];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            out.push(self.expect_ident_like()?);
+        }
+        Ok(out)
     }
 
     /// `CREATE USER` body — name + WITH PASSWORD '<pw>' + optional
@@ -2836,17 +2845,59 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_for_all_tables_except_with_version_hint() {
-        let err = parse_statement("CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t1")
-            .expect_err("must error in v6.1.2");
-        assert!(err.message.contains("v6.1.3"), "got: {}", err.message);
+    fn parser_recognises_for_table_list() {
+        let s = parse("CREATE PUBLICATION pub_a FOR TABLE t1, t2, t3");
+        let Statement::CreatePublication(p) = s else {
+            panic!("expected CreatePublication, got {s:?}")
+        };
+        assert_eq!(p.name, "pub_a");
+        let PublicationScope::ForTables(ts) = p.scope else {
+            panic!("expected ForTables scope")
+        };
+        assert_eq!(ts, alloc::vec!["t1", "t2", "t3"]);
     }
 
     #[test]
-    fn parser_rejects_for_table_list_with_version_hint() {
-        let err = parse_statement("CREATE PUBLICATION pub_a FOR TABLE t1, t2")
-            .expect_err("must error in v6.1.2");
-        assert!(err.message.contains("v6.1.3"), "got: {}", err.message);
+    fn parser_recognises_for_tables_plural() {
+        // PG 19 accepts both `FOR TABLE` and `FOR TABLES` — match.
+        let s = parse("CREATE PUBLICATION pub_a FOR TABLES t1, t2");
+        let Statement::CreatePublication(p) = s else {
+            panic!("expected CreatePublication, got {s:?}")
+        };
+        let PublicationScope::ForTables(ts) = p.scope else {
+            panic!("expected ForTables")
+        };
+        assert_eq!(ts, alloc::vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn parser_recognises_for_all_tables_except_list() {
+        let s = parse("CREATE PUBLICATION p FOR ALL TABLES EXCEPT t1, t2");
+        let Statement::CreatePublication(p) = s else {
+            panic!()
+        };
+        let PublicationScope::AllTablesExcept(ts) = p.scope else {
+            panic!("expected AllTablesExcept")
+        };
+        assert_eq!(ts, alloc::vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn parser_rejects_for_table_with_empty_list() {
+        // `FOR TABLE` with nothing after is a parse error.
+        let err = parse_statement("CREATE PUBLICATION p FOR TABLE")
+            .expect_err("must error on empty list");
+        // No specific message asserted — the call falls through to
+        // expect_ident_like which yields "expected identifier, got …".
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parser_recognises_show_publications() {
+        // v6.1.3 — SHOW PUBLICATIONS lands here. PUBLICATIONS is a
+        // bare ident in this position, NOT a reserved keyword.
+        let s = parse("SHOW PUBLICATIONS");
+        assert!(matches!(s, Statement::ShowPublications));
     }
 
     #[test]
@@ -2865,16 +2916,21 @@ mod tests {
 
     #[test]
     fn publication_ddl_display_roundtrips() {
-        // The AST shape that v6.1.3 will extend is already in scope
-        // — pre-build the non-v6.1.2 variants directly to verify
-        // Display emits parseable text.
-        let s = parse("CREATE PUBLICATION pub_a FOR ALL TABLES");
-        let printed = s.to_string();
-        assert!(printed.contains("CREATE PUBLICATION"), "got: {printed}");
-        let again = parse_statement(&printed).unwrap();
-        assert_eq!(s, again);
-        // DROP form roundtrips too.
-        let d = parse("DROP PUBLICATION pub_a");
-        assert_eq!(parse_statement(&d.to_string()).unwrap(), d);
+        // Every CREATE PUBLICATION variant must Display → parse →
+        // same AST. v6.1.3 covers all three scope shapes.
+        for sql in [
+            "CREATE PUBLICATION pub_a",
+            "CREATE PUBLICATION pub_a FOR ALL TABLES",
+            "CREATE PUBLICATION pub_a FOR TABLE t1, t2",
+            "CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t1",
+            "DROP PUBLICATION pub_a",
+            "SHOW PUBLICATIONS",
+        ] {
+            let s = parse(sql);
+            let printed = s.to_string();
+            let again = parse_statement(&printed)
+                .unwrap_or_else(|e| panic!("re-parse failed for {printed:?}: {e}"));
+            assert_eq!(s, again, "round-trip mismatch for {sql:?}");
+        }
     }
 }

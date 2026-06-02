@@ -66,23 +66,30 @@ pub enum Statement {
     /// v6.1.2 — `DROP PUBLICATION <name>`. PG-compatible silent
     /// no-op when the publication does not exist.
     DropPublication(String),
+    /// v6.1.3 — `SHOW PUBLICATIONS`. Returns one row per
+    /// publication ordered by name with `(name, scope_summary,
+    /// table_count)` columns. The scope summary is the human-
+    /// readable form `ALL TABLES` / `FOR TABLE …` / `FOR ALL
+    /// TABLES EXCEPT …`; `table_count` is `NULL` for the
+    /// `AllTables` scope and the table-list length otherwise.
+    ShowPublications,
 }
 
 /// v6.1.2 — `CREATE PUBLICATION` AST node. The `scope` field uses
-/// the [`PublicationScope`] shape that v6.1.3 will extend with
-/// `ForTables` / `AllTablesExcept`; v6.1.2 only accepts the
-/// implicit / explicit `FOR ALL TABLES` form so the parser
-/// rejects the other variants with a "v6.1.3" diagnostic.
+/// the [`PublicationScope`] shape. v6.1.2 only accepted
+/// `AllTables`; v6.1.3 unlocks the `ForTables` / `AllTablesExcept`
+/// variants by flipping the parser gate (no AST migration).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePublicationStatement {
     pub name: String,
     pub scope: PublicationScope,
 }
 
-/// v6.1.2 — Which tables a publication covers. Only `AllTables`
-/// is parser-reachable in v6.1.2; the other variants exist now so
-/// v6.1.3 only has to wire up the parser without breaking the AST
-/// shape.
+/// v6.1.2 — Which tables a publication covers. v6.1.3 (this commit)
+/// flips the parser gate for the `ForTables` / `AllTablesExcept`
+/// variants — the on-disk shape, snapshot serialisation, and the
+/// AST round-trip Display path were already in place in v6.1.2
+/// so this is a parser-only widening.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicationScope {
     AllTables,
@@ -667,6 +674,7 @@ impl fmt::Display for Statement {
             ),
             Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
             Self::ShowUsers => f.write_str("SHOW USERS"),
+            Self::ShowPublications => f.write_str("SHOW PUBLICATIONS"),
             Self::Explain(e) => {
                 if e.analyze {
                     write!(f, "EXPLAIN ANALYZE {}", e.inner)

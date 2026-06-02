@@ -745,22 +745,27 @@ No new on-disk surfaces — the rebuilt catalog uses the existing
 DataType / Value / dense-row tags established in v6.0.1 /
 v6.0.3.
 
-### Publication DDL (v6.1.2)
+### Publication DDL (v6.1.2 — v6.1.3)
 
-v6.1.2 introduces the first DDL surface on the logical-replication
-path. The grammar is frozen; v6.1.3+ may add additional `FOR`-
-clause variants without breaking the v6.1.2 forms.
+v6.1.2 introduced the first DDL surface on the logical-replication
+path; v6.1.3 added the FOR-list variants and `SHOW PUBLICATIONS`.
+All forms below are frozen.
 
 ```text
-CREATE PUBLICATION <name> [FOR ALL TABLES]
-DROP PUBLICATION <name>
+CREATE PUBLICATION <name> [FOR ALL TABLES                              -- v6.1.2
+                          | FOR ALL TABLES EXCEPT t1, t2, ...          -- v6.1.3
+                          | FOR TABLE  t1, t2, ...                     -- v6.1.3
+                          | FOR TABLES t1, t2, ...]                    -- v6.1.3 (plural alias)
+DROP PUBLICATION <name>                                                -- v6.1.2
+SHOW PUBLICATIONS                                                      -- v6.1.3
 ```
 
 - `<name>` is an unquoted or `"…"`-quoted identifier.
 - Omitting the `FOR` clause is equivalent to `FOR ALL TABLES`.
-- `FOR TABLE <list>` and `FOR ALL TABLES EXCEPT <list>` parse-
-  error in v6.1.2 with a "v6.1.3" diagnostic; the AST shape
-  reserves the variants now so v6.1.3 is a parser-only change.
+- `FOR TABLE` (singular) and `FOR TABLES` (plural) parse
+  identically — PG 19 accepts both forms.
+- Empty FOR-list (`FOR TABLE` followed by nothing) is a parse
+  error.
 - Duplicate `CREATE` errors; `DROP` on a missing publication is
   a silent no-op (PG-compatible). Both are rejected inside an
   active transaction.
@@ -768,6 +773,12 @@ DROP PUBLICATION <name>
   v6.1.4) are reserved keywords from v6.1.2; existing schemas
   that used `publication` as an identifier name must quote it
   as `"publication"`.
+- `SHOW PUBLICATIONS` returns three columns:
+  `(name TEXT NOT NULL, scope TEXT NOT NULL, table_count INT NULL)`,
+  rows ordered alphabetically by `name`. The `scope` column is
+  the human-readable form (`FOR ALL TABLES` / `FOR TABLE …` /
+  `FOR ALL TABLES EXCEPT …`). `table_count` is NULL when the
+  scope is `AllTables` and the list length otherwise.
 
 #### Snapshot envelope v3 (v6.1.2)
 
