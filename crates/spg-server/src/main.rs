@@ -249,6 +249,20 @@ pub(crate) struct ServerState {
     /// subscriptions` adds rows when CREATE SUBSCRIPTION runs and
     /// flips the flag when DROP SUBSCRIPTION runs.
     sub_workers: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    /// v6.1.6 — stable per-cluster identifier used by MAGIC_SUB
+    /// cycle detection. Loaded from the `<wal_path>.cluster_id`
+    /// sidecar at startup (or `<db_path>.cluster_id` if no wal);
+    /// generated randomly on first boot when no sidecar exists.
+    /// Servers with neither path get a random `cluster_id` that
+    /// only lives for the process lifetime — fine for tests but
+    /// not for production replicas. The master sends its
+    /// cluster_id in the MAGIC_SUB handshake reply; the subscriber
+    /// aborts the link when it equals its own (direct
+    /// self-subscription detection). v6.1.6 ships direct-cycle
+    /// detection only; indirect cycles (A → B → A through a
+    /// chain) need WAL-record-level originator tagging — out of
+    /// v6.1 scope.
+    pub(crate) cluster_id: u64,
     /// v4.29: optional failure-injection knobs used by chaos tests.
     /// All branches default-off and skip the check entirely when
     /// the env var wasn't set on startup.
@@ -436,6 +450,62 @@ fn parse_cold_preload_env() -> Vec<ColdPreloadSpec> {
 ///
 /// The registry is a `Mutex<BTreeMap<name, Arc<AtomicBool>>>`; the
 /// flag is shared with the worker so signalling is lock-free.
+/// v6.1.6 — read `<base>.cluster_id` (8 bytes LE) or, if absent,
+/// generate a fresh random `u64` and persist it. The sidecar lives
+/// alongside the WAL (or db file when no WAL is configured) so a
+/// follower restart picks up the same `cluster_id` and cycle
+/// detection survives across the bounce. Servers running with no
+/// db_path AND no wal_path get an in-memory only `cluster_id` —
+/// uniqueness is per-process, fine for ephemeral test workloads.
+fn cluster_id_sidecar_path(wal_path: Option<&Path>, db_path: Option<&Path>) -> Option<PathBuf> {
+    let base = wal_path.or(db_path)?;
+    let mut name = base
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".cluster_id");
+    Some(base.with_file_name(name))
+}
+
+fn load_or_generate_cluster_id(wal_path: Option<&Path>, db_path: Option<&Path>) -> u64 {
+    if let Some(p) = cluster_id_sidecar_path(wal_path, db_path) {
+        if p.exists()
+            && let Ok(bytes) = std::fs::read(&p)
+            && bytes.len() == 8
+        {
+            return u64::from_le_bytes(bytes.try_into().unwrap());
+        }
+        let id = generate_cluster_id();
+        if let Err(e) = std::fs::write(&p, id.to_le_bytes()) {
+            eprintln!(
+                "spg-server: cluster_id sidecar write to {} failed: {e} — \
+                 keeping in-memory id (cycle detection won't survive restart)",
+                p.display()
+            );
+        }
+        id
+    } else {
+        generate_cluster_id()
+    }
+}
+
+/// Cheap non-crypto u64 mixing PID + wall-clock nanos. Good enough
+/// for distinguishing 1000-server topologies; not a security
+/// surface (no auth tokens derived from it). Lives entirely in
+/// the host process.
+fn generate_cluster_id() -> u64 {
+    let pid = u64::from(std::process::id());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    // SplitMix64-shaped finaliser — spreads PID + time bits across
+    // all 64 output bits.
+    let mut x = ts.wrapping_mul(6364136223846793005).wrapping_add(pid);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
 pub(crate) fn reconcile_subscriptions(state: &Arc<ServerState>) {
     use std::collections::BTreeMap;
     let want: BTreeMap<String, (String, bool)> = {
@@ -785,6 +855,7 @@ fn run(
     let cold_preload_done = AtomicBool::new(cold_preload.is_empty());
     let hot_tier_byte_budget =
         parse_env_u64("SPG_HOT_TIER_BYTES").unwrap_or(DEFAULT_HOT_TIER_BYTES);
+    let cluster_id = load_or_generate_cluster_id(wal_path.as_deref(), db_path.as_deref());
     let state = Arc::new(ServerState {
         engine: RwLock::new(engine),
         db_path,
@@ -808,6 +879,7 @@ fn run(
         hot_tier_byte_budget,
         cold_segment_paths: Mutex::new(cold_segment_paths),
         sub_workers: Mutex::new(BTreeMap::new()),
+        cluster_id,
     });
 
     // v6.1.4: spawn subscriber threads for any subscriptions

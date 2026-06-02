@@ -187,10 +187,17 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
         // tail so the master can filter records before sending.
         //   [u16 num_publications]
         //   for each: [u16 name_len][name bytes]
-        // Backwards-compat: a v6.1.4 subscriber emits num=0 (it
-        // didn't know about publication filtering yet); the master
-        // treats that as "AllTables" so legacy behaviour holds.
+        // v6.1.6: subscriber appends its own 8-byte cluster_id
+        // after the publication list. Backwards-compat with
+        // v6.1.4: a subscriber that sent only the 16-byte magic +
+        // offset would block here on the publication list read,
+        // so v6.1.5-and-earlier masters are paired with v6.1.5+
+        // subscribers; legacy v6.1.4 subscribers need a v6.1.4
+        // master.
         let publication_names = read_publication_list(&mut stream)?;
+        let mut sub_cluster_buf = [0u8; 8];
+        stream.read_exact(&mut sub_cluster_buf)?;
+        let subscriber_cluster_id = u64::from_le_bytes(sub_cluster_buf);
         let filter = build_publication_filter(state, &publication_names);
 
         let effective_start = if start_offset == 0 {
@@ -198,8 +205,26 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
         } else {
             start_offset
         };
+        // Reply: [u64 effective_start][u64 master_cluster_id].
+        // The subscriber's REPLICATION_LOOP detection compares
+        // these — direct cycle (subscriber subscribed to itself
+        // or to a target that resolves to its own host).
         stream.write_all(&effective_start.to_le_bytes())?;
+        stream.write_all(&state.cluster_id.to_le_bytes())?;
         stream.flush()?;
+        // Belt-and-suspenders: if master can already see the loop
+        // (it received its own cluster_id from the peer), log it
+        // and bail without forwarding any records. The subscriber
+        // also catches this in its reply parse; doing it here too
+        // means the master doesn't waste WAL frames on a peer
+        // that's about to drop the connection anyway.
+        if subscriber_cluster_id == state.cluster_id {
+            eprintln!(
+                "spg-server: rejecting MAGIC_SUB connection — peer cluster_id matches own ({})",
+                state.cluster_id
+            );
+            return Ok(());
+        }
         let Some(wal_path) = state.wal_path.clone() else {
             return Ok(());
         };
@@ -1225,11 +1250,14 @@ fn subscribe_once(
         }
     };
 
-    // MAGIC_SUB + start_offset + publication-name list.
-    // [8 bytes magic][8 bytes offset][2 bytes num_pubs]
-    //   for each: [2 bytes len][len bytes]
+    // MAGIC_SUB + start_offset + publication-name list +
+    // subscriber's own cluster_id (v6.1.6 addition).
+    // [8 bytes magic]
+    // [8 bytes offset]
+    // [2 bytes num_pubs] for each: [2 bytes len][len bytes]
+    // [8 bytes subscriber_cluster_id]
     let mut hs = Vec::with_capacity(
-        16 + 2 + requested_publications.iter().map(|p| 2 + p.len()).sum::<usize>(),
+        16 + 2 + requested_publications.iter().map(|p| 2 + p.len()).sum::<usize>() + 8,
     );
     hs.extend_from_slice(MAGIC_SUB);
     hs.extend_from_slice(&start_offset.to_le_bytes());
@@ -1244,12 +1272,26 @@ fn subscribe_once(
         hs.extend_from_slice(&len.to_le_bytes());
         hs.extend_from_slice(p.as_bytes());
     }
+    hs.extend_from_slice(&state.cluster_id.to_le_bytes());
     stream.write_all(&hs)?;
     stream.flush()?;
 
-    let mut pos_buf = [0u8; 8];
-    read_exact_with_shutdown(&mut stream, &mut pos_buf, shutdown)?;
-    let mut applied_offset = u64::from_le_bytes(pos_buf);
+    // Reply: [u64 effective_start][u64 master_cluster_id].
+    let mut reply = [0u8; 16];
+    read_exact_with_shutdown(&mut stream, &mut reply, shutdown)?;
+    let mut applied_offset = u64::from_le_bytes(reply[..8].try_into().unwrap());
+    let master_cluster_id = u64::from_le_bytes(reply[8..].try_into().unwrap());
+    if master_cluster_id == state.cluster_id {
+        // v6.1.6 — direct self-loop. Master's cluster_id equals
+        // our own. Logging here, and returning Err so the
+        // reconnect-loop emits a visible signal. Operator must
+        // DROP SUBSCRIPTION to silence the noise.
+        eprintln!(
+            "spg-server: subscription {name:?}: REPLICATION_LOOP — master cluster_id \
+             {master_cluster_id} matches own; aborting link"
+        );
+        return Err(std::io::Error::other("REPLICATION_LOOP"));
+    }
 
     // Tail loop. Same frame format as v6.0.x follower. The chief
     // differences: no local WAL file write, advance the

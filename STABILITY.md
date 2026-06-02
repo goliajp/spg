@@ -781,15 +781,36 @@ SHOW SUBSCRIPTIONS
 
 Subscriber-side connect handshake:
 ```text
-→  [b"SPGSUB\x01\x00"]        ← 8 bytes magic
-   [u64 LE start_offset]       ← 0 = "tail from current end"
-   [u16 LE num_publications]   ← v6.1.5 (0 = legacy v6.1.4 fan-out-all)
+→  [b"SPGSUB\x01\x00"]              ← 8 bytes magic
+   [u64 LE start_offset]             ← 0 = "tail from current end"
+   [u16 LE num_publications]         ← v6.1.5 (0 = legacy v6.1.4 fan-out-all)
    for each publication:
      [u16 LE name_len][name bytes]
-←  [u64 LE effective_start]    ← master's WAL position the
-                                 subscriber records as baseline
-                                 last_received_pos
+   [u64 LE subscriber_cluster_id]    ← v6.1.6 cycle-detection input
+←  [u64 LE effective_start]          ← master's WAL position the
+                                       subscriber records as baseline
+                                       last_received_pos
+   [u64 LE master_cluster_id]        ← v6.1.6 cycle-detection check
 ```
+
+v6.1.6 cycle detection: if `master_cluster_id == subscriber_cluster_id`
+both sides bail. The subscriber returns `REPLICATION_LOOP` from the
+handshake; the master closes the connection before forwarding records.
+Only direct self-loops are caught — indirect cycles (A → B → A through
+a chain) require WAL-record-level originator tagging, deferred to a
+future v6.x.
+
+#### cluster_id sidecar (v6.1.6)
+
+```text
+<wal_path>.cluster_id    (or <db_path>.cluster_id when no WAL configured)
+  8 bytes LE u64
+```
+
+Generated on first boot via a SplitMix64-shaped mix of PID +
+wall-clock nanoseconds. Stable across restarts. Servers with
+neither wal_path nor db_path get a per-process in-memory id (fine
+for tests, not for production replicas).
 
 A v6.1.4 subscriber emits only the first 16 bytes (magic +
 offset) and the master reads `num_publications = 0` from the
