@@ -10,6 +10,90 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.6] — 2026-06-03 (cascading replication + cycle detection)
+
+Fifth v6.1.x sub-version on the logical-replication path. Lands
+the A → B → C cascade topology and adds direct-cycle detection
+via a per-cluster identifier.
+
+### Added
+
+- `ServerState::cluster_id: u64` — stable per-cluster identifier
+  loaded from `<wal_path>.cluster_id` (or `<db_path>.cluster_id`
+  when no WAL is configured). Sidecar is 8 bytes LE; generated
+  on first boot via a SplitMix64-shaped mix of PID + wall-clock
+  nanos. Persisted to disk; in-memory only on servers with
+  neither db_path nor wal_path (ephemeral test workloads).
+- MAGIC_SUB handshake grows the cluster_id exchange:
+    - subscriber → master: 8 bytes subscriber_cluster_id after
+      the publication-name list
+    - master → subscriber: 8 bytes master_cluster_id after the
+      effective_start_offset reply
+  Subscriber aborts the link with `REPLICATION_LOOP` when the
+  master's cluster_id equals its own. Master also rejects the
+  connection on the same condition before forwarding any
+  records — belt-and-suspenders against the time-of-check vs
+  time-of-use race.
+
+### Tests
+
+- `spg-server::e2e_cascade` (3 new):
+    - `three_node_chain_replays_correctly`: A is a publisher;
+      B is both a v2 follower of A and a publisher; C subscribes
+      to B's MAGIC_SUB endpoint. A's CREATE TABLE flows to B via
+      the byte-stream v2 follower path; A's INSERTs flow A → B
+      → C and land on C exactly once.
+    - `cycle_detection_aborts_loop`: a server subscribes to its
+      own replication endpoint. The master's cluster_id reply
+      matches the subscriber's own; link is aborted before any
+      record flows. Verifies row-count never doubles + the
+      catalog entry exists but `last_received_pos` stays at 0.
+    - `cluster_id_persists_across_restart`: bounce the server,
+      verify the sidecar bytes are identical, and a fresh self-
+      subscription is still rejected.
+
+### Cascading topology — operator notes
+
+A → B → C cascade works structurally because:
+- B uses MAGIC_V2 to follow A (byte-stream tail, snapshot
+  bootstrap); A's WAL bytes land verbatim in B's WAL.
+- B exposes a MAGIC_SUB endpoint to C; v6.1.5 publication
+  filtering still applies — C subscribes to a publication
+  declared on B.
+- A's `CREATE PUBLICATION` flows to B as a regular WAL record
+  via the v2 path, so B inherits A's publications. C's
+  subscription names that publication and the filter resolves
+  correctly on B.
+
+Same operator caveats as v6.1.5 apply: DDL only propagates
+through the v2 byte-stream path (MAGIC_V1 / MAGIC_V2 followers),
+NOT through MAGIC_SUB subscribers. C-style subscribers must
+have target schema set up manually.
+
+### Not changed
+
+- WAL on-disk format / record framing.
+- MAGIC_V1 / MAGIC_V2 follower path semantics — cluster_id is
+  exchanged only on MAGIC_SUB. Legacy follower cycles (A → B
+  → A through pure v2 chains) are not detected by v6.1.6 and
+  remain an operator concern (same as pre-v6.1.6).
+- Subscriber-side schema-drift policy.
+
+### Known limitations (out of v6.1.6)
+
+- Indirect cycles (A → B → A through a chain of intermediate
+  subscribers) are NOT detected. The cluster_id check catches
+  only direct self-loops: a subscriber whose master's
+  cluster_id matches its own. Catching indirect cycles needs
+  WAL-record-level originator tagging (each record stamped
+  with the originating cluster_id at the source, preserved
+  through every hop). That's a WAL format extension —
+  deferred to a future v6.x.
+- No `SHOW CLUSTER_ID` SQL surface yet. Operators can read
+  the sidecar file directly when needed.
+
+---
+
 ## [6.1.5] — 2026-06-03 (publisher-side WAL filtering by publication)
 
 Fourth v6.1.x sub-version on the logical-replication path. v6.1.4
