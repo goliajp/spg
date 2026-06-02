@@ -560,6 +560,155 @@ fn sq8_adc_l2_asymmetric_under_200ns_per_pair() {
     );
 }
 
+/// v6.0.2 f32 cosine via NEON dispatch ≤ 50 ns/pair (dim 128). The
+/// public `spg_storage::nsw_query` cosine path hits this loop on
+/// every f32 column with a NEON-compatible dim; the gate guards
+/// against an accidental scalar regression in `metric_distance`.
+#[test]
+fn cosine_dim128_under_50ns() {
+    let _perf = perf_lock();
+    const DIM: usize = 128;
+    const N_PAIRS: usize = 1_000_000;
+    let mut rng: u64 = 0xC051_C051_DEAD_BEEF;
+    let pool: Vec<Vec<f32>> = (0..1024)
+        .map(|_| random_unit_vec_f32(&mut rng, DIM))
+        .collect();
+    // Cold-cache warm-up — see `sq8_adc_l2_asymmetric_neon_dim128`.
+    let mut warm: f32 = 0.0;
+    for i in 0..10_000 {
+        let a = &pool[i & 1023];
+        let b = &pool[(i.wrapping_mul(2_654_435_761)) & 1023];
+        warm += std::hint::black_box(metric_dispatch_cos(a, b));
+    }
+    std::hint::black_box(warm);
+    let t = Instant::now();
+    let mut acc: f32 = 0.0;
+    for i in 0..N_PAIRS {
+        let a = &pool[i & 1023];
+        let b = &pool[(i.wrapping_mul(2_654_435_761)) & 1023];
+        acc += std::hint::black_box(metric_dispatch_cos(a, b));
+    }
+    let elapsed = t.elapsed();
+    std::hint::black_box(acc);
+    let per_call_ns = elapsed.as_nanos() / N_PAIRS as u128;
+    eprintln!("cosine_dim128: {per_call_ns} ns/pair (over {N_PAIRS} pairs)");
+    let budget_ns: u128 = 50;
+    assert!(
+        per_call_ns <= budget_ns,
+        "cosine_dim128 per-pair {per_call_ns} ns exceeds budget {budget_ns} ns — \
+         check NEON dispatch in `metric_distance(Cosine, ...)`"
+    );
+}
+
+/// v6.0.2 f32 inner product via NEON dispatch ≤ 50 ns/pair (dim 128).
+#[test]
+fn inner_product_dim128_under_50ns() {
+    let _perf = perf_lock();
+    const DIM: usize = 128;
+    const N_PAIRS: usize = 1_000_000;
+    let mut rng: u64 = 0xBEEF_FEED_FACE_C001;
+    let pool: Vec<Vec<f32>> = (0..1024)
+        .map(|_| random_unit_vec_f32(&mut rng, DIM))
+        .collect();
+    let mut warm: f32 = 0.0;
+    for i in 0..10_000 {
+        let a = &pool[i & 1023];
+        let b = &pool[(i.wrapping_mul(2_654_435_761)) & 1023];
+        warm += std::hint::black_box(metric_dispatch_ip(a, b));
+    }
+    std::hint::black_box(warm);
+    let t = Instant::now();
+    let mut acc: f32 = 0.0;
+    for i in 0..N_PAIRS {
+        let a = &pool[i & 1023];
+        let b = &pool[(i.wrapping_mul(2_654_435_761)) & 1023];
+        acc += std::hint::black_box(metric_dispatch_ip(a, b));
+    }
+    let elapsed = t.elapsed();
+    std::hint::black_box(acc);
+    let per_call_ns = elapsed.as_nanos() / N_PAIRS as u128;
+    eprintln!("inner_product_dim128: {per_call_ns} ns/pair (over {N_PAIRS} pairs)");
+    let budget_ns: u128 = 50;
+    assert!(
+        per_call_ns <= budget_ns,
+        "inner_product_dim128 per-pair {per_call_ns} ns exceeds budget {budget_ns} ns"
+    );
+}
+
+/// v6.0.2 SQ8 ADC L2 asymmetric via NEON dispatch ≤ 50 ns/pair
+/// (dim 128). This is the kNN-scan hot path — stored SQ8 cell vs
+/// f32 query — under the new 16-wide widening loop.
+///
+/// Measured ~13 ns warm-cache (Apple M-series); design target was
+/// 25 ns but cold-cache transients + parallel-test thermal noise
+/// can spike to ~36 ns under perf_lock contention, so the gate is
+/// set to 50 ns — same ceiling as the f32 cosine / IP gates and
+/// still a 4× win over the v6.0.0 scalar 200 ns floor.
+#[test]
+fn sq8_adc_l2_asymmetric_neon_dim128_under_50ns() {
+    let _perf = perf_lock();
+    const DIM: usize = 128;
+    const N_PAIRS: usize = 1_000_000;
+    let mut rng: u64 = 0x5A8_5A8_5A8_5A8;
+    let pool: Vec<Sq8Vector> = (0..1024)
+        .map(|_| quantize(&random_unit_vec_f32(&mut rng, DIM)))
+        .collect();
+    let queries: Vec<Vec<f32>> = (0..1024)
+        .map(|_| random_unit_vec_f32(&mut rng, DIM))
+        .collect();
+    // Cold-cache warm-up: walk the pool + queries once so the
+    // measured loop sees the same I-cache + D-cache + branch-
+    // predictor state as a long-running kNN scan. Without this
+    // the first 10 ms of the timed loop pays a transient that
+    // doubles the per-call estimate.
+    let mut warm: f32 = 0.0;
+    for i in 0..10_000 {
+        let a = &pool[i & 1023];
+        let q = &queries[(i.wrapping_mul(2_654_435_761)) & 1023];
+        warm += std::hint::black_box(sq8_l2_distance_sq_asymmetric(a, q));
+    }
+    std::hint::black_box(warm);
+    let t = Instant::now();
+    let mut acc: f32 = 0.0;
+    for i in 0..N_PAIRS {
+        let a = &pool[i & 1023];
+        let q = &queries[(i.wrapping_mul(2_654_435_761)) & 1023];
+        acc += std::hint::black_box(sq8_l2_distance_sq_asymmetric(a, q));
+    }
+    let elapsed = t.elapsed();
+    std::hint::black_box(acc);
+    let per_call_ns = elapsed.as_nanos() / N_PAIRS as u128;
+    eprintln!("sq8_adc_l2_asym_neon_dim128: {per_call_ns} ns/pair (over {N_PAIRS} pairs)");
+    // v6.0.0 scalar floor is 200 ns; v6.0.2 NEON measures ~13 ns
+    // warm-cache, ~36 ns under perf_lock thermal noise. Budget
+    // 50 ns gives 1.4× margin over the worst observed and still
+    // 4× the scalar floor. x86_64 hosts fall back to scalar and
+    // would blow this; gate is aarch64-only.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let budget_ns: u128 = 50;
+        assert!(
+            per_call_ns <= budget_ns,
+            "sq8_adc_l2_asym_neon_dim128 per-pair {per_call_ns} ns exceeds budget {budget_ns} ns \
+             — check NEON dispatch in `sq8_l2_distance_sq_asymmetric`"
+        );
+    }
+}
+
+/// Cosine via the v6.0.2 NEON-backed dispatch — same shape the
+/// kNN search path uses inside `metric_distance(Cosine, ...)`.
+fn metric_dispatch_cos(a: &[f32], b: &[f32]) -> f32 {
+    let (dot, na, nb) = spg_storage::cosine_dot_norms_f32(a, b);
+    if na == 0.0 || nb == 0.0 {
+        return f32::INFINITY;
+    }
+    1.0 - dot / (na.sqrt() * nb.sqrt())
+}
+
+fn metric_dispatch_ip(a: &[f32], b: &[f32]) -> f32 {
+    -spg_storage::inner_product_f32(a, b)
+}
+
 /// Recall@10 ≥ 0.95 on a 10K-vector dim-128 unit-sphere corpus with
 /// 100 random queries. Duplicate of the lib-test ranking-preservation
 /// gate, but run as a perf gate so a regression in quantization

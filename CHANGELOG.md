@@ -10,6 +10,83 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.0.2] — 2026-06-02 (NEON SIMD for f32 cosine/IP + SQ8 ADC)
+
+### What changed
+
+v6.0.0/v6.0.1 left two SIMD gaps: `l2_distance_sq` was the only
+distance with an aarch64 NEON path, and every SQ8 ADC call
+dequantised element-by-element through scalar f32 arithmetic.
+v6.0.2 closes both — `inner_product` / `cosine` get FMA-parallel
+NEON paths, and the asymmetric SQ8 ADC (the kNN-scan hot path,
+stored cell vs f32 query) gets a 16-wide u8 → u16 → f32
+widening loop for L2, cosine, and inner-product. Symmetric SQ8
+ADC (used during HNSW build) stays scalar — build-time hot spot
+is graph topology, not distance ns. x86_64 keeps scalar
+fallback. No `FEAT_DotProd` dependency.
+
+### Added
+
+- aarch64 NEON paths in `spg_storage`:
+  - `inner_product_neon(a: &[f32], b: &[f32]) -> f32` — two FMA
+    accumulators.
+  - `cosine_dot_norms_neon(a, b) -> (f32, f32, f32)` — three
+    accumulators for `dot`, `||a||²`, `||b||²`.
+  - `sq8_l2_distance_sq_asymmetric_neon(a, q)` — 16-byte chunk
+    loop, widens to four `f32x4` lane groups via
+    `vmovl_u8` + `vmovl_u16` + `vcvtq_f32_u32`, FMA-accumulates
+    squared diffs against the f32 query.
+  - `sq8_dot_asymmetric_neon` + `sq8_cosine_accumulators_
+    asymmetric_neon` — same widening pattern for IP / cosine
+    asymmetric ADC.
+- Public dispatch wrappers `inner_product_f32` and
+  `cosine_dot_norms_f32` (both `#[doc(hidden)]`, NEON when
+  `len % 4 == 0 && len >= 4`, scalar otherwise). Used by
+  `metric_distance` + the new perf gates; not part of the
+  STABILITY contract.
+- `sq8_*_asymmetric` public functions dispatch internally on the
+  same NEON pre-condition (`dim >= 16 && dim % 16 == 0`); scalar
+  fallback for arbitrary dims.
+- Five lib tests: `neon_inner_product_matches_scalar`,
+  `neon_cosine_dot_norms_matches_scalar`,
+  `sq8_adc_l2_asymmetric_neon_matches_scalar`,
+  `sq8_adc_ip_asymmetric_neon_matches_scalar`,
+  `sq8_adc_cosine_asymmetric_neon_matches_scalar`. Each
+  cross-validates NEON vs scalar across `dim ∈ {16, 32, …,
+  1024}` with magnitude-scaled tolerance.
+- Three perf gates: `cosine_dim128_under_50ns`,
+  `inner_product_dim128_under_50ns`,
+  `sq8_adc_l2_asymmetric_neon_dim128_under_50ns`. All on
+  aarch64 with a 10K-iter warm-up before timing. Measured
+  ~13 ns/pair (SQ8 ADC) and ~26 ns/pair (IP) on Apple M-series
+  warm-cache — down from v6.0.0's 200 ns scalar floor.
+
+### Changed
+
+- `metric_distance` in `spg_storage` now routes through the new
+  dispatch wrappers. `NswMetric::InnerProduct` and
+  `NswMetric::Cosine` paths pick up NEON automatically on
+  aarch64 for `len % 4 == 0`.
+
+### Ship-gate verification
+
+- Workspace `cargo test --lib` 460 / 460 green.
+- `cargo test --release -p spg-storage --test perf_gate` 17 / 17
+  green (includes the three new gates).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo fmt --all -- --check` clean.
+- `xtests/sqllogictest` 4-corpus stays 100% (148 + 17 + 144 + 63).
+
+### Why this matters
+
+PG 19 audit-derived v6.0 plan called out SIMD on cosine / IP +
+SQ8 ADC as the path to the ≤ 50 µs kNN p50 target at 1M dim-128
+SQ8 (V6_DESIGN L1 goal-numbers row). v6.0.1's f32-rerank loop on
+SQ8 columns also benefits — every rerank call now flows through
+the f32 NEON path for the dequantised top-`k * 3` candidates.
+
+---
+
 ## [6.0.1] — 2026-06-02 (SQ8 integration — `VECTOR(N) USING SQ8` end-to-end)
 
 ### What changed

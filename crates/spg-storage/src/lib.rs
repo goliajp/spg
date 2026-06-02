@@ -1741,22 +1741,9 @@ const SQ8_RERANK_OVER_FETCH: usize = 3;
 fn metric_distance(metric: NswMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         NswMetric::L2 => l2_distance_sq(a, b),
-        NswMetric::InnerProduct => {
-            let mut dot: f32 = 0.0;
-            for (x, y) in a.iter().zip(b.iter()) {
-                dot += x * y;
-            }
-            -dot
-        }
+        NswMetric::InnerProduct => -inner_product_f32(a, b),
         NswMetric::Cosine => {
-            let mut dot: f32 = 0.0;
-            let mut na: f32 = 0.0;
-            let mut nb: f32 = 0.0;
-            for (x, y) in a.iter().zip(b.iter()) {
-                dot += x * y;
-                na += x * x;
-                nb += y * y;
-            }
+            let (dot, na, nb) = cosine_dot_norms_f32(a, b);
             if na == 0.0 || nb == 0.0 {
                 return f32::INFINITY;
             }
@@ -1765,6 +1752,125 @@ fn metric_distance(metric: NswMetric, a: &[f32], b: &[f32]) -> f32 {
             let denom = sqrt_newton_f32(na) * sqrt_newton_f32(nb);
             1.0 - dot / denom
         }
+    }
+}
+
+/// v6.0.2: dispatch wrapper for the f32 dot product (used by `<#>` +
+/// the cosine numerator). NEON path when `len % 4 == 0 && len >= 4`,
+/// scalar fallback otherwise. Returns the positive dot — callers
+/// negate for the pgvector `<#>` "smaller = closer" convention.
+///
+/// Public so perf gates + downstream benches can microbenchmark the
+/// dispatch directly; not part of the STABILITY contract — internal
+/// SIMD layout can evolve in any release.
+#[doc(hidden)]
+#[inline]
+pub fn inner_product_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if a.len() == b.len() && a.len() >= 4 && a.len().is_multiple_of(4) {
+            // SAFETY: NEON is a baseline aarch64 feature; preconditions
+            // (matching lengths, ≥ 1 full lane group) are checked above.
+            return unsafe { inner_product_neon(a, b) };
+        }
+    }
+    inner_product_scalar(a, b)
+}
+
+fn inner_product_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot: f32 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+    }
+    dot
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)] // NEON intrinsics work in single-letter regs by convention
+unsafe fn inner_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32,
+    };
+    unsafe {
+        // Two parallel accumulators (same trick as L2 NEON) so the
+        // FMA dependency chain doesn't serialise.
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc0 = zero;
+        let mut acc1 = zero;
+        let n = a.len();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let av0 = vld1q_f32(a.as_ptr().add(i));
+            let bv0 = vld1q_f32(b.as_ptr().add(i));
+            acc0 = vfmaq_f32(acc0, av0, bv0);
+            let av1 = vld1q_f32(a.as_ptr().add(i + 4));
+            let bv1 = vld1q_f32(b.as_ptr().add(i + 4));
+            acc1 = vfmaq_f32(acc1, av1, bv1);
+            i += 8;
+        }
+        while i + 4 <= n {
+            let av = vld1q_f32(a.as_ptr().add(i));
+            let bv = vld1q_f32(b.as_ptr().add(i));
+            acc0 = vfmaq_f32(acc0, av, bv);
+            i += 4;
+        }
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
+}
+
+/// v6.0.2: dispatch wrapper for the three accumulators (`dot`, `||a||²`,
+/// `||b||²`) cosine needs. Same NEON pre-condition as the L2 / IP
+/// paths; same scalar fallback shape.
+///
+/// Public for benchmarking only (see `inner_product_f32`); not in the
+/// STABILITY contract.
+#[doc(hidden)]
+#[inline]
+pub fn cosine_dot_norms_f32(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if a.len() == b.len() && a.len() >= 4 && a.len().is_multiple_of(4) {
+            // SAFETY: see `inner_product_neon`.
+            return unsafe { cosine_dot_norms_neon(a, b) };
+        }
+    }
+    cosine_dot_norms_scalar(a, b)
+}
+
+fn cosine_dot_norms_scalar(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    let mut dot: f32 = 0.0;
+    let mut na: f32 = 0.0;
+    let mut nb: f32 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    (dot, na, nb)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+unsafe fn cosine_dot_norms_neon(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    use core::arch::aarch64::{float32x4_t, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
+    unsafe {
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc_dot = zero;
+        let mut acc_na = zero;
+        let mut acc_nb = zero;
+        let n = a.len();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let av = vld1q_f32(a.as_ptr().add(i));
+            let bv = vld1q_f32(b.as_ptr().add(i));
+            acc_dot = vfmaq_f32(acc_dot, av, bv);
+            acc_na = vfmaq_f32(acc_na, av, av);
+            acc_nb = vfmaq_f32(acc_nb, bv, bv);
+            i += 4;
+        }
+        (vaddvq_f32(acc_dot), vaddvq_f32(acc_na), vaddvq_f32(acc_nb))
     }
 }
 
@@ -3571,6 +3677,87 @@ mod tests {
                 (scalar - neon).abs() <= tol,
                 "dim={d}: scalar={scalar} neon={neon} diff={}",
                 (scalar - neon).abs()
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_inner_product_matches_scalar() {
+        // v6.0.2 step 1: NEON IP must agree with scalar across every
+        // production-shaped dim. FMA rounding differs from
+        // separate * + +, so the tolerance scales with magnitude.
+        let dims = [4usize, 8, 12, 16, 64, 128, 256, 512, 1024];
+        for &d in &dims {
+            let mut state: u64 = (d as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut a = Vec::with_capacity(d);
+            let mut b = Vec::with_capacity(d);
+            for _ in 0..d {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let x = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let y = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
+                a.push(x);
+                b.push(y);
+            }
+            let scalar = inner_product_scalar(&a, &b);
+            let neon = unsafe { inner_product_neon(&a, &b) };
+            #[allow(clippy::cast_precision_loss)]
+            let tol = (scalar.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-6;
+            assert!(
+                (scalar - neon).abs() <= tol,
+                "IP dim={d}: scalar={scalar} neon={neon} diff={}",
+                (scalar - neon).abs()
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::similar_names)]
+    #[test]
+    fn neon_cosine_dot_norms_matches_scalar() {
+        let dims = [4usize, 8, 12, 16, 64, 128, 256, 512, 1024];
+        for &d in &dims {
+            let mut state: u64 = (d as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            let mut a = Vec::with_capacity(d);
+            let mut b = Vec::with_capacity(d);
+            for _ in 0..d {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let x = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let y = (((state >> 32) & 0x00FF_FFFF) as f32) / (0x80_0000_u32 as f32) - 1.0;
+                a.push(x);
+                b.push(y);
+            }
+            let (dot_s, na_s, nb_s) = cosine_dot_norms_scalar(&a, &b);
+            let (dot_n, na_n, nb_n) = unsafe { cosine_dot_norms_neon(&a, &b) };
+            #[allow(clippy::cast_precision_loss)]
+            let tol_d = (dot_s.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-6;
+            #[allow(clippy::cast_precision_loss)]
+            let tol_n = (na_s.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-6;
+            assert!(
+                (dot_s - dot_n).abs() <= tol_d,
+                "cosine dot dim={d}: scalar={dot_s} neon={dot_n}"
+            );
+            assert!(
+                (na_s - na_n).abs() <= tol_n,
+                "cosine na dim={d}: scalar={na_s} neon={na_n}"
+            );
+            assert!(
+                (nb_s - nb_n).abs() <= tol_n,
+                "cosine nb dim={d}: scalar={nb_s} neon={nb_n}"
             );
         }
     }
