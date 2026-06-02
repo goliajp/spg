@@ -745,6 +745,62 @@ No new on-disk surfaces — the rebuilt catalog uses the existing
 DataType / Value / dense-row tags established in v6.0.1 /
 v6.0.3.
 
+### Publication DDL (v6.1.2)
+
+v6.1.2 introduces the first DDL surface on the logical-replication
+path. The grammar is frozen; v6.1.3+ may add additional `FOR`-
+clause variants without breaking the v6.1.2 forms.
+
+```text
+CREATE PUBLICATION <name> [FOR ALL TABLES]
+DROP PUBLICATION <name>
+```
+
+- `<name>` is an unquoted or `"…"`-quoted identifier.
+- Omitting the `FOR` clause is equivalent to `FOR ALL TABLES`.
+- `FOR TABLE <list>` and `FOR ALL TABLES EXCEPT <list>` parse-
+  error in v6.1.2 with a "v6.1.3" diagnostic; the AST shape
+  reserves the variants now so v6.1.3 is a parser-only change.
+- Duplicate `CREATE` errors; `DROP` on a missing publication is
+  a silent no-op (PG-compatible). Both are rejected inside an
+  active transaction.
+- `PUBLICATION` and `SUBSCRIPTION` (the latter reserved for
+  v6.1.4) are reserved keywords from v6.1.2; existing schemas
+  that used `publication` as an identifier name must quote it
+  as `"publication"`.
+
+#### Snapshot envelope v3 (v6.1.2)
+
+The snapshot envelope grows a publications trailer. v1/v2
+envelopes still load with an empty publication table (forward-
+compatible). Writers from v6.1.2 onwards always emit v3.
+
+```text
+[8 bytes "SPGENV01"]
+[u8 version = 3]
+[u32 catalog_len][catalog bytes]
+[u32 users_len][users bytes]
+[u32 pubs_len][publications bytes]   ← new in v3
+[u32 crc32]                          ← covers everything above
+```
+
+Publications-blob format (v6.1.2):
+```text
+[u16 num_publications]
+for each:
+  [u16 name_len][name bytes]
+  [u8 scope_tag]
+    0 → FOR ALL TABLES        (no trailer)
+    1 → FOR TABLE <list>      (v6.1.3 emits; v6.1.2 parses, never writes)
+    2 → FOR ALL TABLES EXCEPT <list>  (v6.1.3 emits; v6.1.2 parses, never writes)
+  for scope_tag ∈ {1, 2}:
+    [u16 num_tables]
+    for each: [u16 t_len][t bytes]
+```
+
+Sorted alphabetically by publication name for byte-stable
+snapshots regardless of insertion order.
+
 ---
 
 ## Not frozen (free to change in any release)

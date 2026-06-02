@@ -117,6 +117,25 @@ pub enum Token {
     /// `0` and `$0` are not valid; the lexer rejects them.
     Placeholder(u16),
 
+    /// v6.1.2 — `DROP` keyword. Used by `DROP PUBLICATION <name>`.
+    /// Reserved for future `DROP TABLE` / `DROP INDEX` / `DROP USER`
+    /// surface that currently goes through SHOW-shaped admin SQL.
+    Drop,
+    /// v6.1.2 — `FOR` keyword (publication scope).
+    For,
+    /// v6.1.2 — `TABLES` plural keyword (`FOR ALL TABLES`,
+    /// `FOR ALL TABLES EXCEPT …`). The existing `TABLE` keyword
+    /// stays a separate token so `CREATE TABLE`'s single-table
+    /// form keeps lexing as today.
+    Tables,
+    /// v6.1.3 (reserved at v6.1.2 to keep the AST shape stable) —
+    /// `EXCEPT` keyword for `FOR ALL TABLES EXCEPT t1, t2`.
+    Except,
+    /// v6.1.2 — `PUBLICATION` keyword.
+    Publication,
+    /// v6.1.4 (reserved at v6.1.2) — `SUBSCRIPTION` keyword.
+    Subscription,
+
     Eof,
 }
 
@@ -374,6 +393,8 @@ fn keyword_or_ident_raw(raw: &str) -> Token {
         7 => kw_len7(b),
         8 => kw_len8(b),
         9 => kw_len9(b),
+        11 => kw_len11(b),
+        12 => kw_len12(b),
         _ => None,
     };
     match tok {
@@ -430,7 +451,10 @@ fn kw_len2(b: &[u8]) -> Option<Token> {
 
 #[inline]
 fn kw_len3(b: &[u8]) -> Option<Token> {
-    // 4 keywords: all, and, asc, not
+    // 5 keywords: all, and, asc, not, for
+    if eq_ci(b, b"for") {
+        return Some(Token::For);
+    }
     if eq_ci(b, b"all") {
         return Some(Token::All);
     }
@@ -448,9 +472,12 @@ fn kw_len3(b: &[u8]) -> Option<Token> {
 
 #[inline]
 fn kw_len4(b: &[u8]) -> Option<Token> {
-    // 9 keywords: from, null, true, into, like, join, left, show, desc
+    // 10 keywords: from, null, true, into, like, join, left, show, desc, drop
     if eq_ci(b, b"from") {
         return Some(Token::From);
+    }
+    if eq_ci(b, b"drop") {
+        return Some(Token::Drop);
     }
     if eq_ci(b, b"null") {
         return Some(Token::Null);
@@ -524,9 +551,15 @@ fn kw_len5(b: &[u8]) -> Option<Token> {
 
 #[inline]
 fn kw_len6(b: &[u8]) -> Option<Token> {
-    // 7 keywords: select, create, insert, values, commit, having, offset
+    // 9 keywords: select, create, insert, values, commit, having, offset, tables, except
     if eq_ci(b, b"select") {
         return Some(Token::Select);
+    }
+    if eq_ci(b, b"tables") {
+        return Some(Token::Tables);
+    }
+    if eq_ci(b, b"except") {
+        return Some(Token::Except);
     }
     if eq_ci(b, b"create") {
         return Some(Token::Create);
@@ -587,6 +620,24 @@ fn kw_len9(b: &[u8]) -> Option<Token> {
     // 1 keyword: savepoint
     if eq_ci(b, b"savepoint") {
         return Some(Token::Savepoint);
+    }
+    None
+}
+
+#[inline]
+fn kw_len11(b: &[u8]) -> Option<Token> {
+    // 1 keyword: publication
+    if eq_ci(b, b"publication") {
+        return Some(Token::Publication);
+    }
+    None
+}
+
+#[inline]
+fn kw_len12(b: &[u8]) -> Option<Token> {
+    // 1 keyword: subscription
+    if eq_ci(b, b"subscription") {
+        return Some(Token::Subscription);
     }
     None
 }

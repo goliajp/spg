@@ -10,9 +10,111 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.2] — 2026-06-03 (CREATE PUBLICATION / DROP PUBLICATION DDL + catalog)
+
+First v6.1.x sub-version on the logical-replication path (see
+`V6_1_DESIGN.md` L3a). Lands the publication catalog without the
+publisher-side WAL filtering (that arrives in v6.1.5): operators
+can declare publications now; followers and subscribers will see
+them once the filtering + worker land.
+
+### Added
+
+- SQL surface
+  - `CREATE PUBLICATION <name> [FOR ALL TABLES]` — bare form
+    defaults to `FOR ALL TABLES`.
+  - `DROP PUBLICATION <name>` — PG-compatible silent no-op when
+    the publication doesn't exist.
+- Reserved keywords (lexer): `PUBLICATION`, `SUBSCRIPTION`
+  (reserved early for v6.1.4), `FOR`, `TABLES`, `EXCEPT`, `DROP`.
+  The bare-ident `drop` dispatch is replaced by `Token::Drop` —
+  `DROP USER` continues to work via the same parser arm.
+- AST: `Statement::CreatePublication(CreatePublicationStatement)`
+  + `Statement::DropPublication(String)` +
+  `PublicationScope::{AllTables, ForTables, AllTablesExcept}`. The
+  three scope variants are wired now so v6.1.3 only has to flip
+  the parser gate.
+- Engine: `Engine::publications() -> &Publications` accessor +
+  `Engine::exec_create_publication` / `exec_drop_publication`
+  dispatch. Duplicate names error; drop of an absent publication
+  reports `affected=0` without erroring (PG-compatible).
+- Persistence: snapshot envelope `v3` — adds a `publications`
+  trailer block before the CRC32. v1/v2 envelopes still load with
+  an empty publication table; v3 envelope is forwards-compat with
+  any future trailer additions.
+
+### Tests
+
+- `spg-engine`'s lib `publications::tests` (9) — serialize /
+  deserialize / scope variants / order stability.
+- `spg-engine`'s lib `tests` (6 new) — end-to-end CREATE / DROP
+  via engine, snapshot persistence, in-transaction rejection,
+  v2 envelope back-compat.
+- `spg-sql`'s `parser::tests` (6 new) — keyword recognition,
+  duplicate-form error hints, Display round-trip.
+- `spg-server`'s `e2e_publication_ddl.rs` (7) — wire-protocol
+  round-trip, persistence across process restart, FOR-clause
+  error hints surfacing the `v6.1.3` version marker.
+
+### Not changed
+
+- WAL format / on-disk catalog format.
+- Existing simple-query / Extended Query semantics.
+- Replication path — publications declared now are visible in
+  the v6.1.5 filter when it lands; v6.1.2 alone changes no
+  replication-stream byte.
+
+### Out of v6.1.2 (deferred)
+
+- `SHOW PUBLICATIONS` — v6.1.3 ships it alongside the
+  `FOR TABLE <list>` / `FOR ALL TABLES EXCEPT <list>` parser
+  surface.
+- Publisher-side WAL filtering — v6.1.5.
+- Subscriber-side worker — v6.1.4.
+
+## [6.1.1] — 2026-06-03 (PG-wire Extended Query Protocol — real prepared statements)
+
+### Added
+
+- SQL surface (lexer / AST): `$N` placeholder tokens
+  (`Token::Placeholder` / `Expr::Placeholder`) with 1-based
+  numbering per PG convention. `$0` errors at lex time.
+- `Engine::prepare(sql) -> Statement` and
+  `Engine::execute_prepared(stmt, params)` — parse once, walk
+  the AST replacing placeholders with `Value`-typed parameters.
+  Clock rewrites + ORDER BY position resolution land at prepare
+  time so the cached AST is execution-ready.
+- pgwire Parse / Bind / Execute path: prepared-statement cache
+  stores the parsed AST (not the raw SQL). Bind decodes text-
+  format parameters into typed `Value`s (`Bool` / `Int` /
+  `BigInt` / `Float` / `[f1,...]` → `Vector` / `Text`).
+
+### Measured
+
+|                                              | Simple Q p50 | Prepared p50 | win   |
+|----------------------------------------------|-------------:|-------------:|------:|
+| short SELECT (`WHERE id = $1`)               |        32 µs |        31 µs | -3.5% |
+| vector kNN (`ORDER BY e <-> $1 LIMIT 10`)    |       298 µs |       287 µs | -3.6% |
+
+Modest p50 win — SPG's SQL lexer/parser was already fast enough
+that parse-skip isn't a big lever. The actual value is PG-driver
+compatibility: JDBC / asyncpg / psycopg3 all default to Extended
+Query, and before v6.1.1 they were silently going through a
+textual `$N` substitution hack that rejected vector binds the
+lexer couldn't round-trip.
+
+### Tests
+
+- `spg-server::e2e_pg_extended` 3/3 — parameter substitution,
+  parameterless prepared SELECT, DML via Bind/Execute.
+- `spg-server::perf_prepared_vs_simple` — Simple-Q vs Extended-Q
+  p50 / p90 / p99 across short and long SQL shapes.
+
 ## [6.1.0] — 2026-06-03 (HNSW graph storage compaction — 12% RSS off the v6.0.5 floor)
 
-First v6.1.x sub-version. Attacks the v6.0.5-measured `1M dim-128
+First v6.1.x sub-version (perf prelude — the logical-replication
+body lands at v6.1.2; see `V6_1_DESIGN.md`). Attacks the
+v6.0.5-measured `1M dim-128
 SQ8 RSS = 624 MiB` gap vs the design's 200 MiB ambition. The
 single largest contributor was the HNSW adjacency Vec<Vec<usize>>
 inside `NswGraph::layers`: each neighbour slot was 8 bytes on

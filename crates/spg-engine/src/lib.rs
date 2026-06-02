@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod aggregate;
 pub mod eval;
 pub mod json;
+pub mod publications;
 pub mod users;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
@@ -21,10 +22,10 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use spg_sql::ast::{
-    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreateTableStatement,
-    CreateUserStatement, Expr, FrameBound, FrameKind, FromClause, IndexMethod, InsertStatement,
-    JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
-    VecEncoding as SqlVecEncoding, WindowFrame,
+    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
+    CreatePublicationStatement, CreateTableStatement, CreateUserStatement, Expr, FrameBound,
+    FrameKind, FromClause, IndexMethod, InsertStatement, JoinKind, Literal, SelectItem,
+    SelectStatement, Statement, UnOp, UnionKind, VecEncoding as SqlVecEncoding, WindowFrame,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -182,7 +183,8 @@ impl<'a> CancelToken<'a> {
     }
 }
 
-// ---- snapshot envelope (v4.1, extended with CRC32 in v4.37) ----
+// ---- snapshot envelope (v4.1, extended with CRC32 in v4.37, ----
+// ----                    publications added in v6.1.2 v3) -------
 //
 // Wraps a catalog blob + a user blob behind a small header so the
 // server can persist both atomically without inventing a new file.
@@ -206,19 +208,30 @@ impl<'a> CancelToken<'a> {
 //                                      bit-flip detector for the
 //                                      whole snapshot file.
 //
-// Writers always emit v2 from v4.37 on. Readers accept both: v1
-// loads with no CRC check (pre-v4.37 snapshots stay readable
-// forever per STABILITY); v2 verifies the trailing CRC and refuses
-// on mismatch with a `StorageError::Corrupt`.
+// Layout — v3 (v6.1.2, publications trailer):
+//   [8 bytes magic "SPGENV01"]
+//   [u8 version = 3]
+//   [u32 catalog_len][catalog bytes]
+//   [u32 users_len][users bytes]
+//   [u32 pubs_len][publications bytes]   ← NEW
+//   [u32 crc32]
+//
+// Writers emit v3 from v6.1.2 on (always — even when publications
+// are empty, the trailer block is present with `pubs_len=2` carrying
+// the encoded empty payload). Readers accept all of {v1, v2, v3}:
+// v1/v2 load with an empty publication table; v3 verifies the
+// trailing CRC and deserialises the publications.
 
 const ENVELOPE_MAGIC: &[u8; 8] = b"SPGENV01";
 const ENVELOPE_VERSION_V1: u8 = 1;
 const ENVELOPE_VERSION_V2: u8 = 2;
+const ENVELOPE_VERSION_V3: u8 = 3;
 
-fn build_envelope(catalog: &[u8], users: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 1 + 4 + catalog.len() + 4 + users.len() + 4);
+fn build_envelope(catalog: &[u8], users: &[u8], pubs: &[u8]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(8 + 1 + 4 + catalog.len() + 4 + users.len() + 4 + pubs.len() + 4);
     out.extend_from_slice(ENVELOPE_MAGIC);
-    out.push(ENVELOPE_VERSION_V2);
+    out.push(ENVELOPE_VERSION_V3);
     out.extend_from_slice(
         &u32::try_from(catalog.len())
             .expect("≤ 4G catalog")
@@ -231,32 +244,49 @@ fn build_envelope(catalog: &[u8], users: &[u8]) -> Vec<u8> {
             .to_le_bytes(),
     );
     out.extend_from_slice(users);
+    out.extend_from_slice(
+        &u32::try_from(pubs.len())
+            .expect("≤ 4G publications")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(pubs);
     let crc = spg_crypto::crc32::crc32(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
 /// Outcome of envelope parsing: either bare-catalog fallback, a
-/// successfully split (catalog, users) pair from a v1 or v2
-/// envelope, or an explicit corruption error from a v2 CRC
-/// mismatch. `None` (bare-catalog fallback) preserves v3.x
-/// readability; `Err` keeps the CRC contract honest for v2.
+/// successfully split section trio from a v1/v2/v3 envelope, or an
+/// explicit corruption error from a v2/v3 CRC mismatch. `Bare`
+/// (catalog-only fallback) preserves v3.x readability. v1/v2
+/// envelopes set `publications` to `None`; v3 sets it to the
+/// publications byte slice.
 enum EnvelopeParse<'a> {
     Bare,
-    Pair(&'a [u8], &'a [u8]),
-    CrcMismatch { expected: u32, computed: u32 },
+    Pair {
+        catalog: &'a [u8],
+        users: &'a [u8],
+        publications: Option<&'a [u8]>,
+    },
+    CrcMismatch {
+        expected: u32,
+        computed: u32,
+    },
 }
 
-/// Returns `EnvelopeParse::Pair` for a valid v1 or v2 envelope,
+/// Returns `EnvelopeParse::Pair` for a valid v1 / v2 / v3 envelope,
 /// `Bare` for a buffer that doesn't look like an envelope (v3.x
-/// bare catalog fallback), and `CrcMismatch` for a v2 envelope
+/// bare catalog fallback), and `CrcMismatch` for a v2/v3 envelope
 /// whose trailing CRC32 doesn't match the body.
 fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     if buf.len() < 8 + 1 + 4 || &buf[..8] != ENVELOPE_MAGIC {
         return EnvelopeParse::Bare;
     }
     let version = buf[8];
-    if version != ENVELOPE_VERSION_V1 && version != ENVELOPE_VERSION_V2 {
+    if !matches!(
+        version,
+        ENVELOPE_VERSION_V1 | ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3
+    ) {
         return EnvelopeParse::Bare;
     }
     let mut p = 9usize;
@@ -286,7 +316,26 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     }
     let users = &buf[p..p + user_len];
     p += user_len;
-    if version == ENVELOPE_VERSION_V2 {
+    let publications = if version == ENVELOPE_VERSION_V3 {
+        // [u32 pubs_len][publications bytes]
+        let Some(pubs_len_bytes) = buf.get(p..p + 4) else {
+            return EnvelopeParse::Bare;
+        };
+        let Ok(pubs_len_arr) = pubs_len_bytes.try_into() else {
+            return EnvelopeParse::Bare;
+        };
+        let pubs_len = u32::from_le_bytes(pubs_len_arr) as usize;
+        p += 4;
+        if p + pubs_len > buf.len() {
+            return EnvelopeParse::Bare;
+        }
+        let pubs_slice = &buf[p..p + pubs_len];
+        p += pubs_len;
+        Some(pubs_slice)
+    } else {
+        None
+    };
+    if matches!(version, ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3) {
         if p + 4 != buf.len() {
             return EnvelopeParse::Bare;
         }
@@ -302,7 +351,11 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
         // v1: must end exactly at the users section.
         return EnvelopeParse::Bare;
     }
-    EnvelopeParse::Pair(catalog, users)
+    EnvelopeParse::Pair {
+        catalog,
+        users,
+        publications,
+    }
 }
 
 /// v4.41.1 opaque transaction handle. Returned by `Engine::alloc_tx_id`,
@@ -377,6 +430,10 @@ pub struct Engine {
     /// through `create_user`/`drop_user`/`verify_user`; persistence
     /// rides the snapshot envelope alongside the catalog.
     users: UserStore,
+    /// v6.1.2 logical-replication publication catalog. Empty until
+    /// `CREATE PUBLICATION` runs. Persistence rides the v3 envelope
+    /// trailer (see `build_envelope`).
+    publications: publications::Publications,
 }
 
 impl Engine {
@@ -390,6 +447,7 @@ impl Engine {
             salt_fn: None,
             max_query_rows: None,
             users: UserStore::new(),
+            publications: publications::Publications::new(),
         }
     }
 
@@ -405,19 +463,32 @@ impl Engine {
             salt_fn: None,
             max_query_rows: None,
             users: UserStore::new(),
+            publications: publications::Publications::new(),
         }
     }
 
     /// Restore an engine + user table from a v4.1 envelope produced
     /// by `snapshot_with_users()`. Falls back to plain catalog-only
     /// restore if the envelope magic isn't present (so v3.x snapshot
-    /// files still load).
+    /// files still load). v6.1.2 adds the optional publications
+    /// trailer (envelope v3); a v1/v2 envelope deserialises to an
+    /// empty publication table.
     pub fn restore_envelope(buf: &[u8]) -> Result<Self, EngineError> {
         match split_envelope(buf) {
-            EnvelopeParse::Pair(catalog_bytes, user_bytes) => {
+            EnvelopeParse::Pair {
+                catalog: catalog_bytes,
+                users: user_bytes,
+                publications: pub_bytes,
+            } => {
                 let catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
                 let users = users::deserialize_users(user_bytes)
                     .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
+                let publications = match pub_bytes {
+                    Some(b) => publications::Publications::deserialize(b).map_err(|e| {
+                        EngineError::Unsupported(alloc::format!("publications restore: {e:?}"))
+                    })?,
+                    None => publications::Publications::new(),
+                };
                 Ok(Self {
                     catalog,
                     tx_catalogs: BTreeMap::new(),
@@ -427,6 +498,7 @@ impl Engine {
                     salt_fn: None,
                     max_query_rows: None,
                     users,
+                    publications,
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -523,14 +595,17 @@ impl Engine {
     /// adds the rule that an open TX's shadow is never snapshotted — only the
     /// post-COMMIT state is persisted. v4.1 wraps the catalog in an envelope
     /// when there are users to persist; an empty user table snapshots as the
-    /// bare catalog format (backwards-compat with v3.x readers).
+    /// bare catalog format (backwards-compat with v3.x readers). v6.1.2
+    /// adds publications to the envelope condition: either non-empty
+    /// users OR non-empty publications now triggers the envelope path.
     pub fn snapshot(&self) -> Vec<u8> {
-        if self.users.is_empty() {
+        if self.users.is_empty() && self.publications.is_empty() {
             self.catalog.serialize()
         } else {
             build_envelope(
                 &self.catalog.serialize(),
                 &users::serialize_users(&self.users),
+                &self.publications.serialize(),
             )
         }
     }
@@ -778,8 +853,60 @@ impl Engine {
             Statement::DropUser(name) => self.exec_drop_user(&name),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
             Statement::AlterIndex(s) => self.exec_alter_index(s),
+            Statement::CreatePublication(s) => self.exec_create_publication(s),
+            Statement::DropPublication(name) => self.exec_drop_publication(&name),
         };
         self.enforce_row_limit(result)
+    }
+
+    /// v6.1.2 — `CREATE PUBLICATION` runtime path. Duplicate names
+    /// surface as `EngineError::Unsupported` so the existing PG-wire
+    /// error mapping stays uniform; the message carries the name so
+    /// operators can grep replication-log noise. Inside-transaction
+    /// invocation is rejected (matches `CREATE USER` / `DROP USER`
+    /// stance) — replication-catalog mutation is a connection-level
+    /// administrative op, not a transactional one.
+    fn exec_create_publication(
+        &mut self,
+        s: CreatePublicationStatement,
+    ) -> Result<QueryResult, EngineError> {
+        if self.in_transaction() {
+            return Err(EngineError::Unsupported(
+                "CREATE PUBLICATION is not allowed inside a transaction".into(),
+            ));
+        }
+        self.publications
+            .create(s.name, s.scope)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE PUBLICATION: {e:?}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    /// v6.1.2 — `DROP PUBLICATION` runtime path. PG-compatible silent
+    /// no-op when the publication doesn't exist (returns `affected=0`
+    /// in that case so the wire-level command tag distinguishes
+    /// "dropped" from "no-op", though both succeed).
+    fn exec_drop_publication(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        if self.in_transaction() {
+            return Err(EngineError::Unsupported(
+                "DROP PUBLICATION is not allowed inside a transaction".into(),
+            ));
+        }
+        let removed = self.publications.drop(name);
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    /// v6.1.2 — read access to the publication catalog. Used by
+    /// the v6.1.5 publisher-side WAL filter, by `SHOW PUBLICATIONS`
+    /// (v6.1.3+), and by e2e tests that need to assert state without
+    /// going through the wire.
+    pub const fn publications(&self) -> &publications::Publications {
+        &self.publications
     }
 
     /// v4.1 `SHOW USERS` — `(name, role)` per row, ordered by name.
@@ -5709,5 +5836,124 @@ mod tests {
             err,
             EngineError::Storage(StorageError::TableNotFound { .. })
         ));
+    }
+
+    // ── v6.1.2: CREATE / DROP PUBLICATION (engine-side) ──────
+
+    #[test]
+    fn create_publication_lands_in_catalog() {
+        let mut e = Engine::new();
+        assert!(e.publications().is_empty());
+        e.execute("CREATE PUBLICATION pub_a").unwrap();
+        assert_eq!(e.publications().len(), 1);
+        assert!(e.publications().contains("pub_a"));
+    }
+
+    #[test]
+    fn create_publication_duplicate_errors() {
+        let mut e = Engine::new();
+        e.execute("CREATE PUBLICATION pub_a").unwrap();
+        let err = e.execute("CREATE PUBLICATION pub_a").unwrap_err();
+        assert!(
+            alloc::format!("{err:?}").contains("DuplicateName"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn drop_publication_silent_when_absent() {
+        let mut e = Engine::new();
+        // PG-compatible: DROP a publication that doesn't exist
+        // succeeds (no-op) but reports zero affected.
+        let r = e.execute("DROP PUBLICATION nope").unwrap();
+        match r {
+            QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 0),
+            other => panic!("expected CommandOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_publication_present_reports_one_affected() {
+        let mut e = Engine::new();
+        e.execute("CREATE PUBLICATION pub_a").unwrap();
+        let r = e.execute("DROP PUBLICATION pub_a").unwrap();
+        match r {
+            QueryResult::CommandOk {
+                affected,
+                modified_catalog,
+            } => {
+                assert_eq!(affected, 1);
+                assert!(modified_catalog);
+            }
+            other => panic!("expected CommandOk, got {other:?}"),
+        }
+        assert!(e.publications().is_empty());
+    }
+
+    #[test]
+    fn publications_persist_across_snapshot_restore() {
+        // The persist-across-restart ship-gate at the engine layer —
+        // snapshot → restore_envelope round trip must preserve the
+        // publication catalog. The spg-server e2e covers the
+        // process-restart variant.
+        let mut e = Engine::new();
+        e.execute("CREATE PUBLICATION pub_a").unwrap();
+        e.execute("CREATE PUBLICATION pub_b FOR ALL TABLES").unwrap();
+        let snap = e.snapshot();
+        let e2 = Engine::restore_envelope(&snap).unwrap();
+        assert_eq!(e2.publications().len(), 2);
+        assert!(e2.publications().contains("pub_a"));
+        assert!(e2.publications().contains("pub_b"));
+    }
+
+    #[test]
+    fn create_publication_blocked_inside_transaction() {
+        let mut e = Engine::new();
+        e.execute("BEGIN").unwrap();
+        let err = e.execute("CREATE PUBLICATION pub_a").unwrap_err();
+        assert!(
+            alloc::format!("{err:?}").contains("not allowed inside a transaction"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn v1_v2_envelope_loads_with_empty_publications() {
+        // A snapshot taken before v6.1.2 (no publication trailer,
+        // envelope v2) must still deserialise — and the resulting
+        // engine must report zero publications. Use the engine's own
+        // round-trip with no publications: that emits v3 but with an
+        // empty pubs block. Then forge a v2 envelope by hand to lock
+        // the back-compat path.
+        let mut e = Engine::new();
+        // Force users to be non-empty so the snapshot takes the
+        // envelope path rather than the bare-catalog fallback.
+        e.create_user(
+            "alice",
+            "secret",
+            crate::users::Role::ReadOnly,
+            [0u8; 16],
+        )
+        .unwrap();
+
+        // Forge an envelope v2: same shape as v3 but no pubs trailer.
+        let catalog = e.catalog.serialize();
+        let users = crate::users::serialize_users(&e.users);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"SPGENV01");
+        buf.push(2u8); // v2
+        buf.extend_from_slice(
+            &u32::try_from(catalog.len()).unwrap().to_le_bytes(),
+        );
+        buf.extend_from_slice(&catalog);
+        buf.extend_from_slice(
+            &u32::try_from(users.len()).unwrap().to_le_bytes(),
+        );
+        buf.extend_from_slice(&users);
+        let crc = spg_crypto::crc32::crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        let e2 = Engine::restore_envelope(&buf).expect("v2 envelope restores");
+        assert!(e2.publications().is_empty());
     }
 }
