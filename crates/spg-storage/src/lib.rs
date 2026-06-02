@@ -3140,12 +3140,36 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         (Value::Text(s), DataType::Text | DataType::Varchar(_) | DataType::Char(_)) => {
             write_str(out, s);
         }
-        (Value::Vector(v), DataType::Vector { .. }) => {
+        (
+            Value::Vector(v),
+            DataType::Vector {
+                encoding: VecEncoding::F32,
+                ..
+            },
+        ) => {
             let dim = u32::try_from(v.len()).expect("vector dim fits in u32");
             out.extend_from_slice(&dim.to_le_bytes());
             for x in v {
                 out.extend_from_slice(&x.to_le_bytes());
             }
+        }
+        // v6.0.1: SQ8 dense body — [u32 dim][f32 min][f32 max]
+        // [u8 * dim]. Self-describes its length so v6 readers
+        // walking rows of a v6 catalog stay aligned even if the
+        // declared column dim drifts (defensive, not normally
+        // possible since CREATE TABLE pins the dim).
+        (
+            Value::Sq8Vector(q),
+            DataType::Vector {
+                encoding: VecEncoding::Sq8,
+                ..
+            },
+        ) => {
+            let dim = u32::try_from(q.bytes.len()).expect("vector dim fits in u32");
+            out.extend_from_slice(&dim.to_le_bytes());
+            out.extend_from_slice(&q.min.to_le_bytes());
+            out.extend_from_slice(&q.max.to_le_bytes());
+            out.extend_from_slice(&q.bytes);
         }
         (Value::Numeric { scaled, .. }, DataType::Numeric { scale, .. }) => {
             out.extend_from_slice(&scaled.to_le_bytes());
@@ -3208,12 +3232,17 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
                 out.extend_from_slice(&x.to_le_bytes());
             }
         }
-        // v6.0.1: Sq8Vector value-tag encoding lands in step 6
-        // (new tag 11 = SQ8 row payload). Until then the INSERT
-        // path is fenced at the engine layer so no `Value::Sq8Vector`
-        // can reach `write_value`.
-        Value::Sq8Vector(_) => {
-            unreachable!("Value::Sq8Vector on-disk encoding lands in v6.0.1 step 6")
+        // v6.0.1: new tag 11 for an SQ8 cell carried with its full
+        // header. Layout matches the dense row body shape so a
+        // round-trip through write_value → read_value bit-equals
+        // the original `Value::Sq8Vector`.
+        Value::Sq8Vector(q) => {
+            out.push(11);
+            let dim = u32::try_from(q.bytes.len()).expect("vector dim fits in u32");
+            out.extend_from_slice(&dim.to_le_bytes());
+            out.extend_from_slice(&q.min.to_le_bytes());
+            out.extend_from_slice(&q.max.to_le_bytes());
+            out.extend_from_slice(&q.bytes);
         }
         Value::Numeric { scaled, scale } => {
             out.push(8);
@@ -3322,6 +3351,10 @@ impl<'a> Cursor<'a> {
         let arr: [u8; 8] = s.try_into().expect("checked");
         Ok(f64::from_le_bytes(arr))
     }
+    fn read_f32(&mut self) -> Result<f32, StorageError> {
+        let s = self.take(4)?;
+        Ok(f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
     fn read_str(&mut self) -> Result<String, StorageError> {
         let len = self.read_u16()? as usize;
         let bytes = self.take(len)?;
@@ -3362,7 +3395,10 @@ impl<'a> Cursor<'a> {
             DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
                 Ok(Value::Text(self.read_str()?))
             }
-            DataType::Vector { .. } => {
+            DataType::Vector {
+                encoding: VecEncoding::F32,
+                ..
+            } => {
                 let dim = self.read_u32()? as usize;
                 let mut v = Vec::with_capacity(dim);
                 for _ in 0..dim {
@@ -3370,6 +3406,16 @@ impl<'a> Cursor<'a> {
                     v.push(f32::from_le_bytes(bytes));
                 }
                 Ok(Value::Vector(v))
+            }
+            DataType::Vector {
+                encoding: VecEncoding::Sq8,
+                ..
+            } => {
+                let dim = self.read_u32()? as usize;
+                let min = self.read_f32()?;
+                let max = self.read_f32()?;
+                let bytes = self.take(dim)?.to_vec();
+                Ok(Value::Sq8Vector(quantize::Sq8Vector { min, max, bytes }))
             }
             DataType::Numeric { .. } => {
                 let s = self.take(16)?;
@@ -3424,6 +3470,17 @@ impl<'a> Cursor<'a> {
             }
             9 => Ok(Value::Date(self.read_i32()?)),
             10 => Ok(Value::Timestamp(self.read_i64()?)),
+            // v6.0.1: tag 11 — Sq8Vector. Pre-v6 readers fall
+            // through to the catch-all and surface
+            // `Corrupt("unknown value tag")`, matching the
+            // forward-compat fence on the column-type side.
+            11 => {
+                let dim = self.read_u32()? as usize;
+                let min = self.read_f32()?;
+                let max = self.read_f32()?;
+                let bytes = self.take(dim)?.to_vec();
+                Ok(Value::Sq8Vector(quantize::Sq8Vector { min, max, bytes }))
+            }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }
@@ -3800,6 +3857,69 @@ mod tests {
                 "layer {l} PV not shared after clone — clone copied elements (O(N))"
             );
         }
+    }
+
+    #[test]
+    fn sq8_catalog_serialise_roundtrip_preserves_cells_and_index() {
+        // v6.0.1 step 6 verify: a catalog with an `VECTOR(N)
+        // USING SQ8` column + NSW index survives a full
+        // serialise → deserialise cycle. Cells re-decode bit-
+        // identically (per-vector affine triple), the NSW
+        // topology stays intact, and kNN search still routes
+        // through the SQ8 ADC dispatcher after the catalog hop.
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "vecs",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new(
+                    "v",
+                    DataType::Vector {
+                        dim: 8,
+                        encoding: VecEncoding::Sq8,
+                    },
+                    false,
+                ),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("vecs").unwrap();
+        for i in 0..32_i32 {
+            #[allow(clippy::cast_precision_loss)]
+            let base = (i as f32) * 0.03;
+            let v: Vec<f32> = (0..8_i32)
+                .map(|j| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let off = (j as f32) * 0.01;
+                    base + off
+                })
+                .collect();
+            t.insert(Row::new(alloc::vec![
+                Value::Int(i),
+                Value::Sq8Vector(quantize::quantize(&v)),
+            ]))
+            .unwrap();
+        }
+        t.add_nsw_index("v_idx".into(), "v", NSW_DEFAULT_M).unwrap();
+        // Capture a pre-serialise reference cell + nsw hits to
+        // compare against the restored catalog.
+        let query = alloc::vec![0.15_f32, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22];
+        let (before_cell, before_ty, before_hits) = {
+            let t_ref = cat.get("vecs").unwrap();
+            (
+                t_ref.rows()[5].values[1].clone(),
+                t_ref.schema().columns[1].ty,
+                nsw_query(t_ref, "v_idx", &query, 5, NswMetric::L2),
+            )
+        };
+
+        let bytes = cat.serialize();
+        let restored = Catalog::deserialize(&bytes).expect("deserialize ok");
+        let rt = restored.get("vecs").unwrap();
+        assert_eq!(rt.schema().columns[1].ty, before_ty);
+        assert_eq!(rt.rows()[5].values[1], before_cell);
+        let after_hits = nsw_query(rt, "v_idx", &query, 5, NswMetric::L2);
+        assert_eq!(before_hits, after_hits);
     }
 
     #[test]
