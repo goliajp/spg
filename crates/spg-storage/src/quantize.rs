@@ -159,11 +159,28 @@ pub fn sq8_l2_distance_sq(a: &Sq8Vector, b: &Sq8Vector) -> f32 {
 /// Asymmetric L2² between a stored SQ8 vector and an un-quantized
 /// query vector. Same semantics as `vec_l2_sq` for the kNN scan
 /// case (one query, many vectors).
+///
+/// v6.0.2: aarch64 NEON path for `dim >= 16 && dim % 16 == 0` —
+/// covers every production-shaped embedding (64, 128, 256, ...).
+/// Other shapes fall back to the scalar loop.
 #[must_use]
 pub fn sq8_l2_distance_sq_asymmetric(a: &Sq8Vector, q: &[f32]) -> f32 {
     if a.bytes.len() != q.len() {
         return f32::INFINITY;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = a.bytes.len();
+        if n >= 16 && n.is_multiple_of(16) {
+            // SAFETY: NEON is baseline aarch64; preconditions (matching
+            // lengths, ≥ 1 full 16-byte lane group) checked above.
+            return unsafe { sq8_l2_distance_sq_asymmetric_neon(a, q) };
+        }
+    }
+    sq8_l2_distance_sq_asymmetric_scalar(a, q)
+}
+
+fn sq8_l2_distance_sq_asymmetric_scalar(a: &Sq8Vector, q: &[f32]) -> f32 {
     let inv_a = sq8_step(a);
     let mut acc: f32 = 0.0;
     for (&ba, &qx) in a.bytes.iter().zip(q.iter()) {
@@ -172,6 +189,52 @@ pub fn sq8_l2_distance_sq_asymmetric(a: &Sq8Vector, q: &[f32]) -> f32 {
         acc += d * d;
     }
     acc
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)] // NEON intrinsics work in single-letter regs by convention
+unsafe fn sq8_l2_distance_sq_asymmetric_neon(a: &Sq8Vector, q: &[f32]) -> f32 {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vcvtq_f32_u32, vdupq_n_f32, vfmaq_f32, vget_high_u16,
+        vget_low_u16, vld1_u8, vld1q_f32, vmovl_u8, vmovl_u16, vsubq_f32,
+    };
+    unsafe {
+        let step = vdupq_n_f32(sq8_step(a));
+        let bias = vdupq_n_f32(a.min);
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc0 = zero;
+        let mut acc1 = zero;
+        let n = a.bytes.len();
+        let mut i = 0usize;
+        while i + 16 <= n {
+            // Two 8-byte loads cover one 16-byte chunk of a.bytes.
+            // Widening u8 → u16 → u32 → f32 stays portable to every
+            // ARMv8.0+ NEON host (no FEAT_DotProd dependency).
+            let lo8 = vld1_u8(a.bytes.as_ptr().add(i));
+            let hi8 = vld1_u8(a.bytes.as_ptr().add(i + 8));
+            let lo16 = vmovl_u8(lo8); // u8x8 → u16x8
+            let hi16 = vmovl_u8(hi8);
+            let xa0 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16))));
+            let xa1 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16))));
+            let xa2 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16))));
+            let xa3 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16))));
+            let q0 = vld1q_f32(q.as_ptr().add(i));
+            let q1 = vld1q_f32(q.as_ptr().add(i + 4));
+            let q2 = vld1q_f32(q.as_ptr().add(i + 8));
+            let q3 = vld1q_f32(q.as_ptr().add(i + 12));
+            let d0 = vsubq_f32(xa0, q0);
+            let d1 = vsubq_f32(xa1, q1);
+            let d2 = vsubq_f32(xa2, q2);
+            let d3 = vsubq_f32(xa3, q3);
+            acc0 = vfmaq_f32(acc0, d0, d0);
+            acc1 = vfmaq_f32(acc1, d1, d1);
+            acc0 = vfmaq_f32(acc0, d2, d2);
+            acc1 = vfmaq_f32(acc1, d3, d3);
+            i += 16;
+        }
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
 }
 
 /// Symmetric inner product, returned **negated** so smaller = closer
@@ -192,19 +255,68 @@ pub fn sq8_inner_product(a: &Sq8Vector, b: &Sq8Vector) -> f32 {
     -dot
 }
 
-/// Asymmetric inner product (negated).
+/// Asymmetric inner product (negated). v6.0.2: aarch64 NEON path
+/// under the same `dim >= 16 && dim % 16 == 0` pre-condition as the
+/// L2 asymmetric variant.
 #[must_use]
 pub fn sq8_inner_product_asymmetric(a: &Sq8Vector, q: &[f32]) -> f32 {
     if a.bytes.len() != q.len() {
         return f32::INFINITY;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = a.bytes.len();
+        if n >= 16 && n.is_multiple_of(16) {
+            // SAFETY: see `sq8_l2_distance_sq_asymmetric_neon`.
+            return -unsafe { sq8_dot_asymmetric_neon(a, q) };
+        }
+    }
+    -sq8_dot_asymmetric_scalar(a, q)
+}
+
+fn sq8_dot_asymmetric_scalar(a: &Sq8Vector, q: &[f32]) -> f32 {
     let inv_a = sq8_step(a);
     let mut dot: f32 = 0.0;
     for (&ba, &qx) in a.bytes.iter().zip(q.iter()) {
         let xa = a.min + f32::from(ba) * inv_a;
         dot += xa * qx;
     }
-    -dot
+    dot
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names)]
+unsafe fn sq8_dot_asymmetric_neon(a: &Sq8Vector, q: &[f32]) -> f32 {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vcvtq_f32_u32, vdupq_n_f32, vfmaq_f32, vget_high_u16,
+        vget_low_u16, vld1_u8, vld1q_f32, vmovl_u8, vmovl_u16,
+    };
+    unsafe {
+        let step = vdupq_n_f32(sq8_step(a));
+        let bias = vdupq_n_f32(a.min);
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc0 = zero;
+        let mut acc1 = zero;
+        let n = a.bytes.len();
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let lo8 = vld1_u8(a.bytes.as_ptr().add(i));
+            let hi8 = vld1_u8(a.bytes.as_ptr().add(i + 8));
+            let lo16 = vmovl_u8(lo8);
+            let hi16 = vmovl_u8(hi8);
+            let xa0 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16))));
+            let xa1 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16))));
+            let xa2 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16))));
+            let xa3 = vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16))));
+            acc0 = vfmaq_f32(acc0, xa0, vld1q_f32(q.as_ptr().add(i)));
+            acc1 = vfmaq_f32(acc1, xa1, vld1q_f32(q.as_ptr().add(i + 4)));
+            acc0 = vfmaq_f32(acc0, xa2, vld1q_f32(q.as_ptr().add(i + 8)));
+            acc1 = vfmaq_f32(acc1, xa3, vld1q_f32(q.as_ptr().add(i + 12)));
+            i += 16;
+        }
+        vaddvq_f32(vaddq_f32(acc0, acc1))
+    }
 }
 
 /// Symmetric cosine distance `1 - dot / (||a|| ||b||)`. Zero-norm
@@ -231,12 +343,45 @@ pub fn sq8_cosine_distance(a: &Sq8Vector, b: &Sq8Vector) -> f32 {
     1.0 - dot / (sqrt_finite(na) * sqrt_finite(nb))
 }
 
-/// Asymmetric cosine distance against an un-quantized query.
+/// Asymmetric cosine distance against an un-quantized query. v6.0.2:
+/// aarch64 NEON path for the three accumulators; norm-sqrt + zero-
+/// guard stays in this safe wrapper.
 #[must_use]
 pub fn sq8_cosine_distance_asymmetric(a: &Sq8Vector, q: &[f32]) -> f32 {
     if a.bytes.len() != q.len() {
         return f32::INFINITY;
     }
+    let (dot, na, nq);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = a.bytes.len();
+        if n >= 16 && n.is_multiple_of(16) {
+            // SAFETY: see `sq8_l2_distance_sq_asymmetric_neon`.
+            let (d, a2, q2) = unsafe { sq8_cosine_accumulators_asymmetric_neon(a, q) };
+            dot = d;
+            na = a2;
+            nq = q2;
+        } else {
+            let (d, a2, q2) = sq8_cosine_accumulators_asymmetric_scalar(a, q);
+            dot = d;
+            na = a2;
+            nq = q2;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let (d, a2, q2) = sq8_cosine_accumulators_asymmetric_scalar(a, q);
+        dot = d;
+        na = a2;
+        nq = q2;
+    }
+    if na == 0.0 || nq == 0.0 {
+        return f32::INFINITY;
+    }
+    1.0 - dot / (sqrt_finite(na) * sqrt_finite(nq))
+}
+
+fn sq8_cosine_accumulators_asymmetric_scalar(a: &Sq8Vector, q: &[f32]) -> (f32, f32, f32) {
     let inv_a = sq8_step(a);
     let (mut dot, mut na, mut nq) = (0.0_f32, 0.0_f32, 0.0_f32);
     for (&ba, &qx) in a.bytes.iter().zip(q.iter()) {
@@ -245,10 +390,52 @@ pub fn sq8_cosine_distance_asymmetric(a: &Sq8Vector, q: &[f32]) -> f32 {
         na += xa * xa;
         nq += qx * qx;
     }
-    if na == 0.0 || nq == 0.0 {
-        return f32::INFINITY;
+    (dot, na, nq)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+unsafe fn sq8_cosine_accumulators_asymmetric_neon(a: &Sq8Vector, q: &[f32]) -> (f32, f32, f32) {
+    use core::arch::aarch64::{
+        float32x4_t, vaddvq_f32, vcvtq_f32_u32, vdupq_n_f32, vfmaq_f32, vget_high_u16,
+        vget_low_u16, vld1_u8, vld1q_f32, vmovl_u8, vmovl_u16,
+    };
+    unsafe {
+        let step = vdupq_n_f32(sq8_step(a));
+        let bias = vdupq_n_f32(a.min);
+        let zero: float32x4_t = vdupq_n_f32(0.0);
+        let mut acc_dot = zero;
+        let mut acc_na = zero;
+        let mut acc_nq = zero;
+        let n = a.bytes.len();
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let lo8 = vld1_u8(a.bytes.as_ptr().add(i));
+            let hi8 = vld1_u8(a.bytes.as_ptr().add(i + 8));
+            let lo16 = vmovl_u8(lo8);
+            let hi16 = vmovl_u8(hi8);
+            let xs = [
+                vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16)))),
+                vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16)))),
+                vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16)))),
+                vfmaq_f32(bias, step, vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16)))),
+            ];
+            let qs = [
+                vld1q_f32(q.as_ptr().add(i)),
+                vld1q_f32(q.as_ptr().add(i + 4)),
+                vld1q_f32(q.as_ptr().add(i + 8)),
+                vld1q_f32(q.as_ptr().add(i + 12)),
+            ];
+            for k in 0..4 {
+                acc_dot = vfmaq_f32(acc_dot, xs[k], qs[k]);
+                acc_na = vfmaq_f32(acc_na, xs[k], xs[k]);
+                acc_nq = vfmaq_f32(acc_nq, qs[k], qs[k]);
+            }
+            i += 16;
+        }
+        (vaddvq_f32(acc_dot), vaddvq_f32(acc_na), vaddvq_f32(acc_nq))
     }
-    1.0 - dot / (sqrt_finite(na) * sqrt_finite(nq))
 }
 
 /// Reconstruction step `(max - min) / 255`; saturates to 0 on
@@ -778,6 +965,92 @@ mod tests {
         for short in [0_usize, 1, 4, 8, 11] {
             let buf = vec![0u8; short];
             assert_eq!(Sq8Vector::from_bytes(&buf), Err(QuantizeError::Truncated));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sq8_adc_ip_asymmetric_neon_matches_scalar() {
+        // v6.0.2 step 3 verify: NEON inner-product asymmetric ADC.
+        // Returned value is `-dot`; we compare against the scalar
+        // shape of the same.
+        let dims = [16usize, 32, 64, 128, 256, 512, 1024];
+        for &d in &dims {
+            let mut rng = SplitMix64::new(0xBEEF_DEAD_1234_A5A5u64 ^ d as u64);
+            for _ in 0..16 {
+                let v = random_gaussian_vec(&mut rng, d);
+                let q = random_gaussian_vec(&mut rng, d);
+                let sq = quantize(&v);
+                let scalar = -sq8_dot_asymmetric_scalar(&sq, &q);
+                let neon = -unsafe { sq8_dot_asymmetric_neon(&sq, &q) };
+                let tol = (scalar.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-5;
+                assert!(
+                    (scalar - neon).abs() <= tol,
+                    "IP asym dim={d}: scalar={scalar} neon={neon} diff={}",
+                    (scalar - neon).abs()
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sq8_adc_cosine_asymmetric_neon_matches_scalar() {
+        // v6.0.2 step 3 verify: cosine accumulators agree across
+        // scalar / NEON; the safe wrapper handles norm-sqrt + zero
+        // guard the same way for both paths.
+        let dims = [16usize, 32, 64, 128, 256, 512, 1024];
+        for &d in &dims {
+            let mut rng = SplitMix64::new(0xC0DE_F00D_1234_5678u64 ^ d as u64);
+            for _ in 0..16 {
+                let v = random_gaussian_vec(&mut rng, d);
+                let q = random_gaussian_vec(&mut rng, d);
+                let sq = quantize(&v);
+                let (dot_s, na_s, nq_s) = sq8_cosine_accumulators_asymmetric_scalar(&sq, &q);
+                let (dot_n, na_n, nq_n) =
+                    unsafe { sq8_cosine_accumulators_asymmetric_neon(&sq, &q) };
+                let tol = |x: f32| (x.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-5;
+                assert!(
+                    (dot_s - dot_n).abs() <= tol(dot_s),
+                    "cos dot dim={d}: scalar={dot_s} neon={dot_n}"
+                );
+                assert!(
+                    (na_s - na_n).abs() <= tol(na_s),
+                    "cos na dim={d}: scalar={na_s} neon={na_n}"
+                );
+                assert!(
+                    (nq_s - nq_n).abs() <= tol(nq_s),
+                    "cos nq dim={d}: scalar={nq_s} neon={nq_n}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sq8_adc_l2_asymmetric_neon_matches_scalar() {
+        // v6.0.2 step 2 verify: NEON L2 asymmetric ADC must agree
+        // with the scalar reference across every production-shaped
+        // dim. Tolerance scales with `dim`: FMA rounding + the
+        // dequantisation step's intermediate widening can drift one
+        // ulp per term, so a scalar / NEON spread of dim * 1e-6 is
+        // expected at dim 1024.
+        let dims = [16usize, 32, 48, 64, 128, 256, 512, 1024];
+        for &d in &dims {
+            let mut rng = SplitMix64::new(0xA5A5_1234_DEAD_BEEFu64 ^ d as u64);
+            for _ in 0..16 {
+                let v = random_gaussian_vec(&mut rng, d);
+                let q = random_gaussian_vec(&mut rng, d);
+                let sq = quantize(&v);
+                let scalar = sq8_l2_distance_sq_asymmetric_scalar(&sq, &q);
+                let neon = unsafe { sq8_l2_distance_sq_asymmetric_neon(&sq, &q) };
+                let tol = (scalar.abs().max(1e-6)) * 1e-4 + (d as f32) * 1e-5;
+                assert!(
+                    (scalar - neon).abs() <= tol,
+                    "L2 asym dim={d}: scalar={scalar} neon={neon} diff={}",
+                    (scalar - neon).abs()
+                );
+            }
         }
     }
 
