@@ -976,6 +976,161 @@ Verification at each todo via the `cargo test` commands listed
 in the L3a-v6.0.3 steps. Anything red → stop and diagnose; do
 not soften the test.
 
+## L3a-v6.0.4 — Hot plan for v6.0.4 (ALTER INDEX REBUILD — synchronous MVP)
+
+v6.0.4 lands the user-visible feature `ALTER INDEX <name> REBUILD
+[WITH (encoding = ...)]` — change a column's vector encoding
+without `DROP INDEX` + `CREATE INDEX`, and rebuild the NSW graph
+in-place when the underlying corpus has drifted (or when the
+encoding needs to change to recover memory after a v6.0.1 / v6.0.3
+migration).
+
+### Architectural deviation from V6_DESIGN L2 (scope-narrowing)
+
+The L2 row promised a **live** rebuild: background worker takes a
+long-lived `TxId` snapshot, builds the new graph in
+`.spg/staging/idx_<id>.tmp`, atomic swap under brief `engine.
+write()` with dual-write to old + new during the build. The
+chaos-recovery path replays WAL `ALTER REBUILD` markers on
+startup to restore old state if killed mid-rebuild.
+
+v6.0.4 ships the **synchronous** MVP instead:
+
+1. `ALTER INDEX <idx> REBUILD [WITH (encoding = ...)]` takes
+   `engine.write()` for the duration of the rebuild.
+2. Reads + writes block until the rebuild completes — same
+   semantics as `CREATE INDEX` today.
+3. No background worker, no staging directory, no dual-write,
+   no WAL replay machinery.
+
+Rationale: the synchronous path delivers the semantic feature
+(change encoding, rebuild topology) without touching the WAL /
+freezer / chaos-recovery state machines. The "live" optimisation
+(no read-side downtime) is a substantial concurrent-execution
+problem that doesn't fit cleanly alongside a six-sub-version
+v6.0 series in one motion. It lands as **v6.0.4.1** or
+**v6.1.x** after v6.0.5 ships the v6.0.0 tag.
+
+This mirrors the v6.0.3 scope adjustment (NEON f16 SIMD →
+scalar codec) — deliver the user-visible feature on the stable
+codepath; defer the performance optimisation to a follow-up.
+
+### Step 1 — ALTER INDEX REBUILD SQL grammar
+
+- `crates/spg-sql/src/ast.rs`:
+  - New `pub struct AlterIndexStatement { name: String, target:
+    AlterIndexTarget }`.
+  - `pub enum AlterIndexTarget { Rebuild { encoding:
+    Option<VecEncoding> } }`. `encoding = None` rebuilds the
+    graph in place without changing encoding (after corpus
+    drift, before a v6.0.5 sweep, etc.). `Some(F32 | Sq8 | F16)`
+    re-encodes every stored cell to the target.
+  - `Statement::AlterIndex(AlterIndexStatement)` variant.
+  - `Display` round-trips through `parse` (matches the v5.x
+    convention).
+- `crates/spg-sql/src/parser.rs`:
+  - `ALTER` is the SQL keyword. Followed by `INDEX <ident>
+    REBUILD [WITH (encoding = <ident>)]`. `encoding` value
+    reuses the v6.0.1 / v6.0.3 case-insensitive matcher
+    (`F32` / `SQ8` / `HALF`).
+  - Parser tests: bare REBUILD, REBUILD WITH (encoding = SQ8),
+    HALF, F32; case insensitivity; unknown encoding rejected;
+    missing parens / leftover tokens rejected.
+
+**Verify:**
+```
+cargo test -p spg-sql --lib parser::alter_index_rebuild
+```
+
+### Step 2 — Engine handler
+
+- `crates/spg-engine/src/lib.rs`:
+  - Match `Statement::AlterIndex` in the main `execute_*`
+    dispatch.
+  - `exec_alter_index_rebuild(stmt, …)`:
+    1. Find the table holding the index by name (linear scan
+       across catalog — index names are globally unique
+       within a catalog by `add_nsw_index_inner` enforcement).
+    2. Snapshot the column position + current encoding + the
+       NSW `m` parameter.
+    3. If target encoding is `Some(new_enc)` and `new_enc !=
+       current_enc`, re-encode every row's cell at the indexed
+       column position via the existing `coerce_value` arms.
+       Schema's `DataType::Vector { encoding }` is updated to
+       the new encoding.
+    4. Drop the old index slot (`indices.remove(idx_pos)`),
+       then call `add_nsw_index_inner(name, column_name, m,
+       None)` which re-walks rows and rebuilds the graph from
+       scratch.
+  - Reject ALTER on a B-tree index (unsupported for v6.0.4 —
+    only NSW indexes have rebuild semantics worth exposing).
+  - Reject ALTER on a non-existent index with
+    `EngineError::Unsupported("index … not found")`.
+
+**Verify:**
+```
+cargo test -p spg-engine --lib exec_alter_index_rebuild
+```
+
+### Step 3 — e2e + lib tests
+
+- `crates/spg-server/tests/e2e_alter_rebuild.rs` (new) with two
+  cases using the standard `tests/common::ServerBuilder`:
+  1. `alter_rebuild_in_place_preserves_topk` — `CREATE TABLE …
+     VECTOR(N) USING SQ8`, `CREATE INDEX … USING hnsw`, ingest,
+     `ALTER INDEX … REBUILD`, assert kNN top-K matches the
+     pre-rebuild result.
+  2. `alter_rebuild_with_encoding_switch_sq8_to_f32` —
+     starts SQ8, switches to F32 via `ALTER INDEX … REBUILD
+     WITH (encoding = F32)`, asserts post-rebuild kNN is
+     bit-exact (F32 vs the original SQ8 result is *not* equal,
+     but the new graph's top-K matches the f32 ground truth
+     within the recall envelope).
+- `crates/spg-storage/src/lib.rs` lib test
+  `alter_rebuild_replaces_encoding_in_schema` —
+  in-process: build a table SQ8, then `Table::rebuild_nsw_index_
+  with_encoding(name, F32)` (new helper), assert
+  `schema().columns[col].ty.encoding == F32` and every cell is
+  now `Value::Vector(_)` not `Value::Sq8Vector(_)`.
+
+**Verify:**
+```
+cargo test --release -p spg-server --test e2e_alter_rebuild
+cargo test -p spg-storage --lib alter_rebuild_replaces_encoding
+```
+
+### Step 4 — STABILITY + CHANGELOG + ship
+
+- STABILITY.md DDL grammar row gains
+  `ALTER INDEX <name> REBUILD [WITH (encoding = ...)]`. No new
+  on-disk surfaces — the rebuilt catalog uses the existing tags
+  established in v6.0.1 / v6.0.3.
+- CHANGELOG `[6.0.4]` entry: lists the synchronous-MVP scope +
+  the deferred async optimisation.
+- `cargo fmt`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo test --release --workspace`, sqllogictest
+  4-corpus 100%.
+- Commit `v6.0.4-alter-index-rebuild-sync-mvp`.
+
+## L4-v6.0.4 — v6.0.4 todos (execution order)
+
+1. `AlterIndexStatement` + `AlterIndexTarget::Rebuild` + parser
+2. parser tests for the new statement
+3. engine `exec_alter_index_rebuild` — single function, re-uses
+   `coerce_value` for re-encoding + `add_nsw_index_inner` for
+   graph rebuild
+4. engine lib tests (success + unknown-index + b-tree-index)
+5. storage `Table::rebuild_nsw_index_with_encoding` helper for
+   the lib-test fixture
+6. e2e_alter_rebuild via ServerBuilder
+7. STABILITY.md DDL row + CHANGELOG entry
+8. fmt + clippy + workspace test green + sqllogictest 4-corpus 100%
+9. commit `v6.0.4-alter-index-rebuild-sync-mvp`
+
+Verification at each todo via the `cargo test` commands listed
+in the L3a-v6.0.4 steps. Anything red → stop and diagnose; do
+not soften the test.
+
 ## Risk register
 
 | risk | mitigation |
@@ -991,8 +1146,11 @@ not soften the test.
 - v6.0.1 hot plan: see L3a-v6.0.1 above (drafted 2026-06-02 after v6.0.0 shipped).
 - v6.0.2 hot plan: see L3a-v6.0.2 above (drafted 2026-06-02 after v6.0.1 shipped).
 - v6.0.3 hot plan: see L3a-v6.0.3 above (drafted 2026-06-02 after v6.0.2 shipped).
-- v6.0.4 (live rebuild) design lands in this file as a new
-  L3a-v6.0.4 section after v6.0.3 ships.
+- v6.0.4 hot plan: see L3a-v6.0.4 above (drafted 2026-06-02 after
+  v6.0.3 shipped). Scoped to synchronous MVP — async "live"
+  rebuild lands as v6.0.4.1 / v6.1.x.
+- v6.0.5 (sweep + tag v6.0.0) design lands in this file as a new
+  L3a-v6.0.5 section after v6.0.4 ships.
 - v6.1 (logical replication) design starts fresh as `V6_1_DESIGN.md` after v6.0.5 tags.
 - Next-version trigger for v6.0.1 → v6.0.2 is: all v6.0.1 perf
   gates green + `xtests/sqllogictest` 4-corpus still 100% +
