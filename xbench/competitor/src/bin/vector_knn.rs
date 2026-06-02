@@ -46,21 +46,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rows: Vec<KnnRes> = Vec::new();
 
-    // SPG embedded — direct Engine; no wire, no fsync.
-    let r = bench_spg_embedded(&vectors, &queries);
-    rows.push(KnnRes {
-        backend: "spg-embedded".into(),
-        ..r
-    });
+    // SPG embedded — direct Engine; no wire, no fsync. Three
+    // encodings: F32 (pre-v6 default), SQ8 (v6.0.1, 4× compression
+    // via per-vector affine), HALF (v6.0.3, IEEE binary16).
+    for enc in [None, Some("SQ8"), Some("HALF")] {
+        let r = bench_spg_embedded(&vectors, &queries, enc);
+        let suffix = enc.map_or(String::new(), |e| format!(" ({e})"));
+        rows.push(KnnRes {
+            backend: format!("spg-embedded{suffix}"),
+            ..r
+        });
+    }
 
-    // SPG server (TCP wire).
-    {
+    // SPG server (TCP wire). Same three-way encoding sweep.
+    for enc in [None, Some("SQ8"), Some("HALF")] {
         let mut child = spawn_spg_server()?;
-        let r = bench_spg_server(&vectors, &queries)?;
+        let r = bench_spg_server(&vectors, &queries, enc)?;
         let _ = child.kill();
         let _ = child.wait();
+        let suffix = enc.map_or(String::new(), |e| format!(" ({e})"));
         rows.push(KnnRes {
-            backend: "spg-server".into(),
+            backend: format!("spg-server{suffix}"),
             ..r
         });
     }
@@ -173,12 +179,16 @@ fn vec_to_pgvector_literal(v: &[f32]) -> String {
 
 // ----- SPG embedded -----------------------------------------------------
 
-fn bench_spg_embedded(vectors: &[Vec<f32>], queries: &[Vec<f32>]) -> KnnRes {
+fn bench_spg_embedded(
+    vectors: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    encoding: Option<&str>,
+) -> KnnRes {
     use spg_engine::Engine;
     let mut eng = Engine::new();
+    let using = encoding.map_or(String::new(), |e| format!(" USING {e}"));
     eng.execute(&format!(
-        "CREATE TABLE vecs (id INT NOT NULL, v VECTOR({}) NOT NULL)",
-        DIM
+        "CREATE TABLE vecs (id INT NOT NULL, v VECTOR({DIM}){using} NOT NULL)"
     ))
     .unwrap();
     let t0 = Instant::now();
@@ -256,6 +266,7 @@ fn spawn_spg_server() -> Result<Child, Box<dyn std::error::Error>> {
 fn bench_spg_server(
     vectors: &[Vec<f32>],
     queries: &[Vec<f32>],
+    encoding: Option<&str>,
 ) -> Result<KnnRes, Box<dyn std::error::Error>> {
     use spg_wire::{Op, build_query, encode, parse_command_complete, parse_error_response};
     fn round_trip(stream: &mut TcpStream, sql: &str) -> Result<usize, String> {
@@ -301,12 +312,10 @@ fn bench_spg_server(
     stream.set_read_timeout(Some(Duration::from_mins(2)))?;
     stream.set_nodelay(true)?;
 
+    let using = encoding.map_or(String::new(), |e| format!(" USING {e}"));
     round_trip(
         &mut stream,
-        &format!(
-            "CREATE TABLE vecs (id INT NOT NULL, v VECTOR({}) NOT NULL)",
-            DIM
-        ),
+        &format!("CREATE TABLE vecs (id INT NOT NULL, v VECTOR({DIM}){using} NOT NULL)"),
     )
     .map_err(|e| format!("create: {e}"))?;
 
