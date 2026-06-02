@@ -1645,8 +1645,24 @@ fn cosine_distance(l: Value, r: Value) -> Result<Value, EvalError> {
 }
 
 fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>), EvalError> {
-    match (l, r) {
-        (Value::Vector(a), Value::Vector(b)) => {
+    // v6.0.1: SQ8 cells coming through the SQL evaluator are
+    // dequantised to f32 here so the existing scalar distance
+    // arithmetic stays intact. HNSW kNN search continues to use
+    // the asymmetric ADC variant inside `cell_to_query_metric_
+    // distance` — this path only runs when a vector expression
+    // lands in the evaluator (full-scan ORDER BY, SELECT
+    // projection of `v <-> $1`, etc.).
+    let to_f32 = |v: Value| -> Option<Vec<f32>> {
+        match v {
+            Value::Vector(a) => Some(a),
+            Value::Sq8Vector(q) => Some(spg_storage::quantize::dequantize(&q)),
+            _ => None,
+        }
+    };
+    let l_ty = l.data_type();
+    let r_ty = r.data_type();
+    match (to_f32(l), to_f32(r)) {
+        (Some(a), Some(b)) => {
             if a.len() != b.len() {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("vector dim mismatch in {op}: {} vs {}", a.len(), b.len()),
@@ -1654,12 +1670,8 @@ fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>),
             }
             Ok((a, b))
         }
-        (a, b) => Err(EvalError::TypeMismatch {
-            detail: format!(
-                "{op} requires two vectors, got {:?} and {:?}",
-                a.data_type(),
-                b.data_type()
-            ),
+        _ => Err(EvalError::TypeMismatch {
+            detail: format!("{op} requires two vectors, got {l_ty:?} and {r_ty:?}"),
         }),
     }
 }
@@ -1731,28 +1743,17 @@ fn arith(
 /// raise `TypeMismatch`.
 #[allow(clippy::many_single_char_names)] // l, r, a, b, d are the natural names
 fn l2_distance(l: Value, r: Value) -> Result<Value, EvalError> {
-    match (l, r) {
-        (Value::Vector(a), Value::Vector(b)) => {
-            if a.len() != b.len() {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("vector dim mismatch in <->: {} vs {}", a.len(), b.len()),
-                });
-            }
-            let mut sum: f64 = 0.0;
-            for (x, y) in a.iter().zip(b.iter()) {
-                let d = f64::from(*x) - f64::from(*y);
-                sum += d * d;
-            }
-            Ok(Value::Float(sqrt_newton(sum)))
-        }
-        (a, b) => Err(EvalError::TypeMismatch {
-            detail: format!(
-                "<-> requires two vectors, got {:?} and {:?}",
-                a.data_type(),
-                b.data_type()
-            ),
-        }),
+    // v6.0.1: route both operands through `unwrap_vec_pair` so SQ8
+    // cells dequantise on the way in. Sub-f64 precision loss is
+    // negligible vs the dequantisation noise the SQ8 path already
+    // ships with.
+    let (a, b) = unwrap_vec_pair(l, r, "<->")?;
+    let mut sum: f64 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = f64::from(*x) - f64::from(*y);
+        sum += d * d;
     }
+    Ok(Value::Float(sqrt_newton(sum)))
 }
 
 /// Self-built `sqrt` for `f64` — `std::f64::sqrt` lives in `std`, which the
