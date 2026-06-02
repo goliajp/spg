@@ -10,6 +10,78 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.0.5.1] — 2026-06-02 (post-tag follow-ups: replication sidecar + competitor sweep)
+
+Two post-v6.0.0-tag cleanups bundled because they share the same
+"deliver on a documented v6.0.x follow-up" theme.
+
+### Replication — follower applied_pos sidecar
+
+The v6.0.x netsplit fix in `198970c` addressed same-process
+reconnect via `state.lag_state.follower_applied_pos`. Cross-
+process restart was left with the wrong fallback. v6.0.5.1
+persists `applied_pos` to a sidecar `<wal_path>.applied_pos`
+file (8 LE bytes, atomic temp+rename) after every frame's
+apply batch and after the initial-handshake snapshot.
+`follow_once` seeds the in-memory atomic from the sidecar on
+fresh-process entry. New e2e test
+`follower_restart_resumes_from_persisted_sidecar` covers the
+kill-and-respawn path.
+
+Caveat (filed): sidecar write is not atomic with apply, so a
+crash between apply and sidecar update causes ≤ one frame's
+records to be re-applied on restart. Non-idempotent SQL sees
+duplicate rows; idempotent SQL is unaffected.
+
+### Vector competitor sweep — SQ8 / HALF variants
+
+`xbench/competitor/src/bin/vector_knn` extended to sweep all
+three v6.0 cell encodings (F32 / SQ8 / HALF) on both
+`spg-embedded` and `spg-server`, alongside the existing
+`postgres+pgvector` baseline. Measured 2026-06-02 on Apple
+M-series, 10K dim-128 corpus, top-10:
+
+| backend             |  build s |  q p50 µs |  q p95 µs |  q p99 µs |
+|---------------------|---------:|----------:|----------:|----------:|
+| spg-embedded        |     0.68 |      33.4 |      41.7 |      49.3 |
+| spg-embedded (SQ8)  |     1.36 |      45.4 |      59.8 |      66.6 |
+| spg-embedded (HALF) |     9.12 |     175.2 |     228.2 |     259.5 |
+| spg-server          |     0.90 |      76.6 |     105.4 |     131.4 |
+| spg-server (SQ8)    |     1.58 |      84.0 |     122.9 |     160.2 |
+| spg-server (HALF)   |     9.75 |     235.3 |     280.7 |     319.3 |
+| postgres+pgvector   |     1.89 |    1454.8 |    2545.2 |    2869.3 |
+
+Findings:
+
+- SPG F32 / SQ8 are ~17–43× faster than pgvector on this shape.
+- SQ8 pays ~30% over F32 (dequant + f32 rerank); SPG's NEON
+  asymmetric ADC path (v6.0.2) keeps the overhead modest.
+- **HALF is ~5× slower than F32** — a real finding. Build /
+  query both hit `HalfVector::to_f32_vec()` which allocates a
+  fresh `Vec<f32>` per distance call. SQ8 has a no-alloc
+  NEON path (`sq8_*_asymmetric`); HALF doesn't. Filed for
+  **v6.0.6 / NEON f16 SIMD** to fix at the source, or
+  separately for v6.0.7-style "in-place dequant scratch
+  buffer" if NEON f16 stays gated on stable Rust.
+- Even slow HALF beats pgvector by ~6× p50.
+
+The 1M-scale + 10M-scale extensions promised in `V6_DESIGN.md
+::L2::v6.0.5` are deferred — the 10K bench already exposes the
+HALF regression cleanly, and per-backend 1M ingest takes 7+
+minutes per row (the slow loop is single-INSERT pgwire round-
+trips, not the kNN search itself; pgwire prepared-statement
+fast path is filed against future v6.x).
+
+### Ship-gate verification
+
+- `cargo test --release --workspace`: 104 / 104 test groups
+  green (e2e_chaos_netsplit now ships 3 tests).
+- `cargo clippy --workspace --all-targets -- -D warnings`:
+  clean.
+- xtests/sqllogictest 4-corpus stays 100%.
+
+---
+
 ## [6.0.5] — 2026-06-02 (v6.0 release roll-up + 1M-scale perf measurements)
 
 Final commit of the v6.0 series. Bundles three threads:
