@@ -192,8 +192,50 @@ fn for_all_tables_explicit_works() {
     fs::remove_dir_all(&dir).ok();
 }
 
+// v6.1.3 — the v6.1.2 versions of these tests asserted that
+// `FOR TABLE …` / `FOR ALL TABLES EXCEPT …` returned a parse-
+// error mentioning "v6.1.3". v6.1.3 ships the parser support, so
+// these tests now assert that both forms succeed and that
+// `SHOW PUBLICATIONS` reflects the parsed scope.
+
+/// Read rows until CommandComplete and stringify each cell. NULL
+/// → empty string; INT → digits; TEXT → the contained string. The
+/// publication SHOW path uses (Text, Text, Int|Null) so this small
+/// mapping is enough.
+fn read_until_cc_collecting_rows(stream: &mut TcpStream) -> Vec<Vec<String>> {
+    use spg_wire::WireValue;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    assert_eq!(read_frame(stream).op, Op::RowDescription);
+    let stringify = |row: Vec<WireValue>| -> Vec<String> {
+        row.into_iter()
+            .map(|v| match v {
+                WireValue::Null => String::new(),
+                WireValue::Int(n) => n.to_string(),
+                WireValue::BigInt(n) => n.to_string(),
+                WireValue::Float(x) => x.to_string(),
+                WireValue::Text(s) => s,
+                WireValue::Bool(b) => b.to_string(),
+                WireValue::Vector(_) => "<vector>".into(),
+            })
+            .collect()
+    };
+    loop {
+        let f = read_frame(stream);
+        match f.op {
+            Op::DataRow => rows.push(stringify(spg_wire::parse_data_row(&f).unwrap())),
+            Op::DataRowBatch => {
+                for r in spg_wire::parse_data_row_batch(&f).unwrap() {
+                    rows.push(stringify(r));
+                }
+            }
+            Op::CommandComplete => return rows,
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+}
+
 #[test]
-fn for_table_list_errors_with_version_hint() {
+fn for_table_list_succeeds_and_shows_scope() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     let (raw, addrs) = local_spawn(&db);
@@ -202,14 +244,20 @@ fn for_table_list_errors_with_version_hint() {
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(&mut s, "CREATE PUBLICATION pub_a FOR TABLE t1, t2");
-    let err = expect_err(&mut s);
-    assert!(err.contains("v6.1.3"), "got: {err}");
+    expect_cc(&mut s);
+
+    send_query(&mut s, "SHOW PUBLICATIONS");
+    let rows = read_until_cc_collecting_rows(&mut s);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "pub_a");
+    assert_eq!(rows[0][1], "FOR TABLE t1, t2");
+    assert_eq!(rows[0][2], "2");
 
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn for_all_tables_except_errors_with_version_hint() {
+fn for_all_tables_except_succeeds_and_shows_scope() {
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     let (raw, addrs) = local_spawn(&db);
@@ -217,9 +265,75 @@ fn for_all_tables_except_errors_with_version_hint() {
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
-    send_query(&mut s, "CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t3");
-    let err = expect_err(&mut s);
-    assert!(err.contains("v6.1.3"), "got: {err}");
+    send_query(&mut s, "CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t3, t4");
+    expect_cc(&mut s);
+
+    send_query(&mut s, "SHOW PUBLICATIONS");
+    let rows = read_until_cc_collecting_rows(&mut s);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "pub_a");
+    assert_eq!(rows[0][1], "FOR ALL TABLES EXCEPT t3, t4");
+    assert_eq!(rows[0][2], "2");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn show_publications_returns_all_scope_variants_ordered_by_name() {
+    let dir = unique_tmpdir();
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+
+    send_query(&mut s, "CREATE PUBLICATION z_all");
+    expect_cc(&mut s);
+    send_query(&mut s, "CREATE PUBLICATION a_list FOR TABLE t1");
+    expect_cc(&mut s);
+    send_query(&mut s, "CREATE PUBLICATION m_except FOR ALL TABLES EXCEPT bad");
+    expect_cc(&mut s);
+
+    send_query(&mut s, "SHOW PUBLICATIONS");
+    let rows = read_until_cc_collecting_rows(&mut s);
+    assert_eq!(rows.len(), 3);
+    let names: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(names, vec!["a_list", "m_except", "z_all"]);
+    // a_list — FOR TABLE t1, count = 1.
+    assert_eq!(rows[0][1], "FOR TABLE t1");
+    assert_eq!(rows[0][2], "1");
+    // m_except — FOR ALL TABLES EXCEPT bad, count = 1.
+    assert_eq!(rows[1][1], "FOR ALL TABLES EXCEPT bad");
+    assert_eq!(rows[1][2], "1");
+    // z_all — FOR ALL TABLES, table_count is NULL → empty
+    // string in the native wire's text encoding.
+    assert_eq!(rows[2][1], "FOR ALL TABLES");
+    // Native wire renders NULL as empty string in DataRow.
+    assert!(
+        rows[2][2].is_empty() || rows[2][2] == "NULL",
+        "got: {:?}",
+        rows[2][2]
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn show_publications_empty_after_drop_all() {
+    let dir = unique_tmpdir();
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+
+    send_query(&mut s, "CREATE PUBLICATION p1");
+    expect_cc(&mut s);
+    send_query(&mut s, "DROP PUBLICATION p1");
+    expect_cc(&mut s);
+    send_query(&mut s, "SHOW PUBLICATIONS");
+    let rows = read_until_cc_collecting_rows(&mut s);
+    assert!(rows.is_empty(), "got {} rows", rows.len());
 
     fs::remove_dir_all(&dir).ok();
 }

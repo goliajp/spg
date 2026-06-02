@@ -713,6 +713,7 @@ impl Engine {
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
+            Statement::ShowPublications => Ok(self.exec_show_publications()),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
             _ => Err(EngineError::WriteRequired),
         };
@@ -849,6 +850,7 @@ impl Engine {
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
+            Statement::ShowPublications => Ok(self.exec_show_publications()),
             Statement::CreateUser(s) => self.exec_create_user(&s),
             Statement::DropUser(name) => self.exec_drop_user(&name),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
@@ -907,6 +909,50 @@ impl Engine {
     /// going through the wire.
     pub const fn publications(&self) -> &publications::Publications {
         &self.publications
+    }
+
+    /// v6.1.3 — `SHOW PUBLICATIONS` row materialisation. Returns
+    /// `(name, scope, table_count)` ordered by publication name.
+    ///   - `scope` is the human-readable string:
+    ///       `"FOR ALL TABLES"` /
+    ///       `"FOR TABLE t1, t2"` /
+    ///       `"FOR ALL TABLES EXCEPT t1, t2"`.
+    ///   - `table_count` is NULL for `AllTables`, the list length
+    ///     otherwise. NULLability lets clients distinguish "publish
+    ///     everything" from "publish exactly 0 tables" (the v6.1.3
+    ///     parser forbids the empty list, but the column shape is
+    ///     ready for the v6.1.5 publisher-side semantics).
+    fn exec_show_publications(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("scope", DataType::Text, false),
+            ColumnSchema::new("table_count", DataType::Int, true),
+        ];
+        let rows: Vec<Row> = self
+            .publications
+            .iter()
+            .map(|(name, scope)| {
+                let (scope_str, count_val) = match scope {
+                    spg_sql::ast::PublicationScope::AllTables => {
+                        ("FOR ALL TABLES".to_string(), Value::Null)
+                    }
+                    spg_sql::ast::PublicationScope::ForTables(ts) => (
+                        alloc::format!("FOR TABLE {}", ts.join(", ")),
+                        Value::Int(i32::try_from(ts.len()).unwrap_or(i32::MAX)),
+                    ),
+                    spg_sql::ast::PublicationScope::AllTablesExcept(ts) => (
+                        alloc::format!("FOR ALL TABLES EXCEPT {}", ts.join(", ")),
+                        Value::Int(i32::try_from(ts.len()).unwrap_or(i32::MAX)),
+                    ),
+                };
+                Row::new(alloc::vec![
+                    Value::Text(name.clone()),
+                    Value::Text(scope_str),
+                    count_val,
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
     }
 
     /// v4.1 `SHOW USERS` — `(name, role)` per row, ordered by name.
@@ -5915,6 +5961,116 @@ mod tests {
             alloc::format!("{err:?}").contains("not allowed inside a transaction"),
             "got {err:?}"
         );
+    }
+
+    // ── v6.1.3: SHOW PUBLICATIONS + FOR-list variants ───────
+
+    #[test]
+    fn create_publication_for_table_list_lands_with_scope() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t1 (id INT NOT NULL)").unwrap();
+        e.execute("CREATE TABLE t2 (id INT NOT NULL)").unwrap();
+        e.execute("CREATE PUBLICATION pub_a FOR TABLE t1, t2")
+            .unwrap();
+        let scope = e.publications().get("pub_a").cloned();
+        let Some(spg_sql::ast::PublicationScope::ForTables(ts)) = scope else {
+            panic!("expected ForTables scope, got {scope:?}")
+        };
+        assert_eq!(ts, alloc::vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[test]
+    fn create_publication_all_tables_except_lands_with_scope() {
+        let mut e = Engine::new();
+        e.execute("CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t3")
+            .unwrap();
+        let scope = e.publications().get("pub_a").cloned();
+        let Some(spg_sql::ast::PublicationScope::AllTablesExcept(ts)) = scope else {
+            panic!("expected AllTablesExcept scope, got {scope:?}")
+        };
+        assert_eq!(ts, alloc::vec!["t3".to_string()]);
+    }
+
+    #[test]
+    fn show_publications_empty_returns_zero_rows() {
+        let e = Engine::new();
+        let r = e.execute_readonly("SHOW PUBLICATIONS").unwrap();
+        let QueryResult::Rows { rows, columns } = r else {
+            panic!()
+        };
+        assert!(rows.is_empty());
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "name");
+        assert_eq!(columns[1].name, "scope");
+        assert_eq!(columns[2].name, "table_count");
+    }
+
+    #[test]
+    fn show_publications_returns_one_row_per_publication_ordered_by_name() {
+        let mut e = Engine::new();
+        e.execute("CREATE PUBLICATION z_pub").unwrap();
+        e.execute("CREATE PUBLICATION a_pub FOR TABLE t1, t2")
+            .unwrap();
+        e.execute("CREATE PUBLICATION m_pub FOR ALL TABLES EXCEPT bad")
+            .unwrap();
+        let r = e.execute_readonly("SHOW PUBLICATIONS").unwrap();
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 3);
+        // Alphabetical order: a_pub, m_pub, z_pub.
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|r| {
+                if let Value::Text(s) = &r.values[0] {
+                    s.as_str()
+                } else {
+                    panic!()
+                }
+            })
+            .collect();
+        assert_eq!(names, alloc::vec!["a_pub", "m_pub", "z_pub"]);
+        // Row 0 — a_pub scope summary + table_count = 2.
+        match &rows[0].values[1] {
+            Value::Text(s) => assert_eq!(s, "FOR TABLE t1, t2"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(rows[0].values[2], Value::Int(2));
+        // Row 1 — m_pub.
+        match &rows[1].values[1] {
+            Value::Text(s) => assert_eq!(s, "FOR ALL TABLES EXCEPT bad"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(rows[1].values[2], Value::Int(1));
+        // Row 2 — z_pub (AllTables → NULL count).
+        match &rows[2].values[1] {
+            Value::Text(s) => assert_eq!(s, "FOR ALL TABLES"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(rows[2].values[2], Value::Null);
+    }
+
+    #[test]
+    fn for_list_scopes_persist_across_snapshot() {
+        // The v6.1.2 envelope-v3 round-trip exercised AllTables;
+        // v6.1.3 needs the scope-1 / scope-2 tags to survive too.
+        let mut e = Engine::new();
+        e.execute("CREATE PUBLICATION p1 FOR TABLE t1, t2").unwrap();
+        e.execute("CREATE PUBLICATION p2 FOR ALL TABLES EXCEPT bad, worse")
+            .unwrap();
+        let snap = e.snapshot();
+        let e2 = Engine::restore_envelope(&snap).unwrap();
+        assert_eq!(e2.publications().len(), 2);
+        let p1 = e2.publications().get("p1").cloned();
+        let Some(spg_sql::ast::PublicationScope::ForTables(ts)) = p1 else {
+            panic!("p1 scope lost: {p1:?}")
+        };
+        assert_eq!(ts, alloc::vec!["t1".to_string(), "t2".to_string()]);
+        let p2 = e2.publications().get("p2").cloned();
+        let Some(spg_sql::ast::PublicationScope::AllTablesExcept(ts)) = p2 else {
+            panic!("p2 scope lost: {p2:?}")
+        };
+        assert_eq!(ts, alloc::vec!["bad".to_string(), "worse".to_string()]);
     }
 
     #[test]

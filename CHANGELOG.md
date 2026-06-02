@@ -10,6 +10,62 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.3] — 2026-06-03 (SHOW PUBLICATIONS + FOR-list parser surface)
+
+Second v6.1.x sub-version on the logical-replication path. Lands
+the `FOR TABLE` / `FOR ALL TABLES EXCEPT` scope forms (their AST
+shape was already reserved at v6.1.2) and adds `SHOW PUBLICATIONS`
+for catalog introspection. No new persistence or wire surface;
+parser-and-row-materialisation only.
+
+### Added
+
+- SQL surface
+  - `CREATE PUBLICATION <name> FOR TABLE t1, t2, …` (PG also
+    accepts `FOR TABLES` plural — both parse identically).
+  - `CREATE PUBLICATION <name> FOR ALL TABLES EXCEPT t1, t2, …`.
+  - `SHOW PUBLICATIONS` — three-column result `(name TEXT NOT
+    NULL, scope TEXT NOT NULL, table_count INT NULL)` ordered
+    by publication name. The scope column is the human-readable
+    shape (`FOR ALL TABLES` / `FOR TABLE …` / `FOR ALL TABLES
+    EXCEPT …`). `table_count` is NULL for the `AllTables`
+    scope, the table-list length otherwise.
+- AST: `Statement::ShowPublications`.
+- Engine: `Publications::get(name) -> Option<&PublicationScope>`
+  + `Engine::exec_show_publications` (uniform with the other
+  SHOW dispatch arms).
+
+### Tests
+
+- `spg-sql` lib (5 new) — `FOR TABLE` / `FOR TABLES` /
+  `FOR ALL TABLES EXCEPT` parser shapes; SHOW PUBLICATIONS; empty
+  list rejection; Display round-trip across all six SQL forms.
+- `spg-engine` lib (5 new) — FOR-list scopes land in the
+  catalog, snapshot-restore preserves scope tags 1+2 (the v6.1.2
+  envelope-v3 trailer was already written; v6.1.3 verifies the
+  full enum round-trips), `SHOW PUBLICATIONS` row shape +
+  ordering.
+- `spg-server::e2e_publication_ddl` (4 new, 7 → 9) — wire-level
+  SHOW PUBLICATIONS, FOR-list / EXCEPT round-trips, "empty after
+  drop all" sanity, native DataRow NULL → empty-string mapping.
+
+### Not changed
+
+- Snapshot envelope (v3 unchanged — the v6.1.2 format already
+  supported scope tags 1 + 2; v6.1.2 simply never emitted them).
+- WAL byte stream / replication protocol.
+- pgwire command tags.
+
+### Out of v6.1.3 (deferred)
+
+- Publisher-side WAL filtering by publication membership —
+  v6.1.5.
+- Subscriber-side worker — v6.1.4.
+- Per-row filter predicates on publications — out of v6.1
+  entirely (v7 territory; see V6_1_DESIGN.md "Out of v6.1").
+
+---
+
 ## [6.1.2] — 2026-06-03 (CREATE PUBLICATION / DROP PUBLICATION DDL + catalog)
 
 First v6.1.x sub-version on the logical-replication path (see

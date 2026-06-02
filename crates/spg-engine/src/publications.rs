@@ -64,6 +64,14 @@ impl Publications {
         self.inner.contains_key(name)
     }
 
+    /// v6.1.3 — read a publication's scope by name. Returns
+    /// `None` if no such publication; used by `SHOW PUBLICATIONS`
+    /// + the v6.1.5 publisher-side filter to resolve the
+    /// per-record OWNER → publication membership question.
+    pub fn get(&self, name: &str) -> Option<&PublicationScope> {
+        self.inner.get(name)
+    }
+
     /// Iterate `(name, scope)` in deterministic (alphabetical)
     /// order. The order matters for snapshot byte-stability.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &PublicationScope)> {
