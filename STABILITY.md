@@ -575,6 +575,66 @@ under a new vector-encoding sub-tag (`SQ8 = 1`); the standalone
 byte layout above is frozen so that integration code can roundtrip
 through it without reaching for a parallel encoder.
 
+### SQ8 schema + on-disk integration (v6.0.1)
+
+v6.0.1 wires the standalone SQ8 layout above into the SQL surface
+and the catalog file format. Each of the following is now frozen.
+
+**1. DDL grammar.** `CREATE TABLE` accepts an optional
+`USING <encoding>` clause after `VECTOR(N)`:
+
+```
+column_def := name VECTOR(N) [ USING SQ8 ] [ NOT NULL | DEFAULT … ]
+```
+
+`USING` and the encoding ident are case-insensitive. Omitting the
+clause is equivalent to `USING F32` (pre-v6 default — pgvector's
+uncompressed `vector` layout). The only encoding recognised in
+v6.0.1 is `SQ8`; `HALF` is reserved for v6.0.3, other identifiers
+are rejected with `unknown vector encoding`.
+
+**2. Catalog DataType tag (catalog file format v9, deserialise
+side).** `write_data_type` / `read_data_type` extend with a new
+tag:
+
+| tag | payload     | meaning                    |
+|----:|-------------|----------------------------|
+|   6 | `[u32 dim]` | `VECTOR(N)` (`encoding = F32`) — pre-v6, unchanged |
+|  14 | `[u32 dim]` | `VECTOR(N) USING SQ8`      |
+
+Pre-v6 binaries reading a v6 catalog with tag 14 fail loudly with
+`Corrupt("unknown data type tag: 14")` — the explicit forward-
+compat fence called out in V6_DESIGN deliberation #5.
+
+**3. Tag-prefixed value codec (catalog DEFAULT path).** `write_value`
+/ `read_value` extend with:
+
+| tag | payload                                       | maps to              |
+|----:|-----------------------------------------------|----------------------|
+|  11 | `[u32 dim][f32 min][f32 max][u8 × dim]`       | `Value::Sq8Vector`   |
+
+Body shape is byte-identical to the standalone `Sq8Vector::to_bytes`
+above. Pre-v6 readers hit tag 11 in `read_value`'s catch-all and
+surface `Corrupt("unknown value tag: 11")`.
+
+**4. Dense-row body (schema-driven, FILE_VERSION 8 / 9).**
+`write_value_body` / `read_value_body` dispatch on the column's
+declared encoding:
+
+- `DataType::Vector { encoding: F32, dim }` → `[u32 dim][f32 * dim]`
+  (pre-v6 shape, unchanged).
+- `DataType::Vector { encoding: Sq8, dim }` → `[u32 dim][f32 min]
+  [f32 max][u8 * dim]` — `12 + dim` bytes per cell.
+
+No `FILE_VERSION` bump; the encoding lives in the column-type tag,
+not the row header.
+
+**5. NSW graph block.** v6.0.1 does **not** add a sub-tag to the
+NSW graph block — the topology is encoding-agnostic (it only
+stores adjacency lists by row index), and the cell encoding is
+carried by the per-column type tag above. The `kind=NSW_GRAPH`
+block byte layout is unchanged from v5.5.
+
 ---
 
 ## Not frozen (free to change in any release)
