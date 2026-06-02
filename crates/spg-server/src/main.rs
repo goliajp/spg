@@ -3010,7 +3010,7 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
-        DataType::Vector(_) => WireType::Vector,
+        DataType::Vector { .. } => WireType::Vector,
     }
 }
 

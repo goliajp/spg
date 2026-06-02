@@ -40,7 +40,7 @@ fn perf_lock() -> MutexGuard<'static, ()> {
 
 use spg_storage::{
     BloomFilter, Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row,
-    SEGMENT_PAGE_BYTES, SegmentReader, TableSchema, Value, encode_segment, nsw_query,
+    SEGMENT_PAGE_BYTES, SegmentReader, TableSchema, Value, VecEncoding, encode_segment, nsw_query,
     persistent::PersistentVec,
     persistent_btree::PersistentBTreeMap,
     quantize::{Sq8Vector, quantize, sq8_l2_distance_sq, sq8_l2_distance_sq_asymmetric},
@@ -98,7 +98,14 @@ fn hnsw_search_under_budget() {
         "vecs",
         vec![
             ColumnSchema::new("id", DataType::Int, false),
-            ColumnSchema::new("v", DataType::Vector(8), false),
+            ColumnSchema::new(
+                "v",
+                DataType::Vector {
+                    dim: 8,
+                    encoding: VecEncoding::F32,
+                },
+                false,
+            ),
         ],
     ))
     .unwrap();

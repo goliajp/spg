@@ -20,7 +20,7 @@ use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
     CreateTableStatement, Expr, ExtractField, FrameBound, FrameKind, FromClause, FromJoin,
     IndexMethod, InsertStatement, JoinKind, Literal, OrderBy, SelectItem, SelectStatement,
-    Statement, TableRef, UnOp, UnionKind, WindowFrame,
+    Statement, TableRef, UnOp, UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -657,7 +657,11 @@ impl Parser {
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
             "char" => ColumnTypeName::Char(self.parse_paren_size("CHAR")?),
-            "vector" => ColumnTypeName::Vector(self.parse_paren_size("VECTOR")?),
+            "vector" => {
+                let dim = self.parse_paren_size("VECTOR")?;
+                let encoding = self.parse_optional_vector_encoding()?;
+                ColumnTypeName::Vector { dim, encoding }
+            }
             "numeric" => {
                 let (precision, scale) = self.parse_optional_numeric_params()?;
                 ColumnTypeName::Numeric(precision, scale)
@@ -794,6 +798,29 @@ impl Parser {
     /// Parse `(N)` where `N` is a positive integer literal — used by the
     /// `VARCHAR`/`CHAR`/`VECTOR` column types. `label` is the type name
     /// for the error message.
+    /// v6.0.1: parse the optional `USING <encoding>` clause that
+    /// follows `VECTOR(N)` in a column definition. Missing clause
+    /// → `VecEncoding::F32` (pre-v6 default). Unknown encoding
+    /// ident → `ParseError` listing the encodings recognised today.
+    fn parse_optional_vector_encoding(&mut self) -> Result<VecEncoding, ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+            return Ok(VecEncoding::F32);
+        }
+        self.advance();
+        let enc_ident = match self.advance() {
+            Token::Ident(s) => s,
+            other => {
+                return Err(self.err(format!(
+                    "expected vector encoding after USING, got {other:?}"
+                )));
+            }
+        };
+        match enc_ident.to_ascii_lowercase().as_str() {
+            "sq8" => Ok(VecEncoding::Sq8),
+            other => Err(self.err(format!("unknown vector encoding {other:?}; supported: SQ8"))),
+        }
+    }
+
     fn parse_paren_size(&mut self, label: &str) -> Result<u32, ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("{label} type requires (N), got {:?}", self.peek())));
@@ -2217,6 +2244,65 @@ mod tests {
             panic!()
         };
         assert_eq!(c.columns[0].ty, ColumnTypeName::BigInt);
+    }
+
+    #[test]
+    fn create_table_vector_default_is_f32() {
+        let s = parse("CREATE TABLE t (v VECTOR(128))");
+        let Statement::CreateTable(c) = s else {
+            panic!()
+        };
+        assert_eq!(
+            c.columns[0].ty,
+            ColumnTypeName::Vector {
+                dim: 128,
+                encoding: VecEncoding::F32,
+            },
+        );
+    }
+
+    #[test]
+    fn create_table_vector_using_sq8() {
+        // v6.0.1: `USING SQ8` selects scalar-quantised encoding.
+        // Case-insensitive on both `USING` and the encoding name.
+        for sql in [
+            "CREATE TABLE t (v VECTOR(128) USING SQ8)",
+            "CREATE TABLE t (v VECTOR(128) using sq8)",
+        ] {
+            let s = parse(sql);
+            let Statement::CreateTable(c) = s else {
+                panic!()
+            };
+            assert_eq!(
+                c.columns[0].ty,
+                ColumnTypeName::Vector {
+                    dim: 128,
+                    encoding: VecEncoding::Sq8,
+                },
+                "{sql}",
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_vector_using_unknown_errors() {
+        let err = parse_statement("CREATE TABLE t (v VECTOR(8) USING PQ8)").unwrap_err();
+        assert!(
+            err.message.contains("unknown vector encoding"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn vector_using_sq8_display_roundtrips() {
+        // The Display impl must produce text that re-parses to the
+        // same AST. Guard for the v6.0.1 `USING SQ8` suffix.
+        let s = parse("CREATE TABLE t (v VECTOR(64) USING SQ8)");
+        let Statement::CreateTable(c) = s else {
+            panic!()
+        };
+        assert_eq!(c.columns[0].ty.to_string(), "VECTOR(64) USING SQ8");
     }
 
     #[test]
