@@ -555,6 +555,26 @@ contract:
   from an unwind). Guarded by
   `tests/e2e_query_budget::chaos_oom_returns_cancelled_not_panic`.
 
+### SQ8 vector quantization standalone format (v6.0.0)
+
+`spg_storage::quantize::Sq8Vector::to_bytes` / `from_bytes` use
+this layout (little-endian throughout):
+
+```
+[u32 dim][f32 min][f32 max][u8 × dim]
+```
+
+Encoded length = `12 + dim` bytes (`Sq8Vector::encoded_size_for`).
+Quantization scheme: per-vector affine f32 → u8 with
+`byte = round((x - min) / (max - min) * 255)`. Reconstruction:
+`x ≈ min + byte/255 * (max - min)`. Degenerate `max == min`
+vectors carry all-zero bytes and reconstruct as `min` exactly.
+
+Reserved for v6.0.1's integration into the segment / WAL envelope
+under a new vector-encoding sub-tag (`SQ8 = 1`); the standalone
+byte layout above is frozen so that integration code can roundtrip
+through it without reaching for a parallel encoder.
+
 ---
 
 ## Not frozen (free to change in any release)

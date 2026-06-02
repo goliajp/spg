@@ -406,3 +406,32 @@ Honest stance:
     (synchronous_commit = off equivalent), which decouples
     client CC from fsync entirely. That's the path to ≥ 200K
     single-client on any platform.
+
+---
+
+## v6 — vector advancement + ecosystem expansion (see `V6_DESIGN.md`)
+
+v5.5.4-ship signed off the v5.5 → v6 trigger (commit `36bcf0e`).
+v6 series is anchored by `V6_DESIGN.md` (v6.0 detail) and the
+research material under `.claude/researches/spg-vs-pg19-comparison.md`
++ `.claude/researches/spg-v6-roadmap-from-pg19.md` (full v6.0 → v6.10
+inventory with PG 19 learning points).
+
+v6.0 ships in six sub-versions:
+
+| ver | scope | ship-gate |
+|-----|-------|-----------|
+| v6.0.0 | SQ8 quantizer + ADC distance (standalone, `crates/spg-storage/src/quantize.rs`) | `sq8_quantize_1m_under_500ms` + `sq8_adc_l2_under_200ns_per_pair` + `sq8_recall_at_10_above_0_95` |
+| v6.0.1 | `VECTOR(N) USING SQ8` schema + write-path quantize + HNSW ADC search + f32 rerank | `sq8_kNN_1m_dim128_p50_under_50us_server` + `sq8_rss_1m_dim128_under_200mib` |
+| v6.0.2 | NEON SIMD for cosine + inner product + SQ8 ADC | `cosine_dim128_under_50ns` + `inner_product_dim128_under_50ns` + `sq8_adc_dim128_under_25ns` |
+| v6.0.3 | halfvec (f16) type + SIMD | `halfvec_kNN_1m_dim128_p50_under_50us_server` + `halfvec_rss_1m_dim128_under_260mib` |
+| v6.0.4 | `ALTER INDEX REBUILD` live rebuild | `live_rebuild_read_p99_overhead_under_5us` + chaos crash-during-rebuild |
+| v6.0.5 | Sweep extension + PROD_READY + CHANGELOG + tag `v6.0.0` | Sweep strict-win at every cell; tag pushed |
+
+Estimated total work: ~8.5 d across v6.0.0 → v6.0.5 (down from 9.5 d
+in the original roadmap because multi-distance SQL operators and
+`NswMetric` are already shipped — v6.0.2 narrows to SIMD-only work).
+
+After v6.0 ships, the recommended v6.1 (logical replication) and
+v6.4 (SQL polish) are independent and can interleave. Full ordering
+in `.claude/researches/spg-v6-roadmap-from-pg19.md` §5.

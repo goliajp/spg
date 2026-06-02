@@ -83,6 +83,7 @@ fn send(s: &mut TcpStream, f: &Frame) {
 /// batch is ~40 KB — far under the ceiling — and the budget resets per query,
 /// so the load never trips it even though the total is multiples of the cap.
 fn create_and_load(s: &mut TcpStream, batches: usize) {
+    use std::fmt::Write as _;
     send(
         s,
         &build_query("CREATE TABLE t (id INT NOT NULL, payload TEXT NOT NULL)"),
@@ -96,7 +97,7 @@ fn create_and_load(s: &mut TcpStream, batches: usize) {
             if row > 0 {
                 sql.push(',');
             }
-            sql.push_str(&format!("({id},'{pad}')"));
+            write!(sql, "({id},'{pad}')").unwrap();
         }
         send(s, &build_query(&sql));
         assert_eq!(

@@ -254,7 +254,7 @@ pub(crate) struct ServerState {
     pub(crate) lag_state: Arc<replication::LagState>,
     /// v5.1: cold-tier segments queued for lazy preload. Each spec
     /// is parsed from `SPG_PRELOAD_COLD_SEGMENT` at startup; the
-    /// first dispatched Op::Query checks each unloaded spec for
+    /// first dispatched `Op::Query` checks each unloaded spec for
     /// `(table, index)` existence and, when both are present, reads
     /// the segment file, registers it via `Catalog::load_segment_
     /// bytes`, and wires every PK in the segment as a Cold locator
@@ -414,6 +414,10 @@ fn parse_cold_preload_env() -> Vec<ColdPreloadSpec> {
 /// loaded so the dispatch hot path drops to one Relaxed load.
 /// Errors don't fail the calling query — they're logged on
 /// stderr and the spec stays pending for retry.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-purpose preload routine; splitting hurts readability more than the line count helps"
+)]
 pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
     if state.cold_preload_done.load(Ordering::Relaxed) {
         return;
@@ -425,9 +429,8 @@ pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
         }
         // Quick read-only probe: does (table, index) exist yet?
         let ready = {
-            let engine = match state.engine.read() {
-                Ok(e) => e,
-                Err(_) => return,
+            let Ok(engine) = state.engine.read() else {
+                return;
             };
             let cat = engine.catalog();
             cat.get(&spec.table)
@@ -451,9 +454,8 @@ pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
                 continue;
             }
         };
-        let mut engine = match state.engine.write() {
-            Ok(e) => e,
-            Err(_) => return,
+        let Ok(mut engine) = state.engine.write() else {
+            return;
         };
         // Snapshot the catalog, register the segment, enumerate
         // its keys, and reinstall under one write lock so a
@@ -483,7 +485,9 @@ pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
             seg.scan()
                 .map(|(key, _payload)| {
                     (
-                        spg_storage::IndexKey::Int(key as i64),
+                        spg_storage::IndexKey::Int(
+                            i64::try_from(key).expect("cold-segment PK fits in i64"),
+                        ),
                         spg_storage::RowLocator::Cold {
                             segment_id: seg_id,
                             page_offset: 0,
@@ -493,16 +497,13 @@ pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
                 .collect()
         };
         let pairs_count = pairs.len();
-        let table_mut = match cat.get_mut(&spec.table) {
-            Some(t) => t,
-            None => {
-                eprintln!(
-                    "spg-server: cold preload {}:{} table disappeared mid-load",
-                    spec.table, spec.index
-                );
-                spec.loaded.store(true, Ordering::Relaxed);
-                continue;
-            }
+        let Some(table_mut) = cat.get_mut(&spec.table) else {
+            eprintln!(
+                "spg-server: cold preload {}:{} table disappeared mid-load",
+                spec.table, spec.index
+            );
+            spec.loaded.store(true, Ordering::Relaxed);
+            continue;
         };
         if let Err(e) = table_mut.register_cold_locators(&spec.index, pairs) {
             eprintln!(

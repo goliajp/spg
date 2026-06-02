@@ -585,6 +585,7 @@ fn slo_wal_insert_4client_throughput_above_floor() {
 ///     completing; (b) the gate target is "is the async path
 ///     working at full speed" which doesn't belong in CI's
 ///     < 30 s test budget anyway.
+///
 /// **Why 100K, not the V5_DESIGN-spec 200K:** matches the
 /// existing v4.42 4-client SLO doctrine
 /// (`SLO_V4_42_4C_THROUGHPUT_FLOOR_RPS = 300`) — SLO floors are
@@ -618,7 +619,7 @@ fn run_insert_workload(commit_env: &str, rows: usize, warmup: usize) -> Duration
     };
     let mut child = ChildGuard(spawn_wal_with_env(&addr, &db, &wal, &env));
     let mut s = wait_for_listener(&addr, &mut child.0);
-    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    s.set_read_timeout(Some(Duration::from_mins(1))).unwrap();
 
     round_trip(
         &mut s,
@@ -656,7 +657,7 @@ fn run_batched_insert_workload(commit_env: &str, total_rows: usize, batch_rows: 
     let env: Vec<(&str, &str)> = vec![("SPG_SYNCHRONOUS_COMMIT", commit_env)];
     let mut child = ChildGuard(spawn_wal_with_env(&addr, &db, &wal, &env));
     let mut s = wait_for_listener(&addr, &mut child.0);
-    s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+    s.set_read_timeout(Some(Duration::from_mins(2))).unwrap();
 
     round_trip(
         &mut s,
@@ -710,14 +711,14 @@ fn slo_wal_insert_async_commit_smoke_speedup_vs_sync() {
     // ratio to ~1.0×, and removing async-commit entirely
     // produces a ratio < 1.0×) still fails the gate.
     let warmup = 20;
-    let t_sync = run_insert_workload("on", SLO_V5_4_ASYNC_SMOKE_ROWS, warmup);
-    let t_async = run_insert_workload("off", SLO_V5_4_ASYNC_SMOKE_ROWS, warmup);
-    let speedup = t_sync.as_secs_f64() / t_async.as_secs_f64();
+    let sync_dur = run_insert_workload("on", SLO_V5_4_ASYNC_SMOKE_ROWS, warmup);
+    let async_dur = run_insert_workload("off", SLO_V5_4_ASYNC_SMOKE_ROWS, warmup);
+    let speedup = sync_dur.as_secs_f64() / async_dur.as_secs_f64();
     eprintln!(
         "SLO smoke (sync vs async-commit, {SLO_V5_4_ASYNC_SMOKE_ROWS} INSERTs each): \
          sync = {:.3} s, async = {:.3} s, speedup = {speedup:.2}× (floor ≥ {:.1}×)",
-        t_sync.as_secs_f64(),
-        t_async.as_secs_f64(),
+        sync_dur.as_secs_f64(),
+        async_dur.as_secs_f64(),
         SLO_V5_4_ASYNC_SMOKE_SPEEDUP_FLOOR,
     );
     assert!(

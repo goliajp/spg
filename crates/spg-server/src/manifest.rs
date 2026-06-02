@@ -447,10 +447,10 @@ mod tests {
         assert!(
             matches!(
                 r,
-                Err(ManifestError::BadCrc32 { .. })
-                    | Err(ManifestError::Truncated { .. })
-                    | Err(ManifestError::TrailingBytes { .. })
-                    | Err(ManifestError::PathNotUtf8 { .. })
+                Err(ManifestError::BadCrc32 { .. }
+                    | ManifestError::Truncated { .. }
+                    | ManifestError::TrailingBytes { .. }
+                    | ManifestError::PathNotUtf8 { .. })
             ),
             "expected an error, got {r:?}"
         );
@@ -485,7 +485,7 @@ mod tests {
         // num_segments at offset 13..17 LE.
         assert_eq!(
             u32::from_le_bytes([bytes[13], bytes[14], bytes[15], bytes[16]]),
-            m.cold_segments.len() as u32
+            u32::try_from(m.cold_segments.len()).unwrap()
         );
         // Trailing CRC32 is the last 4 bytes; reflects the actual
         // body so a re-compute matches.

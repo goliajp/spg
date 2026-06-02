@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod bloom;
 pub mod persistent;
 pub mod persistent_btree;
+pub mod quantize;
 pub mod row_locator;
 pub mod segment;
 

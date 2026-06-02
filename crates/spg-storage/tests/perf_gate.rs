@@ -18,7 +18,9 @@ use std::time::Instant;
 use spg_storage::{
     BloomFilter, Catalog, ColumnSchema, DataType, NSW_DEFAULT_M, NswMetric, Row,
     SEGMENT_PAGE_BYTES, SegmentReader, TableSchema, Value, encode_segment, nsw_query,
-    persistent::PersistentVec, persistent_btree::PersistentBTreeMap,
+    persistent::PersistentVec,
+    persistent_btree::PersistentBTreeMap,
+    quantize::{Sq8Vector, quantize, sq8_l2_distance_sq, sq8_l2_distance_sq_asymmetric},
 };
 
 fn build_catalog(n_rows: i32) -> Catalog {
@@ -385,4 +387,189 @@ fn segment_lookup_p99_under_500us() {
         p99 <= budget_us,
         "segment_lookup p99 {p99} µs exceeds budget {budget_us} µs"
     );
+}
+
+// ===========================================================================
+// v6.0.0 — SQ8 quantization perf gates.
+//
+// All numbers measured in release mode on the macOS APFS aarch64 dev box;
+// budgets sized to break only on > 2× regression. Distance gates use
+// `std::hint::black_box` to defeat constant-folding so the timed loop
+// reflects real per-call cost.
+// ===========================================================================
+
+fn random_unit_vec_f32(rng_state: &mut u64, dim: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        *rng_state = splitmix64(*rng_state);
+        // High 24 bits → [0, 1); shift to [-1, 1].
+        let bits = (*rng_state >> 40) as u32;
+        let u = (bits as f32) / ((1u32 << 24) as f32);
+        out.push(u * 2.0 - 1.0);
+    }
+    out
+}
+
+/// Quantize 1M dim-128 vectors in ≤ 500 ms. Sized so the per-vector
+/// cost (~500 ns) is dwarfed by the existing INSERT path (~30 µs
+/// server), keeping the quantize step well off the INSERT critical
+/// path even at saturation.
+#[test]
+fn sq8_quantize_1m_under_500ms() {
+    const N: usize = 1_000_000;
+    const DIM: usize = 128;
+
+    let mut rng: u64 = 0xC0DE_C0DE_5BAD_5BAD;
+    // Pre-build the corpus so the timer measures pure quantize cost.
+    let corpus: Vec<Vec<f32>> = (0..N).map(|_| random_unit_vec_f32(&mut rng, DIM)).collect();
+
+    let t = Instant::now();
+    let mut sink: u32 = 0;
+    for v in &corpus {
+        let q = quantize(std::hint::black_box(v));
+        // Sum a few bytes to defeat dead-code elimination.
+        sink = sink
+            .wrapping_add(q.bytes[0] as u32)
+            .wrapping_add(q.bytes[DIM / 2] as u32);
+    }
+    let elapsed = t.elapsed();
+    std::hint::black_box(sink);
+    eprintln!(
+        "sq8_quantize_1m_dim128: {} ms ({} ns/vec)",
+        elapsed.as_millis(),
+        elapsed.as_nanos() / N as u128
+    );
+    let budget_ms: u128 = 500;
+    assert!(
+        elapsed.as_millis() <= budget_ms,
+        "sq8_quantize_1m_dim128 took {} ms, budget {budget_ms} ms",
+        elapsed.as_millis()
+    );
+}
+
+/// SQ8 ADC L2² distance ≤ 200 ns per pair (dim 128, scalar path).
+/// v6.0.2 will tighten this to ≤ 50 ns with NEON; the v6.0.0 ceiling
+/// catches a scalar regression that would otherwise hide under NEON's
+/// shadow.
+#[test]
+fn sq8_adc_l2_under_200ns_per_pair() {
+    const DIM: usize = 128;
+    const N_PAIRS: usize = 1_000_000;
+
+    let mut rng: u64 = 0xADC0_ADC0_ADC0_ADC0;
+    // 1024 pre-quantized vectors; rotate through them to give the
+    // branch predictor real work without inflating cache cost.
+    let pool: Vec<Sq8Vector> = (0..1024)
+        .map(|_| quantize(&random_unit_vec_f32(&mut rng, DIM)))
+        .collect();
+
+    let t = Instant::now();
+    let mut acc: f32 = 0.0;
+    for i in 0..N_PAIRS {
+        let a = &pool[i & 1023];
+        let b = &pool[(i.wrapping_mul(2654435761)) & 1023]; // Knuth's mix
+        acc += std::hint::black_box(sq8_l2_distance_sq(a, b));
+    }
+    let elapsed = t.elapsed();
+    std::hint::black_box(acc);
+
+    let per_call_ns = elapsed.as_nanos() / N_PAIRS as u128;
+    eprintln!("sq8_adc_l2_dim128: {per_call_ns} ns/pair (over {N_PAIRS} pairs)");
+    let budget_ns: u128 = 200;
+    assert!(
+        per_call_ns <= budget_ns,
+        "sq8_adc_l2_dim128 per-pair {per_call_ns} ns exceeds budget {budget_ns} ns"
+    );
+}
+
+/// SQ8 ADC L2² asymmetric (stored SQ8 vs un-quantized query) — typical
+/// kNN scan shape. Same budget as symmetric (one dequant per element
+/// either way, asymmetric saves a tiny multiply per element).
+#[test]
+fn sq8_adc_l2_asymmetric_under_200ns_per_pair() {
+    const DIM: usize = 128;
+    const N_PAIRS: usize = 1_000_000;
+
+    let mut rng: u64 = 0xADC1_BEEF_ADC1_BEEF;
+    let pool: Vec<Sq8Vector> = (0..1024)
+        .map(|_| quantize(&random_unit_vec_f32(&mut rng, DIM)))
+        .collect();
+    let queries: Vec<Vec<f32>> = (0..1024)
+        .map(|_| random_unit_vec_f32(&mut rng, DIM))
+        .collect();
+
+    let t = Instant::now();
+    let mut acc: f32 = 0.0;
+    for i in 0..N_PAIRS {
+        let a = &pool[i & 1023];
+        let q = &queries[(i.wrapping_mul(2654435761)) & 1023];
+        acc += std::hint::black_box(sq8_l2_distance_sq_asymmetric(a, q));
+    }
+    let elapsed = t.elapsed();
+    std::hint::black_box(acc);
+
+    let per_call_ns = elapsed.as_nanos() / N_PAIRS as u128;
+    eprintln!("sq8_adc_l2_asym_dim128: {per_call_ns} ns/pair (over {N_PAIRS} pairs)");
+    let budget_ns: u128 = 200;
+    assert!(
+        per_call_ns <= budget_ns,
+        "sq8_adc_l2_asym_dim128 per-pair {per_call_ns} ns exceeds budget {budget_ns} ns"
+    );
+}
+
+/// Recall@10 ≥ 0.95 on a 10K-vector dim-128 unit-sphere corpus with
+/// 100 random queries. Duplicate of the lib-test ranking-preservation
+/// gate, but run as a perf gate so a regression in quantization
+/// quality breaks the release build (not just `cargo test --lib`).
+#[test]
+fn sq8_recall_at_10_above_0_95_perf_gate() {
+    const N: usize = 10_000;
+    const Q: usize = 100;
+    const K: usize = 10;
+    const DIM: usize = 128;
+
+    let mut rng: u64 = 0xCAFE_BABE_5EED_1234;
+    let corpus_f32: Vec<Vec<f32>> = (0..N).map(|_| random_unit_vec_f32(&mut rng, DIM)).collect();
+    let corpus_sq8: Vec<Sq8Vector> = corpus_f32.iter().map(|v| quantize(v)).collect();
+
+    let mut total_recall: f32 = 0.0;
+    for _ in 0..Q {
+        let query = random_unit_vec_f32(&mut rng, DIM);
+
+        // f32 ground truth top-K.
+        let mut scored_f32: Vec<(f32, usize)> = corpus_f32
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut d = 0.0_f32;
+                for (x, y) in v.iter().zip(query.iter()) {
+                    let dd = x - y;
+                    d += dd * dd;
+                }
+                (d, i)
+            })
+            .collect();
+        scored_f32.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let truth: Vec<usize> = scored_f32.into_iter().take(K).map(|(_, i)| i).collect();
+
+        // SQ8 ADC top-K.
+        let mut scored_sq8: Vec<(f32, usize)> = corpus_sq8
+            .iter()
+            .enumerate()
+            .map(|(i, qv)| (sq8_l2_distance_sq_asymmetric(qv, &query), i))
+            .collect();
+        scored_sq8.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let sq8_top: Vec<usize> = scored_sq8.into_iter().take(K).map(|(_, i)| i).collect();
+
+        let mut hits = 0;
+        for x in &truth {
+            if sq8_top.contains(x) {
+                hits += 1;
+            }
+        }
+        total_recall += hits as f32 / K as f32;
+    }
+    let avg = total_recall / Q as f32;
+    eprintln!("sq8_recall_at_10_unit_sphere_dim128: {avg:.4}");
+    assert!(avg >= 0.95, "sq8 recall@10 average = {avg} (need ≥ 0.95)");
 }

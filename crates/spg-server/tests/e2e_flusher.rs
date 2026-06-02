@@ -77,16 +77,14 @@ fn metric_u64(http: &str, name: &str) -> u64 {
     let body = http_get_body(http);
     body.lines()
         .find_map(|l| l.strip_prefix(name).and_then(|tail| tail.strip_prefix(' ')))
-        .map(|s| s.trim().parse::<u64>().unwrap_or(0))
-        .unwrap_or(0)
+        .map_or(0, |s| s.trim().parse::<u64>().unwrap_or(0))
 }
 
 fn metric_f64(http: &str, name: &str) -> f64 {
     let body = http_get_body(http);
     body.lines()
         .find_map(|l| l.strip_prefix(name).and_then(|tail| tail.strip_prefix(' ')))
-        .map(|s| s.trim().parse::<f64>().unwrap_or(0.0))
-        .unwrap_or(0.0)
+        .map_or(0.0, |s| s.trim().parse::<f64>().unwrap_or(0.0))
 }
 
 struct ChildGuard(Child);
