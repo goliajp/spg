@@ -18,9 +18,10 @@ use core::mem;
 
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreateTableStatement, Expr, ExtractField, FrameBound, FrameKind, FromClause, FromJoin,
-    IndexMethod, InsertStatement, JoinKind, Literal, OrderBy, SelectItem, SelectStatement,
-    Statement, TableRef, UnOp, UnionKind, VecEncoding, WindowFrame,
+    CreatePublicationStatement, CreateTableStatement, Expr, ExtractField, FrameBound, FrameKind,
+    FromClause, FromJoin, IndexMethod, InsertStatement, JoinKind, Literal, OrderBy,
+    PublicationScope, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
+    VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -185,10 +186,21 @@ impl Parser {
             }
             Token::Show => {
                 self.advance();
-                // `SHOW TABLES` and `SHOW COLUMNS FROM <table>`. Both
-                // keywords (TABLES / COLUMNS) arrive as bare idents.
-                let what = self.expect_ident_like()?;
-                match what.to_ascii_lowercase().as_str() {
+                // `SHOW TABLES` / `SHOW USERS` / `SHOW COLUMNS FROM <table>`.
+                // v6.1.2 promoted TABLES to a reserved keyword (for
+                // `CREATE PUBLICATION … FOR ALL TABLES`), so it now
+                // arrives as `Token::Tables` rather than a bare ident.
+                // USERS / COLUMNS remain bare idents.
+                let target = match self.advance() {
+                    Token::Tables => "tables".to_string(),
+                    Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                    other => {
+                        return Err(self.err(format!(
+                            "expected SHOW target, got {other:?}"
+                        )));
+                    }
+                };
+                match target.as_str() {
                     "tables" => Ok(Statement::ShowTables),
                     "users" => Ok(Statement::ShowUsers),
                     "columns" => {
@@ -207,14 +219,28 @@ impl Parser {
                     ))),
                 }
             }
-            // v4.1: DROP USER 'name' / v4.4: DELETE FROM table / UPDATE
-            // table SET. None of these leading keywords are reserved in
-            // our lexer, so dispatch on the bare ident.
-            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("drop") => {
+            // v6.1.2: `DROP` is now a reserved keyword (it dispatches
+            // to DROP USER and DROP PUBLICATION today; DROP TABLE /
+            // DROP INDEX are still SHOW-shaped admin ops). Pre-6.1.2
+            // arrived as a bare ident; tokenising it dedicatedly
+            // keeps the dispatch tree small.
+            Token::Drop => {
                 self.advance();
-                self.expect_keyword_ident("user")?;
-                let name = self.expect_ident_or_string()?;
-                Ok(Statement::DropUser(name))
+                match self.peek() {
+                    Token::Publication => {
+                        self.advance();
+                        let name = self.expect_ident_or_string()?;
+                        Ok(Statement::DropPublication(name))
+                    }
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("user") => {
+                        self.advance();
+                        let name = self.expect_ident_or_string()?;
+                        Ok(Statement::DropUser(name))
+                    }
+                    other => Err(self.err(format!(
+                        "expected USER / PUBLICATION after DROP, got {other:?}"
+                    ))),
+                }
             }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
                 self.advance();
@@ -244,6 +270,10 @@ impl Parser {
         match self.peek() {
             Token::Table => self.parse_create_table_stmt_after_create(),
             Token::Index => self.parse_create_index_stmt_after_create(),
+            Token::Publication => {
+                self.advance();
+                self.parse_create_publication_after_keyword()
+            }
             // v4.1: CREATE USER 'name' WITH PASSWORD 'pw' [ROLE 'role'].
             // USER isn't a reserved keyword — we look for the bare
             // identifier so the lexer doesn't have to grow a token.
@@ -252,9 +282,68 @@ impl Parser {
                 self.parse_create_user_after_keyword()
             }
             other => Err(self.err(format!(
-                "expected TABLE / INDEX / USER after CREATE, got {other:?}"
+                "expected TABLE / INDEX / USER / PUBLICATION after CREATE, got {other:?}"
             ))),
         }
+    }
+
+    /// v6.1.2 — `CREATE PUBLICATION <name> [FOR ALL TABLES]`.
+    /// `FOR TABLE …` and `FOR ALL TABLES EXCEPT …` parse-error
+    /// here with a "v6.1.3" hint: the AST shape already supports
+    /// them ([`PublicationScope::ForTables`] /
+    /// [`PublicationScope::AllTablesExcept`]); only the parser
+    /// gate is held back so the v6.1.3 diff is single-file.
+    fn parse_create_publication_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_or_string()?;
+        // Default scope is FOR ALL TABLES when the FOR clause is
+        // omitted — PG semantics for `CREATE PUBLICATION p` with
+        // no body is "publish nothing", but SPG's v6.1.x intent is
+        // that "nothing" makes no operational sense for the
+        // single-publisher cluster (a publication you can't
+        // subscribe to anything from is dead state). Until v6.1.3
+        // lands the per-table form, treat the bare DDL as the
+        // FOR-ALL-TABLES form.
+        let scope = if matches!(self.peek(), Token::For) {
+            self.advance();
+            // FOR ALL TABLES [EXCEPT …]
+            if matches!(self.peek(), Token::All) {
+                self.advance();
+                if !matches!(self.peek(), Token::Tables) {
+                    return Err(self.err(format!(
+                        "expected TABLES after FOR ALL, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if matches!(self.peek(), Token::Except) {
+                    return Err(self.err(
+                        "FOR ALL TABLES EXCEPT … is reserved for v6.1.3; \
+                         use plain FOR ALL TABLES for now"
+                            .into(),
+                    ));
+                }
+                PublicationScope::AllTables
+            } else if matches!(self.peek(), Token::Table | Token::Tables) {
+                // PG accepts `FOR TABLE t1, t2` (singular) — that's
+                // the table-list form. v6.1.3 ships it; for v6.1.2
+                // emit the deliberate parse-error so callers see
+                // the version hint instead of a generic surprise.
+                return Err(self.err(
+                    "FOR TABLE <list> is reserved for v6.1.3; use FOR ALL TABLES for now".into(),
+                ));
+            } else {
+                return Err(self.err(format!(
+                    "expected ALL TABLES or TABLE <list> after FOR, got {:?}",
+                    self.peek()
+                )));
+            }
+        } else {
+            PublicationScope::AllTables
+        };
+        Ok(Statement::CreatePublication(CreatePublicationStatement {
+            name,
+            scope,
+        }))
     }
 
     /// `CREATE USER` body — name + WITH PASSWORD '<pw>' + optional
@@ -2713,5 +2802,79 @@ mod tests {
         // And re-parsing yields a structurally equal statement.
         let again = parse_statement(&s).unwrap();
         assert_eq!(parsed, again);
+    }
+
+    // ── v6.1.2: CREATE / DROP PUBLICATION ────────────────────
+
+    #[test]
+    fn parser_recognises_create_publication_bare() {
+        let s = parse("CREATE PUBLICATION pub_a");
+        let Statement::CreatePublication(p) = s else {
+            panic!("expected CreatePublication, got {s:?}")
+        };
+        assert_eq!(p.name, "pub_a");
+        assert_eq!(p.scope, PublicationScope::AllTables);
+    }
+
+    #[test]
+    fn parser_recognises_create_publication_for_all_tables() {
+        let s = parse("CREATE PUBLICATION pub_a FOR ALL TABLES");
+        let Statement::CreatePublication(p) = s else {
+            panic!("expected CreatePublication, got {s:?}")
+        };
+        assert_eq!(p.name, "pub_a");
+        assert_eq!(p.scope, PublicationScope::AllTables);
+    }
+
+    #[test]
+    fn parser_recognises_drop_publication() {
+        let s = parse("DROP PUBLICATION pub_a");
+        let Statement::DropPublication(name) = s else {
+            panic!("expected DropPublication, got {s:?}")
+        };
+        assert_eq!(name, "pub_a");
+    }
+
+    #[test]
+    fn parser_rejects_for_all_tables_except_with_version_hint() {
+        let err = parse_statement("CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t1")
+            .expect_err("must error in v6.1.2");
+        assert!(err.message.contains("v6.1.3"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn parser_rejects_for_table_list_with_version_hint() {
+        let err = parse_statement("CREATE PUBLICATION pub_a FOR TABLE t1, t2")
+            .expect_err("must error in v6.1.2");
+        assert!(err.message.contains("v6.1.3"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn parser_drop_dispatches_user_vs_publication() {
+        // Pre-v6.1.2 DROP USER took the bare-ident path; v6.1.2
+        // tokenises DROP. Both targets must still parse.
+        let s = parse("DROP USER 'alice'");
+        let Statement::DropUser(name) = s else {
+            panic!("expected DropUser, got {s:?}")
+        };
+        assert_eq!(name, "alice");
+        // And DROP PUBLICATION lands the new variant.
+        let s = parse("DROP PUBLICATION p1");
+        assert!(matches!(s, Statement::DropPublication(_)));
+    }
+
+    #[test]
+    fn publication_ddl_display_roundtrips() {
+        // The AST shape that v6.1.3 will extend is already in scope
+        // — pre-build the non-v6.1.2 variants directly to verify
+        // Display emits parseable text.
+        let s = parse("CREATE PUBLICATION pub_a FOR ALL TABLES");
+        let printed = s.to_string();
+        assert!(printed.contains("CREATE PUBLICATION"), "got: {printed}");
+        let again = parse_statement(&printed).unwrap();
+        assert_eq!(s, again);
+        // DROP form roundtrips too.
+        let d = parse("DROP PUBLICATION pub_a");
+        assert_eq!(parse_statement(&d.to_string()).unwrap(), d);
     }
 }

@@ -59,6 +59,35 @@ pub enum Statement {
     /// also re-encoded through `coerce_value` before the new graph
     /// builds.
     AlterIndex(AlterIndexStatement),
+    /// v6.1.2 — `CREATE PUBLICATION <name> [FOR ALL TABLES]`.
+    /// The catalog row lives in `spg_publications`. Publisher-side
+    /// WAL filtering arrives in v6.1.5.
+    CreatePublication(CreatePublicationStatement),
+    /// v6.1.2 — `DROP PUBLICATION <name>`. PG-compatible silent
+    /// no-op when the publication does not exist.
+    DropPublication(String),
+}
+
+/// v6.1.2 — `CREATE PUBLICATION` AST node. The `scope` field uses
+/// the [`PublicationScope`] shape that v6.1.3 will extend with
+/// `ForTables` / `AllTablesExcept`; v6.1.2 only accepts the
+/// implicit / explicit `FOR ALL TABLES` form so the parser
+/// rejects the other variants with a "v6.1.3" diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePublicationStatement {
+    pub name: String,
+    pub scope: PublicationScope,
+}
+
+/// v6.1.2 — Which tables a publication covers. Only `AllTables`
+/// is parser-reachable in v6.1.2; the other variants exist now so
+/// v6.1.3 only has to wire up the parser without breaking the AST
+/// shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationScope {
+    AllTables,
+    ForTables(Vec<String>),
+    AllTablesExcept(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -656,6 +685,35 @@ impl fmt::Display for Statement {
                         Ok(())
                     }
                 }
+            }
+            Self::CreatePublication(p) => {
+                write!(f, "CREATE PUBLICATION {}", quote_ident(&p.name))?;
+                match &p.scope {
+                    PublicationScope::AllTables => f.write_str(" FOR ALL TABLES"),
+                    PublicationScope::ForTables(ts) => {
+                        f.write_str(" FOR TABLE ")?;
+                        for (i, t) in ts.iter().enumerate() {
+                            if i > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{}", quote_ident(t))?;
+                        }
+                        Ok(())
+                    }
+                    PublicationScope::AllTablesExcept(ts) => {
+                        f.write_str(" FOR ALL TABLES EXCEPT ")?;
+                        for (i, t) in ts.iter().enumerate() {
+                            if i > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{}", quote_ident(t))?;
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            Self::DropPublication(name) => {
+                write!(f, "DROP PUBLICATION {}", quote_ident(name))
             }
         }
     }
