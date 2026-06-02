@@ -258,9 +258,7 @@ fn pump(mut src: TcpStream, mut dst: TcpStream, ctrl: &ProxyControl) {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                // Polling tick — re-check the kill switch. Loop
-                // header handles continuation; no explicit continue
-                // needed.
+                // Polling tick — re-check the kill switch.
             }
             Err(_) => return,
         }
@@ -328,7 +326,6 @@ fn http_get(addr: &str, path: &str) -> String {
 /// then heal the proxy. Final row counts must match exactly — no
 /// duplicates, no gaps. This is PROD_READY row 2.9.
 #[test]
-#[ignore = "v6.0.x port-race migration broke this — needs deeper investigation; the heal step does not propagate new writes to follower via the proxy. follower_metrics_expose_replication_lag_after_status_frame still verifies the v2 status frame contract, so the core ship-gate is unaffected"]
 fn netsplit_disconnect_then_heal_resyncs_without_loss_or_dup() {
     let dir_p = unique_tmpdir("pri");
     let dir_f = unique_tmpdir("fol");
