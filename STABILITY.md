@@ -745,6 +745,86 @@ No new on-disk surfaces — the rebuilt catalog uses the existing
 DataType / Value / dense-row tags established in v6.0.1 /
 v6.0.3.
 
+### Subscription DDL (v6.1.4)
+
+v6.1.4 adds the receive side of logical replication. The grammar
+below is frozen; future v6.1.x sub-versions may add ALTER /
+WITH-options without breaking these forms.
+
+```text
+CREATE SUBSCRIPTION <name>
+  CONNECTION '<keyword=value-string>'
+  PUBLICATION <pub_name> [, <pub_name> ...]
+DROP SUBSCRIPTION <name>
+SHOW SUBSCRIPTIONS
+```
+
+- `<conn>` is a PG-style keyword=value string. v6.1.4 consumes
+  `host=…` and `port=…`; other keys are accepted but ignored
+  (forward-compat for v6.1.x options like `user`, `password`,
+  `application_name`).
+- `<pub_name>` is one or more publication identifiers on the
+  remote side. v6.1.4 records the list; v6.1.5 enforces it at
+  the publisher.
+- Duplicate `CREATE` errors; `DROP` of an absent subscription
+  is a silent no-op.
+- `SHOW SUBSCRIPTIONS` returns:
+  `(name TEXT NOT NULL, conn_str TEXT NOT NULL, publications TEXT
+  NOT NULL, enabled BOOL NOT NULL, last_received_pos BIGINT NOT
+  NULL)` ordered by name. `publications` is comma-joined.
+- Subscriptions are inside-TX-safe — they commit/roll back with
+  the surrounding transaction.
+- `CONNECTION` and `SUBSCRIPTION` are reserved keywords from
+  v6.1.4 (v6.1.2 reserved `SUBSCRIPTION` ahead of time).
+
+### Replication MAGIC_SUB protocol (v6.1.4)
+
+Subscriber-side connect handshake:
+```text
+→  [b"SPGSUB\x01\x00"]   ← 8 bytes magic
+   [u64 LE start_offset]  ← 0 = "tail from current end"
+←  [u64 LE effective_start]   ← master's WAL position the
+                                subscriber should record as its
+                                baseline last_received_pos
+```
+The frame stream from this point uses the v2 framing:
+`[u8 type][u32 len][payload]`. Subscribers never receive an
+initial snapshot — target tables must exist on the subscriber
+side before the worker starts.
+
+### Snapshot envelope v4 (v6.1.4)
+
+The snapshot envelope grows a subscriptions trailer. v1/v2/v3
+envelopes still load with empty subscriptions; writers from
+v6.1.4 onwards always emit v4. v6.1.4 readers parse v1, v2, v3
+and v4; pre-v6.1.4 binaries fail loudly on a v4 envelope (same
+upgrade fence as v6.1.2's v3 introduction).
+
+```text
+[8 bytes "SPGENV01"]
+[u8 version = 4]
+[u32 catalog_len][catalog bytes]
+[u32 users_len][users bytes]
+[u32 pubs_len][publications bytes]
+[u32 subs_len][subscriptions bytes]    ← new in v4
+[u32 crc32]                            ← covers everything above
+```
+
+Subscriptions-blob format (v6.1.4):
+```text
+[u16 num_subscriptions]
+for each:
+  [u16 name_len][name bytes]
+  [u32 conn_str_len][conn_str bytes]
+  [u16 num_publications]
+  for each: [u16 p_len][p bytes]
+  [u8 enabled]
+  [u64 last_received_pos]
+```
+
+Sorted alphabetically by subscription name for byte-stable
+snapshots regardless of insertion order.
+
 ### Publication DDL (v6.1.2 — v6.1.3)
 
 v6.1.2 introduced the first DDL surface on the logical-replication

@@ -1126,6 +1126,9 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         // PG's tag does not include the publication name; we match.
         Statement::CreatePublication(_) => "CREATE PUBLICATION".to_string(),
         Statement::DropPublication(_) => "DROP PUBLICATION".to_string(),
+        // v6.1.4 — symmetric for subscriptions.
+        Statement::CreateSubscription(_) => "CREATE SUBSCRIPTION".to_string(),
+        Statement::DropSubscription(_) => "DROP SUBSCRIPTION".to_string(),
         // Select / Show / Explain go through the Rows path above.
         _ => "OK".to_string(),
     }

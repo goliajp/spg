@@ -10,6 +10,130 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.4] — 2026-06-03 (CREATE SUBSCRIPTION + subscriber worker)
+
+Third v6.1.x sub-version on the logical-replication path — and
+the heaviest single shippable in v6.1 so far. Lands the receive
+side end-to-end: `CREATE SUBSCRIPTION` spawns a background
+worker that connects to a publisher, drains its WAL stream, and
+applies SQL records into the local engine.
+
+### Added
+
+- SQL surface
+  - `CREATE SUBSCRIPTION <name> CONNECTION '<conn>' PUBLICATION
+    <p1> [, <p2> …]` — `<conn>` is a PG-style keyword=value
+    string (`host=… port=…` honoured; other keys forward-compat
+    ignored).
+  - `DROP SUBSCRIPTION <name>` — silent no-op when absent
+    (PG-compatible). Tears down the worker thread within
+    ~500 ms.
+  - `SHOW SUBSCRIPTIONS` — five-column result `(name, conn_str,
+    publications, enabled, last_received_pos)` ordered by name.
+- AST: `Statement::CreateSubscription`, `Statement::Drop
+  Subscription`, `Statement::ShowSubscriptions`, +
+  `CreateSubscriptionStatement {name, conn_str, publications}`.
+- Lexer: `CONNECTION` keyword (`SUBSCRIPTION` was reserved at
+  v6.1.2).
+- Engine
+  - `subscriptions: Subscriptions` field carrying `(conn_str,
+    publications, enabled, last_received_pos)` per row.
+  - `Engine::subscription_advance(name, pos) -> bool` — monotone
+    write hook the worker calls after each apply batch.
+  - `Engine::subscriptions() -> &Subscriptions` accessor.
+- Replication protocol — **MAGIC_SUB** (`b"SPGSUB\x01\x00"`).
+  Distinct from `MAGIC_V2` so the master can:
+    - skip the snapshot dump (subscribers don't bootstrap from
+      master state — operator-managed schema per v6.1 design
+      point 3);
+    - treat `start_offset = 0` as "tail from current WAL end",
+      handing the effective start position back to the
+      subscriber so it can baseline `last_received_pos`.
+  Frame stream past the handshake is identical to v2; the
+  `[u8 type][u32 len][payload]` shape stays.
+- Subscriber worker — `replication::run_subscription_worker`.
+  Per-subscription background thread with shutdown-flag polling
+  (500 ms cadence), reconnect-on-error loop with 500 ms backoff,
+  tolerant-apply mode for idempotent DDL (`DuplicateTable`,
+  `DuplicateIndex`, etc. log + continue).
+- Worker registry — `ServerState::sub_workers:
+  Mutex<BTreeMap<String, Arc<AtomicBool>>>`.
+- `reconcile_subscriptions(state)` — idempotent helper. Called
+  at startup (engine restore) and after every native-wire
+  auto-commit that returns `modified_catalog: true`. Spawns
+  missing workers, signals stale ones.
+- Snapshot envelope **v4** — adds a subscriptions trailer
+  block before the CRC32. v1/v2/v3 envelopes still load with
+  empty subscriptions; v4 deserialises and seeds the worker
+  registry at startup.
+
+### Changed
+
+- `Engine::exec_create_publication` / `exec_drop_publication`
+  / `exec_create_subscription` / `exec_drop_subscription`
+  dropped their v6.1.2 "no DDL inside a transaction" guard.
+  The check was over-cautious — it blocked the auto-commit
+  wrap path (which holds an internal TX around every WAL-
+  logged statement) and is therefore incompatible with WAL-on
+  publishers. PG itself allows the DDL inside a transaction.
+- `main::handle` / `main::dispatch` take `&Arc<ServerState>`
+  instead of `&ServerState` so the dispatch site can clone
+  the Arc into worker threads. All existing call sites coerce
+  unchanged.
+
+### Tests
+
+- `spg-sql` lib (7 new) — CREATE / DROP SUBSCRIPTION,
+  SHOW SUBSCRIPTIONS, multi-publication list, missing-clause
+  errors, Display round-trip.
+- `spg-engine` lib (9 new) — module-level Subscriptions
+  serialize/deserialize (9 module tests), engine CREATE /
+  DROP / advance / SHOW + envelope v3 → v4 forward-compat +
+  v4 round-trip.
+- `spg-server::e2e_subscription` (3) — full publisher +
+  subscriber two-process e2e:
+    - inserts on publisher → subscriber sees rows;
+    - DROP SUBSCRIPTION stops the worker (subsequent writes
+      don't propagate);
+    - publisher restart survives (catalog state preserved
+      across the v4 envelope).
+
+### Ship-gate measurements
+
+| metric                                     | v6.1.4 measured |
+|--------------------------------------------|----------------:|
+| CREATE SUBSCRIPTION → worker observable    | ≤ 500 ms (test sleeps 500 ms then writes) |
+| DROP SUBSCRIPTION → worker exit            | ≤ 500 ms (SUB_READ_TIMEOUT) |
+| 10 INSERTs publisher → subscriber catchup  | ≤ 10 s (CATCHUP_TIMEOUT; observed ~600 ms) |
+
+### Not changed
+
+- WAL on-disk format / frame layout.
+- pgwire Extended Query path (v6.1.1) / Publication DDL
+  (v6.1.2) / SHOW PUBLICATIONS (v6.1.3).
+- Existing v1/v2 replication followers / netsplit chaos
+  semantics.
+
+### Out of v6.1.4 (deferred)
+
+- Publisher-side WAL filtering by publication membership —
+  v6.1.5. Today a subscription with `PUBLICATION pub_a` still
+  receives every record the publisher writes; the catalog
+  declaration is recorded but not yet enforced at the source.
+- ALTER SUBSCRIPTION ENABLE / DISABLE — a future v6.1.x.
+  `enabled` defaults to true and there's no DDL knob to flip.
+- `ALTER SUBSCRIPTION … SET CONNECTION` / `… REFRESH PUBLICATION`
+  — future v6.1.x. Today the conn_str is fixed at CREATE.
+- Initial sync (PG's table-by-table COPY) — v6.1.4 starts
+  from the publisher's current WAL end, so pre-existing rows
+  on the publisher are NOT replayed. Operators are expected
+  to seed target tables before CREATE SUBSCRIPTION.
+- Cascading (follower exposing its own replication endpoint
+  to sub-followers) — v6.1.6.
+- WAIT FOR WAL POSITION — v6.1.7.
+
+---
+
 ## [6.1.3] — 2026-06-03 (SHOW PUBLICATIONS + FOR-list parser surface)
 
 Second v6.1.x sub-version on the logical-replication path. Lands

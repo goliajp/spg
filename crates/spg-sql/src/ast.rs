@@ -73,6 +73,41 @@ pub enum Statement {
     /// TABLES EXCEPT …`; `table_count` is `NULL` for the
     /// `AllTables` scope and the table-list length otherwise.
     ShowPublications,
+    /// v6.1.4 — `CREATE SUBSCRIPTION <name> CONNECTION '<conn>'
+    /// PUBLICATION <pub_name> [, <pub_name> …]`. Catalog lands
+    /// in `spg_subscriptions`; when the subscription is
+    /// `enabled = true` (default) the server spawns a
+    /// background worker that connects to `conn` and drains the
+    /// requested publication(s) into the local engine.
+    CreateSubscription(CreateSubscriptionStatement),
+    /// v6.1.4 — `DROP SUBSCRIPTION <name>`. Like DROP
+    /// PUBLICATION, silent no-op when absent. Stops the
+    /// associated worker thread before removing the row.
+    DropSubscription(String),
+    /// v6.1.4 — `SHOW SUBSCRIPTIONS`. Returns one row per
+    /// subscription ordered by name with `(name, conn_str,
+    /// publications, enabled, last_received_pos)`.
+    ShowSubscriptions,
+}
+
+/// v6.1.4 — `CREATE SUBSCRIPTION` AST node. v6.1.4 ships a
+/// single fixed-shape DDL; the WITH-clause options PG supports
+/// (`enabled`, `slot_name`, `streaming`, `binary`) are out of
+/// scope for v6.1.4 — `enabled` defaults to true and there are
+/// no other knobs to set in v6.1.x.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSubscriptionStatement {
+    pub name: String,
+    /// Connection string in PG keyword=value form (e.g.
+    /// `host=127.0.0.1 port=20002`). v6.1.4 only consumes the
+    /// `host` and `port` fields; the rest is reserved for
+    /// future v6.1.x options.
+    pub conn_str: String,
+    /// One or more publications on the remote side. Order is
+    /// preserved verbatim from the DDL; the worker requests them
+    /// in this order. v6.1.4 records the list; v6.1.5
+    /// publisher-side filtering enforces it.
+    pub publications: Vec<String>,
 }
 
 /// v6.1.2 — `CREATE PUBLICATION` AST node. The `scope` field uses
@@ -675,6 +710,25 @@ impl fmt::Display for Statement {
             Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
             Self::ShowUsers => f.write_str("SHOW USERS"),
             Self::ShowPublications => f.write_str("SHOW PUBLICATIONS"),
+            Self::ShowSubscriptions => f.write_str("SHOW SUBSCRIPTIONS"),
+            Self::CreateSubscription(s) => {
+                write!(
+                    f,
+                    "CREATE SUBSCRIPTION {} CONNECTION '{}' PUBLICATION ",
+                    quote_ident(&s.name),
+                    s.conn_str.replace('\'', "''")
+                )?;
+                for (i, p) in s.publications.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(p))?;
+                }
+                Ok(())
+            }
+            Self::DropSubscription(name) => {
+                write!(f, "DROP SUBSCRIPTION {}", quote_ident(name))
+            }
             Self::Explain(e) => {
                 if e.analyze {
                     write!(f, "EXPLAIN ANALYZE {}", e.inner)

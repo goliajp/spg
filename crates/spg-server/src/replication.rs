@@ -58,7 +58,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -67,6 +67,18 @@ use spg_engine::Engine;
 use crate::ServerState;
 
 const MAGIC_V1: &[u8; 8] = b"SPGREPL\x01";
+/// v6.1.4 — subscriber protocol magic. Distinct from MAGIC_V2 so
+/// the master can:
+///   - skip the snapshot dump (subscribers never want full state;
+///     PG-style logical-replication subscribers expect target
+///     tables to be present already)
+///   - accept `start_offset = 0` as "tail from current end" rather
+///     than "send full snapshot" (the publisher's effective start
+///     position comes back in the handshake reply so the subscriber
+///     can record it as its baseline `last_received_pos`)
+/// Frame format on the post-handshake stream is identical to v2:
+/// `[u8 type][u32 len][payload]` records keep working unchanged.
+pub(crate) const MAGIC_SUB: &[u8; 8] = b"SPGSUB\x01\x00";
 /// v4.36: framed protocol with periodic status frames carrying the
 /// primary's current WAL position. Old clients keep using v1; new
 /// clients send `\x02` and get lag visibility.
@@ -148,10 +160,34 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
         Protocol::V1
     } else if &hs[..8] == MAGIC_V2 {
         Protocol::V2
+    } else if &hs[..8] == MAGIC_SUB {
+        Protocol::Sub
     } else {
         return Err(std::io::Error::other("bad replication magic"));
     };
     let start_offset = u64::from_le_bytes(hs[8..16].try_into().unwrap());
+
+    // v6.1.4: subscription protocol never sends a snapshot — the
+    // subscriber's target tables exist already (per design point
+    // 3 of `V6_1_DESIGN.md`, schema drift is the operator's
+    // problem). `start_offset = 0` means "tail from the current
+    // master WAL end"; non-zero means "resume from this byte".
+    if matches!(protocol, Protocol::Sub) {
+        let effective_start = if start_offset == 0 {
+            current_wal_len(state)?
+        } else {
+            start_offset
+        };
+        stream.write_all(&effective_start.to_le_bytes())?;
+        stream.flush()?;
+        let Some(wal_path) = state.wal_path.clone() else {
+            return Ok(());
+        };
+        // The frame stream is identical to v2 from here on. A
+        // subscriber's drain side parses records the same way a
+        // v6.0.x follower does.
+        return tail_wal_v2(stream, &wal_path, effective_start);
+    }
 
     // Capture snapshot + WAL position under a brief lock so the
     // pair is consistent. If the follower already knows a starting
@@ -187,14 +223,36 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
     };
     match protocol {
         Protocol::V1 => tail_wal_v1(stream, &wal_path, wal_position),
-        Protocol::V2 => tail_wal_v2(stream, &wal_path, wal_position),
+        Protocol::V2 | Protocol::Sub => tail_wal_v2(stream, &wal_path, wal_position),
     }
+}
+
+/// v6.1.4 — read the master's WAL file length under the engine
+/// read-lock (so a concurrent write can't tear the read). Used as
+/// the starting point when a subscriber connects with
+/// `start_offset = 0`: tail from current end.
+fn current_wal_len(state: &ServerState) -> std::io::Result<u64> {
+    let Some(wal_path) = state.wal_path.as_ref() else {
+        return Ok(0);
+    };
+    // Hold the engine read-lock briefly to fence against a
+    // concurrent leader-commit round writing more WAL bytes mid-
+    // stat. The lock is dropped immediately after.
+    let _eng_guard = state
+        .engine
+        .read()
+        .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
+    Ok(std::fs::metadata(wal_path).map_or(0, |m| m.len()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
     V1,
     V2,
+    /// v6.1.4 — subscription protocol (`MAGIC_SUB`). No initial
+    /// snapshot; v2-shaped frame stream after the
+    /// effective-start-offset handshake reply.
+    Sub,
 }
 
 /// Grab the in-memory engine state + WAL length atomically. The
@@ -643,4 +701,307 @@ fn follow_once(
             }
         }
     }
+}
+
+// ---- v6.1.4 subscriber worker ----------------------------------
+
+/// Frequency the worker checks its shutdown flag while blocked on
+/// the read socket. Short enough that DROP SUBSCRIPTION feels
+/// instant in tests; long enough not to pummel the kernel.
+const SUB_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// v6.1.4 — parse PG keyword=value connection string for `host=…
+/// port=…`. Other keywords are accepted but ignored (forward-compat
+/// surface for v6.1.x options). Returns `(host, port)` or an
+/// error string the worker logs verbatim.
+fn parse_conn_str(s: &str) -> Result<(String, u16), String> {
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+    for tok in s.split_ascii_whitespace() {
+        let Some((k, v)) = tok.split_once('=') else {
+            return Err(format!("expected key=value token, got {tok:?}"));
+        };
+        match k.to_ascii_lowercase().as_str() {
+            "host" => host = Some(v.to_string()),
+            "port" => {
+                port = Some(
+                    v.parse::<u16>()
+                        .map_err(|e| format!("bad port {v:?}: {e}"))?,
+                );
+            }
+            // Forward-compat: ignore unknown keys (user, password,
+            // sslmode, application_name, etc.). v6.1.4 only needs
+            // host+port.
+            _ => {}
+        }
+    }
+    let host = host.ok_or_else(|| "conn_str missing host=…".to_string())?;
+    let port = port.ok_or_else(|| "conn_str missing port=…".to_string())?;
+    Ok((host, port))
+}
+
+/// v6.1.4 — entry point for a single subscription's background
+/// thread. Reconnects on failure with `RECONNECT_DELAY` between
+/// attempts; exits cleanly when `shutdown` flips to true.
+pub fn run_subscription_worker(
+    name: String,
+    conn_str: String,
+    state: Arc<ServerState>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        match subscribe_once(&name, &conn_str, &state, &shutdown) {
+            Ok(()) => {
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                eprintln!("spg-server: subscription {name:?} disconnected — retrying");
+            }
+            Err(e) => {
+                eprintln!("spg-server: subscription {name:?} error: {e} — retrying");
+            }
+        }
+        // Sleep a few short ticks rather than one long sleep so
+        // DROP SUBSCRIPTION feels responsive even mid-reconnect.
+        let mut slept = Duration::ZERO;
+        while slept < RECONNECT_DELAY {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(SUB_READ_TIMEOUT);
+            slept += SUB_READ_TIMEOUT;
+        }
+    }
+}
+
+/// One subscription connect-and-drain attempt. Returns `Ok(())`
+/// on clean disconnect (caller decides whether to reconnect based
+/// on the shutdown flag); returns `Err` on any IO / framing /
+/// engine-apply failure.
+#[allow(clippy::too_many_lines)] // tight frame parser; the v6.1.5 filter pass will live here too
+fn subscribe_once(
+    name: &str,
+    conn_str: &str,
+    state: &Arc<ServerState>,
+    shutdown: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let (host, port) = parse_conn_str(conn_str).map_err(std::io::Error::other)?;
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&addr)?;
+    stream.set_read_timeout(Some(SUB_READ_TIMEOUT))?;
+
+    // Worker reads its own row to learn where to resume. If the
+    // subscription was dropped mid-spawn (race against
+    // reconcile), bail out cleanly.
+    let start_offset = {
+        let eng = state
+            .engine
+            .read()
+            .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
+        match eng.subscriptions().get(name) {
+            Some(s) => s.last_received_pos,
+            None => return Ok(()),
+        }
+    };
+
+    // MAGIC_SUB + start_offset → effective_start_offset (u64).
+    let mut hs = Vec::with_capacity(16);
+    hs.extend_from_slice(MAGIC_SUB);
+    hs.extend_from_slice(&start_offset.to_le_bytes());
+    stream.write_all(&hs)?;
+    stream.flush()?;
+
+    let mut pos_buf = [0u8; 8];
+    read_exact_with_shutdown(&mut stream, &mut pos_buf, shutdown)?;
+    let mut applied_offset = u64::from_le_bytes(pos_buf);
+
+    // Tail loop. Same frame format as v6.0.x follower. The chief
+    // differences: no local WAL file write, advance the
+    // engine's subscription `last_received_pos` instead of
+    // `lag_state.follower_applied_pos`, and exit on the
+    // shutdown flag between frame reads.
+    let mut pending: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut header = [0u8; 5];
+        if !read_exact_with_shutdown(&mut stream, &mut header, shutdown)? {
+            return Ok(());
+        }
+        let frame_type = header[0];
+        let payload_len = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0
+            && !read_exact_with_shutdown(&mut stream, &mut payload, shutdown)?
+        {
+            return Ok(());
+        }
+        match frame_type {
+            FRAME_TYPE_WAL => {
+                pending.extend_from_slice(&payload);
+                let mut cur = 0usize;
+                loop {
+                    if pending.len() - cur < 4 {
+                        break;
+                    }
+                    let len_bytes: [u8; 4] = pending[cur..cur + 4].try_into().unwrap();
+                    let raw_len = u32::from_le_bytes(len_bytes);
+                    let is_v2 = raw_len & crate::WAL_V2_SENTINEL != 0;
+                    let is_v3 = is_v2 && (raw_len & crate::WAL_V3_FLAG != 0);
+                    let len_mask = if is_v3 {
+                        !(crate::WAL_V2_SENTINEL | crate::WAL_V3_FLAG)
+                    } else {
+                        !crate::WAL_V2_SENTINEL
+                    };
+                    let rec_len = (raw_len & len_mask) as usize;
+                    let header_len = if is_v3 {
+                        9
+                    } else if is_v2 {
+                        8
+                    } else {
+                        4
+                    };
+                    if pending.len() - cur < header_len + rec_len {
+                        break;
+                    }
+                    let payload_off = cur + header_len;
+                    let sql_bytes = &pending[payload_off..payload_off + rec_len];
+                    if is_v2 {
+                        let expected =
+                            u32::from_le_bytes(pending[cur + 4..cur + 8].try_into().unwrap());
+                        let actual = if is_v3 {
+                            let type_byte = pending[cur + 8];
+                            let mut buf = Vec::with_capacity(1 + sql_bytes.len());
+                            buf.push(type_byte);
+                            buf.extend_from_slice(sql_bytes);
+                            spg_crypto::crc32::crc32(&buf)
+                        } else {
+                            spg_crypto::crc32::crc32(sql_bytes)
+                        };
+                        if actual != expected {
+                            return Err(std::io::Error::other(format!(
+                                "subscription {name:?} WAL CRC mismatch at offset {} \
+                                 (expected={expected:#010x}, computed={actual:#010x}, \
+                                 payload_len={rec_len})",
+                                applied_offset.saturating_add(cur as u64)
+                            )));
+                        }
+                    }
+                    if is_v3 {
+                        let type_byte = pending[cur + 8];
+                        match type_byte {
+                            crate::WAL_V3_TYPE_AUTO_COMMIT_SQL => {}
+                            // v6.1.4 silently skips durability-checkpoint
+                            // markers (no engine state to mutate). v6.1.5
+                            // will treat unknown types as fatal once
+                            // publication-filtered streams stabilise.
+                            crate::WAL_V3_TYPE_DURABILITY_CHECKPOINT => {
+                                cur += header_len + rec_len;
+                                applied_offset =
+                                    applied_offset.saturating_add((header_len + rec_len) as u64);
+                                continue;
+                            }
+                            other => {
+                                return Err(std::io::Error::other(format!(
+                                    "subscription {name:?}: unknown WAL v3 type byte \
+                                     {other:#04x} at offset {} — refusing to apply",
+                                    applied_offset.saturating_add(cur as u64)
+                                )));
+                            }
+                        }
+                    }
+                    let sql = core::str::from_utf8(sql_bytes).map_err(|_| {
+                        std::io::Error::other("non-UTF-8 SQL in subscribed WAL record")
+                    })?;
+                    let record_size = (header_len + rec_len) as u64;
+                    let new_pos = applied_offset.saturating_add(cur as u64) + record_size;
+                    // Apply + advance under the engine write-lock so
+                    // the SQL execution and the position update are
+                    // observed together by SHOW SUBSCRIPTIONS.
+                    {
+                        let mut eng = state
+                            .engine
+                            .write()
+                            .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
+                        // v6.1.4 ignores subscription-side errors that
+                        // duplicate idempotent DDL (CREATE TABLE that
+                        // happens to exist already). Anything else
+                        // surfaces and kills the connection so the
+                        // worker can reconnect with a clean state.
+                        if let Err(e) = eng.execute(sql) {
+                            // Subscription-friendly tolerant apply:
+                            // "table already exists", "duplicate" → log
+                            // and continue. Anything else bails so the
+                            // operator notices.
+                            let msg = format!("{e:?}");
+                            let tolerant = msg.contains("DuplicateTable")
+                                || msg.contains("DuplicateIndex")
+                                || msg.contains("DuplicateUser")
+                                || msg.contains("AlreadyExists");
+                            if !tolerant {
+                                return Err(std::io::Error::other(format!(
+                                    "subscription {name:?} apply rejected {sql:?}: {msg}"
+                                )));
+                            }
+                            eprintln!(
+                                "spg-server: subscription {name:?} tolerating apply error \
+                                 on {sql:?}: {msg}"
+                            );
+                        }
+                        if !eng.subscription_advance(name, new_pos) {
+                            // The subscription was dropped mid-stream.
+                            return Ok(());
+                        }
+                    }
+                    cur += header_len + rec_len;
+                    applied_offset = applied_offset.saturating_add((header_len + rec_len) as u64);
+                }
+                if cur > 0 {
+                    pending.drain(0..cur);
+                }
+            }
+            FRAME_TYPE_STATUS => {
+                // v6.1.4 ignores status frames — they're advisory
+                // for SHOW REPLICATION LAG on followers; the
+                // subscriber materialises its own progress via
+                // SHOW SUBSCRIPTIONS.
+            }
+            _ => {
+                // Unknown frame type — forward-compat skip.
+            }
+        }
+    }
+}
+
+/// Helper around `read_exact` that returns `Ok(false)` instead of
+/// erroring on a clean `UnexpectedEof` AND treats a read timeout
+/// as a "check shutdown then keep waiting" point. The 500 ms read
+/// timeout means a DROP SUBSCRIPTION takes at most ~500 ms to
+/// shut the worker down even mid-receive.
+fn read_exact_with_shutdown(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    shutdown: &Arc<AtomicBool>,
+) -> std::io::Result<bool> {
+    let mut got = 0usize;
+    while got < buf.len() {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        match stream.read(&mut buf[got..]) {
+            Ok(0) => return Ok(false), // peer closed
+            Ok(n) => got += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Read-timeout tick — loop and re-check shutdown.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
 }

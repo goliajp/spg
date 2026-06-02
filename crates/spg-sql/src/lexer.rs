@@ -135,6 +135,9 @@ pub enum Token {
     Publication,
     /// v6.1.4 (reserved at v6.1.2) — `SUBSCRIPTION` keyword.
     Subscription,
+    /// v6.1.4 — `CONNECTION` keyword (for
+    /// `CREATE SUBSCRIPTION … CONNECTION '<conn_str>' …`).
+    Connection,
 
     Eof,
 }
@@ -393,6 +396,7 @@ fn keyword_or_ident_raw(raw: &str) -> Token {
         7 => kw_len7(b),
         8 => kw_len8(b),
         9 => kw_len9(b),
+        10 => kw_len10(b),
         11 => kw_len11(b),
         12 => kw_len12(b),
         _ => None,
@@ -620,6 +624,15 @@ fn kw_len9(b: &[u8]) -> Option<Token> {
     // 1 keyword: savepoint
     if eq_ci(b, b"savepoint") {
         return Some(Token::Savepoint);
+    }
+    None
+}
+
+#[inline]
+fn kw_len10(b: &[u8]) -> Option<Token> {
+    // 1 keyword: connection
+    if eq_ci(b, b"connection") {
+        return Some(Token::Connection);
     }
     None
 }

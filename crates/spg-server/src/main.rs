@@ -243,6 +243,12 @@ pub(crate) struct ServerState {
     /// v4.13: observability counters surfaced via /metrics. Cheap
     /// Relaxed atomics — increment from any dispatch site.
     metrics: Arc<observability::Metrics>,
+    /// v6.1.4 logical-replication subscriber-worker registry. Each
+    /// active subscription has a row mapping its name to a shutdown
+    /// flag the worker polls between frame reads. `reconcile_
+    /// subscriptions` adds rows when CREATE SUBSCRIPTION runs and
+    /// flips the flag when DROP SUBSCRIPTION runs.
+    sub_workers: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
     /// v4.29: optional failure-injection knobs used by chaos tests.
     /// All branches default-off and skip the check entirely when
     /// the env var wasn't set on startup.
@@ -418,6 +424,72 @@ fn parse_cold_preload_env() -> Vec<ColdPreloadSpec> {
     clippy::too_many_lines,
     reason = "single-purpose preload routine; splitting hurts readability more than the line count helps"
 )]
+/// v6.1.4 — reconcile subscriber workers to the engine catalog.
+/// Idempotent + cheap when nothing changed. Called at startup and
+/// after any auto-commit that flipped `modified_catalog: true`.
+///
+/// Algorithm:
+///   1. Snapshot wanted-state from `engine.subscriptions()`.
+///   2. Workers in registry but not in catalog → flag shutdown +
+///      drop the row.
+///   3. Workers in catalog but not in registry → spawn a thread.
+///
+/// The registry is a `Mutex<BTreeMap<name, Arc<AtomicBool>>>`; the
+/// flag is shared with the worker so signalling is lock-free.
+pub(crate) fn reconcile_subscriptions(state: &Arc<ServerState>) {
+    use std::collections::BTreeMap;
+    let want: BTreeMap<String, (String, bool)> = {
+        let Ok(eng) = state.engine.read() else {
+            return;
+        };
+        eng.subscriptions()
+            .iter()
+            .map(|(n, s)| (n.clone(), (s.conn_str.clone(), s.enabled)))
+            .collect()
+    };
+    let Ok(mut workers) = state.sub_workers.lock() else {
+        return;
+    };
+    // Step 1: tear down workers that are no longer wanted.
+    let stale: Vec<String> = workers
+        .keys()
+        .filter(|n| !want.contains_key(n.as_str()))
+        .cloned()
+        .collect();
+    for name in stale {
+        if let Some(flag) = workers.remove(&name) {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    // Step 2: spawn workers for newly enabled subscriptions.
+    for (name, (conn_str, enabled)) in &want {
+        if !enabled {
+            continue;
+        }
+        if workers.contains_key(name) {
+            continue;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_for_worker = Arc::clone(&flag);
+        let state_for_worker = Arc::clone(state);
+        let name_clone = name.clone();
+        let conn_clone = conn_str.clone();
+        let thread_name = format!("spg-sub-{}", name.chars().take(20).collect::<String>());
+        thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                replication::run_subscription_worker(
+                    name_clone,
+                    conn_clone,
+                    state_for_worker,
+                    flag_for_worker,
+                );
+            })
+            .ok();
+        workers.insert(name.clone(), flag);
+    }
+}
+
 pub(crate) fn try_lazy_preload_cold(state: &ServerState) {
     if state.cold_preload_done.load(Ordering::Relaxed) {
         return;
@@ -735,7 +807,13 @@ fn run(
         cold_preload_done,
         hot_tier_byte_budget,
         cold_segment_paths: Mutex::new(cold_segment_paths),
+        sub_workers: Mutex::new(BTreeMap::new()),
     });
+
+    // v6.1.4: spawn subscriber threads for any subscriptions
+    // restored from the v4 snapshot envelope. Idempotent — if no
+    // subscriptions exist (the common case), the call is a no-op.
+    reconcile_subscriptions(&state);
 
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
@@ -983,7 +1061,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
-fn handle(mut stream: TcpStream, state: &ServerState) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     // v4.5 idle timeout: when set, OS-level read timeout closes the
     // connection automatically. read() will return WouldBlock /
@@ -1143,7 +1221,7 @@ fn sql_is_read_only(sql: &str) -> bool {
 fn dispatch(
     stream: &mut TcpStream,
     frame: &Frame,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     role: &mut Option<Role>,
     in_tx: &mut bool,
 ) -> std::io::Result<()> {
@@ -1495,6 +1573,20 @@ fn dispatch(
                     &build_error_response(&format!("audit append failed: {e}")),
                 );
                 return Err(e);
+            }
+            // v6.1.4 — CREATE / DROP SUBSCRIPTION flips
+            // `modified_catalog: true`. Reconcile picks up the
+            // change and spawns / tears down the corresponding
+            // worker thread. Idempotent + cheap when the catalog
+            // change wasn't subscription-related.
+            if matches!(
+                result,
+                Ok(QueryResult::CommandOk {
+                    modified_catalog: true,
+                    ..
+                })
+            ) {
+                reconcile_subscriptions(state);
             }
             emit_result(stream, result)
         }
