@@ -101,15 +101,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     run_spg_embedded(&mut samples, started)?;
 
-    // --- spg-server ---
-    eprintln!("==> spg-server");
-    let mut child = spawn_spg_server()?;
-    let started = Instant::now();
-    if let Err(e) = run_spg_server(&mut samples, started) {
-        eprintln!("  spg-server bench errored: {e}");
+    // --- spg-server (two commit modes) ---
+    // Synchronous (durable, the default) is the apples-to-apples row
+    // against PG / MySQL / MariaDB defaults. Async-commit is the v5
+    // flagship throughput mode (V5_DESIGN §"Async-commit is mandatory
+    // inclusion") — recorded as a separate `spg-server-async` row so the
+    // sweep stays honest about which cells win durable-vs-durable and
+    // which need the async window.
+    for (label, async_commit) in [("spg-server", false), ("spg-server-async", true)] {
+        eprintln!("==> {label}");
+        let mut child = spawn_spg_server(label, async_commit)?;
+        let started = Instant::now();
+        if let Err(e) = run_spg_server(label, &mut samples, started) {
+            eprintln!("  {label} bench errored: {e}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let _ = child.kill();
-    let _ = child.wait();
 
     // --- competitors via sqlx ---
     for (label, url) in connection_strings() {
@@ -222,7 +230,7 @@ fn run_spg_embedded(
     samples: &mut Vec<Sample>,
     started: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use spg_engine::{Engine, QueryResult};
+    use spg_engine::Engine;
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE sweep (id INT NOT NULL, sec INT NOT NULL, name TEXT NOT NULL)")
         .map_err(|e| e.to_string())?;
@@ -258,17 +266,16 @@ fn run_spg_embedded(
         }
         cur = ck;
 
-        // Scan.
+        // Scan throughput via COUNT(*): walks the full table (reads every
+        // row, tallies) without materialising N rows into a result set.
+        // Keeps it apples-to-apples with the competitors' `SELECT COUNT(*)`
+        // and avoids tripping the per-query byte budget on a 10M+ row
+        // SELECT. Rate is over rows scanned (= ck).
         let scan_t = Instant::now();
-        let scan_rows = match eng
-            .execute("SELECT id FROM sweep")
-            .map_err(|e| e.to_string())?
-        {
-            QueryResult::Rows { rows, .. } => rows.len(),
-            QueryResult::CommandOk { .. } => 0,
-        };
+        eng.execute("SELECT COUNT(*) FROM sweep")
+            .map_err(|e| e.to_string())?;
         let scan_s = scan_t.elapsed().as_secs_f64();
-        let scan_rps = scan_rows as f64 / scan_s;
+        let scan_rps = ck as f64 / scan_s;
 
         // PK lookups.
         let (pk_p50, pk_p99) = {
@@ -335,7 +342,10 @@ fn run_spg_embedded(
 
 // ---- spg-server ---------------------------------------------------
 
-fn spawn_spg_server() -> Result<Child, Box<dyn std::error::Error>> {
+fn spawn_spg_server(
+    variant: &str,
+    async_commit: bool,
+) -> Result<Child, Box<dyn std::error::Error>> {
     let build = Command::new("cargo")
         .args(["build", "--release", "-q", "-p", "spg-server"])
         .status()?;
@@ -344,12 +354,17 @@ fn spawn_spg_server() -> Result<Child, Box<dyn std::error::Error>> {
     }
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
     let bin = format!("{target_dir}/release/spg-server");
-    let tmp = std::env::temp_dir().join(format!("spg-sweep-{}", std::process::id()));
+    // Per-variant db dir, wiped first, so the async run starts from an
+    // empty table instead of replaying the sync run's 1M+ rows (same
+    // SPG_SERVER_ADDR is fine — the variants run serially, kill+wait
+    // between them releases the port).
+    let tmp = std::env::temp_dir().join(format!("spg-sweep-{}-{variant}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let db_path = tmp.join("a.db");
     let wal_path = tmp.join("a.wal");
-    let mut child = Command::new(&bin)
-        .arg(SPG_SERVER_ADDR)
+    let mut cmd = Command::new(&bin);
+    cmd.arg(SPG_SERVER_ADDR)
         .arg(&db_path)
         .arg("-")
         .arg(&wal_path)
@@ -358,7 +373,11 @@ fn spawn_spg_server() -> Result<Child, Box<dyn std::error::Error>> {
         .env_remove("SPG_PASSWORD")
         .env_remove("SPG_ADMIN_PASSWORD")
         .env_remove("SPG_PG_ADDR")
-        .spawn()?;
+        .env(
+            "SPG_SYNCHRONOUS_COMMIT",
+            if async_commit { "off" } else { "on" },
+        );
+    let mut child = cmd.spawn()?;
     let stderr = child.stderr.take().expect("stderr piped");
     let mut reader = BufReader::new(stderr);
     let start = Instant::now();
@@ -383,6 +402,7 @@ fn spawn_spg_server() -> Result<Child, Box<dyn std::error::Error>> {
 }
 
 fn run_spg_server(
+    label: &str,
     samples: &mut Vec<Sample>,
     started: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -422,11 +442,13 @@ fn run_spg_server(
         }
         cur = ck;
 
-        // Scan.
+        // Scan throughput via COUNT(*) — see run_spg_embedded for why
+        // (apples-to-apples with competitors, no full-row materialise, no
+        // per-query budget trip). Rate is over rows scanned (= ck).
         let scan_t = Instant::now();
-        let scan_rows = exec_count(&mut s, "SELECT id FROM sweep")?;
+        exec_count(&mut s, "SELECT COUNT(*) FROM sweep")?;
         let scan_s = scan_t.elapsed().as_secs_f64();
-        let scan_rps = scan_rows as f64 / scan_s;
+        let scan_rps = ck as f64 / scan_s;
 
         let (pk_p50, pk_p99) = {
             let mut samples_us: Vec<u128> = Vec::with_capacity(LOOKUP_SAMPLES);
@@ -458,7 +480,7 @@ fn run_spg_server(
 
         let rss = server_pid.and_then(process_rss_mb);
         let mut sample = Sample {
-            backend: "spg-server".into(),
+            backend: label.into(),
             n: ck,
             insert_segment_s: seg_s,
             insert_segment_rps: seg_rps,
