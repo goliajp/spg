@@ -328,7 +328,33 @@ fn follow_once(
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
     // Determine our starting offset: 0 if no db yet, else current WAL length.
-    let start_offset: u64 = if db_path.exists() && wal_path.exists() {
+    // v6.0.5+: start_offset is a position in MASTER's WAL file
+    // (master `f.seek(SeekFrom::Start(start_offset))`), not a count
+    // of bytes the follower has received. Those two diverged the
+    // moment the master picked a non-zero wal_position at the
+    // initial handshake (i.e. master had pre-existing WAL data
+    // before the follower's first connect).
+    //
+    // The previous fallback — `std::fs::metadata(wal_path).len()`
+    // — accidentally agreed with master's offset ONLY when the
+    // master's wal_position at first handshake was 0. Otherwise
+    // reconnect resumed from the wrong byte and the drain loop
+    // silently misaligned on the next record header.
+    //
+    // The right source of truth for "next master-WAL byte to ship"
+    // is the AtomicU64 the apply loop already maintains. Same-
+    // process reconnects (chaos netsplit, leader handoff in v4.42
+    // group commit, etc.) read it for free. Cross-process restart
+    // still falls back to `wal_path` length — at that point the
+    // engine reload from snapshot has reset state, so a fresh
+    // start_offset=0 path with a re-applied snapshot is the only
+    // safe handshake. (Persisting `follower_applied_pos` to a
+    // sidecar file would let cross-process resumes too — filed
+    // for a future replication sub-version.)
+    let stored_applied = state.lag_state.follower_applied_pos.load(Ordering::Acquire);
+    let start_offset: u64 = if db_path.exists() && stored_applied > 0 {
+        stored_applied
+    } else if db_path.exists() && wal_path.exists() {
         std::fs::metadata(wal_path).map_or(0, |m| m.len())
     } else {
         0

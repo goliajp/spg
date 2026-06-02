@@ -1194,6 +1194,61 @@ fn row_5_6_memory_exhaustion_survives_covered_by_e2e() {
     );
 }
 
+/// 6.11 Vector encoding alternatives — `VECTOR(N) USING SQ8 |
+/// HALF` lands in v6.0.1 + v6.0.3 with end-to-end e2e tests and
+/// NEON SIMD dispatch in v6.0.2.
+#[test]
+fn row_6_11_vector_encoding_alternatives_covered_by_e2e() {
+    for path in [
+        "crates/spg-server/tests/e2e_sq8.rs",
+        "crates/spg-server/tests/e2e_half.rs",
+    ] {
+        let body = std::fs::read_to_string(workspace_root().join(path))
+            .unwrap_or_else(|_| panic!("{path} missing"));
+        assert!(
+            body.contains("USING SQ8") || body.contains("USING HALF"),
+            "{path} must exercise the encoding it tests"
+        );
+    }
+}
+
+/// 6.12 Vector kNN at 1M scale — perf-gate harness staged in
+/// v6.0.1, real measurement in v6.0.5. The gates are `#[ignore]`'d
+/// (1M-scale; takes minutes to run) but the harness must be
+/// present.
+#[test]
+fn row_6_12_vector_knn_1m_scale_perf_gate_present() {
+    let path = "crates/spg-server/tests/perf_gate_sq8.rs";
+    let body = std::fs::read_to_string(workspace_root().join(path))
+        .unwrap_or_else(|_| panic!("{path} missing"));
+    assert!(
+        body.contains("sq8_knn_1m_dim128_p50_under_5ms_server")
+            && body.contains("sq8_rss_1m_dim128_under_800mib"),
+        "{path} must declare the v6.0.5 1M-scale perf gates"
+    );
+    assert!(
+        body.contains("#[ignore"),
+        "{path}'s 1M-scale gates must be #[ignore]'d (run via --ignored)"
+    );
+}
+
+/// 6.13 Vector encoding migration — `ALTER INDEX REBUILD` lands
+/// in v6.0.4 with e2e tests covering the three encoding-switch
+/// directions.
+#[test]
+fn row_6_13_alter_index_rebuild_covered_by_e2e() {
+    let path = "crates/spg-server/tests/e2e_alter_rebuild.rs";
+    let body = std::fs::read_to_string(workspace_root().join(path)).expect("e2e_alter_rebuild.rs");
+    assert!(
+        body.contains("ALTER INDEX") && body.contains("REBUILD"),
+        "e2e_alter_rebuild.rs must exercise ALTER INDEX … REBUILD"
+    );
+    assert!(
+        body.contains("WITH (encoding"),
+        "e2e_alter_rebuild.rs must exercise the encoding-switch path"
+    );
+}
+
 // ---- meta-test: every [machine] row in the doc has a Rust test ----
 
 /// Meta-check: PROD_READY.md must not promise a [machine] row
