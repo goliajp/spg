@@ -2,7 +2,9 @@
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v5.4.2 — async-commit write path validation.
@@ -30,8 +32,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::Child;
 use std::time::Duration;
+
+use std::process::Child;
 
 mod common;
 

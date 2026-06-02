@@ -4,7 +4,9 @@
     clippy::doc_markdown,
     clippy::manual_assert,
     clippy::uninlined_format_args,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.30 — RESTORE_DRILL.md as executable test.
@@ -28,23 +30,32 @@
 //! re-bootstrap) is covered by e2e_replication.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+use std::thread;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+mod common;
+
+fn local_spawn(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, String)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal);
+    for (k, v) in env {
+        b = b.env(*k, v);
+    }
+    b.spawn()
 }
+
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -54,47 +65,6 @@ fn tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-drill-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn(addr: &str, db: &Path, wal: &Path, env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
 }
 
 fn read_frame(s: &mut TcpStream) -> Frame {
@@ -217,9 +187,9 @@ fn restore_drill_full_plus_incremental_recovers_row_count() {
     let src_full = src_dir.join("full.bkp");
     let src_incr = src_dir.join("incr.bkp");
 
-    let src_addr = pick_free_addr();
-    let mut src_child = ChildGuard(spawn(&src_addr, &src_db, &src_wal, &[]));
-    let mut s = wait_for_listener(&src_addr, &mut src_child.0);
+    let (raw, src_addrs) = local_spawn(&src_db, &src_wal, &[]);
+    let mut src_child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&src_addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
     for i in 0..50 {
@@ -253,9 +223,9 @@ fn restore_drill_full_plus_incremental_recovers_row_count() {
     apply_bundle(&rec_db, &rec_wal, &src_incr);
 
     // Step 3 (start recovered server).
-    let rec_addr = pick_free_addr();
-    let mut rec_child = ChildGuard(spawn(&rec_addr, &rec_db, &rec_wal, &[]));
-    let mut rs = wait_for_listener(&rec_addr, &mut rec_child.0);
+    let (raw, rec_addrs) = local_spawn(&rec_db, &rec_wal, &[]);
+    let mut rec_child = common::ChildGuard(raw);
+    let mut rs = common::connect_to(&rec_addrs.native);
     rs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     // Step 4 (verify).
@@ -272,14 +242,10 @@ fn restore_drill_full_plus_incremental_recovers_row_count() {
     // Snapshot-only recovery from the same files. The full
     // bundle's snapshot already encodes 50 rows; SPG_REPLAY_UPTO=0
     // skips the appended incremental WAL slice entirely.
-    let rec_addr2 = pick_free_addr();
-    let mut rec_child2 = ChildGuard(spawn(
-        &rec_addr2,
-        &rec_db,
-        &rec_wal,
-        &[("SPG_REPLAY_UPTO", "0")],
-    ));
-    let mut rs2 = wait_for_listener(&rec_addr2, &mut rec_child2.0);
+    let (raw, rec_addr2_addrs) =
+        local_spawn(&rec_db, &rec_wal, &[("SPG_REPLAY_UPTO", "0".to_string())]);
+    let _rec_child2 = common::ChildGuard(raw);
+    let mut rs2 = common::connect_to(&rec_addr2_addrs.native);
     rs2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let after_pitr = select_int(&mut rs2, "SELECT count(*) FROM t");
     assert_eq!(

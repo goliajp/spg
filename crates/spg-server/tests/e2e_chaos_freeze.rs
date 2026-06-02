@@ -5,7 +5,9 @@
     clippy::doc_markdown,
     clippy::manual_assert,
     clippy::uninlined_format_args,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
 )]
 
 //! v5.2.4 — chaos suite for the freezer thread (v5.2.2).
@@ -36,23 +38,33 @@
 //!    ```
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+use std::thread;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+mod common;
+
+fn local_spawn(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, String)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal);
+    for (k, v) in env {
+        b = b.env(*k, v);
+    }
+    b.spawn()
 }
+
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -64,51 +76,9 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     p
 }
 
-fn spawn_server(addr: &str, db: &Path, wal: &Path, env: &[(&str, String)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl ChildGuard {
-    fn pid(&self) -> u32 {
-        self.0.id()
-    }
-}
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-}
+// `ChildGuard` from `tests/common::ChildGuard` is reused; this file
+// previously had a local `pid()` helper that just forwarded to
+// `child.0.id()`. Inline the call at the use sites instead.
 
 fn read_frame(s: &mut TcpStream) -> Frame {
     let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
@@ -188,7 +158,6 @@ fn chaos_kill_during_freeze_recovers_clean_state() {
     let dir = unique_tmpdir("kill-mid-freeze");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let addr1 = pick_free_addr();
 
     // Tight budget + fast tick → freezer fires within a few hundred
     // ms of the budget being exceeded. PK gets a BTree index so the
@@ -201,8 +170,9 @@ fn chaos_kill_during_freeze_recovers_clean_state() {
 
     let committed: i64;
     {
-        let mut c = ChildGuard(spawn_server(&addr1, &db, &wal, &env));
-        let mut s = wait_for_listener(&addr1, &mut c.0);
+        let (raw, addrs1) = local_spawn(&db, &wal, &env);
+        let mut c = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs1.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         exec_ok(
@@ -251,14 +221,9 @@ fn chaos_kill_during_freeze_recovers_clean_state() {
     //     (no WAL record; cold_segments_total = 0).
     //   - count(*) returns exactly `committed`.
     //   - Random PK lookups for ids in [0, committed) all resolve.
-    let addr2 = pick_free_addr();
-    let mut c2 = ChildGuard(spawn_server(
-        &addr2,
-        &db,
-        &wal,
-        &[("SPG_FREEZER_DISABLE", "1".to_string())],
-    ));
-    let mut s2 = wait_for_listener(&addr2, &mut c2.0);
+    let (raw, addrs2) = local_spawn(&db, &wal, &[("SPG_FREEZER_DISABLE", "1".to_string())]);
+    let _c2 = common::ChildGuard(raw);
+    let mut s2 = common::connect_to(&addrs2.native);
     s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     let after = select_int(&mut s2, "SELECT count(*) FROM big");
@@ -306,7 +271,6 @@ fn freeze_30m_rss_stays_under_6gib_during_sweep_loop() {
     let dir = unique_tmpdir("rss-30m");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let addr = pick_free_addr();
 
     let env: Vec<(&str, String)> = vec![
         // 512 MiB budget — the freezer should run constantly past
@@ -319,9 +283,10 @@ fn freeze_30m_rss_stays_under_6gib_during_sweep_loop() {
         ("SPG_FREEZER_BATCH_ROWS", "50000".to_string()),
     ];
 
-    let mut c = ChildGuard(spawn_server(&addr, &db, &wal, &env));
-    let pid = c.pid();
-    let mut s = wait_for_listener(&addr, &mut c.0);
+    let (raw, addrs) = local_spawn(&db, &wal, &env);
+    let c = common::ChildGuard(raw);
+    let pid = c.0.id();
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
 
     exec_ok(

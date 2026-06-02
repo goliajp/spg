@@ -1,7 +1,9 @@
 #![allow(
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v5.2.2 — background freezer thread end-to-end.

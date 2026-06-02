@@ -1,7 +1,9 @@
 #![allow(
     clippy::doc_markdown,
     clippy::cast_possible_truncation,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.13 observability: /healthz + /metrics + structured logging.

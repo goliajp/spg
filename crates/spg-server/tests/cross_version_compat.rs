@@ -6,7 +6,9 @@
     clippy::manual_assert,
     clippy::uninlined_format_args,
     clippy::unnecessary_debug_formatting,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.31 — cross-version snapshot + WAL compatibility gate.
@@ -33,15 +35,25 @@
 //! version.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+mod common;
+
+fn local_spawn(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+) -> (std::process::Child, common::ServerAddrs) {
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal)
+        .spawn()
+}
+
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn workspace_root() -> PathBuf {
@@ -53,13 +65,6 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
-}
-
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -68,45 +73,6 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-compat-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn(addr: &str, db: &Path, wal: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg(addr)
-        .arg(db)
-        .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR")
-        .spawn()
-        .unwrap()
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
 }
 
 fn read_frame(s: &mut TcpStream) -> Frame {
@@ -248,9 +214,9 @@ fn every_fixture_restores_and_verifies() {
         let rec_wal = rec.join("rec.wal");
         apply_bundle(&rec_db, &rec_wal, &bundle);
 
-        let addr = pick_free_addr();
-        let mut child = ChildGuard(spawn(&addr, &rec_db, &rec_wal));
-        let mut s = wait_for_listener(&addr, &mut child.0);
+        let (raw, addrs) = local_spawn(&rec_db, &rec_wal);
+        let _child = common::ChildGuard(raw);
+        let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         let table = expected
@@ -326,9 +292,9 @@ fn capture_fixture(label: &str) {
     let db = work.join("a.db");
     let wal = work.join("a.wal");
     let bkp = work.join("full.bkp");
-    let addr = pick_free_addr();
-    let mut child = ChildGuard(spawn(&addr, &db, &wal));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, &wal);
+    let _child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     let stmts = [

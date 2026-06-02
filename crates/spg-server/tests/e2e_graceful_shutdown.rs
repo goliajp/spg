@@ -13,23 +13,34 @@
 //! issues SIGKILL and would bypass the drain path entirely).
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
+use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use spg_wire::{Frame, Op, build_query, encode};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+use std::process::Child;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+use std::thread;
+
+mod common;
+
+fn local_spawn(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, String)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal);
+    for (k, v) in env {
+        b = b.env(*k, v);
+    }
+    b.spawn()
 }
+
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -39,49 +50,6 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-shutdown-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-fn spawn_server(addr: &str, db: &Path, wal: &Path, env: &[(&str, String)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        // SIGKILL fallback for the case where the drain hung or the
-        // test exits before the child finished its graceful path.
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
 }
 
 fn read_frame(s: &mut TcpStream) -> Frame {
@@ -133,20 +101,19 @@ fn send_sigterm(child: &Child) {
 /// shutdown deadline.
 #[test]
 fn graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero() {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir("drain");
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
-    let mut c = ChildGuard(spawn_server(
-        &addr,
+    let (raw, addrs) = local_spawn(
         &db,
         &wal,
         // Generous drain budget; test asserts the child exits well
         // before the budget so we know the drain logic — not the
         // deadline — released the process.
         &[("SPG_SHUTDOWN_DEADLINE_SEC", "10".to_string())],
-    ));
-    let mut bootstrap = wait_for_listener(&addr, &mut c.0);
+    );
+    let mut c = common::ChildGuard(raw);
+    let mut bootstrap = common::connect_to(&addrs.native);
     bootstrap.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut bootstrap, "CREATE TABLE g (id INT NOT NULL)");
     drop(bootstrap);
@@ -155,7 +122,7 @@ fn graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero() {
     // The query is a recursive CTE chosen to take ~100-500ms so
     // SIGTERM has a real window to interrupt; it's also CPU-bound
     // so a non-trivial chunk of work is genuinely mid-flight.
-    let mut inflight = TcpStream::connect(&addr).expect("inflight connect");
+    let mut inflight = TcpStream::connect(&addrs.native).expect("inflight connect");
     inflight.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let slow_sql = "WITH RECURSIVE seq(n) AS (\
                     SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<20000\
@@ -193,7 +160,7 @@ fn graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero() {
     //    outright (ECONNREFUSED) or it succeeds at the OS layer
     //    but the server never reads the request and the socket
     //    closes when the process exits. Either is a "refusal".
-    let refused = TcpStream::connect(&addr).is_err();
+    let refused = TcpStream::connect(&addrs.native).is_err();
     let drained_by_exit = !refused && {
         // OS-level accept happened (kernel SYN backlog) but the
         // server isn't reading. Wait briefly; if the child exits

@@ -2,7 +2,9 @@
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
     clippy::manual_assert,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    unused_mut,
+    unused_variables
 )]
 
 //! v4.25 backup bundles + PITR — full backup, incremental backup,
@@ -17,23 +19,30 @@
 //!      db_path + wal_path, restart, verify state matches.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+mod common;
 
-fn pick_free_addr() -> String {
-    let p = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = p.local_addr().unwrap();
-    drop(p);
-    a.to_string()
+fn local_spawn(
+    db: &std::path::Path,
+    wal: &std::path::Path,
+    env: &[(&str, String)],
+) -> (std::process::Child, common::ServerAddrs) {
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
+        .arg("-")
+        .arg_path(wal);
+    for (k, v) in env {
+        b = b.env(*k, v);
+    }
+    b.spawn()
 }
+
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn unique_tmpdir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -43,47 +52,6 @@ fn unique_tmpdir() -> PathBuf {
     let p = std::env::temp_dir().join(format!("spg-e2e-bkup-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-fn spawn(addr: &str, db: &PathBuf, wal: &PathBuf, extra_env: Vec<(&str, String)>) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg(addr)
-        .arg(db)
-        .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for_listener(addr: &str, child: &mut Child) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => return s,
-            Err(e) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited early: {status:?} ({e})");
-                }
-                assert!(Instant::now() < deadline, "server never came up: {e}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
 }
 
 fn read_frame(s: &mut TcpStream) -> Frame {
@@ -203,13 +171,13 @@ fn apply_bundle_to(dest_db: &Path, dest_wal: &Path, bundle: &Path) -> (u8, u64, 
 
 #[test]
 fn full_plus_incremental_round_trip_restores_state() {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("a.db");
     let wal = dir.join("a.wal");
 
-    let mut child = ChildGuard(spawn(&addr, &db, &wal, vec![]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, &wal, &[]);
+    let child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     exec_ok(&mut s, "CREATE TABLE k (id INT NOT NULL, v INT NOT NULL)");
@@ -250,9 +218,9 @@ fn full_plus_incremental_round_trip_restores_state() {
     assert_eq!(kind_incr, 1, "expected incremental marker");
     assert_eq!(since_incr, pos_after_full);
 
-    let rec_addr = pick_free_addr();
-    let mut rec_child = ChildGuard(spawn(&rec_addr, &rec_db, &rec_wal, vec![]));
-    let mut rs = wait_for_listener(&rec_addr, &mut rec_child.0);
+    let (raw, rec_addrs) = local_spawn(&rec_db, &rec_wal, &[]);
+    let _rec_child = common::ChildGuard(raw);
+    let mut rs = common::connect_to(&rec_addrs.native);
     rs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     assert_eq!(select_count(&mut rs, "SELECT count(*) FROM k"), 5);
@@ -260,13 +228,13 @@ fn full_plus_incremental_round_trip_restores_state() {
 
 #[test]
 fn pitr_via_replay_upto_truncates_history() {
-    let addr = pick_free_addr();
     let dir = unique_tmpdir();
     let db = dir.join("p.db");
     let wal = dir.join("p.wal");
 
-    let mut child = ChildGuard(spawn(&addr, &db, &wal, vec![]));
-    let mut s = wait_for_listener(&addr, &mut child.0);
+    let (raw, addrs) = local_spawn(&db, &wal, &[]);
+    let child = common::ChildGuard(raw);
+    let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     exec_ok(&mut s, "CREATE TABLE p (id INT NOT NULL)");
@@ -286,14 +254,9 @@ fn pitr_via_replay_upto_truncates_history() {
 
     // Recover at the pivot: SPG_REPLAY_UPTO = pivot_pos truncates
     // WAL replay there, so only rows 1+2 should be present.
-    let rec_addr = pick_free_addr();
-    let mut rec_child = ChildGuard(spawn(
-        &rec_addr,
-        &db,
-        &wal,
-        vec![("SPG_REPLAY_UPTO", pivot_pos.to_string())],
-    ));
-    let mut rs = wait_for_listener(&rec_addr, &mut rec_child.0);
+    let (raw, rec_addrs) = local_spawn(&db, &wal, &[("SPG_REPLAY_UPTO", pivot_pos.to_string())]);
+    let _rec_child = common::ChildGuard(raw);
+    let mut rs = common::connect_to(&rec_addrs.native);
     rs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     assert_eq!(select_count(&mut rs, "SELECT count(*) FROM p"), 2);

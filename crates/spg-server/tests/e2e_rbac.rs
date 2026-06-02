@@ -1,3 +1,5 @@
+#![allow(unused_mut, unused_variables)]
+
 //! v4.1 multi-user + RBAC end-to-end.
 //!
 //! Boots a server with `SPG_ADMIN_PASSWORD` set (auto-creates an admin
