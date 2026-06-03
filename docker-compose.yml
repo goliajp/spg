@@ -1,0 +1,37 @@
+# SPG v7.0 — minimal "docker compose up and go" topology.
+#
+# Brings up a single-node SPG database with persistent
+# state under ./data. Native wire on 5544.
+#
+#   docker compose up -d
+#   docker compose logs -f spg     # tail server logs
+#   docker compose exec spg /usr/local/bin/spg ping 127.0.0.1:5544
+#
+# Stop & wipe state:
+#
+#   docker compose down -v
+
+services:
+  spg:
+    image: goliakk/spg:7.0.0
+    container_name: spg-server
+    restart: unless-stopped
+    ports:
+      - "5544:5544"
+    volumes:
+      - spg-data:/data
+    healthcheck:
+      # The spg-cli's `ping` subcommand round-trips a wire frame
+      # against the listener — fastest non-SQL liveness probe
+      # available without exposing the HTTP /metrics surface.
+      test: ["CMD", "/usr/local/bin/spg", "ping", "127.0.0.1:5544"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  # Named volume keeps the catalog snapshot + WAL on Docker's
+  # managed storage. Swap for a bind mount if you'd rather
+  # introspect the files (e.g. `./data:/data`).
+  spg-data:

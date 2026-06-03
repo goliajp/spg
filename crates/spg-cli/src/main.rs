@@ -19,7 +19,7 @@ use std::time::Duration;
 use spg_storage::Catalog;
 use spg_wire::{
     ColumnDesc, Frame, FrameError, Op, WireValue, build_auth, build_query, build_stats_request,
-    encode, parse_command_complete, parse_data_row, parse_error_response, parse_row_description,
+    encode, parse_command_complete, parse_data_row, parse_data_row_batch, parse_error_response, parse_row_description,
     parse_stats_response,
 };
 
@@ -446,6 +446,13 @@ fn query(addr: &str, sql: &str) -> Result<(), String> {
                     Op::DataRow => {
                         let row = parse_data_row(&f).map_err(|e| format!("decode DR: {e}"))?;
                         rows.push(row);
+                    }
+                    // v3.3.1 server batches result rows when len > 1.
+                    // Decode every row in the batch and append.
+                    Op::DataRowBatch => {
+                        let batch = parse_data_row_batch(&f)
+                            .map_err(|e| format!("decode DRB: {e}"))?;
+                        rows.extend(batch);
                     }
                     Op::CommandComplete => break,
                     Op::ErrorResponse => {
