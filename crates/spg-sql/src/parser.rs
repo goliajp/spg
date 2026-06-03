@@ -1457,7 +1457,8 @@ impl Parser {
             // validation. We accept the JSONB spelling too because
             // most PG clients default to it; SPG doesn't distinguish
             // the two (no path-operator perf advantage to model).
-            "json" | "jsonb" => ColumnTypeName::Json,
+            "json" => ColumnTypeName::Json,
+            "jsonb" => ColumnTypeName::Jsonb,
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),

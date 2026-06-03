@@ -648,6 +648,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Timestamp => "TIMESTAMP".into(),
         DataType::Interval => "INTERVAL".into(),
         DataType::Json => "JSON".into(),
+        DataType::Jsonb => "JSONB".into(),
     }
 }
 
@@ -7935,6 +7936,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Date => DataType::Date,
         ColumnTypeName::Timestamp => DataType::Timestamp,
         ColumnTypeName::Json => DataType::Json,
+        ColumnTypeName::Jsonb => DataType::Jsonb,
     }
 }
 

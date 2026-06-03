@@ -116,12 +116,17 @@ pub enum DataType {
     /// arithmetic results); on-disk encoding is rejected so this branch
     /// can't appear in a `ColumnSchema`.
     Interval,
-    /// v4.9: `JSON` / `JSONB` — text-backed JSON document. We don't
-    /// parse the content (no path operators or jsonb functions yet) —
+    /// v4.9: `JSON` — text-backed JSON document. We don't parse
+    /// the content (no path operators or jsonb functions yet) —
     /// the column accepts any TEXT-compatible value and round-trips
-    /// it verbatim. Equivalent to `Text` storage with a distinct
-    /// type tag for the wire layer (PG OID 114).
+    /// it verbatim. PG OID 114 on the wire.
     Json,
+    /// v7.9.0: `JSONB` — semantically identical to `Json` on
+    /// the storage side (same `Value::Json` cells, same
+    /// row codec), but advertised as PG OID 3802 on the wire
+    /// so `sqlx`-style clients that bind `jsonb` columns
+    /// decode correctly. mailrs migration blocker #3.
+    Jsonb,
 }
 
 impl fmt::Display for DataType {
@@ -151,6 +156,7 @@ impl fmt::Display for DataType {
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::Interval => f.write_str("INTERVAL"),
             Self::Json => f.write_str("JSON"),
+            Self::Jsonb => f.write_str("JSONB"),
         }
     }
 }
@@ -969,8 +975,8 @@ impl Table {
                     (actual, col.ty),
                     (
                         DataType::Text,
-                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json
-                    ) | (DataType::Json, DataType::Text)
+                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
+                    ) | (DataType::Json | DataType::Jsonb, DataType::Text)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -1409,8 +1415,8 @@ impl Table {
                     (actual, col.ty),
                     (
                         DataType::Text,
-                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json
-                    ) | (DataType::Json, DataType::Text)
+                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
+                    ) | (DataType::Json | DataType::Jsonb, DataType::Text)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -3825,7 +3831,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 13;
+const FILE_VERSION: u8 = 14;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4451,6 +4457,9 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             unreachable!("DataType::Interval has no on-disk encoding in v2.11")
         }
         DataType::Json => out.push(13),
+        // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
+        // tag 13 — only the wire OID differs.
+        DataType::Jsonb => out.push(16),
     }
 }
 
@@ -4489,6 +4498,10 @@ impl Cursor<'_> {
                 dim: self.read_u32()?,
                 encoding: VecEncoding::F16,
             }),
+            // v7.9.0: tag 16 for `JSONB`. Storage shape == Json;
+            // we only carry the type tag so the wire layer can
+            // emit PG OID 3802 instead of 114.
+            16 => Ok(DataType::Jsonb),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -4694,7 +4707,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         // v4.9: JSON stores as length-prefixed text; same shape as
         // Text — the type tag lives in the column schema, not the
         // per-cell body.
-        (Value::Json(s), DataType::Json) => write_str(out, s),
+        (Value::Json(s), DataType::Json | DataType::Jsonb) => write_str(out, s),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -4966,6 +4979,7 @@ impl<'a> Cursor<'a> {
             }
             DataType::Date => Ok(Value::Date(self.read_i32()?)),
             DataType::Timestamp => Ok(Value::Timestamp(self.read_i64()?)),
+            DataType::Jsonb => Ok(Value::Json(self.read_str()?)),
             DataType::Interval => {
                 // Defensive — schema gate (CREATE TABLE rejects Interval
                 // columns) means this branch can't be hit through normal

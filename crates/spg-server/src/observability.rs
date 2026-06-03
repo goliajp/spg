@@ -561,7 +561,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // Average a half-full VARCHAR; the exact value is
                 // operator-knowable but not in the catalog.
                 DataType::Varchar(n) => u64::from(n).max(1) / 2,
-                DataType::Text | DataType::Json => 64,
+                DataType::Text | DataType::Json | DataType::Jsonb => 64,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

@@ -2627,7 +2627,8 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Date => 1082,
         DataType::Interval => 1186,
         DataType::Numeric { .. } => 1700,
-        DataType::Json => 114, // PG's "json" type (jsonb would be 3802)
+        DataType::Json => 114,  // PG `json`
+        DataType::Jsonb => 3802, // PG `jsonb` — v7.9.0 mailrs blocker fix
     }
 }
 
