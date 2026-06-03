@@ -2822,13 +2822,31 @@ impl Engine {
                 modified_catalog: false,
             });
         }
+        let table_name = stmt.name.clone();
         let cols = stmt
             .columns
             .into_iter()
             .map(column_def_to_schema)
             .collect::<Result<Vec<_>, _>>()?;
-        self.active_catalog_mut()
-            .create_table(TableSchema::new(stmt.name, cols))?;
+        // v7.6.1 — resolve every FK in the statement against the
+        // already-known catalog. Validates: parent table exists,
+        // parent column names exist, arity matches, parent columns
+        // have a PK / UNIQUE index. Self-referencing FKs (parent
+        // table == this table) resolve against the column list we
+        // just built — they don't need the catalog yet.
+        let mut fks: Vec<spg_storage::ForeignKeyConstraint> =
+            Vec::with_capacity(stmt.foreign_keys.len());
+        for fk in stmt.foreign_keys {
+            fks.push(resolve_foreign_key(
+                &table_name,
+                &cols,
+                fk,
+                self.active_catalog(),
+            )?);
+        }
+        let mut schema = TableSchema::new(table_name, cols);
+        schema.foreign_keys = fks;
+        self.active_catalog_mut().create_table(schema)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
@@ -6924,6 +6942,183 @@ fn apply_offset_and_limit(rows: &mut Vec<Row>, offset: Option<u32>, limit: Optio
     }
     if let Some(n) = limit {
         rows.truncate(n as usize);
+    }
+}
+
+/// v7.6.1 — resolve a parser-level `ForeignKeyConstraint` (column
+/// names + parent table name) into the storage-layer shape (column
+/// indices + same parent table). Validates everything the engine
+/// needs to know about the FK at CREATE TABLE time:
+///
+///   - parent table exists (catalog lookup, unless self-referencing)
+///   - parent columns exist on the parent table
+///   - parent column list matches the local arity (defaults to the
+///     parent's primary index column when omitted)
+///   - parent columns are covered by a `BTree` UNIQUE-class index
+///     (SPG's stand-in for `PRIMARY KEY`/`UNIQUE`) — required so
+///     the v7.6.2 INSERT path can do an O(log n) parent lookup
+///   - local columns exist on the table being created
+fn resolve_foreign_key(
+    local_table_name: &str,
+    local_cols: &[ColumnSchema],
+    fk: spg_sql::ast::ForeignKeyConstraint,
+    catalog: &Catalog,
+) -> Result<spg_storage::ForeignKeyConstraint, EngineError> {
+    // Resolve local columns.
+    let mut local_columns = Vec::with_capacity(fk.columns.len());
+    for name in &fk.columns {
+        let pos = local_cols
+            .iter()
+            .position(|c| c.name == *name)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "FOREIGN KEY references unknown local column {name:?}"
+                ))
+            })?;
+        local_columns.push(pos);
+    }
+    // Self-referencing FK: parent table is the one we're creating.
+    // The parent column resolution uses the local column list since
+    // the catalog doesn't have this table yet.
+    let is_self_ref = fk.parent_table == local_table_name;
+    let (parent_cols_for_lookup, parent_table_str): (&[ColumnSchema], &str) = if is_self_ref {
+        (local_cols, local_table_name)
+    } else {
+        let parent_table = catalog.get(&fk.parent_table).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: fk.parent_table.clone(),
+            })
+        })?;
+        (parent_table.schema().columns.as_slice(), fk.parent_table.as_str())
+    };
+    // Resolve parent column names → positions. If the FK omitted the
+    // parent column list, fall back to the parent's primary index
+    // column (single-column only — composite default is rejected
+    // because there's no unambiguous "PK" in SPG's index list).
+    let parent_columns: Vec<usize> = if fk.parent_columns.is_empty() {
+        if fk.columns.len() != 1 {
+            return Err(EngineError::Unsupported(
+                "composite FOREIGN KEY without explicit parent column list is not supported \
+                 — list the parent columns explicitly"
+                    .into(),
+            ));
+        }
+        // Find a single BTree index on the parent and use its column.
+        let pos = pick_pk_index_column(catalog, parent_table_str, is_self_ref, local_cols)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "parent table {parent_table_str:?} has no PRIMARY-key / UNIQUE BTree index \
+                     to default the FOREIGN KEY against"
+                ))
+            })?;
+        alloc::vec![pos]
+    } else {
+        let mut out = Vec::with_capacity(fk.parent_columns.len());
+        for name in &fk.parent_columns {
+            let pos = parent_cols_for_lookup
+                .iter()
+                .position(|c| c.name == *name)
+                .ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "FOREIGN KEY references unknown parent column \
+                         {name:?} on table {parent_table_str:?}"
+                    ))
+                })?;
+            out.push(pos);
+        }
+        out
+    };
+    if parent_columns.len() != local_columns.len() {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "FOREIGN KEY arity mismatch: {} local columns vs {} parent columns",
+            local_columns.len(),
+            parent_columns.len()
+        )));
+    }
+    // For non-self-referencing FKs, verify the parent column set is
+    // covered by a BTree index. SPG doesn't have a `PRIMARY KEY`
+    // declaration; the convention is "the parent column for FK
+    // purposes must have a BTree index" — which the user creates via
+    // `CREATE INDEX ... USING btree (col)` (the default). We accept
+    // any single-column BTree index that covers a parent column;
+    // composite parent column lists require an index whose `column_position`
+    // matches the first parent column (multi-column BTree indices
+    // are not in the v7.x roadmap).
+    if !is_self_ref {
+        let parent_table = catalog
+            .get(&fk.parent_table)
+            .expect("checked above");
+        let primary_parent_col = parent_columns[0];
+        let has_btree = parent_table.schema().columns.get(primary_parent_col).is_some()
+            && parent_table
+                .indices()
+                .iter()
+                .any(|idx| {
+                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                        && idx.column_position == primary_parent_col
+                        && idx.partial_predicate.is_none()
+                });
+        if !has_btree {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "FOREIGN KEY parent column on {:?} is not covered by an unconditional BTree \
+                 index — create one with `CREATE INDEX ... ON {} ({})` first",
+                parent_table_str,
+                parent_table_str,
+                parent_table.schema().columns[primary_parent_col].name,
+            )));
+        }
+    }
+    let on_delete = fk_action_sql_to_storage(fk.on_delete);
+    let on_update = fk_action_sql_to_storage(fk.on_update);
+    Ok(spg_storage::ForeignKeyConstraint {
+        name: fk.name,
+        local_columns,
+        parent_table: fk.parent_table,
+        parent_columns,
+        on_delete,
+        on_update,
+    })
+}
+
+/// v7.6.1 — pick a sentinel "primary key" column from the parent
+/// table when the FK didn't name parent columns. Picks the first
+/// single-column unconditional BTree index — that's the closest
+/// thing SPG has to a PRIMARY KEY today. Self-referencing FKs use
+/// `local_cols` as the column source.
+fn pick_pk_index_column(
+    catalog: &Catalog,
+    parent_name: &str,
+    is_self_ref: bool,
+    local_cols: &[ColumnSchema],
+) -> Option<usize> {
+    if is_self_ref {
+        // Self-ref FK omitted parent columns: pick column 0 by
+        // convention (no catalog entry yet). Engine will widen this
+        // when v7.6.7 lands; v7.6.1 only handles the explicit form.
+        let _ = local_cols;
+        return Some(0);
+    }
+    let parent = catalog.get(parent_name)?;
+    parent.indices().iter().find_map(|idx| {
+        if matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+            && idx.partial_predicate.is_none()
+            && idx.included_columns.is_empty()
+            && idx.expression.is_none()
+        {
+            Some(idx.column_position)
+        } else {
+            None
+        }
+    })
+}
+
+fn fk_action_sql_to_storage(a: spg_sql::ast::FkAction) -> spg_storage::FkAction {
+    match a {
+        spg_sql::ast::FkAction::Restrict => spg_storage::FkAction::Restrict,
+        spg_sql::ast::FkAction::Cascade => spg_storage::FkAction::Cascade,
+        spg_sql::ast::FkAction::SetNull => spg_storage::FkAction::SetNull,
+        spg_sql::ast::FkAction::SetDefault => spg_storage::FkAction::SetDefault,
+        spg_sql::ast::FkAction::NoAction => spg_storage::FkAction::NoAction,
     }
 }
 
