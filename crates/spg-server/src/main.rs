@@ -27,6 +27,7 @@ mod freezer;
 mod manifest;
 mod observability;
 mod prefetch;
+mod pubsub;
 
 thread_local! {
     /// v6.7.6 — single-cell handoff for the prefetch hit count.
@@ -3233,11 +3234,20 @@ fn run_leader_commit_round(state: &ServerState) {
         // branch), so even when the in-memory exec succeeded but
         // fsync failed, the client sees the WAL error and
         // recovers to a state consistent with the durable WAL.
+        //
+        // v6.10.0 — also fan out each successfully-committed SQL
+        // to the pubsub side-channel. Fires only when WAL fsync
+        // succeeded (no point publishing a record that hasn't
+        // landed on disk).
+        let wal_ok = wal_outcome.is_ok();
         for p in prepared {
             let cloned_wal = match &wal_outcome {
                 Ok(()) => Ok(()),
                 Err(e) => Err(clone_io_err(e)),
             };
+            if wal_ok {
+                pubsub::publish_sql(&p.task.sql);
+            }
             let _ = p.task.ack.send(CommitResult {
                 result: Ok(p.result),
                 wal_outcome: cloned_wal,
