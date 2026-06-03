@@ -12,17 +12,17 @@ categories   = ["database", "database-implementations", "embedded"]
 keywords     = ["spg", "database", "embedded", "sql", "vector"]
 
 [dependencies]
-spg-engine  = { path = "../spg-engine" }
-spg-storage = { path = "../spg-storage" }
+spg-engine   = { workspace = true }
+spg-storage  = { workspace = true }
 # v7.1 — WAL record CRC32 (same algo + same on-disk format as
 # `spg-server`, so an embedded-written DB boots cleanly on the
 # server and vice versa).
-spg-crypto  = { path = "../spg-crypto" }
+spg-crypto   = { workspace = true }
 # v7.1.4 — cold-segment manifest persistence (SPGMAN01 v10).
 # Same bytes spg-server reads + writes, so a database an
 # embedded process produces boots cleanly on the server (and
 # vice versa) even with cold-tier state.
-spg-manifest = { path = "../spg-manifest" }
+spg-manifest = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

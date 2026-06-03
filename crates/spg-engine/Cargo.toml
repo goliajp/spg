@@ -11,9 +11,9 @@ categories   = ["database-implementations"]
 keywords     = ["spg", "sql", "engine", "executor", "no-std"]
 
 [dependencies]
-spg-crypto  = { path = "../spg-crypto" }
-spg-sql     = { path = "../spg-sql" }
-spg-storage = { path = "../spg-storage" }
+spg-crypto  = { workspace = true }
+spg-sql     = { workspace = true }
+spg-storage = { workspace = true }
 
 [lints]
 workspace = true

@@ -15,23 +15,23 @@ name = "spg"
 path = "src/main.rs"
 
 [dependencies]
-spg-wire = { path = "../spg-wire" }
+spg-wire    = { workspace = true }
 # Backup / restore subcommands talk directly to the on-disk format,
 # never via the wire protocol — the server can be down or absent.
-spg-storage = { path = "../spg-storage" }
+spg-storage = { workspace = true }
 # v6.10.5 — `spg wal-lint` dry-run-applies WAL records against a
 # catalog snapshot to validate operator commands before they
 # reach a live server.
-spg-engine  = { path = "../spg-engine" }
-spg-crypto  = { path = "../spg-crypto" }
+spg-engine  = { workspace = true }
+spg-crypto  = { workspace = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-criterion = { workspace = true }
-spg-engine  = { path = "../spg-engine" }
-spg-crypto  = { path = "../spg-crypto" }
+criterion   = { workspace = true }
+spg-engine  = { workspace = true }
+spg-crypto  = { workspace = true }
 
 [[bench]]
 name    = "backup"

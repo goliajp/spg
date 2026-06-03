@@ -14,7 +14,7 @@ keywords     = ["spg", "storage", "btree", "catalog", "no-std"]
 workspace = true
 
 [dependencies]
-spg-crypto = { path = "../spg-crypto" }
+spg-crypto = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
