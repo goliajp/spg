@@ -302,6 +302,35 @@ pub struct CreateTableStatement {
     /// form) is normalised into this vec at parse time so the engine
     /// sees one uniform list.
     pub foreign_keys: Vec<ForeignKeyConstraint>,
+    /// v7.9.18 — table-level constraints: `PRIMARY KEY (a, b)` and
+    /// `UNIQUE (a, b, ...)`. mailrs migration follow-up G1 + G6.
+    /// Engine resolves each into a BTree index named after the
+    /// constraint's leading column at CREATE TABLE time; INSERT
+    /// path enforces composite uniqueness via row scan on the
+    /// leading column index.
+    pub table_constraints: Vec<TableConstraint>,
+}
+
+/// v7.9.18 — table-level constraint at the end of a CREATE TABLE
+/// column list. Either a composite PRIMARY KEY or a UNIQUE
+/// (single- or multi-column).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableConstraint {
+    /// `PRIMARY KEY (col1, col2, ...)`. Implies NOT NULL on each
+    /// referenced column. Engine builds a BTree index named
+    /// `<table>_pkey` and enforces composite uniqueness on INSERT.
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    /// `UNIQUE (col1, col2, ...)`. Engine builds a BTree index
+    /// named `<table>_<leading_col>_key` (single-column) or
+    /// `<table>_<leading_col>_<…>_key` (composite) and enforces
+    /// uniqueness on INSERT.
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
