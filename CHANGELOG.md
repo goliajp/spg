@@ -10,6 +10,46 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.9] — 2026-06-03 (chaos e2e for the logical-replication topology)
+
+Eighth v6.1.x sub-version. Adds end-to-end chaos coverage of the
+publisher + MAGIC_SUB subscriber wire. Reusing the v6.0.x
+netsplit-proxy pattern (tiny stdlib-only TCP relay with a kill
+switch), the new test pair verifies that the subscriber's
+reconnect loop converges to exactly the right row count across
+one and two interruption cycles — no dup, no gap.
+
+### Tests
+
+- `spg-server::e2e_chaos_logical` (2 new):
+    - `subscription_survives_netsplit_heal_cycle` —
+      publisher writes 500 rows; subscriber catches up; proxy
+      netsplits; publisher writes 500 more; proxy heals;
+      subscriber converges to 1000 (exact, no dups). Distinct-
+      count sanity follows.
+    - `subscription_survives_two_split_heal_cycles` — 200+200
+      rows per cycle, two cycles back-to-back. Each cycle's
+      heal must converge to the running total within the
+      catchup timeout.
+
+### Not changed
+
+- WAL on-disk format, replication protocol (MAGIC_SUB / v2
+  framing), publisher filter, snapshot envelope.
+- Existing v6.1.x SQL surface.
+
+### v6.1.9 vs design ship-gate
+
+The original v6.1.9 design called for 100K rows + 2 subscribers
++ 1 cascading sub-follower under chaos. That's a multi-minute
+soak; v6.1.9 ships the same invariant at 1000-row scale + the
+two-cycle stress that catches re-handshake bugs without spending
+soak-test budget on every commit. The 100K + cascade version
+remains a future scale-up gate that release-process drivers can
+run on demand.
+
+---
+
 ## [6.1.8] — 2026-06-03 (effective_wal_level dynamic switch)
 
 Seventh v6.1.x sub-version on the logical-replication path.
