@@ -3162,6 +3162,47 @@ impl Engine {
         if !fks.is_empty() {
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
         }
+        // v7.9.8 — ON CONFLICT DO NOTHING: split `all_values` into
+        // {inserts, skipped}. The conflict target column position
+        // is resolved against the table's BTree indices; a row whose
+        // value already lives in that index goes to `skipped`.
+        // Self-batch deduplication (two rows in the same VALUES that
+        // would collide with each other) follows the same rule:
+        // first wins, rest skip.
+        let mut skipped_count = 0usize;
+        if matches!(
+            stmt.on_conflict.as_ref().map(|c| &c.action),
+            Some(spg_sql::ast::OnConflictAction::Nothing)
+        ) {
+            let conflict_col = resolve_on_conflict_column(
+                self.active_catalog(),
+                &stmt.table,
+                stmt.on_conflict.as_ref().expect("checked").target_columns.as_slice(),
+            )?;
+            let mut kept: Vec<Vec<Value>> = Vec::with_capacity(all_values.len());
+            // Value isn't Ord; use Vec + linear contains. Batches
+            // are typically ≤ 100 rows so this is fine.
+            let mut seen_keys: Vec<Value> = Vec::new();
+            for values in all_values {
+                let key = &values[conflict_col];
+                let collides_with_table = !matches!(key, Value::Null)
+                    && on_conflict_key_exists(
+                        self.active_catalog(),
+                        &stmt.table,
+                        conflict_col,
+                        key,
+                    );
+                let collides_with_batch =
+                    !matches!(key, Value::Null) && seen_keys.iter().any(|k| k == key);
+                if collides_with_table || collides_with_batch {
+                    skipped_count += 1;
+                    continue;
+                }
+                seen_keys.push(key.clone());
+                kept.push(values);
+            }
+            all_values = kept;
+        }
         // Stage 3 — insert all rows under a fresh mutable borrow.
         let table = self
             .active_catalog_mut()
@@ -3178,6 +3219,7 @@ impl Engine {
             table.insert(Row::new(values))?;
             affected += 1;
         }
+        let _ = skipped_count; // available if we need to surface it later
         // v7.9.4 — if RETURNING was specified, project each
         // inserted row and stream as Rows result instead of
         // CommandOk.
@@ -7364,6 +7406,84 @@ fn pick_pk_index_column(
         } else {
             None
         }
+    })
+}
+
+/// v7.9.8 — resolve the column position that uniquely identifies
+/// a conflict for ON CONFLICT. When the user wrote
+/// `ON CONFLICT (col) DO …`, look up that column on the table.
+/// When they wrote bare `ON CONFLICT DO …`, fall back to the
+/// table's first single-column unconditional BTree index column.
+/// Returns the column position or an Unsupported error.
+fn resolve_on_conflict_column(
+    catalog: &Catalog,
+    table_name: &str,
+    target: &[String],
+) -> Result<usize, EngineError> {
+    let table = catalog.get(table_name).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: table_name.into(),
+        })
+    })?;
+    if target.is_empty() {
+        let pos = table
+            .indices()
+            .iter()
+            .find_map(|idx| {
+                if matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                    && idx.partial_predicate.is_none()
+                    && idx.included_columns.is_empty()
+                    && idx.expression.is_none()
+                {
+                    Some(idx.column_position)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ON CONFLICT without target requires a UNIQUE BTree index on {table_name:?}"
+                ))
+            })?;
+        return Ok(pos);
+    }
+    if target.len() > 1 {
+        return Err(EngineError::Unsupported(
+            "ON CONFLICT with composite target lands in v7.9.10".into(),
+        ));
+    }
+    let name = &target[0];
+    table
+        .schema()
+        .columns
+        .iter()
+        .position(|c| c.name == *name)
+        .ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!(
+                "ON CONFLICT target column {name:?} not found on {table_name:?}"
+            ))
+        })
+}
+
+/// v7.9.8 — check whether the BTree index on `column_pos` of
+/// `table_name` already has a row with this key.
+fn on_conflict_key_exists(
+    catalog: &Catalog,
+    table_name: &str,
+    column_pos: usize,
+    key: &Value,
+) -> bool {
+    let Some(table) = catalog.get(table_name) else {
+        return false;
+    };
+    let Some(idx_key) = spg_storage::IndexKey::from_value(key) else {
+        return false;
+    };
+    table.indices().iter().any(|idx| {
+        matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+            && idx.column_position == column_pos
+            && idx.partial_predicate.is_none()
+            && !idx.lookup_eq(&idx_key).is_empty()
     })
 }
 
