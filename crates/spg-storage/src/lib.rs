@@ -368,6 +368,11 @@ pub struct Index {
     /// catalog snapshot (FILE_VERSION 12, appended after
     /// `included_columns`).
     pub partial_predicate: Option<String>,
+    /// v6.8.2 — expression-index key, stored as the expression's
+    /// canonical Display form. `None` = bare column-reference
+    /// index (the legacy shape). Persisted alongside
+    /// `partial_predicate` on the v12 catalog snapshot.
+    pub expression: Option<String>,
 }
 
 /// Default neighbor degree (M) for the NSW graph. Picked at construction
@@ -592,6 +597,7 @@ impl Index {
             kind: IndexKind::BTree(PersistentBTreeMap::new()),
             included_columns: Vec::new(),
             partial_predicate: None,
+            expression: None,
         }
     }
 
@@ -602,6 +608,7 @@ impl Index {
             kind: IndexKind::Nsw(NswGraph::new(m)),
             included_columns: Vec::new(),
             partial_predicate: None,
+            expression: None,
         }
     }
 
@@ -615,6 +622,7 @@ impl Index {
             kind: IndexKind::Brin { column_type },
             included_columns: Vec::new(),
             partial_predicate: None,
+            expression: None,
         }
     }
 
@@ -1109,6 +1117,7 @@ impl Table {
             kind: IndexKind::BTree(map),
             included_columns: Vec::new(),
             partial_predicate: None,
+            expression: None,
         });
         Ok(())
     }
@@ -1513,6 +1522,7 @@ impl Table {
                 kind: IndexKind::Nsw(graph),
                 included_columns: Vec::new(),
                 partial_predicate: None,
+                expression: None,
             });
             return Ok(());
         }
@@ -3881,6 +3891,15 @@ impl Catalog {
                         write_str(&mut out, pred);
                     }
                 }
+                // v6.8.2 — expression appendix. Same shape as
+                // partial_predicate.
+                match &idx.expression {
+                    None => out.push(0),
+                    Some(expr) => {
+                        out.push(1);
+                        write_str(&mut out, expr);
+                    }
+                }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
             // Layout: [u8 has_value][u64 LE value (if has_value)].
@@ -4110,6 +4129,21 @@ fn deserialize_indices(
                 other => {
                     return Err(StorageError::Corrupt(format!(
                         "partial_predicate tag: unknown byte {other}"
+                    )));
+                }
+            }
+            // v6.8.2 — expression appendix.
+            match cur.read_u8()? {
+                0 => {}
+                1 => {
+                    let expr = cur.read_str()?;
+                    if let Some(last) = t.indices.last_mut() {
+                        last.expression = Some(expr);
+                    }
+                }
+                other => {
+                    return Err(StorageError::Corrupt(format!(
+                        "expression tag: unknown byte {other}"
                     )));
                 }
             }

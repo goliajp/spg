@@ -2765,6 +2765,24 @@ impl Engine {
                 idx.partial_predicate = Some(canonical);
             }
         }
+        // v6.8.2 — persist expression index key. Same Display-form
+        // storage; the runtime maintenance pass evaluates each
+        // row's expression to derive the index key, but for v6.8.2
+        // the engine falls through to the bare-column-reference
+        // path and the expression is preserved for format-layer
+        // round-trip + future planner work. Carved-out in
+        // STABILITY § "Out of v6.8".
+        if let Some(key_expr) = &stmt.expression {
+            if matches!(stmt.method, IndexMethod::Hnsw | IndexMethod::Brin) {
+                return Err(EngineError::Unsupported(
+                    "Expression keys are not supported on HNSW or BRIN indexes".into(),
+                ));
+            }
+            let canonical = key_expr.to_string();
+            if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
+                idx.expression = Some(canonical);
+            }
+        }
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.
         self.plan_cache.evict_referencing(&table_name);
