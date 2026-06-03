@@ -10,6 +10,10 @@ description  = "v6.10.3 — ergonomic embedded-mode entry point for SPG. Wraps s
 [dependencies]
 spg-engine  = { path = "../spg-engine" }
 spg-storage = { path = "../spg-storage" }
+# v7.1 — WAL record CRC32 (same algo + same on-disk format as
+# `spg-server`, so an embedded-written DB boots cleanly on the
+# server and vice versa).
+spg-crypto  = { path = "../spg-crypto" }
 
 [lints]
 workspace = true
