@@ -516,6 +516,97 @@ fn generate_cluster_id() -> u64 {
     x ^ (x >> 31)
 }
 
+/// v6.2.1 — interval (milliseconds) between auto-analyze sweeps.
+/// Defaults to 30 s. Tests set `SPG_AUTO_ANALYZE_INTERVAL_MS=200`
+/// so the sweep fires within their probe window.
+pub(crate) fn auto_analyze_interval_ms() -> u64 {
+    std::env::var("SPG_AUTO_ANALYZE_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000)
+}
+
+/// v6.2.1 — spawn the background auto-analyze worker. One thread
+/// per server. Sleeps in small ticks (200 ms) so the worker can
+/// check for shutdown promptly even mid-interval.
+pub(crate) fn spawn_auto_analyze_worker(state: Arc<ServerState>) {
+    let interval = std::time::Duration::from_millis(auto_analyze_interval_ms());
+    if interval.is_zero() {
+        // Opt-out — interval 0 disables the worker entirely.
+        return;
+    }
+    thread::Builder::new()
+        .name("spg-auto-analyze".into())
+        .spawn(move || {
+            run_auto_analyze_loop(state, interval);
+        })
+        .ok();
+}
+
+const AUTO_ANALYZE_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn run_auto_analyze_loop(state: Arc<ServerState>, interval: std::time::Duration) {
+    let mut last_sweep = std::time::Instant::now();
+    loop {
+        // Bounded sleep so a future shutdown signal (or
+        // SIGTERM-driven exit) doesn't wait the full interval.
+        thread::sleep(AUTO_ANALYZE_TICK);
+        if last_sweep.elapsed() < interval {
+            continue;
+        }
+        last_sweep = std::time::Instant::now();
+        // Phase 1: snapshot the work-list under the read lock.
+        let needs: Vec<String> = {
+            let Ok(eng) = state.engine.read() else {
+                continue;
+            };
+            eng.tables_needing_analyze()
+        };
+        if needs.is_empty() {
+            continue;
+        }
+        // Phase 2: take the write lock once per table. Holding
+        // briefly is critical — ANALYZE itself is fast on small
+        // tables (sub-ms) and bounded on larger ones. A long
+        // write-lock would block every other query.
+        for table in &needs {
+            let Ok(mut eng) = state.engine.write() else {
+                break;
+            };
+            // The catalog may have changed since the read-lock
+            // released (DROP TABLE, etc.) — re-check before
+            // ANALYZE so we don't error-out a clean sweep.
+            if eng.catalog().get(table).is_none() {
+                continue;
+            }
+            if let Err(e) = eng.execute(&format!("ANALYZE {}", quote_ident_simple(table))) {
+                eprintln!("spg-server: auto-analyze {table:?} failed: {e}");
+            }
+        }
+    }
+}
+
+/// v6.2.1 — tiny SQL-ident quoter used by the auto-analyze worker
+/// when composing `ANALYZE <name>`. Mirrors `spg_sql::ast::
+/// quote_ident` behaviour but lives in the server crate so we
+/// don't add a new spg-sql dependency just for one helper.
+fn quote_ident_simple(name: &str) -> String {
+    let needs_quote = name.is_empty()
+        || name
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+        || name.starts_with(|c: char| c.is_ascii_digit());
+    if needs_quote {
+        let escaped: String = name
+            .chars()
+            .flat_map(|c| if c == '"' { vec!['"', '"'] } else { vec![c] })
+            .collect();
+        format!("\"{escaped}\"")
+    } else {
+        name.to_string()
+    }
+}
+
 pub(crate) fn reconcile_subscriptions(state: &Arc<ServerState>) {
     use std::collections::BTreeMap;
     let want: BTreeMap<String, (String, bool)> = {
@@ -897,6 +988,14 @@ fn run(
     // restored from the v4 snapshot envelope. Idempotent — if no
     // subscriptions exist (the common case), the call is a no-op.
     reconcile_subscriptions(&state);
+
+    // v6.2.1: spawn the background auto-analyze worker. Single
+    // thread per server — wakes every SPG_AUTO_ANALYZE_INTERVAL_MS
+    // (default 30 s), reads the engine's `tables_needing_analyze()`
+    // under a read-lock, then takes a write-lock per table to run
+    // ANALYZE. The Acquire-load on the global shutdown atomic lets
+    // the worker exit at server shutdown.
+    spawn_auto_analyze_worker(Arc::clone(&state));
 
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
