@@ -302,7 +302,17 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                     wbuf.clear();
                     continue;
                 }
+                // v6.5.5 — wait_event = write_lock around the
+                // engine lock acquisition. Cleared in all paths
+                // below (success, error, panic via guard would be
+                // overkill — execute_with_role returns Result).
+                conn_state
+                    .wait_event
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
                 let result = execute_with_role(state, &sql, role);
+                conn_state
+                    .wait_event
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 match result {
                     Ok(QueryResult::Rows { columns, rows }) => {
                         send_row_description(&mut wbuf, &columns)?;
