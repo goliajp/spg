@@ -2909,7 +2909,16 @@ impl Engine {
             }
         };
         let expected_tuple_len = stmt.columns.as_ref().map_or(schema_cols_len, Vec::len);
+        // v7.6.2 — snapshot this table's FK list before the
+        // mutable-borrow window so we can run parent lookups
+        // against the immutable catalog after parsing. Empty vec is
+        // the no-FK fast path; clone cost is O(fks * arity) which
+        // is < 100 ns for typical schemas.
+        let fks = table.schema().foreign_keys.clone();
         let mut affected = 0usize;
+        // Stage 1 — parse + AUTO_INC + coerce all rows under the
+        // single mutable borrow.
+        let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(stmt.rows.len());
         for tuple in stmt.rows {
             if tuple.len() != expected_tuple_len {
                 return Err(EngineError::Storage(StorageError::ArityMismatch {
@@ -2962,6 +2971,26 @@ impl Engine {
                 }
                 out
             };
+            all_values.push(values);
+        }
+        // Stage 2 — FK enforcement on the immutable catalog.
+        // Non-lexical lifetimes release the mutable borrow on
+        // `table` here since stage 1 was the last use. The
+        // parent-table lookup runs before any row is committed.
+        let _ = table;
+        if !fks.is_empty() {
+            enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
+        }
+        // Stage 3 — insert all rows under a fresh mutable borrow.
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.table)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
+        for values in all_values {
             table.insert(Row::new(values))?;
             affected += 1;
         }
@@ -7110,6 +7139,109 @@ fn pick_pk_index_column(
             None
         }
     })
+}
+
+/// v7.6.2 — INSERT-side FK enforcement. For every row about to be
+/// inserted into `child_table`, every FK declared on that table is
+/// checked: the row's FK columns must either be NULL (SQL spec
+/// skip) or match an existing parent row via the parent's BTree
+/// PK / UNIQUE index.
+///
+/// Returns `EngineError::Unsupported` with a `FOREIGN KEY violation`
+/// payload on first failure — wire layer translates this to PG
+/// SQLSTATE 23503 in v7.6.10.
+///
+/// Self-referencing FKs (parent table == child table): the parent
+/// rows visible to this check are the rows *already* in the table
+/// before this INSERT batch. v7.6.2 ships the simple read-modify
+/// model — within a single INSERT batch, a row cannot reference
+/// another row introduced by the same statement. The cycle-tolerant
+/// form lands in v7.6.7.
+fn enforce_fk_inserts(
+    catalog: &Catalog,
+    child_table: &str,
+    fks: &[spg_storage::ForeignKeyConstraint],
+    rows: &[Vec<Value>],
+) -> Result<(), EngineError> {
+    for fk in fks {
+        let parent_is_self = fk.parent_table == child_table;
+        let parent = if parent_is_self {
+            // Self-ref: read the current state of the same table.
+            // The mut borrow on child has been dropped by the caller.
+            catalog.get(child_table).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: child_table.into(),
+                })
+            })?
+        } else {
+            catalog.get(&fk.parent_table).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: fk.parent_table.clone(),
+                })
+            })?
+        };
+        for row_values in rows {
+            // Single-column FK fast path: try the parent's BTree
+            // index for an O(log n) lookup. Composite FKs scan in
+            // v7.6.2; v7.6.7 widens this to multi-column index
+            // probes once SPG grows composite indices.
+            if fk.local_columns.len() == 1 {
+                let v = &row_values[fk.local_columns[0]];
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                let parent_col = fk.parent_columns[0];
+                let key = spg_storage::IndexKey::from_value(v).ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "FOREIGN KEY column value of type {:?} is not index-eligible",
+                        v.data_type()
+                    ))
+                })?;
+                let present = parent.indices().iter().any(|idx| {
+                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                        && idx.column_position == parent_col
+                        && idx.partial_predicate.is_none()
+                        && !idx.lookup_eq(&key).is_empty()
+                });
+                if !present {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "FOREIGN KEY violation: no parent row in {:?} where {} = {:?}",
+                        fk.parent_table,
+                        parent
+                            .schema()
+                            .columns
+                            .get(parent_col)
+                            .map_or("?", |c| c.name.as_str()),
+                        v,
+                    )));
+                }
+            } else {
+                // Composite FK: scan parent rows. v7.6.2 keeps
+                // this simple; v7.6.7 wires it into a composite
+                // index probe.
+                if fk.local_columns
+                    .iter()
+                    .all(|&i| matches!(row_values.get(i), Some(Value::Null)))
+                {
+                    continue;
+                }
+                let local: Vec<&Value> = fk.local_columns.iter().map(|&i| &row_values[i]).collect();
+                let parent_match = parent.rows().iter().any(|prow| {
+                    fk.parent_columns
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &pi)| prow.values.get(pi) == Some(local[i]))
+                });
+                if !parent_match {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "FOREIGN KEY violation: no parent row in {:?} matching composite key",
+                        fk.parent_table,
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn fk_action_sql_to_storage(a: spg_sql::ast::FkAction) -> spg_storage::FkAction {
