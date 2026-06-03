@@ -276,6 +276,26 @@ impl Parser {
                 self.advance();
                 self.parse_wait_after_keyword()
             }
+            // v6.2.0: ANALYZE [<table>]. ANALYZE is a bare ident.
+            // Bare ANALYZE → analyse every user table; ANALYZE
+            // <name> → re-stats one. The argument is an optional
+            // ident (or quoted ident); anything else is a parse
+            // error.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("analyze") => {
+                self.advance();
+                let target = match self.peek() {
+                    Token::Eof | Token::Semicolon => None,
+                    Token::Ident(_) | Token::QuotedIdent(_) => {
+                        Some(self.expect_ident_like()?)
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected table name or end of statement after ANALYZE, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(Statement::Analyze(target))
+            }
             other => Err(self.err(format!(
                 "expected SELECT / CREATE / DROP / INSERT / UPDATE / DELETE / ALTER / BEGIN / COMMIT / \
                  ROLLBACK / SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
@@ -3087,6 +3107,47 @@ mod tests {
         // parse error one way or another.
         let err = parse_statement("WAIT FOR WAL POSITION -1").unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parser_recognises_bare_analyze() {
+        let s = parse("ANALYZE");
+        assert!(matches!(s, Statement::Analyze(None)));
+    }
+
+    #[test]
+    fn parser_recognises_analyze_with_table() {
+        let s = parse("ANALYZE users");
+        let Statement::Analyze(Some(name)) = s else {
+            panic!("expected Analyze, got {s:?}")
+        };
+        assert_eq!(name, "users");
+    }
+
+    #[test]
+    fn parser_recognises_analyze_with_quoted_table() {
+        let s = parse("ANALYZE \"Mixed Case\"");
+        let Statement::Analyze(Some(name)) = s else {
+            panic!()
+        };
+        assert_eq!(name, "Mixed Case");
+    }
+
+    #[test]
+    fn parser_rejects_analyze_with_garbage_token() {
+        let err = parse_statement("ANALYZE 42").expect_err("must error");
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn analyze_display_roundtrips() {
+        for sql in ["ANALYZE", "ANALYZE users"] {
+            let s = parse(sql);
+            let printed = s.to_string();
+            let again = parse_statement(&printed)
+                .unwrap_or_else(|e| panic!("re-parse failed for {printed:?}: {e}"));
+            assert_eq!(s, again);
+        }
     }
 
     #[test]

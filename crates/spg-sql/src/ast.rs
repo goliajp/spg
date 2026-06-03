@@ -99,6 +99,11 @@ pub enum Statement {
         /// milliseconds even if the target isn't reached.
         timeout_ms: Option<u64>,
     },
+    /// v6.2.0 — `ANALYZE [<table>]`. Bare form walks every user
+    /// table; `ANALYZE <name>` re-stats just one. Populates
+    /// `spg_statistic` with per-column null_frac + n_distinct +
+    /// 100-bucket equi-depth histogram.
+    Analyze(Option<String>),
 }
 
 /// v6.1.4 — `CREATE SUBSCRIPTION` AST node. v6.1.4 ships a
@@ -747,6 +752,8 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::Analyze(None) => f.write_str("ANALYZE"),
+            Self::Analyze(Some(t)) => write!(f, "ANALYZE {}", quote_ident(t)),
             Self::Explain(e) => {
                 if e.analyze {
                     write!(f, "EXPLAIN ANALYZE {}", e.inner)

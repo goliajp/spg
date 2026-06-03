@@ -10,6 +10,100 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.0] — 2026-06-03 (spg_statistic + ANALYZE + envelope v5)
+
+First v6.2.x sub-version on the optimizer-foundation path. Lands
+the catalog substrate every later v6.2.x sub-version reads from:
+per-column statistics + the `ANALYZE` command that populates
+them.
+
+### Added
+
+- SQL surface
+  - `ANALYZE` — walks every user table, rebuilding per-column
+    histogram + null_frac + n_distinct.
+  - `ANALYZE <table>` — re-stats just one.
+  - `SELECT * FROM spg_statistic` — virtual table returning
+    `(table_name TEXT NOT NULL, column_name TEXT NOT NULL,
+    null_frac FLOAT NOT NULL, n_distinct BIGINT NOT NULL,
+    histogram_bounds TEXT NOT NULL)`, ordered alphabetically
+    by `(table_name, column_name)`. Read-only — INSERT /
+    UPDATE / DELETE error; the only way to populate is
+    `ANALYZE`.
+- AST: `Statement::Analyze(Option<String>)`.
+- Parser dispatch via the bare `analyze` ident (no new lexer
+  tokens).
+- Engine module `statistics` mirrors v6.1.2 / v6.1.4 shape —
+  `BTreeMap<(String, String), ColumnStats>` for alphabetical
+  byte-stable iteration; serialise / deserialise via the
+  envelope-trailer pattern.
+- `Engine::statistics()` accessor + `Engine::exec_analyze` runtime
+  (single-pass scan + type-aware sort + 100-bucket equi-depth
+  histogram + linear-counting n_distinct).
+- Snapshot envelope **v5** — adds a statistics trailer block
+  before the CRC32. v1/v2/v3/v4 envelopes still load (statistics
+  defaults to empty); v5 writers always emit.
+
+### Tests
+
+- `spg-engine::statistics` lib (9 module tests) — empty /
+  single / multi-column round-trip, deterministic-order
+  independent of insert sequence, n_distinct estimator
+  within 5 % on uniform corpus, clear_table targets exact rows,
+  corrupt-payload errors, histogram passthrough for ≤ 101
+  values.
+- `spg-engine` lib (8 new) — ANALYZE populates histogram bounds
+  with correct first/last (proving the sort is type-aware, not
+  lexicographic on string form), re-ANALYZE overwrites prior
+  stats, unknown-table errors, bare ANALYZE covers all tables,
+  SELECT FROM spg_statistic returns rows per column, ANALYZE
+  skips vector columns, envelope v5 round-trip preserves stats,
+  v4 envelope back-compat.
+- `spg-server::e2e_spg_statistic` (6) — wire-level ANALYZE +
+  SELECT round-trip, bare ANALYZE multi-table coverage, error
+  for unknown table, ANALYZE persists across process restart
+  (envelope v5 on disk), empty engine SELECT, re-ANALYZE after
+  growth updates n_distinct.
+
+### Frozen surface
+
+- `spg_statistic` column list + order (from v6.2.0; later
+  v6.2.x can append columns but not reorder or rename).
+- `ANALYZE [<table>]` grammar.
+- Snapshot envelope v5 layout (including statistics trailer
+  byte format).
+
+### Not changed
+
+- WAL on-disk format / replication protocol.
+- Existing v6.1.x SQL surface (publications, subscriptions,
+  WAIT FOR, SHOW effective_wal_level).
+- All vector / SQ8 / Half code paths.
+
+### Out of v6.2.0 (deferred to later v6.2.x — NOT v7)
+
+Per the **v6.2 → v7.0 no-defer rule** locked in V6_2_DESIGN.md L0,
+every item below points at a later sub-version *inside the v6.2
+series*:
+
+- Auto-analyze background trigger (10 % modified-fraction
+  threshold) — v6.2.1.
+- Selectivity functions reading from `Statistics` — v6.2.2.
+- JOIN reorder using selectivity — v6.2.3.
+- EXPLAIN ANALYZE with per-operator stats — v6.2.4.
+- Hot/cold tier annotation in EXPLAIN ANALYZE — v6.2.5.
+- Memoize node for correlated subqueries — v6.2.6.
+- TPC-H Q1 – Q5 integration tests — v6.2.7.
+- v6.2 ship rollup — v6.2.8.
+
+### Out of v6.2 entirely (carved out, NOT deferred)
+
+- Multi-column statistics, MCV list, bitmap scans, CBO for
+  vector kNN, parallel executor nodes. See V6_2_DESIGN.md L1
+  §"Out of v6.2" for full rationale.
+
+---
+
 ## [6.1] — 2026-06-03 (logical replication series — release roll-up)
 
 v6.1 closes the second-biggest gap from the PG-19 audit: **logical

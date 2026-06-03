@@ -795,6 +795,76 @@ WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>
   stays at 0 and `WAIT FOR WAL POSITION 0` returns immediately.
   Larger targets block until the optional timeout fires.
 
+### ANALYZE + spg_statistic (v6.2.0)
+
+v6.2.0 introduces the first DDL on the optimizer-foundation
+path. The grammar + virtual-table column shape are frozen;
+v6.2.x can append (not reorder or rename) columns to
+`spg_statistic` as later sub-versions add stats.
+
+```text
+ANALYZE                  -- analyse every user table
+ANALYZE <table>          -- analyse one table
+SELECT * FROM spg_statistic   -- read per-column stats
+```
+
+`spg_statistic` columns (frozen from v6.2.0):
+
+```text
+table_name        TEXT NOT NULL
+column_name       TEXT NOT NULL
+null_frac         FLOAT NOT NULL    -- 0.0 .. 1.0
+n_distinct        BIGINT NOT NULL   -- approximate
+histogram_bounds  TEXT NOT NULL     -- "[v0, v1, ...]"
+```
+
+Rows sorted alphabetically by `(table_name, column_name)`.
+Read-only — INSERT / UPDATE / DELETE on `spg_statistic` errors.
+The only way to populate is `ANALYZE`.
+
+Histogram is 100-bucket equi-depth → 101 sorted bounds per
+column. Values use the column's natural ordering (INT decimal,
+TEXT lexicographic, DATE/TIMESTAMP ISO, etc.); the rendered
+string form is for human consumption, not a re-parseable
+exchange format. Vector / SQ8 / HalfVector columns are skipped
+by ANALYZE (their stats live in HNSW graph state).
+
+#### Snapshot envelope v5 (v6.2.0)
+
+The snapshot envelope grows a statistics trailer. v1/v2/v3/v4
+envelopes still load with empty statistics; writers from v6.2.0
+onwards always emit v5. v6.2.0 readers parse all five versions;
+pre-v6.2.0 binaries fail loudly on a v5 envelope (same upgrade
+fence as v6.1.2 / v6.1.4).
+
+```text
+[8 bytes "SPGENV01"]
+[u8 version = 5]
+[u32 catalog_len][catalog bytes]
+[u32 users_len][users bytes]
+[u32 pubs_len][publications bytes]
+[u32 subs_len][subscriptions bytes]
+[u32 stats_len][statistics bytes]    ← new in v5
+[u32 crc32]                          ← covers everything above
+```
+
+Statistics-blob format (v6.2.0):
+```text
+[u16 num_columns]
+for each column:
+  [u16 table_len][table bytes]
+  [u16 column_len][column bytes]
+  [f32 null_frac]
+  [u64 n_distinct]
+  [u16 num_bounds]
+  for each bound: [u16 b_len][b bytes]
+[u16 num_modified_entries]
+for each: [u16 t_len][t bytes][u64 modified_count]
+```
+
+The `modified_entries` trailer feeds v6.2.1 auto-analyze's 10 %
+threshold trigger.
+
 ### Subscription DDL (v6.1.4)
 
 v6.1.4 adds the receive side of logical replication. The grammar
