@@ -273,6 +273,11 @@ pub struct CreateTableStatement {
     /// `IF NOT EXISTS` — engine returns `CommandOk` no-op when the
     /// table name already exists, instead of raising `DuplicateTable`.
     pub if_not_exists: bool,
+    /// v7.6.0 — table-level `FOREIGN KEY (...) REFERENCES ...`
+    /// constraints. Column-level `REFERENCES` (single-column inline
+    /// form) is normalised into this vec at parse time so the engine
+    /// sees one uniform list.
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +293,51 @@ pub struct ColumnDef {
     /// per such column and fills the slot when INSERT leaves it
     /// unbound (omitted from a column-list INSERT or explicitly NULL).
     pub auto_increment: bool,
+}
+
+/// v7.6.0 — A single FOREIGN KEY constraint. Both column-level
+/// `REFERENCES` and table-level `FOREIGN KEY (...) REFERENCES ...`
+/// parse into this shape — the column-level form has a single-entry
+/// `columns` / `parent_columns`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeyConstraint {
+    /// Optional `CONSTRAINT <name>` prefix. Engine ignores the name
+    /// today but parses + stores it so a future ALTER TABLE DROP
+    /// CONSTRAINT can target by name (v7.6.8).
+    pub name: Option<String>,
+    /// Local columns participating in the FK (≥ 1).
+    pub columns: Vec<String>,
+    /// Referenced parent table.
+    pub parent_table: String,
+    /// Referenced parent columns. Must have the same arity as
+    /// `columns`; engine validates parent has a PK / UNIQUE index
+    /// on exactly this column set (v7.6.1).
+    pub parent_columns: Vec<String>,
+    /// `ON DELETE` action. Defaults to `Restrict` if absent.
+    pub on_delete: FkAction,
+    /// `ON UPDATE` action. Defaults to `Restrict` if absent.
+    pub on_update: FkAction,
+}
+
+/// v7.6.0 — Referential action for `ON DELETE` / `ON UPDATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    /// Reject the parent mutation if any child row references it.
+    /// SQL spec default; SPG default when no clause is given.
+    Restrict,
+    /// Recursively propagate the parent's delete / update to the
+    /// child rows. Same TX.
+    Cascade,
+    /// Set the child FK column(s) to NULL. Requires the FK columns
+    /// to be NULL-able.
+    SetNull,
+    /// Set the child FK column(s) to their declared DEFAULT.
+    /// Requires the child column(s) to have DEFAULT.
+    SetDefault,
+    /// SQL spec `NO ACTION` (deferred check). SPG treats this as
+    /// `Restrict` because the single-writer model has no deferred
+    /// constraint window; the keyword is accepted for compatibility.
+    NoAction,
 }
 
 /// In-cell encoding for a `VECTOR(N)` column. v6.0.1 added the
@@ -975,7 +1025,63 @@ impl fmt::Display for CreateTableStatement {
             }
             write!(f, "{col}")?;
         }
+        // v7.6.0 — render FK constraints in table-level form, after
+        // the column list. WAL replay round-trips through Display, so
+        // every FK must serialise here for replay to reconstruct the
+        // schema bit-for-bit.
+        for fk in &self.foreign_keys {
+            f.write_str(", ")?;
+            write!(f, "{fk}")?;
+        }
         f.write_str(")")
+    }
+}
+
+impl fmt::Display for ForeignKeyConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(name) = &self.name {
+            write!(f, "CONSTRAINT {} ", quote_ident(name))?;
+        }
+        f.write_str("FOREIGN KEY (")?;
+        for (i, c) in self.columns.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(&quote_ident(c))?;
+        }
+        write!(f, ") REFERENCES {}", quote_ident(&self.parent_table))?;
+        if !self.parent_columns.is_empty() {
+            f.write_str(" (")?;
+            for (i, c) in self.parent_columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(&quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        // Only render non-default actions to keep Display output
+        // close to user input. SPG's default is RESTRICT (matches
+        // SQL spec).
+        if self.on_delete != FkAction::Restrict {
+            write!(f, " ON DELETE {}", self.on_delete)?;
+        }
+        if self.on_update != FkAction::Restrict {
+            write!(f, " ON UPDATE {}", self.on_update)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for FkAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Restrict => f.write_str("RESTRICT"),
+            Self::Cascade => f.write_str("CASCADE"),
+            Self::SetNull => f.write_str("SET NULL"),
+            Self::SetDefault => f.write_str("SET DEFAULT"),
+            Self::NoAction => f.write_str("NO ACTION"),
+        }
     }
 }
 

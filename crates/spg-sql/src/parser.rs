@@ -12,6 +12,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem;
@@ -19,9 +20,9 @@ use core::mem;
 use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
     CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement, Expr,
-    ExtractField, FrameBound, FrameKind, FromClause, FromJoin, IndexMethod, InsertStatement,
-    JoinKind, Literal, NullTreatment, OrderBy, PublicationScope, SelectItem, SelectStatement, Statement,
-    TableRef, UnOp, UnionKind, VecEncoding, WindowFrame,
+    ExtractField, FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin,
+    IndexMethod, InsertStatement, JoinKind, Literal, NullTreatment, OrderBy, PublicationScope,
+    SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -932,8 +933,21 @@ impl Parser {
         }
         self.advance();
         let mut columns = Vec::new();
+        let mut foreign_keys: Vec<ForeignKeyConstraint> = Vec::new();
         loop {
-            columns.push(self.parse_column_def()?);
+            // v7.6.0 — distinguish a table-level constraint clause
+            // from a column definition. Constraints start with
+            // `CONSTRAINT <name> ...` or with the bare `FOREIGN KEY (...)`
+            // shape. Anything else is a column.
+            if self.peek_constraint_or_fk_start() {
+                foreign_keys.push(self.parse_table_level_fk()?);
+            } else {
+                let (col, col_level_fk) = self.parse_column_def_with_fk()?;
+                columns.push(col);
+                if let Some(fk) = col_level_fk {
+                    foreign_keys.push(fk);
+                }
+            }
             match self.peek() {
                 Token::Comma => {
                     self.advance();
@@ -956,7 +970,181 @@ impl Parser {
             name,
             columns,
             if_not_exists,
+            foreign_keys,
         }))
+    }
+
+    /// v7.6.0 — true when the next tokens are `CONSTRAINT <name>
+    /// FOREIGN KEY` or bare `FOREIGN KEY`. Both introduce a
+    /// table-level FK; a column def never starts with either keyword
+    /// (column names are not in this reserved set).
+    fn peek_constraint_or_fk_start(&self) -> bool {
+        let is_constraint_kw = matches!(
+            self.peek(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("constraint")
+        );
+        let is_foreign_kw = matches!(
+            self.peek(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("foreign")
+        );
+        is_constraint_kw || is_foreign_kw
+    }
+
+    /// v7.6.0 — parse a table-level FK clause:
+    /// `[CONSTRAINT <name>] FOREIGN KEY (<col>[,<col>]*) REFERENCES
+    /// <tbl> [(<pcol>[,<pcol>]*)] [ON DELETE <action>] [ON UPDATE <action>]`.
+    fn parse_table_level_fk(&mut self) -> Result<ForeignKeyConstraint, ParseError> {
+        let mut name: Option<String> = None;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint")) {
+            self.advance();
+            name = Some(self.expect_ident_like()?);
+        }
+        // `FOREIGN`
+        match self.advance() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("foreign") => {}
+            other => return Err(self.err(format!("expected FOREIGN, got {other:?}"))),
+        }
+        // `KEY`
+        match self.advance() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("key") => {}
+            other => return Err(self.err(format!("expected KEY after FOREIGN, got {other:?}"))),
+        }
+        // `(col, col, ...)`
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("expected '(' after FOREIGN KEY, got {:?}", self.peek())));
+        }
+        self.advance();
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident_like()?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                other => return Err(self.err(format!("expected ',' or ')' in FK column list, got {other:?}"))),
+            }
+        }
+        if columns.is_empty() {
+            return Err(self.err("FOREIGN KEY requires at least one column".into()));
+        }
+        let (parent_table, parent_columns, on_delete, on_update) =
+            self.parse_references_tail(columns.len())?;
+        Ok(ForeignKeyConstraint {
+            name,
+            columns,
+            parent_table,
+            parent_columns,
+            on_delete,
+            on_update,
+        })
+    }
+
+    /// v7.6.0 — parse the tail `REFERENCES <tbl> [(<pcol>...)] [ON
+    /// DELETE <action>] [ON UPDATE <action>]`. `expected_arity` is
+    /// the local column count, used to default the parent column
+    /// list when omitted (SQL spec: parent's PK is implied).
+    fn parse_references_tail(
+        &mut self,
+        expected_arity: usize,
+    ) -> Result<(String, Vec<String>, FkAction, FkAction), ParseError> {
+        match self.advance() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("references") => {}
+            other => return Err(self.err(format!("expected REFERENCES, got {other:?}"))),
+        }
+        let parent_table = self.expect_ident_like()?;
+        let mut parent_columns: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                parent_columns.push(self.expect_ident_like()?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => return Err(self.err(format!("expected ',' or ')' in REFERENCES column list, got {other:?}"))),
+                }
+            }
+        }
+        if !parent_columns.is_empty() && parent_columns.len() != expected_arity {
+            return Err(self.err(format!(
+                "FK arity mismatch: {} local column(s) vs {} parent column(s)",
+                expected_arity,
+                parent_columns.len()
+            )));
+        }
+        // Optional `ON DELETE <action>` and `ON UPDATE <action>` in
+        // either order, each at most once.
+        let mut on_delete = FkAction::Restrict;
+        let mut on_update = FkAction::Restrict;
+        let mut seen_on_delete = false;
+        let mut seen_on_update = false;
+        loop {
+            if !matches!(self.peek(), Token::On) {
+                break;
+            }
+            self.advance();
+            let which = self.advance();
+            let action = self.parse_fk_action()?;
+            match which {
+                Token::Ident(ref s) if s.eq_ignore_ascii_case("delete") => {
+                    if seen_on_delete {
+                        return Err(self.err("ON DELETE specified twice".into()));
+                    }
+                    seen_on_delete = true;
+                    on_delete = action;
+                }
+                Token::Ident(ref s) if s.eq_ignore_ascii_case("update") => {
+                    if seen_on_update {
+                        return Err(self.err("ON UPDATE specified twice".into()));
+                    }
+                    seen_on_update = true;
+                    on_update = action;
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "expected DELETE or UPDATE after ON, got {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok((parent_table, parent_columns, on_delete, on_update))
+    }
+
+    /// v7.6.0 — parse `CASCADE | RESTRICT | SET NULL | SET DEFAULT |
+    /// NO ACTION`.
+    fn parse_fk_action(&mut self) -> Result<FkAction, ParseError> {
+        match self.advance() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("cascade") => Ok(FkAction::Cascade),
+            Token::Ident(s) if s.eq_ignore_ascii_case("restrict") => Ok(FkAction::Restrict),
+            Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
+                match self.advance() {
+                    Token::Null => Ok(FkAction::SetNull),
+                    Token::Default => Ok(FkAction::SetDefault),
+                    other => Err(self.err(format!(
+                        "expected NULL or DEFAULT after SET in FK action, got {other:?}"
+                    ))),
+                }
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("no") => {
+                match self.advance() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("action") => Ok(FkAction::NoAction),
+                    other => Err(self.err(format!(
+                        "expected ACTION after NO in FK action, got {other:?}"
+                    ))),
+                }
+            }
+            other => Err(self.err(format!(
+                "expected CASCADE | RESTRICT | SET NULL | SET DEFAULT | NO ACTION, got {other:?}"
+            ))),
+        }
     }
 
     /// Recognise the optional `IF NOT EXISTS` prefix shared by `CREATE
@@ -1116,6 +1304,35 @@ impl Parser {
             partial_predicate,
             expression,
         }))
+    }
+
+    /// v7.6.0 — wraps `parse_column_def` and consumes an optional
+    /// column-level `REFERENCES ...` clause. The trailing FK is
+    /// normalised into table-level shape (single-element columns +
+    /// parent_columns) so the engine sees one uniform constraint list.
+    fn parse_column_def_with_fk(
+        &mut self,
+    ) -> Result<(ColumnDef, Option<ForeignKeyConstraint>), ParseError> {
+        let col = self.parse_column_def()?;
+        // Inline form: `col INT REFERENCES tbl(pcol) [ON DELETE ...] [ON UPDATE ...]`.
+        let inline_references = matches!(
+            self.peek(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("references")
+        );
+        if !inline_references {
+            return Ok((col, None));
+        }
+        let (parent_table, parent_columns, on_delete, on_update) =
+            self.parse_references_tail(1)?;
+        let fk = ForeignKeyConstraint {
+            name: None,
+            columns: vec![col.name.clone()],
+            parent_table,
+            parent_columns,
+            on_delete,
+            on_update,
+        };
+        Ok((col, Some(fk)))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
