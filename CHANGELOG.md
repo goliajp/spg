@@ -8,6 +8,67 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.8] — 2026-06-03 (crates.io publish + spg-server docs)
+
+First public crates.io release. All ten crates now resolve
+via `cargo add` against the official registry.
+
+Published (all v7.8.0):
+
+  - [`spg-wire`](https://crates.io/crates/spg-wire) — wire-frame protocol
+  - [`spg-crypto`](https://crates.io/crates/spg-crypto) — BLAKE3 + CRC32, no_std
+  - [`spg-sql`](https://crates.io/crates/spg-sql) — PG-dialect SQL parser
+  - [`spg-storage`](https://crates.io/crates/spg-storage) — catalog + rows + FKs
+  - [`spg-audit`](https://crates.io/crates/spg-audit) — hash-chain audit log
+  - [`spg-manifest`](https://crates.io/crates/spg-manifest) — SPGMAN01 v10
+  - [`spg-engine`](https://crates.io/crates/spg-engine) — execution engine
+  - [`spg-embedded`](https://crates.io/crates/spg-embedded) — embedded Rust API
+  - [`spgctl`](https://crates.io/crates/spgctl) — command-line client
+  - [`spg-server`](https://crates.io/crates/spg-server) — daemon binary
+
+`spg-cli` was already taken on crates.io (unrelated Spring CLI
+scaffolding); the SPG command-line crate ships as `spgctl`
+(same `ctl`-suffix convention as kubectl / etcdctl /
+systemctl). The binary name stays `spg`, so end users still
+run `spg query …` after `cargo install spgctl`.
+
+Workspace shipped:
+
+  - **spg-server README.md** — PG-wire client compatibility
+    matrix (psql / libpq / pgx / JDBC / psycopg2 /
+    tokio-postgres / Rails / ODBC), Docker quick-start,
+    config table, operations (backup / replication / audit /
+    metrics), SQL surface summary, migration recipe link.
+  - **`[workspace.dependencies]` refactor** — all 10 internal
+    dep entries declared once at the workspace level with
+    both `path = …` and `version = "7.8"`. crates.io publish
+    uses the `version`; local development uses the `path`.
+
+Sub-versions:
+
+  v7.8.0  spg-server README.md
+  v7.8.1  internal deps centralised in [workspace.dependencies]
+  v7.8.2  cargo publish dry-run (3 leaf crates pass; downstream
+          fail until leaves land — expected, documented)
+  v7.8.3  cargo publish real run, all 10 crates live on crates.io
+  v7.8.4  series rollup + tag + docker push
+
+Operator command:
+
+```bash
+# Server (PG-wire compatible)
+docker run -p 5432:5432 -v spg-data:/data goliakk/spg:7.8.0
+
+# Embedded library
+[dependencies]
+spg-embedded = "7.8"
+
+# CLI client
+cargo install spgctl
+```
+
+---
+
 ## [7.7] — 2026-06-03 (Embedded production-ready)
 
 Brings `spg-embedded` from "works" to "publishable". Eight
