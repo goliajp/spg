@@ -147,10 +147,13 @@ fn explain_analyze_attaches_actual_rows() {
 
     let lines = explain_lines(&mut s, "EXPLAIN ANALYZE SELECT * FROM t WHERE id > 4");
     let blob = lines.join("\n");
-    assert!(blob.contains("Actual:"), "missing Actual: {blob}");
+    // v6.2.4 changed the EXPLAIN ANALYZE annotation shape: per-op
+    // `(rows=N)` inline on each operator line plus a `Total:` line
+    // at the bottom carrying total rows + elapsed micros. Drop the
+    // legacy "Actual:" probe; assert on the new shape instead.
     assert!(
-        blob.contains("rows=3"),
-        "expected rows=3 (id > 4 ⇒ 5/6/7), got: {blob}"
+        blob.contains("Total:") && blob.contains("rows=3"),
+        "expected Total: + rows=3 on a `id > 4` filter over 7 rows; got: {blob}"
     );
 }
 
