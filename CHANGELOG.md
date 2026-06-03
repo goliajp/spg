@@ -10,6 +10,72 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.6] — 2026-06-03 (Memoize node for correlated subqueries)
+
+Seventh v6.2.x sub-version. Wraps the correlated-subquery
+evaluation path with a per-query LRU cache so workloads where
+many outer rows share the same correlated key avoid re-running
+the inner SELECT on every iteration.
+
+### Added
+
+- New module `spg_engine::memoize` with:
+    - `MemoizeCache` — `VecDeque` of `((subquery_repr,
+      outer_values), Value)` entries, LRU-ordered (front = most-
+      recently-used).
+    - Caps: `DEFAULT_MAX_ENTRIES = 1024`,
+      `DEFAULT_MAX_BYTES = 16 MiB` (1/16 of v5.5's per-query
+      budget). Either cap triggers LRU eviction.
+    - Builders: `with_max_entries(n)`, `with_max_bytes(b)`.
+    - Hit / miss counters (`hit_count`, `miss_count`) for
+      observability.
+- `Engine::eval_expr_with_correlated` +
+  `Engine::resolve_correlated_in_expr` grow an
+  `Option<&mut MemoizeCache>` parameter. The three call sites
+  (aggregate fast path × 2 + bare-SELECT closure) each
+  construct a fresh cache per row-loop entry.
+- Cache key = (subquery's Display repr, outer row's values).
+  Two outer rows with the same correlated key hit the same
+  cache entry; distinct subqueries with the same outer key
+  don't collide.
+
+### Tests
+
+- `spg-engine::memoize` lib (7 module tests) — empty-miss /
+  insert-then-hit / repeated-key hit ratio / max-entries
+  eviction / max-bytes eviction / distinct-repr non-collision /
+  LRU promotion.
+- `spg-engine::e2e_memoize` (3) — wire-level integration:
+    - `correlated_subquery_completes_in_reasonable_time` —
+      500 outer rows × 10-key domain × 200 inner rows; whole
+      SELECT completes inside 2 s (gate; observed ~10 ms).
+    - `cache_hits_dominate_repeated_key_workload` — direct
+      cache exercise: 5 distinct keys × 100 evaluations =
+      5 miss + 95 hit (95 % hit ratio).
+    - `distinct_outer_keys_miss_distinctly` — disjoint keys
+      → 50 miss / 0 hit.
+- `spg-engine` lib total                    157 → 164 passing.
+
+### Not changed
+
+- SQL surface — no new syntax.
+- Plan tree shape / EXPLAIN ANALYZE format.
+- Existing uncorrelated-subquery fast path
+  (`resolve_select_subqueries`) — untouched.
+- WAL / replication / snapshot envelope.
+
+### Out of v6.2.6 (deferred to later v6.2.x — NOT v7)
+
+- v6.2.5's deferred per-table cold_rows count + per-operator
+  inner-node elapsed metrics — both depend on the same inline
+  executor-instrumentation refactor; v6.2.6 ships the per-query
+  caching primitive (`MemoizeCache`) that v6.2.x can reuse for
+  the wider tracing structure. Final wiring lands in v6.2.7
+  alongside the TPC-H Q1-Q5 integration tests.
+- `cold_segment_ids=[…]` list per scan — v6.2.7.
+
+---
+
 ## [6.2.5] — 2026-06-03 (EXPLAIN ANALYZE hot/cold tier annotation)
 
 Sixth v6.2.x sub-version. Scan operators in EXPLAIN ANALYZE now
