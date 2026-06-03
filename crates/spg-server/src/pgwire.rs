@@ -312,9 +312,18 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         }
                         send_command_complete(&mut wbuf, &format!("SELECT {n}"))?;
                     }
-                    Ok(QueryResult::CommandOk { affected, .. }) => {
+                    Ok(QueryResult::CommandOk { affected, modified_catalog }) => {
                         let tag = command_tag(&sql, affected);
                         send_command_complete(&mut wbuf, &tag)?;
+                        // v6.5.3 — audit-log every catalog-mutating
+                        // statement from the pgwire path (matches the
+                        // native-wire path's audit hook). Silent on
+                        // mutex poisoning / write error to keep the
+                        // hot path simple; broken audit chains surface
+                        // via spg_audit_verify.
+                        if modified_catalog && state.audit_path.is_some() {
+                            let _ = crate::append_audit_pub(state, &sql);
+                        }
                         // Sync tx state from engine after writes.
                         tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
                             b'T'

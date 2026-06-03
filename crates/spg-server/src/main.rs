@@ -366,6 +366,59 @@ impl ConnState {
 pub(crate) static ACTIVITY_STATE: std::sync::OnceLock<Arc<ServerState>> =
     std::sync::OnceLock::new();
 
+/// v6.5.3 — Engine-registered audit-chain provider. Snapshots
+/// every entry in the live AuditLog as an `AuditRow`.
+pub(crate) fn audit_chain_snapshot() -> Vec<spg_engine::AuditRow> {
+    let Some(state) = ACTIVITY_STATE.get() else {
+        return Vec::new();
+    };
+    let Ok(log) = state.audit_log.lock() else {
+        return Vec::new();
+    };
+    log.entries()
+        .iter()
+        .map(|e| spg_engine::AuditRow {
+            seq: i64::try_from(e.seq).unwrap_or(i64::MAX),
+            ts_ms: i64::try_from(e.ts_ms).unwrap_or(i64::MAX),
+            prev_hash_hex: hex_encode(&e.prev_hash),
+            entry_hash_hex: hex_encode(&e.hash),
+            sql: e.sql.clone(),
+        })
+        .collect()
+}
+
+/// v6.5.3 — Engine-registered chain verifier. Returns
+/// `(verified_count, broken_at_seq)` — broken_at_seq is `-1` on
+/// a clean chain (or empty log).
+pub(crate) fn audit_verify_snapshot() -> (i64, i64) {
+    let Some(state) = ACTIVITY_STATE.get() else {
+        return (0, -1);
+    };
+    let Ok(log) = state.audit_log.lock() else {
+        return (0, -1);
+    };
+    let n = log.entries().len() as i64;
+    match log.verify() {
+        Ok(()) => (n, -1),
+        Err(spg_audit::AuditError::BrokenChain { seq })
+        | Err(spg_audit::AuditError::HashMismatch { seq })
+        | Err(spg_audit::AuditError::InvalidUtf8 { seq }) => {
+            (i64::try_from(seq).unwrap_or(i64::MAX), i64::try_from(seq).unwrap_or(i64::MAX))
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
 /// v6.5.2 — Engine-registered activity provider. Snapshots the
 /// live `connections` registry into the `ActivityRow` shape the
 /// engine renders.
@@ -1077,11 +1130,13 @@ fn run(
     // state — engine refs through the static are always live.
     let _ = ACTIVITY_STATE.set(Arc::clone(&state));
     if let Ok(mut e) = state.engine.write() {
-        // Replace the engine with one carrying the provider. The
-        // builder consumes by value, but we can swap in place by
+        // Replace the engine with one carrying the providers. The
+        // builders consume by value, but we can swap in place by
         // taking ownership through std::mem::replace.
         let prev = std::mem::replace(&mut *e, Engine::new());
-        *e = prev.with_activity_provider(activity_snapshot);
+        *e = prev
+            .with_activity_provider(activity_snapshot)
+            .with_audit_providers(audit_chain_snapshot, audit_verify_snapshot);
     }
 
     // v6.1.4: spawn subscriber threads for any subscriptions
@@ -3141,6 +3196,12 @@ fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize>
         }
     }
     Ok(applied)
+}
+
+/// v6.5.3 — public alias so the pgwire crate can append audit
+/// entries on catalog-mutating statements.
+pub(crate) fn append_audit_pub(state: &ServerState, sql: &str) -> std::io::Result<()> {
+    append_audit(state, sql)
 }
 
 fn append_audit(state: &ServerState, sql: &str) -> std::io::Result<()> {
