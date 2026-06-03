@@ -2390,20 +2390,38 @@ impl Engine {
                 to_delete_rows.push(row.values.clone());
             }
         }
-        // v7.6.3 — Stage 2: FK enforcement on the immutable catalog.
-        // Release the mut borrow and run reverse-scan against every
-        // child table whose FK targets this table. RESTRICT / NoAction
-        // raises an error; CASCADE / SET NULL / SET DEFAULT are
-        // currently reported as not-yet-implemented until v7.6.4 /
-        // v7.6.5 land.
+        // v7.6.3 / v7.6.4 — Stage 2: FK enforcement on the immutable
+        // catalog. Release the mut borrow and run reverse-scan
+        // against every child table whose FK targets this table.
+        // RESTRICT / NoAction raise an error; CASCADE returns a
+        // cascade plan that stage 3 applies after the primary delete.
+        // SET NULL / SET DEFAULT remain Unsupported until v7.6.5.
         let _ = table;
-        enforce_fk_parent_deletions(
+        let cascade_plan = plan_fk_parent_deletions(
             self.active_catalog(),
             &stmt.table,
             &positions,
             &to_delete_rows,
         )?;
-        // Stage 3 — actually delete.
+        // Stage 3a — apply cascade-driven child deletions FIRST (so
+        // that the same single-writer commit observes the children
+        // gone before the parent). Recursion is bounded by the FK
+        // graph: each cascade level reduces row count, and SPG
+        // refuses FK cycles with CASCADE (the catalog accepts the
+        // declaration, but a cycle hitting the same row twice
+        // surfaces as a duplicate-position-no-op in `delete_rows`).
+        for step in &cascade_plan {
+            let child = self
+                .active_catalog_mut()
+                .get_mut(&step.child_table)
+                .ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: step.child_table.clone(),
+                    })
+                })?;
+            let _ = child.delete_rows(&step.child_positions);
+        }
+        // Stage 3b — actually delete the original target rows.
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -7271,60 +7289,81 @@ fn enforce_fk_inserts(
     Ok(())
 }
 
-/// v7.6.3 — DELETE-side FK enforcement (RESTRICT / NoAction).
-/// CASCADE / SetNull / SetDefault report `Unsupported` for now
-/// (v7.6.4 / v7.6.5).
+/// v7.6.4 — one step of a CASCADE plan: which rows in which child
+/// table need to be deleted because their FK parent is going away.
+/// Stacked across the FK graph by `plan_fk_parent_deletions`.
+#[derive(Debug, Clone)]
+struct FkCascadeStep {
+    child_table: String,
+    /// Sorted, deduplicated positions to delete in `child_table`.
+    child_positions: Vec<usize>,
+}
+
+/// v7.6.3 / v7.6.4 — plan FK fallout for a DELETE on a parent table.
 ///
 /// Walks every table in the catalog looking for FKs whose
-/// `parent_table` is `parent_table_name`. For each such FK, scans
-/// the child table's rows; any child row whose FK columns match a
-/// to-be-deleted parent row triggers an action. Self-referencing
-/// FKs (child == parent) treat the to-be-deleted positions as
-/// vanishing — a child row already in `to_delete_positions` does
-/// not block its own parent's delete.
-fn enforce_fk_parent_deletions(
+/// `parent_table` is `parent_table_name`. For each such FK + each
+/// to-be-deleted parent row:
+///
+///   - RESTRICT / NoAction → error, no plan returned
+///   - CASCADE → child rows get added to the cascade plan;
+///     recursive: if those child rows are themselves parents in
+///     some other FK chain, the cascade follows
+///   - SetNull / SetDefault → still `Unsupported` until v7.6.5
+///
+/// Self-referencing FKs (child == parent) treat positions already
+/// in `to_delete_positions` as vanishing — a row already doomed
+/// doesn't block its own parent's delete.
+fn plan_fk_parent_deletions(
     catalog: &Catalog,
     parent_table_name: &str,
     to_delete_positions: &[usize],
     to_delete_rows: &[Vec<Value>],
-) -> Result<(), EngineError> {
+) -> Result<Vec<FkCascadeStep>, EngineError> {
+    use alloc::collections::{BTreeMap, BTreeSet};
     if to_delete_rows.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    // Build a set of doomed-position lookups for the self-ref case.
-    let doomed: alloc::collections::BTreeSet<usize> =
-        to_delete_positions.iter().copied().collect();
-    for child_name in catalog.table_names() {
-        let child = catalog
-            .get(&child_name)
-            .expect("table_names → catalog.get round-trip is total");
-        for fk in &child.schema().foreign_keys {
-            if fk.parent_table != parent_table_name {
-                continue;
-            }
-            // For every to-delete parent row, derive the FK key
-            // (the parent FK columns' values). Then look for any
-            // child row that matches that key.
-            for (parent_row_idx, parent_row) in to_delete_rows.iter().enumerate() {
-                // Build the key tuple from the parent row.
+    // Cascade plan, keyed by child table → set of positions to
+    // delete. Sorted set ensures `child.delete_rows` sees positions
+    // in ascending order (which `delete_rows` requires).
+    let mut plan: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    // Track which (table, row) tuples we've already enqueued, so a
+    // diamond-shaped FK graph (X references Y AND Z; both Y and Z
+    // reference W; deleting W) doesn't double-enqueue X.
+    let mut visited: BTreeSet<(String, usize)> = BTreeSet::new();
+    // Doomed positions for the *original* DELETE target (used for
+    // self-ref skip in the first level).
+    for &p in to_delete_positions {
+        visited.insert((parent_table_name.to_string(), p));
+    }
+    // Work queue: each entry is a (parent_table, row_value_tuple)
+    // — the rows being removed, contributed in waves.
+    let mut work: Vec<(String, Vec<Value>)> = to_delete_rows
+        .iter()
+        .map(|r| (parent_table_name.to_string(), r.clone()))
+        .collect();
+    while let Some((cur_parent, parent_row)) = work.pop() {
+        for child_name in catalog.table_names() {
+            let child = catalog
+                .get(&child_name)
+                .expect("table_names → catalog.get round-trip is total");
+            for fk in &child.schema().foreign_keys {
+                if fk.parent_table != cur_parent {
+                    continue;
+                }
                 let parent_key: Vec<&Value> = fk
                     .parent_columns
                     .iter()
                     .map(|&pi| &parent_row[pi])
                     .collect();
-                // Skip if any parent FK column is NULL — by SQL spec
-                // a NULL parent cannot have child references.
                 if parent_key.iter().any(|v| matches!(v, Value::Null)) {
                     continue;
                 }
-                // Scan child rows looking for one that matches.
                 for (child_row_idx, child_row) in child.rows().iter().enumerate() {
-                    // Self-ref: skip the rows that are themselves
-                    // being deleted by this same DELETE — they
-                    // vanish with their parent so the reference is
-                    // not orphaned.
-                    if child_name == parent_table_name
-                        && doomed.contains(&child_row_idx)
+                    // Self-ref doomed-row skip.
+                    if child_name == cur_parent
+                        && visited.contains(&(child_name.clone(), child_row_idx))
                     {
                         continue;
                     }
@@ -7336,39 +7375,51 @@ fn enforce_fk_parent_deletions(
                     if !matches_key {
                         continue;
                     }
-                    // Found a referring child — apply the action.
-                    return match fk.on_delete {
+                    match fk.on_delete {
                         spg_storage::FkAction::Restrict
                         | spg_storage::FkAction::NoAction => {
-                            Err(EngineError::Unsupported(alloc::format!(
-                                "FOREIGN KEY violation: DELETE on {parent_table_name:?} is \
-                                 restricted by FK from {child_name:?}.{:?} \
-                                 (row #{parent_row_idx} of the deletion set still has \
-                                 a child referent at row #{child_row_idx})",
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "FOREIGN KEY violation: DELETE on {cur_parent:?} is \
+                                 restricted by FK from {child_name:?}.{:?}",
                                 fk.local_columns,
-                            )))
+                            )));
                         }
-                        spg_storage::FkAction::Cascade => Err(EngineError::Unsupported(
-                            "FOREIGN KEY ON DELETE CASCADE: not yet implemented \
-                             (lands in v7.6.4)"
-                                .into(),
-                        )),
-                        spg_storage::FkAction::SetNull => Err(EngineError::Unsupported(
-                            "FOREIGN KEY ON DELETE SET NULL: not yet implemented \
-                             (lands in v7.6.5)"
-                                .into(),
-                        )),
-                        spg_storage::FkAction::SetDefault => Err(EngineError::Unsupported(
-                            "FOREIGN KEY ON DELETE SET DEFAULT: not yet implemented \
-                             (lands in v7.6.5)"
-                                .into(),
-                        )),
-                    };
+                        spg_storage::FkAction::Cascade => {
+                            // Add to plan and enqueue for further
+                            // cascade. Dedup via `visited`.
+                            if visited.insert((child_name.clone(), child_row_idx)) {
+                                plan.entry(child_name.clone())
+                                    .or_default()
+                                    .insert(child_row_idx);
+                                work.push((child_name.clone(), child_row.values.clone()));
+                            }
+                        }
+                        spg_storage::FkAction::SetNull => {
+                            return Err(EngineError::Unsupported(
+                                "FOREIGN KEY ON DELETE SET NULL: not yet implemented \
+                                 (lands in v7.6.5)"
+                                    .into(),
+                            ));
+                        }
+                        spg_storage::FkAction::SetDefault => {
+                            return Err(EngineError::Unsupported(
+                                "FOREIGN KEY ON DELETE SET DEFAULT: not yet implemented \
+                                 (lands in v7.6.5)"
+                                    .into(),
+                            ));
+                        }
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(plan
+        .into_iter()
+        .map(|(child_table, positions)| FkCascadeStep {
+            child_table,
+            child_positions: positions.into_iter().collect(),
+        })
+        .collect())
 }
 
 fn fk_action_sql_to_storage(a: spg_sql::ast::FkAction) -> spg_storage::FkAction {

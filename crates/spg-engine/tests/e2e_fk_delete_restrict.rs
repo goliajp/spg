@@ -82,21 +82,6 @@ fn delete_with_explicit_no_action_is_also_restricted() {
 }
 
 #[test]
-fn delete_with_cascade_currently_reports_not_implemented() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE u (id INT NOT NULL)",
-        "CREATE INDEX u_pk ON u (id)",
-        "CREATE TABLE o (id INT NOT NULL, uid INT NOT NULL, \
-         FOREIGN KEY (uid) REFERENCES u(id) ON DELETE CASCADE)",
-        "INSERT INTO u VALUES (1)",
-        "INSERT INTO o VALUES (10, 1)",
-    ]);
-    let r = eng.execute("DELETE FROM u WHERE id = 1");
-    // v7.6.3 placeholder — v7.6.4 will accept this and cascade.
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("CASCADE")));
-}
-
-#[test]
 fn delete_with_set_null_currently_reports_not_implemented() {
     let mut eng = engine_with(&[
         "CREATE TABLE u (id INT NOT NULL)",
