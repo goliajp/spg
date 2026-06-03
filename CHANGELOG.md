@@ -109,7 +109,7 @@ Quality:
   one-fsync ~4 ms, SELECT PK seek ~1.7 µs, vector kNN
   k=10 dim=8 ~1.9 µs.
 - **`crates.io` metadata** on every crate (description,
-  repository, categories, keywords). `PUBLISH_ORDER.md` at
+  repository, categories, keywords). publish playbook at
   repo root documents the full publish flow including the
   dependency-ordered crate list.
 
@@ -122,7 +122,7 @@ Sub-versions:
   v7.7.4  background freezer auto-compact
   v7.7.5  Database::metrics() observability hook
   v7.7.6  revert_wal_to_seq rewind API
-  v7.7.7  crates.io publish metadata + PUBLISH_ORDER.md
+  v7.7.7  crates.io publish metadata + publish playbook
   v7.7.8  series ship rollup + tag + docker push
 
 Image `goliakk/spg:7.7.0` is byte-identical to `7.6.0` —
@@ -653,7 +653,7 @@ The series sets up the v7.0 release with every
 ## [6.9] — 2026-06-03 (Concurrency expansion — release roll-up)
 
 v6.9 is the **conditional sub-version** from the v6.x roadmap
-(see `.claude/researches/spg-v6-roadmap-from-pg19.md` §v6.9 +
+(see internal research note §v6.9 +
 `feedback_v7_path_c`): a 2 d evaluation of whether SPG's
 single-writer / RwLock-reader concurrency model needs Choice A
 (parallel prepare under `engine.read()` + install-phase OCC
@@ -1412,7 +1412,7 @@ CHANGELOG.md  Adds the high-level v6.2 entry above the individual
               (6.2.0 → 6.2.7), goal-vs-measured numbers, frozen-
               surface inventory, and known limitations.
 
-PROD_READY.md Adds rows 7.16 – 7.20 to §7 Operational tooling:
+internal readiness matrix Adds rows 7.16 – 7.20 to §7 Operational tooling:
               statistics catalog + ANALYZE, JOIN reorder, EXPLAIN
               ANALYZE, Memoize correlated-subquery cache, TPC-H
               integration coverage.
@@ -1456,7 +1456,7 @@ v6.2 series test footprint (new in series):
   spg-engine::e2e_tpch                          6 tests
 
 Next sub-version: v6.3 — PG-wire extended query finish (real
-prepared statement + pipelined query + plan cache). V6_3_DESIGN.md
+prepared statement + pipelined query + plan cache). the internal design notes
 still to be written.
 
 ---
@@ -1900,7 +1900,7 @@ fraction crosses 10 %.
   `record_modifications` hook only fires on auto-commit paths
   today. v6.2.x cleanup will move it into the commit path so
   explicit transactions feed the counter too. Same-minor
-  follow-up per V6_2_DESIGN.md L0 no-defer rule.
+  follow-up per the internal design notes L0 no-defer rule.
 - Reservoir sampling for very large tables — v6.2.x can swap
   the full-table scan for a 100K-row reservoir without changing
   the histogram's wire surface.
@@ -1979,7 +1979,7 @@ them.
 
 ### Out of v6.2.0 (deferred to later v6.2.x — NOT v7)
 
-Per the **v6.2 → v7.0 no-defer rule** locked in V6_2_DESIGN.md L0,
+Per the **v6.2 → v7.0 no-defer rule** locked in the internal design notes L0,
 every item below points at a later sub-version *inside the v6.2
 series*:
 
@@ -1996,7 +1996,7 @@ series*:
 ### Out of v6.2 entirely (carved out, NOT deferred)
 
 - Multi-column statistics, MCV list, bitmap scans, CBO for
-  vector kNN, parallel executor nodes. See V6_2_DESIGN.md L1
+  vector kNN, parallel executor nodes. See the internal design notes L1
   §"Out of v6.2" for full rationale.
 
 ---
@@ -2383,7 +2383,7 @@ they hit the wire.
   `DELETE FROM <t>`; everything else (DDL, session-control,
   catalog mutation) maps to `OwnerKind::Skip`. Measured
   **41 ns/call** on Apple-M (release), well inside the 200 ns
-  budget from V6_1_DESIGN.md L2 row 5.
+  budget from the internal design notes L2 row 5.
 - `replication::PublicationFilter` — OR-combines requested
   publications' scopes. `AllTables` short-circuits. `ForTables`
   goes through a deduped `HashSet`; `AllTablesExcept` is checked
@@ -2425,7 +2425,7 @@ they hit the wire.
   publications) — v6.x discussion topic; out of v6.1.
 - DDL propagation under logical replication — v6.1 explicitly
   doesn't propagate DDL; subscriber-side schema drift remains
-  the operator's problem (V6_1_DESIGN.md design point 3).
+  the operator's problem (the internal design notes design point 3).
 - Cascading (follower exposing its own replication endpoint) —
   v6.1.6.
 - WAIT FOR WAL POSITION — v6.1.7.
@@ -2608,14 +2608,14 @@ parser-and-row-materialisation only.
   v6.1.5.
 - Subscriber-side worker — v6.1.4.
 - Per-row filter predicates on publications — out of v6.1
-  entirely (v7 territory; see V6_1_DESIGN.md "Out of v6.1").
+  entirely (v7 territory; see the internal design notes "Out of v6.1").
 
 ---
 
 ## [6.1.2] — 2026-06-03 (CREATE PUBLICATION / DROP PUBLICATION DDL + catalog)
 
 First v6.1.x sub-version on the logical-replication path (see
-`V6_1_DESIGN.md` L3a). Lands the publication catalog without the
+the internal design notes L3a). Lands the publication catalog without the
 publisher-side WAL filtering (that arrives in v6.1.5): operators
 can declare publications now; followers and subscribers will see
 them once the filtering + worker land.
@@ -2715,7 +2715,7 @@ lexer couldn't round-trip.
 ## [6.1.0] — 2026-06-03 (HNSW graph storage compaction — 12% RSS off the v6.0.5 floor)
 
 First v6.1.x sub-version (perf prelude — the logical-replication
-body lands at v6.1.2; see `V6_1_DESIGN.md`). Attacks the
+body lands at v6.1.2; see the internal design notes). Attacks the
 v6.0.5-measured `1M dim-128
 SQ8 RSS = 624 MiB` gap vs the design's 200 MiB ambition. The
 single largest contributor was the HNSW adjacency Vec<Vec<usize>>
@@ -2936,7 +2936,7 @@ Findings:
   buffer" if NEON f16 stays gated on stable Rust.
 - Even slow HALF beats pgvector by ~6× p50.
 
-The 1M-scale + 10M-scale extensions promised in `V6_DESIGN.md
+The 1M-scale + 10M-scale extensions promised in `the internal design notes
 ::L2::v6.0.5` are deferred — the 10K bench already exposes the
 HALF regression cleanly, and per-backend 1M ingest takes 7+
 minutes per row (the slow loop is single-INSERT pgwire round-
@@ -2983,7 +2983,7 @@ The shortfalls are honest and tracked:
   raw f32), but the HNSW adjacency graph (`Vec<Vec<usize>>` per
   layer, M=16 default) dominates at ~150 MiB and `Row::values`
   Vec headers add another ~80 MiB. The 200 MiB target stays in
-  `V6_DESIGN.md` as the v6.1.x ambition; v6.0.5 records the
+  the internal design notes as the v6.1.x ambition; v6.0.5 records the
   measured floor and updates the regression-catch budget to
   800 MiB / 5 ms.
 
@@ -3003,7 +3003,7 @@ pgvector's published ~1500 µs at the same shape.
   `sq8_rss_1m_dim128_under_800mib`. READ_TIMEOUT bumped from
   120 s to 1800 s so `CREATE INDEX … USING hnsw` on 1M rows
   completes before the wire-read deadline.
-- `PROD_READY.md` rows 6.11 (vector encoding alternatives), 6.12
+- internal readiness matrix rows 6.11 (vector encoding alternatives), 6.12
   (vector kNN at 1M scale), 6.13 (vector encoding migration via
   ALTER INDEX REBUILD).
 - `STABILITY.md` v6.0 series roll-up: every frozen surface
@@ -3318,7 +3318,7 @@ candidates recovers recall the raw ADC sacrifices for 4×
 compression. Per-cell on-disk shape is `[u32 dim][f32 min][f32 max]
 [u8 × dim]` (row body + tag-11 catalog tag); pre-v6 binaries hit
 the unknown tags and fail loudly with `Corrupt("unknown … tag")`
-(forward-compat fence, see `V6_DESIGN.md` deliberation #5).
+(forward-compat fence, see the internal design notes deliberation #5).
 
 ### Added
 
@@ -3382,7 +3382,7 @@ the unknown tags and fail loudly with `Corrupt("unknown … tag")`
 
 ### Why this matters
 
-PG 19 audit (`.claude/researches/spg-vs-pg19-comparison.md`)
+PG 19 audit (internal research note)
 called out vector storage size as SPG's biggest competitive gap.
 v6.0 closes it: 1M dim-128 SQ8 RSS target is ≤ 200 MiB
 (pgvector halfvec ~300 MiB; raw f32 ~488 MiB just for the row
@@ -3552,7 +3552,7 @@ batch. v4.40 made Catalog::clone O(1) at any scale, removing the
 cost half of v4.34's reasoning. v4.42 will remove the structural
 half: engine MVCC (`tx_catalog: BTreeMap<TxId, Catalog>`) + dispatch
 splits the engine.write() critical section + group commit at install
-phase. See NEXT.md "v4.42" section.
+phase. See next steps "v4.42" section.
 
 ### Replay three-way dispatch
 
@@ -3585,9 +3585,9 @@ is enforced by `e2e_wal_binary.rs::unknown_v3_type_byte_aborts_replay`.
 
 ### Sweep delta (vs v4.40)
 
-See PERFORMANCE.md "after v4.41" — spg-server INSERT 1M: 66K → 76.6K r/s
+See perf notes "after v4.41" — spg-server INSERT 1M: 66K → 76.6K r/s
 (+16%), 10M: 49K → 59.4K r/s (+21%, no RSS bail). The 200K single-client
-gate from NEXT.md's earlier projection moves to v4.42 where it becomes
+gate from next steps's earlier projection moves to v4.42 where it becomes
 structurally reachable (engine MVCC + group commit).
 
 ### Files touched
@@ -3615,9 +3615,9 @@ structurally reachable (engine MVCC + group commit).
 
   xtests/compat-fixtures/v4.41/ (new)
   STABILITY.md (new ### WAL record format section — v1/v2/v3 frozen surface)
-  NEXT.md (v4.41 rewrite + new v4.42 section + perf gate matrix refresh)
-  PERFORMANCE.md (after v4.41 section)
-  PROD_READY.md (1.11 row reference)
+  next steps (v4.41 rewrite + new v4.42 section + perf gate matrix refresh)
+  perf notes (after v4.41 section)
+  internal readiness matrix (1.11 row reference)
 
 ### Test verification
 
@@ -3693,7 +3693,7 @@ capping spg-server sweep INSERT at ~15K r/s. v4.40 closes that half.
 
 ### Refs
 
-- NEXT.md §v4.40, PROD_READY row 1.11, PERFORMANCE.md "v4.40 scale
+- next steps §v4.40, PROD_READY row 1.11, perf notes "v4.40 scale
   sweep" section.
 
 ---
@@ -3756,7 +3756,7 @@ sites in the NSW search path keep their original shape.
 ### Closes / refs
 
 - PROD_READY row 1.11 — promoted to "@ scale verified".
-- NEXT.md — v4.39 checkpoint of the v4.38–v5.0 perf recovery
+- next steps — v4.39 checkpoint of the v4.38–v5.0 perf recovery
   roadmap (post-v4.37).
 
 ---
@@ -3822,7 +3822,7 @@ known-vector test + bit-flip detection test cover it.
 - STABILITY.md §"Snapshot file format" + §"Backup bundle format"
   pin both v1 and v2 layouts plus the writers-from-v4.37-emit-v2
   rule.
-- PROD_READY.md audit snapshot: 75 → 76 ✅ / 4 → 3 ⚠️; [machine]
+- internal readiness matrix audit snapshot: 75 → 76 ✅ / 4 → 3 ⚠️; [machine]
   rows 37 → 38.
 
 ### Test verification
@@ -3878,7 +3878,7 @@ protocol" pins both versions.
   section pinning both v1 and v2 wire layouts plus the forward-
   compat rule (followers MUST tolerate unknown frame types and
   unknown payload sizes on known types).
-- PROD_READY.md audit snapshot: 73 → 75 ✅ / 5 → 4 ⚠️ / 1 → 0 ❌;
+- internal readiness matrix audit snapshot: 73 → 75 ✅ / 5 → 4 ⚠️ / 1 → 0 ❌;
   [machine] rows 35 → 37.
 
 ### Test verification
@@ -3905,9 +3905,9 @@ protocol" pins both versions.
 - `prod_ready.rs::row_4_6_*` machine row.
 
 ### Changed
-- PROD_READY.md audit snapshot: 72 → 73 ✅ / 2 → 1 ❌;
+- internal readiness matrix audit snapshot: 72 → 73 ✅ / 2 → 1 ❌;
   [machine] rows 34 → 35.
-- DEPLOYMENT.md env-var table gains both new entries.
+- deployment notes env-var table gains both new entries.
 
 ### Test verification
   cargo test --release --workspace                              # all green
@@ -3949,7 +3949,7 @@ protocol" pins both versions.
   multi-statement variant for the implicit-wrap path.
 - v4.30 preflight quota check now sizes for the full
   `[BEGIN, sql, COMMIT]` block when the wrap is active.
-- PROD_READY.md audit snapshot: 71 → 72 ✅ / 6 → 5 ⚠️;
+- internal readiness matrix audit snapshot: 71 → 72 ✅ / 6 → 5 ⚠️;
   [machine] rows 33 → 34.
 
 ### Test verification
@@ -3987,16 +3987,16 @@ protocol" pins both versions.
 - `prod_ready.rs` rows `row_2_7_*` / `row_4_5_*` / `row_5_7_*`.
 
 ### Changed
-- PROD_READY.md audit snapshot: 68 → 71 ✅ / 7 → 6 ⚠️ /
+- internal readiness matrix audit snapshot: 68 → 71 ✅ / 7 → 6 ⚠️ /
   4 → 2 ❌; 30 → 33 [machine] rows.
-- DEPLOYMENT.md env-var table gains three rows.
+- deployment notes env-var table gains three rows.
 
 ## [4.30.0] — 2026-05-27 (ops docs suite + RESTORE_DRILL + in-memory rollback fix)
 
 ### Added
-- `DEPLOYMENT.md` — install, file layout, env-var reference, ports.
-- `RUNBOOK.md` — common alert → response mappings.
-- `RESTORE_DRILL.md` — verbatim recovery commands, backed by
+- deployment notes — install, file layout, env-var reference, ports.
+- operational runbook — common alert → response mappings.
+- restore drill — verbatim recovery commands, backed by
   `tests/e2e_restore_drill.rs` (CI gate).
 - `SECURITY.md` — disclosure process, threat model, secret handling.
 - `CHANGELOG.md` (this file).
@@ -4022,13 +4022,13 @@ protocol" pins both versions.
 ## [4.28.0] — 2026-05-27 (PROD_READY baseline + machine-checked gate)
 
 ### Added
-- `PROD_READY.md` — 85 rows across 10 dimensions with judgment
+- internal readiness matrix — 85 rows across 10 dimensions with judgment
   criteria + status + evidence links.
 - `tests/prod_ready.rs` — meta-test asserts every `[machine]`
-  row in PROD_READY.md has a paired `row_X_Y_*` test.
+  row in internal readiness matrix has a paired `row_X_Y_*` test.
 - 12 baseline machine-checked rows: WAL replay, /healthz,
   /metrics, max_connections, wire opcode freeze, perf gates
-  present, CI workflow present, PERFORMANCE.md v4.27 baseline.
+  present, CI workflow present, perf notes v4.27 baseline.
 - New CI job `prod_ready gate`.
 
 ## [4.27.1] — 2026-05-27 (v4.x perf coverage)
@@ -4038,7 +4038,7 @@ protocol" pins both versions.
   `xbench/competitor/src/bin/backup_bench.rs` — measure
   replication attach cost, snapshot bootstrap, lag distribution,
   full + incremental backup bandwidth, restore round-trip, PITR.
-- PERFORMANCE.md §v4.27 / §v4.24 / §v4.25 numbers.
+- perf notes §v4.27 / §v4.24 / §v4.25 numbers.
 
 ### Fixed
 - `SPG_REPLAY_UPTO=0` is now accepted as a literal "skip all WAL"
@@ -4180,7 +4180,7 @@ The v4.0-v4.13 sprint, all on the same day:
 
 Pre-v4 push to take SPG from "correct" to "competitive".
 End-state: spg-server scan 5.2× over PG/MySQL/MariaDB; spg-
-embedded ANN 54× over pgvector. See PERFORMANCE.md for full
+embedded ANN 54× over pgvector. See perf notes for full
 numbers.
 
 - **v3.4** baseline series — binary size, RSS, large-data
@@ -4227,7 +4227,7 @@ pgvector.
 
 For maintainers cutting a new release:
 
-1. Update PROD_READY.md audit snapshot.
+1. Update internal readiness matrix audit snapshot.
 2. Add a top-section entry to this file (Added / Changed /
    Fixed / Removed / Security).
 3. `cargo test --release --workspace` (must pass).

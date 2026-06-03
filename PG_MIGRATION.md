@@ -409,11 +409,11 @@ needs work" decisions fall out of that one CI run.
 - Bug reports / feature requests: project repo issues.
 - Compatibility questions: this doc's PR history is the
   canonical "is X supported?" record.
-- Operational questions: `RUNBOOK.md` + `DEPLOYMENT.md`.
+- Operational questions: operational runbook + deployment notes.
 
 Documents this guide depends on:
 - `CHANGELOG.md` — release contract per v7.x
 - `STABILITY.md` — frozen public surfaces + "Out of v7.x"
   carve-outs
-- `PROD_READY.md` — feature ship status table
+- internal readiness matrix — feature ship status table
 - 4-corpus regression: `xtests/sqllogictest/corpus/`
