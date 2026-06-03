@@ -10,6 +10,65 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.9] — 2026-06-03 (Concurrency expansion — release roll-up)
+
+v6.9 is the **conditional sub-version** from the v6.x roadmap
+(see `.claude/researches/spg-v6-roadmap-from-pg19.md` §v6.9 +
+`feedback_v7_path_c`): a 2 d evaluation of whether SPG's
+single-writer / RwLock-reader concurrency model needs Choice A
+(parallel prepare under `engine.read()` + install-phase OCC
+retry), with 5–7 d of implementation if the bench shows real
+pressure.
+
+**Decision (v6.9.1):** Choice A is **carved out to v7.x**. The
+v6.9.0 bench (`tests/perf_concurrency.rs`) on a 14-core
+M-series host shows SELECT-only saturates at ~143k ops/sec
+(1.17× scaling from 8 → 32 clients) and mixed traffic at
+~9.3k ops/sec with p99 ≤ 16 ms. Numbers sit well above the
+typical OLTP target operating point; Choice A's 5–7 d cost
+buys ceiling, not bottleneck relief. v7.x revisits the
+decision once a concrete workload pushes against the read-lock
+ceiling.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.9.0 | Concurrency bench (`#[ignore]`) |
+| 6.9.1 | series ship rollup + Choice A decision (this entry) |
+
+### Bench numbers (v6.9.0, 14-core M-series, single
+process, one-table schema, `SPG_FREEZER_DISABLE=1`)
+
+| clients | SELECT-only ops/s | p99   | Mixed (75/25) ops/s | p99    |
+|--------:|------------------:|------:|--------------------:|-------:|
+|       8 |           122 107 | 120µs |               2 535 |  9.9ms |
+|      16 |           138 436 | 234µs |               4 676 | 11.3ms |
+|      32 |           143 051 | 496µs |               9 339 | 15.6ms |
+
+### Frozen surfaces added in v6.9
+
+None — v6.9 ships measurement + decision; no new SQL surface,
+no new wire frame, no catalog snapshot bump.
+
+### Known v6.9 limitations (carved out, NOT deferred)
+
+- **Choice A — parallel prepare under `engine.read()` +
+  install-phase OCC retry.** The 5–7 d implementation is
+  parked behind STABILITY § "Out of v6.9". v7.x revisits once
+  a concrete workload pushes past the v6.9.0 measured ceiling.
+- **Per-statement read pinning.** SPG's engine RwLock today
+  holds the read lock for the full statement duration. A
+  finer-grained read-pin (per-row or per-segment) would let a
+  long scan release the write-blocking read lock, but the
+  surface change is invasive and the v6.9.0 numbers don't
+  motivate it.
+- **Lock-free / wait-free indices.** Out of v6.x scope. SPG's
+  PersistentBTreeMap is structurally-shared but takes the
+  engine write lock for mutations.
+
+---
+
 ## [6.8] — 2026-06-03 (Index breadth — release roll-up)
 
 v6.8 broadens the SPG index surface to cover PG-parity index

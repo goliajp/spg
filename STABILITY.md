@@ -1561,6 +1561,40 @@ pre-v6.8.0 binary fail loudly at the version check. Empty Vec
 - `Index.expression: Option<String>` — canonical Display of an
   expression-key index. `None` = bare column-reference index.
 
+### Concurrency model (v6.9 series)
+
+The v6.9 series is **measurement + decision** — it adds no
+SQL surface, no wire frame, and no catalog snapshot bump. The
+single-writer / RwLock-reader concurrency model documented in
+the engine docs is frozen as-is for v6.x.
+
+Bench harness: `crates/spg-server/tests/perf_concurrency.rs`
+(`#[ignore]`). Runs 8 / 16 / 32 concurrent native-wire clients
+under SELECT-only and mixed (75% SELECT / 25% INSERT) workloads;
+emits aggregate ops/sec + p99 latency per client count + per
+workload shape.
+
+### Out of v6.9 (carved out — explicit STABILITY entries)
+
+The v6.9.0 bench measured throughput at the operating point
+SPG ships for; the v6.9.1 ship-rollup recorded the decision to
+defer the bigger concurrency work to v7.x. The following items
+remain unimplemented and carry future-revisit hooks:
+
+1. **Choice A — parallel prepare under `engine.read()` +
+   install-phase OCC retry.** The bench measurement
+   (1.17× SELECT-only scale 8 → 32 clients) shows the read-lock
+   ceiling exists, but the 5–7 d implementation cost buys
+   ceiling-lift rather than relief from a real bottleneck. v7.x
+   revisits when a concrete workload pushes past the v6.9.0
+   numbers.
+2. **Per-statement read pinning.** Finer-grained
+   per-row / per-segment read pins would let long scans release
+   the engine read lock; invasive change, no v6.x driver.
+3. **Lock-free / wait-free indices.** Out of v6.x scope; the
+   PersistentBTreeMap is structurally-shared but takes the
+   engine write lock for mutations.
+
 ### Out of v6.8 (carved out — explicit STABILITY entries)
 
 These v6.8 features ship at the format layer but their runtime
