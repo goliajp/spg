@@ -19,9 +19,9 @@ members = [
 version      = "7.8.0"
 edition      = "2024"
 rust-version = "1.95"
-authors      = ["lihao <lihao@golia.jp>"]
+authors      = ["GOLIA K.K. <lihao@golia.jp>"]
 license      = "MIT OR Apache-2.0"
-repository   = "https://github.com/lihao/spg"
+repository   = "https://github.com/goliajp/spg"
 
 # Shared workspace dev-dependencies. Each crate's bench harness pulls
 # criterion from here so the version is locked across stones; that
