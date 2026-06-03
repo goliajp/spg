@@ -72,12 +72,150 @@ fn main() {
                 Err(e) => die(&format!("{verb} failed: {e}"), 1),
             }
         }
+        // v6.10.5 — WAL schema lint. `spg wal-lint <wal_path>
+        // --against-schema <db_path>` parses every record in
+        // the WAL file + checks each SQL statement against the
+        // catalog snapshot at `db_path` (dry-run apply on a
+        // clone). Prints `OK <n>` on success, `FAIL <offset>:
+        // <msg>` on the first rejected record.
+        Some("wal-lint") => {
+            let Some(wal_path) = args.next() else {
+                die("usage: spg wal-lint <wal_path> --against-schema <db_path>", 2);
+                return;
+            };
+            let mut db_path: Option<String> = None;
+            while let Some(a) = args.next() {
+                if a == "--against-schema" {
+                    db_path = args.next();
+                } else {
+                    die(&format!("unknown wal-lint arg: {a}"), 2);
+                    return;
+                }
+            }
+            let Some(db_path) = db_path else {
+                die("wal-lint: --against-schema <db_path> required", 2);
+                return;
+            };
+            match wal_lint(&wal_path, &db_path) {
+                Ok(applied) => println!("OK {applied}"),
+                Err((offset, msg)) => {
+                    eprintln!("FAIL {offset}: {msg}");
+                    process::exit(1);
+                }
+            }
+        }
         Some(other) => die(&format!("unknown command: {other}"), 2),
         None => die(
-            "usage: spg <ping|query|stats|backup|restore|version> ...",
+            "usage: spg <ping|query|stats|backup|restore|wal-lint|version> ...",
             2,
         ),
     }
+}
+
+/// v6.10.5 — dry-run apply every WAL record at `wal_path` to
+/// a fresh `Engine` restored from the catalog snapshot at
+/// `db_path`. Returns the count of records successfully
+/// applied on full success; `(byte_offset, error_msg)` on the
+/// first rejection. No persistence — the engine is dropped at
+/// fn exit.
+fn wal_lint(wal_path: &str, db_path: &str) -> Result<usize, (u64, String)> {
+    use spg_engine::Engine;
+    let snapshot = fs::read(db_path)
+        .map_err(|e| (0u64, format!("read schema {db_path}: {e}")))?;
+    let mut engine = Engine::restore_envelope(&snapshot)
+        .map_err(|e| (0u64, format!("restore schema: {e}")))?;
+    let wal_bytes = fs::read(wal_path)
+        .map_err(|e| (0u64, format!("read wal {wal_path}: {e}")))?;
+    // Iterate records via the same v1/v2/v3 dispatch the server
+    // boot path uses. We track offsets so a rejection points at
+    // the exact byte where the offending record starts.
+    let mut applied = 0usize;
+    let mut cur = 0usize;
+    while cur < wal_bytes.len() {
+        let (sql_bytes, header_plus_payload) = decode_one_record(&wal_bytes[cur..])
+            .map_err(|e| (cur as u64, format!("decode: {e}")))?;
+        let sql = std::str::from_utf8(&sql_bytes)
+            .map_err(|e| (cur as u64, format!("non-UTF-8 SQL: {e}")))?;
+        if let Err(e) = engine.execute(sql) {
+            return Err((cur as u64, format!("apply rejected {sql:?}: {e:?}")));
+        }
+        applied += 1;
+        cur += header_plus_payload;
+    }
+    Ok(applied)
+}
+
+/// v6.10.5 — decode one WAL record from a byte tail. Returns
+/// `(sql_bytes, total_header_plus_payload_len)`. Handles the
+/// three on-disk formats (v1: 4-byte len; v2: 4-byte
+/// `len|0x8000_0000` + 4-byte CRC; v3: 4-byte
+/// `len|0xC000_0000` + 4-byte CRC + 1-byte type) just like
+/// `replay_wal_bytes`. CRCs are not re-validated here — the
+/// caller's intent is "does the SQL string parse + apply
+/// against the schema?", not "is the WAL byte stream itself
+/// valid?".
+fn decode_one_record(tail: &[u8]) -> Result<(Vec<u8>, usize), String> {
+    if tail.len() < 4 {
+        return Err(format!("truncated record: {} < 4 header bytes", tail.len()));
+    }
+    let raw_len = u32::from_le_bytes(tail[..4].try_into().unwrap());
+    const WAL_V2_SENTINEL: u32 = 0x8000_0000;
+    const WAL_V3_FLAG: u32 = 0x4000_0000;
+    let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
+    let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+    let len_mask = if is_v3 {
+        !(WAL_V2_SENTINEL | WAL_V3_FLAG)
+    } else {
+        !WAL_V2_SENTINEL
+    };
+    let rec_len = (raw_len & len_mask) as usize;
+    let header_len = if is_v3 {
+        9
+    } else if is_v2 {
+        8
+    } else {
+        4
+    };
+    if tail.len() < header_len + rec_len {
+        return Err(format!(
+            "truncated payload: need {} bytes, got {}",
+            header_len + rec_len,
+            tail.len()
+        ));
+    }
+    if is_v3 {
+        let type_byte = tail[8];
+        // 0x01 = auto_commit_sql; 0x02 = durability checkpoint
+        // (skip — no SQL to apply); 0x03 = compressed SQL.
+        match type_byte {
+            0x01 => {}
+            0x02 => {
+                return Ok((Vec::new(), header_len + rec_len));
+            }
+            0x03 => {
+                // v6.6.1 LZSS-compressed SQL. Decompress on the
+                // fly so the lint applies the canonical text.
+                let compressed = &tail[header_len..header_len + rec_len];
+                if compressed.is_empty() {
+                    return Err("v3 compressed record: empty body".into());
+                }
+                let algo = compressed[0];
+                if algo != 0x01 {
+                    return Err(format!(
+                        "v3 compressed record: unknown algo byte {algo:#04x}"
+                    ));
+                }
+                let decompressed = spg_crypto::lzss::decompress(&compressed[1..])
+                    .map_err(|e| format!("lzss decompress: {e:?}"))?;
+                return Ok((decompressed, header_len + rec_len));
+            }
+            other => {
+                return Err(format!("v3 unknown type byte {other:#04x}"));
+            }
+        }
+    }
+    let payload = tail[header_len..header_len + rec_len].to_vec();
+    Ok((payload, header_len + rec_len))
 }
 
 /// Read a `.spgdb` catalog file, validate by round-tripping through the
