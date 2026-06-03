@@ -1,3 +1,7 @@
+// v7.7.2 — every public item in this crate must carry a
+// doc-comment; new code that adds a `pub` without one fails CI.
+#![deny(missing_docs)]
+
 //! # spg-embedded
 //!
 //! Ergonomic embedded-mode entry point for SPG. Wraps the
@@ -910,6 +914,9 @@ fn _database_is_send() {
 /// fields. Errors surface as `EngineError::Unsupported` so the
 /// caller's error type stays uniform.
 pub trait FromSpgRow: Sized {
+    /// Decode one query result row into `Self`. Called once per
+    /// row by [`Database::query_typed`]. The slice length equals
+    /// the number of columns in the SELECT projection.
     fn from_spg_row(row: &[Value]) -> Result<Self, EngineError>;
 }
 
@@ -994,6 +1001,10 @@ macro_rules! spg_row {
 /// covers every numeric / text / bytes / bool variant in
 /// `Value`, plus `Option<T>` for nullable columns.
 pub trait FromSpgValue: Sized {
+    /// Decode one cell into `Self`. The returned `&'static str`
+    /// is a short diagnostic for type mismatches (e.g. `"expected
+    /// integer, got TEXT"`); callers wrap it into their own
+    /// error type.
     fn from_spg_value(v: &Value) -> Result<Self, &'static str>;
 }
 
