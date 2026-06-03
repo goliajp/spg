@@ -47,7 +47,7 @@ pub struct PreparedPlan {
     pub describe_columns: Vec<ColumnSchema>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PlanCache {
     /// SQL string → cached plan. `BTreeMap` for deterministic
     /// iteration (test stability); ordering of LRU is tracked
@@ -57,11 +57,39 @@ pub struct PlanCache {
     /// referenced key to the back; `insert` pushes to the back and
     /// evicts the front when at cap.
     lru: VecDeque<String>,
+    /// v6.5.6 — runtime-configurable cap. Defaults to
+    /// `PLAN_CACHE_MAX_ENTRIES` (256); spg-server reads
+    /// `SPG_PLAN_CACHE_MAX` env at startup and overrides via
+    /// `PlanCache::with_max_entries`.
+    max_entries: usize,
+}
+
+impl Default for PlanCache {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            lru: VecDeque::new(),
+            max_entries: PLAN_CACHE_MAX_ENTRIES,
+        }
+    }
 }
 
 impl PlanCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// v6.5.6 — runtime cap override. Operator-tunable via
+    /// `SPG_PLAN_CACHE_MAX` env at startup. Minimum 1; values
+    /// above the compile-time `PLAN_CACHE_MAX_ENTRIES` are
+    /// clamped down to it (defensive backstop against runaway
+    /// configs).
+    pub fn set_max_entries(&mut self, n: usize) {
+        self.max_entries = n.max(1).min(PLAN_CACHE_MAX_ENTRIES);
+    }
+
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     pub fn len(&self) -> usize {
@@ -103,7 +131,7 @@ impl PlanCache {
             self.entries.insert(sql, plan);
             return;
         }
-        if self.entries.len() >= PLAN_CACHE_MAX_ENTRIES {
+        if self.entries.len() >= self.max_entries {
             if let Some(oldest) = self.lru.pop_front() {
                 self.entries.remove(&oldest);
             }

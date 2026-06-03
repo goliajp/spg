@@ -574,7 +574,19 @@ pub struct Engine {
     /// `SELECT * FROM spg_audit_verify`. `None` ⇒ no-data.
     audit_chain_provider: Option<AuditChainProvider>,
     audit_verifier: Option<AuditVerifier>,
+    /// v6.5.6 — slow-query log threshold in microseconds. When set,
+    /// every successful execute whose elapsed exceeds the threshold
+    /// gets fed to the registered slow-query log callback (so
+    /// spg-server can emit a structured log line). Default `None`
+    /// = no slow-query logging.
+    slow_query_threshold_us: Option<u64>,
+    slow_query_logger: Option<SlowQueryLogger>,
 }
+
+/// v6.5.6 — callback signature for slow-query log emission. Called
+/// with `(sql, elapsed_us)` once per successful execute that crosses
+/// the threshold.
+pub type SlowQueryLogger = fn(&str, u64);
 
 /// v6.5.4 — synthesise a `CREATE TABLE` statement from catalog
 /// state. Round-trips through `Engine::execute` to recreate the
@@ -680,6 +692,8 @@ impl Engine {
             activity_provider: None,
             audit_chain_provider: None,
             audit_verifier: None,
+            slow_query_threshold_us: None,
+            slow_query_logger: None,
         }
     }
 
@@ -703,6 +717,8 @@ impl Engine {
             activity_provider: None,
             audit_chain_provider: None,
             audit_verifier: None,
+            slow_query_threshold_us: None,
+            slow_query_logger: None,
         }
     }
 
@@ -759,6 +775,8 @@ impl Engine {
                     activity_provider: None,
                     audit_chain_provider: None,
                     audit_verifier: None,
+                    slow_query_threshold_us: None,
+                    slow_query_logger: None,
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1169,6 +1187,14 @@ impl Engine {
             let now = self.clock.map_or(t0, |f| f());
             let elapsed = now.saturating_sub(t0).max(0) as u64;
             self.query_stats.record(sql, elapsed, now as u64);
+            // v6.5.6 — slow-query log: fire callback when elapsed
+            // exceeds the configured floor.
+            if let (Some(threshold), Some(logger)) =
+                (self.slow_query_threshold_us, self.slow_query_logger)
+                && elapsed >= threshold
+            {
+                logger(sql, elapsed);
+            }
         }
         result
     }
@@ -1500,6 +1526,28 @@ impl Engine {
         self.audit_chain_provider = Some(chain);
         self.audit_verifier = Some(verify);
         self
+    }
+
+    /// v6.5.6 — register a slow-query log callback. `threshold_us`
+    /// is the floor (in microseconds); only executes above the floor
+    /// fire the callback. spg-server wires this from
+    /// `SPG_SLOW_QUERY_THRESHOLD_MS` (default 100 ms).
+    #[must_use]
+    pub const fn with_slow_query_log(
+        mut self,
+        threshold_us: u64,
+        logger: SlowQueryLogger,
+    ) -> Self {
+        self.slow_query_threshold_us = Some(threshold_us);
+        self.slow_query_logger = Some(logger);
+        self
+    }
+
+    /// v6.5.6 — operator knob for plan cache cap. spg-server reads
+    /// `SPG_PLAN_CACHE_MAX` env at startup; uses this to override
+    /// the compile-time default of 256.
+    pub fn set_plan_cache_max(&mut self, n: usize) {
+        self.plan_cache.set_max_entries(n);
     }
 
     /// v6.5.2 — materialise `spg_stat_activity` rows. Pulls a fresh

@@ -409,6 +409,17 @@ pub(crate) fn audit_verify_snapshot() -> (i64, i64) {
     }
 }
 
+/// v6.5.6 — slow-query log callback wired into the engine. Emits
+/// a single structured log line per crossing.
+pub(crate) fn log_slow_query(sql: &str, elapsed_us: u64) {
+    let elapsed_str = elapsed_us.to_string();
+    observability::log_event(
+        "warn",
+        "slow_query",
+        &[("elapsed_us", &elapsed_str), ("sql", sql)],
+    );
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1134,9 +1145,22 @@ fn run(
         // builders consume by value, but we can swap in place by
         // taking ownership through std::mem::replace.
         let prev = std::mem::replace(&mut *e, Engine::new());
+        // v6.5.6 — slow-query log threshold from env, default 100ms.
+        let slow_us: u64 = std::env::var("SPG_SLOW_QUERY_THRESHOLD_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100)
+            * 1_000;
         *e = prev
             .with_activity_provider(activity_snapshot)
-            .with_audit_providers(audit_chain_snapshot, audit_verify_snapshot);
+            .with_audit_providers(audit_chain_snapshot, audit_verify_snapshot)
+            .with_slow_query_log(slow_us, log_slow_query);
+        // v6.5.6 — operator-tunable plan cache cap.
+        if let Ok(s) = std::env::var("SPG_PLAN_CACHE_MAX")
+            && let Ok(n) = s.parse::<usize>()
+        {
+            e.set_plan_cache_max(n);
+        }
     }
 
     // v6.1.4: spawn subscriber threads for any subscriptions
