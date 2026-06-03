@@ -113,6 +113,10 @@ impl Runner {
                     Ok(QueryResult::CommandOk { .. }) => {
                         return Outcome::Fail(format!("query record but ran DDL/DML: {sql}"));
                     }
+                    // v7.5.0 — QueryResult is #[non_exhaustive].
+                    Ok(_) => {
+                        return Outcome::Fail(format!("unexpected QueryResult variant: {sql}"));
+                    }
                     Err(e) => return Outcome::Fail(format!("{e}")),
                 };
                 let actual = render_rows(&result, type_string, *sort);
@@ -216,6 +220,9 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
         Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
         Value::Json(s) => s.clone(),
+        // v7.5.0 — Value is #[non_exhaustive]; Debug-form fallback
+        // for any future variant.
+        _ => format!("{v:?}"),
     }
 }
 

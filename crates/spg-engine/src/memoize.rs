@@ -163,6 +163,8 @@ fn approx_value_bytes(v: &Value) -> usize {
         Value::Vector(v) => v.len() * 4,
         Value::Sq8Vector(q) => q.bytes.len() + 8,
         Value::HalfVector(h) => h.dim() * 2,
+        // v7.5.0 — Value is #[non_exhaustive]; conservative estimate.
+        _ => 16,
     }
 }
 

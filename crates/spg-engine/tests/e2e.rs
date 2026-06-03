@@ -11,6 +11,7 @@ fn unwrap_rows(r: QueryResult) -> (Vec<ColumnSchema>, Vec<Row>) {
     match r {
         QueryResult::Rows { columns, rows } => (columns, rows),
         QueryResult::CommandOk { .. } => panic!("expected Rows"),
+        _ => panic!("unexpected QueryResult variant"),
     }
 }
 
@@ -24,6 +25,7 @@ fn create_two_inserts_then_select_returns_two_rows() {
     match r {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 0),
         QueryResult::Rows { .. } => panic!("expected CommandOk"),
+        _ => panic!("unexpected QueryResult variant"),
     }
 
     engine

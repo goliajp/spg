@@ -96,6 +96,7 @@ fn select_name_by_id(engine: &mut Engine, id: i64) -> Option<String> {
     let (_cols, rows) = match r {
         QueryResult::Rows { columns, rows } => (columns, rows),
         QueryResult::CommandOk { .. } => panic!("expected Rows"),
+        _ => panic!("unexpected QueryResult variant"),
     };
     if rows.is_empty() {
         return None;
@@ -248,6 +249,7 @@ fn count_by_id(engine: &mut Engine, id: i64) -> i64 {
     let rows = match r {
         QueryResult::Rows { rows, .. } => rows,
         QueryResult::CommandOk { .. } => panic!("expected Rows"),
+        _ => panic!("unexpected QueryResult variant"),
     };
     assert_eq!(rows.len(), 1);
     match &rows[0].values[0] {
@@ -277,6 +279,7 @@ fn update_promotes_cold_row_to_hot_tier() {
     match r {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 1),
         QueryResult::Rows { .. } => panic!("UPDATE returns CommandOk"),
+        _ => panic!("unexpected QueryResult variant"),
     }
 
     // After UPDATE: hot tier has one row (the promoted + updated
@@ -307,6 +310,7 @@ fn delete_shadows_cold_row_without_promoting() {
     match r {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 1),
         QueryResult::Rows { .. } => panic!("DELETE returns CommandOk"),
+        _ => panic!("unexpected QueryResult variant"),
     }
     assert_eq!(
         engine.catalog().get("users").unwrap().row_count(),
@@ -362,6 +366,7 @@ fn delete_with_non_pk_where_does_not_touch_cold_rows() {
             assert_eq!(affected, 0, "non-PK DELETE doesn't reach cold tier");
         }
         QueryResult::Rows { .. } => panic!("DELETE returns CommandOk"),
+        _ => panic!("unexpected QueryResult variant"),
     }
     // Cold row still there.
     assert_eq!(select_name_by_id(&mut engine, 100).as_deref(), Some("ivy"));

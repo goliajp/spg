@@ -23,7 +23,7 @@ compatibility second.**
 | Replace a PG server with another network DB | `spg-server` + Docker | ✅ libpq / psql / pgx / JDBC / ODBC via PG-wire |
 | Replace SQLite with a Rust-native embedded DB | `spg-embedded` crate | ❌ no network — Rust API only |
 | Get vector / kNN without pgvector + PG | either | ✅ pgvector-flavoured (`<->`, `<#>`, `<=>`) |
-| Multi-writer OLTP / FKs / triggers / stored procs | **Stay on PG** | n/a — these are explicit non-goals (axiom A7) |
+| Multi-writer OLTP / triggers / stored procs | **Stay on PG** | n/a — these are explicit non-goals (axiom A7). FKs land in v7.6. |
 
 The rest of this doc backs each row with specifics.
 
@@ -34,12 +34,12 @@ The rest of this doc backs each row with specifics.
 ```
                 ┌──────────────────────────────────────────────┐
                 │  Does your app rely on any of:               │
-                │   - Foreign keys / REFERENCES                │
                 │   - Triggers                                 │
                 │   - Stored procedures (PL/pgSQL etc)         │
                 │   - Row-Level Security                       │
                 │   - Multiple concurrent writers              │
                 │   - Multi-master replication                 │
+                │  (FKs ship in v7.6 — not a blocker anymore)  │
                 └────────────────────┬─────────────────────────┘
                                      │
                        ┌─── yes ─────┴─────  no ────┐
@@ -139,7 +139,7 @@ implemented; further breakdown follows the table.
 | `ALTER INDEX … REBUILD` | ✅ | NSW / BRIN rebuild lands; B-tree no-op |
 | `CREATE SCHEMA foo; foo.bar` | ❌ | Single-namespace catalog; rename-to-prefix as workaround |
 | `CREATE TYPE` / domains / composite types | ❌ | A7 — out of scope |
-| Foreign keys (`REFERENCES`) | ❌ | A7 — won't do |
+| Foreign keys (`REFERENCES … ON DELETE/UPDATE …`) | 🚧 v7.6 | Lands in v7.6; A7 narrowed (see below) |
 | `CHECK` constraints | ❌ | A7 — won't do |
 | `CREATE TRIGGER` | ❌ | A7 — won't do |
 | `CREATE FUNCTION` / `CREATE PROCEDURE` / PL/pgSQL | ❌ | A7 — won't do |
@@ -309,11 +309,18 @@ These items appear in user requests every release cycle. SPG's
 design axioms make them explicit non-goals; they're not on any
 v8 / v9 plan. If you need any of them, **stay on PG**.
 
+> **v7.5 update — A7 narrowed.** Foreign keys were removed from
+> the won't-do list in v7.5. SPG's single-writer model makes FK
+> enforcement cheap (no concurrent-write race conditions, no
+> phantom child rows), and downstream users surfaced FK as a
+> hard requirement. The full `REFERENCES … ON DELETE …` surface
+> ships in v7.6. The remaining A7 items below are still
+> structural non-goals.
+
 | Won't do | Why | Workaround |
 |---|---|---|
-| Foreign keys / `REFERENCES` | Complexity explosion at the boundary; SPG targets analytics + vector workloads, not transactional integrity | Validate at the application layer |
-| `CREATE TRIGGER` | Same as FK | Application-level event hooks |
-| `CREATE FUNCTION` / PL/pgSQL | A7 | Application-level functions |
+| `CREATE TRIGGER` | Side effects break the single-writer determinism guarantee that powers group commit + WAL replay | Application-level event hooks via the publication/subscription change feed |
+| `CREATE FUNCTION` / PL/pgSQL | Adds a new VM surface inside the engine; SPG keeps SQL execution purely declarative | Application-level functions |
 | Row-Level Security | Multi-tenant via process isolation (one SPG instance per tenant) | `docker compose` with N services |
 | Multi-writer MVCC | Single-writer is the core architectural choice (powers group commit + zero-cost catalog clone) | Read replicas via logical replication |
 | Multi-master | A3 | Single primary + read replicas |

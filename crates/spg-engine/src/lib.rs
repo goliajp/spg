@@ -46,6 +46,7 @@ use crate::eval::{EvalContext, EvalError};
 
 /// Result of executing one statement.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum QueryResult {
     /// DDL or DML succeeded.
     ///
@@ -66,7 +67,13 @@ pub enum QueryResult {
     },
 }
 
+/// All errors the engine can return.
+///
+/// Marked `#[non_exhaustive]` from v7.5.0 onward: external `match`
+/// must include a `_` arm so new variants in subsequent v7.x releases
+/// are not breaking changes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EngineError {
     Parse(ParseError),
     Storage(StorageError),
@@ -3689,6 +3696,12 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Json(_) => Err(EngineError::Unsupported(
             "ORDER BY of a JSON value is not supported — cast the document to text first".into(),
         )),
+        // v7.5.0 — Value is #[non_exhaustive]; future variants need
+        // an explicit ORDER BY mapping. Surface as Unsupported until
+        // engine support is added.
+        _ => Err(EngineError::Unsupported(
+            "ORDER BY of this value type is not supported".into(),
+        )),
     }
 }
 
@@ -6560,6 +6573,10 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
             // vector-stats path doesn't crash.
             alloc::format!("{v:?}")
         }
+        // v7.5.0 — Value is #[non_exhaustive] for downstream
+        // forward-compat. Future variants fall through to Debug
+        // form here (same shape as the vector fallback above).
+        _ => alloc::format!("{v:?}"),
     }
 }
 
@@ -6597,6 +6614,10 @@ fn value_to_literal(v: Value) -> Literal {
         // substitute walker; pgwire's Bind path handles that.
         Value::Sq8Vector(q) => Literal::Vector(spg_storage::quantize::dequantize(&q)),
         Value::HalfVector(h) => Literal::Vector(h.to_f32_vec()),
+        // v7.5.0 — Value is #[non_exhaustive]; future variants
+        // render as Debug-form String literal until explicit
+        // mapping is added.
+        v => Literal::String(alloc::format!("{v:?}")),
     }
 }
 

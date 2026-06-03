@@ -275,6 +275,9 @@ fn value_cmp_str(value: &Value, bound: &str) -> core::cmp::Ordering {
             // Equal as a defensive no-op.
             Ordering::Equal
         }
+        // v7.5.0 — Value is #[non_exhaustive]; future variants fall
+        // back to canonical-form lex compare.
+        _ => crate::canonical_value_repr(value).as_str().cmp(bound),
     }
 }
 

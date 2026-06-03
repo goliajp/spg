@@ -159,6 +159,7 @@ impl fmt::Display for DataType {
 /// non-equal to itself (PG behaviour) — `PartialEq` is derived so callers
 /// must opt into NaN-aware comparison if they need stronger guarantees.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     SmallInt(i16),
     Int(i32),
@@ -3572,6 +3573,7 @@ fn index_key_as_u64(key: &IndexKey) -> Option<u64> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StorageError {
     DuplicateTable {
         name: String,

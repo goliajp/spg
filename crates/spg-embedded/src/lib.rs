@@ -10,7 +10,9 @@
 //! ```no_run
 //! use spg_embedded::Database;
 //!
-//! let mut db = Database::open_in_memory();
+//! // On-disk, durable. WAL fsynced per commit; auto-checkpoint
+//! // at 4 MiB WAL by default.
+//! let mut db = Database::open_path("/data/app.db").unwrap();
 //! db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
 //! db.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
 //! let rows = db.query("SELECT name FROM users WHERE id = 1").unwrap();
@@ -19,31 +21,49 @@
 //! }
 //! ```
 //!
-//! ## v6.10.3 scope
+//! ## Production checklist (v7.5)
 //!
-//! v6.10.3 ships the crate scaffold + a thin `Database` wrapper
-//! that:
+//! - **Persistence**: `Database::open_path(p)` writes a
+//!   crash-consistent WAL + periodic checkpoint snapshot. The
+//!   on-disk format is byte-identical to what `spg-server`
+//!   produces, so a database can move between modes without
+//!   conversion.
+//! - **Durability**: every `execute()` that mutates calls
+//!   `fsync` before returning `Ok`. There is no group commit
+//!   in embedded mode — every commit pays one fsync. If you
+//!   need batch throughput, wrap multiple statements in
+//!   [`Database::with_transaction`] which fsyncs only at
+//!   commit.
+//! - **Concurrency**: [`Database`] is `Send` but **not** `Sync`.
+//!   Share across threads via `Arc<Mutex<Database>>`. The
+//!   single-writer model is intentional — see
+//!   [STABILITY § A1](https://github.com/lihao/spg/blob/master/STABILITY.md).
+//! - **Background work**: [`Database::spawn_background_freezer`]
+//!   moves cold rows to disk-resident segments while you keep
+//!   serving requests. It runs in a dedicated thread; drop the
+//!   returned [`FreezerHandle`] (or call `stop()`) for clean
+//!   shutdown.
+//! - **Errors**: all public enums ([`EngineError`],
+//!   [`QueryResult`], [`Value`]) are `#[non_exhaustive]`. Match
+//!   them with a wildcard arm so future v7.x releases can add
+//!   variants without breaking your code.
 //!
-//! - Constructs an `Engine` (in-memory or restored from a
-//!   catalog snapshot byte slice).
-//! - Forwards `execute(sql)` directly to the engine.
-//! - Returns query results as a `Vec<Vec<Value>>` for
-//!   read-side ergonomics.
+//! ## Panic contract
 //!
-//! The following are explicit **STABILITY § "Out of v6.10"**
-//! carve-outs:
-//!
-//! - **Typed query API**: `db.query::<User>("SELECT …")` that
-//!   row-decodes into a user struct. Lands once the macro
-//!   landed; until then, callers pattern-match on `Value`.
-//! - **`#[derive(SpgRow)]`**: proc-macro that generates the
-//!   `FromRow` impl mapping schema columns → struct fields.
-//!   Needs a new proc-macro crate (`spg-embedded-macros`); the
-//!   shape is reserved by the trait sketch below.
-//! - **On-disk persistence**: `Database::open_path(p)` that
-//!   restores from a catalog snapshot + drives a WAL.
-//!   v6.10.3 ships in-memory + byte-slice round-trip;
-//!   persistence is `spg-server`'s job today.
+//! - **No `execute()` / `query()` call panics on user input.**
+//!   Malformed SQL, type mismatches, missing tables — all
+//!   return `Err(EngineError::…)`. If you observe a panic on
+//!   a user-controlled string, that is a bug; file an issue.
+//! - The library panics **only** on internal invariant
+//!   violations (e.g., catalog snapshot magic mismatch, WAL
+//!   record CRC sentinel corruption that survived the boot-
+//!   time validation). These represent silent disk corruption
+//!   and an unwind would leak inconsistent state, so the
+//!   release profile uses `panic = abort` — your host process
+//!   dies fast rather than continuing on poisoned data.
+//! - If you cannot tolerate `panic = abort`, build with
+//!   `--profile release-dbg` (keeps unwind tables) and use
+//!   `std::panic::catch_unwind` at your application boundary.
 //!
 //! ## Why a separate crate?
 //!
@@ -584,6 +604,11 @@ impl Database {
         match self.engine.execute(sql)? {
             QueryResult::Rows { rows, .. } => Ok(rows.into_iter().map(|r| r.values).collect()),
             QueryResult::CommandOk { .. } => Err(EngineError::Unsupported(
+                "query() expects a SELECT — use execute() for DML/DDL".into(),
+            )),
+            // v7.5.0 — QueryResult is #[non_exhaustive]; any future
+            // variant is not a SELECT row stream, treat as Unsupported.
+            _ => Err(EngineError::Unsupported(
                 "query() expects a SELECT — use execute() for DML/DDL".into(),
             )),
         }

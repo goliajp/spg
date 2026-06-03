@@ -353,6 +353,10 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                             b'I'
                         };
                     }
+                    // v7.5.0 — QueryResult is #[non_exhaustive].
+                    Ok(_) => {
+                        send_error(&mut wbuf, "XX000", "unexpected QueryResult variant")?;
+                    }
                 }
                 send_ready_for_query(&mut wbuf, tx_state)?;
                 stream.write_all(&wbuf)?;
@@ -1479,6 +1483,8 @@ fn handle_execute(
             };
         }
         Err(e) => return Err(e.to_string()),
+        // v7.5.0 — QueryResult is #[non_exhaustive].
+        Ok(_) => return Err("unexpected QueryResult variant".to_string()),
     }
     Ok(())
 }
@@ -2149,6 +2155,11 @@ fn handle_copy_to_stdout(
             send_error(stream, "42000", &e.to_string())?;
             return Ok(());
         }
+        // v7.5.0 — QueryResult is #[non_exhaustive].
+        Ok(_) => {
+            send_error(stream, "XX000", "unexpected QueryResult variant")?;
+            return Ok(());
+        }
     };
     let col_count = columns.len();
     // CopyOutResponse 'H' body, same layout as CopyInResponse.
@@ -2218,6 +2229,8 @@ fn encode_copy_cell(v: &spg_storage::Value) -> String {
                 .collect();
             escape_copy_cell(&format!("[{}]", parts.join(", ")))
         }
+        // v7.5.0 — Value is #[non_exhaustive].
+        _ => escape_copy_cell(&format!("{v:?}")),
     }
 }
 
@@ -2665,6 +2678,8 @@ fn value_to_pg_text(v: &Value, _ty: Option<DataType>) -> Option<String> {
                 .collect();
             format!("[{}]", parts.join(", "))
         }
+        // v7.5.0 — Value is #[non_exhaustive].
+        _ => format!("{v:?}"),
     })
 }
 
