@@ -22,9 +22,10 @@ pub mod segment;
 pub use self::bloom::{BloomError, BloomFilter};
 pub use self::row_locator::{RowLocator, RowLocatorError};
 pub use self::segment::{
-    OwnedSegment, SEGMENT_COMPRESS_ALGO_LZSS, SEGMENT_COMPRESS_ALGO_NONE, SEGMENT_MAGIC,
-    SEGMENT_MAGIC_V2, SEGMENT_PAGE_BYTES, SegmentError, SegmentMeta, SegmentReader,
-    encode_segment, wrap_v2_envelope,
+    BRIN_SIDECAR_MAGIC, BrinSummary, OwnedSegment, SEGMENT_COMPRESS_ALGO_LZSS,
+    SEGMENT_COMPRESS_ALGO_NONE, SEGMENT_MAGIC, SEGMENT_MAGIC_V2, SEGMENT_PAGE_BYTES, SegmentError,
+    SegmentMeta, SegmentReader, derive_brin_summaries, encode_segment, wrap_v2_envelope,
+    wrap_v2_envelope_with_brin,
 };
 
 use alloc::collections::BTreeMap;
@@ -397,6 +398,18 @@ pub enum IndexKind {
     BTree(PersistentBTreeMap<IndexKey, Vec<RowLocator>>),
     /// Navigable-small-world graph for vector kNN search.
     Nsw(NswGraph),
+    /// v6.7.1 — BRIN (Block Range INdex). Pure metadata: BRIN
+    /// indexes carry NO in-memory key→locator map. The (min,
+    /// max) summaries live in each cold-tier segment's v2
+    /// envelope sidecar; the BRIN entry in `Table.indices` only
+    /// records THAT a BRIN index exists on this column so the
+    /// segment encoder + planner can opt into the summary path.
+    Brin {
+        /// The cell type at `column_position` at CREATE INDEX time.
+        /// Used by the planner to type-check WHERE-clause range
+        /// predicates against the BRIN-indexed column.
+        column_type: DataType,
+    },
 }
 
 /// Multi-layer HNSW graph (v2.13). Each node is assigned a `top_level`;
@@ -506,6 +519,17 @@ impl Index {
         }
     }
 
+    /// v6.7.1 — BRIN index constructor. BRIN carries no in-memory
+    /// data; the `column_type` snapshot is used by the segment
+    /// encoder + planner for type-checking range predicates.
+    fn new_brin(name: String, column_position: usize, column_type: DataType) -> Self {
+        Self {
+            name,
+            column_position,
+            kind: IndexKind::Brin { column_type },
+        }
+    }
+
     /// Look up the locators stored under `key` (B-tree only). Returns
     /// an empty slice when the key is absent or the index is an NSW
     /// graph — callers can treat both cases uniformly.
@@ -517,7 +541,8 @@ impl Index {
     pub fn lookup_eq(&self, key: &IndexKey) -> &[RowLocator] {
         match &self.kind {
             IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
-            IndexKind::Nsw(_) => &[][..],
+            // BRIN/Nsw have no key→locator map; lookup is a no-op.
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } => &[][..],
         }
     }
 
@@ -526,8 +551,16 @@ impl Index {
     pub const fn nsw(&self) -> Option<&NswGraph> {
         match &self.kind {
             IndexKind::Nsw(g) => Some(g),
-            IndexKind::BTree(_) => None,
+            IndexKind::BTree(_) | IndexKind::Brin { .. } => None,
         }
+    }
+
+    /// v6.7.1 — true when this index is a BRIN (block range) index.
+    /// Used by the segment encoder to opt into BRIN sidecar emission
+    /// at freeze time, and by the planner to opt into page-skipping
+    /// on range predicates.
+    pub const fn is_brin(&self) -> bool {
+        matches!(self.kind, IndexKind::Brin { .. })
     }
 }
 
@@ -703,9 +736,20 @@ impl Table {
     /// (`v0.8` supports at most one index per column logically; the search
     /// just picks the first match.)
     pub fn index_on(&self, column_position: usize) -> Option<&Index> {
+        // v6.7.1 — prefer BTree (has the key→locator map needed
+        // for `lookup_eq`) over BRIN (metadata-only). When only a
+        // BRIN exists on the column, return None so the executor
+        // falls back to the hot-tier row scan instead of trying
+        // to use BRIN for an equality lookup (which would always
+        // return an empty slice and look like "no rows matched").
         self.indices
             .iter()
-            .find(|i| i.column_position == column_position)
+            .find(|i| i.column_position == column_position && matches!(i.kind, IndexKind::BTree(_)))
+            .or_else(|| {
+                self.indices
+                    .iter()
+                    .find(|i| i.column_position == column_position && matches!(i.kind, IndexKind::Nsw(_)))
+            })
     }
 
     /// Insert one row after validating it matches the schema (length + type).
@@ -879,9 +923,9 @@ impl Table {
         let col_pos = self.indices[idx_pos].column_position;
         let m = match &self.indices[idx_pos].kind {
             IndexKind::Nsw(g) => g.m,
-            IndexKind::BTree(_) => {
+            IndexKind::BTree(_) | IndexKind::Brin { .. } => {
                 return Err(StorageError::Unsupported(format!(
-                    "ALTER INDEX REBUILD on BTree index {name:?} — only NSW indexes can rebuild"
+                    "ALTER INDEX REBUILD on non-NSW index {name:?} — only NSW indexes can rebuild"
                 )));
             }
         };
@@ -964,6 +1008,49 @@ impl Table {
         Ok(())
     }
 
+    /// v6.7.1 — public restore counterpart for BRIN indices. Used
+    /// by `Catalog::deserialize` when a v10 snapshot carries a
+    /// BRIN index entry. BRIN carries no in-memory data — only the
+    /// `column_type` snapshot is restored.
+    pub fn restore_brin_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        column_type: DataType,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        self.indices.push(Index::new_brin(name, column_position, column_type));
+        Ok(())
+    }
+
+    /// v6.7.1 — public CREATE INDEX counterpart for BRIN. Creates
+    /// the index entry with a snapshot of the indexed column's
+    /// current `DataType`.
+    pub fn add_brin_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        let column_type = self.schema.columns[column_position].ty;
+        self.indices.push(Index::new_brin(name, column_position, column_type));
+        Ok(())
+    }
+
     /// v5.1: register cold-tier locators on a `BTree` index. Used
     /// after [`Catalog::load_segment_bytes`] to wire every cold-
     /// tier row's PK back to its segment so
@@ -995,9 +1082,9 @@ impl Table {
             .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
         let map = match &mut idx.kind {
             IndexKind::BTree(map) => map,
-            IndexKind::Nsw(_) => {
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
                 return Err(StorageError::Corrupt(format!(
-                    "index {index_name:?} is NSW; cold locators apply only to BTree indices"
+                    "index {index_name:?} is not BTree; cold locators apply only to BTree indices"
                 )));
             }
         };
@@ -1036,9 +1123,9 @@ impl Table {
             })?;
         let map = match &mut idx.kind {
             IndexKind::BTree(map) => map,
-            IndexKind::Nsw(_) => {
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
                 return Err(StorageError::Corrupt(format!(
-                    "remove_cold_locators_for_key: index {index_name:?} is NSW; \
+                    "remove_cold_locators_for_key: index {index_name:?} is not BTree; \
                      cold locators apply only to BTree indices"
                 )));
             }
@@ -1213,44 +1300,63 @@ impl Table {
                         Some((idx.name.clone(), cold))
                     }
                 }
-                IndexKind::Nsw(_) => None,
+                // BRIN / NSW carry no key→locator map.
+                IndexKind::Nsw(_) | IndexKind::Brin { .. } => None,
             })
             .collect();
 
-        let descriptors: Vec<(String, usize, Option<usize>)> = self
+        // v6.7.1 — descriptor needs to capture index kind so the
+        // rebuild loop can resurrect BTree / NSW / BRIN exactly as
+        // they were. (NSW carries m; BRIN carries the column type
+        // snapshot; BTree needs no extra payload.)
+        #[derive(Clone)]
+        enum RebuildKind {
+            BTree,
+            Nsw(usize),
+            Brin(DataType),
+        }
+        let descriptors: Vec<(String, usize, RebuildKind)> = self
             .indices
             .iter()
             .map(|idx| {
-                let m = if let IndexKind::Nsw(g) = &idx.kind {
-                    Some(g.m)
-                } else {
-                    None
+                let kind = match &idx.kind {
+                    IndexKind::Nsw(g) => RebuildKind::Nsw(g.m),
+                    IndexKind::Brin { column_type } => RebuildKind::Brin(*column_type),
+                    IndexKind::BTree(_) => RebuildKind::BTree,
                 };
-                (idx.name.clone(), idx.column_position, m)
+                (idx.name.clone(), idx.column_position, kind)
             })
             .collect();
         self.indices.clear();
-        for (name, column_position, nsw_m) in descriptors {
-            if let Some(m) = nsw_m {
-                let idx = Index::new_nsw(name, column_position, m);
-                self.indices.push(idx);
-                let idx_pos = self.indices.len() - 1;
-                let row_indices: Vec<usize> = (0..self.rows.len()).collect();
-                for row_idx in row_indices {
-                    nsw_insert_at(self, idx_pos, row_idx);
-                }
-            } else {
-                let mut idx = Index::new_btree(name, column_position);
-                if let IndexKind::BTree(map) = &mut idx.kind {
-                    for (i, row) in self.rows.iter().enumerate() {
-                        if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
-                            let mut entries = map.get(&key).cloned().unwrap_or_default();
-                            entries.push(RowLocator::Hot(i));
-                            map.insert_mut(key, entries);
-                        }
+        for (name, column_position, rebuild_kind) in descriptors {
+            match rebuild_kind {
+                RebuildKind::Nsw(m) => {
+                    let idx = Index::new_nsw(name, column_position, m);
+                    self.indices.push(idx);
+                    let idx_pos = self.indices.len() - 1;
+                    let row_indices: Vec<usize> = (0..self.rows.len()).collect();
+                    for row_idx in row_indices {
+                        nsw_insert_at(self, idx_pos, row_idx);
                     }
                 }
-                self.indices.push(idx);
+                RebuildKind::Brin(column_type) => {
+                    // BRIN has no in-memory rebuild — the summaries
+                    // live in cold segments which freeze emits.
+                    self.indices.push(Index::new_brin(name, column_position, column_type));
+                }
+                RebuildKind::BTree => {
+                    let mut idx = Index::new_btree(name, column_position);
+                    if let IndexKind::BTree(map) = &mut idx.kind {
+                        for (i, row) in self.rows.iter().enumerate() {
+                            if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
+                                let mut entries = map.get(&key).cloned().unwrap_or_default();
+                                entries.push(RowLocator::Hot(i));
+                                map.insert_mut(key, entries);
+                            }
+                        }
+                    }
+                    self.indices.push(idx);
+                }
             }
         }
 
@@ -1377,7 +1483,9 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     ensure_node_slot(table, idx_pos, new_row_idx, level);
     let (entry, entry_level, m) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level, g.m),
-        IndexKind::BTree(_) => unreachable!("nsw_insert_at on a BTree index"),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } => {
+            unreachable!("nsw_insert_at on a non-NSW index")
+        }
     };
     // First node ever — declare it the entry (it gets its own level).
     if entry.is_none() {
@@ -1491,7 +1599,7 @@ fn greedy_layer_walk(
 ) -> (usize, f32) {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) => return (current, current_d),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } => return (current, current_d),
     };
     let col_pos = table.indices[idx_pos].column_position;
     loop {
@@ -1542,7 +1650,7 @@ fn layer_beam_search(
 ) -> Vec<(f32, usize)> {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) => return Vec::new(),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } => return Vec::new(),
     };
     let col_pos = table.indices[idx_pos].column_position;
     let d0 = if matches!(metric, NswMetric::L2) {
@@ -1723,7 +1831,7 @@ fn connect_at_layer(
     let col_pos = table.indices[idx_pos].column_position;
     let cap = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g.cap_for_layer(layer),
-        IndexKind::BTree(_) => return,
+        IndexKind::BTree(_) | IndexKind::Brin { .. } => return,
     };
     // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
     // each) rather than usize (8 B on 64-bit). Boundary casts here
@@ -1763,7 +1871,7 @@ fn connect_at_layer(
         //    insert path so connectivity stays consistent.
         let needs_trim = match &table.indices[idx_pos].kind {
             IndexKind::Nsw(g) => g.layers[layer as usize][peer].len() > cap,
-            IndexKind::BTree(_) => false,
+            IndexKind::BTree(_) | IndexKind::Brin { .. } => false,
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
@@ -1771,7 +1879,7 @@ fn connect_at_layer(
                     .iter()
                     .map(|&n| n as usize)
                     .collect(),
-                IndexKind::BTree(_) => continue,
+                IndexKind::BTree(_) | IndexKind::Brin { .. } => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
             // heuristic receives candidates closest-first. `cell_l2_sq`
@@ -1908,7 +2016,7 @@ fn nsw_search(
 ) -> Vec<(f32, usize)> {
     let (entry, entry_level) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level),
-        IndexKind::BTree(_) => return Vec::new(),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } => return Vec::new(),
     };
     let Some(entry) = entry else {
         return Vec::new();
@@ -2947,7 +3055,12 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// by version dispatch in [`Catalog::deserialize`] — every entry decodes
 /// as `RowLocator::Hot(_)` via `add_index` rebuild, identical to v5.1
 /// behaviour.
-const FILE_VERSION: u8 = 9;
+/// v6.7.1 — bumped from 9 to 10 to add the BRIN index tag (byte 2)
+/// in the per-table index section. v9 catalog snapshots load
+/// unchanged (no BRIN tags appear); v10 snapshots written by a
+/// pre-v6.7.1 binary fail loudly at the version check, matching
+/// the v6.1.2 / v6.1.4 / v6.2.0 envelope-bump upgrade fence.
+const FILE_VERSION: u8 = 10;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -3046,6 +3159,15 @@ impl Catalog {
                         out.push(1);
                         write_u16(&mut out, u16::try_from(g.m).expect("≤ 65k NSW neighbours"));
                         write_nsw_graph(&mut out, g);
+                    }
+                    IndexKind::Brin { column_type } => {
+                        // v6.7.1 — tag byte 2 = BRIN. Payload is the
+                        // column type code (1 byte mapping to the
+                        // shared DataType numeric encoding); no
+                        // further data — BRIN summaries live in
+                        // cold segments, not the catalog.
+                        out.push(2);
+                        write_data_type(&mut out, *column_type);
                     }
                 }
             }
@@ -3198,6 +3320,13 @@ fn deserialize_indices(
                 let m = cur.read_u16()? as usize;
                 let graph = cur.read_nsw_graph(m)?;
                 t.restore_nsw_index(idx_name, &column_name, graph)?;
+            }
+            2 => {
+                // v6.7.1 — BRIN tag. Payload is the column type
+                // tag. No further data — summaries live in cold
+                // segments.
+                let column_type = cur.read_data_type()?;
+                t.restore_brin_index(idx_name, &column_name, column_type)?;
             }
             other => {
                 return Err(StorageError::Corrupt(format!(
@@ -4346,7 +4475,7 @@ mod tests {
             .unwrap();
         let g = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g,
-            IndexKind::BTree(_) => panic!("expected NSW"),
+            IndexKind::BTree(_) | IndexKind::Brin { .. } => panic!("expected NSW"),
         };
         // Non-trivial graph: one level slot per row, and the geometric level
         // distribution puts some nodes above layer 0.
@@ -4706,13 +4835,13 @@ mod tests {
             .unwrap();
         let original = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) => panic!("expected NSW"),
+            IndexKind::BTree(_) | IndexKind::Brin { .. } => panic!("expected NSW"),
         };
         let bytes = cat.serialize();
         let restored = Catalog::deserialize(&bytes).expect("deserialize");
         let restored_graph = match &restored.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) => panic!("expected NSW"),
+            IndexKind::BTree(_) | IndexKind::Brin { .. } => panic!("expected NSW"),
         };
         assert_eq!(restored_graph.m, original.m);
         assert_eq!(restored_graph.m_max_0, original.m_max_0);
@@ -5323,7 +5452,9 @@ mod tests {
                 )],
             )
             .unwrap_err();
-        assert!(matches!(err, StorageError::Corrupt(ref s) if s.contains("NSW")));
+        // v6.7.1: message switched from "is NSW" to "is not BTree"
+        // when the Brin variant was added.
+        assert!(matches!(err, StorageError::Corrupt(ref s) if s.contains("not BTree")));
     }
 
     #[test]
@@ -5441,6 +5572,12 @@ mod tests {
                         write_u16(&mut out, u16::try_from(g.m).unwrap());
                         write_nsw_graph(&mut out, g);
                     }
+                    // v8 had no BRIN; this test-only writer can't
+                    // serialise BRIN into the legacy format.
+                    IndexKind::Brin { .. } => panic!(
+                        "v8 catalog writer cannot serialise BRIN — \
+                         tests with BRIN indices must use the current writer"
+                    ),
                 }
             }
         }

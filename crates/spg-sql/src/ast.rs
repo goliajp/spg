@@ -199,6 +199,15 @@ pub enum IndexMethod {
     BTree,
     /// `USING hnsw` — NSW graph for kNN over a vector column.
     Hnsw,
+    /// v6.7.1 — `USING brin` — Block Range INdex. Per-segment
+    /// metadata that records (min_key, max_key) for each page in a
+    /// cold-tier segment, on the indexed column. The optimizer
+    /// can use these summaries to skip pages whose range does NOT
+    /// overlap a query's WHERE predicate. BRIN indexes carry no
+    /// in-memory data — the summaries live in the segment v2
+    /// envelope's sidecar. Created via the standard
+    /// `CREATE INDEX … USING brin (col)` syntax.
+    Brin,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -851,8 +860,10 @@ impl fmt::Display for CreateIndexStatement {
             quote_ident(&self.name),
             quote_ident(&self.table)
         )?;
-        if matches!(self.method, IndexMethod::Hnsw) {
-            f.write_str("USING hnsw ")?;
+        match self.method {
+            IndexMethod::Hnsw => f.write_str("USING hnsw ")?,
+            IndexMethod::Brin => f.write_str("USING brin ")?,
+            IndexMethod::BTree => {}
         }
         write!(f, "({})", quote_ident(&self.column))
     }
