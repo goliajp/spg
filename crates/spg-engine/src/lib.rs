@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod eval;
 pub mod json;
 pub mod memoize;
+pub mod plan_cache;
 pub mod publications;
 pub mod reorder;
 pub mod selectivity;
@@ -550,6 +551,10 @@ pub struct Engine {
     /// Populated by `ANALYZE`; queried via `spg_statistic` virtual
     /// table. Persistence rides the v5 envelope trailer.
     statistics: statistics::Statistics,
+    /// v6.3.0 — engine-level plan cache. Caches the post-`prepare()`
+    /// `Statement` keyed on SQL text. In-memory only — does NOT ride
+    /// the snapshot envelope (rebuilt on demand after restart).
+    plan_cache: plan_cache::PlanCache,
 }
 
 impl Engine {
@@ -566,6 +571,7 @@ impl Engine {
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
             statistics: statistics::Statistics::new(),
+            plan_cache: plan_cache::PlanCache::new(),
         }
     }
 
@@ -584,6 +590,7 @@ impl Engine {
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
             statistics: statistics::Statistics::new(),
+            plan_cache: plan_cache::PlanCache::new(),
         }
     }
 
@@ -635,6 +642,7 @@ impl Engine {
                     publications,
                     subscriptions,
                     statistics,
+                    plan_cache: plan_cache::PlanCache::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -949,6 +957,43 @@ impl Engine {
             reorder::reorder_joins(s, &self.catalog, &self.statistics);
         }
         Ok(stmt)
+    }
+
+    /// v6.3.0 — cached prepare. Returns a cloned `Statement` from
+    /// the plan cache on hit, runs the full `prepare()` path on miss
+    /// and inserts the resulting plan before returning. Skipping the
+    /// parse + JOIN-reorder pipeline on hit is the dominant win for
+    /// JDBC / sqlx / pgx clients that reuse the same SQL string.
+    ///
+    /// Returns a cloned `Statement` (not a borrow) because the
+    /// pgwire layer owns its `PreparedStmt` map per-session and the
+    /// engine-level cache must stay available for other sessions.
+    /// Clone cost on a 5-table JOIN AST is well under the parse cost
+    /// it replaces.
+    pub fn prepare_cached(&mut self, sql: &str) -> Result<Statement, ParseError> {
+        if let Some(plan) = self.plan_cache.get(sql) {
+            return Ok(plan.stmt.clone());
+        }
+        let stmt = self.prepare(sql)?;
+        let source_tables = plan_cache::collect_source_tables(&stmt);
+        let plan = plan_cache::PreparedPlan {
+            stmt: stmt.clone(),
+            statistics_version: 0, // v6.3.1 will populate.
+            source_tables,
+            describe_columns: alloc::vec::Vec::new(),
+        };
+        self.plan_cache.insert(String::from(sql), plan);
+        Ok(stmt)
+    }
+
+    /// v6.3.0 — read-only accessor for tests and v6.3.1 invalidation.
+    pub fn plan_cache(&self) -> &plan_cache::PlanCache {
+        &self.plan_cache
+    }
+
+    /// v6.3.0 — mutable accessor for v6.3.1 invalidation hooks.
+    pub fn plan_cache_mut(&mut self) -> &mut plan_cache::PlanCache {
+        &mut self.plan_cache
     }
 
     /// v6.1.1 — execute a [`Statement`] previously returned by
