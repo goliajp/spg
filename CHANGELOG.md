@@ -10,6 +10,92 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1] — 2026-06-03 (logical replication series — release roll-up)
+
+v6.1 closes the second-biggest gap from the PG-19 audit: **logical
+replication** (Publication / Subscription) with cascading, cycle
+detection, consistent-read barriers, and opt-in gating. Built on
+the v6.0 vector advancement baseline and v6.1.0 / v6.1.1
+performance preludes (HNSW graph compaction + PG-wire Extended
+Query Protocol).
+
+The whole logical-replication path stays in-house: 0 external
+dependencies, no `unsafe` outside the v6.0 NEON aarch64 carve-out,
+WAL format unchanged from v6.0.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.1.0 | HNSW graph adjacency `Vec<u32>` (−78 MiB at 1M dim-128 SQ8) |
+| 6.1.1 | PG-wire Extended Query Protocol — real AST-cached prepared statements |
+| 6.1.2 | `CREATE PUBLICATION` / `DROP PUBLICATION` DDL + `spg_publications` catalog |
+| 6.1.3 | `SHOW PUBLICATIONS` + `FOR TABLE` / `FOR ALL TABLES EXCEPT` parser surface |
+| 6.1.4 | `CREATE SUBSCRIPTION` + subscriber background worker (`MAGIC_SUB` protocol) |
+| 6.1.5 | publisher-side WAL filtering by publication (lightweight owner scanner ≤ 200 ns/record) |
+| 6.1.6 | cascading A → B → C + direct-cycle detection via per-cluster `cluster_id` |
+| 6.1.7 | `WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>]` — read-after-write barrier |
+| 6.1.8 | `SET / SHOW effective_wal_level` — opt-in gate for the MAGIC_SUB endpoint |
+| 6.1.9 | chaos e2e (multi-cycle netsplit + heal under load) |
+| 6.1.10 | ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.1 target | measured |
+|--------|------------:|---------:|
+| Publisher + subscriber row consistency over 1000-row netsplit cycle | 100 % | ✅ 100 % |
+| Publisher-side owner extraction cost | ≤ 200 ns/record | ✅ 41 ns/record |
+| Cascading three-node chain consistency | 100 % | ✅ 100 % |
+| `WAIT FOR WAL POSITION` resolves within timeout when target reached | < 200 ms after catchup | ✅ |
+| Existing v6.0 follower path (MAGIC_V2) regression | 0 % | ✅ no regression (`e2e_chaos_netsplit` 3/3 unchanged) |
+| 4-corpus sqllogictest pass rate | 100 % | ✅ 148 + 17 + 144 + 63 |
+
+### Frozen surfaces (added to STABILITY.md)
+
+- `CREATE / DROP / SHOW PUBLICATION` grammar + 3 scope variants
+- `CREATE / DROP / SHOW SUBSCRIPTION` grammar
+- `WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>]`
+- `SET / SHOW effective_wal_level` (replica / logical)
+- `MAGIC_SUB` replication protocol — handshake format + frame
+  types (`FRAME_TYPE_WAL` / `FRAME_TYPE_STATUS` / `FRAME_TYPE_SKIP`)
+- Snapshot envelope v3 (publications trailer) + v4 (publications
+  + subscriptions trailers)
+- `<wal_path>.cluster_id` sidecar (8 bytes LE)
+
+### Known limitations (out of v6.1)
+
+- DDL doesn't propagate through MAGIC_SUB (subscriber-side
+  schema drift is the operator's problem; same as PG logical
+  replication).
+- Indirect cycles (A → B → A through a chain of subscribers)
+  aren't detected — needs WAL-record-level originator tagging.
+  Direct self-loop is caught at the MAGIC_SUB cluster_id
+  handshake step.
+- Per-row publication predicates (PG's `WHERE` clause on
+  publications) — v7 territory.
+- v6.1.4 ↔ v6.1.5 wire-protocol break: v6.1.5 masters expect
+  the publication-name list immediately after the offset; a
+  v6.1.4 subscriber blocks on the master's read. Operators
+  upgrade subscribers before masters.
+- v6.1.2+ snapshot envelope (v3 / v4) is not backward-loadable
+  by pre-v6.1.2 binaries; the read fails loudly on unknown
+  version (no silent data loss).
+- `effective_wal_level` is not persisted across restarts; the
+  `SPG_WAL_LEVEL` env var is the persistence mechanism.
+- 100K-row + 2-subscriber + cascading chaos soak from the
+  v6.1.9 design is a release-process gate, not a CI gate.
+
+---
+
+## [6.1.10] — 2026-06-03 (v6.1 series ship rollup)
+
+Release-process commit for the v6.1 logical-replication series.
+Adds the high-level v6.1 entry above (sub-version map + measured
+goals + frozen-surface inventory + limitations), PROD_READY rows
+7.9 – 7.15, and updates `MEMORY.md` index entries. No code change.
+
+---
+
 ## [6.1.9] — 2026-06-03 (chaos e2e for the logical-replication topology)
 
 Eighth v6.1.x sub-version. Adds end-to-end chaos coverage of the
