@@ -10,6 +10,118 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.5] — 2026-06-03 (Observability v2 — release roll-up)
+
+v6.5 closes the **thirteenth-gap cluster** from the PG-19 audit:
+SQL-queryable runtime state. Pre-v6.5 SPG exposed `/metrics`
+HTTP + `SHOW PUBLICATIONS/SUBSCRIPTIONS/USERS` + `spg_statistic`;
+v6.5 adds the per-connection / per-query / per-segment / audit /
+DDL-introspection / wait-event surface PG operators expect to
+grep from psql.
+
+The whole series stays in-house: 0 external dependencies,
+no `unsafe`, WAL on-disk format unchanged from v6.0.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.5.0 | `spg_stat_replication` + `spg_stat_segment` virtual tables |
+| 6.5.1 | `spg_stat_query` per-distinct-SQL LRU stats |
+| 6.5.2 | `spg_stat_activity` per-pgwire-connection state |
+| 6.5.3 | `spg_audit_chain` + `spg_audit_verify` virtual tables |
+| 6.5.4 | DDL introspection: `spg_table_ddl` / `spg_role_ddl` / `spg_database_ddl` |
+| 6.5.5 | Wait events lite — write_lock instrumentation |
+| 6.5.6 | Defaults rebaseline — slow-query log + `SPG_PLAN_CACHE_MAX` env |
+| 6.5.7 | series ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.5 target | measured |
+|--------|------------:|---------:|
+| `SELECT * FROM spg_stat_activity` returns N rows for N conns | ✅ | ✅ |
+| `SELECT * FROM spg_stat_segment` returns 1 row per segment | ✅ | ✅ |
+| `spg_audit_verify` detects empty-chain + clean-chain cases | ✅ | ✅ |
+| `spg_table_ddl` round-trips through Engine::execute | ✅ | ✅ |
+| Slow-query log default threshold | 100 ms | ✅ env-tunable |
+| sqllogictest 4-corpus regression | 100 % | ✅ 372/372 |
+
+### Frozen surfaces added in v6.5
+
+- Virtual tables (read-only, dispatch via name match in
+  exec_select_cancel):
+  - `spg_stat_replication(name, conn_str, publications,
+                          last_received_pos, enabled)`
+  - `spg_stat_segment(segment_id, num_rows, num_pages, total_bytes)`
+  - `spg_stat_query(sql, exec_count, total_us, mean_us, max_us,
+                    last_seen_us)`
+  - `spg_stat_activity(pid, user, started_at_us, current_sql,
+                      wait_event, elapsed_us, in_transaction)`
+  - `spg_audit_chain(seq, ts_ms, prev_hash, entry_hash, sql)`
+  - `spg_audit_verify(verified_count, broken_at_seq)`
+  - `spg_table_ddl(table_name, ddl)`
+  - `spg_role_ddl(role_name, ddl)`
+  - `spg_database_ddl(ddl)`
+
+- Engine API additions:
+  - `ActivityRow`, `ActivityProvider`, `with_activity_provider`
+  - `AuditRow`, `AuditChainProvider`, `AuditVerifier`,
+    `with_audit_providers`
+  - `SlowQueryLogger`, `with_slow_query_log`
+  - `QueryStats`, `query_stats()`, `query_stats_mut()`
+  - `set_plan_cache_max(n)` + `PlanCache::set_max_entries`
+
+- Server surface additions:
+  - `ServerState.connections: RwLock<Vec<Arc<ConnState>>>`
+  - `ConnState { pid, user, started_at_us, current_sql,
+                 wait_event, last_query_start_us, in_transaction }`
+  - `ACTIVITY_STATE` global handle bridging the fn-pointer
+    activity_provider to the live registry
+  - Pgwire 'Q' path appends to AuditLog on modified_catalog
+    statements (was native-wire only pre-v6.5.3)
+
+- Env vars:
+  - `SPG_SLOW_QUERY_THRESHOLD_MS` (default 100)
+  - `SPG_PLAN_CACHE_MAX` (default 256, capped at 256)
+
+### Known v6.5 limitations (carved out, NOT deferred)
+
+- **`spg_audit_verify(from_ts, to_ts)` timestamp range**. SPG's
+  virtual-table dispatch is name-based only; parameterised
+  virtual tables aren't a thing in the current engine. v6.5.3
+  ships the no-arg form that verifies the whole chain. Operators
+  who want range verification WHERE-filter `spg_audit_chain`.
+  Parameterised virtual tables out of v6.x.
+- **Wait events: fsync + group_commit**. Cross-thread state
+  attribution problem — the flusher and group-commit leader
+  threads serve multiple connections without per-follower
+  attribution. v6.5.5 ships write_lock only; full per-event
+  attribution needs a commit-task → ConnState bridge that's
+  bigger work.
+- **Index DDL in spg_table_ddl / spg_database_ddl**. v6.5.4
+  emits CREATE TABLE + CREATE USER only; CREATE INDEX needs a
+  separate per-table indices walk + method/option synthesis.
+  Indexes-in-DDL out of v6.5.
+- **`spg_stat_segment.table_name`**. Storage layer doesn't
+  persist a segment → table mapping; segments are looked up by
+  id off RowLocator::Cold. Adding the back-reference requires
+  storage-side index expansion. Out of v6.5.
+- **pg_stat_database / pg_stat_user_tables / per-table modify
+  counters** (n_tup_ins, n_tup_upd, n_dead_tup). SPG's catalog
+  doesn't keep persistent per-table modify counters beyond
+  v6.2.1's auto-analyze tracker. Out of v6.x.
+- **Per-query EXPLAIN cache**. spg_stat_query holds SQL +
+  timings, NOT the cached EXPLAIN tree. Joining stat with
+  EXPLAIN ANALYZE is operator-driven.
+- **PG `pg_stat_statements` byte-for-byte column parity**.
+  spg_stat_query is the equivalent surface but doesn't aim for
+  exact column-name compatibility.
+- **WAL receiver / decoded WAL inspection** (`pg_get_wal_records`).
+  SPG's WAL format is internal; full WAL introspection is a
+  separate large surface.
+
+---
+
 ## [6.4] — 2026-06-03 (SQL polish — release roll-up)
 
 v6.4 closes the **twelfth-gap cluster** from the PG-19 audit:
