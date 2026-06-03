@@ -1331,6 +1331,12 @@ impl Engine {
                 affected: 0,
                 modified_catalog: false,
             }),
+            // v7.9.27 — DO $$ ... $$ is also a no-op (SPG has no
+            // PL/pgSQL). mailrs H1 + pg_dump compat.
+            Statement::DoBlock => Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            }),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Update(s) => self.exec_update_cancel(&s, cancel),

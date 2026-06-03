@@ -22,6 +22,13 @@ pub enum Statement {
     /// (notably `pgvector`) load against SPG without splitting
     /// init scripts. mailrs migration follow-up F3.
     CreateExtension(String),
+    /// v7.9.27 — PG `DO $$ … $$ [LANGUAGE plpgsql];` block. SPG
+    /// has no PL/pgSQL; engine returns CommandOk no-op so
+    /// `pg_dump` output with idempotent DO migrations loads
+    /// against SPG without splitting scripts. The lexer
+    /// consumes the dollar-quoted body into a discarded
+    /// Token::String. mailrs migration follow-up H1.
+    DoBlock,
     CreateIndex(CreateIndexStatement),
     Insert(InsertStatement),
     /// v4.4 — `UPDATE <table> SET col=expr [, ...] [WHERE cond]`.
@@ -1169,6 +1176,7 @@ impl fmt::Display for Statement {
             Self::CreateExtension(name) => {
                 write!(f, "CREATE EXTENSION IF NOT EXISTS {}", quote_ident(name))
             }
+            Self::DoBlock => f.write_str("DO $$ /* SPG no-op */ $$"),
             Self::DropPublication(name) => {
                 write!(f, "DROP PUBLICATION {}", quote_ident(name))
             }

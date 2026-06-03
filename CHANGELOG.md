@@ -77,6 +77,13 @@ Sub-versions:
   v7.9.21  G4 — runtime DEFAULT (now() / current_timestamp evaluated at INSERT)
   v7.9.22  G5 — HNSW pgvector opclass syntax `(col vector_cosine_ops)`
   v7.9.23  D-validate-2 ship: tag v7.9.2 + crates.io + docker
+  v7.9.24  H2 — `LIMIT $N` placeholder (prepared-statement param)
+  v7.9.25  H3a — `::INTERVAL` cast target (PG-style time arithmetic)
+  v7.9.26  H3b — `::regtype` / `::regclass` accept (cast returns text)
+  v7.9.26b pg_dump — `CREATE INDEX … USING gin/gist/spgist/hash` accept (no-op + BTree fallback)
+  v7.9.27  H1 — `DO $$ … $$ [LANGUAGE plpgsql]` no-op (dollar-quoted lexer + DO statement)
+  v7.9.27b pg_dump — `IS [NOT] DISTINCT FROM` NULL-safe equality
+  v7.9.28  D-validate-3 ship: tag v7.9.3 + crates.io + docker
 
 This closes the blocker list in
 `.claude/notes/mailrs-migration-feedback.md`. Remaining items

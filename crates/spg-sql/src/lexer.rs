@@ -364,11 +364,65 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 out.push(Token::NotEq);
                 i += 2;
             }
+            // v7.9.27 — PG dollar-quoted string `$$ … $$` (or
+            // `$tag$ … $tag$`). Used in `DO $$ … $$ LANGUAGE
+            // plpgsql;` blocks that pg_dump emits for idempotent
+            // migrations. SPG has no PL/pgSQL, so the lexer
+            // consumes the entire string as a single Token::String
+            // and the parser treats the surrounding `DO …;` as a
+            // no-op. mailrs follow-up H1.
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'$' => {
+                // Empty tag form: `$$ … $$`.
+                let end = find_dollar_tag_end(bytes, i + 2, b"$$");
+                let body = match end {
+                    Some(e) => &input[i + 2..e],
+                    None => {
+                        return Err(LexError {
+                            kind: LexErrorKind::UnterminatedString,
+                            pos: i,
+                        });
+                    }
+                };
+                out.push(Token::String(body.to_string()));
+                i = end.unwrap() + 2;
+            }
+            b'$' if i + 1 < bytes.len()
+                && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') =>
+            {
+                // Tagged form: `$foo$ … $foo$`. Scan the tag
+                // ident, find the closing copy.
+                let mut j = i + 1;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j >= bytes.len() || bytes[j] != b'$' {
+                    // Not a dollar-quoted string — fall through
+                    // to the generic-unknown-char path.
+                    let ch = input[i..].chars().next().unwrap_or('?');
+                    return Err(LexError {
+                        kind: LexErrorKind::UnknownChar(ch),
+                        pos: i,
+                    });
+                }
+                let close: alloc::vec::Vec<u8> = bytes[i..=j].to_vec();
+                let end = find_dollar_tag_end(bytes, j + 1, &close);
+                let body = match end {
+                    Some(e) => &input[j + 1..e],
+                    None => {
+                        return Err(LexError {
+                            kind: LexErrorKind::UnterminatedString,
+                            pos: i,
+                        });
+                    }
+                };
+                out.push(Token::String(body.to_string()));
+                i = end.unwrap() + close.len();
+            }
             // v6.1.1: `$N` parameter placeholder for the extended
             // query protocol. PG numbers them 1..=N; we reject $0
-            // and a bare `$` not followed by a digit. Dollar-quoted
-            // strings ($$ ... $$) are not supported here — they're
-            // a separate lexer feature filed for a future release.
+            // and a bare `$` not followed by a digit.
             b'$' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() => {
                 let mut j = i + 1;
                 let mut n: u32 = 0;
@@ -401,6 +455,22 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 
 fn peek_eq(bytes: &[u8], i: usize, target: u8) -> bool {
     bytes.get(i) == Some(&target)
+}
+
+/// v7.9.27 — find the start index of the next occurrence of `tag`
+/// (e.g. `b"$$"` or `b"$foo$"`) in `bytes` starting at `from`.
+fn find_dollar_tag_end(bytes: &[u8], from: usize, tag: &[u8]) -> Option<usize> {
+    if tag.is_empty() || from > bytes.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + tag.len() <= bytes.len() {
+        if &bytes[i..i + tag.len()] == tag {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn peek_pred<F: Fn(&u8) -> bool>(bytes: &[u8], i: usize, pred: F) -> bool {
