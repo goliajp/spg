@@ -931,6 +931,21 @@ pub enum CastTarget {
     Vector,
     Date,
     Timestamp,
+    /// v7.9.25 — `::INTERVAL` and `::TIMESTAMPTZ`. mailrs follow-up
+    /// H3a. Engine reuses the existing runtime-interval / timestamp
+    /// paths (parse the text input, return the matching Value).
+    Interval,
+    Timestamptz,
+    /// v7.9.25 — `::JSON` and `::JSONB`. SPG already has both
+    /// types (v7.9.0); the cast just routes Text→Json with the
+    /// requested OID for the wire layer.
+    Json,
+    Jsonb,
+    /// v7.9.26 — `::regtype` / `::regclass`. Parsed for PG dump
+    /// compatibility; engine surfaces as Unsupported with a
+    /// hint to use `SHOW TABLES` or `spg_table_ddl`. mailrs F3b.
+    RegType,
+    RegClass,
 }
 
 impl fmt::Display for CastTarget {
@@ -942,6 +957,12 @@ impl fmt::Display for CastTarget {
             Self::Text => "text",
             Self::Bool => "bool",
             Self::Vector => "vector",
+            Self::Interval => "interval",
+            Self::Timestamptz => "timestamptz",
+            Self::Json => "json",
+            Self::Jsonb => "jsonb",
+            Self::RegType => "regtype",
+            Self::RegClass => "regclass",
             Self::Date => "date",
             Self::Timestamp => "timestamp",
         })

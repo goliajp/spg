@@ -2472,16 +2472,26 @@ impl Parser {
         loop {
             if matches!(self.peek(), Token::DoubleColon) {
                 self.advance();
+                // v7.9.25 / v7.9.26 — broaden the postfix `::` cast
+                // target set to include INTERVAL (reserved Token),
+                // TIMESTAMPTZ, and PG catalog regtype / regclass.
+                // mailrs follow-up H3a + H3b.
                 let target = match self.advance() {
-                    Token::Ident(s) => match s.as_str() {
-                        "int" => CastTarget::Int,
-                        "bigint" => CastTarget::BigInt,
-                        "float" => CastTarget::Float,
+                    Token::Ident(s) => match s.to_ascii_lowercase().as_str() {
+                        "int" | "integer" | "int4" => CastTarget::Int,
+                        "bigint" | "int8" => CastTarget::BigInt,
+                        "float" | "double" | "real" => CastTarget::Float,
                         "text" => CastTarget::Text,
-                        "bool" => CastTarget::Bool,
+                        "bool" | "boolean" => CastTarget::Bool,
                         "vector" => CastTarget::Vector,
                         "date" => CastTarget::Date,
                         "timestamp" | "datetime" => CastTarget::Timestamp,
+                        "timestamptz" => CastTarget::Timestamptz,
+                        "interval" => CastTarget::Interval,
+                        "json" => CastTarget::Json,
+                        "jsonb" => CastTarget::Jsonb,
+                        "regtype" => CastTarget::RegType,
+                        "regclass" => CastTarget::RegClass,
                         other => {
                             return Err(ParseError {
                                 message: format!("unsupported cast target `::{other}`"),
@@ -2489,6 +2499,7 @@ impl Parser {
                             });
                         }
                     },
+                    Token::Interval => CastTarget::Interval,
                     other => {
                         return Err(ParseError {
                             message: format!("expected type ident after `::`, got {other:?}"),
