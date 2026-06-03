@@ -714,6 +714,15 @@ pub enum BinOp {
     /// TEXT (unwraps a top-level JSON string; renders other scalars
     /// as their canonical text).
     JsonGetText,
+    /// v6.4.5 `json #> path_text` — walk the path encoded as a PG
+    /// text array literal like `'{a,0,b}'`. Returns JSON.
+    JsonGetPath,
+    /// v6.4.5 `json #>> path_text` — same walk, returns TEXT.
+    JsonGetPathText,
+    /// v6.4.5 `json @> sub_json` — containment. Returns BOOL; true
+    /// when every key/value in `sub_json` is structurally present in
+    /// the left side. Matches PG semantics (top-level + recursive).
+    JsonContains,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1260,6 +1269,9 @@ impl fmt::Display for BinOp {
             Self::Concat => "||",
             Self::JsonGet => "->",
             Self::JsonGetText => "->>",
+            Self::JsonGetPath => "#>",
+            Self::JsonGetPathText => "#>>",
+            Self::JsonContains => "@>",
         })
     }
 }

@@ -74,6 +74,15 @@ pub enum Token {
     JsonGet,
     /// v4.14 `->>` — same access, returns text.
     JsonGetText,
+    /// v6.4.5 `#>` — JSON path walk, returns json. Path is the
+    /// right-hand TEXT with PG `{a,b,0}` syntax.
+    JsonGetPath,
+    /// v6.4.5 `#>>` — same walk, returns text.
+    JsonGetPathText,
+    /// v6.4.5 `@>` — JSON containment. `j @> sub` returns true if
+    /// every key/value in `sub` is present in `j` with structural
+    /// containment for objects + arrays.
+    JsonContains,
     L2Distance,
     /// pgvector inner-product operator `<#>` (returns negative dot product
     /// so smaller still means more similar — same semantics as pgvector).
@@ -274,6 +283,33 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     i += 2;
                 } else {
                     single(&mut out, Token::Minus, &mut i);
+                }
+            }
+            // v6.4.5: `#>>` and `#>` JSON path walk.
+            b'#' => {
+                if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'>') {
+                    out.push(Token::JsonGetPathText);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'>') {
+                    out.push(Token::JsonGetPath);
+                    i += 2;
+                } else {
+                    return Err(LexError {
+                        kind: LexErrorKind::UnknownChar('#'),
+                        pos: i,
+                    });
+                }
+            }
+            // v6.4.5: `@>` JSON containment.
+            b'@' => {
+                if peek_eq(bytes, i + 1, b'>') {
+                    out.push(Token::JsonContains);
+                    i += 2;
+                } else {
+                    return Err(LexError {
+                        kind: LexErrorKind::UnknownChar('@'),
+                        pos: i,
+                    });
                 }
             }
             b'*' => single(&mut out, Token::Star, &mut i),

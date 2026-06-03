@@ -1550,6 +1550,9 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::Concat => Ok(text_concat(&l, &r)),
         BinOp::JsonGet => crate::json::path_get(&l, &r, false),
         BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
+        BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
+        BinOp::JsonGetPathText => crate::json::path_walk(&l, &r, true),
+        BinOp::JsonContains => crate::json::contains(&l, &r),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
@@ -2224,7 +2227,10 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::CosineDistance
         | BinOp::Concat
         | BinOp::JsonGet
-        | BinOp::JsonGetText => {
+        | BinOp::JsonGetText
+        | BinOp::JsonGetPath
+        | BinOp::JsonGetPathText
+        | BinOp::JsonContains => {
             unreachable!("compare() only called with comparison ops")
         }
     };
