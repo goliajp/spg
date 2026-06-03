@@ -72,6 +72,13 @@ impl PlanCache {
         self.entries.is_empty()
     }
 
+    /// Read-only peek without LRU promotion. Used by introspection
+    /// and v6.3.1 tests that want to inspect a cached plan's
+    /// metadata without mutating the cache.
+    pub fn get_snapshot(&self, sql: &str) -> Option<&PreparedPlan> {
+        self.entries.get(sql)
+    }
+
     /// Returns the cached plan if present and promotes it to most-
     /// recently-used. Returns `None` on miss.
     pub fn get(&mut self, sql: &str) -> Option<&PreparedPlan> {
