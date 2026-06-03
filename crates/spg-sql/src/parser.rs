@@ -1080,6 +1080,46 @@ impl Parser {
                 parent_columns.len()
             )));
         }
+        // v7.6.7 — accept and reject `[NOT] DEFERRABLE [INITIALLY
+        // {DEFERRED | IMMEDIATE}]` so existing PG dumps don't fail
+        // at parse time. SPG's single-writer model has no deferred
+        // constraint window, so we surface this as a clean
+        // unsupported-feature error rather than a syntax error.
+        loop {
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable")) {
+                return Err(self.err(
+                    "DEFERRABLE constraints are not supported (SPG is single-writer; \
+                     constraints are always evaluated immediately at commit)"
+                        .into(),
+                ));
+            }
+            if matches!(self.peek(), Token::Not) {
+                let look = self.tokens.get(self.pos + 1);
+                if matches!(look, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")) {
+                    // NOT DEFERRABLE — accept as the SPG default
+                    // and consume both tokens silently.
+                    self.advance();
+                    self.advance();
+                    // Optional `INITIALLY IMMEDIATE` clause.
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially"))
+                    {
+                        self.advance();
+                        match self.advance() {
+                            Token::Ident(s) if s.eq_ignore_ascii_case("immediate") => {}
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected IMMEDIATE after INITIALLY for NOT DEFERRABLE, \
+                                     got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                break;
+            }
+            break;
+        }
         // Optional `ON DELETE <action>` and `ON UPDATE <action>` in
         // either order, each at most once.
         let mut on_delete = FkAction::Restrict;

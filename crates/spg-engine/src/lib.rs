@@ -7214,22 +7214,22 @@ fn pick_pk_index_column(
     })
 }
 
-/// v7.6.2 — INSERT-side FK enforcement. For every row about to be
-/// inserted into `child_table`, every FK declared on that table is
-/// checked: the row's FK columns must either be NULL (SQL spec
-/// skip) or match an existing parent row via the parent's BTree
-/// PK / UNIQUE index.
+/// v7.6.2 / v7.6.7 — INSERT-side FK enforcement. For every row
+/// about to be inserted into `child_table`, every FK declared on
+/// that table is checked: the row's FK columns must either be
+/// NULL (SQL spec skip) or match an existing parent row via the
+/// parent's BTree PK / UNIQUE index.
 ///
 /// Returns `EngineError::Unsupported` with a `FOREIGN KEY violation`
-/// payload on first failure — wire layer translates this to PG
-/// SQLSTATE 23503 in v7.6.10.
+/// payload on first failure.
 ///
-/// Self-referencing FKs (parent table == child table): the parent
-/// rows visible to this check are the rows *already* in the table
-/// before this INSERT batch. v7.6.2 ships the simple read-modify
-/// model — within a single INSERT batch, a row cannot reference
-/// another row introduced by the same statement. The cycle-tolerant
-/// form lands in v7.6.7.
+/// **Self-referencing FKs (v7.6.7 widening):** when `fk.parent_table
+/// == child_table`, the parent rows visible to this check are
+///  (a) rows already committed to the table, plus
+///  (b) earlier rows from the *same* `rows` batch.
+/// This makes `INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2)`
+/// work in a single statement — common pattern for bulk-loading
+/// hierarchies.
 fn enforce_fk_inserts(
     catalog: &Catalog,
     child_table: &str,
@@ -7253,11 +7253,10 @@ fn enforce_fk_inserts(
                 })
             })?
         };
-        for row_values in rows {
+        for (batch_idx, row_values) in rows.iter().enumerate() {
             // Single-column FK fast path: try the parent's BTree
-            // index for an O(log n) lookup. Composite FKs scan in
-            // v7.6.2; v7.6.7 widens this to multi-column index
-            // probes once SPG grows composite indices.
+            // index for an O(log n) lookup. Composite FKs fall back
+            // to a parent-row scan.
             if fk.local_columns.len() == 1 {
                 let v = &row_values[fk.local_columns[0]];
                 if matches!(v, Value::Null) {
@@ -7270,13 +7269,20 @@ fn enforce_fk_inserts(
                         v.data_type()
                     ))
                 })?;
-                let present = parent.indices().iter().any(|idx| {
+                let present_committed = parent.indices().iter().any(|idx| {
                     matches!(idx.kind, spg_storage::IndexKind::BTree(_))
                         && idx.column_position == parent_col
                         && idx.partial_predicate.is_none()
                         && !idx.lookup_eq(&key).is_empty()
                 });
-                if !present {
+                // v7.6.7 self-ref widening: also accept a match
+                // against earlier rows in this same batch when the
+                // FK points at the table being inserted into.
+                let present_in_batch = parent_is_self
+                    && rows[..batch_idx].iter().any(|earlier| {
+                        earlier.get(parent_col) == Some(v)
+                    });
+                if !(present_committed || present_in_batch) {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "FOREIGN KEY violation: no parent row in {:?} where {} = {:?}",
                         fk.parent_table,
@@ -7289,9 +7295,9 @@ fn enforce_fk_inserts(
                     )));
                 }
             } else {
-                // Composite FK: scan parent rows. v7.6.2 keeps
-                // this simple; v7.6.7 wires it into a composite
-                // index probe.
+                // Composite FK: scan parent rows. v7.6.7 also
+                // accepts a match against earlier rows in the same
+                // batch (self-ref bulk-loading of hierarchies).
                 if fk.local_columns
                     .iter()
                     .all(|&i| matches!(row_values.get(i), Some(Value::Null)))
@@ -7299,13 +7305,20 @@ fn enforce_fk_inserts(
                     continue;
                 }
                 let local: Vec<&Value> = fk.local_columns.iter().map(|&i| &row_values[i]).collect();
-                let parent_match = parent.rows().iter().any(|prow| {
+                let parent_match_committed = parent.rows().iter().any(|prow| {
                     fk.parent_columns
                         .iter()
                         .enumerate()
                         .all(|(i, &pi)| prow.values.get(pi) == Some(local[i]))
                 });
-                if !parent_match {
+                let parent_match_in_batch = parent_is_self
+                    && rows[..batch_idx].iter().any(|earlier| {
+                        fk.parent_columns
+                            .iter()
+                            .enumerate()
+                            .all(|(i, &pi)| earlier.get(pi) == Some(local[i]))
+                    });
+                if !(parent_match_committed || parent_match_in_batch) {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "FOREIGN KEY violation: no parent row in {:?} matching composite key",
                         fk.parent_table,
@@ -7549,8 +7562,11 @@ fn plan_fk_parent_updates(
     if plan_with_old.is_empty() {
         return Ok(Vec::new());
     }
-    // For each child table we may touch, build per-child step lists.
-    let mut delete_plan: BTreeMap<String, alloc::collections::BTreeSet<usize>> = BTreeMap::new();
+    // For each child table we may touch, build per-child step
+    // lists. UPDATE never deletes children — `delete_plan` stays
+    // empty here but is kept structurally aligned with
+    // `plan_fk_parent_deletions` for future use.
+    let delete_plan: BTreeMap<String, alloc::collections::BTreeSet<usize>> = BTreeMap::new();
     let mut setnull_plan: BTreeMap<
         String,
         alloc::collections::BTreeSet<(usize, usize)>,
