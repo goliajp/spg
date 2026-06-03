@@ -675,6 +675,34 @@ impl Default for Database {
     }
 }
 
+/// v7.7.5 — observability snapshot returned by
+/// [`Database::metrics`]. Plain data, no allocations beyond
+/// what the struct itself takes; cheap to construct and
+/// cheap to serialise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EmbeddedMetrics {
+    /// Total live row count across every user table (hot
+    /// tier only — cold-tier rows live in segment files).
+    pub hot_rows: u64,
+    /// Sum of `Table::hot_bytes` across every user table.
+    /// Tracks against the freezer's `hot_tier_bytes` budget.
+    pub hot_bytes: u64,
+    /// Number of cold-tier segments registered in the catalog.
+    /// Includes tombstoned slots (segments retired by
+    /// compaction whose disk file may still be on disk).
+    pub cold_segments: u64,
+    /// User-table count (excludes any future engine-managed
+    /// internal tables).
+    pub tables: u64,
+    /// WAL size at last `execute()` / `checkpoint()`. Zero
+    /// when the database is in-memory.
+    pub wal_bytes: u64,
+    /// `true` when the database was opened with `open_path` —
+    /// i.e. WAL + checkpoint persistence is active.
+    pub persistent: bool,
+}
+
 /// v7.2.1 — handle returned by `spawn_background_freezer`.
 /// Drop signals the worker thread to wind down + joins it,
 /// so a `Database` (or its shared `Arc<Mutex<Database>>`)
@@ -752,6 +780,39 @@ impl Database {
     #[must_use]
     pub fn cold_segment_count(&self) -> usize {
         self.engine.catalog().cold_segment_count()
+    }
+
+    /// v7.7.5 — observability snapshot. Returns a point-in-time
+    /// view of the engine + persistence counters. Cheap (no
+    /// locks beyond the existing `&self` borrow), so safe to
+    /// call from a hot metrics-scrape path.
+    ///
+    /// Fields mirror the operational dashboard
+    /// [`spg-server`](https://crates.io/crates/spg-server) exposes,
+    /// minus the network counters that don't apply to embedded.
+    #[must_use]
+    pub fn metrics(&self) -> EmbeddedMetrics {
+        let cat = self.engine.catalog();
+        let mut hot_rows: u64 = 0;
+        let mut hot_bytes: u64 = 0;
+        for name in cat.table_names() {
+            if let Some(t) = cat.get(&name) {
+                hot_rows = hot_rows.saturating_add(t.row_count() as u64);
+                hot_bytes = hot_bytes.saturating_add(t.hot_bytes());
+            }
+        }
+        let (wal_bytes, persistent) = match &self.persistence {
+            Some(p) => (p.wal_len, true),
+            None => (0, false),
+        };
+        EmbeddedMetrics {
+            hot_rows,
+            hot_bytes,
+            cold_segments: cat.cold_segment_count() as u64,
+            tables: cat.table_count() as u64,
+            wal_bytes,
+            persistent,
+        }
     }
 
     /// v7.2.1 — spawn a background thread that periodically
