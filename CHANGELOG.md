@@ -8,6 +8,70 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.7] — 2026-06-03 (Embedded production-ready)
+
+Brings `spg-embedded` from "works" to "publishable". Eight
+sub-versions, no breaking changes — every addition is on top
+of the v7.6 surface.
+
+Surface added:
+
+- **README + 6 runnable examples** — `cargo add spg-embedded`
+  → 30-second tour. `examples/{hello, persistent, typed,
+  transactions, vector_knn, foreign_keys}.rs` all build and
+  run via `cargo run --example NAME`.
+- **`Database::metrics() -> EmbeddedMetrics`** — point-in-time
+  observability snapshot (hot_rows, hot_bytes, cold_segments,
+  tables, wal_bytes, persistent). `#[non_exhaustive]` so
+  future fields ship as minor bumps.
+- **`Database::cold_segment_count()`** — single accessor for
+  dashboards.
+- **`spg_embedded::revert_wal_to_seq(wal, n, out)`** — embedded
+  rewind. Same semantics as the CLI `spg revert` subcommand;
+  returns count of statements applied.
+- **`FreezerOptions.compact_when_segments_exceed`** /
+  **`compact_target_bytes`** — auto-compaction in the
+  background freezer. Default threshold 64 segments
+  (matches `spg-server`). Set to `usize::MAX` to disable.
+
+Quality:
+
+- **`#![deny(missing_docs)]`** on the `spg-embedded` crate
+  root. Every `pub` item carries a doc-comment; CI fails on
+  any future `pub` lacking one.
+- **Chaos test suite** — 5 crash scenarios: clean reopen,
+  torn-tail WAL recovery, stray checkpoint .tmp ignored,
+  freezer-during-drop is panic-free, explicit
+  checkpoint round-trip.
+- **Bench suite** with public numbers in README:
+  INSERT in-memory ~0.6 µs (1.7 M ops/s), persistent INSERT
+  one-fsync ~4 ms, SELECT PK seek ~1.7 µs, vector kNN
+  k=10 dim=8 ~1.9 µs.
+- **`crates.io` metadata** on every crate (description,
+  repository, categories, keywords). `PUBLISH_ORDER.md` at
+  repo root documents the full publish flow including the
+  dependency-ordered crate list.
+
+Sub-versions:
+
+  v7.7.0  README.md + examples/
+  v7.7.1  embedded chaos suite
+  v7.7.2  rustdoc 100% + missing_docs deny
+  v7.7.3  benchmarks + README QPS
+  v7.7.4  background freezer auto-compact
+  v7.7.5  Database::metrics() observability hook
+  v7.7.6  revert_wal_to_seq rewind API
+  v7.7.7  crates.io publish metadata + PUBLISH_ORDER.md
+  v7.7.8  series ship rollup + tag + docker push
+
+Image `goliakk/spg:7.7.0` is byte-identical to `7.6.0` —
+the code embedded in the server binary didn't change in v7.7
+(all additions are on the embedded crate). The retag exists
+so `docker pull goliakk/spg:7.7` matches the documentation
+version.
+
+---
+
 ## [7.6] — 2026-06-03 (Foreign keys)
 
 Adds the full SQL `FOREIGN KEY` surface. Together with the
