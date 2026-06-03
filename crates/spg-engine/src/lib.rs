@@ -2553,6 +2553,8 @@ impl Engine {
             IndexMethod::Hnsw => {
                 table.add_nsw_index(stmt.name, &stmt.column, spg_storage::NSW_DEFAULT_M)?;
             }
+            // v6.7.1 — BRIN. Pure metadata; no in-memory data.
+            IndexMethod::Brin => table.add_brin_index(stmt.name, &stmt.column)?,
         }
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.

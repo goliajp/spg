@@ -110,6 +110,22 @@ pub const SEGMENT_MAGIC: [u8; 8] = *b"SPGSEG\x01\x00";
 /// files (magic `SPGSEG\x01\x00`) still load through the legacy
 /// parser path with zero changes.
 pub const SEGMENT_MAGIC_V2: [u8; 8] = *b"SPGSEG\x02\x00";
+
+/// v6.7.1 — BRIN sidecar tag inside the v2 envelope's inner bytes.
+/// Distinguishes "inner is plain v1 bytes" (current) from "inner is
+/// `[BRIN_SIDECAR_MAGIC][u32 brin_section_len][BRIN entries][v1 segment bytes]`".
+/// Distinct prefix so a v1 segment (which starts with `SPGSEG\x01\x00`)
+/// can't be confused with a BRIN-sidecar-wrapped inner.
+pub const BRIN_SIDECAR_MAGIC: [u8; 4] = *b"BRIN";
+
+/// v6.7.1 — one BRIN summary entry: (page_index, min_key, max_key).
+/// 20 bytes on disk: `[u32 page_index][u64 min_key][u64 max_key]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrinSummary {
+    pub page_index: u32,
+    pub min_key: u64,
+    pub max_key: u64,
+}
 pub(crate) const SEGMENT_V2_HEADER_LEN: usize = 8 + 1 + 4;
 pub const SEGMENT_COMPRESS_ALGO_NONE: u8 = 0;
 pub const SEGMENT_COMPRESS_ALGO_LZSS: u8 = 1;
@@ -699,6 +715,87 @@ pub struct SegmentReader<'a> {
     metadata: SegmentMetadata,
 }
 
+/// v6.7.1 — derive per-page BRIN summaries from an encoded v1
+/// segment. Walks the segment's `scan()` iterator + the page-index
+/// section to bucket each key into its source page; returns one
+/// `BrinSummary { page_index, min_key, max_key }` per page in
+/// page-order. Used by `wrap_v2_envelope_with_brin` to emit the
+/// sidecar at freeze time, and exposed publicly for compaction +
+/// future planner work.
+pub fn derive_brin_summaries(v1_bytes: &[u8]) -> Result<Vec<BrinSummary>, SegmentError> {
+    let reader = SegmentReader::open(v1_bytes)?;
+    let num_pages = reader.meta().num_pages as usize;
+    if num_pages == 0 {
+        return Ok(Vec::new());
+    }
+    // Page-index entries' first_pk values bound the pages. Walk
+    // the scan iterator; group keys by the page whose first_pk is
+    // the greatest one ≤ the current key.
+    let page_starts: Vec<u64> = reader.metadata.page_index.iter().map(|e| e.first_pk).collect();
+    let mut min_by_page: Vec<Option<u64>> = alloc::vec![None; num_pages];
+    let mut max_by_page: Vec<Option<u64>> = alloc::vec![None; num_pages];
+    let mut current_page: usize = 0;
+    for (key, _) in reader.scan() {
+        while current_page + 1 < num_pages && key >= page_starts[current_page + 1] {
+            current_page += 1;
+        }
+        if min_by_page[current_page].is_none() {
+            min_by_page[current_page] = Some(key);
+        }
+        max_by_page[current_page] = Some(key);
+    }
+    let mut out = Vec::with_capacity(num_pages);
+    for p in 0..num_pages {
+        let (Some(min_key), Some(max_key)) = (min_by_page[p], max_by_page[p]) else {
+            continue;
+        };
+        out.push(BrinSummary {
+            page_index: u32::try_from(p).expect("page count fits u32"),
+            min_key,
+            max_key,
+        });
+    }
+    Ok(out)
+}
+
+/// v6.7.1 — wrap v1 segment bytes in a v2 LZSS envelope with a
+/// BRIN sidecar prefixed inside the inner bytes. Layout of inner
+/// before compression:
+///   [4-byte magic "BRIN"]
+///   [u32 LE num_summaries]
+///   [per summary: u32 LE page_index, u64 LE min_key, u64 LE max_key]
+///   [v1 segment bytes]
+/// Reader detects the BRIN magic at the start of inner and parses
+/// the sidecar, then continues to parse the v1 segment.
+/// Falls back to the standard `wrap_v2_envelope` (no sidecar) when
+/// `summaries.is_empty()`.
+#[must_use]
+pub fn wrap_v2_envelope_with_brin(
+    v1_bytes: Vec<u8>,
+    summaries: &[BrinSummary],
+    compress: bool,
+) -> Vec<u8> {
+    if summaries.is_empty() {
+        return wrap_v2_envelope(v1_bytes, compress);
+    }
+    // Build the BRIN-prefixed inner.
+    let brin_section_len = 4 + summaries.len() * 20;
+    let mut inner = Vec::with_capacity(4 + 4 + brin_section_len + v1_bytes.len());
+    inner.extend_from_slice(&BRIN_SIDECAR_MAGIC);
+    let n = u32::try_from(summaries.len()).expect("BRIN summary count fits u32");
+    inner.extend_from_slice(&n.to_le_bytes());
+    for s in summaries {
+        inner.extend_from_slice(&s.page_index.to_le_bytes());
+        inner.extend_from_slice(&s.min_key.to_le_bytes());
+        inner.extend_from_slice(&s.max_key.to_le_bytes());
+    }
+    inner.extend_from_slice(&v1_bytes);
+    // Now wrap the BRIN-prefixed inner into the v2 envelope. The
+    // wrap_v2_envelope helper compresses + emits the envelope
+    // header.
+    wrap_v2_envelope(inner, compress)
+}
+
 /// v6.6.2 — wrap v1 segment bytes in a v2 LZSS envelope when
 /// `compress=true` and the compressed form is strictly smaller.
 /// Returns the v1 bytes unchanged otherwise (the caller's "ship
@@ -723,10 +820,13 @@ pub fn wrap_v2_envelope(v1_bytes: Vec<u8>, compress: bool) -> Vec<u8> {
 }
 
 /// v6.6.2 — unwrap a v2 envelope to v1 bytes. v1-magic input
-/// passes through unchanged.
-pub(crate) fn unwrap_v2_envelope(bytes: Vec<u8>) -> Result<Vec<u8>, SegmentError> {
+/// passes through unchanged. v6.7.1 — also extracts any BRIN
+/// sidecar prefix; returns it alongside the v1 bytes.
+pub(crate) fn unwrap_v2_envelope(
+    bytes: Vec<u8>,
+) -> Result<(Vec<u8>, Vec<BrinSummary>), SegmentError> {
     if bytes.len() < 8 || bytes[..8] != SEGMENT_MAGIC_V2 {
-        return Ok(bytes);
+        return Ok((bytes, Vec::new()));
     }
     if bytes.len() < SEGMENT_V2_HEADER_LEN {
         return Err(SegmentError::TooShort {
@@ -737,11 +837,8 @@ pub(crate) fn unwrap_v2_envelope(bytes: Vec<u8>) -> Result<Vec<u8>, SegmentError
     let algo = bytes[8];
     let inner_len = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]) as usize;
     let inner = &bytes[SEGMENT_V2_HEADER_LEN..];
-    match algo {
+    let decoded = match algo {
         SEGMENT_COMPRESS_ALGO_NONE => {
-            // v2 envelope with no compression (rare — would only
-            // appear if a writer opted in to v2 but the LZSS check
-            // bailed). Return inner directly.
             if inner.len() != inner_len {
                 return Err(SegmentError::BadShape(alloc::format!(
                     "v2 envelope algo=none: declared inner_len {inner_len} \
@@ -749,7 +846,7 @@ pub(crate) fn unwrap_v2_envelope(bytes: Vec<u8>) -> Result<Vec<u8>, SegmentError
                     inner.len()
                 )));
             }
-            Ok(inner.to_vec())
+            inner.to_vec()
         }
         SEGMENT_COMPRESS_ALGO_LZSS => {
             let decompressed = spg_crypto::lzss::decompress(inner)
@@ -760,10 +857,57 @@ pub(crate) fn unwrap_v2_envelope(bytes: Vec<u8>) -> Result<Vec<u8>, SegmentError
                     decompressed.len()
                 )));
             }
-            Ok(decompressed)
+            decompressed
         }
-        other => Err(SegmentError::UnknownCompressionAlgo(other)),
+        other => return Err(SegmentError::UnknownCompressionAlgo(other)),
+    };
+    // v6.7.1 — peek for BRIN sidecar magic.
+    if decoded.len() >= 4 && decoded[..4] == BRIN_SIDECAR_MAGIC {
+        return parse_brin_sidecar_then_v1(decoded);
     }
+    Ok((decoded, Vec::new()))
+}
+
+/// v6.7.1 — parse a BRIN-prefixed inner buffer into (v1_bytes,
+/// summaries). Called by `unwrap_v2_envelope` after the magic
+/// peek confirms BRIN is present.
+fn parse_brin_sidecar_then_v1(
+    decoded: Vec<u8>,
+) -> Result<(Vec<u8>, Vec<BrinSummary>), SegmentError> {
+    if decoded.len() < 8 {
+        return Err(SegmentError::BadShape(alloc::format!(
+            "BRIN sidecar: truncated header ({}B < 8)",
+            decoded.len()
+        )));
+    }
+    let n_summaries =
+        u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]) as usize;
+    let summaries_end = 8 + n_summaries * 20;
+    if decoded.len() < summaries_end {
+        return Err(SegmentError::BadShape(alloc::format!(
+            "BRIN sidecar: truncated body (need {summaries_end}B, have {}B)",
+            decoded.len()
+        )));
+    }
+    let mut summaries = Vec::with_capacity(n_summaries);
+    for i in 0..n_summaries {
+        let off = 8 + i * 20;
+        let page_index =
+            u32::from_le_bytes([decoded[off], decoded[off + 1], decoded[off + 2], decoded[off + 3]]);
+        let mut k = [0u8; 8];
+        k.copy_from_slice(&decoded[off + 4..off + 12]);
+        let min_key = u64::from_le_bytes(k);
+        k.copy_from_slice(&decoded[off + 12..off + 20]);
+        let max_key = u64::from_le_bytes(k);
+        summaries.push(BrinSummary {
+            page_index,
+            min_key,
+            max_key,
+        });
+    }
+    // The v1 segment bytes follow the sidecar section.
+    let v1_bytes = decoded[summaries_end..].to_vec();
+    Ok((v1_bytes, summaries))
 }
 
 impl<'a> SegmentReader<'a> {
@@ -831,6 +975,10 @@ impl<'a> SegmentReader<'a> {
 pub struct OwnedSegment {
     bytes: Vec<u8>,
     metadata: SegmentMetadata,
+    /// v6.7.1 — BRIN per-page summaries when the v2 envelope
+    /// included a BRIN sidecar. Empty when the segment was v1 or
+    /// v2-without-sidecar. Exposed via `brin_summaries()`.
+    brin_summaries: Vec<BrinSummary>,
 }
 
 impl OwnedSegment {
@@ -843,11 +991,24 @@ impl OwnedSegment {
     /// (`SPGSEG\x02\x00`) magics. A v2 file's body is transparently
     /// unwrapped before the v1 parser runs; the unwrapped v1 bytes
     /// become the `bytes` field, so all downstream readers see a
-    /// canonical v1 layout.
+    /// canonical v1 layout. v6.7.1 — also extracts any BRIN
+    /// sidecar.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SegmentError> {
-        let bytes = unwrap_v2_envelope(bytes)?;
+        let (bytes, brin_summaries) = unwrap_v2_envelope(bytes)?;
         let metadata = parse_segment_metadata(&bytes)?;
-        Ok(Self { bytes, metadata })
+        Ok(Self {
+            bytes,
+            metadata,
+            brin_summaries,
+        })
+    }
+
+    /// v6.7.1 — borrow the BRIN per-page summaries when the
+    /// segment was written with a BRIN sidecar. Empty for v1
+    /// segments or v2 without a sidecar.
+    #[must_use]
+    pub fn brin_summaries(&self) -> &[BrinSummary] {
+        &self.brin_summaries
     }
 
     #[must_use]
@@ -1007,6 +1168,74 @@ mod tests {
                 (i * 2 + 1, payload) // sparse keys to exercise binary search
             })
             .collect()
+    }
+
+    #[test]
+    fn brin_summaries_derive_matches_per_page_pk_ranges() {
+        // Encode 200 rows over a few pages; derive BRIN summaries
+        // and assert each page's [min_key, max_key] envelopes
+        // every key in that page.
+        let rows = build_rows(200);
+        let expected: Vec<u64> = rows.iter().map(|(k, _)| *k).collect();
+        let (v1_bytes, meta) =
+            encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
+        let summaries = derive_brin_summaries(&v1_bytes).expect("derive");
+        assert_eq!(summaries.len(), meta.num_pages as usize);
+        // Every key must fall in exactly one summary's range.
+        for k in expected {
+            let hits = summaries
+                .iter()
+                .filter(|s| k >= s.min_key && k <= s.max_key)
+                .count();
+            assert!(hits >= 1, "key {k} not covered by any BRIN summary");
+        }
+        // Summaries are monotone increasing — page N's max < page
+        // N+1's min.
+        for w in summaries.windows(2) {
+            assert!(
+                w[0].max_key < w[1].min_key,
+                "summary ranges overlap: page {} max {} >= page {} min {}",
+                w[0].page_index,
+                w[0].max_key,
+                w[1].page_index,
+                w[1].min_key
+            );
+        }
+    }
+
+    #[test]
+    fn brin_sidecar_round_trips_through_v2_envelope() {
+        let rows = build_rows(150);
+        let (v1_bytes, _) =
+            encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
+        let summaries = derive_brin_summaries(&v1_bytes).expect("derive");
+        assert!(!summaries.is_empty());
+        let wrapped = wrap_v2_envelope_with_brin(v1_bytes, &summaries, true);
+        // Parse it back via OwnedSegment.
+        let seg = OwnedSegment::from_bytes(wrapped).expect("v2+brin parses");
+        // Lookup still works — the v1 bytes are intact inside.
+        assert!(seg.lookup(1).is_some(), "lookup hits a known key");
+        assert!(seg.lookup(299).is_some(), "lookup hits another known key");
+        // BRIN summaries are recoverable.
+        let recovered = seg.brin_summaries();
+        assert_eq!(recovered.len(), summaries.len());
+        for (a, b) in summaries.iter().zip(recovered) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn segment_without_brin_sidecar_returns_empty_summaries() {
+        let rows = build_rows(50);
+        let (v1_bytes, _) =
+            encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
+        // v1 segment (no v2 wrap).
+        let seg1 = OwnedSegment::from_bytes(v1_bytes.clone()).expect("v1 parses");
+        assert!(seg1.brin_summaries().is_empty());
+        // v2 envelope without BRIN sidecar.
+        let wrapped = wrap_v2_envelope(v1_bytes, true);
+        let seg2 = OwnedSegment::from_bytes(wrapped).expect("v2 parses");
+        assert!(seg2.brin_summaries().is_empty());
     }
 
     #[test]

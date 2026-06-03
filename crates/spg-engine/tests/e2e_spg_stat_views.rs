@@ -58,10 +58,12 @@ fn segment_lists_cold_inventory_when_empty() {
     let mut eng = Engine::new();
     let res = eng.execute("SELECT * FROM spg_stat_segment").unwrap();
     let cols = columns_of(eng.execute("SELECT * FROM spg_stat_segment").unwrap());
+    // v6.7.0 — spg_stat_segment gained a `table_name` column.
     assert_eq!(
         cols,
         vec![
             "segment_id".to_string(),
+            "table_name".to_string(),
             "num_rows".to_string(),
             "num_pages".to_string(),
             "total_bytes".to_string(),

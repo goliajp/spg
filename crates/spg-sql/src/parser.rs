@@ -917,9 +917,10 @@ impl Parser {
             match m.to_ascii_lowercase().as_str() {
                 "hnsw" => IndexMethod::Hnsw,
                 "btree" => IndexMethod::BTree,
+                "brin" => IndexMethod::Brin,
                 other => {
                     return Err(self.err(alloc::format!(
-                        "unknown index method {other:?}; supported: hnsw, btree"
+                        "unknown index method {other:?}; supported: hnsw, btree, brin"
                     )));
                 }
             }
