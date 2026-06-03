@@ -2452,6 +2452,19 @@ pub(crate) const WAL_V3_TYPE_AUTO_COMMIT_SQL: u8 = 0x01;
 /// know how much of an async-commit window was durable on kill.
 pub(crate) const WAL_V3_TYPE_DURABILITY_CHECKPOINT: u8 = 0x02;
 
+/// v6.6.1 — LZSS-compressed auto-commit SQL. Payload layout:
+///   `[u8 algo][compressed bytes]`
+/// where `algo = 0x01` reserves room for v6.x to add LZ4 / zstd
+/// without another type-tag bump. The compressed bytes are
+/// `spg_crypto::lzss::compress(sql.as_bytes())`. Replay decompresses
+/// and routes through `Engine::execute` exactly like type 0x01.
+pub(crate) const WAL_V3_TYPE_COMPRESSED_SQL: u8 = 0x03;
+pub(crate) const WAL_COMPRESS_ALGO_LZSS: u8 = 0x01;
+/// Compression threshold (bytes). SQL payloads smaller than this
+/// skip the encoder — LZSS overhead doesn't pay off below ~256 B.
+/// Operator-tunable via `SPG_COMPRESSION_MIN_BYTES` env (v6.6.3).
+pub(crate) const WAL_COMPRESS_MIN_BYTES: usize = 256;
+
 fn encode_wal_record(sql: &str) -> std::io::Result<Vec<u8>> {
     let len = u32::try_from(sql.len())
         .map_err(|_| std::io::Error::other("SQL too large for WAL entry"))?;
@@ -2492,6 +2505,39 @@ fn encode_wal_v3_record(type_tag: u8, payload: &[u8]) -> std::io::Result<Vec<u8>
     entry.push(type_tag);
     entry.extend_from_slice(payload);
     Ok(entry)
+}
+
+/// v6.6.1 — encode an auto-commit SQL record, applying LZSS
+/// compression when the payload would benefit. Falls back to the
+/// uncompressed v3 type=0x01 path when:
+///   - SPG_WAL_COMPRESSION env is `none`
+///   - SQL bytes < WAL_COMPRESS_MIN_BYTES
+///   - LZSS output isn't actually smaller than input (pathological)
+/// Returns the framed record bytes ready for WAL append.
+pub(crate) fn encode_wal_auto_commit_sql(sql: &str) -> std::io::Result<Vec<u8>> {
+    if !wal_compression_enabled() || sql.len() < WAL_COMPRESS_MIN_BYTES {
+        return encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes());
+    }
+    let compressed = spg_crypto::lzss::compress(sql.as_bytes());
+    // Compressed payload = [algo byte][compressed bytes]. Compare
+    // against the uncompressed SQL length to decide.
+    if compressed.len() + 1 >= sql.len() {
+        return encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes());
+    }
+    let mut payload = Vec::with_capacity(1 + compressed.len());
+    payload.push(WAL_COMPRESS_ALGO_LZSS);
+    payload.extend_from_slice(&compressed);
+    encode_wal_v3_record(WAL_V3_TYPE_COMPRESSED_SQL, &payload)
+}
+
+/// v6.6.1 — runtime check of `SPG_WAL_COMPRESSION` env. Default
+/// `lzss` (enabled). `none` disables. Cached after first call.
+pub(crate) fn wal_compression_enabled() -> bool {
+    static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHECKED.get_or_init(|| {
+        std::env::var("SPG_WAL_COMPRESSION")
+            .map_or(true, |v| !v.eq_ignore_ascii_case("none"))
+    })
 }
 
 /// v4.41 single-record byte total for the v3 auto-commit wrap.
@@ -2877,21 +2923,20 @@ fn run_leader_commit_round(state: &ServerState) {
                     });
                     continue;
                 }
-                // Encode v3 framed bytes. Encoding-time failures
-                // (payload > 1 GiB) abort just this task's slot,
-                // not the group.
-                let wal_bytes =
-                    match encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, task.sql.as_bytes()) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let _ = engine.execute_in("ROLLBACK", tx_id);
-                            let _ = task.ack.send(CommitResult {
-                                result: exec_res,
-                                wal_outcome: Err(e),
-                            });
-                            continue;
-                        }
-                    };
+                // Encode v3 framed bytes — v6.6.1 chooses between
+                // uncompressed (type=0x01) and LZSS-compressed
+                // (type=0x03) based on payload size + env knob.
+                let wal_bytes = match encode_wal_auto_commit_sql(&task.sql) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = engine.execute_in("ROLLBACK", tx_id);
+                        let _ = task.ack.send(CommitResult {
+                            result: exec_res,
+                            wal_outcome: Err(e),
+                        });
+                        continue;
+                    }
+                };
                 // In-memory COMMIT — merges this slot's catalog
                 // over `engine.catalog`. The next task's BEGIN
                 // (above) clones *this* catalog, so per-task
@@ -3085,6 +3130,38 @@ fn dispatch_v3_record(
         WAL_V3_TYPE_AUTO_COMMIT_SQL => {
             let sql = core::str::from_utf8(payload).map_err(|_| {
                 std::io::Error::other("v3 auto_commit_sql payload has non-UTF-8 SQL")
+            })?;
+            engine
+                .execute(sql)
+                .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+            Ok(true)
+        }
+        WAL_V3_TYPE_COMPRESSED_SQL => {
+            // v6.6.1 — `[algo byte][compressed bytes]`. Decompress
+            // via LZSS for algo 0x01, route through Engine::execute.
+            if payload.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "WAL compressed_sql at offset {frame_off}: empty payload"
+                )));
+            }
+            let algo = payload[0];
+            let compressed = &payload[1..];
+            let raw_bytes = match algo {
+                WAL_COMPRESS_ALGO_LZSS => spg_crypto::lzss::decompress(compressed).map_err(|e| {
+                    std::io::Error::other(format!(
+                        "WAL compressed_sql at offset {frame_off}: LZSS decompress failed: {e:?}"
+                    ))
+                })?,
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "WAL compressed_sql at offset {frame_off}: unknown algo byte {other:#04x}"
+                    )));
+                }
+            };
+            let sql = core::str::from_utf8(&raw_bytes).map_err(|_| {
+                std::io::Error::other(format!(
+                    "WAL compressed_sql at offset {frame_off}: decompressed bytes are not valid UTF-8"
+                ))
             })?;
             engine
                 .execute(sql)
