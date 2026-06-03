@@ -2624,6 +2624,7 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Float => 701,
         DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::Vector { .. } => 25,
         DataType::Timestamp => 1114,
+        DataType::Timestamptz => 1184, // v7.9.2 mailrs blocker fix
         DataType::Date => 1082,
         DataType::Interval => 1186,
         DataType::Numeric { .. } => 1700,

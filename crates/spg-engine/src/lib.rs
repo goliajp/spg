@@ -649,6 +649,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Interval => "INTERVAL".into(),
         DataType::Json => "JSON".into(),
         DataType::Jsonb => "JSONB".into(),
+        DataType::Timestamptz => "TIMESTAMPTZ".into(),
     }
 }
 
@@ -7935,6 +7936,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Numeric(precision, scale) => DataType::Numeric { precision, scale },
         ColumnTypeName::Date => DataType::Date,
         ColumnTypeName::Timestamp => DataType::Timestamp,
+        ColumnTypeName::Timestamptz => DataType::Timestamptz,
         ColumnTypeName::Json => DataType::Json,
         ColumnTypeName::Jsonb => DataType::Jsonb,
     }
@@ -8058,7 +8060,7 @@ fn coerce_value(
             // valid JSON lies with the producer.
             (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::Json(s)),
             (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
-            (Value::Text(s), DataType::Timestamp) => {
+            (Value::Text(s), DataType::Timestamp | DataType::Timestamptz) => {
                 let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
                     EngineError::Eval(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -8070,7 +8072,7 @@ fn coerce_value(
             }
             // DATE ↔ TIMESTAMP convertibility (DATE → midnight,
             // TIMESTAMP → day truncation).
-            (Value::Date(d), DataType::Timestamp) => {
+            (Value::Date(d), DataType::Timestamp | DataType::Timestamptz) => {
                 Some(Value::Timestamp(i64::from(d) * 86_400_000_000))
             }
             (Value::Timestamp(t), DataType::Date) => {

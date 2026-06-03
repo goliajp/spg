@@ -1453,6 +1453,10 @@ impl Parser {
             // MySQL's `DATETIME` is the same domain as standard
             // `TIMESTAMP` — accept both spellings.
             "timestamp" | "datetime" => ColumnTypeName::Timestamp,
+            // v7.9.2 — `TIMESTAMPTZ` and full PG spelling
+            // `TIMESTAMP WITH TIME ZONE`. Same storage as TIMESTAMP;
+            // only PG-wire OID differs.
+            "timestamptz" => ColumnTypeName::Timestamptz,
             // v4.9: JSON / JSONB. Stored as raw text — no parse-time
             // validation. We accept the JSONB spelling too because
             // most PG clients default to it; SPG doesn't distinguish

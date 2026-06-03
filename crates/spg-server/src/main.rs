@@ -4147,6 +4147,7 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Numeric { .. }
         | DataType::Date
         | DataType::Timestamp
+        | DataType::Timestamptz
         | DataType::Interval
         | DataType::Json
         | DataType::Jsonb => WireType::Text,
