@@ -80,6 +80,43 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     // ---- Startup phase ----
     let (user, params) = read_startup(&mut stream)?;
     let _ = params; // database / options / etc. — we only honor `user`
+
+    // v6.5.2 — register this connection in the activity registry.
+    // Removed when `_conn_guard` drops at function exit.
+    let conn_state = Arc::new(crate::ConnState {
+        pid: std::process::id().wrapping_add(state.active_connections.load(
+            std::sync::atomic::Ordering::Relaxed,
+        ) as u32),
+        user: user.clone(),
+        started_at_us: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0),
+        current_sql: std::sync::RwLock::new(String::new()),
+        wait_event: std::sync::atomic::AtomicU8::new(0),
+        last_query_start_us: std::sync::atomic::AtomicI64::new(0),
+        in_transaction: std::sync::atomic::AtomicBool::new(false),
+    });
+    if let Ok(mut conns) = state.connections.write() {
+        conns.push(Arc::clone(&conn_state));
+    }
+    // RAII guard: drops the connection from the registry when this
+    // function returns (normal exit or error).
+    struct ConnGuard {
+        state: Arc<ServerState>,
+        conn: Arc<crate::ConnState>,
+    }
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            if let Ok(mut conns) = self.state.connections.write() {
+                conns.retain(|x| !Arc::ptr_eq(x, &self.conn));
+            }
+        }
+    }
+    let _conn_guard = ConnGuard {
+        state: Arc::clone(state),
+        conn: Arc::clone(&conn_state),
+    };
     // RBAC: if there are users in the engine, demand password.
     // Else (open mode), accept any startup as admin.
     let has_users = state.engine.read().is_ok_and(|e| !e.users().is_empty());
@@ -182,6 +219,17 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             b'Q' => {
                 // Null-terminated SQL string (typically — psql appends \0).
                 let sql_bytes = body.strip_suffix(b"\0").unwrap_or(&body);
+                // v6.5.2 — update activity registry.
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0);
+                conn_state
+                    .last_query_start_us
+                    .store(now_us, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut s) = conn_state.current_sql.write() {
+                    *s = String::from_utf8_lossy(sql_bytes).to_string();
+                }
                 let Ok(sql_str) = std::str::from_utf8(sql_bytes) else {
                     send_error(&mut wbuf, "22021", "invalid UTF-8 in query")?;
                     send_ready_for_query(&mut wbuf, tx_state)?;

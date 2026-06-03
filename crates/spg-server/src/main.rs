@@ -37,7 +37,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -310,6 +310,91 @@ pub(crate) struct ServerState {
     /// registry. Held behind a `Mutex` because freezer + dispatch
     /// + snapshot-write can hit it concurrently.
     pub(crate) cold_segment_paths: Mutex<BTreeMap<u32, PathBuf>>,
+    /// v6.5.2 — per-pgwire-connection state registry. Each accepted
+    /// connection registers a `ConnState` here; the connection
+    /// thread updates `current_sql` / `wait_event` / `elapsed_us` /
+    /// `in_transaction` during its lifetime, and deregisters on
+    /// close. Surfaced through `spg_stat_activity` virtual table via
+    /// the engine's registered activity provider.
+    pub(crate) connections: RwLock<Vec<Arc<ConnState>>>,
+}
+
+/// v6.5.2 — one row of `spg_stat_activity`'s per-connection state.
+/// Lives behind `Arc` so the connection thread keeps one handle and
+/// the registry keeps another; both can update the inner atomics
+/// without locking.
+pub(crate) struct ConnState {
+    pub(crate) pid: u32,
+    pub(crate) user: String,
+    pub(crate) started_at_us: i64,
+    pub(crate) current_sql: RwLock<String>,
+    /// 0 = idle, 1 = write_lock, 2 = fsync, 3 = group_commit.
+    /// String mapping handled at snapshot time.
+    pub(crate) wait_event: AtomicU8,
+    pub(crate) last_query_start_us: AtomicI64,
+    pub(crate) in_transaction: AtomicBool,
+}
+
+impl ConnState {
+    pub(crate) fn elapsed_us(&self) -> i64 {
+        let start = self.last_query_start_us.load(Ordering::Relaxed);
+        if start == 0 {
+            return 0;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map_or(0, |d| d.as_micros() as i64);
+        (now - start).max(0)
+    }
+
+    pub(crate) fn wait_event_str(&self) -> &'static str {
+        match self.wait_event.load(Ordering::Relaxed) {
+            1 => "write_lock",
+            2 => "fsync",
+            3 => "group_commit",
+            _ => "",
+        }
+    }
+}
+
+/// v6.5.2 — global handle to `ServerState` so the engine's
+/// `activity_provider` callback (a bare fn pointer that can't
+/// capture state) can read from the live registry. Set once at
+/// startup before any connection is accepted; read on every
+/// `SELECT * FROM spg_stat_activity`.
+pub(crate) static ACTIVITY_STATE: std::sync::OnceLock<Arc<ServerState>> =
+    std::sync::OnceLock::new();
+
+/// v6.5.2 — Engine-registered activity provider. Snapshots the
+/// live `connections` registry into the `ActivityRow` shape the
+/// engine renders.
+pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
+    let Some(state) = ACTIVITY_STATE.get() else {
+        return Vec::new();
+    };
+    let Ok(conns) = state.connections.read() else {
+        return Vec::new();
+    };
+    conns
+        .iter()
+        .map(|c| {
+            let current_sql = c
+                .current_sql
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            spg_engine::ActivityRow {
+                pid: c.pid,
+                user: c.user.clone(),
+                started_at_us: c.started_at_us,
+                current_sql,
+                wait_event: c.wait_event_str().to_string(),
+                elapsed_us: c.elapsed_us(),
+                in_transaction: c.in_transaction.load(Ordering::Relaxed),
+            }
+        })
+        .collect()
 }
 
 /// Default `SPG_HOT_TIER_BYTES` when the env var is unset / invalid —
@@ -982,7 +1067,22 @@ fn run(
         sub_workers: Mutex::new(BTreeMap::new()),
         cluster_id,
         wal_level: AtomicU8::new(parse_wal_level_env()),
+        connections: RwLock::new(Vec::new()),
     });
+    // v6.5.2 — register the global handle so the engine's
+    // activity_provider callback can read the live registry. Safe
+    // to set unconditionally: ACTIVITY_STATE is a OnceLock with
+    // single-set semantics; subsequent server boots in the same
+    // process (only relevant for tests) silently keep the first
+    // state — engine refs through the static are always live.
+    let _ = ACTIVITY_STATE.set(Arc::clone(&state));
+    if let Ok(mut e) = state.engine.write() {
+        // Replace the engine with one carrying the provider. The
+        // builder consumes by value, but we can swap in place by
+        // taking ownership through std::mem::replace.
+        let prev = std::mem::replace(&mut *e, Engine::new());
+        *e = prev.with_activity_provider(activity_snapshot);
+    }
 
     // v6.1.4: spawn subscriber threads for any subscriptions
     // restored from the v4 snapshot envelope. Idempotent — if no
