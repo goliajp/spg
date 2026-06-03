@@ -137,6 +137,30 @@ impl Parser {
     fn parse_one_statement(&mut self) -> Result<Statement, ParseError> {
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
+            // v7.9.27 — `DO $$ … $$ [LANGUAGE plpgsql]`. PG-only;
+            // SPG has no PL/pgSQL so the body is consumed (lexer
+            // already turned it into a Token::String) and the whole
+            // DO statement returns CommandOk no-op. mailrs H1 +
+            // pg_dump compat.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do") => {
+                self.advance();
+                // Body — single string token (dollar-quoted or
+                // ordinary).
+                match self.advance() {
+                    Token::String(_) => {}
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected dollar-quoted body after DO, got {other:?}"
+                        )));
+                    }
+                }
+                // Optional `LANGUAGE <name>` trailer (idents only).
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("language")) {
+                    self.advance();
+                    let _ = self.expect_ident_like()?;
+                }
+                Ok(Statement::DoBlock)
+            }
             // v4.11: `WITH name AS (SELECT ...) [, ...] SELECT ...`.
             // WITH isn't a reserved token in our lexer — comes through
             // as `Token::Ident("with")` (case-insensitive).
