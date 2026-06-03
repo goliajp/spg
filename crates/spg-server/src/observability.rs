@@ -104,6 +104,14 @@ pub struct Metrics {
     /// when SPG_SEGMENT_COMPRESSION=none. Derives
     /// `spg_segment_bytes_compressed_total`.
     pub segment_bytes_compressed_out: AtomicU64,
+    /// v6.7.6 — number of cold-segment files the boot-time
+    /// prefetch worker pool successfully read off disk (Linux:
+    /// also `posix_fadvise(WILLNEED)`'d to seed the page cache).
+    /// Increments by 1 per segment regardless of size. Derives
+    /// `spg_cold_prefetch_hits_total`. A boot that loads N
+    /// manifest-listed cold segments lands `N` hits; reconnects
+    /// and CHECKPOINTs don't touch this counter.
+    pub cold_prefetch_hits: AtomicU64,
 }
 
 /// JSON-safe escape: replace `"`, `\\`, and control characters per
@@ -314,6 +322,14 @@ fn render_compression(state: &crate::ServerState, out: &mut String) {
     out.push_str(&format!(
         "spg_segment_bytes_compressed_total {}\n",
         state.metrics.segment_bytes_compressed_out.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP spg_cold_prefetch_hits_total Cold-segment files loaded via the boot-time prefetch worker pool (v6.7.6)\n",
+    );
+    out.push_str("# TYPE spg_cold_prefetch_hits_total counter\n");
+    out.push_str(&format!(
+        "spg_cold_prefetch_hits_total {}\n",
+        state.metrics.cold_prefetch_hits.load(Ordering::Relaxed)
     ));
 }
 

@@ -26,6 +26,16 @@ mod flusher;
 mod freezer;
 mod manifest;
 mod observability;
+mod prefetch;
+
+thread_local! {
+    /// v6.7.6 — single-cell handoff for the prefetch hit count.
+    /// `load_manifest_and_preload_cold` runs before
+    /// `Arc<ServerState>` is constructed, so it stashes the count
+    /// here and `main()` drains it into `state.metrics
+    /// .cold_prefetch_hits` after the state is built.
+    static PREFETCH_HITS_BOOT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 mod pgwire;
 mod replication;
 mod scram;
@@ -1140,6 +1150,17 @@ fn run(
     // process (only relevant for tests) silently keep the first
     // state — engine refs through the static are always live.
     let _ = ACTIVITY_STATE.set(Arc::clone(&state));
+    // v6.7.6 — drain the boot-time prefetch hit count into the
+    // live metrics (the counter ran before ServerState existed).
+    PREFETCH_HITS_BOOT.with(|cell| {
+        let hits = cell.take();
+        if hits > 0 {
+            state
+                .metrics
+                .cold_prefetch_hits
+                .store(hits, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     if let Ok(mut e) = state.engine.write() {
         // Replace the engine with one carrying the providers. The
         // builders consume by value, but we can swap in place by
@@ -3838,8 +3859,33 @@ fn load_manifest_and_preload_cold(
     let mut cat = engine.catalog().clone();
     let mut loaded: usize = 0;
     let mut skipped: usize = 0;
+    // v6.7.6 — parallel prefetch. Read every segment file off disk
+    // in a `SPG_PREFETCH_WORKERS`-wide thread pool before the
+    // sequential CRC + register loop runs.
+    let paths_to_read: Vec<(u32, PathBuf)> = m
+        .cold_segments
+        .iter()
+        .map(|e| (e.segment_id, e.path.clone()))
+        .collect();
+    let workers = prefetch::worker_count_from_env();
+    let prefetched = prefetch::parallel_read_segments(&paths_to_read, workers, None);
+    let read_map: std::collections::BTreeMap<u32, std::io::Result<Vec<u8>>> =
+        prefetched.into_iter().collect();
+    let mut prefetch_hits: u64 = 0;
     for entry in &m.cold_segments {
-        match fs::read(&entry.path) {
+        let bytes_result = read_map
+            .get(&entry.segment_id)
+            .map(|r| match r {
+                Ok(b) => Ok(b.clone()),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            })
+            .unwrap_or_else(|| {
+                Err(std::io::Error::other(format!(
+                    "no prefetch result for segment {}",
+                    entry.segment_id
+                )))
+            });
+        match bytes_result {
             Ok(seg_bytes) => {
                 let computed = spg_crypto::crc32::crc32(&seg_bytes);
                 if computed != entry.crc32 {
@@ -3860,6 +3906,7 @@ fn load_manifest_and_preload_cold(
                     Ok(()) => {
                         cold_segment_paths.insert(entry.segment_id, entry.path.clone());
                         loaded += 1;
+                        prefetch_hits += 1;
                     }
                     Err(e) => {
                         eprintln!(
@@ -3881,6 +3928,9 @@ fn load_manifest_and_preload_cold(
         }
     }
     engine.replace_catalog(cat);
+    // Stash on a thread-local so the post-boot `state.metrics`
+    // can claim the counter once ServerState is built.
+    PREFETCH_HITS_BOOT.with(|cell| cell.set(prefetch_hits));
     eprintln!(
         "spg-server: manifest {} loaded {loaded} cold segment(s), skipped {skipped}; wal_baseline_offset={}",
         mp.display(),
