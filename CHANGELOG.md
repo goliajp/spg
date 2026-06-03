@@ -10,6 +10,56 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.5] — 2026-06-03 (EXPLAIN ANALYZE hot/cold tier annotation)
+
+Sixth v6.2.x sub-version. Scan operators in EXPLAIN ANALYZE now
+split their row stats into `hot_rows=N` plus a `cold_tier=present`
+marker when the catalog holds at least one frozen segment.
+
+### Added / Changed
+
+- `From: <table>` lines emit `(hot_rows=N)` instead of v6.2.4's
+  `(rows_scanned=N)`. The naming makes the hot-tier vs cold-tier
+  split explicit; the value is unchanged for tables with no
+  cold segments.
+- When the catalog holds at least one cold-tier segment
+  (`Catalog::cold_segment_count() > 0`), the scan annotation
+  appends `cold_tier=present`. Lets operators see at-a-glance
+  that a scan MAY have walked a cold segment without needing
+  per-table breakdown.
+
+### Tests
+
+- `spg-engine::e2e_explain_analyze` (6, +1 over v6.2.4):
+    - `scan_omits_cold_marker_when_no_cold_segments` (new) —
+      tables with only hot rows don't gain the cold flag
+    - Existing v6.2.4 tests updated to the new key names
+      (`hot_rows` replacing `rows_scanned`)
+
+### Frozen surface
+
+- `From:` line annotation key:
+  `(hot_rows=N[, cold_tier=present])` from v6.2.5. v6.2.x can
+  expand into per-table cold breakdown without renaming.
+
+### Not changed
+
+- Plan tree shape, operator names, indentation.
+- `Total:` line — still `rows=N elapsed=Mμs`.
+
+### Out of v6.2.5 (deferred to later v6.2.x — NOT v7)
+
+- Per-table cold_rows count (precise per-table breakdown vs the
+  global `cold_tier=present` flag) — needs inline executor
+  instrumentation; lands in v6.2.6 alongside the Memoize node's
+  inline-timing infrastructure.
+- Per-operator elapsed for inner nodes (Filter / Join / GroupBy /
+  …) — same v6.2.6 follow-up (the v6.2.4 deferral now routes
+  through v6.2.6's instrumentation refactor).
+- `cold_segment_ids=[…]` list per scan — v6.2.6.
+
+---
+
 ## [6.2.4] — 2026-06-03 (EXPLAIN ANALYZE per-operator stats)
 
 Fifth v6.2.x sub-version. EXPLAIN ANALYZE now annotates every
