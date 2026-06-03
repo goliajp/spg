@@ -568,6 +568,12 @@ pub struct Engine {
     /// `None` ⇒ no-data (returns empty rows; matches the no_std
     /// embedded callers that don't run pgwire).
     activity_provider: Option<ActivityProvider>,
+    /// v6.5.3 — audit-chain provider + verifier. Same pattern as
+    /// activity_provider: spg-server registers both at startup;
+    /// engine reads through on `SELECT * FROM spg_audit_chain` and
+    /// `SELECT * FROM spg_audit_verify`. `None` ⇒ no-data.
+    audit_chain_provider: Option<AuditChainProvider>,
+    audit_verifier: Option<AuditVerifier>,
 }
 
 /// v6.5.2 — one row of `spg_stat_activity`. Engine-public so
@@ -588,6 +594,24 @@ pub struct ActivityRow {
 /// call; engine doesn't cache the slice.
 pub type ActivityProvider = fn() -> Vec<ActivityRow>;
 
+/// v6.5.3 — one row of `spg_audit_chain`. Engine-public so
+/// spg-server can construct rows directly from `AuditEntry`.
+#[derive(Debug, Clone)]
+pub struct AuditRow {
+    pub seq: i64,
+    pub ts_ms: i64,
+    pub prev_hash_hex: String,
+    pub entry_hash_hex: String,
+    pub sql: String,
+}
+
+/// v6.5.3 — chain-table provider + verifier. spg-server registers
+/// fn pointers that snapshot / verify the audit log. `verify`
+/// returns `(verified_count, broken_at_seq)` — `broken_at_seq` is
+/// `-1` on a clean chain.
+pub type AuditChainProvider = fn() -> Vec<AuditRow>;
+pub type AuditVerifier = fn() -> (i64, i64);
+
 impl Engine {
     pub fn new() -> Self {
         Self {
@@ -605,6 +629,8 @@ impl Engine {
             plan_cache: plan_cache::PlanCache::new(),
             query_stats: query_stats::QueryStats::new(),
             activity_provider: None,
+            audit_chain_provider: None,
+            audit_verifier: None,
         }
     }
 
@@ -626,6 +652,8 @@ impl Engine {
             plan_cache: plan_cache::PlanCache::new(),
             query_stats: query_stats::QueryStats::new(),
             activity_provider: None,
+            audit_chain_provider: None,
+            audit_verifier: None,
         }
     }
 
@@ -680,6 +708,8 @@ impl Engine {
                     plan_cache: plan_cache::PlanCache::new(),
                     query_stats: query_stats::QueryStats::new(),
                     activity_provider: None,
+                    audit_chain_provider: None,
+                    audit_verifier: None,
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1411,6 +1441,18 @@ impl Engine {
         self
     }
 
+    /// v6.5.3 — register audit chain provider + verifier.
+    #[must_use]
+    pub const fn with_audit_providers(
+        mut self,
+        chain: AuditChainProvider,
+        verify: AuditVerifier,
+    ) -> Self {
+        self.audit_chain_provider = Some(chain);
+        self.audit_verifier = Some(verify);
+        self
+    }
+
     /// v6.5.2 — materialise `spg_stat_activity` rows. Pulls a fresh
     /// snapshot from the registered `ActivityProvider`. Returns an
     /// empty result set when no provider is registered (the no_std
@@ -1443,6 +1485,56 @@ impl Engine {
             })
             .collect();
         QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.3 — materialise `spg_audit_chain` rows. Pulls a fresh
+    /// snapshot from the registered provider; empty when no
+    /// provider is set.
+    fn exec_spg_audit_chain(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("seq", DataType::BigInt, false),
+            ColumnSchema::new("ts_ms", DataType::BigInt, false),
+            ColumnSchema::new("prev_hash", DataType::Text, false),
+            ColumnSchema::new("entry_hash", DataType::Text, false),
+            ColumnSchema::new("sql", DataType::Text, false),
+        ];
+        let rows: Vec<Row> = self
+            .audit_chain_provider
+            .map(|f| f())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                Row::new(alloc::vec![
+                    Value::BigInt(r.seq),
+                    Value::BigInt(r.ts_ms),
+                    Value::Text(r.prev_hash_hex),
+                    Value::Text(r.entry_hash_hex),
+                    Value::Text(r.sql),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.3 — materialise `spg_audit_verify` single-row result.
+    /// `(verified_count, broken_at_seq)` — broken_at_seq is `-1`
+    /// on a clean chain. Returns one row with both values 0 when
+    /// no verifier is registered (no-data fallback for embedded
+    /// callers).
+    fn exec_spg_audit_verify(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("verified_count", DataType::BigInt, false),
+            ColumnSchema::new("broken_at_seq", DataType::BigInt, false),
+        ];
+        let (verified, broken) = self.audit_verifier.map(|f| f()).unwrap_or((0, -1));
+        let row = Row::new(alloc::vec![
+            Value::BigInt(verified),
+            Value::BigInt(broken),
+        ]);
+        QueryResult::Rows {
+            columns,
+            rows: alloc::vec![row],
+        }
     }
 
     /// v6.5.1 — read-only accessor for tests + v6.5.6 ops resets.
@@ -2397,6 +2489,8 @@ impl Engine {
                 "spg_stat_segment" => return Ok(self.exec_spg_stat_segment()),
                 "spg_stat_query" => return Ok(self.exec_spg_stat_query()),
                 "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
+                "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
+                "spg_audit_verify" => return Ok(self.exec_spg_audit_verify()),
                 _ => {}
             }
         }
