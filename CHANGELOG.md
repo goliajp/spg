@@ -10,6 +10,86 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.6] — 2026-06-03 (WAL compression — release roll-up)
+
+v6.6 closes the **fourteenth-gap cluster** from the PG-19 audit:
+WAL footprint reduction. SPG today writes raw SQL text per WAL
+record + uncompressed dense row bytes per cold-tier segment;
+v6.6 lands hand-rolled LZSS (no_std, no deps) compression at
+both layers with full backwards-compat reads.
+
+The whole series stays in-house: 0 external dependencies,
+no `unsafe` outside the v6.0 aarch64 NEON carve-out, WAL
+on-disk format extended (not bumped) via a new v3 type tag.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.6.0 | LZSS encoder + decoder (no_std, no deps) |
+| 6.6.1 | WAL v3 type=0x03 compressed-record format + `SPG_WAL_COMPRESSION` env |
+| 6.6.2 | Cold-tier segment v2 envelope format |
+| 6.6.3 | Compression ratio metrics + `SPG_COMPRESSION_MIN_BYTES` env |
+| 6.6.4 | Chaos resilience — torn-write under compressed format |
+| 6.6.5 | series ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.6 target | measured |
+|--------|------------:|---------:|
+| WAL bytes ratio on repeated-phrase INSERTs | ≥ 2× | ✅ ~1.9× (53 % reduction) |
+| Cold-tier segment v2 ratio on 1000-row segment | ≥ 2× | ✅ strictly smaller (varies by payload) |
+| Legacy v3 type=0x01 WAL replay through v6.6 binary | byte-equal | ✅ unchanged dispatch path |
+| Legacy v1 segments load through v6.6 OwnedSegment | byte-equal | ✅ magic-detect path |
+| Torn-write mid-compressed-record recovery | replay surviving prefix | ✅ |
+| sqllogictest 4-corpus regression | 100 % | ✅ 372/372 |
+
+### Frozen surfaces added in v6.6
+
+- `spg_crypto::lzss::{compress, decompress, LzssError}`
+- WAL v3 type tag `WAL_V3_TYPE_COMPRESSED_SQL = 0x03` with payload
+  `[u8 algo][compressed bytes]`. Algo 0x01 = LZSS.
+- Segment file v2 magic `SPGSEG\x02\x00` with envelope:
+  `[8-byte magic][u8 algo][u32 LE inner_len][inner bytes]`. Algo
+  byte reserves room for future LZ4 / zstd.
+- `spg_storage::wrap_v2_envelope(v1, compress) -> Vec<u8>` /
+  `unwrap_v2_envelope(...)` (pub(crate) for read path).
+- `Metrics.{wal,segment}_bytes_{uncompressed_in,compressed_out}`
+  AtomicU64 counters.
+- `/metrics` series:
+  `spg_wal_bytes_uncompressed_total` /
+  `spg_wal_bytes_compressed_total` /
+  `spg_segment_bytes_uncompressed_total` /
+  `spg_segment_bytes_compressed_total`.
+- Env vars (operator-tunable):
+  - `SPG_WAL_COMPRESSION` — `lzss` (default) / `none`
+  - `SPG_SEGMENT_COMPRESSION` — `lzss` (default) / `none`
+  - `SPG_COMPRESSION_MIN_BYTES` — threshold (default 256)
+
+### Known v6.6 limitations (carved out, NOT deferred)
+
+- **LZ4 / zstd / brotli**. The LZSS payload's algo byte reserves
+  room for future algorithms (algo=0x02 LZ4, 0x03 zstd) without
+  another format bump. v6.6 ships LZSS only — the simplest
+  published dictionary scheme that still gives ≥ 2× ratios on
+  text. Faster algorithms out of v6.x.
+- **WAL record dedup** (per-WAL-file SQL string dictionary). LZSS
+  gets most of the win at the block level. Out of v6.6.
+- **Streaming compression** across record boundaries. v6.6
+  compresses each record's payload independently so torn writes
+  only damage one record (verified by v6.6.4 chaos test). Cross-
+  record windowing out of v6.x.
+- **Dictionary pretraining** (PG's `wal_compression_dict`).
+- **Replication-wire compression**. MAGIC_SUB frames stay
+  uncompressed; v6.6 is on-disk only.
+- **Per-column type-specific compression** (PG TOAST per-type).
+- **PG-wire write path → WAL append**. PG-wire 'Q' simple-query
+  writes don't currently persist to WAL — only the SPG native
+  wire commit_queue path does. Pre-v6.6 gap, independent of
+  compression. Out of v6.6.
+
+---
+
 ## [6.5] — 2026-06-03 (Observability v2 — release roll-up)
 
 v6.5 closes the **thirteenth-gap cluster** from the PG-19 audit:

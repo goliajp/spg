@@ -795,6 +795,72 @@ WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>
   stays at 0 and `WAIT FOR WAL POSITION 0` returns immediately.
   Larger targets block until the optional timeout fires.
 
+### WAL compression (v6.6 series)
+
+v6.6 closes the fourteenth-gap cluster from the PG-19 audit: WAL
+footprint reduction. Hand-rolled LZSS (no_std, no deps) lands
+compression at both the WAL record layer and the cold-tier
+segment file layer with full backwards-compat reads. Frozen
+surfaces below.
+
+#### Frozen surfaces (added v6.6.x)
+
+- `spg_crypto::lzss::compress(input: &[u8]) -> Vec<u8>` /
+  `spg_crypto::lzss::decompress(input: &[u8]) -> Result<Vec<u8>, LzssError>`.
+  Storer-Szymanski 1982 algorithm: 4 KiB window, 18-byte max
+  match, output stream `[u32 LE original_len][flag byte][8 tokens]*`.
+
+- WAL v3 type tag `WAL_V3_TYPE_COMPRESSED_SQL = 0x03`. Payload
+  layout `[u8 algo][compressed bytes]`. Algo 0x01 = LZSS.
+  Decoder dispatch on type byte; v3 type=0x01 (uncompressed)
+  still works.
+
+- Cold-tier segment file v2 magic `SPGSEG\x02\x00`. Envelope
+  layout `[8-byte magic][u8 algo: 0=none, 1=lzss][u32 LE
+  inner_uncompressed_len][inner bytes]`. v1-magic
+  `SPGSEG\x01\x00` files still load via `OwnedSegment::from_bytes`.
+
+- `spg_storage::wrap_v2_envelope(v1: Vec<u8>, compress: bool) -> Vec<u8>` —
+  public wrapper. Returns v1 unchanged when compress=false OR
+  when LZSS output isn't strictly smaller.
+
+- `Metrics` AtomicU64 counters:
+  `wal_bytes_uncompressed_in`, `wal_bytes_compressed_out`,
+  `segment_bytes_uncompressed_in`, `segment_bytes_compressed_out`.
+
+- `/metrics` series (Prometheus counters):
+  `spg_wal_bytes_uncompressed_total`,
+  `spg_wal_bytes_compressed_total`,
+  `spg_segment_bytes_uncompressed_total`,
+  `spg_segment_bytes_compressed_total`.
+
+- Env vars (operator-tunable):
+  - `SPG_WAL_COMPRESSION` — `lzss` (default) or `none`
+  - `SPG_SEGMENT_COMPRESSION` — `lzss` (default) or `none`
+  - `SPG_COMPRESSION_MIN_BYTES` — threshold floor (default 256).
+    SQL payloads smaller than this skip LZSS.
+
+#### Out of scope for v6 (carved out — not deferred)
+
+- **LZ4 / zstd / brotli**. The algo byte in both the WAL v3
+  payload and the segment v2 envelope reserves the namespace
+  for future algorithms (0x02 LZ4, 0x03 zstd) without another
+  format bump. v6.6 ships LZSS only — simplest published
+  dictionary scheme that gives ≥ 2× ratios on text.
+- **WAL record dedup** (per-WAL-file SQL string dictionary
+  back-referencing).
+- **Streaming compression across record boundaries**. Per-record
+  framing means torn writes only damage their own record;
+  v6.6.4 chaos test locks this invariant.
+- **Dictionary pretraining** (PG's `wal_compression_dict`).
+- **Replication-wire compression**. MAGIC_SUB frames stay
+  uncompressed; v6.6 is on-disk only.
+- **Per-column type-specific compression** (PG TOAST style).
+- **PG-wire write path → WAL append**. PG-wire 'Q' simple-query
+  writes don't currently persist to WAL — only the SPG native
+  wire commit_queue path does. Pre-v6.6 gap unaffected by the
+  v6.6 compression work.
+
 ### Observability v2 (v6.5 series)
 
 v6.5 closes the thirteenth-gap cluster from the PG-19 audit:
