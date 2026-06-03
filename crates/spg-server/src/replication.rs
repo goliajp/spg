@@ -95,6 +95,108 @@ const FRAME_TYPE_STATUS: u8 = 0x01;
 /// without applying anything. Followers using MAGIC_V1 / MAGIC_V2
 /// never receive this frame.
 const FRAME_TYPE_SKIP: u8 = 0x02;
+/// v6.7.5 — `FRAME_TYPE_SEGMENT_FILE_CHUNK`. Master ships cold-tier
+/// segment files to a freshly-connected v2 follower in 4 MiB
+/// chunks so the follower can skip the WAL-replay-from-scratch
+/// path for already-frozen rows. Payload layout:
+///
+/// ```text
+/// [u32 LE segment_id  ]
+/// [u32 LE chunk_seq   ]  // 0-based
+/// [u32 LE chunk_total ]  // total chunks for this segment
+/// [u32 LE chunk_bytes ]  // ≤ SEGMENT_CHUNK_HEADER_MAX_BYTES
+/// [chunk_bytes bytes  ]
+/// ```
+///
+/// V6_7_DESIGN.md L2 originally allocated `0x02` for this frame;
+/// `0x02` was claimed by `FRAME_TYPE_SKIP` in v6.1.5 (post-design
+/// drafting), so v6.7.5 ships at the next free slot `0x03`. The
+/// design doc's reference will be reconciled in the v6.7.8 rollup.
+const FRAME_TYPE_SEGMENT_FILE_CHUNK: u8 = 0x03;
+
+/// v6.7.5 — outbound chunk size on the wire. V6_7_DESIGN.md §5
+/// picks 4 MiB as the sweet spot: TCP-MSS-amortised framing,
+/// 1-chunk-in-flight memory budget, ≤ 4 MiB re-transfer on
+/// disconnect.
+const SEGMENT_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+/// v6.7.5 — hard protocol cap on `chunk_bytes` (§5). Followers
+/// reject frames declaring `chunk_bytes > 16 MiB` as malformed.
+/// Leaves room for a future bump without re-rolling the frame
+/// type.
+const SEGMENT_CHUNK_HEADER_MAX_BYTES: u32 = 16 * 1024 * 1024;
+/// v6.7.5 — payload header bytes preceding the chunk body
+/// (4 × u32: segment_id, chunk_seq, chunk_total, chunk_bytes).
+const SEGMENT_CHUNK_HEADER_LEN: usize = 16;
+
+/// v6.7.5 — encode a single segment-file-chunk frame payload.
+/// `chunk_bytes` is the raw byte slice (already sliced to size by
+/// the caller). Returns the wire-format payload (4 × u32
+/// header + body), ready to hand to `write_frame` with
+/// `FRAME_TYPE_SEGMENT_FILE_CHUNK`.
+fn encode_segment_chunk_payload(
+    segment_id: u32,
+    chunk_seq: u32,
+    chunk_total: u32,
+    chunk_bytes: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SEGMENT_CHUNK_HEADER_LEN + chunk_bytes.len());
+    out.extend_from_slice(&segment_id.to_le_bytes());
+    out.extend_from_slice(&chunk_seq.to_le_bytes());
+    out.extend_from_slice(&chunk_total.to_le_bytes());
+    out.extend_from_slice(&(chunk_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(chunk_bytes);
+    out
+}
+
+/// v6.7.5 — decoded view of a segment-file-chunk frame payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentChunk<'a> {
+    segment_id: u32,
+    chunk_seq: u32,
+    chunk_total: u32,
+    body: &'a [u8],
+}
+
+/// v6.7.5 — decode a segment-file-chunk payload. Validates the
+/// chunk-bytes cap (§5) + that the declared chunk size matches
+/// the slice tail; anything malformed surfaces as
+/// `std::io::Error` so the follower can drop the connection
+/// (mismatched protocol versions or wire corruption).
+fn decode_segment_chunk(payload: &[u8]) -> std::io::Result<SegmentChunk<'_>> {
+    if payload.len() < SEGMENT_CHUNK_HEADER_LEN {
+        return Err(std::io::Error::other(format!(
+            "segment-chunk: payload too short ({} < {SEGMENT_CHUNK_HEADER_LEN})",
+            payload.len()
+        )));
+    }
+    let segment_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    let chunk_seq = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+    let chunk_total = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let chunk_bytes = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+    if chunk_bytes > SEGMENT_CHUNK_HEADER_MAX_BYTES {
+        return Err(std::io::Error::other(format!(
+            "segment-chunk: chunk_bytes {chunk_bytes} > cap {SEGMENT_CHUNK_HEADER_MAX_BYTES}"
+        )));
+    }
+    let body_len = chunk_bytes as usize;
+    if payload.len() != SEGMENT_CHUNK_HEADER_LEN + body_len {
+        return Err(std::io::Error::other(format!(
+            "segment-chunk: declared chunk_bytes {body_len} ≠ payload tail {}",
+            payload.len() - SEGMENT_CHUNK_HEADER_LEN
+        )));
+    }
+    if chunk_total == 0 || chunk_seq >= chunk_total {
+        return Err(std::io::Error::other(format!(
+            "segment-chunk: out-of-range chunk_seq {chunk_seq} / chunk_total {chunk_total}"
+        )));
+    }
+    Ok(SegmentChunk {
+        segment_id,
+        chunk_seq,
+        chunk_total,
+        body: &payload[SEGMENT_CHUNK_HEADER_LEN..],
+    })
+}
 /// Cadence for tailing the master WAL when no new bytes are present.
 const TAIL_POLL: Duration = Duration::from_millis(50);
 /// v4.36: cadence for periodic status-frame emission to v2 followers.
@@ -266,6 +368,25 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
     }
     stream.flush()?;
 
+    // v6.7.5 — segment forwarding phase. Before the V2 follower
+    // starts replaying WAL, ship every cold-tier segment the
+    // master currently has so the follower can answer cold-row
+    // queries without first replaying the freeze records out of
+    // WAL (orders of magnitude faster for bootstrap). V1
+    // followers stay on the legacy WAL-only path.
+    //
+    // Follower-side segment-level resume = file existence on disk
+    // + `Catalog::load_segment_bytes_at`'s "slot occupied" guard:
+    // if a follower already wrote a segment in a prior connect
+    // session, the next forwarding pass will re-transmit the same
+    // bytes but the follower drops them on receipt. Wasteful on
+    // reconnect; correct. True chunk-level resume (sub-segment
+    // progress survives mid-segment disconnect) is carved out to
+    // STABILITY § v6.7 — pre-v6.7.8.
+    if matches!(protocol, Protocol::V2) {
+        forward_cold_segments(&mut stream, state)?;
+    }
+
     // Tail the WAL from `wal_position`.
     let Some(wal_path) = state.wal_path.clone() else {
         // No WAL configured → cannot stream further. Hold the
@@ -276,6 +397,221 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
         Protocol::V1 => tail_wal_v1(stream, &wal_path, wal_position),
         Protocol::V2 | Protocol::Sub => tail_wal_v2(stream, &wal_path, wal_position),
     }
+}
+
+/// v6.7.5 — follower-side per-segment chunk accumulator.
+/// Builds a contiguous `bytes` buffer from in-order chunks
+/// (master writes them sequentially); also caches `expected_total`
+/// from the first chunk so subsequent chunks for the same
+/// segment can be validated.
+struct SegmentReceiveState {
+    bytes: Vec<u8>,
+    expected_total: u32,
+    next_seq: u32,
+    skip: bool,
+}
+
+/// v6.7.5 — fold one `SegmentChunk` frame into `segment_buffers`.
+/// Returns `Ok(Some(complete_bytes))` when this chunk closes out
+/// the segment and the caller should commit it to disk.
+/// Returns `Ok(None)` when the segment still has chunks
+/// outstanding, or when the chunk belongs to a segment we're
+/// already skipping (file already present on disk from a prior
+/// session).
+fn absorb_segment_chunk(
+    segment_buffers: &mut std::collections::BTreeMap<u32, SegmentReceiveState>,
+    chunk: &SegmentChunk<'_>,
+    db_path: &Path,
+) -> std::io::Result<Option<Vec<u8>>> {
+    // Look up or initialise the per-segment buffer. On the first
+    // chunk for a segment, check whether the segment file already
+    // exists on disk — if so, the follower owns that segment from
+    // a prior session and we can short-circuit the whole
+    // forwarding for it (segment-level resume).
+    let entry = segment_buffers
+        .entry(chunk.segment_id)
+        .or_insert_with(|| SegmentReceiveState {
+            bytes: Vec::new(),
+            expected_total: chunk.chunk_total,
+            next_seq: 0,
+            skip: cold_segment_file_already_present(db_path, chunk.segment_id),
+        });
+    if entry.skip {
+        // Drop the chunk on the floor. After the last chunk in the
+        // group we tear down the entry so memory is bounded.
+        entry.next_seq = entry.next_seq.saturating_add(1);
+        if entry.next_seq >= entry.expected_total {
+            segment_buffers.remove(&chunk.segment_id);
+        }
+        return Ok(None);
+    }
+    if chunk.chunk_total != entry.expected_total {
+        return Err(std::io::Error::other(format!(
+            "segment {}: chunk_total {} ≠ first-seen {}",
+            chunk.segment_id, chunk.chunk_total, entry.expected_total
+        )));
+    }
+    if chunk.chunk_seq != entry.next_seq {
+        return Err(std::io::Error::other(format!(
+            "segment {}: chunk_seq {} out of order (expected {})",
+            chunk.segment_id, chunk.chunk_seq, entry.next_seq
+        )));
+    }
+    entry.bytes.extend_from_slice(chunk.body);
+    entry.next_seq += 1;
+    if entry.next_seq >= entry.expected_total {
+        let state = segment_buffers
+            .remove(&chunk.segment_id)
+            .expect("just inserted");
+        return Ok(Some(state.bytes));
+    }
+    Ok(None)
+}
+
+/// v6.7.5 — does `<db>.spg/segments/seg_<id>.spg` already exist?
+/// Used as the segment-level resume signal: a follower that
+/// already has the file from a prior session drops the chunks
+/// on the floor.
+fn cold_segment_file_already_present(db_path: &Path, segment_id: u32) -> bool {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = db_path
+        .file_stem()
+        .unwrap_or_else(|| std::ffi::OsStr::new("db"))
+        .to_string_lossy();
+    let seg_path = parent
+        .join(format!("{stem}.spg"))
+        .join("segments")
+        .join(format!("seg_{segment_id}.spg"));
+    seg_path.exists()
+}
+
+/// v6.7.5 — atomically write the assembled segment bytes to
+/// `<db>.spg/segments/seg_<id>.spg`, register it with the engine
+/// at the master's `segment_id`, and record the path on
+/// `state.cold_segment_paths` so the next CHECKPOINT picks it
+/// up in the manifest.
+fn commit_received_segment(
+    segment_id: u32,
+    bytes: Vec<u8>,
+    db_path: &Path,
+    state: &ServerState,
+) -> std::io::Result<()> {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = db_path
+        .file_stem()
+        .unwrap_or_else(|| std::ffi::OsStr::new("db"))
+        .to_string_lossy();
+    let seg_dir = parent.join(format!("{stem}.spg")).join("segments");
+    std::fs::create_dir_all(&seg_dir)?;
+    let final_path = seg_dir.join(format!("seg_{segment_id}.spg"));
+    let tmp_path = seg_dir.join(format!("seg_{segment_id}.spg.tmp"));
+    std::fs::write(&tmp_path, &bytes)?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    {
+        let mut eng = state
+            .engine
+            .write()
+            .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
+        eng.receive_cold_segment(segment_id, bytes).map_err(|e| {
+            std::io::Error::other(format!(
+                "follower receive_cold_segment(id={segment_id}): {e:?}"
+            ))
+        })?;
+    }
+    if let Ok(mut paths) = state.cold_segment_paths.lock() {
+        paths.insert(segment_id, final_path);
+    }
+    // v6.7.5 — refresh the manifest so a follower restart picks
+    // up the newly-resident segment file alongside its catalog
+    // snapshot. The follower never runs CHECKPOINT explicitly,
+    // so without this the `<db>.spg/segments/` files would be
+    // orphans on the next boot (catalog Cold locators pointing
+    // at unregistered segment slots). Best-effort: a manifest
+    // write failure is logged + ignored; the next received
+    // segment retries.
+    let snap_bytes = match std::fs::read(db_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "spg-server: follower manifest refresh skipped — db_path read failed: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let cold_paths = state
+        .cold_segment_paths
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    crate::write_manifest_alongside(db_path, &snap_bytes, &cold_paths, 0);
+    // Reflect the new active segment count on the metrics gauge.
+    if let Ok(eng) = state.engine.read() {
+        state.metrics.cold_segments.store(
+            eng.catalog().cold_segment_count() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Ok(())
+}
+
+/// v6.7.5 — leader-side segment forwarding. Walks the live
+/// `cold_segment_paths` snapshot, reads each segment file off
+/// disk, slices into `SEGMENT_CHUNK_SIZE_BYTES` chunks, and
+/// emits one `FRAME_TYPE_SEGMENT_FILE_CHUNK` frame per chunk
+/// with the standard `(segment_id, chunk_seq, chunk_total,
+/// chunk_bytes)` header.
+///
+/// Snapshot-then-stream pattern: we capture the
+/// `(segment_id, path)` pairs under the mutex once and release
+/// it before doing the per-segment I/O, so a concurrent
+/// freezer / compaction can keep mutating the map without
+/// blocking the forwarding loop. A segment that appears between
+/// the snapshot and the actual file read still gets picked up
+/// by the next reconnect; one that's compacted away mid-stream
+/// silently 404s — the follower's catalog snapshot (already
+/// shipped) points at the merged segment, so resolving the
+/// retired source segment would never have happened.
+fn forward_cold_segments(stream: &mut TcpStream, state: &ServerState) -> std::io::Result<()> {
+    let snapshot: Vec<(u32, std::path::PathBuf)> = {
+        let Ok(paths) = state.cold_segment_paths.lock() else {
+            // Mutex poisoned: log + skip forwarding. The follower
+            // will fall back to WAL replay for cold rows; not
+            // ideal but not fatal.
+            eprintln!(
+                "spg-server: cold_segment_paths mutex poisoned; \
+                 skipping segment forwarding for this follower"
+            );
+            return Ok(());
+        };
+        paths.iter().map(|(id, p)| (*id, p.clone())).collect()
+    };
+
+    for (segment_id, path) in snapshot {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "spg-server: segment forwarding skip seg {segment_id}: read {} failed: {e}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let total_chunks = bytes.len().div_ceil(SEGMENT_CHUNK_SIZE_BYTES).max(1);
+        let total_u32 = u32::try_from(total_chunks).map_err(|_| {
+            std::io::Error::other(format!(
+                "segment {segment_id}: chunk_total {total_chunks} exceeds u32::MAX"
+            ))
+        })?;
+        for seq in 0..total_chunks {
+            let start = seq * SEGMENT_CHUNK_SIZE_BYTES;
+            let end = (start + SEGMENT_CHUNK_SIZE_BYTES).min(bytes.len());
+            let chunk = &bytes[start..end];
+            let payload = encode_segment_chunk_payload(segment_id, seq as u32, total_u32, chunk);
+            write_frame(stream, FRAME_TYPE_SEGMENT_FILE_CHUNK, &payload)?;
+        }
+    }
+    Ok(())
 }
 
 /// v6.1.5 — read the publication-name list a subscriber appends
@@ -1001,6 +1337,11 @@ fn follow_once(
         .append(true)
         .open(wal_path)?;
     let mut pending: Vec<u8> = Vec::with_capacity(4096);
+    // v6.7.5 — per-segment chunk assembly state. Populated by
+    // `FRAME_TYPE_SEGMENT_FILE_CHUNK` frames; drained + committed
+    // to disk once a segment has every chunk in flight.
+    let mut segment_buffers: std::collections::BTreeMap<u32, SegmentReceiveState> =
+        std::collections::BTreeMap::new();
     loop {
         // Frame header.
         let mut header = [0u8; 5];
@@ -1018,6 +1359,21 @@ fn follow_once(
             stream.read_exact(&mut payload)?;
         }
         match frame_type {
+            FRAME_TYPE_SEGMENT_FILE_CHUNK => {
+                let chunk = decode_segment_chunk(&payload)?;
+                if let Some(committed_bytes) = absorb_segment_chunk(
+                    &mut segment_buffers,
+                    &chunk,
+                    db_path,
+                )? {
+                    commit_received_segment(
+                        chunk.segment_id,
+                        committed_bytes,
+                        db_path,
+                        state,
+                    )?;
+                }
+            }
             FRAME_TYPE_WAL => {
                 wal_appender.write_all(&payload)?;
                 wal_appender.sync_data()?;
@@ -1659,5 +2015,61 @@ mod tests {
         assert!(f.accepts_owner("t1")); // matched by ForTables
         assert!(f.accepts_owner("anything_else")); // accepted by AllTablesExcept (not in deny)
         assert!(!f.accepts_owner("bad")); // denied by AllTablesExcept AND not allowed by ForTables
+    }
+
+    // --- v6.7.5 segment-file-chunk codec --------------------------
+
+    #[test]
+    fn segment_chunk_encode_decode_round_trip() {
+        let body: Vec<u8> = (0u8..=200).collect();
+        let payload = encode_segment_chunk_payload(7, 1, 4, &body);
+        let decoded = decode_segment_chunk(&payload).expect("decode ok");
+        assert_eq!(decoded.segment_id, 7);
+        assert_eq!(decoded.chunk_seq, 1);
+        assert_eq!(decoded.chunk_total, 4);
+        assert_eq!(decoded.body, body.as_slice());
+    }
+
+    #[test]
+    fn segment_chunk_decode_rejects_truncated_header() {
+        let r = decode_segment_chunk(&[0u8; 12]);
+        assert!(r.is_err(), "header < 16 bytes must error");
+    }
+
+    #[test]
+    fn segment_chunk_decode_rejects_oversize_chunk() {
+        // Synthetic header declares chunk_bytes = 32 MiB (over the 16 MiB cap).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // segment_id
+        payload.extend_from_slice(&0u32.to_le_bytes()); // chunk_seq
+        payload.extend_from_slice(&1u32.to_le_bytes()); // chunk_total
+        payload.extend_from_slice(&(32u32 * 1024 * 1024).to_le_bytes()); // chunk_bytes
+        let r = decode_segment_chunk(&payload);
+        assert!(r.is_err(), "chunk_bytes > 16 MiB cap must error");
+    }
+
+    #[test]
+    fn segment_chunk_decode_rejects_size_tail_mismatch() {
+        // Declares chunk_bytes = 10 but body is 5.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&10u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 5]);
+        let r = decode_segment_chunk(&payload);
+        assert!(r.is_err(), "declared chunk_bytes ≠ tail length must error");
+    }
+
+    #[test]
+    fn segment_chunk_decode_rejects_seq_out_of_range() {
+        // chunk_seq >= chunk_total is illegal.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&5u32.to_le_bytes()); // chunk_seq
+        payload.extend_from_slice(&3u32.to_le_bytes()); // chunk_total
+        payload.extend_from_slice(&0u32.to_le_bytes()); // chunk_bytes
+        let r = decode_segment_chunk(&payload);
+        assert!(r.is_err(), "chunk_seq ≥ chunk_total must error");
     }
 }
