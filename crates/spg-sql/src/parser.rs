@@ -1000,10 +1000,39 @@ impl Parser {
             )));
         }
         self.advance();
-        let column = self.expect_ident_like()?;
+        // v6.8.2 — accept either a bare column ident (legacy) or
+        // an expression `fn(col, …)` for expression indexes.
+        // Distinguish by peeking the token *after* the current
+        // ident: `ident )` is the legacy column-only path;
+        // anything else triggers the Pratt expression parser.
+        // (`advance()` uses `mem::replace` to nil out the current
+        // slot, so we can't save+rewind cleanly — peek-ahead via
+        // direct index avoids the mutation.)
+        let (column, expression): (String, Option<Expr>) = match self.peek().clone() {
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::RParen)) =>
+            {
+                self.advance();
+                (s, None)
+            }
+            Token::Ident(_) | Token::QuotedIdent(_) => {
+                let key_expr = self.parse_expr(0)?;
+                let primary = extract_first_column(&key_expr).ok_or_else(|| {
+                    self.err(
+                        "expression index key must reference at least one column".into(),
+                    )
+                })?;
+                (primary, Some(key_expr))
+            }
+            other => {
+                return Err(self.err(format!(
+                    "expected column ident or expression, got {other:?}"
+                )));
+            }
+        };
         if !matches!(self.peek(), Token::RParen) {
             return Err(self.err(format!(
-                "expected ')' after indexed column, got {:?}",
+                "expected ')' after indexed column / expression, got {:?}",
                 self.peek()
             )));
         }
@@ -1058,6 +1087,7 @@ impl Parser {
             if_not_exists,
             included_columns,
             partial_predicate,
+            expression,
         }))
     }
 
@@ -2323,6 +2353,25 @@ impl Parser {
             qualifier: None,
             name: first,
         }))
+    }
+}
+
+/// v6.8.2 — walk an expression tree and return the first column
+/// reference's bare name. Used by `parse_create_index_stmt_after_create`
+/// to derive `CreateIndexStatement.column` from an expression
+/// key (so downstream planner code resolving a primary column
+/// position keeps working with expression indexes). Returns
+/// `None` when the expression has no column ref at all — caller
+/// surfaces that as a parse error.
+fn extract_first_column(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(cn) => Some(cn.name.clone()),
+        Expr::FunctionCall { args, .. } => args.iter().find_map(extract_first_column),
+        Expr::Binary { lhs, rhs, .. } => {
+            extract_first_column(lhs).or_else(|| extract_first_column(rhs))
+        }
+        Expr::Unary { expr: e, .. } => extract_first_column(e),
+        _ => None,
     }
 }
 

@@ -232,6 +232,14 @@ pub struct CreateIndexStatement {
     /// re-uses the existing evaluation path; storage persists the
     /// Display form on the catalog snapshot.
     pub partial_predicate: Option<Expr>,
+    /// v6.8.2 — expression-based index. When `Some(expr)`, the
+    /// index key is the result of `expr` evaluated on each row
+    /// (e.g. `CREATE INDEX … (lower(name))`). The `column`
+    /// field still names the *primary* column the expression
+    /// touches so existing planner shortcuts that resolve a
+    /// column position stay valid. `None` = plain
+    /// column-reference index (the legacy shape).
+    pub expression: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -916,7 +924,11 @@ impl fmt::Display for CreateIndexStatement {
             IndexMethod::Brin => f.write_str("USING brin ")?,
             IndexMethod::BTree => {}
         }
-        write!(f, "({})", quote_ident(&self.column))?;
+        if let Some(expr) = &self.expression {
+            write!(f, "({})", expr)?;
+        } else {
+            write!(f, "({})", quote_ident(&self.column))?;
+        }
         if !self.included_columns.is_empty() {
             f.write_str(" INCLUDE (")?;
             for (i, c) in self.included_columns.iter().enumerate() {
