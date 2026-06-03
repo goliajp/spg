@@ -22,6 +22,9 @@ spg-engine  = { path = "../spg-engine" }
 spg-storage = { path = "../spg-storage" }
 spg-audit   = { path = "../spg-audit" }
 spg-crypto  = { path = "../spg-crypto" }
+# v7.1 — manifest format extracted into a standalone crate so
+# spg-embedded can read + write the same bytes spg-server does.
+spg-manifest = { path = "../spg-manifest" }
 # v4.33 ops three-pack uses POSIX FFI for:
 #   - signal(SIGTERM/SIGINT) to drive graceful shutdown
 #   - statvfs(2) to compute WAL volume free space for the disk water-mark

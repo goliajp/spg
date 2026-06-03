@@ -55,9 +55,12 @@
 pub use spg_engine::{Engine, EngineError, QueryResult};
 pub use spg_storage::Value;
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+use spg_manifest::{CatalogManifest, ColdSegmentEntry, manifest_path as spg_manifest_path};
 
 // -- v7.1 WAL format constants (mirror `spg-server`'s) ---------
 // Kept private so callers can't mis-frame records; the v3 layout
@@ -216,6 +219,13 @@ struct PersistenceCtx {
     /// truncates back to 0).
     wal_len: u64,
     checkpoint_threshold_bytes: u64,
+    /// v7.1.4 — `<db_path>.spg/segments/` directory. Cold-tier
+    /// segments produced by `freeze_oldest_to_cold` / compaction
+    /// are persisted here as `seg_<id>.spg` files; the manifest
+    /// at `<db_path>.spg/manifest.v10` records every active
+    /// segment + its CRC32 so the next boot can verify + reload.
+    cold_segments_dir: PathBuf,
+    cold_segment_paths: BTreeMap<u32, PathBuf>,
 }
 
 impl Database {
@@ -268,15 +278,80 @@ impl Database {
         }
         let mut engine = if db_path.exists() {
             let bytes = std::fs::read(&db_path).map_err(io_err)?;
-            Engine::restore_envelope(&bytes).map_err(|e| {
+            let engine = Engine::restore_envelope(&bytes).map_err(|e| {
                 EngineError::Storage(spg_storage::StorageError::Corrupt(format!(
                     "restore from {}: {e}",
                     db_path.display()
                 )))
-            })?
+            })?;
+            engine
         } else {
             Engine::new()
         };
+        // v7.1.4 — manifest-driven cold-segment reload. The
+        // manifest sidecar pairs the catalog snapshot CRC with a
+        // list of `(segment_id, path, crc32)` triples; verify
+        // before loading so a torn or stale manifest doesn't
+        // surface phantom data.
+        let cold_segments_dir = {
+            let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+            let stem = db_path
+                .file_stem()
+                .unwrap_or_else(|| std::ffi::OsStr::new("db"))
+                .to_string_lossy()
+                .into_owned();
+            parent.join(format!("{stem}.spg")).join("segments")
+        };
+        let mut cold_segment_paths: BTreeMap<u32, PathBuf> = BTreeMap::new();
+        let manifest_pth = spg_manifest_path(&db_path);
+        if manifest_pth.exists() && db_path.exists() {
+            let m_bytes = std::fs::read(&manifest_pth).map_err(io_err)?;
+            if let Ok(m) = CatalogManifest::deserialize(&m_bytes) {
+                let snap_bytes = std::fs::read(&db_path).map_err(io_err)?;
+                let snap_crc = spg_crypto::crc32::crc32(&snap_bytes);
+                if snap_crc == m.catalog_crc32 {
+                    for entry in &m.cold_segments {
+                        if let Ok(seg_bytes) = std::fs::read(&entry.path) {
+                            let computed = spg_crypto::crc32::crc32(&seg_bytes);
+                            if computed != entry.crc32 {
+                                eprintln!(
+                                    "spg-embedded: manifest skip segment {}: CRC mismatch",
+                                    entry.segment_id
+                                );
+                                continue;
+                            }
+                            if engine
+                                .catalog()
+                                .cold_segment(entry.segment_id)
+                                .is_some()
+                            {
+                                // Already loaded via Catalog::clone path (shouldn't happen
+                                // since Engine::new + restore_envelope don't populate cold).
+                                continue;
+                            }
+                            let mut new_cat = engine.catalog().clone();
+                            if let Err(e) = new_cat
+                                .load_segment_bytes_at(entry.segment_id, seg_bytes)
+                            {
+                                eprintln!(
+                                    "spg-embedded: manifest load segment {} failed: {e}",
+                                    entry.segment_id
+                                );
+                                continue;
+                            }
+                            engine.replace_catalog(new_cat);
+                            cold_segment_paths
+                                .insert(entry.segment_id, entry.path.clone());
+                        } else {
+                            eprintln!(
+                                "spg-embedded: manifest skip segment {}: file unreadable",
+                                entry.segment_id
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if wal_path.exists() {
             let wal_bytes = std::fs::read(&wal_path).map_err(io_err)?;
             if !wal_bytes.is_empty() {
@@ -299,8 +374,40 @@ impl Database {
                 wal,
                 wal_len,
                 checkpoint_threshold_bytes: default_checkpoint_threshold_bytes(),
+                cold_segments_dir,
+                cold_segment_paths,
             }),
         })
+    }
+
+    /// v7.1.4 — freeze the oldest `max_rows` of `table_name`'s
+    /// hot tier into a brand-new cold-tier segment + persist
+    /// it to disk. Same semantics as `spg-server`'s freezer
+    /// thread; embedded just runs the freeze synchronously on
+    /// the caller's thread. Persistence + manifest update
+    /// happen as part of the next `checkpoint()` (or on Drop).
+    pub fn freeze_oldest_to_cold(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        max_rows: usize,
+    ) -> Result<spg_storage::FreezeReport, EngineError> {
+        let report = self
+            .engine
+            .freeze_oldest_to_cold(table_name, index_name, max_rows)?;
+        if let Some(p) = &mut self.persistence {
+            std::fs::create_dir_all(&p.cold_segments_dir).map_err(io_err)?;
+            let final_path = p
+                .cold_segments_dir
+                .join(format!("seg_{}.spg", report.segment_id));
+            let tmp_path = p
+                .cold_segments_dir
+                .join(format!("seg_{}.spg.tmp", report.segment_id));
+            std::fs::write(&tmp_path, &report.segment_bytes).map_err(io_err)?;
+            std::fs::rename(&tmp_path, &final_path).map_err(io_err)?;
+            p.cold_segment_paths.insert(report.segment_id, final_path);
+        }
+        Ok(report)
     }
 
     /// v7.1 — override the auto-checkpoint WAL-size ceiling for
@@ -347,6 +454,47 @@ impl Database {
         };
         std::fs::write(&tmp, &snapshot).map_err(io_err)?;
         std::fs::rename(&tmp, &p.db_path).map_err(io_err)?;
+        // v7.1.4 — refresh the manifest so the next boot can
+        // reload cold segments alongside the snapshot. Bytes
+        // come from the freshly-written snapshot file (= the
+        // canonical CRC source).
+        if !p.cold_segment_paths.is_empty() {
+            let snap_crc = spg_crypto::crc32::crc32(&snapshot);
+            let entries: Vec<ColdSegmentEntry> = p
+                .cold_segment_paths
+                .iter()
+                .filter_map(|(&segment_id, path)| {
+                    let bytes = std::fs::read(path).ok()?;
+                    Some(ColdSegmentEntry {
+                        segment_id,
+                        path: path.clone(),
+                        crc32: spg_crypto::crc32::crc32(&bytes),
+                    })
+                })
+                .collect();
+            let manifest = CatalogManifest {
+                catalog_crc32: snap_crc,
+                cold_segments: entries,
+                wal_baseline_offset: 0,
+            };
+            let m_bytes = manifest.serialize();
+            let m_path = spg_manifest_path(&p.db_path);
+            if let Some(dir) = m_path.parent() {
+                std::fs::create_dir_all(dir).map_err(io_err)?;
+            }
+            let m_tmp = {
+                let mut t = m_path.clone();
+                let mut name = t
+                    .file_name()
+                    .map(std::ffi::OsStr::to_os_string)
+                    .unwrap_or_default();
+                name.push(".tmp");
+                t.set_file_name(name);
+                t
+            };
+            std::fs::write(&m_tmp, &m_bytes).map_err(io_err)?;
+            std::fs::rename(&m_tmp, &m_path).map_err(io_err)?;
+        }
         p.wal.set_len(0).map_err(io_err)?;
         p.wal.seek(SeekFrom::Start(0)).map_err(io_err)?;
         p.wal.sync_data().map_err(io_err)?;

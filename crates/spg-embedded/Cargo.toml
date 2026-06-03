@@ -14,6 +14,11 @@ spg-storage = { path = "../spg-storage" }
 # `spg-server`, so an embedded-written DB boots cleanly on the
 # server and vice versa).
 spg-crypto  = { path = "../spg-crypto" }
+# v7.1.4 — cold-segment manifest persistence (SPGMAN01 v10).
+# Same bytes spg-server reads + writes, so a database an
+# embedded process produces boots cleanly on the server (and
+# vice versa) even with cold-tier state.
+spg-manifest = { path = "../spg-manifest" }
 
 [lints]
 workspace = true
