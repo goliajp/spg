@@ -2511,16 +2511,60 @@ fn encode_wal_v3_record(type_tag: u8, payload: &[u8]) -> std::io::Result<Vec<u8>
 /// compression when the payload would benefit. Falls back to the
 /// uncompressed v3 type=0x01 path when:
 ///   - SPG_WAL_COMPRESSION env is `none`
-///   - SQL bytes < WAL_COMPRESS_MIN_BYTES
+///   - SQL bytes < SPG_COMPRESSION_MIN_BYTES env (default 256)
 ///   - LZSS output isn't actually smaller than input (pathological)
 /// Returns the framed record bytes ready for WAL append.
-pub(crate) fn encode_wal_auto_commit_sql(sql: &str) -> std::io::Result<Vec<u8>> {
-    if !wal_compression_enabled() || sql.len() < WAL_COMPRESS_MIN_BYTES {
-        return encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes());
+///
+/// v6.6.3 — increments `Metrics.wal_bytes_uncompressed_in` and
+/// `wal_bytes_compressed_out` so the `/metrics` endpoint can
+/// derive the live ratio.
+pub(crate) fn encode_wal_auto_commit_sql_metrics(
+    sql: &str,
+    metrics: &observability::Metrics,
+) -> std::io::Result<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+    let raw_len = sql.len() as u64;
+    metrics
+        .wal_bytes_uncompressed_in
+        .fetch_add(raw_len, Ordering::Relaxed);
+    let threshold = wal_compression_min_bytes();
+    if !wal_compression_enabled() || sql.len() < threshold {
+        let out = encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes())?;
+        metrics
+            .wal_bytes_compressed_out
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
+        return Ok(out);
     }
     let compressed = spg_crypto::lzss::compress(sql.as_bytes());
     // Compressed payload = [algo byte][compressed bytes]. Compare
     // against the uncompressed SQL length to decide.
+    if compressed.len() + 1 >= sql.len() {
+        let out = encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes())?;
+        metrics
+            .wal_bytes_compressed_out
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
+        return Ok(out);
+    }
+    let mut payload = Vec::with_capacity(1 + compressed.len());
+    payload.push(WAL_COMPRESS_ALGO_LZSS);
+    payload.extend_from_slice(&compressed);
+    let out = encode_wal_v3_record(WAL_V3_TYPE_COMPRESSED_SQL, &payload)?;
+    metrics
+        .wal_bytes_compressed_out
+        .fetch_add(out.len() as u64, Ordering::Relaxed);
+    Ok(out)
+}
+
+/// v6.6.1 — encode without metrics. Used in test paths and the
+/// few callers that don't have ServerState handy. Production
+/// commit_queue path uses `_metrics`.
+#[allow(dead_code)]
+pub(crate) fn encode_wal_auto_commit_sql(sql: &str) -> std::io::Result<Vec<u8>> {
+    let threshold = wal_compression_min_bytes();
+    if !wal_compression_enabled() || sql.len() < threshold {
+        return encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes());
+    }
+    let compressed = spg_crypto::lzss::compress(sql.as_bytes());
     if compressed.len() + 1 >= sql.len() {
         return encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, sql.as_bytes());
     }
@@ -2528,6 +2572,19 @@ pub(crate) fn encode_wal_auto_commit_sql(sql: &str) -> std::io::Result<Vec<u8>> 
     payload.push(WAL_COMPRESS_ALGO_LZSS);
     payload.extend_from_slice(&compressed);
     encode_wal_v3_record(WAL_V3_TYPE_COMPRESSED_SQL, &payload)
+}
+
+/// v6.6.3 — operator-tunable threshold (bytes). SQL payloads
+/// smaller than this skip LZSS. Default 256; env-tunable via
+/// `SPG_COMPRESSION_MIN_BYTES`. Cached after first call.
+pub(crate) fn wal_compression_min_bytes() -> usize {
+    static CHECKED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHECKED.get_or_init(|| {
+        std::env::var("SPG_COMPRESSION_MIN_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(WAL_COMPRESS_MIN_BYTES)
+    })
 }
 
 /// v6.6.1 — runtime check of `SPG_WAL_COMPRESSION` env. Default
@@ -2926,7 +2983,8 @@ fn run_leader_commit_round(state: &ServerState) {
                 // Encode v3 framed bytes — v6.6.1 chooses between
                 // uncompressed (type=0x01) and LZSS-compressed
                 // (type=0x03) based on payload size + env knob.
-                let wal_bytes = match encode_wal_auto_commit_sql(&task.sql) {
+                // v6.6.3 — tracks bytes-in/bytes-out via Metrics.
+                let wal_bytes = match encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics) {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = engine.execute_in("ROLLBACK", tx_id);
