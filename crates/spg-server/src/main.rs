@@ -508,7 +508,15 @@ fn resolve_path(cli: Option<String>, env_key: &str) -> Option<PathBuf> {
 }
 
 fn main() {
-    let mut args = env::args().skip(1);
+    // v6.10.4 — peek for `--replay-only` before parsing the
+    // positional addr arg. The flag re-targets the boot path:
+    // load the catalog snapshot + replay the WAL into the
+    // engine, then exit 0 without ever opening a listener.
+    // Useful for ops "did the WAL replay cleanly?" smoke tests
+    // and for sandboxed forensic restores.
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let replay_only = raw_args.iter().any(|a| a == "--replay-only");
+    let mut args = raw_args.into_iter().filter(|a| a != "--replay-only");
     let addr = args
         .next()
         .or_else(|| env::var("SPG_ADDR").ok())
@@ -532,10 +540,65 @@ fn main() {
         shutdown_deadline_sec: parse_env_u64("SPG_SHUTDOWN_DEADLINE_SEC"),
     };
     install_shutdown_handlers();
+    if replay_only {
+        if let Err(e) = run_replay_only(db_path, wal_path) {
+            eprintln!("spg-server: replay-only fatal: {e}");
+            process::exit(1);
+        }
+        eprintln!("spg-server: --replay-only complete; exiting 0");
+        return;
+    }
     if let Err(e) = run(&addr, db_path, audit_path, wal_path, password, limits) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
     }
+}
+
+/// v6.10.4 — `--replay-only` boot path. Restores the catalog
+/// snapshot at `db_path` (if any) + replays the WAL at
+/// `wal_path` (if any) into the engine, then returns. No
+/// listener, no audit chain, no replication. The success
+/// criterion is "no error reached this layer" — the catalog
+/// is dropped at fn exit. Sandboxed by design: a WAL containing
+/// poisonous SQL still bubbles up the exec error here, but
+/// can't push state into a live deployment.
+fn run_replay_only(
+    db_path: Option<PathBuf>,
+    wal_path: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let mut engine = match db_path.as_deref() {
+        Some(p) if p.exists() => {
+            let bytes = fs::read(p)?;
+            let engine = Engine::restore_envelope(&bytes)
+                .map_err(|e| std::io::Error::other(format!("restore: {e}")))?;
+            eprintln!(
+                "spg-server: --replay-only restored {} table(s) from {}",
+                engine.catalog().table_count(),
+                p.display()
+            );
+            engine
+        }
+        _ => Engine::new(),
+    };
+    if let Some(w) = wal_path.as_deref() {
+        if w.exists() {
+            let wal_bytes = fs::read(w)?;
+            let applied = replay_wal_bytes(&wal_bytes, &mut engine)?;
+            eprintln!(
+                "spg-server: --replay-only applied {applied} WAL record(s) from {}",
+                w.display()
+            );
+        } else {
+            eprintln!(
+                "spg-server: --replay-only WAL path {} doesn't exist; nothing to replay",
+                w.display()
+            );
+        }
+    }
+    // Final sanity: take a snapshot so the in-memory state has
+    // been exercised through the serialise path before exit.
+    let _ = engine.snapshot();
+    Ok(())
 }
 
 /// Read a usize from `env_key`; non-positive / unparseable / unset
