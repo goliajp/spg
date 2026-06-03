@@ -8,6 +8,56 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.2] — 2026-06-03 (Embedded ergonomics — closures, background workers, sharing)
+
+v7.2 closes the embedded ergonomic carve-outs from v6.10
+STABILITY. Three new surfaces:
+
+```rust
+// (1) Closure-based transaction.
+db.with_transaction(|tx| {
+    tx.execute("INSERT INTO t VALUES (1)")?;
+    tx.execute("INSERT INTO t VALUES (2)")?;
+    Ok::<_, EngineError>(())
+})?;
+
+// (2) Background freezer thread via Arc<Mutex<_>> sharing.
+let shared = Arc::new(Mutex::new(db));
+let _handle = Database::spawn_background_freezer(
+    Arc::clone(&shared),
+    FreezerOptions { hot_tier_bytes: 4 << 30, ..Default::default() },
+);
+
+// (3) `Database: Send` (compile-time guarantee), so
+//     `Arc<Mutex<Database>>` shares cleanly across threads.
+```
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 7.2.0 | `Database::with_transaction(\|tx\| …)` closure ergonomic |
+| 7.2.1 | `Database::spawn_background_freezer` + `FreezerHandle` |
+| 7.2.2 | `Database: Send` compile-time assert + `Arc<Mutex<_>>` doc |
+| 7.2.3 | series ship rollup + tag (this entry) |
+
+### Frozen surfaces added in v7.2
+
+**`spg-embedded` API:**
+- `Database::with_transaction<R, F>(&mut self, body: F) -> Result<R, EngineError>` where `F: FnOnce(&mut Database) -> Result<R, EngineError>`. Implicit `BEGIN` → body → `COMMIT` on `Ok`, `ROLLBACK` on `Err`.
+- `Database::spawn_background_freezer(Arc<Mutex<Database>>, FreezerOptions) -> FreezerHandle`. The handle's `Drop` joins the worker.
+- `FreezerOptions { tick, hot_tier_bytes, batch_rows }` — `Default` mirrors `spg-server`'s defaults (4 GiB / 1 s tick / 1000-row batches).
+- `FreezerHandle::stop(&mut self)` — explicit graceful shutdown (idempotent; `Drop` also calls it).
+- Compile-time `Database: Send` guarantee (`_database_is_send` static assert).
+
+### Known v7.2 limitations (carved out to v7.3+)
+
+- **Multi-reader concurrent `&Database`** (today's API is `&mut self` so `Mutex` serialises all calls). Internal `RwLock` to let many threads hold `&Database` for SELECT-only traffic without contention is parked behind the same v6.9.1 "Choice A" carve-out (planner-side read-lock release).
+- **`#[derive(SpgRow)]` proc-macro** — v7.3 candidate.
+- **Auto-ANALYZE background worker** — same shape as the freezer; not built yet.
+
+---
+
 ## [7.1] — 2026-06-03 (Embedded durability parity)
 
 v7.1 closes the `spg-embedded` carve-outs from the v6.10
