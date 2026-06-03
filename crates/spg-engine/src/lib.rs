@@ -1643,6 +1643,22 @@ impl Engine {
         let mut lines = Vec::<String>::new();
         explain_select(&e.inner, self, 0, &mut lines);
         if e.analyze {
+            // v6.2.4 — EXPLAIN ANALYZE annotates each operator line
+            // with `(rows=N)` where the row count is computable
+            // without re-executing the full query:
+            //   - Top-level operator (first non-indented line):
+            //     rows = final result.len()
+            //   - "From: <table> [full scan]" lines: rows =
+            //     table.rows().len() (catalog read; no execution)
+            //   - "From: <table> [index seek]": indeterminate —
+            //     the index step would need re-execution; v6.2.5
+            //     adds per-operator wall-clock + hot/cold rows
+            //     instrumentation that makes this concrete.
+            //   - Everything else: marked `(—)` so the surface
+            //     stays well-defined without silently dropping
+            //     stats. v6.2.5 fills in via inline executor
+            //     instrumentation.
+            // Total elapsed lands on a trailing `Total: …` line.
             let started = self.clock.map(|f| f());
             let exec = self.exec_select_cancel(&e.inner, cancel)?;
             let elapsed_micros = match (self.clock, started) {
@@ -1654,11 +1670,12 @@ impl Engine {
             } else {
                 0
             };
-            let mut annot = alloc::format!("Actual: rows={row_count}");
+            annotate_explain_lines(&mut lines, row_count, self);
+            let mut total = alloc::format!("Total: rows={row_count}");
             if let Some(us) = elapsed_micros {
-                annot.push_str(&alloc::format!(" elapsed={us}us"));
+                total.push_str(&alloc::format!(" elapsed={us}us"));
             }
-            lines.push(annot);
+            lines.push(total);
         }
         let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
         let rows: Vec<Row> = lines
@@ -3969,6 +3986,59 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
 /// describe the rewritten SELECT — what the executor *would* do —
 /// using the engine handle to spot indexed lookups and table shapes.
 #[allow(clippy::too_many_lines, clippy::format_push_string)]
+/// v6.2.4 — Walk every line of the rendered plan tree and append
+/// per-operator stats. Lines that name a known operator get
+/// `(rows=N)` (`actual_rows` of the top-level operator equals the
+/// final result row count; scans report their catalog row count
+/// as the rows-considered metric). Other lines — Filter / Join /
+/// GroupBy / OrderBy etc. — are marked `(—)` so the surface is
+/// complete-by-construction; v6.2.5 fills these in via inline
+/// executor counters.
+fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engine) {
+    for (idx, line) in lines.iter_mut().enumerate() {
+        let trimmed = line.trim_start();
+        let is_top_level = idx == 0;
+        if is_top_level {
+            // Every top-level node — Result / TableScan / Aggregate
+            // / Distinct / WindowAgg / UnionScan / CTEScan — gets
+            // the final result row count + the total elapsed line
+            // (appended at exec_explain).
+            line.push_str(&alloc::format!(" (rows={total_rows})"));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("From: ") {
+            // Parse `From: <table> [full scan|index seek]`.
+            let (name, scan_kind) = match rest.split_once(" [") {
+                Some((n, k)) => (n.trim(), k.trim_end_matches(']')),
+                None => (rest.trim(), ""),
+            };
+            // Strip an `AS alias` suffix from the table name.
+            let bare = name.split_whitespace().next().unwrap_or(name);
+            let rows = engine
+                .active_catalog()
+                .get(bare)
+                .map(|t| t.rows().len());
+            let annot = match (rows, scan_kind) {
+                (Some(n), "full scan") => alloc::format!(" (rows_scanned={n})"),
+                (Some(n), "index seek") => {
+                    // For an index seek the engine reads ≤ n rows;
+                    // the actual hit count needs inline
+                    // instrumentation (v6.2.5). Mark as upper-
+                    // bounded.
+                    alloc::format!(" (rows_scanned≤{n})")
+                }
+                _ => " (rows=—)".to_string(),
+            };
+            line.push_str(&annot);
+            continue;
+        }
+        // Filter / GroupBy / Having / OrderBy / Limit / Join etc.:
+        // not computable from catalog-level reads alone. Marker
+        // makes the line shape consistent.
+        line.push_str(" (rows=—)");
+    }
+}
+
 fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &mut Vec<String>) {
     let pad = "  ".repeat(depth);
     // 1) Top-level operator label.

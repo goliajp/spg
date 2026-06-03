@@ -10,6 +10,58 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.4] — 2026-06-03 (EXPLAIN ANALYZE per-operator stats)
+
+Fifth v6.2.x sub-version. EXPLAIN ANALYZE now annotates every
+operator line with row-count stats, plus a `Total: …` line
+carrying the final result count + (when the engine has a clock)
+the elapsed time.
+
+### Added
+
+- `annotate_explain_lines` post-pass walks each rendered plan
+  line and appends:
+    - Top-level operator: `(rows=N)` where N = final result count
+    - `From: <table> [full scan]`: `(rows_scanned=N)` from
+      catalog row count
+    - `From: <table> [index seek]`: `(rows_scanned≤N)` (upper
+      bound; v6.2.5 adds the precise count)
+    - Everything else (Filter / JOIN / GroupBy / OrderBy / …):
+      `(rows=—)` — well-defined "not yet measured" marker so the
+      surface is complete by construction
+  Trailing `Total: rows=N elapsed=Mμs` line carries the whole-
+  query stats.
+
+### Tests
+
+- `spg-engine::e2e_explain_analyze` (5):
+    - `every_operator_reports_stats` — no plan line is
+      annotation-less
+    - `top_level_rows_match_result_count` — top reports the
+      final result count
+    - `scan_reports_catalog_row_count` — From line reports
+      `rows_scanned=40` for a 40-row full-scan target
+    - `no_unknown_operator_in_top_level` — 5 representative SQL
+      shapes (TableScan / Aggregate / Distinct / Result / Union)
+      all produce a known top operator
+    - `trailing_total_line_has_elapsed_when_clock_is_set` —
+      `elapsed=…us` lands when an engine clock is injected
+
+### Not changed
+
+- Plan tree shape — same operator names + indentation as v6.2.3.
+- SQL surface — `EXPLAIN ANALYZE` syntax unchanged.
+
+### Out of v6.2.4 (deferred to later v6.2.x — NOT v7)
+
+- Per-operator `elapsed=…us` for inner nodes (Filter / Join /
+  …) — needs inline executor instrumentation; lands in v6.2.5
+  alongside the hot/cold tier row annotation.
+- Per-operator loop counts (PG's `loops=N`) — same v6.2.5
+  follow-up.
+
+---
+
 ## [6.2.3] — 2026-06-03 (JOIN reorder)
 
 Fourth v6.2.x sub-version. Lands cost-based JOIN reorder using
