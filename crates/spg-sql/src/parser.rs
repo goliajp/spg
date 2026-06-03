@@ -1457,8 +1457,55 @@ impl Parser {
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
         let name = self.expect_ident_like()?;
+        // v6.10.2 — optional `AS OF SEGMENT '<id>'` cold-tier
+        // time-travel clause. Parse BEFORE the alias so the
+        // alias can still ride at the tail (`tbl AS OF SEGMENT
+        // '5' alias`). `AS` is a reserved keyword token, while
+        // `OF` and `SEGMENT` are bare idents.
+        let as_of_segment = if matches!(self.peek(), Token::As)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("of"))
+        {
+            self.advance(); // AS
+            self.advance(); // OF
+            let kw = match self.peek().clone() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s,
+                other => {
+                    return Err(self.err(format!(
+                        "expected SEGMENT after AS OF, got {other:?}"
+                    )));
+                }
+            };
+            if !kw.eq_ignore_ascii_case("segment") {
+                return Err(self.err(format!(
+                    "expected SEGMENT after AS OF, got {kw:?}; v6.10.2 supports SEGMENT only"
+                )));
+            }
+            self.advance();
+            // Segment id literal — accept either a string or
+            // integer for operator ergonomics.
+            let id = match self.advance() {
+                Token::String(s) => s
+                    .parse::<u32>()
+                    .map_err(|e| self.err(format!("AS OF SEGMENT id parse: {e}")))?,
+                Token::Integer(n) => u32::try_from(n).map_err(|e| {
+                    self.err(format!("AS OF SEGMENT id parse: {e}"))
+                })?,
+                other => {
+                    return Err(self.err(format!(
+                        "expected segment id literal after AS OF SEGMENT, got {other:?}"
+                    )));
+                }
+            };
+            Some(id)
+        } else {
+            None
+        };
         let alias = self.parse_optional_alias();
-        Ok(TableRef { name, alias })
+        Ok(TableRef {
+            name,
+            alias,
+            as_of_segment,
+        })
     }
 
     /// FROM-clause: a primary table reference plus zero-or-more joined

@@ -2959,12 +2959,178 @@ impl Engine {
     /// loop; HNSW kNN graph walks and the aggregate executor don't
     /// honour it yet (deferred — those paths bound their work
     /// internally by `LIMIT k` and `GROUP BY` cardinality).
+    /// v6.10.2 — cold-tier time-travel scan. Resolves the segment
+    /// by id, decodes each row body against the table's current
+    /// schema, applies the SELECT's projection + optional WHERE +
+    /// optional LIMIT, returns a `Rows` result. JOINs / aggregates
+    /// / ORDER BY are unsupported on this path (STABILITY carve-
+    /// out); operators wanting them should restore the segment
+    /// into a regular table first.
+    fn exec_select_as_of_segment(
+        &self,
+        stmt: &SelectStatement,
+        from: &spg_sql::ast::FromClause,
+        segment_id: u32,
+    ) -> Result<QueryResult, EngineError> {
+        // v6.10.2 scope: no joins, no aggregates, no ORDER BY,
+        // no GROUP BY / HAVING / UNION / OFFSET / DISTINCT.
+        if !from.joins.is_empty()
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || !stmt.unions.is_empty()
+            || !stmt.order_by.is_empty()
+            || stmt.offset.is_some()
+            || stmt.distinct
+            || aggregate::uses_aggregate(stmt)
+        {
+            return Err(EngineError::Unsupported(
+                "AS OF SEGMENT supports SELECT projection + WHERE + LIMIT only \
+                 (joins / aggregates / ORDER BY are STABILITY § \"Out of v6.10\")"
+                    .into(),
+            ));
+        }
+        let table = self
+            .active_catalog()
+            .get(&from.primary.name)
+            .ok_or_else(|| StorageError::TableNotFound {
+                name: from.primary.name.clone(),
+            })?;
+        let schema = table.schema().clone();
+        let schema_cols = &schema.columns;
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let ctx = EvalContext::new(schema_cols, Some(alias));
+        let seg = self
+            .active_catalog()
+            .cold_segment(segment_id)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "AS OF SEGMENT: cold segment {segment_id} not registered"
+                ))
+            })?;
+        let mut out_rows: Vec<Row> = Vec::new();
+        let mut limit_remaining: Option<usize> =
+            stmt.limit.as_ref().and_then(|n| usize::try_from(*n).ok());
+        for (_key, body) in seg.scan() {
+            let (row, _consumed) = spg_storage::decode_row_body_dense(&body, &schema)
+                .map_err(EngineError::Storage)?;
+            if let Some(where_expr) = &stmt.where_ {
+                let cond = self.eval_expr_simple(where_expr, &row, &ctx)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            // Projection.
+            let projected = self.project_row_simple(&row, &stmt.items, schema_cols, alias)?;
+            out_rows.push(projected);
+            if let Some(rem) = limit_remaining.as_mut() {
+                if *rem == 0 {
+                    out_rows.pop();
+                    break;
+                }
+                *rem -= 1;
+            }
+        }
+        // Output column schema: derive from SELECT items.
+        let columns = self.derive_output_columns(&stmt.items, schema_cols, alias);
+        Ok(QueryResult::Rows {
+            columns,
+            rows: out_rows,
+        })
+    }
+
+    /// v6.10.2 — simple-path WHERE eval that doesn't go through
+    /// the correlated-subquery / Memoize machinery. AS OF SEGMENT
+    /// scan paths predicate against a snapshot frozen segment, no
+    /// cross-row state.
+    fn eval_expr_simple(
+        &self,
+        expr: &Expr,
+        row: &Row,
+        ctx: &EvalContext,
+    ) -> Result<Value, EngineError> {
+        let cancel = CancelToken::none();
+        self.eval_expr_with_correlated(expr, row, ctx, cancel, None)
+    }
+
+    /// v6.10.2 — projection for AS OF SEGMENT. Resolves
+    /// `SelectItem::Wildcard` to all schema columns and
+    /// `SelectItem::Expr` via the regular eval path.
+    fn project_row_simple(
+        &self,
+        row: &Row,
+        items: &[SelectItem],
+        schema_cols: &[ColumnSchema],
+        alias: &str,
+    ) -> Result<Row, EngineError> {
+        let ctx = EvalContext::new(schema_cols, Some(alias));
+        let cancel = CancelToken::none();
+        let mut out_vals = Vec::new();
+        for item in items {
+            match item {
+                SelectItem::Wildcard => {
+                    out_vals.extend(row.values.iter().cloned());
+                }
+                SelectItem::Expr { expr, .. } => {
+                    let v = self.eval_expr_with_correlated(expr, row, &ctx, cancel, None)?;
+                    out_vals.push(v);
+                }
+            }
+        }
+        Ok(Row::new(out_vals))
+    }
+
+    /// v6.10.2 — derive the output `ColumnSchema` list for an
+    /// AS OF SEGMENT projection. Wildcards take the full schema;
+    /// expressions take the alias if present or a synthetic
+    /// `?column?` (PG convention) otherwise.
+    fn derive_output_columns(
+        &self,
+        items: &[SelectItem],
+        schema_cols: &[ColumnSchema],
+        _alias: &str,
+    ) -> Vec<ColumnSchema> {
+        let mut out = Vec::new();
+        for item in items {
+            match item {
+                SelectItem::Wildcard => {
+                    out.extend(schema_cols.iter().cloned());
+                }
+                SelectItem::Expr { alias, .. } => {
+                    let name = alias
+                        .clone()
+                        .unwrap_or_else(|| "?column?".to_string());
+                    // Default to Text; the caller's row values
+                    // carry the actual type. v6.10.2 scope.
+                    out.push(ColumnSchema::new(name, DataType::Text, true));
+                }
+            }
+        }
+        out
+    }
+
     fn exec_select_cancel(
         &self,
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v6.10.2 — cold-tier time-travel short-circuit. When the
+        // primary TableRef carries `AS OF SEGMENT '<id>'`, run a
+        // dedicated cold-segment scan instead of the regular
+        // hot+index path. The scope is intentionally narrow for
+        // v6.10.2 — bare `SELECT * FROM <t> AS OF SEGMENT 'id'`,
+        // optionally with a single-column-equality WHERE. JOINs /
+        // aggregates / ORDER BY / subqueries on top of a time-
+        // travelled scan are STABILITY § "Out of v6.10".
+        if let Some(from) = &stmt.from
+            && let Some(seg_id) = from.primary.as_of_segment
+        {
+            return self.exec_select_as_of_segment(stmt, from, seg_id);
+        }
         // v6.2.0 / v6.5.0 — virtual-table short-circuits. Detected
         // pre-CTE because they don't read from the catalog and
         // shouldn't participate in regular FROM resolution.
