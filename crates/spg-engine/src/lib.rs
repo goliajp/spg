@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod aggregate;
 pub mod eval;
 pub mod json;
+pub mod memoize;
 pub mod publications;
 pub mod reorder;
 pub mod selectivity;
@@ -2254,14 +2255,21 @@ impl Engine {
         // aggregate executor which does its own projection + ORDER BY.
         if aggregate::uses_aggregate(stmt) {
             let mut filtered: Vec<&Row> = Vec::new();
-            // Cold-tier rows are owned inside `indexed_rows`'s `Cow`,
-            // so we keep the Vec alive across the loop and borrow into
-            // it. `filtered` borrows from one of two backing stores.
+            // v6.2.6 — Memoize: per-query LRU cache for correlated
+            // scalar subqueries. Fresh per row-loop entry so each
+            // SELECT execution gets an isolated cache.
+            let mut memo = memoize::MemoizeCache::new();
             if let Some(rows) = &indexed_rows {
                 for cow in rows {
                     let row = cow.as_ref();
                     if let Some(where_expr) = &stmt.where_ {
-                        let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
+                        let cond = self.eval_expr_with_correlated(
+                            where_expr,
+                            row,
+                            &ctx,
+                            cancel,
+                            Some(&mut memo),
+                        )?;
                         if !matches!(cond, Value::Bool(true)) {
                             continue;
                         }
@@ -2272,7 +2280,13 @@ impl Engine {
                 for i in 0..table.row_count() {
                     let row = &table.rows()[i];
                     if let Some(where_expr) = &stmt.where_ {
-                        let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
+                        let cond = self.eval_expr_with_correlated(
+                            where_expr,
+                            row,
+                            &ctx,
+                            cancel,
+                            Some(&mut memo),
+                        )?;
                         if !matches!(cond, Value::Bool(true)) {
                             continue;
                         }
@@ -2293,6 +2307,8 @@ impl Engine {
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
         let mut tagged: Vec<(Option<f64>, Row)> = Vec::new();
+        // v6.2.6 — Memoize per-row WHERE eval shares one cache.
+        let mut memo = memoize::MemoizeCache::new();
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row, loop_idx: usize| -> Result<(), EngineError> {
@@ -2300,7 +2316,13 @@ impl Engine {
                 cancel.check()?;
             }
             if let Some(where_expr) = &stmt.where_ {
-                let cond = self.eval_expr_with_correlated(where_expr, row, &ctx, cancel)?;
+                let cond = self.eval_expr_with_correlated(
+                    where_expr,
+                    row,
+                    &ctx,
+                    cancel,
+                    Some(&mut memo),
+                )?;
                 if !matches!(cond, Value::Bool(true)) {
                     return Ok(());
                 }
@@ -3637,12 +3659,13 @@ impl Engine {
         row: &Row,
         ctx: &EvalContext<'_>,
         cancel: CancelToken<'_>,
+        memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<Value, EngineError> {
         if !expr_has_subquery(expr) {
             return eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval);
         }
         let mut e = expr.clone();
-        self.resolve_correlated_in_expr(&mut e, row, ctx, cancel)?;
+        self.resolve_correlated_in_expr(&mut e, row, ctx, cancel, memo)?;
         eval::eval_expr(&e, row, ctx).map_err(EngineError::Eval)
     }
 
@@ -3652,9 +3675,24 @@ impl Engine {
         row: &Row,
         ctx: &EvalContext<'_>,
         cancel: CancelToken<'_>,
+        mut memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<(), EngineError> {
         match e {
             Expr::ScalarSubquery(inner) => {
+                // v6.2.6 — Memoize: build the cache key from the
+                // pre-substitution subquery repr + the outer row's
+                // values. Two outer rows with identical correlated
+                // values hit the same entry.
+                let cache_key = memo.as_ref().map(|_| memoize::CacheKey {
+                    subquery_repr: alloc::format!("{}", **inner),
+                    outer_values: row.values.clone(),
+                });
+                if let (Some(cache), Some(k)) = (memo.as_deref_mut(), cache_key.as_ref())
+                    && let Some(cached) = cache.get(k)
+                {
+                    *e = value_to_literal_expr(cached)?;
+                    return Ok(());
+                }
                 let mut s = (**inner).clone();
                 substitute_outer_columns(&mut s, row, ctx);
                 let r = self.exec_select_cancel(&s, cancel)?;
@@ -3673,6 +3711,9 @@ impl Engine {
                         )));
                     }
                 };
+                if let (Some(cache), Some(k)) = (memo.as_deref_mut(), cache_key) {
+                    cache.insert(k, value.clone());
+                }
                 *e = value_to_literal_expr(value)?;
             }
             Expr::Exists { subquery, negated } => {
@@ -3688,7 +3729,7 @@ impl Engine {
                 subquery,
                 negated,
             } => {
-                self.resolve_correlated_in_expr(lhs, row, ctx, cancel)?;
+                self.resolve_correlated_in_expr(lhs, row, ctx, cancel, memo.as_deref_mut())?;
                 let lhs_val = eval::eval_expr(lhs, row, ctx).map_err(EngineError::Eval)?;
                 let mut s = (**subquery).clone();
                 substitute_outer_columns(&mut s, row, ctx);
@@ -3729,23 +3770,23 @@ impl Engine {
                 *e = Expr::Literal(Literal::Bool(bit));
             }
             Expr::Binary { lhs, rhs, .. } => {
-                self.resolve_correlated_in_expr(lhs, row, ctx, cancel)?;
-                self.resolve_correlated_in_expr(rhs, row, ctx, cancel)?;
+                self.resolve_correlated_in_expr(lhs, row, ctx, cancel, memo.as_deref_mut())?;
+                self.resolve_correlated_in_expr(rhs, row, ctx, cancel, memo.as_deref_mut())?;
             }
             Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-                self.resolve_correlated_in_expr(expr, row, ctx, cancel)?;
+                self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
             }
             Expr::Like { expr, pattern, .. } => {
-                self.resolve_correlated_in_expr(expr, row, ctx, cancel)?;
-                self.resolve_correlated_in_expr(pattern, row, ctx, cancel)?;
+                self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
+                self.resolve_correlated_in_expr(pattern, row, ctx, cancel, memo.as_deref_mut())?;
             }
             Expr::FunctionCall { args, .. } => {
                 for a in args {
-                    self.resolve_correlated_in_expr(a, row, ctx, cancel)?;
+                    self.resolve_correlated_in_expr(a, row, ctx, cancel, memo.as_deref_mut())?;
                 }
             }
             Expr::Extract { source, .. } => {
-                self.resolve_correlated_in_expr(source, row, ctx, cancel)?;
+                self.resolve_correlated_in_expr(source, row, ctx, cancel, memo.as_deref_mut())?;
             }
             Expr::WindowFunction { .. } | Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
         }
