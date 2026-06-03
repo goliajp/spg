@@ -939,6 +939,29 @@ impl Engine {
         self.catalog = catalog;
     }
 
+    /// v6.7.0 — public shim around `Catalog::freeze_oldest_to_cold`
+    /// so tests + the spg-server freezer can drive a freeze without
+    /// reaching into the private `active_catalog_mut`. v6.7.4
+    /// parallel freezer will build on this surface.
+    ///
+    /// Marks the table's cached `cold_row_count` stale because the
+    /// freeze added cold locators that ANALYZE hasn't yet refreshed.
+    pub fn freeze_oldest_to_cold(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        max_rows: usize,
+    ) -> Result<spg_storage::FreezeReport, EngineError> {
+        let report = self
+            .active_catalog_mut()
+            .freeze_oldest_to_cold(table_name, index_name, max_rows)
+            .map_err(EngineError::Storage)?;
+        if let Some(t) = self.active_catalog_mut().get_mut(table_name) {
+            t.mark_cold_row_count_stale();
+        }
+        Ok(report)
+    }
+
     fn active_catalog(&self) -> &Catalog {
         match self.current_tx {
             Some(t) => self
@@ -1389,17 +1412,27 @@ impl Engine {
             ColumnSchema::new("null_frac", DataType::Float, false),
             ColumnSchema::new("n_distinct", DataType::BigInt, false),
             ColumnSchema::new("histogram_bounds", DataType::Text, false),
+            // v6.7.0 — appended column (v6.2.0 stability contract
+            // allows APPEND to spg_statistic, not reorder/rename).
+            // Reports the cached per-table cold-row count; same
+            // value across every column row of the same table.
+            ColumnSchema::new("cold_row_count", DataType::BigInt, false),
         ];
         let rows: Vec<Row> = self
             .statistics
             .iter()
             .map(|((t, c), s)| {
+                let cold = self
+                    .catalog
+                    .get(t)
+                    .map_or(0, |table| table.cold_row_count());
                 Row::new(alloc::vec![
                     Value::Text(t.clone()),
                     Value::Text(c.clone()),
                     Value::Float(f64::from(s.null_frac)),
                     Value::BigInt(i64::try_from(s.n_distinct).unwrap_or(i64::MAX)),
                     Value::Text(render_histogram_bounds(&s.histogram_bounds)),
+                    Value::BigInt(i64::try_from(cold).unwrap_or(i64::MAX)),
                 ])
             })
             .collect();
@@ -1438,19 +1471,48 @@ impl Engine {
 
     /// v6.5.0 — materialise `spg_stat_segment` rows. One row per
     /// cold-tier segment with `(segment_id, num_rows, num_pages,
-    /// total_bytes)`. The `table_name` column is intentionally NOT
-    /// part of v6.5.0: SPG's storage layer doesn't persist a
-    /// segment→table mapping (segments are looked up by id off
-    /// `RowLocator::Cold`; resolving back to a table requires
-    /// walking every table's BTree-index keys). Surface
-    /// carve-out documented in STABILITY.
+    /// total_bytes)`.
+    ///
+    /// v6.7.0 — appended `table_name` column resolves the v6.5.0
+    /// carve-out. Walks every user table's BTree indices to find
+    /// which table's Cold locators point at each segment. Empty
+    /// string for orphan segments (loaded via SPG_PRELOAD_COLD_SEGMENT
+    /// before any index registered a locator). The walk is
+    /// O(tables × indices × keys); cached per call, not across
+    /// calls — re-walked on every `SELECT * FROM spg_stat_segment`.
     fn exec_spg_stat_segment(&self) -> QueryResult {
         let columns = alloc::vec![
             ColumnSchema::new("segment_id", DataType::BigInt, false),
+            ColumnSchema::new("table_name", DataType::Text, false),
             ColumnSchema::new("num_rows", DataType::BigInt, false),
             ColumnSchema::new("num_pages", DataType::BigInt, false),
             ColumnSchema::new("total_bytes", DataType::BigInt, false),
         ];
+        // v6.7.0 — build a segment_id → table_name map by walking
+        // every user table's BTree indices once. O(tables × indices
+        // × keys) for the v6.5.0 carve-out resolution; acceptable
+        // because spg_stat_segment is operator-facing (not on a
+        // hot-loop path).
+        let mut segment_owners: alloc::collections::BTreeMap<u32, String> = BTreeMap::new();
+        for tname in self.catalog.table_names() {
+            if is_internal_table_name(&tname) {
+                continue;
+            }
+            let Some(t) = self.catalog.get(&tname) else {
+                continue;
+            };
+            for idx in t.indices() {
+                if let spg_storage::IndexKind::BTree(map) = &idx.kind {
+                    for (_, locs) in map.iter() {
+                        for loc in locs {
+                            if let spg_storage::RowLocator::Cold { segment_id, .. } = loc {
+                                segment_owners.entry(*segment_id).or_insert_with(|| tname.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let rows: Vec<Row> = self
             .catalog
             .cold_segment_ids_global()
@@ -1458,8 +1520,13 @@ impl Engine {
             .filter_map(|&id| {
                 let seg = self.catalog.cold_segment(id)?;
                 let meta = seg.meta();
+                let owner = segment_owners
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(Row::new(alloc::vec![
                     Value::BigInt(i64::from(id)),
+                    Value::Text(owner),
                     Value::BigInt(i64::try_from(meta.num_rows).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::from(meta.num_pages)),
                     Value::BigInt(i64::try_from(meta.total_bytes).unwrap_or(i64::MAX)),
@@ -1876,6 +1943,23 @@ impl Engine {
             );
         }
         self.statistics.reset_modified(table_name);
+        // v6.7.0 — refresh the per-table cold_rows cache. Walk the
+        // BTree indices and count Cold locators (MAX across
+        // indices); store the result on the table. Surfaced via
+        // `spg_statistic.cold_row_count` (new column) and
+        // `spg_stat_segment.table_name` (new column).
+        let cold_count = {
+            let table = self
+                .active_catalog()
+                .get(table_name)
+                .expect("table still present");
+            table.count_cold_locators()
+        };
+        let table_mut = self
+            .active_catalog_mut()
+            .get_mut(table_name)
+            .expect("table still present");
+        table_mut.set_cold_row_count(cold_count);
         Ok(())
     }
 
@@ -7719,9 +7803,11 @@ mod tests {
         let QueryResult::Rows { rows, columns } = r else {
             panic!()
         };
-        assert_eq!(columns.len(), 5);
+        // v6.7.0 — spg_statistic gained a `cold_row_count` column.
+        assert_eq!(columns.len(), 6);
         assert_eq!(columns[0].name, "table_name");
         assert_eq!(columns[4].name, "histogram_bounds");
+        assert_eq!(columns[5].name, "cold_row_count");
         assert_eq!(rows.len(), 2, "one row per column of t");
         // Sorted by (table_name, column_name).
         match (&rows[0].values[0], &rows[0].values[1]) {
