@@ -329,18 +329,55 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             b'D' => {
                 if !body.is_empty() {
                     let kind = body[0];
-                    // PG spec says NoData (`n`) is the right reply
-                    // when we can't compute the row description ahead
-                    // of time. Most drivers tolerate this even though
-                    // it forces them to read RD off the Execute reply.
+                    let name = cstring_at(&body, 1).unwrap_or_default();
+                    // v6.3.3 — real Describe. Statement (S) returns
+                    // ParameterDescription + RowDescription | NoData.
+                    // Portal (P) returns RowDescription | NoData
+                    // (portals don't carry their own param desc — that's
+                    // on the underlying statement).
+                    let (param_oids, columns): (Vec<u32>, Vec<ColumnSchema>) = if kind == b'S' {
+                        if let Some(stmt) = prepared.get(&name) {
+                            let eng = state.engine.read().map_err(|_| {
+                                std::io::Error::other("engine lock poisoned")
+                            })?;
+                            eng.describe_prepared(&stmt.ast)
+                        } else {
+                            (Vec::new(), Vec::new())
+                        }
+                    } else if kind == b'P' {
+                        let cols = if let Some(portal) = portals.get(&name) {
+                            if let Some(stmt) = prepared.get(&portal.stmt_name) {
+                                let eng = state.engine.read().map_err(|_| {
+                                    std::io::Error::other("engine lock poisoned")
+                                })?;
+                                let (_, c) = eng.describe_prepared(&stmt.ast);
+                                c
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        (Vec::new(), cols)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                     if kind == b'S' {
-                        // ParameterDescription: zero parameters
-                        // declared (we'll trust the Bind to count them).
-                        let mut pd = Vec::with_capacity(2);
-                        pd.extend_from_slice(&0u16.to_be_bytes());
+                        let n = u16::try_from(param_oids.len()).map_err(|_| {
+                            std::io::Error::other("too many parameters")
+                        })?;
+                        let mut pd = Vec::with_capacity(2 + param_oids.len() * 4);
+                        pd.extend_from_slice(&n.to_be_bytes());
+                        for oid in &param_oids {
+                            pd.extend_from_slice(&oid.to_be_bytes());
+                        }
                         send_msg(&mut wbuf, b't', &pd)?;
                     }
-                    send_msg(&mut wbuf, b'n', &[])?; // NoData
+                    if columns.is_empty() {
+                        send_msg(&mut wbuf, b'n', &[])?; // NoData
+                    } else {
+                        send_row_description(&mut wbuf, &columns)?;
+                    }
                 }
             }
             // Execute (E): portal name + max-rows (0 = all).
