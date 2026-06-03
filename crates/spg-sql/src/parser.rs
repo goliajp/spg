@@ -1453,7 +1453,31 @@ impl Parser {
                 });
             }
         };
+        // v7.9.6 — PG `SERIAL` / `BIGSERIAL` shorthand for
+        // `INT/BIGINT NOT NULL AUTO_INCREMENT`. PG also defines
+        // SMALLSERIAL → SMALLINT; we accept that too. The implicit
+        // NOT NULL + AUTO_INCREMENT flags get baked in after the
+        // type tag so the rest of the constraint-loop parser sees
+        // them as if user-supplied (rejecting duplicates).
+        let mut implied_auto_increment = false;
+        let mut implied_not_null = false;
         let ty = match ty_ident.as_str() {
+            // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
+            "smallserial" | "serial2" => {
+                implied_auto_increment = true;
+                implied_not_null = true;
+                ColumnTypeName::SmallInt
+            }
+            "serial" | "serial4" => {
+                implied_auto_increment = true;
+                implied_not_null = true;
+                ColumnTypeName::Int
+            }
+            "bigserial" | "serial8" => {
+                implied_auto_increment = true;
+                implied_not_null = true;
+                ColumnTypeName::BigInt
+            }
             // MySQL flavours we accept by aliasing to the closest SPG
             // type. TINYINT covers MySQL's i8 — held inside SMALLINT
             // since SPG doesn't have a dedicated i8. MEDIUMINT (MySQL
@@ -1510,9 +1534,9 @@ impl Parser {
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
         // each at most once.
         let mut default: Option<Expr> = None;
-        let mut nullable = true;
-        let mut nullability_seen = false;
-        let mut auto_increment = false;
+        let mut nullable = !implied_not_null;
+        let mut nullability_seen = implied_not_null;
+        let mut auto_increment = implied_auto_increment;
         loop {
             if matches!(self.peek(), Token::Default) {
                 if default.is_some() {
