@@ -3171,28 +3171,34 @@ impl Engine {
         let mut pending_updates: Vec<(usize, Vec<Value>)> = Vec::new();
         let mut skipped_count = 0usize;
         if let Some(clause) = &stmt.on_conflict {
-            let conflict_col = resolve_on_conflict_column(
+            let conflict_cols = resolve_on_conflict_columns(
                 self.active_catalog(),
                 &stmt.table,
                 clause.target_columns.as_slice(),
             )?;
             let mut kept: Vec<Vec<Value>> = Vec::with_capacity(all_values.len());
-            let mut seen_keys: Vec<Value> = Vec::new();
+            let mut seen_keys: Vec<Vec<Value>> = Vec::new();
             for values in all_values {
-                let key = &values[conflict_col];
-                let collides_with_table = !matches!(key, Value::Null)
-                    && on_conflict_key_exists(
+                let key_tuple: Vec<&Value> =
+                    conflict_cols.iter().map(|&c| &values[c]).collect();
+                // SQL spec: NULL in any conflict column means "no
+                // conflict possible" (NULL ≠ NULL for uniqueness).
+                let has_null_key = key_tuple.iter().any(|v| matches!(v, Value::Null));
+                let collides_with_table = !has_null_key
+                    && on_conflict_keys_exist(
                         self.active_catalog(),
                         &stmt.table,
-                        conflict_col,
-                        key,
+                        &conflict_cols,
+                        &key_tuple,
                     );
-                let collides_with_batch =
-                    !matches!(key, Value::Null) && seen_keys.iter().any(|k| k == key);
+                let key_tuple_owned: Vec<Value> =
+                    key_tuple.iter().map(|v| (*v).clone()).collect();
+                let collides_with_batch = !has_null_key
+                    && seen_keys.iter().any(|k| k == &key_tuple_owned);
                 let collides = collides_with_table || collides_with_batch;
                 match (&clause.action, collides) {
                     (_, false) => {
-                        seen_keys.push(key.clone());
+                        seen_keys.push(key_tuple_owned);
                         kept.push(values);
                     }
                     (spg_sql::ast::OnConflictAction::Nothing, true) => {
@@ -3205,23 +3211,15 @@ impl Engine {
                         },
                         true,
                     ) => {
-                        // Only the table-side collision triggers an
-                        // UPDATE; batch-internal collisions still skip
-                        // (PG: the second incoming row goes into the
-                        // UPDATE's incoming-row pool, not into the
-                        // first row's update).
                         if !collides_with_table {
                             skipped_count += 1;
                             continue;
                         }
-                        // Find the existing row position. With a
-                        // BTree index on `conflict_col`, lookup_eq
-                        // hands back the row locator.
-                        let target_pos = lookup_row_position_by_pk(
+                        let target_pos = lookup_row_position_by_keys(
                             self.active_catalog(),
                             &stmt.table,
-                            conflict_col,
-                            key,
+                            &conflict_cols,
+                            &key_tuple,
                         )
                         .ok_or_else(|| {
                             EngineError::Unsupported(
@@ -3230,8 +3228,6 @@ impl Engine {
                                     .into(),
                             )
                         })?;
-                        // Build the post-update row by starting from
-                        // the existing row and applying each assignment.
                         let updated = apply_on_conflict_assignments(
                             self.active_catalog(),
                             &stmt.table,
@@ -7470,17 +7466,17 @@ fn pick_pk_index_column(
     })
 }
 
-/// v7.9.8 — resolve the column position that uniquely identifies
-/// a conflict for ON CONFLICT. When the user wrote
-/// `ON CONFLICT (col) DO …`, look up that column on the table.
-/// When they wrote bare `ON CONFLICT DO …`, fall back to the
-/// table's first single-column unconditional BTree index column.
-/// Returns the column position or an Unsupported error.
-fn resolve_on_conflict_column(
+/// v7.9.8 / v7.9.10 — resolve the column positions that
+/// identify a conflict for ON CONFLICT. Returns a Vec of
+/// column positions (1 element for single-column form, N for
+/// composite). When the user wrote bare `ON CONFLICT DO …`,
+/// falls back to the table's first unconditional BTree index
+/// (always single-column today).
+fn resolve_on_conflict_columns(
     catalog: &Catalog,
     table_name: &str,
     target: &[String],
-) -> Result<usize, EngineError> {
+) -> Result<Vec<usize>, EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
             name: table_name.into(),
@@ -7506,24 +7502,23 @@ fn resolve_on_conflict_column(
                     "ON CONFLICT without target requires a UNIQUE BTree index on {table_name:?}"
                 ))
             })?;
-        return Ok(pos);
+        return Ok(alloc::vec![pos]);
     }
-    if target.len() > 1 {
-        return Err(EngineError::Unsupported(
-            "ON CONFLICT with composite target lands in v7.9.10".into(),
-        ));
+    let mut out = Vec::with_capacity(target.len());
+    for name in target {
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name == *name)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ON CONFLICT target column {name:?} not found on {table_name:?}"
+                ))
+            })?;
+        out.push(pos);
     }
-    let name = &target[0];
-    table
-        .schema()
-        .columns
-        .iter()
-        .position(|c| c.name == *name)
-        .ok_or_else(|| {
-            EngineError::Unsupported(alloc::format!(
-                "ON CONFLICT target column {name:?} not found on {table_name:?}"
-            ))
-        })
+    Ok(out)
 }
 
 /// v7.9.8 — check whether the BTree index on `column_pos` of
@@ -7548,22 +7543,53 @@ fn on_conflict_key_exists(
     })
 }
 
-/// v7.9.9 — look up an existing row's `Table::rows()` position by
-/// scanning the table for the row whose `column_pos` cell equals
-/// `key`. Returns the first match; on a UNIQUE BTree the first
-/// match is the only match. Cold-tier rows surface as None (the
-/// caller treats that as "can't ON CONFLICT this row").
-fn lookup_row_position_by_pk(
+/// v7.9.9 / v7.9.10 — look up an existing row's position by
+/// matching all `column_positions` against the incoming `key`
+/// tuple. Single-column shape (one column) reduces to the
+/// canonical PK lookup; composite shapes scan linearly until
+/// every position matches.
+fn lookup_row_position_by_keys(
     catalog: &Catalog,
     table_name: &str,
-    column_pos: usize,
-    key: &Value,
+    column_positions: &[usize],
+    key: &[&Value],
 ) -> Option<usize> {
     let table = catalog.get(table_name)?;
-    table
-        .rows()
-        .iter()
-        .position(|r| r.values.get(column_pos) == Some(key))
+    table.rows().iter().position(|r| {
+        column_positions
+            .iter()
+            .enumerate()
+            .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
+    })
+}
+
+/// v7.9.10 — does the table already contain a row whose
+/// `column_positions` tuple equals `key`? Single-column shape
+/// uses the existing BTree fast path; composite shapes fall
+/// back to a row scan.
+fn on_conflict_keys_exist(
+    catalog: &Catalog,
+    table_name: &str,
+    column_positions: &[usize],
+    key: &[&Value],
+) -> bool {
+    if column_positions.len() == 1 {
+        return on_conflict_key_exists(
+            catalog,
+            table_name,
+            column_positions[0],
+            key[0],
+        );
+    }
+    let Some(table) = catalog.get(table_name) else {
+        return false;
+    };
+    table.rows().iter().any(|r| {
+        column_positions
+            .iter()
+            .enumerate()
+            .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
+    })
 }
 
 /// v7.9.9 — apply ON CONFLICT DO UPDATE SET assignments to an
