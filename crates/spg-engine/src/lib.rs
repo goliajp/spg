@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod aggregate;
+pub mod describe;
 pub mod eval;
 pub mod json;
 pub mod memoize;
@@ -1001,6 +1002,18 @@ impl Engine {
     /// v6.3.0 — mutable accessor for v6.3.1 invalidation hooks.
     pub fn plan_cache_mut(&mut self) -> &mut plan_cache::PlanCache {
         &mut self.plan_cache
+    }
+
+    /// v6.3.3 — Describe a prepared `Statement` without executing.
+    /// Returns `(parameter_oids, output_columns)`. Empty
+    /// `output_columns` means the statement has no row-producing
+    /// shape we could resolve here (JOIN, subquery, non-SELECT, …)
+    /// — pgwire layer maps that to a `NoData` reply.
+    pub fn describe_prepared(
+        &self,
+        stmt: &Statement,
+    ) -> (Vec<u32>, Vec<ColumnSchema>) {
+        describe::describe_prepared(stmt, self.active_catalog())
     }
 
     /// v6.1.1 — execute a [`Statement`] previously returned by
