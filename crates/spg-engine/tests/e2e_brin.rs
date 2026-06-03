@@ -79,6 +79,9 @@ fn brin_summaries_get_emitted_at_freeze_when_brin_index_exists() {
     let _schema = TableSchema {
         name: "t".to_string(),
         columns: vec![ColumnSchema::new("id".to_string(), DataType::Int, false)],
+        // v6.7.2 added per-table hot_tier_bytes override; defaults
+        // to None (= follow global SPG_HOT_TIER_BYTES).
+        hot_tier_bytes: None,
     };
     // Encode 100 rows with sparse keys.
     let pairs: Vec<(u64, Vec<u8>)> = (0..100u64)

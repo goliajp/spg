@@ -212,10 +212,12 @@ fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
     engine.replace_catalog(new_cat);
     // Reflect the new segment count on the /metrics surface
     // (`spg_cold_segments_total`) via the Metrics gauge.
-    state
-        .metrics
-        .cold_segments
-        .store(u64::from(report.segment_id + 1), Ordering::Relaxed);
+    // v6.7.3 — read the live count off the catalog (sparse since
+    // compaction tombstones a slot without renumbering the rest).
+    state.metrics.cold_segments.store(
+        engine.catalog().cold_segment_count() as u64,
+        Ordering::Relaxed,
+    );
     // Persist segment bytes to disk so a restart can reload via
     // SPG_PRELOAD_COLD_SEGMENT (or, since v5.3.1, the manifest
     // sidecar that CHECKPOINT writes).

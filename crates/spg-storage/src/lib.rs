@@ -28,7 +28,7 @@ pub use self::segment::{
     wrap_v2_envelope_with_brin,
 };
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -381,6 +381,42 @@ pub struct FreezeReport {
     /// copy inside `cold_segments`; this hand-off lets the caller
     /// persist them without re-encoding.
     pub segment_bytes: Vec<u8>,
+}
+
+/// v6.7.3 — outcome of a [`Catalog::compact_cold_segments`] call.
+/// The catalog state has already been mutated when this is returned:
+/// the merged segment is loaded into `cold_segments`, the source
+/// segment slots are tombstoned (`None`), and every BTree-index
+/// `RowLocator::Cold` that previously pointed at a source now
+/// points at the merged segment. The caller's remaining job is to
+/// persist `merged_segment_bytes` under
+/// `<db>.spg/segments/seg_<merged_segment_id>.spg` and update the
+/// in-memory `segment_id → path` map (remove the source ids, add
+/// the merged id) so the next CHECKPOINT writes a manifest that
+/// no longer lists the retired sources.
+///
+/// On a no-op (fewer than 2 candidate segments under the threshold),
+/// `merged_segment_id` is `None` and `sources` is empty; the
+/// catalog was not mutated.
+#[derive(Debug, Clone)]
+pub struct CompactReport {
+    /// Source segment ids that were merged + tombstoned.
+    pub sources: Vec<u32>,
+    /// Id allocated for the merged segment. `None` on no-op.
+    pub merged_segment_id: Option<u32>,
+    /// Encoded merged-segment bytes (empty on no-op).
+    pub merged_segment_bytes: Vec<u8>,
+    /// Number of rows that landed in the merged segment.
+    pub merged_rows: usize,
+    /// `Σ source.num_rows − merged_rows`. Rows present in source
+    /// segment payloads but unreferenced by any live BTree
+    /// `Cold` locator — DELETE'd-but-still-frozen rows that
+    /// compaction GC'd during the merge.
+    pub deleted_rows_pruned: usize,
+    /// `Σ source.bytes() − merged.bytes()`. Estimate of on-disk
+    /// space the merge will reclaim once the source segment files
+    /// are GC'd. Saturating subtract — never negative.
+    pub bytes_reclaimed_estimate: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2380,7 +2416,16 @@ pub struct Catalog {
     /// (rather than O(total segment bytes) memcpy) so the v4.42
     /// group-commit pre-image rollback invariant — clone is
     /// effectively free — survives the cold-tier addition.
-    cold_segments: Vec<Arc<OwnedSegment>>,
+    ///
+    /// v6.7.3 — slots became `Option<…>` so cold-segment compaction
+    /// can tombstone merged sources without breaking the
+    /// `segment_id = index_into_vec` contract that on-disk
+    /// `RowLocator::Cold { segment_id }` already serialized.
+    /// `None` slot = the segment was retired by compaction; the
+    /// physical file may still be on disk (next CHECKPOINT writes
+    /// a manifest that no longer lists it, and the file becomes
+    /// an orphan eligible for offline cleanup).
+    cold_segments: Vec<Option<Arc<OwnedSegment>>>,
 }
 
 impl Catalog {
@@ -2441,24 +2486,87 @@ impl Catalog {
         })?;
         let seg = OwnedSegment::from_bytes(bytes)
             .map_err(|e| StorageError::Corrupt(format!("cold segment parse failed: {e}")))?;
-        self.cold_segments.push(Arc::new(seg));
+        self.cold_segments.push(Some(Arc::new(seg)));
         Ok(id)
     }
 
+    /// v6.7.3 — register a cold-tier segment at a specific id. Used
+    /// by the spg-server manifest-boot path so segments whose
+    /// neighbouring ids were retired by compaction still get back
+    /// the same `segment_id` they had pre-restart (the
+    /// `RowLocator::Cold { segment_id }` baked into the BTree-index
+    /// snapshot persists across restart and must continue to
+    /// resolve).
+    ///
+    /// Pads the Vec with `None` slots up to `target_id` if needed.
+    /// Errors when the target slot is already occupied (would
+    /// stomp another segment), the parse fails, or `target_id`
+    /// exceeds `u32::MAX`.
+    pub fn load_segment_bytes_at(
+        &mut self,
+        target_id: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), StorageError> {
+        let seg = OwnedSegment::from_bytes(bytes)
+            .map_err(|e| StorageError::Corrupt(format!("cold segment parse failed: {e}")))?;
+        let idx = target_id as usize;
+        while self.cold_segments.len() <= idx {
+            self.cold_segments.push(None);
+        }
+        if self.cold_segments[idx].is_some() {
+            return Err(StorageError::Corrupt(format!(
+                "load_segment_bytes_at: segment_id {target_id} already occupied"
+            )));
+        }
+        self.cold_segments[idx] = Some(Arc::new(seg));
+        Ok(())
+    }
+
+    /// v6.7.3 — retire a cold-tier segment slot (compaction-driven).
+    /// The physical file is the caller's concern (typically kept
+    /// on disk until the next CHECKPOINT writes a manifest that
+    /// no longer lists it); this just flips the in-memory slot
+    /// to `None` so later cold lookups for `segment_id` resolve
+    /// as "unknown" instead of returning a stale row.
+    ///
+    /// No-op when the slot is already `None`. Errors only when
+    /// `segment_id` is out of bounds.
+    pub fn tombstone_segment(&mut self, segment_id: u32) -> Result<(), StorageError> {
+        let idx = segment_id as usize;
+        if idx >= self.cold_segments.len() {
+            return Err(StorageError::Corrupt(format!(
+                "tombstone_segment: segment_id {segment_id} out of bounds (len={})",
+                self.cold_segments.len()
+            )));
+        }
+        self.cold_segments[idx] = None;
+        Ok(())
+    }
+
+    /// Number of *active* (non-tombstoned) cold segments.
     #[must_use]
     pub fn cold_segment_count(&self) -> usize {
+        self.cold_segments.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Slot count including tombstones (= the next id the
+    /// no-arg `load_segment_bytes` would allocate).
+    #[must_use]
+    pub fn cold_segment_slot_count(&self) -> usize {
         self.cold_segments.len()
     }
 
-    /// v6.2.7 — list every cold-tier segment id known to this
-    /// catalog. Used by EXPLAIN ANALYZE to annotate scan nodes
-    /// with the segments they could have walked. Currently
-    /// returns the global set across all tables; per-table
-    /// breakdown lands in a future v6.2.x (would require
-    /// walking each table's BTree-index cold locators).
+    /// v6.2.7 — list every *active* cold-tier segment id known to
+    /// this catalog (skips compaction tombstones since v6.7.3).
+    /// Used by EXPLAIN ANALYZE to annotate scan nodes with the
+    /// segments they could have walked.
     #[must_use]
     pub fn cold_segment_ids_global(&self) -> Vec<u32> {
-        (0..self.cold_segments.len() as u32).collect()
+        self.cold_segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|_| i as u32))
+            .collect()
     }
 
     /// v5.2.1: sum of `Table::hot_bytes` across every table. The v5.2
@@ -2657,7 +2765,7 @@ impl Catalog {
     pub fn cold_segment(&self, segment_id: u32) -> Option<&OwnedSegment> {
         self.cold_segments
             .get(segment_id as usize)
-            .map(AsRef::as_ref)
+            .and_then(|s| s.as_deref())
     }
 
     /// v5.1: resolve a single `RowLocator::Cold` to its underlying
@@ -2676,7 +2784,7 @@ impl Catalog {
     ) -> Option<Row> {
         let t = self.get(table_name)?;
         let u64_key = index_key_as_u64(key)?;
-        let seg = self.cold_segments.get(segment_id as usize)?;
+        let seg = self.cold_segments.get(segment_id as usize)?.as_ref()?;
         let payload = seg.lookup(u64_key)?;
         let (row, _) = decode_row_body_dense(&payload, &t.schema).ok()?;
         Some(row)
@@ -2720,7 +2828,21 @@ impl Catalog {
                         // only handles BIGINT/INT/SMALLINT in v5.1.
                         continue;
                     };
-                    let Some(seg) = self.cold_segments.get(segment_id as usize) else {
+                    let Some(seg) = self
+                        .cold_segments
+                        .get(segment_id as usize)
+                        .and_then(|s| s.as_deref())
+                    else {
+                        // v6.7.3 — `None` slot = compaction
+                        // retired this segment; the live locator
+                        // on a freshly-compacted index points to
+                        // the merged segment_id, so a Cold hit
+                        // here against a tombstone means the BTree
+                        // entry hasn't been swapped yet (mid-
+                        // compaction reader race) or the caller is
+                        // looking up a stale snapshot. Skip — the
+                        // next locator in the list, if any, is
+                        // typically the merged segment.
                         continue;
                     };
                     let Some(payload) = seg.lookup(u64_key) else {
@@ -2781,11 +2903,15 @@ impl Catalog {
             })?
             .schema
             .clone();
-        let seg = self.cold_segments.get(segment_id as usize).ok_or_else(|| {
-            StorageError::Corrupt(format!(
-                "promote_cold_row: segment {segment_id} not registered on catalog"
-            ))
-        })?;
+        let seg = self
+            .cold_segments
+            .get(segment_id as usize)
+            .and_then(|s| s.as_ref())
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "promote_cold_row: segment {segment_id} not registered on catalog"
+                ))
+            })?;
         let payload = seg.lookup(u64_key).ok_or_else(|| {
             StorageError::Corrupt(format!(
                 "promote_cold_row: key {u64_key} resolves to segment {segment_id} \
@@ -2839,6 +2965,249 @@ impl Catalog {
             StorageError::Corrupt(format!("shadow_cold_row: table {table_name:?} not found"))
         })?;
         t.remove_cold_locators_for_key(index_name, key)
+    }
+
+    /// v6.7.3 — compact every cold segment on `(table, index)` whose
+    /// `OwnedSegment::bytes().len()` is below `target_segment_bytes`
+    /// into a single larger merged segment. Rows present in source
+    /// segment payloads but no longer referenced by any
+    /// `RowLocator::Cold` on the index (DELETE'd + frozen rows
+    /// retired via [`Catalog::shadow_cold_row`]) are GC'd in the
+    /// merge.
+    ///
+    /// **Semantics**:
+    /// 1. Walk the BTree index to collect every Cold locator that
+    ///    targets a small (< threshold) segment. Each such
+    ///    `(key, segment_id)` becomes a row in the merged segment;
+    ///    payload is looked up from the source segment in-place.
+    /// 2. Encode the collected rows into one new segment via
+    ///    [`encode_segment`]; register it via
+    ///    [`Catalog::load_segment_bytes`] (allocating a fresh
+    ///    `merged_segment_id` at the end of `cold_segments`).
+    /// 3. Rewrite the BTree index in one pass: every
+    ///    `RowLocator::Cold { segment_id ∈ sources }` becomes
+    ///    `RowLocator::Cold { segment_id = merged_id, page_offset = 0 }`.
+    ///    Hot locators are untouched.
+    /// 4. Tombstone every source slot via
+    ///    [`Catalog::tombstone_segment`]. Source segment payloads
+    ///    are no longer reachable through the catalog; the on-disk
+    ///    files are the caller's concern.
+    ///
+    /// On fewer than 2 candidate segments the catalog is **not**
+    /// mutated and a no-op report (`merged_segment_id: None`,
+    /// `sources: []`) is returned. This is the routine case — a
+    /// freshly-frozen table has at most 1 small segment, no merge
+    /// possible.
+    ///
+    /// Atomicity: every mutating step runs after the read-only
+    /// gather phase, so a panic before the merge encode leaves the
+    /// catalog unchanged. The mutation block itself (load + rewrite +
+    /// tombstone) takes only `&mut self` — callers serialise the
+    /// engine write lock outside this function.
+    ///
+    /// Errors when the table / index doesn't exist, the index isn't
+    /// `BTree`, the index column type isn't u64-coercible (cold-tier
+    /// pre-condition), or a source segment fails its in-place
+    /// row-body lookup (would indicate prior catalog corruption).
+    pub fn compact_cold_segments(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        target_segment_bytes: u64,
+    ) -> Result<CompactReport, StorageError> {
+        // --- validation phase ----------------------------------
+        let t = self.get(table_name).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "compact_cold_segments: table {table_name:?} not found"
+            ))
+        })?;
+        let idx = t
+            .indices
+            .iter()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "compact_cold_segments: index {index_name:?} not found on {table_name:?}"
+                ))
+            })?;
+        let map = match &idx.kind {
+            IndexKind::BTree(m) => m,
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
+                return Err(StorageError::Corrupt(format!(
+                    "compact_cold_segments: index {index_name:?} is not BTree; \
+                     compaction applies only to BTree cold-tier indices"
+                )));
+            }
+        };
+
+        // --- gather phase --------------------------------------
+        // Step A: every segment_id this BTree index Cold-references.
+        let mut referenced_ids: BTreeSet<u32> = BTreeSet::new();
+        for (_key, locators) in map.iter() {
+            for loc in locators {
+                if let RowLocator::Cold { segment_id, .. } = loc {
+                    referenced_ids.insert(*segment_id);
+                }
+            }
+        }
+        // Step B: keep only the small + still-active ones.
+        let candidate_set: BTreeSet<u32> = referenced_ids
+            .into_iter()
+            .filter(|id| {
+                self.cold_segments
+                    .get(*id as usize)
+                    .and_then(|s| s.as_deref())
+                    .is_some_and(|s| (s.bytes().len() as u64) < target_segment_bytes)
+            })
+            .collect();
+        if candidate_set.len() < 2 {
+            return Ok(CompactReport {
+                sources: Vec::new(),
+                merged_segment_id: None,
+                merged_segment_bytes: Vec::new(),
+                merged_rows: 0,
+                deleted_rows_pruned: 0,
+                bytes_reclaimed_estimate: 0,
+            });
+        }
+        // Step C: pre-count source rows for the deleted-pruned metric.
+        let mut source_row_count: usize = 0;
+        let mut source_byte_total: u64 = 0;
+        for &id in &candidate_set {
+            let seg = self.cold_segments[id as usize]
+                .as_ref()
+                .expect("candidate selected only when slot is Some");
+            source_row_count = source_row_count.saturating_add(seg.meta().num_rows as usize);
+            source_byte_total =
+                source_byte_total.saturating_add(seg.bytes().len() as u64);
+        }
+        // Step D: collect (key, body) pairs from every live Cold
+        // locator pointing at a candidate. dedupe by key — one
+        // BTree key resolves to at most one cold payload (the
+        // freezer + promote/shadow flow keeps Cold locators
+        // unique per key).
+        let mut collected: BTreeMap<u64, (Vec<u8>, IndexKey)> = BTreeMap::new();
+        for (key, locators) in map.iter() {
+            for loc in locators {
+                let RowLocator::Cold { segment_id, .. } = loc else {
+                    continue;
+                };
+                if !candidate_set.contains(segment_id) {
+                    continue;
+                }
+                let u64_key = index_key_as_u64(key).ok_or_else(|| {
+                    StorageError::Corrupt(format!(
+                        "compact_cold_segments: index {index_name:?} has non-integer Cold key; \
+                         cold tier requires IndexKey::Int (Text PK lands in v5.5+)"
+                    ))
+                })?;
+                let seg = self.cold_segments[*segment_id as usize]
+                    .as_ref()
+                    .expect("candidate slot guaranteed Some above");
+                let payload = seg.lookup(u64_key).ok_or_else(|| {
+                    StorageError::Corrupt(format!(
+                        "compact_cold_segments: BTree {index_name:?} points key={u64_key} \
+                         at segment {segment_id} but the segment lookup missed"
+                    ))
+                })?;
+                collected.insert(u64_key, (payload, key.clone()));
+                break;
+            }
+        }
+        let merged_rows = collected.len();
+        let deleted_rows_pruned = source_row_count.saturating_sub(merged_rows);
+
+        // Step E: encode the merged segment. `BTreeMap<u64, _>`
+        // iteration is ascending by key, which is what
+        // `encode_segment` requires.
+        let seg_rows: Vec<(u64, Vec<u8>)> = collected
+            .iter()
+            .map(|(k, (body, _))| (*k, body.clone()))
+            .collect();
+        let (seg_bytes, _meta) =
+            encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).map_err(|e| {
+                StorageError::Corrupt(format!("compact_cold_segments: encode: {e}"))
+            })?;
+        let merged_bytes_len = seg_bytes.len() as u64;
+
+        // --- atomic mutation phase ------------------------------
+        let merged_segment_id = self
+            .load_segment_bytes(seg_bytes.clone())
+            .map_err(|e| StorageError::Corrupt(format!("compact_cold_segments: load: {e}")))?;
+
+        // Rewrite the BTree index: every Cold locator pointing at
+        // a candidate source becomes a Cold locator pointing at
+        // the merged segment. Use a flat collect-then-replace
+        // pattern so we never hold a `&self` borrow across the
+        // `&mut self` write.
+        let entries: Vec<(IndexKey, Vec<RowLocator>)> = {
+            let t = self
+                .get(table_name)
+                .expect("table existed at the start of this fn");
+            let idx = t
+                .indices
+                .iter()
+                .find(|i| i.name == index_name)
+                .expect("index existed at the start of this fn");
+            let IndexKind::BTree(map) = &idx.kind else {
+                unreachable!("validated above");
+            };
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let t_mut = self
+            .get_mut(table_name)
+            .expect("table existed at the start of this fn");
+        let idx_mut = t_mut
+            .indices
+            .iter_mut()
+            .find(|i| i.name == index_name)
+            .expect("index existed at the start of this fn");
+        let IndexKind::BTree(map_mut) = &mut idx_mut.kind else {
+            unreachable!("validated above");
+        };
+        for (key, locators) in entries {
+            let mut new_locs: Vec<RowLocator> = Vec::with_capacity(locators.len());
+            let mut changed = false;
+            for loc in &locators {
+                match *loc {
+                    RowLocator::Cold {
+                        segment_id,
+                        page_offset: _,
+                    } if candidate_set.contains(&segment_id) => {
+                        let replacement = RowLocator::Cold {
+                            segment_id: merged_segment_id,
+                            page_offset: 0,
+                        };
+                        if !new_locs.contains(&replacement) {
+                            new_locs.push(replacement);
+                        }
+                        changed = true;
+                    }
+                    other => new_locs.push(other),
+                }
+            }
+            if changed {
+                map_mut.insert_mut(key, new_locs);
+            }
+        }
+
+        // Tombstone every source slot. Last step — failures here
+        // would leave the segment double-referenced in both
+        // memory + manifest, but `tombstone_segment` only errors
+        // on out-of-bounds, which we've already validated.
+        for &id in &candidate_set {
+            self.tombstone_segment(id)?;
+        }
+
+        let bytes_reclaimed_estimate = source_byte_total.saturating_sub(merged_bytes_len);
+        Ok(CompactReport {
+            sources: candidate_set.into_iter().collect(),
+            merged_segment_id: Some(merged_segment_id),
+            merged_segment_bytes: seg_bytes,
+            merged_rows,
+            deleted_rows_pruned,
+            bytes_reclaimed_estimate,
+        })
     }
 
     /// Internal helper: scan `(table, index)` for a `Cold` locator
@@ -6256,6 +6625,243 @@ mod tests {
         ));
         assert!(matches!(
             cat.shadow_cold_row("users", "no_such_index", &IndexKey::Int(1)),
+            Err(StorageError::Corrupt(_))
+        ));
+    }
+
+    // --- v6.7.3 cold-segment compaction ---------------------------
+
+    /// Two small cold segments merge into a single larger one. The
+    /// merged segment carries every cold-resident row; the source
+    /// slots are tombstoned; every PK still resolves through the
+    /// new merged segment via `lookup_by_pk`.
+    #[test]
+    fn compact_merges_small_segments_storage_unit() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..8i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        // Two freezes of 3 rows each → two small cold segments.
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+        assert_eq!(cat.cold_segment_count(), 2);
+        assert_eq!(cat.cold_segment_slot_count(), 2);
+
+        // Pick a threshold larger than either segment's size so
+        // both qualify.
+        let max_seg_bytes = cat
+            .cold_segment_ids_global()
+            .iter()
+            .map(|id| cat.cold_segment(*id).unwrap().bytes().len() as u64)
+            .max()
+            .unwrap();
+        let target = max_seg_bytes + 1;
+
+        let report = cat
+            .compact_cold_segments("users", "by_id", target)
+            .expect("compact succeeds");
+        assert_eq!(report.sources.len(), 2);
+        let merged_id = report.merged_segment_id.expect("merge happened");
+        assert_eq!(report.merged_rows, 6);
+        assert_eq!(report.deleted_rows_pruned, 0);
+        assert!(!report.merged_segment_bytes.is_empty());
+
+        // Active count drops back to 1; slot count grew to 3
+        // (2 sources tombstoned + 1 merged appended).
+        assert_eq!(cat.cold_segment_count(), 1);
+        assert_eq!(cat.cold_segment_slot_count(), 3);
+        assert_eq!(cat.cold_segment_ids_global(), alloc::vec![merged_id]);
+
+        // Every PK that was frozen still resolves (via the merged
+        // segment); the 2 hot rows still resolve too.
+        for id in 0..8i64 {
+            let got = cat
+                .lookup_by_pk("users", "by_id", &IndexKey::Int(id))
+                .unwrap_or_else(|| panic!("PK {id} lost after compaction"));
+            assert_eq!(got, make_user_row(id, &alloc::format!("u-{id}")));
+        }
+    }
+
+    /// DELETE'd-but-frozen rows are dropped during the merge. Set
+    /// up two small segments, then shadow one row in each; the
+    /// merged segment must NOT carry the shadowed rows.
+    #[test]
+    fn compact_drops_shadowed_cold_rows() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..6i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+        // Shadow PK 1 (in seg 0) + PK 4 (in seg 1).
+        assert_eq!(
+            cat.shadow_cold_row("users", "by_id", &IndexKey::Int(1))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            cat.shadow_cold_row("users", "by_id", &IndexKey::Int(4))
+                .unwrap(),
+            1
+        );
+
+        let max_seg_bytes = cat
+            .cold_segment_ids_global()
+            .iter()
+            .map(|id| cat.cold_segment(*id).unwrap().bytes().len() as u64)
+            .max()
+            .unwrap();
+        let report = cat
+            .compact_cold_segments("users", "by_id", max_seg_bytes + 1)
+            .expect("compact succeeds");
+        assert_eq!(report.sources.len(), 2);
+        assert_eq!(report.merged_rows, 4, "6 frozen − 2 shadowed = 4 live");
+        assert_eq!(report.deleted_rows_pruned, 2);
+
+        // PK 1 and 4 stay invisible after compact.
+        for shadowed in [1i64, 4i64] {
+            assert!(
+                cat.lookup_by_pk("users", "by_id", &IndexKey::Int(shadowed))
+                    .is_none(),
+                "shadowed PK {shadowed} must remain invisible after compact"
+            );
+        }
+        // The other 4 frozen rows resolve.
+        for live in [0i64, 2, 3, 5] {
+            cat.lookup_by_pk("users", "by_id", &IndexKey::Int(live))
+                .unwrap_or_else(|| panic!("live PK {live} lost after compact"));
+        }
+    }
+
+    /// No-op cases: 0 or 1 candidate segment under the threshold
+    /// leaves the catalog untouched.
+    #[test]
+    fn compact_is_noop_below_two_candidates() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..6i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        // 0 cold segments.
+        let report = cat
+            .compact_cold_segments("users", "by_id", 1 << 30)
+            .expect("noop ok");
+        assert!(report.merged_segment_id.is_none());
+        assert!(report.sources.is_empty());
+
+        // 1 cold segment — still a no-op (need ≥2 to merge).
+        cat.freeze_oldest_to_cold("users", "by_id", 4).unwrap();
+        let report = cat
+            .compact_cold_segments("users", "by_id", 1 << 30)
+            .expect("noop ok");
+        assert!(report.merged_segment_id.is_none());
+        assert_eq!(cat.cold_segment_count(), 1);
+
+        // Threshold too small to cover the single segment → still
+        // no-op.
+        let report = cat
+            .compact_cold_segments("users", "by_id", 1)
+            .expect("noop ok");
+        assert!(report.merged_segment_id.is_none());
+        assert_eq!(cat.cold_segment_count(), 1);
+    }
+
+    /// Manifest-style atomicity: a Catalog snapshot taken AFTER
+    /// `compact_cold_segments` returns must round-trip with the
+    /// post-compact BTree state, while the cold-tier registry is
+    /// re-derived from the source-of-truth manifest (=
+    /// `load_segment_bytes_at` with the merged id + the still-on-
+    /// disk merged bytes). This mirrors the boot path: catalog
+    /// snapshot + cold-segment files = full state.
+    #[test]
+    fn compact_swap_survives_catalog_roundtrip_via_load_at() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..6i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+        cat.freeze_oldest_to_cold("users", "by_id", 3).unwrap();
+        let max_seg_bytes = cat
+            .cold_segment_ids_global()
+            .iter()
+            .map(|id| cat.cold_segment(*id).unwrap().bytes().len() as u64)
+            .max()
+            .unwrap();
+        let report = cat
+            .compact_cold_segments("users", "by_id", max_seg_bytes + 1)
+            .expect("compact ok");
+        let merged_id = report.merged_segment_id.unwrap();
+
+        // Serialise the catalog (BTree index points at merged_id
+        // now) and the merged segment bytes; pretend to crash; on
+        // restart, re-hydrate the catalog and reload only the
+        // merged segment at its baked-in id.
+        let cat_bytes = cat.serialize();
+        let merged_bytes = report.merged_segment_bytes.clone();
+
+        let mut restored = Catalog::deserialize(&cat_bytes).expect("deserialize ok");
+        restored
+            .load_segment_bytes_at(merged_id, merged_bytes)
+            .expect("reload merged ok");
+
+        // All 6 PKs still resolve through the restored merged segment.
+        for id in 0..6i64 {
+            let got = restored
+                .lookup_by_pk("users", "by_id", &IndexKey::Int(id))
+                .unwrap_or_else(|| panic!("PK {id} lost across roundtrip"));
+            assert_eq!(got, make_user_row(id, &alloc::format!("u-{id}")));
+        }
+        // No source slot ever rehydrates — confirmed by
+        // `cold_segment_count` matching only the merged segment.
+        assert_eq!(restored.cold_segment_count(), 1);
+    }
+
+    /// `load_segment_bytes_at` refuses to stomp an occupied slot
+    /// and pads with `None` when the target id is past the end.
+    #[test]
+    fn load_segment_bytes_at_pads_and_rejects_collision() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..4i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        let report = cat.freeze_oldest_to_cold("users", "by_id", 2).unwrap();
+        let bytes_seg0 = report.segment_bytes.clone();
+
+        // Pad to id=5 (slots 1..5 are None, slot 5 holds the
+        // segment loaded back). The slot count jumps, the active
+        // count is now 2 (seg 0 + seg 5).
+        cat.load_segment_bytes_at(5, bytes_seg0.clone())
+            .expect("pad + load ok");
+        assert_eq!(cat.cold_segment_slot_count(), 6);
+        assert_eq!(cat.cold_segment_count(), 2);
+
+        // Re-loading at the same id collides.
+        assert!(matches!(
+            cat.load_segment_bytes_at(5, bytes_seg0.clone()),
+            Err(StorageError::Corrupt(_))
+        ));
+        // Re-loading at id 0 (already occupied) also collides.
+        assert!(matches!(
+            cat.load_segment_bytes_at(0, bytes_seg0),
             Err(StorageError::Corrupt(_))
         ));
     }

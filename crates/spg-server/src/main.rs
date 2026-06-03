@@ -1955,6 +1955,24 @@ fn dispatch(
                 }
                 return run_checkpoint_command(stream, state);
             }
+            // v6.7.3: intercept COMPACT COLD SEGMENTS. Engine-level
+            // execution would only mutate the catalog in memory;
+            // server-side persists each merged segment to
+            // `<db>.spg/segments/seg_<merged_id>.spg` + updates
+            // `cold_segment_paths` so the next CHECKPOINT writes a
+            // manifest that no longer lists the retired sources.
+            // Admin-only — same operator-surface as CHECKPOINT.
+            if parse_compact_cold_segments_intent(&sql) {
+                if !acting.can_manage_users() {
+                    return write_frame(
+                        stream,
+                        &build_error_response(
+                            "permission denied: COMPACT COLD SEGMENTS requires admin role",
+                        ),
+                    );
+                }
+                return run_compact_cold_segments_command(stream, state);
+            }
             // v4.34: when WAL is on and this is an auto-commit write
             // (no client-driven TX in flight, not a TX-control verb),
             // wrap the engine mutation in an implicit BEGIN..COMMIT.
@@ -2368,6 +2386,141 @@ fn run_checkpoint_command(stream: &mut TcpStream, state: &ServerState) -> std::i
     // count for a checkpoint. Operators can poll `wal_path` size
     // afterwards to confirm the truncate.
     write_frame(stream, &build_command_complete(0))
+}
+
+/// v6.7.3 — parse `COMPACT COLD SEGMENTS` (case-insensitive,
+/// whitespace-tolerant, trailing semicolon optional). The v6.7.3
+/// SQL form takes no arguments; a future v6.7.x can extend with
+/// `WHERE` predicates (currently STABILITY carve-out).
+fn parse_compact_cold_segments_intent(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let mut parts = trimmed.split_whitespace();
+    matches!(parts.next(), Some(w) if w.eq_ignore_ascii_case("compact"))
+        && matches!(parts.next(), Some(w) if w.eq_ignore_ascii_case("cold"))
+        && matches!(parts.next(), Some(w) if w.eq_ignore_ascii_case("segments"))
+        && parts.next().is_none()
+}
+
+/// v6.7.3 — read `SPG_COMPACTION_TARGET_SEGMENT_BYTES` (default
+/// `COMPACTION_TARGET_DEFAULT_BYTES` = 4 MiB). Cached after first
+/// call. Invalid values fall through to the default — operators
+/// reading the spg-server stderr will see the parse failure.
+fn compaction_target_bytes() -> u64 {
+    static CHECKED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CHECKED.get_or_init(|| {
+        parse_env_u64("SPG_COMPACTION_TARGET_SEGMENT_BYTES")
+            .unwrap_or(spg_engine::COMPACTION_TARGET_DEFAULT_BYTES)
+    })
+}
+
+/// v6.7.3 — `COMPACT COLD SEGMENTS` handler. Takes the engine
+/// write lock, runs `Engine::compact_cold_segments_with_target`,
+/// persists each merged segment to
+/// `<db>.spg/segments/seg_<merged_id>.spg`, and updates
+/// `cold_segment_paths` (remove sources, add merged) so the next
+/// CHECKPOINT writes a manifest that no longer lists the retired
+/// sources. Returns one `CommandComplete` carrying the count of
+/// merges that ran.
+fn run_compact_cold_segments_command(
+    stream: &mut TcpStream,
+    state: &ServerState,
+) -> std::io::Result<()> {
+    let target = compaction_target_bytes();
+    let reports = {
+        let mut engine = state
+            .engine
+            .write()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        if engine.in_transaction() {
+            return write_frame(
+                stream,
+                &build_error_response(
+                    "COMPACT COLD SEGMENTS refused: an open transaction is in flight",
+                ),
+            );
+        }
+        match engine.compact_cold_segments_with_target(target) {
+            Ok(r) => r,
+            Err(e) => {
+                return write_frame(
+                    stream,
+                    &build_error_response(&format!("COMPACT COLD SEGMENTS failed: {e:?}")),
+                );
+            }
+        }
+    };
+
+    let merged_count = reports.len();
+    // Persist every merged segment to disk + update the in-memory
+    // path map. A persist failure is logged + reported but doesn't
+    // roll back the in-memory swap — the in-memory state is the
+    // source of truth until the next CHECKPOINT writes a manifest,
+    // and the legacy SPG_PRELOAD_COLD_SEGMENT path can pick up
+    // anything the manifest path missed.
+    if let Some(db_path) = state.db_path.as_deref() {
+        for (_tname, _iname, report) in &reports {
+            let Some(merged_id) = report.merged_segment_id else {
+                continue;
+            };
+            match persist_compact_merged_segment(db_path, merged_id, &report.merged_segment_bytes)
+            {
+                Ok(merged_path) => {
+                    if let Ok(mut paths) = state.cold_segment_paths.lock() {
+                        for src in &report.sources {
+                            paths.remove(src);
+                        }
+                        paths.insert(merged_id, merged_path);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "spg-server: COMPACT persist of merged segment {merged_id} failed: {e}"
+                    );
+                }
+            }
+        }
+        state.metrics.cold_segments.store(
+            state
+                .engine
+                .read()
+                .ok()
+                .map(|e| e.catalog().cold_segment_count() as u64)
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    write_frame(stream, &build_command_complete(merged_count as u64))
+}
+
+/// v6.7.3 — write a compaction-merged segment to
+/// `<parent>/<db_stem>.spg/segments/seg_<merged_id>.spg` via the
+/// same tmp+rename atomicity that `freezer::persist_segment` uses.
+/// Honours the v6.6.2 segment v2-envelope compression knob
+/// (`SPG_SEGMENT_COMPRESSION`).
+fn persist_compact_merged_segment(
+    db_path: &Path,
+    merged_id: u32,
+    merged_segment_bytes: &[u8],
+) -> std::io::Result<PathBuf> {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = db_path
+        .file_stem()
+        .unwrap_or_else(|| std::ffi::OsStr::new("db"))
+        .to_string_lossy();
+    let seg_dir = parent.join(format!("{stem}.spg")).join("segments");
+    fs::create_dir_all(&seg_dir)?;
+    let final_path = seg_dir.join(format!("seg_{merged_id}.spg"));
+    let tmp_path = seg_dir.join(format!("seg_{merged_id}.spg.tmp"));
+    let bytes_to_write = if std::env::var("SPG_SEGMENT_COMPRESSION")
+        .map_or(true, |v| !v.eq_ignore_ascii_case("none"))
+    {
+        spg_storage::wrap_v2_envelope(merged_segment_bytes.to_vec(), true)
+    } else {
+        merged_segment_bytes.to_vec()
+    };
+    fs::write(&tmp_path, &bytes_to_write)?;
+    fs::rename(&tmp_path, &final_path)?;
+    Ok(final_path)
 }
 
 fn run_backup_command(
@@ -3697,9 +3850,15 @@ fn load_manifest_and_preload_cold(
                     skipped += 1;
                     continue;
                 }
-                match cat.load_segment_bytes(seg_bytes) {
-                    Ok(new_id) => {
-                        cold_segment_paths.insert(new_id, entry.path.clone());
+                // v6.7.3 — load at the manifest-baked id so a
+                // tombstoned-but-not-yet-orphan-GC'd source
+                // segment doesn't shift the surviving ids; the
+                // BTree-index `RowLocator::Cold { segment_id }`
+                // baked into the catalog snapshot must continue
+                // to resolve byte-identically across the bounce.
+                match cat.load_segment_bytes_at(entry.segment_id, seg_bytes) {
+                    Ok(()) => {
+                        cold_segment_paths.insert(entry.segment_id, entry.path.clone());
                         loaded += 1;
                     }
                     Err(e) => {
