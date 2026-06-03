@@ -1008,12 +1008,48 @@ impl Parser {
             )));
         }
         self.advance();
+        // v6.8.0 — optional `INCLUDE (col1, col2, …)` clause for
+        // index-only-scan annotation. Bare ident (not a reserved
+        // keyword) so we test by case-insensitive string match.
+        let included_columns =
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("include")) {
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(format!(
+                        "expected '(' after INCLUDE, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.expect_ident_like()?);
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                        }
+                        Token::RParen => {
+                            self.advance();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "expected ',' or ')' in INCLUDE list, got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                cols
+            } else {
+                Vec::new()
+            };
         Ok(Statement::CreateIndex(CreateIndexStatement {
             name,
             table,
             column,
             method,
             if_not_exists,
+            included_columns,
         }))
     }
 
