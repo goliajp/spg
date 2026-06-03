@@ -383,6 +383,29 @@ pub struct FreezeReport {
     pub segment_bytes: Vec<u8>,
 }
 
+/// v6.7.4 — read-only output of [`Catalog::prepare_freeze_slice`].
+/// Carries every row body + key in a contiguous hot-row range,
+/// already encoded and sorted by PK so the coordinator's merge
+/// step is a k-way merge over already-sorted streams.
+///
+/// `Vec<FreezeSlice>` from N independent workers feeds
+/// [`Catalog::commit_freeze_slices`], which concats + encodes the
+/// merged segment + atomically swaps the catalog state.
+#[derive(Debug, Clone)]
+pub struct FreezeSlice {
+    /// Hot-row index range this slice covered (half-open, in the
+    /// table's `rows: PersistentVec` ordering at call time). The
+    /// commit step uses this to compute the union range that
+    /// gets passed to [`Table::delete_rows`].
+    pub row_range: core::ops::Range<usize>,
+    /// `(pk_u64, encoded_row_body, IndexKey)` triples, sorted
+    /// ascending by `pk_u64`. Per-slice sort happens inside
+    /// `prepare_freeze_slice`; the coordinator does only a
+    /// k-way merge to reach the global PK ordering
+    /// [`encode_segment`] requires.
+    pub rows: Vec<(u64, Vec<u8>, IndexKey)>,
+}
+
 /// v6.7.3 — outcome of a [`Catalog::compact_cold_segments`] call.
 /// The catalog state has already been mutated when this is returned:
 /// the merged segment is loaded into `cold_segments`, the source
@@ -2965,6 +2988,241 @@ impl Catalog {
             StorageError::Corrupt(format!("shadow_cold_row: table {table_name:?} not found"))
         })?;
         t.remove_cold_locators_for_key(index_name, key)
+    }
+
+    /// v6.7.4 — read-only slice preparation for the parallel
+    /// freezer. Walks rows in `row_range`, builds the
+    /// `(pk_u64, encoded_body, IndexKey)` triples that the
+    /// coordinator's k-way merge consumes, sorts the slice by
+    /// `pk_u64`, and returns a [`FreezeSlice`].
+    ///
+    /// Caller invariants:
+    /// - `row_range.end <= table.rows.len()` (caller's job to
+    ///   compute the partition).
+    /// - All slices passed to `commit_freeze_slices` must cover a
+    ///   contiguous half-open range `[0, total_max_rows)` with no
+    ///   gaps and no overlaps. The coordinator validates this
+    ///   invariant before committing.
+    ///
+    /// `&self`-only — multiple workers can run this concurrently
+    /// against the same `Catalog` reference under the engine's
+    /// write lock (workers don't mutate; the coordinator does).
+    pub fn prepare_freeze_slice(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        row_range: core::ops::Range<usize>,
+    ) -> Result<FreezeSlice, StorageError> {
+        let table = self.get(table_name).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "prepare_freeze_slice: table {table_name:?} not found"
+            ))
+        })?;
+        let idx = table
+            .indices
+            .iter()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "prepare_freeze_slice: index {index_name:?} not found on {table_name:?}"
+                ))
+            })?;
+        if !matches!(idx.kind, IndexKind::BTree(_)) {
+            return Err(StorageError::Corrupt(format!(
+                "prepare_freeze_slice: index {index_name:?} is NSW; only BTree indices may freeze"
+            )));
+        }
+        if row_range.end > table.rows.len() {
+            return Err(StorageError::Corrupt(format!(
+                "prepare_freeze_slice: row_range end {} > row_count {}",
+                row_range.end,
+                table.rows.len()
+            )));
+        }
+        let column_position = idx.column_position;
+        let schema = table.schema.clone();
+        let mut rows: Vec<(u64, Vec<u8>, IndexKey)> = Vec::with_capacity(row_range.len());
+        for row_idx in row_range.clone() {
+            let row = table.rows.get(row_idx).expect("bounds-checked above");
+            let key = IndexKey::from_value(&row.values[column_position]).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "prepare_freeze_slice: row {row_idx} has NULL / non-key value in index column"
+                ))
+            })?;
+            let pk_u64 = index_key_as_u64(&key).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "prepare_freeze_slice: index {index_name:?} column type is non-integer; \
+                     v5.2.2 cold tier requires IndexKey::Int (Text PK lands in v5.5+)"
+                ))
+            })?;
+            rows.push((pk_u64, encode_row_body_dense(row, &schema), key));
+        }
+        rows.sort_by_key(|(k, _, _)| *k);
+        Ok(FreezeSlice { row_range, rows })
+    }
+
+    /// v6.7.4 — coordinator commit step. Merges N
+    /// [`FreezeSlice`]s into one segment via the standard
+    /// [`encode_segment`] path, atomically swaps the catalog
+    /// state (delete the union row range + register Cold
+    /// locators + load the segment).
+    ///
+    /// Validates that the slices cover a contiguous, gap-free,
+    /// overlap-free half-open range starting at index 0 (the
+    /// freezer always freezes "oldest first" — same semantics as
+    /// the single-threaded [`Catalog::freeze_oldest_to_cold`]).
+    ///
+    /// Empty `slices` → no-op success (returns a zero-row report
+    /// without mutating). Total row count = `Σ slice.rows.len()`.
+    pub fn commit_freeze_slices(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        slices: Vec<FreezeSlice>,
+    ) -> Result<FreezeReport, StorageError> {
+        // --- validation phase: never mutates ---------------------
+        let table = self.get(table_name).ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "commit_freeze_slices: table {table_name:?} not found"
+            ))
+        })?;
+        let idx = table
+            .indices
+            .iter()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "commit_freeze_slices: index {index_name:?} not found on {table_name:?}"
+                ))
+            })?;
+        if !matches!(idx.kind, IndexKind::BTree(_)) {
+            return Err(StorageError::Corrupt(format!(
+                "commit_freeze_slices: index {index_name:?} is NSW; only BTree indices may freeze"
+            )));
+        }
+        // Validate slice coverage: contiguous from 0, no gaps, no
+        // overlaps. Allow the caller to pass slices in any order —
+        // sort by row_range.start first.
+        let mut ordered = slices;
+        ordered.sort_by_key(|s| s.row_range.start);
+        // Drop fully-empty slices that fell out of an uneven
+        // partition; they carry no data but contribute to the
+        // contiguity check, so keep them in line.
+        let mut expected_start = 0usize;
+        for s in &ordered {
+            if s.row_range.start != expected_start {
+                return Err(StorageError::Corrupt(format!(
+                    "commit_freeze_slices: gap/overlap at row {}; expected start {}",
+                    s.row_range.start, expected_start
+                )));
+            }
+            expected_start = s.row_range.end;
+        }
+        let max_rows = expected_start;
+        if max_rows > table.rows.len() {
+            return Err(StorageError::Corrupt(format!(
+                "commit_freeze_slices: total row range {} exceeds row_count {}",
+                max_rows,
+                table.rows.len()
+            )));
+        }
+        if max_rows == 0 {
+            return Ok(FreezeReport {
+                segment_id: u32::MAX,
+                frozen_rows: 0,
+                bytes_freed: 0,
+                segment_bytes: Vec::new(),
+            });
+        }
+
+        // --- segment build phase: reads only --------------------
+        // K-way merge of already-sorted slices. Each slice's rows
+        // are ascending by pk_u64; we keep a per-slice cursor and
+        // pull the next-smallest head until every cursor drains.
+        let total_rows: usize = ordered.iter().map(|s| s.rows.len()).sum();
+        if total_rows != max_rows {
+            return Err(StorageError::Corrupt(format!(
+                "commit_freeze_slices: total slice rows {total_rows} ≠ row_range coverage {max_rows}"
+            )));
+        }
+        let mut cursors: Vec<usize> = alloc::vec![0; ordered.len()];
+        let mut merged: Vec<(u64, Vec<u8>, IndexKey)> = Vec::with_capacity(total_rows);
+        loop {
+            // Pick the slice whose head row has the smallest key
+            // and isn't yet exhausted.
+            let mut pick: Option<usize> = None;
+            for (i, c) in cursors.iter().enumerate() {
+                let slice = &ordered[i];
+                if *c >= slice.rows.len() {
+                    continue;
+                }
+                match pick {
+                    None => pick = Some(i),
+                    Some(j) => {
+                        if slice.rows[*c].0 < ordered[j].rows[cursors[j]].0 {
+                            pick = Some(i);
+                        }
+                    }
+                }
+            }
+            let Some(i) = pick else { break };
+            let row = ordered[i].rows[cursors[i]].clone();
+            cursors[i] += 1;
+            merged.push(row);
+        }
+        // Reject duplicate PKs — same error as the single-threaded
+        // path so callers get a uniform surface.
+        for w in merged.windows(2) {
+            if w[0].0 == w[1].0 {
+                return Err(StorageError::Corrupt(format!(
+                    "commit_freeze_slices: duplicate PK {} across slices",
+                    w[0].0
+                )));
+            }
+        }
+        let post_swap_keys: Vec<IndexKey> = merged.iter().map(|(_, _, k)| k.clone()).collect();
+        let seg_rows: Vec<(u64, Vec<u8>)> = merged
+            .into_iter()
+            .map(|(k, body, _)| (k, body))
+            .collect();
+        let frozen_rows = seg_rows.len();
+        let (seg_bytes, _meta) =
+            encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).map_err(|e| {
+                StorageError::Corrupt(format!("commit_freeze_slices: encode: {e}"))
+            })?;
+
+        // --- atomic swap phase: mutations only past this point ---
+        let bytes_before = self.get(table_name).expect("just validated").hot_bytes();
+        let positions: Vec<usize> = (0..max_rows).collect();
+        let t_mut = self
+            .get_mut(table_name)
+            .expect("just validated; still present");
+        let removed = t_mut.delete_rows(&positions);
+        debug_assert_eq!(removed, max_rows, "delete_rows count matches request");
+        let bytes_after = t_mut.hot_bytes();
+        let bytes_freed = bytes_before.saturating_sub(bytes_after);
+
+        let segment_id = self
+            .load_segment_bytes(seg_bytes.clone())
+            .map_err(|e| StorageError::Corrupt(format!("commit_freeze_slices: load: {e}")))?;
+        let new_cold = post_swap_keys.into_iter().map(|k| {
+            (
+                k,
+                RowLocator::Cold {
+                    segment_id,
+                    page_offset: 0,
+                },
+            )
+        });
+        let t_mut = self.get_mut(table_name).expect("still present");
+        t_mut.register_cold_locators(index_name, new_cold)?;
+
+        Ok(FreezeReport {
+            segment_id,
+            frozen_rows,
+            bytes_freed,
+            segment_bytes: seg_bytes,
+        })
     }
 
     /// v6.7.3 — compact every cold segment on `(table, index)` whose
@@ -6627,6 +6885,134 @@ mod tests {
             cat.shadow_cold_row("users", "no_such_index", &IndexKey::Int(1)),
             Err(StorageError::Corrupt(_))
         ));
+    }
+
+    // --- v6.7.4 parallel-freezer slice/commit API -----------------
+
+    /// One slice covering the entire freeze produces the same
+    /// catalog state as the single-threaded `freeze_oldest_to_cold`
+    /// — segment id, frozen row count, hot byte delta, and every
+    /// post-freeze PK lookup match exactly.
+    #[test]
+    fn commit_freeze_slices_single_slice_matches_freeze_oldest() {
+        let mut a = Catalog::new();
+        let mut b = Catalog::new();
+        for cat in [&mut a, &mut b] {
+            cat.create_table(bigint_pk_users_schema()).unwrap();
+            let t = cat.get_mut("users").unwrap();
+            for id in 0..10i64 {
+                t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                    .unwrap();
+            }
+            t.add_index("by_id".into(), "id").unwrap();
+        }
+        let single = a.freeze_oldest_to_cold("users", "by_id", 6).unwrap();
+        let slice = b
+            .prepare_freeze_slice("users", "by_id", 0..6)
+            .expect("prepare");
+        let parallel = b
+            .commit_freeze_slices("users", "by_id", alloc::vec![slice])
+            .expect("commit");
+        assert_eq!(single.segment_id, parallel.segment_id);
+        assert_eq!(single.frozen_rows, parallel.frozen_rows);
+        assert_eq!(single.bytes_freed, parallel.bytes_freed);
+        assert_eq!(single.segment_bytes, parallel.segment_bytes);
+        // Same post-freeze lookup behaviour on both catalogs.
+        for id in 0..10i64 {
+            assert_eq!(
+                a.lookup_by_pk("users", "by_id", &IndexKey::Int(id)),
+                b.lookup_by_pk("users", "by_id", &IndexKey::Int(id)),
+                "PK {id} differs after single vs slice freeze"
+            );
+        }
+    }
+
+    /// Two slices covering disjoint halves of the freeze produce
+    /// the same merged segment as one slice covering the full
+    /// range. The k-way merge preserves PK ordering even when
+    /// slice halves alternate.
+    #[test]
+    fn commit_freeze_slices_two_slices_match_single_slice() {
+        let mut a = Catalog::new();
+        let mut b = Catalog::new();
+        for cat in [&mut a, &mut b] {
+            cat.create_table(bigint_pk_users_schema()).unwrap();
+            let t = cat.get_mut("users").unwrap();
+            // Random-ish PKs so the per-slice sort actually has
+            // work to do (and slice halves carry interleaved keys).
+            for id in [3, 7, 1, 9, 5, 0, 8, 4, 2, 6].iter().copied() {
+                t.insert(make_user_row(id as i64, &alloc::format!("u-{id}")))
+                    .unwrap();
+            }
+            t.add_index("by_id".into(), "id").unwrap();
+        }
+        let single = a
+            .prepare_freeze_slice("users", "by_id", 0..8)
+            .expect("prepare");
+        let one = a
+            .commit_freeze_slices("users", "by_id", alloc::vec![single])
+            .expect("commit one");
+        let s1 = b
+            .prepare_freeze_slice("users", "by_id", 0..4)
+            .expect("prepare s1");
+        let s2 = b
+            .prepare_freeze_slice("users", "by_id", 4..8)
+            .expect("prepare s2");
+        let two = b
+            .commit_freeze_slices("users", "by_id", alloc::vec![s1, s2])
+            .expect("commit two");
+        assert_eq!(one.segment_bytes, two.segment_bytes);
+        assert_eq!(one.frozen_rows, two.frozen_rows);
+        // Every PK that survived freeze (hot or cold) resolves on
+        // both catalogs.
+        for id in 0..10i64 {
+            assert_eq!(
+                a.lookup_by_pk("users", "by_id", &IndexKey::Int(id)),
+                b.lookup_by_pk("users", "by_id", &IndexKey::Int(id)),
+                "PK {id} differs after one-slice vs two-slice freeze"
+            );
+        }
+    }
+
+    /// Gap between slices → error before any mutation lands.
+    #[test]
+    fn commit_freeze_slices_rejects_gap() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..6i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        let s1 = cat.prepare_freeze_slice("users", "by_id", 0..2).unwrap();
+        let s2 = cat.prepare_freeze_slice("users", "by_id", 3..5).unwrap();
+        assert!(matches!(
+            cat.commit_freeze_slices("users", "by_id", alloc::vec![s1, s2]),
+            Err(StorageError::Corrupt(_))
+        ));
+        // Catalog untouched.
+        assert_eq!(cat.cold_segment_count(), 0);
+        assert_eq!(cat.get("users").unwrap().row_count(), 6);
+    }
+
+    /// Empty slice list → no-op success, catalog untouched.
+    #[test]
+    fn commit_freeze_slices_empty_is_noop() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for id in 0..3i64 {
+            t.insert(make_user_row(id, &alloc::format!("u-{id}")))
+                .unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        let report = cat
+            .commit_freeze_slices("users", "by_id", Vec::new())
+            .unwrap();
+        assert_eq!(report.frozen_rows, 0);
+        assert_eq!(cat.cold_segment_count(), 0);
+        assert_eq!(cat.get("users").unwrap().row_count(), 3);
     }
 
     // --- v6.7.3 cold-segment compaction ---------------------------
