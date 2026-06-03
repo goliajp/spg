@@ -8056,7 +8056,7 @@ fn coerce_value(
             // v4.9: Text ↔ JSON coercion. No structural validation —
             // any text literal is accepted; the responsibility for
             // valid JSON lies with the producer.
-            (Value::Text(s), DataType::Json) => Some(Value::Json(s)),
+            (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::Json(s)),
             (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
             (Value::Text(s), DataType::Timestamp) => {
                 let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {

@@ -977,6 +977,7 @@ impl Table {
                         DataType::Text,
                         DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
                     ) | (DataType::Json | DataType::Jsonb, DataType::Text)
+                      | (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -1417,6 +1418,7 @@ impl Table {
                         DataType::Text,
                         DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
                     ) | (DataType::Json | DataType::Jsonb, DataType::Text)
+                      | (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json)
                 )
                 || matches!(
                     (actual, col.ty),
