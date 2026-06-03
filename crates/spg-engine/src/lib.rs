@@ -4037,7 +4037,21 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
 /// executor counters.
 fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engine) {
     let catalog = engine.active_catalog();
-    let any_cold_segments = catalog.cold_segment_count() > 0;
+    let cold_ids = catalog.cold_segment_ids_global();
+    let any_cold = !cold_ids.is_empty();
+    let cold_ids_repr = if any_cold {
+        let mut s = alloc::string::String::from("[");
+        for (i, id) in cold_ids.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&alloc::format!("{id}"));
+        }
+        s.push(']');
+        s
+    } else {
+        alloc::string::String::new()
+    };
     for (idx, line) in lines.iter_mut().enumerate() {
         let trimmed = line.trim_start();
         let is_top_level = idx == 0;
@@ -4046,34 +4060,33 @@ fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engi
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("From: ") {
-            // Parse `From: <table> [full scan|index seek]`.
             let (name, scan_kind) = match rest.split_once(" [") {
                 Some((n, k)) => (n.trim(), k.trim_end_matches(']')),
                 None => (rest.trim(), ""),
             };
             let bare = name.split_whitespace().next().unwrap_or(name);
-            // v6.2.5 — split scan stats into hot vs cold. Hot rows
-            // are the in-memory rows the executor walks. The cold
-            // tier currently exposes its row count only through
-            // index-side locators; v6.2.5 reports the global
-            // cold-segment presence flag so operators know whether
-            // the table COULD have cold rows. Precise per-table
-            // cold_rows count lands in v6.2.6 alongside the
-            // Memoize inline-instrumentation refactor.
             let hot = catalog.get(bare).map(|t| t.rows().len());
+            // v6.2.7 — `cold_segments=[id0,id1,…]` enumerates every
+            // cold-tier segment the scan COULD have walked. v6.2.x
+            // can tighten to per-table by walking the table's
+            // BTree-index cold locators.
             let annot = match (hot, scan_kind) {
                 (Some(h), "full scan") => {
                     let mut s = alloc::format!(" (hot_rows={h}");
-                    if any_cold_segments {
-                        s.push_str(", cold_tier=present");
+                    if any_cold {
+                        s.push_str(&alloc::format!(
+                            ", cold_tier=present, cold_segments={cold_ids_repr}"
+                        ));
                     }
                     s.push(')');
                     s
                 }
                 (Some(h), "index seek") => {
                     let mut s = alloc::format!(" (hot_rows≤{h}");
-                    if any_cold_segments {
-                        s.push_str(", cold_tier=present");
+                    if any_cold {
+                        s.push_str(&alloc::format!(
+                            ", cold_tier=present, cold_segments={cold_ids_repr}"
+                        ));
                     }
                     s.push(')');
                     s

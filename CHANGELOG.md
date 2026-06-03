@@ -10,6 +10,81 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.7] — 2026-06-03 (TPC-H Q1-Q5 + plan stability + cold_segment_ids)
+
+Eighth v6.2.x sub-version. Wires together the v6.2.0-v6.2.6
+optimizer chain (statistics + selectivity + JOIN reorder +
+Memoize) on actual TPC-H micro-fixture queries, plus adds
+the deferred-from-v6.2.6 `cold_segments=[id0,id1,…]` list to
+scan annotations.
+
+### Added
+
+- `Catalog::cold_segment_ids_global()` — returns every cold-
+  tier segment id in the catalog. Used by EXPLAIN ANALYZE to
+  enumerate which segments a scan could have walked.
+- EXPLAIN ANALYZE `From:` lines now include
+  `cold_segments=[…]` when any cold segment is present.
+- TPC-H micro-fixture (`tests/e2e_tpch.rs`) — deterministic
+  generator producing 7 tables (region, nation, supplier,
+  customer, orders, lineitem) totalling ~480 rows. ANALYZE
+  runs on every load.
+
+### Tests
+
+- `spg-engine::e2e_tpch` (6 / ship gate):
+    - `q1_pricing_summary_report` — GROUP BY 2 columns + 4
+      aggregates over `lineitem`; verifies row preservation
+      (`SUM(count(*)) == N_LINEITEMS`)
+    - `q3_shipping_priority` — 3-table JOIN (customer +
+      orders + lineitem) + GROUP BY + ORDER BY revenue DESC
+      LIMIT 10
+    - `q5_local_supplier_volume` — 5-table JOIN with cross-
+      column predicate on the last edge. Exercises v6.2.3's
+      reorder pass on a real workload.
+    - `q2_minimum_cost_supplier_via_subquery` — Q2-shape
+      (PARTSUPP isn't in our 7-table fixture; we use the
+      equivalent 3-table region/nation/supplier shape)
+    - `q4_order_priority_check_via_exists` — IN-subquery on
+      lineitem.l_quantity ≥ 25 (exercises v6.2.6 Memoize
+      cache for the correlated path)
+    - `plan_stable_after_analyze` — 5 consecutive runs of
+      the same EXPLAIN produce byte-identical plan text
+- `spg-engine` lib total                    164 (unchanged)
+- 4-corpus sqllogictest                     100 %
+
+### SQL-surface deviations from TPC-H spec (documented in-test)
+
+SPG's current SQL surface lacks:
+- Multi-column ORDER BY — Q1 uses single-column equivalent
+- SELECT-list aliases in ORDER BY — Q3 / Q5 use the full
+  aggregate expression
+- PARTSUPP table not in fixture — Q2 substitutes 3-table
+  region/nation/supplier shape
+- Date arithmetic in WHERE — Q4 substitutes quantity-based
+  predicate
+
+These are SQL gaps, not optimizer gaps. v6.4 (SQL polish) is
+where multi-column ORDER BY + alias-in-ORDER-BY land per the
+v6.x roadmap.
+
+### Not changed
+
+- Plan tree shape outside the `From:` annotation.
+- TopN / aggregate / scan algorithms — Q1-Q5 all run through
+  the existing executor.
+
+### Out of v6.2.7 (deferred to v6.2.8 ship rollup — NOT v7)
+
+- Per-table cold_rows count (precise per-scan vs the v6.2.7
+  global `cold_segments=[…]` list) — requires walking each
+  table's BTree-index cold locators; lands in v6.2.8's
+  ship-rollup commit alongside the documentation merge.
+- Per-operator inner-node `elapsed=Mμs` — requires inline
+  executor instrumentation; v6.2.8 ship rollup.
+
+---
+
 ## [6.2.6] — 2026-06-03 (Memoize node for correlated subqueries)
 
 Seventh v6.2.x sub-version. Wraps the correlated-subquery
