@@ -2304,7 +2304,44 @@ impl Engine {
             }
             planned.push((i, new_vals));
         }
+        // v7.6.6 — capture pre-update row values for the FK
+        // enforcement passes below. `planned` carries new values
+        // only; pair them with the old row.
+        let plan_with_old: Vec<(usize, Vec<Value>, Vec<Value>)> = planned
+            .iter()
+            .map(|(pos, new_vals)| (*pos, table.rows()[*pos].values.clone(), new_vals.clone()))
+            .collect();
+        let self_fks = table.schema().foreign_keys.clone();
         let affected = planned.len();
+        // Release mutable borrow on `table` for the FK passes.
+        let _ = table;
+        // v7.6.6 — Stage 2a: outbound FK check. For every row whose
+        // local FK columns changed, the new value must exist in the
+        // parent.
+        if !self_fks.is_empty() {
+            let new_rows: Vec<Vec<Value>> = planned
+                .iter()
+                .map(|(_pos, new_vals)| new_vals.clone())
+                .collect();
+            enforce_fk_inserts(self.active_catalog(), &stmt.table, &self_fks, &new_rows)?;
+        }
+        // v7.6.6 — Stage 2b: inbound FK check. For every row that
+        // changed value in a column that *some other table* uses as
+        // a FK parent column, react per `on_update` action.
+        let child_plan = plan_fk_parent_updates(self.active_catalog(), &stmt.table, &plan_with_old)?;
+        // Stage 3a — apply each child-side action.
+        for step in &child_plan {
+            apply_fk_child_step(self.active_catalog_mut(), step)?;
+        }
+        // Stage 3b — apply the original UPDATE.
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.table)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
         for (pos, vals) in planned {
             table.update_row(pos, vals)?;
         }
@@ -7484,6 +7521,206 @@ fn plan_fk_parent_deletions(
             },
         });
     }
+    Ok(steps)
+}
+
+/// v7.6.6 — plan FK fallout for an UPDATE that mutates parent-side
+/// PK/UNIQUE columns. Walks every other table whose FK references
+/// `parent_table_name`; for each FK whose parent_columns overlap a
+/// mutated column, decides the action by `fk.on_update`.
+///
+///   - RESTRICT / NoAction → error if any child references the OLD
+///     value
+///   - CASCADE → child FK columns get rewritten to the NEW parent
+///     value (a SetNull-style update step with the new value)
+///   - SetNull → child FK columns set to NULL
+///   - SetDefault → child FK columns set to declared default
+///
+/// `plan_with_old` is `(row_position, old_values, new_values)` so
+/// the planner can detect "did this row's parent key actually
+/// change?" — only rows where at least one referenced parent
+/// column moved trigger inbound work.
+fn plan_fk_parent_updates(
+    catalog: &Catalog,
+    parent_table_name: &str,
+    plan_with_old: &[(usize, Vec<Value>, Vec<Value>)],
+) -> Result<Vec<FkChildStep>, EngineError> {
+    use alloc::collections::BTreeMap;
+    if plan_with_old.is_empty() {
+        return Ok(Vec::new());
+    }
+    // For each child table we may touch, build per-child step lists.
+    let mut delete_plan: BTreeMap<String, alloc::collections::BTreeSet<usize>> = BTreeMap::new();
+    let mut setnull_plan: BTreeMap<
+        String,
+        alloc::collections::BTreeSet<(usize, usize)>,
+    > = BTreeMap::new();
+    let mut setdefault_plan: BTreeMap<String, BTreeMap<(usize, usize), Value>> =
+        BTreeMap::new();
+    // Cascade-update plan: child_table → row_idx → col_idx → new_value
+    let mut cascade_plan: BTreeMap<String, BTreeMap<(usize, usize), Value>> = BTreeMap::new();
+
+    for child_name in catalog.table_names() {
+        let child = catalog
+            .get(&child_name)
+            .expect("table_names → catalog.get total");
+        for fk in &child.schema().foreign_keys {
+            if fk.parent_table != parent_table_name {
+                continue;
+            }
+            for (_pos, old_row, new_row) in plan_with_old {
+                // Did any parent FK column change?
+                let key_changed = fk
+                    .parent_columns
+                    .iter()
+                    .any(|&pi| old_row.get(pi) != new_row.get(pi));
+                if !key_changed {
+                    continue;
+                }
+                // The OLD parent key — used to find referring children.
+                let old_key: Vec<&Value> = fk
+                    .parent_columns
+                    .iter()
+                    .map(|&pi| &old_row[pi])
+                    .collect();
+                if old_key.iter().any(|v| matches!(v, Value::Null)) {
+                    // NULL parent has no children — skip.
+                    continue;
+                }
+                let new_key: Vec<&Value> = fk
+                    .parent_columns
+                    .iter()
+                    .map(|&pi| &new_row[pi])
+                    .collect();
+                for (child_row_idx, child_row) in child.rows().iter().enumerate() {
+                    // Self-ref same-row updates: a row updating its
+                    // own PK doesn't restrict itself.
+                    if child_name == parent_table_name
+                        && plan_with_old
+                            .iter()
+                            .any(|(p, _, _)| *p == child_row_idx)
+                    {
+                        continue;
+                    }
+                    let matches_key = fk
+                        .local_columns
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &li)| child_row.values.get(li) == Some(old_key[i]));
+                    if !matches_key {
+                        continue;
+                    }
+                    match fk.on_update {
+                        spg_storage::FkAction::Restrict
+                        | spg_storage::FkAction::NoAction => {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "FOREIGN KEY violation: UPDATE on {parent_table_name:?} PK is \
+                                 restricted by FK from {child_name:?}.{:?}",
+                                fk.local_columns,
+                            )));
+                        }
+                        spg_storage::FkAction::Cascade => {
+                            // Rewrite child FK columns to new key.
+                            let entry = cascade_plan.entry(child_name.clone()).or_default();
+                            for (i, &li) in fk.local_columns.iter().enumerate() {
+                                entry.insert((child_row_idx, li), new_key[i].clone());
+                            }
+                        }
+                        spg_storage::FkAction::SetNull => {
+                            for &li in &fk.local_columns {
+                                let col = child.schema().columns.get(li).ok_or_else(|| {
+                                    EngineError::Unsupported(alloc::format!(
+                                        "FK local column {li} missing in {child_name:?}"
+                                    ))
+                                })?;
+                                if !col.nullable {
+                                    return Err(EngineError::Unsupported(alloc::format!(
+                                        "FOREIGN KEY ON UPDATE SET NULL: column \
+                                         {child_name:?}.{:?} is NOT NULL",
+                                        col.name,
+                                    )));
+                                }
+                            }
+                            let entry = setnull_plan.entry(child_name.clone()).or_default();
+                            for &li in &fk.local_columns {
+                                entry.insert((child_row_idx, li));
+                            }
+                        }
+                        spg_storage::FkAction::SetDefault => {
+                            let entry =
+                                setdefault_plan.entry(child_name.clone()).or_default();
+                            for &li in &fk.local_columns {
+                                let col = child.schema().columns.get(li).ok_or_else(|| {
+                                    EngineError::Unsupported(alloc::format!(
+                                        "FK local column {li} missing in {child_name:?}"
+                                    ))
+                                })?;
+                                let default = col.default.clone().ok_or_else(|| {
+                                    EngineError::Unsupported(alloc::format!(
+                                        "FOREIGN KEY ON UPDATE SET DEFAULT: column \
+                                         {child_name:?}.{:?} has no DEFAULT",
+                                        col.name,
+                                    ))
+                                })?;
+                                entry.insert((child_row_idx, li), default);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Flatten into FkChildStep list. UPDATE doesn't produce
+    // DeleteSteps (CASCADE on UPDATE just rewrites FK values).
+    let mut steps: Vec<FkChildStep> = Vec::new();
+    for (child_table, entries) in cascade_plan {
+        let mut positions = Vec::with_capacity(entries.len());
+        let mut columns = Vec::with_capacity(entries.len());
+        let mut defaults = Vec::with_capacity(entries.len());
+        for ((p, c), v) in entries {
+            positions.push(p);
+            columns.push(c);
+            defaults.push(v);
+        }
+        // We reuse `FkChildAction::SetDefault` for cascade-update:
+        // both shapes are "write a known value into specific cells"
+        // — `apply_per_cell_writes` doesn't care whether the value
+        // came from a DEFAULT declaration or a new parent key.
+        steps.push(FkChildStep {
+            child_table,
+            action: FkChildAction::SetDefault {
+                positions,
+                columns,
+                defaults,
+            },
+        });
+    }
+    for (child_table, entries) in setnull_plan {
+        let (positions, columns): (Vec<usize>, Vec<usize>) = entries.into_iter().unzip();
+        steps.push(FkChildStep {
+            child_table,
+            action: FkChildAction::SetNull { positions, columns },
+        });
+    }
+    for (child_table, entries) in setdefault_plan {
+        let mut positions = Vec::with_capacity(entries.len());
+        let mut columns = Vec::with_capacity(entries.len());
+        let mut defaults = Vec::with_capacity(entries.len());
+        for ((p, c), v) in entries {
+            positions.push(p);
+            columns.push(c);
+            defaults.push(v);
+        }
+        steps.push(FkChildStep {
+            child_table,
+            action: FkChildAction::SetDefault {
+                positions,
+                columns,
+                defaults,
+            },
+        });
+    }
+    let _ = delete_plan; // UPDATE never deletes children.
     Ok(steps)
 }
 
