@@ -13,6 +13,7 @@ pub mod json;
 pub mod memoize;
 pub mod plan_cache;
 pub mod publications;
+pub mod query_stats;
 pub mod reorder;
 pub mod selectivity;
 pub mod statistics;
@@ -556,6 +557,10 @@ pub struct Engine {
     /// `Statement` keyed on SQL text. In-memory only — does NOT ride
     /// the snapshot envelope (rebuilt on demand after restart).
     plan_cache: plan_cache::PlanCache,
+    /// v6.5.1 — per-distinct-SQL execution stats. In-memory only,
+    /// surfaced via `spg_stat_query` virtual table. Updated by the
+    /// `execute_*` paths after a successful execute.
+    query_stats: query_stats::QueryStats,
 }
 
 impl Engine {
@@ -573,6 +578,7 @@ impl Engine {
             subscriptions: subscriptions::Subscriptions::new(),
             statistics: statistics::Statistics::new(),
             plan_cache: plan_cache::PlanCache::new(),
+            query_stats: query_stats::QueryStats::new(),
         }
     }
 
@@ -592,6 +598,7 @@ impl Engine {
             subscriptions: subscriptions::Subscriptions::new(),
             statistics: statistics::Statistics::new(),
             plan_cache: plan_cache::PlanCache::new(),
+            query_stats: query_stats::QueryStats::new(),
         }
     }
 
@@ -644,6 +651,7 @@ impl Engine {
                     subscriptions,
                     statistics,
                     plan_cache: plan_cache::PlanCache::new(),
+                    query_stats: query_stats::QueryStats::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1045,7 +1053,17 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
         let stmt = self.prepare(sql)?;
-        self.execute_stmt_with_cancel(stmt, cancel)
+        // v6.5.1 — wrap the executor with a wall-clock window so we
+        // can record into spg_stat_query. Skip when the engine has
+        // no clock attached (no_std embedded callers).
+        let start_us = self.clock.map(|f| f());
+        let result = self.execute_stmt_with_cancel(stmt, cancel);
+        if let (Some(t0), Ok(_)) = (start_us, &result) {
+            let now = self.clock.map_or(t0, |f| f());
+            let elapsed = now.saturating_sub(t0).max(0) as u64;
+            self.query_stats.record(sql, elapsed, now as u64);
+        }
+        result
     }
 
     fn execute_stmt_with_cancel(
@@ -1316,6 +1334,53 @@ impl Engine {
             })
             .collect();
         QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.1 — materialise `spg_stat_query` rows. One row per
+    /// distinct SQL text recorded since the engine booted, capped
+    /// at `QUERY_STATS_MAX` (1024). Columns:
+    ///   sql, exec_count, total_us, mean_us, max_us, last_seen_us
+    /// mean_us = total_us / exec_count (saturating).
+    fn exec_spg_stat_query(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("sql", DataType::Text, false),
+            ColumnSchema::new("exec_count", DataType::BigInt, false),
+            ColumnSchema::new("total_us", DataType::BigInt, false),
+            ColumnSchema::new("mean_us", DataType::BigInt, false),
+            ColumnSchema::new("max_us", DataType::BigInt, false),
+            ColumnSchema::new("last_seen_us", DataType::BigInt, false),
+        ];
+        let rows: Vec<Row> = self
+            .query_stats
+            .snapshot()
+            .into_iter()
+            .map(|(sql, s)| {
+                let mean = if s.exec_count == 0 {
+                    0
+                } else {
+                    s.total_us / s.exec_count
+                };
+                Row::new(alloc::vec![
+                    Value::Text(sql),
+                    Value::BigInt(i64::try_from(s.exec_count).unwrap_or(i64::MAX)),
+                    Value::BigInt(i64::try_from(s.total_us).unwrap_or(i64::MAX)),
+                    Value::BigInt(i64::try_from(mean).unwrap_or(i64::MAX)),
+                    Value::BigInt(i64::try_from(s.max_us).unwrap_or(i64::MAX)),
+                    Value::BigInt(i64::try_from(s.last_seen_us).unwrap_or(i64::MAX)),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.1 — read-only accessor for tests + v6.5.6 ops resets.
+    pub fn query_stats(&self) -> &query_stats::QueryStats {
+        &self.query_stats
+    }
+
+    /// v6.5.1 — mutable accessor (clear, etc).
+    pub fn query_stats_mut(&mut self) -> &mut query_stats::QueryStats {
+        &mut self.query_stats
     }
 
     /// v6.2.0 — read access to the per-column statistics table.
@@ -2258,6 +2323,7 @@ impl Engine {
                 // v6.5.0 — observability v2 virtual tables.
                 "spg_stat_replication" => return Ok(self.exec_spg_stat_replication()),
                 "spg_stat_segment" => return Ok(self.exec_spg_stat_segment()),
+                "spg_stat_query" => return Ok(self.exec_spg_stat_query()),
                 _ => {}
             }
         }
