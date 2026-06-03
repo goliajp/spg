@@ -59,6 +59,11 @@ pub enum Statement {
     /// also re-encoded through `coerce_value` before the new graph
     /// builds.
     AlterIndex(AlterIndexStatement),
+    /// v6.7.2 — `ALTER TABLE <name> SET <setting> = <value>`.
+    /// The only setting in v6.7.2 is `hot_tier_bytes`, which
+    /// overrides the global `SPG_HOT_TIER_BYTES` freezer trigger
+    /// for the named table.
+    AlterTable(AlterTableStatement),
     /// v6.1.2 — `CREATE PUBLICATION <name> [FOR ALL TABLES]`.
     /// The catalog row lives in `spg_publications`. Publisher-side
     /// WAL filtering arrives in v6.1.5.
@@ -160,6 +165,22 @@ pub enum AlterIndexTarget {
     /// rebuilds the existing graph in place without touching the
     /// column encoding; `Some(enc)` re-encodes every cell first.
     Rebuild { encoding: Option<VecEncoding> },
+}
+
+/// v6.7.2 — `ALTER TABLE t SET <setting> = <value>`. v6.7.2 ships
+/// the single `hot_tier_bytes` setting; later v6.7.x sub-versions
+/// can add more SET subjects without changing the dispatch shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTableStatement {
+    pub name: String,
+    pub target: AlterTableTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterTableTarget {
+    /// Per-table hot-tier byte budget override. The freezer
+    /// reads this before falling back to `SPG_HOT_TIER_BYTES`.
+    SetHotTierBytes(u64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -812,6 +833,14 @@ impl fmt::Display for Statement {
                             write!(f, " WITH (encoding = {enc})")?;
                         }
                         Ok(())
+                    }
+                }
+            }
+            Self::AlterTable(a) => {
+                write!(f, "ALTER TABLE {} ", quote_ident(&a.name))?;
+                match a.target {
+                    AlterTableTarget::SetHotTierBytes(n) => {
+                        write!(f, "SET hot_tier_bytes = {n}")
                     }
                 }
             }

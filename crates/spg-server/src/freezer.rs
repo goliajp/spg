@@ -165,8 +165,28 @@ fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
         return Ok(());
     }
 
+    // v6.7.2 — freeze trigger:
+    //   1. Any single table exceeds its own `hot_tier_bytes`
+    //      override (set via `ALTER TABLE … SET hot_tier_bytes`).
+    //   2. Otherwise: global hot tier exceeds
+    //      `state.hot_tier_byte_budget` (env-set
+    //      `SPG_HOT_TIER_BYTES`).
+    // Either condition fires; the per-table check runs first so
+    // operators can shrink a specific table without raising the
+    // global watermark.
+    let any_table_over = engine
+        .catalog()
+        .table_names()
+        .iter()
+        .any(|n| {
+            engine
+                .catalog()
+                .get(n)
+                .and_then(|t| t.schema().hot_tier_bytes.map(|cap| t.hot_bytes() > cap))
+                .unwrap_or(false)
+        });
     let used = engine.catalog().hot_tier_bytes();
-    if used <= state.hot_tier_byte_budget {
+    if !any_table_over && used <= state.hot_tier_byte_budget {
         return Ok(());
     }
 

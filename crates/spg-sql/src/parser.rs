@@ -567,15 +567,17 @@ impl Parser {
     /// ALTER INDEX <name> REBUILD [WITH (encoding = <enc>)]
     /// ```
     fn parse_alter_after_keyword(&mut self) -> Result<Statement, ParseError> {
-        // ALTER INDEX <name>. `INDEX` is a reserved Token::Index in
-        // the lexer (used by CREATE INDEX); accept either the
-        // tokenised keyword or the bare ident spelling for symmetry
-        // with the rest of the parser.
+        // ALTER INDEX <name> ... | ALTER TABLE <name> SET hot_tier_bytes = <n>
         match self.advance() {
             Token::Index => {}
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("index") => {}
+            // v6.7.2 — ALTER TABLE t SET hot_tier_bytes = X
+            Token::Table => return self.parse_alter_table_after_keyword(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("table") => {
+                return self.parse_alter_table_after_keyword();
+            }
             other => {
-                return Err(self.err(format!("expected INDEX after ALTER, got {other:?}")));
+                return Err(self.err(format!("expected INDEX or TABLE after ALTER, got {other:?}")));
             }
         }
         let name = self.expect_ident_like()?;
@@ -629,6 +631,32 @@ impl Parser {
         Ok(Statement::AlterIndex(crate::ast::AlterIndexStatement {
             name,
             target: crate::ast::AlterIndexTarget::Rebuild { encoding },
+        }))
+    }
+
+    /// v6.7.2 — `ALTER TABLE <name> SET hot_tier_bytes = <n>`. The
+    /// only `SET` form currently supported; future v6.7.x can add
+    /// more SET subjects without changing the dispatch shape.
+    fn parse_alter_table_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let table_name = self.expect_ident_like()?;
+        self.expect_keyword_ident("set")?;
+        let setting = self.expect_ident_like()?;
+        if !setting.eq_ignore_ascii_case("hot_tier_bytes") {
+            return Err(self.err(alloc::format!(
+                "ALTER TABLE SET: unknown setting {setting:?}; supported: hot_tier_bytes"
+            )));
+        }
+        if !matches!(self.peek(), Token::Eq) {
+            return Err(self.err(alloc::format!(
+                "expected '=' after hot_tier_bytes, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let n = self.expect_u64_literal()?;
+        Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
+            name: table_name,
+            target: crate::ast::AlterTableTarget::SetHotTierBytes(n),
         }))
     }
 
