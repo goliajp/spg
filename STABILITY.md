@@ -795,6 +795,69 @@ WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>
   stays at 0 and `WAIT FOR WAL POSITION 0` returns immediately.
   Larger targets block until the optional timeout fires.
 
+### SQL polish (v6.4 series)
+
+v6.4 ships the SQL surface-polish set PG 19 brought plus the
+JSON path operators every real app eventually wants. Closes the
+twelfth-gap cluster from the PG-19 audit and the two SQL-surface
+gaps v6.2.7 explicitly carved as "follow-up in v6.4". Frozen
+surfaces below.
+
+#### Frozen surfaces (added v6.4.x)
+
+- `SelectStatement.order_by: Vec<OrderBy>` (was `Option<OrderBy>`).
+  Empty Vec = no ORDER BY. Multi-key sort chains comparisons
+  left-to-right with per-key DESC.
+- `SelectStatement.group_by_all: bool`. When true, planner expands
+  `group_by` to every non-aggregate SELECT-list item before
+  executor dispatch. Parser sets it on `GROUP BY ALL`.
+- `Expr::WindowFunction.null_treatment: NullTreatment` (Respect /
+  Ignore). Applies to LAG / LEAD / FIRST_VALUE / LAST_VALUE;
+  other window funcs ignore it. Default Respect (PG / ANSI).
+- New BinOp variants: `JsonGetPath` (`#>`), `JsonGetPathText`
+  (`#>>`), `JsonContains` (`@>`). Same precedence rung 7 as
+  `->` / `->>`.
+- SQL function table additions (eval dispatch):
+  - `encode(text, format)` / `decode(text, format)` — base64,
+    base64url, base32hex, hex
+  - `error_on_null(v)` — passthrough or raise
+- COPY FROM STDIN option tail: `WITH (SKIP N, ON_ERROR SET_NULL,
+  FORMAT JSON)`. Default values preserve v4.17 behaviour.
+
+#### Out of scope for v6 (carved out — not deferred)
+
+- **INSERT ON CONFLICT** (any form: DO NOTHING / DO SELECT / DO
+  UPDATE). v6.4 design originally scheduled `DO SELECT [FOR
+  UPDATE]` for v6.4.4 on the false assumption that v5.x already
+  shipped ON CONFLICT DO NOTHING / DO UPDATE. Audit during v6.4.4
+  work found SPG has NO PRIMARY KEY / UNIQUE constraint
+  enforcement anywhere (no PRIMARY KEY syntax, no UNIQUE in
+  storage or engine). ON CONFLICT has nothing to detect. The
+  prerequisites — PK / UNIQUE syntax + storage indexes +
+  enforcement on every INSERT + WAL replay path — are
+  foundational DML work, not SQL polish. Picked up as a dedicated
+  v6.x effort (most likely v6.6 territory, once the WAL-format
+  work in that series can carry enforcement-ready indexes).
+- **`random(date, date)` / `random(ts, ts)`**. Designed for v6.4.3
+  but needs a per-row RNG state EvalContext doesn't currently
+  plumb. Adding RNG threading is a separate concern from the
+  SQL-polish theme.
+- **Full SQL/JSON path** (`jsonpath` opaque type, `json_path_exists`,
+  `json_path_query`, `jsonb_path_query_array`, `@?`). v6.4.5
+  ships the bare-key/path-array operators; the path-expression
+  grammar is a separate surface.
+- **MERGE statement** (`MERGE ... WHEN NOT MATCHED BY SOURCE`).
+  Separate verb; INSERT ON CONFLICT covers the common upsert
+  case once its prereqs ship.
+- **COPY FORMAT BINARY**. PG's binary COPY format is a separate
+  spec; text + CSV + JSON cover the practically-needed surface.
+- **True per-cell ON_ERROR SET_NULL**. v6.4.7 ships row-level
+  skip-on-error semantics. Per-column SET_NULL (replace the failed
+  cell with NULL, keep the row) needs per-cell parse visibility
+  inside `build_copy_insert`.
+- **XML functions** (`xmlforest`, `xmlagg`, …). SPG has no XML
+  type.
+
 ### PG-wire extended query finish (v6.3 series)
 
 v6.3 closes the eleventh-gap cluster from the PG-19 audit — the
