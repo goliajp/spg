@@ -293,8 +293,17 @@ pub struct ColumnSchema {
     pub nullable: bool,
     /// Optional `DEFAULT` value, frozen at CREATE TABLE time. `None`
     /// means "no default" (so omitted columns become NULL, or error
-    /// out when the column is NOT NULL).
+    /// out when the column is NOT NULL). Literal defaults take this
+    /// path.
     pub default: Option<Value>,
+    /// v7.9.21 — for DEFAULT expressions that need INSERT-time
+    /// evaluation (e.g. `DEFAULT now()`, `DEFAULT CURRENT_TIMESTAMP`),
+    /// the Display form of the expression. The engine re-parses
+    /// it on each INSERT default-fill, evaluates against an empty
+    /// row context, and coerces to the column type. mailrs G4.
+    /// Persisted in catalog FILE_VERSION 15+; older catalogs
+    /// deserialise with None.
+    pub runtime_default: Option<String>,
     /// MySQL-style `AUTO_INCREMENT`. When set, an INSERT that leaves
     /// this column unbound (or sets it to NULL) gets the next integer
     /// computed from the column's current max + 1.
@@ -3765,6 +3774,7 @@ impl ColumnSchema {
             ty,
             nullable,
             default: None,
+            runtime_default: None,
             auto_increment: false,
         }
     }
@@ -3775,6 +3785,16 @@ impl ColumnSchema {
     #[must_use]
     pub fn with_default(mut self, default: Value) -> Self {
         self.default = Some(default);
+        self
+    }
+
+    /// v7.9.21 — builder for runtime-evaluated defaults
+    /// (`DEFAULT now()`, `DEFAULT CURRENT_TIMESTAMP`, …).
+    /// `expr` is the Expr's `Display` form, re-parsed by the
+    /// engine at each INSERT.
+    #[must_use]
+    pub fn with_runtime_default(mut self, expr: impl Into<String>) -> Self {
+        self.runtime_default = Some(expr.into());
         self
     }
 
@@ -4102,6 +4122,30 @@ impl Catalog {
                     );
                 }
             }
+            // v7.9.21 — runtime_default appendix per table.
+            // Layout: [u16 count] then for each:
+            //   [u16 col_pos][str expr]
+            // Only columns whose runtime_default is Some land here;
+            // catalog stays compact for the common literal-default
+            // case.
+            let mut rt_defaults: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(e) = &c.runtime_default {
+                    rt_defaults.push((i, e.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(rt_defaults.len())
+                    .expect("≤ 65k runtime defaults/table"),
+            );
+            for (pos, expr) in rt_defaults {
+                write_u16(
+                    &mut out,
+                    u16::try_from(pos).expect("≤ 65k columns/table"),
+                );
+                write_str(&mut out, expr);
+            }
         }
         out
     }
@@ -4164,11 +4208,15 @@ fn deserialize_table(
             }
         };
         let auto_increment = cur.read_u8()? != 0;
+        // Note: deserialiser sets runtime_default = None for
+        // older catalogs (≤ v14). v15+ reads it from the
+        // per-column appendix below.
         cols.push(ColumnSchema {
             name: c_name,
             ty,
             nullable,
             default,
+            runtime_default: None,
             auto_increment,
         });
     }
@@ -4264,6 +4312,15 @@ fn deserialize_table(
             });
         }
         t.schema_mut().uniqueness_constraints = ucs;
+        // v7.9.21 — runtime_default appendix (FILE_VERSION 15+).
+        let rt_count = cur.read_u16()? as usize;
+        for _ in 0..rt_count {
+            let pos = cur.read_u16()? as usize;
+            let expr = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(pos) {
+                col.runtime_default = Some(expr);
+            }
+        }
     }
     let _ = table_name;
     Ok(())
