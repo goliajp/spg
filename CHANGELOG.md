@@ -65,7 +65,12 @@ Sub-versions:
   v7.9.9   ON CONFLICT DO UPDATE SET (EXCLUDED) + RETURNING
   v7.9.10  ON CONFLICT composite target
   v7.9.11  sqlx-pgwire integration smoke suite
-  v7.9.12  series ship rollup + tag + docker + crates.io
+  v7.9.12  initial v7.9 ship: tag v7.9.0 + crates.io + docker
+  v7.9.13  F1 — inline PRIMARY KEY column constraint + implicit pkey index
+  v7.9.14  F2 — multi-column CREATE INDEX (a, b, c [ASC|DESC])
+  v7.9.15  F3 — CREATE EXTENSION as no-op
+  v7.9.16  F4 — bare/quoted `key` column name (side effect of F1)
+  v7.9.17  follow-up ship: tag v7.9.1 + crates.io 7.9.17 + docker 7.9.1
 
 This closes the blocker list in
 `.claude/notes/mailrs-migration-feedback.md`. Remaining items
