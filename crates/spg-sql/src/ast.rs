@@ -378,7 +378,10 @@ pub struct SelectStatement {
     /// None` (the parser enforces that — ORDER BY / LIMIT belong to the
     /// top of the chain).
     pub unions: Vec<(UnionKind, SelectStatement)>,
-    pub order_by: Option<OrderBy>,
+    /// v6.4.0 — multi-key ORDER BY. Empty `Vec` means no ORDER BY.
+    /// Keys are matched left-to-right: first key decides, ties break
+    /// to the second, etc.
+    pub order_by: Vec<OrderBy>,
     pub limit: Option<u32>,
     /// `OFFSET <n>` — drop the first `n` rows after ORDER BY but
     /// before LIMIT (so `LIMIT 10 OFFSET 5` keeps rows 6..=15).
@@ -925,10 +928,16 @@ impl fmt::Display for SelectStatement {
             })?;
             write_bare_select(peer, f)?;
         }
-        if let Some(o) = &self.order_by {
-            write!(f, " ORDER BY {}", o.expr)?;
-            if o.desc {
-                f.write_str(" DESC")?;
+        if !self.order_by.is_empty() {
+            f.write_str(" ORDER BY ")?;
+            for (i, o) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", o.expr)?;
+                if o.desc {
+                    f.write_str(" DESC")?;
+                }
             }
         }
         if let Some(n) = &self.limit {
@@ -1367,7 +1376,7 @@ mod tests {
             group_by: None,
             having: None,
             unions: vec![],
-            order_by: None,
+            order_by: Vec::new(),
             limit: None,
             offset: None,
             distinct: false,

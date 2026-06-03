@@ -32,7 +32,7 @@ use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
     CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement,
     CreateUserStatement, Expr, FrameBound, FrameKind, FromClause, IndexMethod, InsertStatement,
-    JoinKind, Literal, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
+    JoinKind, Literal, OrderBy, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
     VecEncoding as SqlVecEncoding, WindowFrame,
 };
 use spg_sql::parser::{self, ParseError};
@@ -2180,7 +2180,7 @@ impl Engine {
             && stmt.group_by.is_none()
             && stmt.having.is_none()
             && stmt.unions.is_empty()
-            && stmt.order_by.is_none()
+            && stmt.order_by.is_empty()
             && stmt.limit.is_none()
             && stmt.offset.is_none()
             && !stmt.distinct
@@ -2221,7 +2221,7 @@ impl Engine {
         // peers with left-associative dedup semantics.
         let mut head = stmt_ref.clone();
         head.unions = Vec::new();
-        head.order_by = None;
+        head.order_by = Vec::new();
         head.limit = None;
         let QueryResult::Rows { columns, mut rows } =
             self.exec_bare_select_cancel(&head, cancel)?
@@ -2250,14 +2250,15 @@ impl Engine {
         }
         // ORDER BY at the top of a UNION applies to the combined result.
         // Eval against the projected schema (NOT the source table).
-        if let Some(order) = &stmt.order_by {
+        if !stmt.order_by.is_empty() {
             let synth_ctx = EvalContext::new(&columns, None);
-            let mut tagged: Vec<(f64, Row)> = Vec::with_capacity(rows.len());
+            let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+            let mut tagged: Vec<(Vec<f64>, Row)> = Vec::with_capacity(rows.len());
             for r in rows {
-                let key = eval::eval_expr(&order.expr, &r, &synth_ctx)?;
-                tagged.push((value_to_order_key(&key)?, r));
+                let keys = build_order_keys(&stmt.order_by, &r, &synth_ctx)?;
+                tagged.push((keys, r));
             }
-            sort_by_key_with_direction(&mut tagged, order.desc);
+            sort_by_keys(&mut tagged, &descs);
             rows = tagged.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_and_limit(&mut rows, stmt.offset, stmt.limit);
@@ -2393,7 +2394,7 @@ impl Engine {
 
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
-        let mut tagged: Vec<(Option<f64>, Row)> = Vec::new();
+        let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
         // v6.2.6 — Memoize per-row WHERE eval shares one cache.
         let mut memo = memoize::MemoizeCache::new();
         // Inline the per-row work in a closure so the indexed and full-
@@ -2418,13 +2419,12 @@ impl Engine {
             for p in &projection {
                 values.push(eval::eval_expr(&p.expr, row, &ctx)?);
             }
-            let order_key = if let Some(order) = &stmt.order_by {
-                let key = eval::eval_expr(&order.expr, row, &ctx)?;
-                Some(value_to_order_key(&key)?)
+            let order_keys = if stmt.order_by.is_empty() {
+                Vec::new()
             } else {
-                None
+                build_order_keys(&stmt.order_by, row, &ctx)?
             };
-            tagged.push((order_key, Row::new(values)));
+            tagged.push((order_keys, Row::new(values)));
             Ok(())
         };
         if let Some(rows) = &indexed_rows {
@@ -2437,7 +2437,7 @@ impl Engine {
             }
         }
 
-        if let Some(order) = &stmt.order_by {
+        if !stmt.order_by.is_empty() {
             // Partial-sort fast path: when LIMIT is small relative to
             // the row count, select_nth_unstable + sort just the
             // prefix is O(n + k log k) instead of O(n log n). DISTINCT
@@ -2448,7 +2448,8 @@ impl Engine {
                 stmt.limit
                     .map(|l| l as usize + stmt.offset.map_or(0, |o| o as usize))
             };
-            partial_sort_tagged(&mut tagged, keep, order.desc);
+            let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+            partial_sort_tagged(&mut tagged, keep, &descs);
         }
 
         let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
@@ -2598,28 +2599,28 @@ impl Engine {
         }
 
         let projection = build_projection(&stmt.items, &combined_schema, "")?;
-        let mut tagged: Vec<(Option<f64>, Row)> = Vec::new();
+        let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
         for row in &filtered {
             let mut values = Vec::with_capacity(projection.len());
             for p in &projection {
                 values.push(eval::eval_expr(&p.expr, row, &ctx)?);
             }
-            let order_key = if let Some(order) = &stmt.order_by {
-                let key = eval::eval_expr(&order.expr, row, &ctx)?;
-                Some(value_to_order_key(&key)?)
+            let order_keys = if stmt.order_by.is_empty() {
+                Vec::new()
             } else {
-                None
+                build_order_keys(&stmt.order_by, row, &ctx)?
             };
-            tagged.push((order_key, Row::new(values)));
+            tagged.push((order_keys, Row::new(values)));
         }
-        if let Some(order) = &stmt.order_by {
+        if !stmt.order_by.is_empty() {
             let keep = if stmt.distinct {
                 None
             } else {
                 stmt.limit
                     .map(|l| l as usize + stmt.offset.map_or(0, |o| o as usize))
             };
-            partial_sort_tagged(&mut tagged, keep, order.desc);
+            let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+            partial_sort_tagged(&mut tagged, keep, &descs);
         }
         let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
         if stmt.distinct {
@@ -2743,7 +2744,13 @@ fn try_nsw_knn(
     if limit == 0 {
         return None;
     }
-    let order = stmt.order_by.as_ref()?;
+    // v6.4.0 — NSW kNN dispatch needs a single ORDER BY key on the
+    // distance metric. Multi-key ORDER BY falls through to the
+    // generic sort path.
+    if stmt.order_by.len() != 1 {
+        return None;
+    }
+    let order = &stmt.order_by[0];
     // NSW kNN returns rows ascending by distance — DESC inverts the
     // natural order, so the planner can't handle it without a sort
     // pass. Fall back to the generic ORDER BY path.
@@ -3375,7 +3382,7 @@ impl Engine {
         // 7) Project into final rows.
         let ext_ctx = EvalContext::new(&ext_cols, Some(alias));
         let projection = build_projection(&rewritten_items, &ext_cols, alias)?;
-        let mut tagged: Vec<(Option<f64>, Row)> = Vec::with_capacity(n_rows);
+        let mut tagged: Vec<(Vec<f64>, Row)> = Vec::with_capacity(n_rows);
         for (i, row) in ext_rows.iter().enumerate() {
             if i.is_multiple_of(256) {
                 cancel.check()?;
@@ -3384,23 +3391,24 @@ impl Engine {
             for p in &projection {
                 values.push(eval::eval_expr(&p.expr, row, &ext_ctx)?);
             }
-            let order_key = if let Some(order) = &stmt.order_by {
-                let mut e = order.expr.clone();
-                rewrite_window_to_columns(&mut e, &window_nodes);
-                let key = eval::eval_expr(&e, row, &ext_ctx)?;
-                Some(value_to_order_key(&key)?)
+            let order_keys = if stmt.order_by.is_empty() {
+                Vec::new()
             } else {
-                None
+                let mut keys = Vec::with_capacity(stmt.order_by.len());
+                for o in &stmt.order_by {
+                    let mut e = o.expr.clone();
+                    rewrite_window_to_columns(&mut e, &window_nodes);
+                    let key = eval::eval_expr(&e, row, &ext_ctx)?;
+                    keys.push(value_to_order_key(&key)?);
+                }
+                keys
             };
-            tagged.push((order_key, Row::new(values)));
+            tagged.push((order_keys, Row::new(values)));
         }
         // ORDER BY + LIMIT/OFFSET on the projected rows.
-        if let Some(order) = &stmt.order_by {
-            tagged.sort_by(|a, b| {
-                let (ka, kb) = (a.0.unwrap_or(f64::INFINITY), b.0.unwrap_or(f64::INFINITY));
-                let cmp = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
-                if order.desc { cmp.reverse() } else { cmp }
-            });
+        if !stmt.order_by.is_empty() {
+            let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+            sort_by_keys(&mut tagged, &descs);
         }
         let mut out_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
         apply_offset_and_limit(&mut out_rows, stmt.offset, stmt.limit);
@@ -3664,7 +3672,7 @@ impl Engine {
         if let Some(h) = &mut stmt.having {
             self.resolve_expr_subqueries(h, cancel)?;
         }
-        if let Some(o) = &mut stmt.order_by {
+        for o in &mut stmt.order_by {
             self.resolve_expr_subqueries(&mut o.expr, cancel)?;
         }
         for (_, peer) in &mut stmt.unions {
@@ -4278,7 +4286,7 @@ fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &m
     if let Some(h) = &stmt.having {
         out.push(alloc::format!("{child}Having: {h}"));
     }
-    if let Some(o) = &stmt.order_by {
+    for o in &stmt.order_by {
         let dir = if o.desc { "DESC" } else { "ASC" };
         out.push(alloc::format!("{child}OrderBy: {} {dir}", o.expr));
     }
@@ -4361,7 +4369,7 @@ fn substitute_in_select(
     if let Some(h) = &mut stmt.having {
         substitute_in_expr(h, row, ctx, outer_alias);
     }
-    if let Some(o) = &mut stmt.order_by {
+    for o in &mut stmt.order_by {
         substitute_in_expr(&mut o.expr, row, ctx, outer_alias);
     }
     for (_, peer) in &mut stmt.unions {
@@ -5111,7 +5119,7 @@ fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
     if let Some(h) = &stmt.having {
         any = any || expr_has_subquery(h);
     }
-    if let Some(o) = &stmt.order_by {
+    for o in &stmt.order_by {
         any = any || expr_has_subquery(&o.expr);
     }
     for (_, peer) in &stmt.unions {
@@ -5230,7 +5238,7 @@ fn substitute_select(
     if let Some(h) = &mut s.having {
         substitute_expr(h, params)?;
     }
-    if let Some(o) = &mut s.order_by {
+    for o in &mut s.order_by {
         substitute_expr(&mut o.expr, params)?;
     }
     for (_, peer) in &mut s.unions {
@@ -5494,7 +5502,7 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: i64) {
     if let Some(h) = &mut s.having {
         rewrite_expr_clock(h, now);
     }
-    if let Some(o) = &mut s.order_by {
+    for o in &mut s.order_by {
         rewrite_expr_clock(&mut o.expr, now);
     }
     for (_, peer) in &mut s.unions {
@@ -5614,16 +5622,37 @@ enum ClockSite {
 /// executor doesn't need a special-case branch. Recurses into UNION
 /// peers because each peer keeps its own SELECT list.
 fn resolve_order_by_position(s: &mut SelectStatement) {
-    if let Some(order) = &mut s.order_by
-        && let Expr::Literal(Literal::Integer(n)) = &order.expr
-        && *n >= 1
-        && let Ok(idx_one_based) = usize::try_from(*n)
-    {
-        let idx = idx_one_based - 1;
-        if idx < s.items.len()
-            && let SelectItem::Expr { expr, .. } = &s.items[idx]
-        {
-            order.expr = expr.clone();
+    // v6.4.0 — iterate every ORDER BY key. Position references
+    // (`ORDER BY 2`) bind to the 1-based projection index;
+    // identifier references that match a SELECT-list alias bind to
+    // the projected expression (Step 4 of L3a).
+    for order in &mut s.order_by {
+        match &order.expr {
+            Expr::Literal(Literal::Integer(n)) if *n >= 1 => {
+                if let Ok(idx_one_based) = usize::try_from(*n) {
+                    let idx = idx_one_based - 1;
+                    if idx < s.items.len()
+                        && let SelectItem::Expr { expr, .. } = &s.items[idx]
+                    {
+                        order.expr = expr.clone();
+                    }
+                }
+            }
+            Expr::Column(c) if c.qualifier.is_none() => {
+                // Alias-in-ORDER-BY lookup.
+                for item in &s.items {
+                    if let SelectItem::Expr {
+                        expr,
+                        alias: Some(a),
+                    } = item
+                        && a == &c.name
+                    {
+                        order.expr = expr.clone();
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     for (_, peer) in &mut s.unions {
@@ -5643,19 +5672,14 @@ fn resolve_order_by_position(s: &mut SelectStatement) {
 ///
 /// `tagged` holds `(Option<f64>, Row)` (the SELECT path) — `None` keys
 /// sort last in ascending order, mirroring NULL-sorts-last in SQL.
-fn partial_sort_tagged(tagged: &mut Vec<(Option<f64>, Row)>, keep: Option<usize>, desc: bool) {
-    let cmp = move |a: &(Option<f64>, Row), b: &(Option<f64>, Row)| {
-        let ka = a.0.unwrap_or(f64::INFINITY);
-        let kb = b.0.unwrap_or(f64::INFINITY);
-        let ord = ka.partial_cmp(&kb).unwrap_or(core::cmp::Ordering::Equal);
-        if desc { ord.reverse() } else { ord }
-    };
+fn partial_sort_tagged(
+    tagged: &mut Vec<(Vec<f64>, Row)>,
+    keep: Option<usize>,
+    descs: &[bool],
+) {
+    let cmp = |a: &(Vec<f64>, Row), b: &(Vec<f64>, Row)| cmp_multi_key(&a.0, &b.0, descs);
     match keep {
         Some(k) if k < tagged.len() && k > 0 => {
-            // Partition: every element at or before index k-1 is "≤"
-            // (or "≥" under DESC) every element after it. Then sort
-            // just the prefix to give the caller a proper ordering of
-            // the kept rows.
             let pivot = k - 1;
             tagged.select_nth_unstable_by(pivot, cmp);
             tagged[..k].sort_by(cmp);
@@ -5667,11 +5691,42 @@ fn partial_sort_tagged(tagged: &mut Vec<(Option<f64>, Row)>, keep: Option<usize>
     }
 }
 
-fn sort_by_key_with_direction(tagged: &mut [(f64, Row)], desc: bool) {
-    tagged.sort_by(|a, b| {
-        let cmp = a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal);
-        if desc { cmp.reverse() } else { cmp }
-    });
+fn sort_by_keys(tagged: &mut [(Vec<f64>, Row)], descs: &[bool]) {
+    tagged.sort_by(|a, b| cmp_multi_key(&a.0, &b.0, descs));
+}
+
+/// v6.4.0 — multi-key ORDER BY comparator. Each key's per-key DESC
+/// flag is honored independently. NULL is encoded as `f64::INFINITY`
+/// so it sorts last in ASC and first in DESC (matches PG default).
+fn cmp_multi_key(a: &[f64], b: &[f64], descs: &[bool]) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    for (i, (ka, kb)) in a.iter().zip(b.iter()).enumerate() {
+        let ord = ka.partial_cmp(kb).unwrap_or(Ordering::Equal);
+        let ord = if descs.get(i).copied().unwrap_or(false) {
+            ord.reverse()
+        } else {
+            ord
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// v6.4.0 — eval every ORDER BY expression for a row and pack the
+/// resulting keys into a `Vec<f64>`. NULL → `f64::INFINITY`.
+fn build_order_keys(
+    order_by: &[OrderBy],
+    row: &Row,
+    ctx: &EvalContext,
+) -> Result<Vec<f64>, EngineError> {
+    let mut keys = Vec::with_capacity(order_by.len());
+    for o in order_by {
+        let v = eval::eval_expr(&o.expr, row, ctx)?;
+        keys.push(value_to_order_key(&v)?);
+    }
+    Ok(keys)
 }
 
 /// Drop the first `offset` rows then truncate to `limit`. PG / `MySQL`
