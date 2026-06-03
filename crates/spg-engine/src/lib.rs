@@ -1324,6 +1324,13 @@ impl Engine {
         cancel.check()?;
         let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
+            // v7.9.15 — CREATE EXTENSION is a no-op on SPG. Returns
+            // CommandOk with affected=0; modified_catalog=false so
+            // the WAL doesn't grow a useless entry. mailrs F3.
+            Statement::CreateExtension(_) => Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            }),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Update(s) => self.exec_update_cancel(&s, cancel),

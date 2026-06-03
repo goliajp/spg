@@ -16,6 +16,12 @@ use core::fmt;
 pub enum Statement {
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
+    /// v7.9.15 — `CREATE EXTENSION [IF NOT EXISTS] <name>
+    /// [WITH SCHEMA <s>] [VERSION <v>] [CASCADE]` accepted as a
+    /// no-op so PG dumps that include extension declarations
+    /// (notably `pgvector`) load against SPG without splitting
+    /// init scripts. mailrs migration follow-up F3.
+    CreateExtension(String),
     CreateIndex(CreateIndexStatement),
     Insert(InsertStatement),
     /// v4.4 — `UPDATE <table> SET col=expr [, ...] [WHERE cond]`.
@@ -1049,6 +1055,9 @@ impl fmt::Display for Statement {
                         Ok(())
                     }
                 }
+            }
+            Self::CreateExtension(name) => {
+                write!(f, "CREATE EXTENSION IF NOT EXISTS {}", quote_ident(name))
             }
             Self::DropPublication(name) => {
                 write!(f, "DROP PUBLICATION {}", quote_ident(name))
