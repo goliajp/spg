@@ -43,10 +43,10 @@ pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
             return true;
         }
     }
-    if let Some(o) = &stmt.order_by
-        && contains_aggregate(&o.expr)
-    {
-        return true;
+    for o in &stmt.order_by {
+        if contains_aggregate(&o.expr) {
+            return true;
+        }
     }
     if let Some(h) = &stmt.having
         && contains_aggregate(h)
@@ -132,7 +132,7 @@ pub fn run(
             collect_aggregates(expr, &mut agg_specs);
         }
     }
-    if let Some(o) = &stmt.order_by {
+    for o in &stmt.order_by {
         collect_aggregates(&o.expr, &mut agg_specs);
     }
     if let Some(h) = &stmt.having {
@@ -261,19 +261,36 @@ pub fn run(
 
     // ORDER BY: evaluate the rewritten order_by against each synth row,
     // sort, then drop the keys. Limit is applied by the caller.
-    if let Some(order) = &stmt.order_by {
-        let rewritten = rewrite_expr(&order.expr, &group_exprs, &agg_specs);
-        let mut tagged: Vec<(Value, Row)> = kept_synth
+    if !stmt.order_by.is_empty() {
+        // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
+        // gets its own rewrite + per-key DESC flag.
+        let rewritten: Vec<Expr> = stmt
+            .order_by
+            .iter()
+            .map(|o| rewrite_expr(&o.expr, &group_exprs, &agg_specs))
+            .collect();
+        let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+        let mut tagged: Vec<(Vec<Value>, Row)> = kept_synth
             .into_iter()
             .zip(out_rows)
             .map(|(s, o)| {
-                let key = eval::eval_expr(&rewritten, &s, &synth_ctx)?;
-                Ok::<_, EvalError>((key, o))
+                let mut keys = Vec::with_capacity(rewritten.len());
+                for e in &rewritten {
+                    keys.push(eval::eval_expr(e, &s, &synth_ctx)?);
+                }
+                Ok::<_, EvalError>((keys, o))
             })
             .collect::<Result<_, _>>()?;
         tagged.sort_by(|a, b| {
-            let cmp = value_cmp(&a.0, &b.0);
-            if order.desc { cmp.reverse() } else { cmp }
+            use core::cmp::Ordering;
+            for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
+                let cmp = value_cmp(ka, kb);
+                let cmp = if descs[i] { cmp.reverse() } else { cmp };
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+            Ordering::Equal
         });
         out_rows = tagged.into_iter().map(|(_, o)| o).collect();
     }

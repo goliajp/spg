@@ -689,21 +689,30 @@ impl Parser {
                 return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
             }
             self.advance();
-            let expr = self.parse_expr(0)?;
-            // ASC is the default; either keyword may follow the
-            // order_by expression.
-            let desc = if matches!(self.peek(), Token::Desc) {
-                self.advance();
-                true
-            } else if matches!(self.peek(), Token::Asc) {
-                self.advance();
-                false
-            } else {
-                false
-            };
-            Some(OrderBy { expr, desc })
+            // v6.4.0 — multi-key ORDER BY. Loop over comma-separated
+            // `<expr> [ASC|DESC]` items.
+            let mut keys = Vec::new();
+            loop {
+                let expr = self.parse_expr(0)?;
+                let desc = if matches!(self.peek(), Token::Desc) {
+                    self.advance();
+                    true
+                } else if matches!(self.peek(), Token::Asc) {
+                    self.advance();
+                    false
+                } else {
+                    false
+                };
+                keys.push(OrderBy { expr, desc });
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            keys
         } else {
-            None
+            Vec::new()
         };
         head.limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
@@ -800,7 +809,7 @@ impl Parser {
             group_by,
             having,
             unions: Vec::new(),
-            order_by: None,
+            order_by: Vec::new(),
             limit: None,
             offset: None,
         })
