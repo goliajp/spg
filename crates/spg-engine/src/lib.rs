@@ -2708,15 +2708,92 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::AlterTableStatement,
     ) -> Result<QueryResult, EngineError> {
-        let table = self
-            .active_catalog_mut()
-            .get_mut(&s.name)
-            .ok_or_else(|| {
-                EngineError::Storage(StorageError::TableNotFound { name: s.name.clone() })
-            })?;
         match s.target {
             spg_sql::ast::AlterTableTarget::SetHotTierBytes(n) => {
+                let table = self
+                    .active_catalog_mut()
+                    .get_mut(&s.name)
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: s.name.clone(),
+                        })
+                    })?;
                 table.schema_mut().hot_tier_bytes = Some(n);
+            }
+            spg_sql::ast::AlterTableTarget::AddForeignKey(fk) => {
+                // v7.6.8 — resolve FK against the live catalog first
+                // (validates parent table, columns, indices). Then
+                // verify every existing row in the child table
+                // satisfies the new constraint. Then install it.
+                let cols_snapshot = self
+                    .active_catalog()
+                    .get(&s.name)
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: s.name.clone(),
+                        })
+                    })?
+                    .schema()
+                    .columns
+                    .clone();
+                let storage_fk = resolve_foreign_key(
+                    &s.name,
+                    &cols_snapshot,
+                    fk,
+                    self.active_catalog(),
+                )?;
+                // Verify existing rows. Treat them as a virtual
+                // INSERT batch — reusing the v7.6.2 enforce helper.
+                let existing_rows: Vec<Vec<Value>> = self
+                    .active_catalog()
+                    .get(&s.name)
+                    .expect("checked above")
+                    .rows()
+                    .iter()
+                    .map(|r| r.values.clone())
+                    .collect();
+                enforce_fk_inserts(
+                    self.active_catalog(),
+                    &s.name,
+                    core::slice::from_ref(&storage_fk),
+                    &existing_rows,
+                )?;
+                // Reject duplicate constraint name.
+                let table = self
+                    .active_catalog_mut()
+                    .get_mut(&s.name)
+                    .expect("checked above");
+                if let Some(name) = &storage_fk.name
+                    && table
+                        .schema()
+                        .foreign_keys
+                        .iter()
+                        .any(|f| f.name.as_ref() == Some(name))
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE ADD CONSTRAINT: a constraint named {name:?} already exists"
+                    )));
+                }
+                table.schema_mut().foreign_keys.push(storage_fk);
+            }
+            spg_sql::ast::AlterTableTarget::DropForeignKey(name) => {
+                let table = self
+                    .active_catalog_mut()
+                    .get_mut(&s.name)
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: s.name.clone(),
+                        })
+                    })?;
+                let fks = &mut table.schema_mut().foreign_keys;
+                let before = fks.len();
+                fks.retain(|f| f.name.as_ref() != Some(&name));
+                if fks.len() == before {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE DROP CONSTRAINT: no FK named {name:?} on {:?}",
+                        s.name
+                    )));
+                }
             }
         }
         Ok(QueryResult::CommandOk {

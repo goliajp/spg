@@ -178,17 +178,26 @@ pub enum AlterIndexTarget {
 /// v6.7.2 — `ALTER TABLE t SET <setting> = <value>`. v6.7.2 ships
 /// the single `hot_tier_bytes` setting; later v6.7.x sub-versions
 /// can add more SET subjects without changing the dispatch shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AlterTableStatement {
     pub name: String,
     pub target: AlterTableTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableTarget {
     /// Per-table hot-tier byte budget override. The freezer
     /// reads this before falling back to `SPG_HOT_TIER_BYTES`.
     SetHotTierBytes(u64),
+    /// v7.6.8 — `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY
+    /// (cols) REFERENCES parent[(pcols)] [ON DELETE/UPDATE …]`.
+    /// Engine validates existing rows against the new constraint
+    /// before installing it.
+    AddForeignKey(ForeignKeyConstraint),
+    /// v7.6.8 — `ALTER TABLE t DROP CONSTRAINT name`. Removes the
+    /// constraint by user-supplied name; raises if no FK with that
+    /// name exists on the table.
+    DropForeignKey(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -934,9 +943,13 @@ impl fmt::Display for Statement {
             }
             Self::AlterTable(a) => {
                 write!(f, "ALTER TABLE {} ", quote_ident(&a.name))?;
-                match a.target {
+                match &a.target {
                     AlterTableTarget::SetHotTierBytes(n) => {
                         write!(f, "SET hot_tier_bytes = {n}")
+                    }
+                    AlterTableTarget::AddForeignKey(fk) => write!(f, "ADD {fk}"),
+                    AlterTableTarget::DropForeignKey(name) => {
+                        write!(f, "DROP CONSTRAINT {}", quote_ident(name))
                     }
                 }
             }
