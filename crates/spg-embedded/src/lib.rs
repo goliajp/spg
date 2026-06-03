@@ -59,6 +59,10 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use spg_manifest::{CatalogManifest, ColdSegmentEntry, manifest_path as spg_manifest_path};
 
@@ -589,12 +593,217 @@ impl Database {
     pub const fn engine_mut(&mut self) -> &mut Engine {
         &mut self.engine
     }
+
+    /// v7.2.0 — run `body` inside an implicit `BEGIN` /
+    /// `COMMIT` pair. The body receives `&mut Database` so it
+    /// can `execute()` / `query()` like any other code path;
+    /// the only difference is that every write in the body
+    /// lands inside one transaction, and a returned `Err` from
+    /// the body triggers `ROLLBACK` before the error propagates.
+    ///
+    /// Nested calls are not supported — SPG's transaction
+    /// model is single-writer with explicit `BEGIN` /
+    /// `COMMIT` / `ROLLBACK`, and a nested `with_transaction`
+    /// would hit `EngineError::Unsupported("nested
+    /// transaction")` at the inner `BEGIN`.
+    pub fn with_transaction<R, F>(&mut self, body: F) -> Result<R, EngineError>
+    where
+        F: FnOnce(&mut Self) -> Result<R, EngineError>,
+    {
+        self.execute("BEGIN")?;
+        match body(self) {
+            Ok(value) => {
+                self.execute("COMMIT")?;
+                Ok(value)
+            }
+            Err(e) => {
+                // Best-effort rollback. If ROLLBACK itself
+                // fails (rare — the engine reports it via
+                // `Unsupported` only when there's no active
+                // TX, which can't happen here) we surface the
+                // original body error, not the rollback error.
+                let _ = self.execute("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
 }
 
 impl Default for Database {
     fn default() -> Self {
         Self::open_in_memory()
     }
+}
+
+/// v7.2.1 — handle returned by `spawn_background_freezer`.
+/// Drop signals the worker thread to wind down + joins it,
+/// so a `Database` (or its shared `Arc<Mutex<Database>>`)
+/// can safely drop after the handle does.
+#[must_use = "the background freezer keeps running until this handle is dropped"]
+#[derive(Debug)]
+pub struct FreezerHandle {
+    shutdown: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl FreezerHandle {
+    /// v7.2.1 — request the worker stop + join. Idempotent;
+    /// safe to call from `Drop` (which also calls it).
+    pub fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(h) = self.join.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for FreezerHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// v7.2.1 — knobs for `Database::spawn_background_freezer`.
+#[derive(Debug, Clone)]
+pub struct FreezerOptions {
+    /// Tick interval. Worker wakes every `tick`, checks the
+    /// catalog's `hot_tier_bytes`, and freezes if over budget.
+    pub tick: Duration,
+    /// Hot-tier byte budget. Exceeded → next tick freezes the
+    /// largest table's oldest `batch_rows` rows into a new
+    /// cold segment.
+    pub hot_tier_bytes: u64,
+    /// Max rows the freezer demotes per fire.
+    pub batch_rows: usize,
+}
+
+impl Default for FreezerOptions {
+    fn default() -> Self {
+        // Match the `spg-server` freezer's default operating
+        // point (SPG_HOT_TIER_BYTES = 4 GiB, batch 1000 rows,
+        // tick every 1 s) so embedded behaviour is predictable
+        // for operators familiar with the server.
+        Self {
+            tick: Duration::from_secs(1),
+            hot_tier_bytes: 4 * 1024 * 1024 * 1024,
+            batch_rows: 1000,
+        }
+    }
+}
+
+impl Database {
+    /// v7.2.1 — spawn a background thread that periodically
+    /// runs `freeze_oldest_to_cold` when the catalog-wide hot
+    /// tier exceeds `opts.hot_tier_bytes`. The `Arc<Mutex<_>>`
+    /// pattern matches the v7.2 sharing story: callers wrap
+    /// their `Database` in `Arc::new(Mutex::new(db))` once,
+    /// then clone the Arc for the worker + for foreground
+    /// access. Return value is a handle whose `Drop` joins the
+    /// worker.
+    ///
+    /// Picks the freeze target the same way `spg-server`'s
+    /// freezer does: largest-`hot_bytes` user table with at
+    /// least one BTree integer-PK index. Tables without a
+    /// freezable index are skipped silently.
+    pub fn spawn_background_freezer(
+        db: Arc<Mutex<Database>>,
+        opts: FreezerOptions,
+    ) -> FreezerHandle {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let join = thread::Builder::new()
+            .name("spg-embedded-freezer".into())
+            .spawn(move || {
+                background_freezer_loop(db, opts, shutdown_for_thread);
+            })
+            .expect("spawn background freezer thread");
+        FreezerHandle {
+            shutdown,
+            join: Some(join),
+        }
+    }
+}
+
+/// v7.2.1 — the freezer's main loop, factored out so the
+/// `Database::spawn_background_freezer` path stays readable.
+fn background_freezer_loop(
+    db: Arc<Mutex<Database>>,
+    opts: FreezerOptions,
+    shutdown: Arc<AtomicBool>,
+) {
+    // Sleep in short slices so a shutdown request resolves
+    // quickly (vs sleeping the full tick).
+    let slice = Duration::from_millis(50.min(opts.tick.as_millis() as u64));
+    let mut last_tick = std::time::Instant::now();
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        thread::sleep(slice);
+        if last_tick.elapsed() < opts.tick {
+            continue;
+        }
+        last_tick = std::time::Instant::now();
+        let Ok(mut guard) = db.lock() else {
+            return;
+        };
+        if guard.engine.catalog().hot_tier_bytes() <= opts.hot_tier_bytes {
+            continue;
+        }
+        let Some((table, index)) = pick_freeze_target(&guard) else {
+            continue;
+        };
+        let row_count = guard
+            .engine
+            .catalog()
+            .get(&table)
+            .map_or(0, spg_storage::Table::row_count);
+        let to_freeze = opts.batch_rows.min(row_count);
+        if to_freeze == 0 {
+            continue;
+        }
+        if let Err(e) = guard.freeze_oldest_to_cold(&table, &index, to_freeze) {
+            eprintln!(
+                "spg-embedded: background freeze on {table}.{index} failed: {e:?}"
+            );
+        }
+    }
+}
+
+/// v7.2.1 — pick the highest-`hot_bytes` user table with a
+/// BTree integer-PK index. Returns `(table, index_name)` so the
+/// caller can dispatch through `freeze_oldest_to_cold`.
+fn pick_freeze_target(db: &Database) -> Option<(String, String)> {
+    let cat = db.engine.catalog();
+    let mut best: Option<(String, String, u64)> = None;
+    for name in cat.table_names() {
+        let Some(t) = cat.get(&name) else { continue };
+        if t.row_count() == 0 {
+            continue;
+        }
+        let cols = &t.schema().columns;
+        let Some(idx) = t.indices().iter().find(|i| {
+            matches!(i.kind, spg_storage::IndexKind::BTree(_))
+                && i.column_position < cols.len()
+                && matches!(
+                    cols[i.column_position].ty,
+                    spg_storage::DataType::SmallInt
+                        | spg_storage::DataType::Int
+                        | spg_storage::DataType::BigInt
+                )
+        }) else {
+            continue;
+        };
+        let hot = t.hot_bytes();
+        match best {
+            None => best = Some((name, idx.name.clone(), hot)),
+            Some((_, _, best_hot)) if hot > best_hot => {
+                best = Some((name, idx.name.clone(), hot));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(t, i, _)| (t, i))
 }
 
 impl Drop for Database {
@@ -623,6 +832,35 @@ impl Drop for Database {
 /// callers, which keeps the public error enum unchanged.
 fn io_err(e: std::io::Error) -> EngineError {
     EngineError::Storage(spg_storage::StorageError::Corrupt(format!("io: {e}")))
+}
+
+/// v7.2.2 — `Database` is `Send`, so the recommended sharing
+/// pattern for multi-threaded callers is `Arc<Mutex<Database>>`:
+///
+/// ```no_run
+/// use std::sync::{Arc, Mutex};
+/// use spg_embedded::Database;
+///
+/// let db = Database::open_in_memory();
+/// let shared = Arc::new(Mutex::new(db));
+/// let shared_for_worker = Arc::clone(&shared);
+/// std::thread::spawn(move || {
+///     let mut guard = shared_for_worker.lock().unwrap();
+///     guard.execute("INSERT INTO t VALUES (1)").unwrap();
+/// });
+/// ```
+///
+/// Internal `RwLock`-wrapped state — letting many threads
+/// hold concurrent `&Database` for `SELECT` without contending
+/// — is parked as STABILITY § "Out of v7.2"; multi-reader
+/// embedded throughput needs a planner-side change to release
+/// the engine read lock between scans, which is the v7.x
+/// "Choice A" line of work already documented in v6.9.1's
+/// carve-out.
+#[allow(dead_code)]
+fn _database_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Database>();
 }
 
 /// v6.10.3 — sketch trait for the future `#[derive(SpgRow)]`
