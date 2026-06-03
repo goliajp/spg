@@ -1503,6 +1503,92 @@ exposition):
 - `spg_cold_prefetch_hits_total` — counter, increments by 1 per
   successfully prefetched cold segment at boot.
 
+### Index breadth (v6.8 series)
+
+v6.8 broadens the CREATE INDEX surface to cover three new
+PG-parity index shapes — INCLUDE columns, partial WHERE
+predicates, and expression keys — plus an `EXPLAIN (SUGGEST)`
+advisor. The format-layer surfaces below are frozen as of
+v6.8.4.
+
+**Parser surface** — `CREATE INDEX` grammar extension is
+backward-compatible (all v6.7- statements parse unchanged):
+
+```text
+CREATE INDEX [IF NOT EXISTS] <name>
+  ON <table>
+  [USING <method>]
+  ( <key> )                    -- bare column ident OR any Pratt expr
+  [ INCLUDE ( <col>, … ) ]
+  [ WHERE <expr> ]
+```
+
+`<key>` legacy fast path: a bare ident immediately followed by
+`)` parses as a column reference. Anything else falls through
+to the Pratt expression parser. Expression keys without a
+column reference (`(1 + 1)`) are a parse error.
+
+`INCLUDE` / `WHERE` / expression keys on HNSW or BRIN
+indexes are rejected at execution time.
+
+**`EXPLAIN (SUGGEST) <select>`** — index advisor opt-in. The
+`(…)` option list currently only recognises `SUGGEST`; unknown
+options error loudly. Mutually exclusive with `EXPLAIN ANALYZE`
+at parse time (the bare `ANALYZE` keyword and the `(…)` option
+list use different prefix-arms in the parser).
+
+**Catalog snapshot envelope** — `FILE_VERSION = 12` (v6.8.0
+bump). Per-index payload extension is append-only:
+
+```text
+[u16 num_included][num × u16 col_pos]   -- v6.8.0
+[u8 has_pred][u16 LE len][bytes (if has_pred)]   -- v6.8.1
+[u8 has_expr][u16 LE len][bytes (if has_expr)]   -- v6.8.2
+```
+
+v11 catalog snapshots load with `included_columns = Vec::new()`,
+`partial_predicate = None`, `expression = None` (deserialise
+loop gated on `version >= 12`); v12 snapshots written by a
+pre-v6.8.0 binary fail loudly at the version check. Empty Vec
+/ `None` serialise as bare `0` bytes.
+
+**`Index` struct fields** (catalog snapshot frozen):
+- `Index.included_columns: Vec<usize>` — column positions of
+  `INCLUDE` columns. Empty Vec = no INCLUDE clause.
+- `Index.partial_predicate: Option<String>` — canonical Display
+  of the partial-index `WHERE` expression. `None` =
+  unconditional index.
+- `Index.expression: Option<String>` — canonical Display of an
+  expression-key index. `None` = bare column-reference index.
+
+### Out of v6.8 (carved out — explicit STABILITY entries)
+
+These v6.8 features ship at the format layer but their runtime
+maintenance / planner optimisations are deferred to future v6.x
+revisits. None block the v6.8 ship contract; all are documented
+in the v6.8.4 CHANGELOG entry's "Known limitations" section.
+
+1. **In-BTree-leaf INCLUDE payload + planner `index only
+   scan`.** v6.8.0 persists the included column positions; the
+   covered-query optimisation (avoid heap fetch by storing
+   included values in the BTree leaf) is unimplemented. EXPLAIN
+   doesn't emit `index only scan` annotations on covered
+   queries.
+2. **Partial-index planner selection.** v6.8.1 stores the
+   predicate's canonical Display form; the planner doesn't yet
+   check "query WHERE clause ⇒ partial predicate" to opt
+   into a partial index. Maintenance is over-maintenance (every
+   row enters partial indexes); correctness preserved.
+3. **Expression-key seek shortcut.** v6.8.2 stores the
+   expression's canonical Display form; the runtime maintenance
+   pass that evaluates the expression on each row to derive the
+   actual BTree key is not yet wired. Expression indexes
+   effectively behave like the primary column's index.
+4. **Index advisor cost-based ranking.** v6.8.3 emits SUGGEST
+   lines in deterministic walk order; per-suggestion cost /
+   cardinality estimates land once the optimiser ingests
+   selectivity stats more directly.
+
 ### Out of v6.7 (carved out — explicit STABILITY entries)
 
 These items remain unimplemented in v6.7 but are explicitly
