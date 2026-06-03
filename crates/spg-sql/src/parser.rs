@@ -1048,12 +1048,18 @@ impl Parser {
         self.advance();
         let mut columns = Vec::new();
         let mut foreign_keys: Vec<ForeignKeyConstraint> = Vec::new();
+        let mut table_constraints: Vec<crate::ast::TableConstraint> = Vec::new();
         loop {
-            // v7.6.0 — distinguish a table-level constraint clause
-            // from a column definition. Constraints start with
-            // `CONSTRAINT <name> ...` or with the bare `FOREIGN KEY (...)`
-            // shape. Anything else is a column.
-            if self.peek_constraint_or_fk_start() {
+            // v7.6.0 / v7.9.18 — distinguish table-level constraint
+            // clauses from column definitions. Constraints start
+            // with `CONSTRAINT <name> …`, `FOREIGN KEY (…)`,
+            // `PRIMARY KEY (…)`, or `UNIQUE (…)`. Anything else is
+            // a column.
+            if self.peek_table_level_pk_start() {
+                table_constraints.push(self.parse_table_level_primary_key()?);
+            } else if self.peek_table_level_unique_start() {
+                table_constraints.push(self.parse_table_level_unique()?);
+            } else if self.peek_constraint_or_fk_start() {
                 foreign_keys.push(self.parse_table_level_fk()?);
             } else {
                 let (col, col_level_fk) = self.parse_column_def_with_fk()?;
@@ -1085,7 +1091,89 @@ impl Parser {
             columns,
             if_not_exists,
             foreign_keys,
+            table_constraints,
         }))
+    }
+
+    /// v7.9.18 — true when the next tokens are `PRIMARY KEY (…)`.
+    /// PRIMARY and KEY are bare idents; we look-ahead 2 to be
+    /// sure (otherwise a column literally named `primary` would
+    /// be mistaken).
+    fn peek_table_level_pk_start(&self) -> bool {
+        let cur = self.peek();
+        let nxt = self.tokens.get(self.pos + 1);
+        let nxt2 = self.tokens.get(self.pos + 2);
+        let is_primary = matches!(cur, Token::Ident(s) if s.eq_ignore_ascii_case("primary"));
+        let is_key = matches!(nxt, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("key"));
+        let is_lparen = matches!(nxt2, Some(Token::LParen));
+        is_primary && is_key && is_lparen
+    }
+
+    /// v7.9.18 — true when the next tokens are `UNIQUE (…)`.
+    fn peek_table_level_unique_start(&self) -> bool {
+        let cur = self.peek();
+        let nxt = self.tokens.get(self.pos + 1);
+        let is_unique = matches!(cur, Token::Ident(s) if s.eq_ignore_ascii_case("unique"));
+        let is_lparen = matches!(nxt, Some(Token::LParen));
+        is_unique && is_lparen
+    }
+
+    fn parse_table_level_primary_key(
+        &mut self,
+    ) -> Result<crate::ast::TableConstraint, ParseError> {
+        self.advance(); // PRIMARY
+        self.advance(); // KEY
+        let columns = self.parse_paren_ident_list("PRIMARY KEY")?;
+        Ok(crate::ast::TableConstraint::PrimaryKey {
+            name: None,
+            columns,
+        })
+    }
+
+    fn parse_table_level_unique(
+        &mut self,
+    ) -> Result<crate::ast::TableConstraint, ParseError> {
+        self.advance(); // UNIQUE
+        let columns = self.parse_paren_ident_list("UNIQUE")?;
+        Ok(crate::ast::TableConstraint::Unique {
+            name: None,
+            columns,
+        })
+    }
+
+    fn parse_paren_ident_list(
+        &mut self,
+        ctx: &str,
+    ) -> Result<Vec<String>, ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after {ctx}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut out = Vec::new();
+        loop {
+            out.push(self.expect_ident_like()?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected ',' or ')' in {ctx} list, got {other:?}"
+                    )));
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(self.err(alloc::format!("{ctx} requires at least one column")));
+        }
+        Ok(out)
     }
 
     /// v7.6.0 — true when the next tokens are `CONSTRAINT <name>
