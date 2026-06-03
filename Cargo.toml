@@ -8,6 +8,7 @@ members = [
     "crates/spg-audit",
     "crates/spg-engine",
     "crates/spg-embedded",
+    "crates/spg-manifest",
     "crates/spg-server",
     "crates/spg-cli",
     "xtests/sqllogictest",

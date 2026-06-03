@@ -939,13 +939,17 @@ fn row_6_3_concurrent_reads_dont_serialize() {
 /// `#[ignore]`-marked 100M release-process gate.
 #[test]
 fn row_2_10_fast_restart_at_scale_covered_by_e2e() {
-    // Manifest module ships the v10 wire format.
-    let manifest_path = workspace_root().join("crates/spg-server/src/manifest.rs");
+    // v7.1.4 — manifest module extracted into the standalone
+    // `spg-manifest` crate; `spg-server/src/manifest.rs` keeps
+    // the path alive as a `pub use spg_manifest::*` shim. The
+    // v10 wire format constants now live in the new crate's
+    // `src/lib.rs`.
+    let manifest_path = workspace_root().join("crates/spg-manifest/src/lib.rs");
     let manifest_src = std::fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|_| panic!("manifest.rs missing at {}", manifest_path.display()));
+        .unwrap_or_else(|_| panic!("manifest lib.rs missing at {}", manifest_path.display()));
     assert!(
         manifest_src.contains("SPGMAN01") && manifest_src.contains("MANIFEST_VERSION"),
-        "manifest.rs must declare the v10 magic + MANIFEST_VERSION constants"
+        "spg-manifest/src/lib.rs must declare the v10 magic + MANIFEST_VERSION constants"
     );
 
     // main.rs wires the manifest + CHECKPOINT path + auto-preload.
