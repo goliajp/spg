@@ -795,6 +795,102 @@ WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>
   stays at 0 and `WAIT FOR WAL POSITION 0` returns immediately.
   Larger targets block until the optional timeout fires.
 
+### Observability v2 (v6.5 series)
+
+v6.5 closes the thirteenth-gap cluster from the PG-19 audit:
+SQL-queryable runtime state. Nine new virtual tables + env knobs
++ engine builder APIs land here, all frozen from the named
+sub-version.
+
+#### Frozen surfaces (added v6.5.x)
+
+- Virtual tables (read-only, dispatch by name match in
+  `exec_select_cancel`; columns + order frozen):
+  - `spg_stat_replication(name, conn_str, publications,
+                          last_received_pos, enabled)`  (v6.5.0)
+  - `spg_stat_segment(segment_id, num_rows, num_pages,
+                      total_bytes)`                     (v6.5.0)
+  - `spg_stat_query(sql, exec_count, total_us, mean_us,
+                    max_us, last_seen_us)`              (v6.5.1)
+  - `spg_stat_activity(pid, user, started_at_us,
+                       current_sql, wait_event,
+                       elapsed_us, in_transaction)`     (v6.5.2)
+  - `spg_audit_chain(seq, ts_ms, prev_hash, entry_hash,
+                     sql)`                              (v6.5.3)
+  - `spg_audit_verify(verified_count, broken_at_seq)`   (v6.5.3)
+  - `spg_table_ddl(table_name, ddl)`                    (v6.5.4)
+  - `spg_role_ddl(role_name, ddl)`                      (v6.5.4)
+  - `spg_database_ddl(ddl)`                             (v6.5.4)
+
+- Engine API additions:
+  - `pub struct ActivityRow { pid, user, started_at_us,
+                              current_sql, wait_event,
+                              elapsed_us, in_transaction }`
+  - `pub type ActivityProvider = fn() -> Vec<ActivityRow>`
+  - `Engine::with_activity_provider(f)` builder
+  - `pub struct AuditRow { seq, ts_ms, prev_hash_hex,
+                           entry_hash_hex, sql }`
+  - `pub type AuditChainProvider = fn() -> Vec<AuditRow>`
+  - `pub type AuditVerifier = fn() -> (i64, i64)`
+  - `Engine::with_audit_providers(chain, verify)` builder
+  - `pub type SlowQueryLogger = fn(&str, u64)`
+  - `Engine::with_slow_query_log(threshold_us, logger)` builder
+  - `Engine::query_stats()` / `query_stats_mut()` accessors
+  - `Engine::set_plan_cache_max(n)` mutable knob
+  - `PlanCache::set_max_entries(n)` / `max_entries()`
+
+- Pgwire ConnState registry surface (server-internal but stable):
+  `ConnState { pid: u32, user: String, started_at_us: i64,
+               current_sql: RwLock<String>,
+               wait_event: AtomicU8 (0=idle, 1=write_lock,
+               2=fsync, 3=group_commit),
+               last_query_start_us: AtomicI64,
+               in_transaction: AtomicBool }`
+
+- Env vars (operator-tunable):
+  - `SPG_SLOW_QUERY_THRESHOLD_MS` — slow-query log floor (ms).
+    Default 100. Crossings emit a structured log line via
+    `observability::log_event("warn", "slow_query", …)`.
+  - `SPG_PLAN_CACHE_MAX` — runtime cap on the v6.3.0 plan cache.
+    Default 256; values above the compile-time `PLAN_CACHE_MAX_
+    ENTRIES` (256) are clamped down.
+
+- Pgwire 'Q' path now appends to AuditLog on modified_catalog
+  statements (was native-wire-only pre-v6.5.3) so
+  `spg_audit_chain` reflects actual usage regardless of wire.
+
+#### Out of scope for v6 (carved out — not deferred)
+
+- **`spg_audit_verify(from_ts, to_ts)` parameterised form**. SPG's
+  virtual-table dispatch is name-based only; parameterised virtual
+  tables aren't a thing in the current engine. v6.5.3 ships the
+  no-arg form. Operators who want range verification WHERE-filter
+  `spg_audit_chain` on ts_ms.
+- **Wait events: fsync + group_commit attribution**. The flusher
+  and group-commit leader threads serve multiple connections; per-
+  follower attribution needs a commit-task → ConnState bridge that
+  v6.5.5 doesn't take.
+- **Index DDL in spg_table_ddl / spg_database_ddl**. v6.5.4 emits
+  CREATE TABLE + CREATE USER only. CREATE INDEX needs per-table
+  indices walk + method/option synthesis.
+- **spg_stat_segment.table_name**. Storage layer doesn't persist a
+  segment → table mapping; segments are looked up by id off
+  `RowLocator::Cold`. Adding the back-reference needs storage-side
+  index expansion.
+- **pg_stat_database / pg_stat_user_tables / per-table modify
+  counters** (`n_tup_ins`, `n_tup_upd`, `n_dead_tup`). SPG's
+  catalog doesn't keep persistent per-table modify counters
+  beyond v6.2.1's auto-analyze tracker.
+- **Per-query EXPLAIN cache**. `spg_stat_query` holds SQL +
+  timings, NOT the cached EXPLAIN tree.
+- **PG `pg_stat_statements` byte-for-byte column parity**.
+  `spg_stat_query` is the equivalent surface but doesn't aim for
+  exact column-name compatibility.
+- **Streaming notify of stat changes**. `spg_stat_activity` is
+  point-in-time; row-version notifications are out of v6.x.
+- **WAL receiver / decoded WAL inspection** (`pg_get_wal_records`).
+  SPG's WAL format is internal.
+
 ### SQL polish (v6.4 series)
 
 v6.4 ships the SQL surface-polish set PG 19 brought plus the
