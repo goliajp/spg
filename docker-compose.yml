@@ -16,8 +16,17 @@ services:
     image: goliakk/spg:7.0.0
     container_name: spg-server
     restart: unless-stopped
+    environment:
+      # Enable the PG-wire listener on 5432 so any libpq-style
+      # client can connect with `postgres://localhost:5432/<db>`.
+      # Comment out to disable.
+      SPG_PG_ADDR: "0.0.0.0:5432"
     ports:
-      - "5544:5544"
+      - "5544:5544"   # native SPG wire (spg CLI, spg-embedded)
+      - "5433:5432"   # PG-wire (psql, pgx, libpq, JDBC, ODBC, …)
+                      # Host port 5433 to avoid collision with a
+                      # local Postgres on the standard 5432; the
+                      # in-container listener still binds 5432.
     volumes:
       - spg-data:/data
     healthcheck:
