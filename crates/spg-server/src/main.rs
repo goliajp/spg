@@ -4148,7 +4148,8 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Date
         | DataType::Timestamp
         | DataType::Interval
-        | DataType::Json => WireType::Text,
+        | DataType::Json
+        | DataType::Jsonb => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.

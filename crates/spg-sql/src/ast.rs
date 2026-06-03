@@ -413,9 +413,14 @@ pub enum ColumnTypeName {
     /// `TIMESTAMP` / `MySQL` `DATETIME` — instant with microsecond
     /// precision.
     Timestamp,
-    /// v4.9 `JSON` / `JSONB` — text-backed JSON document. No parse-
-    /// time validation; the engine round-trips the literal verbatim.
+    /// v4.9 `JSON` — text-backed JSON document. No parse-time
+    /// validation; the engine round-trips the literal verbatim.
+    /// PG OID 114 on the wire.
     Json,
+    /// v7.9.0 `JSONB` — same storage shape as Json, advertised as
+    /// PG OID 3802 on the wire so sqlx-style binary-typed clients
+    /// decode without a custom type registration.
+    Jsonb,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -434,6 +439,8 @@ impl fmt::Display for ColumnTypeName {
                 VecEncoding::Sq8 => write!(f, "VECTOR({dim}) USING SQ8"),
                 VecEncoding::F16 => write!(f, "VECTOR({dim}) USING HALF"),
             },
+            Self::Json => f.write_str("JSON"),
+            Self::Jsonb => f.write_str("JSONB"),
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
@@ -443,7 +450,6 @@ impl fmt::Display for ColumnTypeName {
             }
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
-            Self::Json => f.write_str("JSON"),
         }
     }
 }
