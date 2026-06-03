@@ -240,9 +240,30 @@ fn persist_segment(db_path: &Path, report: &FreezeReport) -> std::io::Result<std
     std::fs::create_dir_all(&seg_dir)?;
     let final_path = seg_dir.join(format!("seg_{}.spg", report.segment_id));
     let tmp_path = seg_dir.join(format!("seg_{}.spg.tmp", report.segment_id));
-    std::fs::write(&tmp_path, &report.segment_bytes)?;
+    // v6.6.2 — env-gated v2 envelope compression. Default `lzss`
+    // wraps the v1 segment bytes in a v2 envelope (only when
+    // compression is strictly smaller; wrap_v2_envelope returns
+    // the v1 bytes unchanged otherwise). `none` ships v1 directly.
+    let bytes_to_write = if segment_compression_enabled() {
+        spg_storage::wrap_v2_envelope(report.segment_bytes.clone(), true)
+    } else {
+        report.segment_bytes.clone()
+    };
+    std::fs::write(&tmp_path, &bytes_to_write)?;
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(final_path)
+}
+
+/// v6.6.2 — operator knob for cold-tier segment v2 envelope.
+/// `SPG_SEGMENT_COMPRESSION=lzss` (default) wraps each freshly
+/// persisted segment in a LZSS-compressed v2 envelope; `=none`
+/// keeps the v1 layout. Cached after first call.
+fn segment_compression_enabled() -> bool {
+    static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHECKED.get_or_init(|| {
+        std::env::var("SPG_SEGMENT_COMPRESSION")
+            .map_or(true, |v| !v.eq_ignore_ascii_case("none"))
+    })
 }
 
 #[cfg(test)]

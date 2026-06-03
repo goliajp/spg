@@ -22,8 +22,9 @@ pub mod segment;
 pub use self::bloom::{BloomError, BloomFilter};
 pub use self::row_locator::{RowLocator, RowLocatorError};
 pub use self::segment::{
-    OwnedSegment, SEGMENT_MAGIC, SEGMENT_PAGE_BYTES, SegmentError, SegmentMeta, SegmentReader,
-    encode_segment,
+    OwnedSegment, SEGMENT_COMPRESS_ALGO_LZSS, SEGMENT_COMPRESS_ALGO_NONE, SEGMENT_MAGIC,
+    SEGMENT_MAGIC_V2, SEGMENT_PAGE_BYTES, SegmentError, SegmentMeta, SegmentReader,
+    encode_segment, wrap_v2_envelope,
 };
 
 use alloc::collections::BTreeMap;
