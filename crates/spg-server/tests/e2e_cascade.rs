@@ -51,6 +51,7 @@ fn spawn_with_repl(
         .arg("-")
         .arg_path(wal)
         .with_repl()
+        .with_logical_wal()
         .spawn()
 }
 
@@ -76,6 +77,7 @@ fn spawn_follower_with_repl(
         .arg_path(wal)
         .env("SPG_FOLLOW_OF", follow_of)
         .with_repl()
+        .with_logical_wal()
         .spawn()
 }
 

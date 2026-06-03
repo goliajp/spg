@@ -745,6 +745,32 @@ No new on-disk surfaces — the rebuilt catalog uses the existing
 DataType / Value / dense-row tags established in v6.0.1 /
 v6.0.3.
 
+### effective_wal_level (v6.1.8)
+
+Gate for the MAGIC_SUB endpoint. Mirrors PG's `wal_level`
+config var:
+
+```text
+SET effective_wal_level = 'logical'   -- opens MAGIC_SUB
+SET effective_wal_level = 'replica'   -- closes MAGIC_SUB (default)
+SHOW effective_wal_level              -- "replica" or "logical"
+```
+
+- Default at startup is `replica`. Override via
+  `SPG_WAL_LEVEL=logical` env var.
+- The value is global (not session-local) and lives in
+  `ServerState`. Operators flipping at runtime via SET affect
+  every subsequent MAGIC_SUB handshake immediately.
+- MAGIC_V1 / MAGIC_V2 follower paths are unaffected by this
+  setting — they keep working in either mode.
+- A MAGIC_SUB connection attempt while the level is `replica`
+  gets an `"MAGIC_SUB rejected: effective_wal_level must be
+  \`logical\`"` error response on the wire and the connection
+  drops.
+- `wal_level` is NOT persisted across restarts. The env var
+  is the persistence mechanism; runtime SET overrides last
+  until the next boot.
+
 ### WAIT FOR WAL POSITION (v6.1.7)
 
 Consistent-read barrier for follower-based read-after-write.

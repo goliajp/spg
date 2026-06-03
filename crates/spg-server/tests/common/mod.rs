@@ -175,6 +175,18 @@ impl ServerBuilder {
         self
     }
 
+    /// v6.1.8 — set `SPG_WAL_LEVEL=logical` so MAGIC_SUB
+    /// subscribers can attach. Default in production is
+    /// `replica`; tests that exercise the v6.1.4+ subscription
+    /// surface call this to flip on the logical-replication
+    /// gate at startup.
+    #[must_use]
+    pub fn with_logical_wal(mut self) -> Self {
+        self.extra_env
+            .push(("SPG_WAL_LEVEL".into(), "logical".into()));
+        self
+    }
+
     /// Echo every stderr line back to the test's stderr (useful when
     /// the test wants server logs visible on failure). Default is to
     /// drain stderr to a sink after the listen line(s) parse.

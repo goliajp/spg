@@ -10,6 +10,80 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.1.8] — 2026-06-03 (effective_wal_level dynamic switch)
+
+Seventh v6.1.x sub-version on the logical-replication path.
+Gates the MAGIC_SUB endpoint behind an explicit opt-in so a
+freshly-deployed cluster doesn't expose logical-replication
+machinery until an operator turns it on. Mirrors PG's
+`wal_level = replica` vs `wal_level = logical` switch.
+
+### Added
+
+- SQL surface
+  - `SET effective_wal_level = 'logical'` / `… = 'replica'`
+    (also accepts `TO` instead of `=`; PG-style quoted or
+    bare values).
+  - `SHOW effective_wal_level` — single-row result returning
+    the current value as `"replica"` or `"logical"`.
+- `ServerState::wal_level: AtomicU8`. Initial value read from
+  the `SPG_WAL_LEVEL` env var at startup (defaults to
+  `replica` when unset, empty, or unknown — unknown logs a
+  loud warning).
+- Server-layer intercept in spg-server's Op::Query dispatch
+  (`sql_looks_like_set_wal_level` / `sql_looks_like_show_wal_level`
+  prefix checks; `handle_set_wal_level` / `handle_show_wal_level`
+  handlers). The engine never sees these statements.
+- Replication gate — `serve_follower` rejects MAGIC_SUB
+  connections with `"MAGIC_SUB rejected: effective_wal_level
+  must be \`logical\`"` when the level is `replica`. MAGIC_V1
+  / MAGIC_V2 follower paths remain unaffected (no change to
+  the v6.0.x replica streaming path).
+- Test helper: `common::ServerBuilder::with_logical_wal()` —
+  patches existing subscription / filter / cascade tests so
+  they explicitly opt in to logical mode at startup.
+
+### Tests
+
+- `spg-server::e2e_wal_level` (6 new):
+    - `fresh_cluster_boots_in_replica_mode`
+    - `set_logical_then_show_returns_logical` (round-trip)
+    - `replica_mode_rejects_subscription_traffic` (publisher
+      in replica mode; subscriber CREATE SUBSCRIPTION lands
+      the catalog row but the worker's handshake gets refused
+      → 0 rows propagate)
+    - `flip_to_logical_unblocks_existing_subscription`
+      (SET at runtime; subscriber worker reconnects;
+      post-flip writes propagate)
+    - `set_invalid_value_errors` (`'nope'` → ErrorResponse)
+    - `env_var_logical_at_startup`
+- `spg-server::e2e_subscription` / `e2e_replication_filter` /
+  `e2e_cascade` updated to call `.with_logical_wal()` on
+  publishers — no test changes beyond the helper hookup.
+
+### Not changed
+
+- WAL on-disk format / record framing.
+- MAGIC_V1 / MAGIC_V2 follower path semantics.
+- Engine-level SQL surface (CREATE/DROP/SHOW PUBLICATION,
+  CREATE/DROP/SHOW SUBSCRIPTION). The gate is purely at the
+  master's replication listener.
+
+### Out of v6.1.8 (deferred)
+
+- Persisting `wal_level` across restarts. Currently the env
+  var is the only persistence mechanism; a SET that flips at
+  runtime gets lost on the next boot. Persisting via the
+  snapshot envelope would couple a single global setting to
+  the whole envelope and complicate cross-version upgrades;
+  v6.1.x intentionally keeps it as a startup-time setting
+  with runtime override.
+- `SHOW ALL` listing the wal_level alongside other session
+  settings — would need a deeper pgwire integration. Use
+  `SHOW effective_wal_level` for now.
+
+---
+
 ## [6.1.7] — 2026-06-03 (WAIT FOR WAL POSITION)
 
 Sixth v6.1.x sub-version on the logical-replication path. Adds
