@@ -208,7 +208,7 @@ pub struct CreateUserStatement {
     pub role: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndexStatement {
     pub name: String,
     pub table: String,
@@ -224,6 +224,14 @@ pub struct CreateIndexStatement {
     /// this index when checking whether a query can run as an
     /// index-only scan. Empty when no `INCLUDE` clause was given.
     pub included_columns: Vec<String>,
+    /// v6.8.1 — `WHERE <expr>` partial-index predicate. Only rows
+    /// for which `<expr>` evaluates truthy enter the index;
+    /// queries whose `WHERE` clause's canonical Display form
+    /// matches this expression's Display form can be served by the
+    /// partial index. Stored as a parsed `Expr` so the engine
+    /// re-uses the existing evaluation path; storage persists the
+    /// Display form on the catalog snapshot.
+    pub partial_predicate: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -918,6 +926,9 @@ impl fmt::Display for CreateIndexStatement {
                 write!(f, "{}", quote_ident(c))?;
             }
             f.write_str(")")?;
+        }
+        if let Some(pred) = &self.partial_predicate {
+            write!(f, " WHERE {}", pred)?;
         }
         Ok(())
     }

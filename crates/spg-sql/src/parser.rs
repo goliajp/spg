@@ -1043,6 +1043,13 @@ impl Parser {
             } else {
                 Vec::new()
             };
+        // v6.8.1 — optional `WHERE <expr>` partial-index predicate.
+        let partial_predicate = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
         Ok(Statement::CreateIndex(CreateIndexStatement {
             name,
             table,
@@ -1050,6 +1057,7 @@ impl Parser {
             method,
             if_not_exists,
             included_columns,
+            partial_predicate,
         }))
     }
 
