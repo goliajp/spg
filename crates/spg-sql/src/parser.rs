@@ -20,7 +20,7 @@ use crate::ast::{
     BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
     CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement, Expr,
     ExtractField, FrameBound, FrameKind, FromClause, FromJoin, IndexMethod, InsertStatement,
-    JoinKind, Literal, OrderBy, PublicationScope, SelectItem, SelectStatement, Statement,
+    JoinKind, Literal, NullTreatment, OrderBy, PublicationScope, SelectItem, SelectStatement, Statement,
     TableRef, UnOp, UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
@@ -1932,6 +1932,35 @@ impl Parser {
     /// v4.12: parse `(PARTITION BY expr, ... ORDER BY expr [DESC]
     /// [, ...])`. Caller has already consumed `OVER`. Either clause
     /// is optional; an empty `()` is also legal (PG semantics).
+    /// v6.4.2 — consume an optional `IGNORE NULLS` / `RESPECT NULLS`
+    /// modifier between `name(args)` and `OVER (...)`. Default is
+    /// `Respect`. Unrecognised idents leave the stream unchanged.
+    fn parse_null_treatment_modifier(&mut self) -> NullTreatment {
+        let Token::Ident(s) = self.peek().clone() else {
+            return NullTreatment::Respect;
+        };
+        let is_ignore = s.eq_ignore_ascii_case("ignore");
+        let is_respect = s.eq_ignore_ascii_case("respect");
+        if !is_ignore && !is_respect {
+            return NullTreatment::Respect;
+        }
+        // Lookahead for NULLS — only consume both tokens together.
+        // pos+1 must hold a "nulls" ident.
+        if self.pos + 1 < self.tokens.len()
+            && let Token::Ident(s2) = &self.tokens[self.pos + 1]
+            && s2.eq_ignore_ascii_case("nulls")
+        {
+            self.advance();
+            self.advance();
+            return if is_ignore {
+                NullTreatment::Ignore
+            } else {
+                NullTreatment::Respect
+            };
+        }
+        NullTreatment::Respect
+    }
+
     /// No frame clause is supported.
     #[allow(clippy::type_complexity)] // (partitions, ordered-keys-with-desc) is the natural shape
     fn parse_over_clause(
@@ -2117,6 +2146,7 @@ impl Parser {
                 }
                 self.advance();
                 // v4.12: COUNT(*) OVER (...) — same window tail.
+                let null_treatment = self.parse_null_treatment_modifier();
                 if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                     && s.eq_ignore_ascii_case("over")
                 {
@@ -2128,6 +2158,7 @@ impl Parser {
                         partition_by,
                         order_by,
                         frame,
+                        null_treatment,
                     });
                 }
                 return Ok(Expr::FunctionCall {
@@ -2157,6 +2188,10 @@ impl Parser {
             // v4.12: window-function tail — `name(args) OVER (...)`.
             // Promotes the just-parsed FunctionCall into a
             // WindowFunction node carrying partition + order.
+            // v6.4.2: also accepts `name(args) IGNORE NULLS OVER (...)`
+            // / `RESPECT NULLS OVER (...)` between the closing paren
+            // and `OVER`.
+            let null_treatment = self.parse_null_treatment_modifier();
             if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                 && s.eq_ignore_ascii_case("over")
             {
@@ -2168,6 +2203,7 @@ impl Parser {
                     partition_by,
                     order_by,
                     frame,
+                    null_treatment,
                 });
             }
             return Ok(Expr::FunctionCall { name: first, args });

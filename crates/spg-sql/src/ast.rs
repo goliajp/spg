@@ -521,6 +521,11 @@ pub enum Expr {
         /// whole-partition when unordered, running aggregate from
         /// partition start through current row when ordered.
         frame: Option<WindowFrame>,
+        /// v6.4.2 — `IGNORE NULLS` / `RESPECT NULLS` modifier on
+        /// LAG / LEAD / FIRST_VALUE / LAST_VALUE. Default is
+        /// `Respect` (PG / ANSI default — NULLs participate). Other
+        /// window functions ignore this flag.
+        null_treatment: NullTreatment,
     },
     /// v4.10 scalar subquery — `(SELECT ...)` used in expression
     /// position. Must return exactly one row × one column at eval
@@ -550,6 +555,17 @@ pub enum Expr {
         field: ExtractField,
         source: Box<Expr>,
     },
+}
+
+/// v6.4.2 — null treatment on `LAG` / `LEAD` / `FIRST_VALUE` /
+/// `LAST_VALUE`. PG / ANSI default is `Respect` — NULLs participate
+/// in the offset walk. `Ignore` causes the function to skip NULL
+/// values in the argument expression, returning the next non-NULL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NullTreatment {
+    #[default]
+    Respect,
+    Ignore,
 }
 
 /// v4.20 explicit window frame: `ROWS|RANGE BETWEEN <bound> AND
@@ -1091,6 +1107,7 @@ impl fmt::Display for Expr {
                 partition_by,
                 order_by,
                 frame,
+                null_treatment: _,
             } => {
                 write!(f, "{name}(")?;
                 for (i, a) in args.iter().enumerate() {
