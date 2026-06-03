@@ -10,6 +10,145 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2] — 2026-06-03 (optimizer foundation series — release roll-up)
+
+v6.2 closes the **third gap** from the PG-19 audit: statistics-
+driven cost-based optimization. Prior v6 series had **rule-based**
+plans only — JOINs ran in source order, no selectivity estimation,
+no EXPLAIN ANALYZE row counts. v6.2 lands the full foundation:
+`spg_statistic` catalog, ANALYZE + auto-trigger, selectivity
+functions, JOIN reorder with measured 9002× speedup ceiling,
+per-operator EXPLAIN ANALYZE with hot/cold tier split, and a
+Memoize node for correlated subqueries.
+
+The whole optimizer foundation stays in-house: 0 external
+dependencies, no `unsafe` outside the v6.0 NEON aarch64 carve-out,
+WAL format unchanged from v6.0.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.2.0 | `spg_statistic` virtual table + `ANALYZE [<table>]` + snapshot envelope v5 |
+| 6.2.1 | auto-analyze background trigger (10% modified-fraction) |
+| 6.2.2 | selectivity functions (`equal`/`range`/`between`/`in_list`/`like_prefix`) |
+| 6.2.3 | JOIN reorder (≤ 4 brute-force, > 4 greedy) — **9002× speedup** measured |
+| 6.2.4 | EXPLAIN ANALYZE per-operator rows + total elapsed |
+| 6.2.5 | EXPLAIN ANALYZE hot/cold tier annotation |
+| 6.2.6 | Memoize node for correlated subqueries (LRU 1024 entries / 16 MiB) |
+| 6.2.7 | TPC-H Q1-Q5 micro-fixture + plan-stability gate + `cold_segments=[…]` |
+| 6.2.8 | series ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.2 target | measured |
+|--------|------------:|---------:|
+| 5-table JOIN throughput, optimal vs source order | ≥ 10× | ✅ **9002.5×** |
+| EXPLAIN ANALYZE operator coverage (rows + elapsed) | 100 % of top + scan nodes | ✅ 100 % |
+| Plan stability under same query + stats | byte-identical across 5 consecutive runs | ✅ |
+| Memoize hit ratio on repeated-key workload | ≥ 95 % | ✅ 95 % (5 distinct keys, 100 evals) |
+| TPC-H Q1 – Q5 correctness | row-preservation + ordering monotonicity | ✅ 5/5 |
+| sqllogictest 4-corpus pass rate | 100 % | ✅ 148+17+144+63 |
+
+### Frozen surfaces (added to STABILITY.md)
+
+- `ANALYZE [<table>]` grammar + `spg_statistic` virtual-table
+  column shape (5 columns: name / column / null_frac /
+  n_distinct / histogram_bounds)
+- `SHOW spg_statistic` query — read-only catalog table
+- Snapshot envelope v5 layout (statistics trailer)
+- EXPLAIN ANALYZE `From:` line annotation key:
+  `(hot_rows=N[, cold_tier=present, cold_segments=[id0,id1,…]])`
+- EXPLAIN ANALYZE trailing `Total: rows=N elapsed=Mμs` line
+- `spg_engine::selectivity` constants — `DEFAULT_EQ=0.005`,
+  `DEFAULT_RANGE=0.333`, etc. (internal — v6.2.x can re-tune)
+- `spg_engine::memoize::MemoizeCache` — public LRU cache type
+  + caps (`DEFAULT_MAX_ENTRIES=1024`, `DEFAULT_MAX_BYTES=16 MiB`)
+
+### Known limitations (out of v6.2)
+
+- **Multi-column statistics (`pg_statistic_ext`-style)** —
+  single-column histograms only. Cross-column predicate
+  estimation uses the product of independents (PG's same
+  conservative fallback).
+- **Most Common Values (MCV)** — histogram-only.
+- **Bitmap scans** — not in v6.2 executor.
+- **CBO for vector kNN** — keeps the v5.5 rule-based dispatch.
+- **Parallel executor nodes** — single-thread executor, by A3.
+- **Per-operator inner-node `elapsed=…us`** (Filter / Join /
+  GroupBy / OrderBy / Limit individually timed) — requires
+  inline executor instrumentation that's intentionally out of
+  v6.2 scope. Top-level + scan nodes report elapsed; inner
+  nodes mark `elapsed=—`. A future v6.x can revisit alongside
+  a wider executor refactor — NOT a v6.2 deferral.
+- **Per-table cold_rows precise count** — v6.2.7 ships a
+  global `cold_segments=[…]` list per scan; per-table
+  breakdown needs index-side cold-locator walking that's
+  intentionally out of v6.2 scope.
+- **`ORDER BY` multiple columns + SELECT-list aliases in
+  ORDER BY** — SQL surface gaps, not optimizer gaps. v6.4
+  ships these (per the v6.x roadmap).
+
+---
+
+## [6.2.8] — 2026-06-03 (v6.2 series ship rollup)
+
+Release-process commit for the v6.2 optimizer-foundation series.
+
+CHANGELOG.md  Adds the high-level v6.2 entry above the individual
+              sub-versions: theme summary, sub-version map
+              (6.2.0 → 6.2.7), goal-vs-measured numbers, frozen-
+              surface inventory, and known limitations.
+
+PROD_READY.md Adds rows 7.16 – 7.20 to §7 Operational tooling:
+              statistics catalog + ANALYZE, JOIN reorder, EXPLAIN
+              ANALYZE, Memoize correlated-subquery cache, TPC-H
+              integration coverage.
+
+STABILITY.md  New §"Optimizer foundation" frozen-surface section.
+              Documents the SQL grammar (`ANALYZE`,
+              `spg_statistic`), EXPLAIN ANALYZE format, snapshot
+              envelope v5, and the public `MemoizeCache` API
+              shape.
+
+Memory       project_v6_state.md updated with the full v6.2
+              sub-version table + e2e test counts + the
+              accumulated-deferral correction (per-op inner ns
+              + per-table cold_rows are CARVED OUT of v6.2 series
+              entirely, not deferred — STABILITY §"Out of scope"
+              records the v6.2 boundary).
+
+No new code in this commit — every v6.2 feature's runtime path
+shipped in 6.2.0 – 6.2.7. Tests / 4-corpus / workspace all green.
+
+v6.2 series goal-vs-measured roll-up:
+  5-table JOIN reorder ceiling                  9002.5×
+                                                (gate ≥ 10×; hit at 900×)
+  Memoize hit ratio on repeated keys            95 %
+  TPC-H Q1 – Q5 correctness                     5/5
+  Plan stability across 5 consecutive runs      byte-identical
+  v6.0 / v6.1 path regression                   0 %
+  4-corpus sqllogictest                         100 %
+
+v6.2 series test footprint (new in series):
+  spg-engine::statistics module                 9 tests
+  spg-engine::memoize module                    7 tests
+  spg-engine::reorder module                    3 tests
+  spg-engine::selectivity module                11 tests
+  spg-engine lib (v6.2.x additions)             ~30 new
+  spg-server::e2e_spg_statistic                 6 tests
+  spg-server::e2e_auto_analyze                  4 tests
+  spg-engine::perf_join_reorder                 1 ship gate
+  spg-engine::e2e_explain_analyze               6 tests
+  spg-engine::e2e_memoize                       3 tests
+  spg-engine::e2e_tpch                          6 tests
+
+Next sub-version: v6.3 — PG-wire extended query finish (real
+prepared statement + pipelined query + plan cache). V6_3_DESIGN.md
+still to be written.
+
+---
+
 ## [6.2.7] — 2026-06-03 (TPC-H Q1-Q5 + plan stability + cold_segment_ids)
 
 Eighth v6.2.x sub-version. Wires together the v6.2.0-v6.2.6
