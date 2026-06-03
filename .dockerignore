@@ -1,0 +1,18 @@
+# Local build outputs — the builder stage runs its own cargo
+# build inside the container, so we don't want to invalidate
+# its layer cache (or balloon the build context) with the
+# host's target dir.
+target/
+dist/
+
+# Generated test / bench output.
+xtests/sqllogictest/report.md
+xtests/sqllogictest/report.json
+
+# Local-only research material (gitignored).
+.claude/researches/
+
+# IDE + OS noise.
+.git/
+.DS_Store
+*.swp

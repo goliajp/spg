@@ -119,6 +119,7 @@ pub(crate) fn parallel_read_segments(
 /// open fd on Linux so the kernel's read-ahead overlaps with the
 /// next worker's I/O. macOS / other platforms fall through to a
 /// plain `std::fs::read`.
+#[allow(unsafe_code)]
 fn read_with_hint(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
