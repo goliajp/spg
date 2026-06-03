@@ -146,6 +146,21 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     // map first, falls back to a known-defaults table.
     let mut settings: std::collections::HashMap<String, String> =
         std::collections::HashMap::default();
+    // v6.3.2 — pipelined-query response buffer. Every send_*
+    // helper writes here instead of straight to the socket; the
+    // buffer is flushed at strategic sync points:
+    //   - after each simple-query 'Q' that ends with ReadyForQuery
+    //   - on extended-query 'S' (Sync) / 'H' (Flush)
+    //   - before COPY mode hands the raw stream to its handler
+    //   - if the buffer grows past PIPELINE_FLUSH_BYTES (4 KiB) —
+    //     defensive backstop against a client that piles up
+    //     responses without ever sending Sync
+    // For pipelined batches of N P/B/E messages followed by S, the
+    // server now hands the kernel one write() per Sync instead of
+    // 3N syscalls. Loopback already coalesces well via Nagle —
+    // this brings the same property to high-latency networks.
+    const PIPELINE_FLUSH_BYTES: usize = 4096;
+    let mut wbuf: Vec<u8> = Vec::with_capacity(8192);
     loop {
         let mut header = [0u8; 5];
         if let Err(e) = stream.read_exact(&mut header) {
@@ -168,8 +183,10 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 // Null-terminated SQL string (typically — psql appends \0).
                 let sql_bytes = body.strip_suffix(b"\0").unwrap_or(&body);
                 let Ok(sql_str) = std::str::from_utf8(sql_bytes) else {
-                    send_error(&mut stream, "22021", "invalid UTF-8 in query")?;
-                    send_ready_for_query(&mut stream, tx_state)?;
+                    send_error(&mut wbuf, "22021", "invalid UTF-8 in query")?;
+                    send_ready_for_query(&mut wbuf, tx_state)?;
+                    stream.write_all(&wbuf)?;
+                    wbuf.clear();
                     continue;
                 };
                 let sql = sql_str.trim_end_matches(';').trim().to_string();
@@ -184,18 +201,29 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 // returns what was stored.
                 if let Some((name, value)) = parse_set_statement(&sql) {
                     settings.insert(name.to_ascii_lowercase(), value);
-                    send_command_complete(&mut stream, "SET")?;
-                    send_ready_for_query(&mut stream, tx_state)?;
+                    send_command_complete(&mut wbuf, "SET")?;
+                    send_ready_for_query(&mut wbuf, tx_state)?;
+                    stream.write_all(&wbuf)?;
+                    wbuf.clear();
                     continue;
                 }
                 // v4.19: SHOW name / SHOW ALL.
                 if let Some(name) = parse_show_statement(&sql) {
                     let resp = render_show(&name, &settings);
-                    send_canned(&mut stream, &resp)?;
-                    send_ready_for_query(&mut stream, tx_state)?;
+                    send_canned(&mut wbuf, &resp)?;
+                    send_ready_for_query(&mut wbuf, tx_state)?;
+                    stream.write_all(&wbuf)?;
+                    wbuf.clear();
                     continue;
                 }
                 if let Some(copy) = parse_copy_intent(&sql) {
+                    // COPY mode handles its own protocol roundtrips —
+                    // flush any pending output so the COPY handler
+                    // starts from a clean wire state.
+                    if !wbuf.is_empty() {
+                        stream.write_all(&wbuf)?;
+                        wbuf.clear();
+                    }
                     match copy {
                         CopyIntent::From(table) => {
                             handle_copy_from_stdin(
@@ -210,30 +238,34 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                             handle_copy_to_stdout(&mut stream, state, role, &table, &mut tx_state)?;
                         }
                     }
-                    send_ready_for_query(&mut stream, tx_state)?;
+                    send_ready_for_query(&mut wbuf, tx_state)?;
+                    stream.write_all(&wbuf)?;
+                    wbuf.clear();
                     continue;
                 }
                 // psql sends startup probes like "SELECT version()" /
                 // "SHOW search_path". Stub the common ones with sane
                 // canned answers so the client doesn't error out.
                 if let Some(canned) = canned_response(&sql, state) {
-                    send_canned(&mut stream, &canned)?;
-                    send_ready_for_query(&mut stream, tx_state)?;
+                    send_canned(&mut wbuf, &canned)?;
+                    send_ready_for_query(&mut wbuf, tx_state)?;
+                    stream.write_all(&wbuf)?;
+                    wbuf.clear();
                     continue;
                 }
                 let result = execute_with_role(state, &sql, role);
                 match result {
                     Ok(QueryResult::Rows { columns, rows }) => {
-                        send_row_description(&mut stream, &columns)?;
+                        send_row_description(&mut wbuf, &columns)?;
                         let n = rows.len();
                         for row in &rows {
-                            send_data_row(&mut stream, &columns, row)?;
+                            send_data_row(&mut wbuf, &columns, row)?;
                         }
-                        send_command_complete(&mut stream, &format!("SELECT {n}"))?;
+                        send_command_complete(&mut wbuf, &format!("SELECT {n}"))?;
                     }
                     Ok(QueryResult::CommandOk { affected, .. }) => {
                         let tag = command_tag(&sql, affected);
-                        send_command_complete(&mut stream, &tag)?;
+                        send_command_complete(&mut wbuf, &tag)?;
                         // Sync tx state from engine after writes.
                         tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
                             b'T'
@@ -242,7 +274,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         };
                     }
                     Err(e) => {
-                        send_error(&mut stream, "42000", &e.to_string())?;
+                        send_error(&mut wbuf, "42000", &e.to_string())?;
                         // After an error inside a TX, PG goes to 'E'
                         // and stays there until ROLLBACK. We track
                         // best-effort: if engine still in TX, mark
@@ -254,18 +286,28 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         };
                     }
                 }
-                send_ready_for_query(&mut stream, tx_state)?;
+                send_ready_for_query(&mut wbuf, tx_state)?;
+                stream.write_all(&wbuf)?;
+                wbuf.clear();
             }
-            b'X' => return Ok(()),
+            b'X' => {
+                // Terminate. Flush any pending bytes before returning so
+                // a CommandComplete on the last simple query doesn't
+                // get dropped by the connection teardown.
+                if !wbuf.is_empty() {
+                    let _ = stream.write_all(&wbuf);
+                }
+                return Ok(());
+            }
             // ---- v4.7: extended-query protocol ----
             // Parse (P): name + SQL + parameter type OIDs. Store the
             // statement; reply ParseComplete (no ReadyForQuery — that
             // waits for Sync).
             b'P' => {
                 if let Err(msg) = handle_parse(&body, &mut prepared, state) {
-                    send_error(&mut stream, "42601", &msg)?;
+                    send_error(&mut wbuf, "42601", &msg)?;
                 } else {
-                    send_msg(&mut stream, b'1', &[])?;
+                    send_msg(&mut wbuf, b'1', &[])?;
                 }
             }
             // Bind (B): create a portal with parameter values
@@ -274,9 +316,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 match handle_bind(&body, &prepared) {
                     Ok(portal) => {
                         portals.insert(portal.0.clone(), portal.1);
-                        send_msg(&mut stream, b'2', &[])?; // BindComplete
+                        send_msg(&mut wbuf, b'2', &[])?; // BindComplete
                     }
-                    Err(msg) => send_error(&mut stream, "42601", &msg)?,
+                    Err(msg) => send_error(&mut wbuf, "42601", &msg)?,
                 }
             }
             // Describe (D): describe statement ('S') or portal ('P').
@@ -296,9 +338,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         // declared (we'll trust the Bind to count them).
                         let mut pd = Vec::with_capacity(2);
                         pd.extend_from_slice(&0u16.to_be_bytes());
-                        send_msg(&mut stream, b't', &pd)?;
+                        send_msg(&mut wbuf, b't', &pd)?;
                     }
-                    send_msg(&mut stream, b'n', &[])?; // NoData
+                    send_msg(&mut wbuf, b'n', &[])?; // NoData
                 }
             }
             // Execute (E): portal name + max-rows (0 = all).
@@ -307,12 +349,12 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                     &body,
                     &portals,
                     &prepared,
-                    &mut stream,
+                    &mut wbuf,
                     state,
                     role,
                     &mut tx_state,
                 ) {
-                    send_error(&mut stream, "42000", &msg)?;
+                    send_error(&mut wbuf, "42000", &msg)?;
                 }
             }
             // Close (C): drop the named statement or portal. Reply
@@ -327,35 +369,56 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         portals.remove(&name);
                     }
                 }
-                send_msg(&mut stream, b'3', &[])?; // CloseComplete
+                send_msg(&mut wbuf, b'3', &[])?; // CloseComplete
             }
-            // Flush (H): no-op for our buffered TcpStream (everything
-            // is already on the wire after each send_msg). Spec says
-            // no reply is required.
-            b'H' => {}
+            // Flush (H): client wants pending responses on the wire
+            // without forcing a Sync (which would also emit
+            // ReadyForQuery). Drain wbuf to the socket.
+            b'H' => {
+                if !wbuf.is_empty() {
+                    stream.write_all(&wbuf)?;
+                    wbuf.clear();
+                }
+            }
             // Sync (S): boundary marker — reply with ReadyForQuery
-            // reflecting the current transaction state.
+            // reflecting the current transaction state, then drain
+            // every accumulated response in one syscall (the v6.3.2
+            // pipelining win).
             b'S' => {
-                send_ready_for_query(&mut stream, tx_state)?;
+                send_ready_for_query(&mut wbuf, tx_state)?;
+                stream.write_all(&wbuf)?;
+                wbuf.clear();
             }
             // CopyData / CopyDone / CopyFail outside of an active
             // COPY block — protocol error from the client.
             b'd' | b'c' | b'f' => {
                 send_error(
-                    &mut stream,
+                    &mut wbuf,
                     "08P01",
                     "unexpected CopyData/Done/Fail outside COPY mode",
                 )?;
-                send_ready_for_query(&mut stream, tx_state)?;
+                send_ready_for_query(&mut wbuf, tx_state)?;
+                stream.write_all(&wbuf)?;
+                wbuf.clear();
             }
             _ => {
                 send_error(
-                    &mut stream,
+                    &mut wbuf,
                     "08P01",
                     &format!("unknown frontend message type: 0x{msg_type:02x}"),
                 )?;
-                send_ready_for_query(&mut stream, tx_state)?;
+                send_ready_for_query(&mut wbuf, tx_state)?;
+                stream.write_all(&wbuf)?;
+                wbuf.clear();
             }
+        }
+        // Defensive backstop: if a client piles up many P/B/E without
+        // ever sending Sync, drain the buffer once it crosses the
+        // 4 KiB threshold so the client receiving these responses
+        // can make forward progress.
+        if wbuf.len() >= PIPELINE_FLUSH_BYTES {
+            stream.write_all(&wbuf)?;
+            wbuf.clear();
         }
     }
 }
@@ -580,7 +643,7 @@ impl CannedResponse {
     }
 }
 
-fn send_canned(stream: &mut TcpStream, c: &CannedResponse) -> std::io::Result<()> {
+fn send_canned(stream: &mut dyn Write, c: &CannedResponse) -> std::io::Result<()> {
     match c {
         CannedResponse::Rows { columns, rows } => {
             send_row_description(stream, columns)?;
@@ -1019,7 +1082,7 @@ fn handle_execute(
     body: &[u8],
     portals: &std::collections::HashMap<String, Portal>,
     prepared: &std::collections::HashMap<String, PreparedStmt>,
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     state: &Arc<ServerState>,
     role: Role,
     tx_state: &mut u8,
@@ -1864,7 +1927,7 @@ fn read_password_message(stream: &mut TcpStream) -> std::io::Result<String> {
 
 // ---- Message writers ----
 
-fn send_msg(stream: &mut TcpStream, ty: u8, body: &[u8]) -> std::io::Result<()> {
+fn send_msg(stream: &mut dyn Write, ty: u8, body: &[u8]) -> std::io::Result<()> {
     let len = u32::try_from(body.len() + 4)
         .map_err(|_| std::io::Error::other("PG message body too large"))?;
     let mut out = Vec::with_capacity(5 + body.len());
@@ -1874,7 +1937,7 @@ fn send_msg(stream: &mut TcpStream, ty: u8, body: &[u8]) -> std::io::Result<()> 
     stream.write_all(&out)
 }
 
-fn send_parameter_status(stream: &mut TcpStream, key: &str, value: &str) -> std::io::Result<()> {
+fn send_parameter_status(stream: &mut dyn Write, key: &str, value: &str) -> std::io::Result<()> {
     let mut body = Vec::with_capacity(key.len() + value.len() + 2);
     body.extend_from_slice(key.as_bytes());
     body.push(0);
@@ -1883,18 +1946,18 @@ fn send_parameter_status(stream: &mut TcpStream, key: &str, value: &str) -> std:
     send_msg(stream, b'S', &body)
 }
 
-fn send_ready_for_query(stream: &mut TcpStream, state: u8) -> std::io::Result<()> {
+fn send_ready_for_query(stream: &mut dyn Write, state: u8) -> std::io::Result<()> {
     send_msg(stream, b'Z', &[state])
 }
 
-fn send_command_complete(stream: &mut TcpStream, tag: &str) -> std::io::Result<()> {
+fn send_command_complete(stream: &mut dyn Write, tag: &str) -> std::io::Result<()> {
     let mut body = Vec::with_capacity(tag.len() + 1);
     body.extend_from_slice(tag.as_bytes());
     body.push(0);
     send_msg(stream, b'C', &body)
 }
 
-fn send_error(stream: &mut TcpStream, sqlstate: &str, msg: &str) -> std::io::Result<()> {
+fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Result<()> {
     // ErrorResponse: each field is `[fieldcode byte][value][\0]`,
     // terminated by a single `\0`. Minimum useful set: S (severity),
     // C (sqlstate), M (message).
@@ -1912,7 +1975,7 @@ fn send_error(stream: &mut TcpStream, sqlstate: &str, msg: &str) -> std::io::Res
     send_msg(stream, b'E', &body)
 }
 
-fn send_row_description(stream: &mut TcpStream, cols: &[ColumnSchema]) -> std::io::Result<()> {
+fn send_row_description(stream: &mut dyn Write, cols: &[ColumnSchema]) -> std::io::Result<()> {
     let n = u16::try_from(cols.len())
         .map_err(|_| std::io::Error::other("RowDescription: too many columns"))?;
     let mut body = Vec::with_capacity(2 + cols.len() * 24);
@@ -1930,7 +1993,7 @@ fn send_row_description(stream: &mut TcpStream, cols: &[ColumnSchema]) -> std::i
     send_msg(stream, b'T', &body)
 }
 
-fn send_data_row(stream: &mut TcpStream, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
+fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
     let n = u16::try_from(row.values.len())
         .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
     let mut body = Vec::with_capacity(2 + row.values.len() * 8);
