@@ -6,6 +6,9 @@ rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "Self-built wire-frame protocol for SPG. no_std + alloc."
+repository   = { workspace = true }
+categories   = ["network-programming", "encoding", "no-std"]
+keywords     = ["spg", "wire", "protocol", "framing"]
 
 [lints]
 workspace = true

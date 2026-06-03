@@ -6,6 +6,9 @@ rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "Append-only audit log with BLAKE3 hash-chain for SPG (compliance)."
+repository   = { workspace = true }
+categories   = ["database-implementations"]
+keywords     = ["spg", "audit", "blake3", "compliance"]
 
 [dependencies]
 spg-crypto = { path = "../spg-crypto" }
