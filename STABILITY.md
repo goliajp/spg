@@ -370,7 +370,7 @@ the boot-time optimisation.
 CHECKPOINT (v5.3.2) is the explicit operator surface: admin-only
 SQL command that snapshots the engine, writes a fresh manifest,
 and truncates the WAL to 0 bytes. Documented in
-`PROD_READY.md` row 2.10 alongside its CI gate
+internal readiness matrix row 2.10 alongside its CI gate
 (`tests/e2e_manifest.rs`).
 
 ### Cold-tier segments (v5.1; side-loaded, not in the catalog snapshot)
@@ -463,7 +463,7 @@ pins the bounded-loss invariant.
 
 ### Env-var contract
 
-Every env var listed in DEPLOYMENT.md's table is stable. New
+Every env var listed in deployment notes's table is stable. New
 env vars are additions; existing env vars keep their semantics
 and acceptable values within v4.x.
 
@@ -1295,7 +1295,7 @@ Logical-replication policy (v6.1.5):
   …), session control (`BEGIN`, `COMMIT`, `ROLLBACK`,
   `SAVEPOINT`, `SET`), and catalog mutations are never
   propagated — subscriber-side schema drift is the operator's
-  problem (V6_1_DESIGN.md design point 3). PG-compatible — PG
+  problem (the internal design notes design point 3). PG-compatible — PG
   logical decoders also drop DDL.
 
 ### Snapshot envelope v4 (v6.1.4)
@@ -1469,7 +1469,7 @@ envelope without sidecar. Older v2 segments load unchanged.
 ```
 Default chunk size is 4 MiB. `chunk_bytes > 16 MiB` is a wire
 format error; `chunk_seq >= chunk_total` is a wire format
-error. (V6_7_DESIGN.md L2 originally allocated 0x02 — v6.1.5
+error. (the internal design notes L2 originally allocated 0x02 — v6.1.5
 had claimed 0x02 for `FRAME_TYPE_SKIP`; v6.7.5 ships at the
 next free slot. The design reference is reconciled in the
 frame-type doc comment.)
@@ -1744,7 +1744,7 @@ CHANGELOG entry's "Known limitations" section.
   not the text rendering.
 - `cargo-target-dir`, `BUDGETS.md`, perf gate budgets — these
   are internal development infrastructure, not user-facing.
-- Exact wording in PROD_READY.md / RUNBOOK.md / etc. — the docs
+- Exact wording in internal readiness matrix / operational runbook / etc. — the docs
   evolve; the system behaviors they describe stay stable per
   the rules above.
 
@@ -1757,7 +1757,7 @@ CHANGELOG entry's "Known limitations" section.
 2. **New wire opcode**: pick the next free byte, document it in
    the table above, add to `STABILITY.md` and the `prod_ready`
    row 8.2 expected table. Old clients don't send it — fine.
-3. **New env var**: document in DEPLOYMENT.md, default-off,
+3. **New env var**: document in deployment notes, default-off,
    one-line entry in next CHANGELOG section.
 4. **New backup-bundle field**: bump the `kind` byte or add a
    new section *after* every existing field so old parsers stop
@@ -1779,6 +1779,6 @@ removal for the v5 milestone.
 
 ## What this document is NOT
 
-- Not a feature list. See PROD_READY.md.
-- Not a tutorial. See DEPLOYMENT.md + RESTORE_DRILL.md.
-- Not a roadmap. See RUNBOOK.md / CHANGELOG.md.
+- Not a feature list. See internal readiness matrix.
+- Not a tutorial. See deployment notes + restore drill.
+- Not a roadmap. See operational runbook / CHANGELOG.md.
