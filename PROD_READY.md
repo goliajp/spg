@@ -157,6 +157,11 @@ without reading the source code.
 | 7.13 | Logical replication: consistent-read barrier | `WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>]` blocks until the local apply pos reaches the target or the timeout fires; reached=1 / timed-out=0 via CommandComplete count | ✅ | v6.1.7, `e2e_wait_pos.rs` (5/5) |
 | 7.14 | Logical replication: opt-in gate | Fresh cluster boots in `replica` mode; MAGIC_SUB stays closed until `SET effective_wal_level = 'logical'` (or `SPG_WAL_LEVEL=logical` env at startup); `SHOW effective_wal_level` exposes current value | ✅ | v6.1.8, `e2e_wal_level.rs` (6/6) |
 | 7.15 | Logical replication: chaos resilience | Subscription worker reconnects across multiple netsplit + heal cycles; final row count is exactly correct (no dup, no gap) | ✅ | v6.1.9, `e2e_chaos_logical.rs` (2/2) |
+| 7.16 | Optimizer: per-column statistics + ANALYZE | `spg_statistic` virtual table (name/column/null_frac/n_distinct/histogram_bounds) + `ANALYZE [<table>]` foreground command + background auto-trigger (10% modified) | ✅ | v6.2.0 + v6.2.1, `e2e_spg_statistic.rs` (6/6) + `e2e_auto_analyze.rs` (4/4) + `spg_engine::statistics` module (9) |
+| 7.17 | Optimizer: JOIN reorder | ≤ 4 tables brute-force, > 4 greedy; uses v6.2.0 stats; reorder skipped when no ANALYZE has run (PG-compatible opt-in); 5-table speedup ship gate measured 9002.5× vs source order | ✅ | v6.2.3, `perf_join_reorder.rs` ship gate + `spg_engine::reorder` module (3) + `spg_engine::selectivity` module (11) |
+| 7.18 | Optimizer: EXPLAIN ANALYZE | Every operator line carries `(rows=N)` or `(hot_rows=N, cold_tier=present, cold_segments=[id0,…])` for scans; `Total: rows=N elapsed=Mμs` trailer for whole-query timing | ✅ | v6.2.4 + v6.2.5 + v6.2.7, `e2e_explain_analyze.rs` (6/6) |
+| 7.19 | Optimizer: Memoize correlated subqueries | Per-query LRU cache (1024 entries / 16 MiB caps) sharing key on (subquery repr, outer-row values); 95 % hit ratio on repeated-key workloads | ✅ | v6.2.6, `spg_engine::memoize` module (7) + `e2e_memoize.rs` (3/3) |
+| 7.20 | Optimizer: TPC-H integration | Q1 – Q5 against a deterministic 7-table micro-fixture; correctness via row-preservation + ORDER-BY-monotonicity invariants; plan stability gate (5 consecutive byte-identical EXPLAIN runs) | ✅ | v6.2.7, `e2e_tpch.rs` (6/6) |
 
 ## 8. Stability + compatibility
 

@@ -795,6 +795,36 @@ WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>
   stays at 0 and `WAIT FOR WAL POSITION 0` returns immediately.
   Larger targets block until the optional timeout fires.
 
+### Optimizer foundation (v6.2 series)
+
+v6.2 closes the third gap from the PG-19 audit — statistics-
+driven cost-based optimization. The series ships a virtual
+catalog table (`spg_statistic`), an `ANALYZE` SQL surface, the
+cost-based JOIN reorder pass, per-operator EXPLAIN ANALYZE row +
+elapsed annotations, and a Memoize cache for correlated
+subqueries. Every surface below is frozen from the named
+sub-version.
+
+#### Out of scope for v6 (carved out — not deferred)
+
+- **Per-operator inner-node `elapsed=…us`** (per-Filter,
+  per-Join, per-GroupBy, per-OrderBy, per-Limit individually
+  timed): EXPLAIN ANALYZE marks inner nodes with `(rows=—)`
+  and the trailing `Total: elapsed=…` line carries whole-
+  query wall-clock. Per-node inner-node elapsed requires
+  inline executor instrumentation that v6.2 intentionally
+  doesn't add — a v6.x or v7.x revisit, NOT a v6.2 deferral.
+- **Per-table `cold_rows` precise count**: v6.2.7 ships a
+  global `cold_segments=[id0,…]` list on scan annotations.
+  Per-table breakdown needs index-side cold-locator walking
+  — same v6.x revisit posture as above.
+- **Multi-column statistics (`pg_statistic_ext`-style)**:
+  single-column histograms only.
+- **Most Common Values (MCV) list**: histogram-only.
+- **Bitmap scans**: executor unchanged in v6.2.
+- **CBO for vector kNN**: rule-based v5.5 dispatch retained.
+- **Parallel executor nodes**: single-thread executor (A3).
+
 ### ANALYZE + spg_statistic (v6.2.0)
 
 v6.2.0 introduces the first DDL on the optimizer-foundation
