@@ -2904,6 +2904,12 @@ impl Engine {
                 modified_catalog: false,
             });
         }
+        // v7.9.14 — multi-column index parses through; engine
+        // builds a single-column BTree on the leading column only.
+        // The extras live on the AST so spg-server's dispatcher
+        // can emit a PG-wire NoticeResponse / log line. Composite
+        // BTree keys land in v7.10.
+        let _ = &stmt.extra_columns; // intentional drop on engine side
         let table_name = stmt.table.clone();
         // v6.8.0 — resolve INCLUDE column names to positions. Done
         // before `add_index` so a typo error surfaces before any

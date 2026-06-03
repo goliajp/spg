@@ -1279,6 +1279,35 @@ impl Parser {
         true
     }
 
+    /// v7.9.14 — consume `ASC | DESC | NULLS FIRST | NULLS LAST`
+    /// qualifiers after an index column ref. ASC / DESC are
+    /// reserved tokens; NULLS / FIRST / LAST are bare idents.
+    /// We accept and discard them since single-column BTree
+    /// stores rows in natural key order today.
+    fn consume_optional_index_column_qualifiers(&mut self) {
+        loop {
+            match self.peek() {
+                Token::Asc | Token::Desc => {
+                    self.advance();
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("nulls") => {
+                    let look = self.tokens.get(self.pos + 1);
+                    if matches!(
+                        look,
+                        Some(Token::Ident(k)) if k.eq_ignore_ascii_case("first")
+                            || k.eq_ignore_ascii_case("last")
+                    ) {
+                        self.advance();
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
     fn parse_create_index_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
         // Caller consumed CREATE; we're on INDEX.
         debug_assert!(matches!(self.peek(), Token::Index));
@@ -1350,6 +1379,23 @@ impl Parser {
                 )));
             }
         };
+        // v7.9.14 — accept extra comma-separated columns inside
+        // the index key parens (`CREATE INDEX … (a, b, c)`).
+        // mailrs F2. Each extra column may carry an optional
+        // `ASC` / `DESC` / `NULLS FIRST` / `NULLS LAST` clause
+        // — parsed and discarded; SPG doesn't honour direction
+        // on a BTree index today (column ordering is intrinsic
+        // to the storage). v7.10 will widen to genuine composite
+        // index keys.
+        let mut extra_columns: Vec<String> = Vec::new();
+        // The leading column may also have ASC/DESC after it.
+        self.consume_optional_index_column_qualifiers();
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            let extra = self.expect_ident_like()?;
+            self.consume_optional_index_column_qualifiers();
+            extra_columns.push(extra);
+        }
         if !matches!(self.peek(), Token::RParen) {
             return Err(self.err(format!(
                 "expected ')' after indexed column / expression, got {:?}",
@@ -1407,6 +1453,7 @@ impl Parser {
             if_not_exists,
             included_columns,
             partial_predicate,
+            extra_columns: extra_columns.clone(),
             expression,
         }))
     }
