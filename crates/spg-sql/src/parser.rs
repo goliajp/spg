@@ -128,7 +128,33 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("explain") => {
                 self.advance();
                 let mut analyze = false;
-                if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
+                let mut suggest = false;
+                // v6.8.3 — `EXPLAIN (SUGGEST)` opt-in.
+                if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    let opt = match self.peek().clone() {
+                        Token::Ident(s) | Token::QuotedIdent(s) => s,
+                        other => {
+                            return Err(self.err(format!(
+                                "expected option keyword inside EXPLAIN (…), got {other:?}"
+                            )));
+                        }
+                    };
+                    if !opt.eq_ignore_ascii_case("suggest") {
+                        return Err(self.err(format!(
+                            "unknown EXPLAIN option {opt:?}; v6.8.3 supports SUGGEST"
+                        )));
+                    }
+                    self.advance();
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after EXPLAIN option, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    suggest = true;
+                } else if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                     && (s.eq_ignore_ascii_case("analyze") || s.eq_ignore_ascii_case("analyse"))
                 {
                     self.advance();
@@ -141,6 +167,7 @@ impl Parser {
                 Ok(Statement::Explain(crate::ast::ExplainStatement {
                     analyze,
                     inner: Box::new(s),
+                    suggest,
                 }))
             }
             Token::Create => self.parse_create_stmt(),

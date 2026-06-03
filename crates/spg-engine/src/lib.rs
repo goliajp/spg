@@ -2407,7 +2407,20 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let mut lines = Vec::<String>::new();
         explain_select(&e.inner, self, 0, &mut lines);
-        if e.analyze {
+        if e.suggest {
+            // v6.8.3 — index advisor. Walks the SELECT's FROM
+            // tables + WHERE column refs; for each (table, column)
+            // pair that lacks an index, append a SUGGEST line with
+            // a copy-pastable `CREATE INDEX` statement. This is a
+            // pure-syntax heuristic — no cardinality estimation —
+            // matching the v6.8.3 design intent of "tell the
+            // operator where indexes are missing", not "give the
+            // mathematically optimal index set".
+            let suggestions = build_index_suggestions(&e.inner, self);
+            for s in suggestions {
+                lines.push(s);
+            }
+        } else if e.analyze {
             // v6.2.4 — EXPLAIN ANALYZE annotates each operator line
             // with `(rows=N)` where the row count is computable
             // without re-executing the full query:
@@ -4927,6 +4940,109 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
 /// GroupBy / OrderBy etc. — are marked `(—)` so the surface is
 /// complete-by-construction; v6.2.5 fills these in via inline
 /// executor counters.
+/// v6.8.3 — surface "CREATE INDEX …" suggestions for every
+/// `(table, column)` pair the query touches via WHERE / JOIN
+/// that doesn't already have an index on the owning table.
+/// Walks the SELECT's FROM clauses + WHERE expression tree;
+/// returns one line per missing index. Deterministic order:
+/// FROM-clause iteration order, then column-reference walk
+/// order inside each WHERE. Each suggestion is a copy-pastable
+/// DDL string.
+fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -> Vec<String> {
+    use alloc::collections::BTreeSet;
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let cat = engine.active_catalog();
+    // Build a (table, qualifier-or-alias) list from the FROM clause
+    // so unqualified column refs in WHERE resolve to the correct
+    // table.
+    let Some(from) = &stmt.from else {
+        return out;
+    };
+    let mut tables: Vec<String> = Vec::new();
+    tables.push(from.primary.name.clone());
+    for j in &from.joins {
+        tables.push(j.table.name.clone());
+    }
+    // Collect column refs from the WHERE expression. JOIN ON
+    // predicates also feed in.
+    let mut col_refs: Vec<spg_sql::ast::ColumnName> = Vec::new();
+    if let Some(w) = &stmt.where_ {
+        collect_column_refs(w, &mut col_refs);
+    }
+    for j in &from.joins {
+        if let Some(on) = &j.on {
+            collect_column_refs(on, &mut col_refs);
+        }
+    }
+    for cn in &col_refs {
+        // Resolve owner table: explicit qualifier first, else
+        // first table in FROM that has a column of this name.
+        let owner: Option<String> = if let Some(q) = &cn.qualifier {
+            tables.iter().find(|t| t == &q).cloned()
+        } else {
+            tables.iter().find_map(|t| {
+                cat.get(t).and_then(|tbl| {
+                    if tbl.schema().column_position(&cn.name).is_some() {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+        let Some(owner) = owner else {
+            continue;
+        };
+        let Some(tbl) = cat.get(&owner) else {
+            continue;
+        };
+        let Some(col_pos) = tbl.schema().column_position(&cn.name) else {
+            continue;
+        };
+        // Skip if any BTree index already covers this column as
+        // its key.
+        let already_indexed = tbl.indices().iter().any(|i| {
+            matches!(i.kind, spg_storage::IndexKind::BTree(_))
+                && i.column_position == col_pos
+                && i.expression.is_none()
+                && i.partial_predicate.is_none()
+        });
+        if already_indexed {
+            continue;
+        }
+        if seen.insert((owner.clone(), cn.name.clone())) {
+            out.push(alloc::format!(
+                "SUGGEST: CREATE INDEX ix_{}_{} ON {} ({})",
+                owner,
+                cn.name,
+                owner,
+                cn.name
+            ));
+        }
+    }
+    out
+}
+
+/// Walks an `Expr` and pushes every `ColumnName` it references.
+/// Order is depth-first, left-to-right.
+fn collect_column_refs(expr: &Expr, out: &mut Vec<spg_sql::ast::ColumnName>) {
+    match expr {
+        Expr::Column(cn) => out.push(cn.clone()),
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_column_refs(a, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_column_refs(lhs, out);
+            collect_column_refs(rhs, out);
+        }
+        Expr::Unary { expr: e, .. } => collect_column_refs(e, out),
+        _ => {}
+    }
+}
+
 fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engine) {
     let catalog = engine.active_catalog();
     let cold_ids = catalog.cold_segment_ids_global();

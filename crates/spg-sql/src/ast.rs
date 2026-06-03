@@ -195,6 +195,12 @@ pub enum AlterTableTarget {
 pub struct ExplainStatement {
     pub analyze: bool,
     pub inner: Box<SelectStatement>,
+    /// v6.8.3 — `EXPLAIN (SUGGEST) <SELECT>` enables the index
+    /// advisor pass: after the regular plan tree, the engine
+    /// emits one suggestion line per column referenced in the
+    /// query's WHERE / JOIN that has no covering index on the
+    /// owning table.
+    pub suggest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -848,7 +854,9 @@ impl fmt::Display for Statement {
             Self::Analyze(Some(t)) => write!(f, "ANALYZE {}", quote_ident(t)),
             Self::CompactColdSegments => f.write_str("COMPACT COLD SEGMENTS"),
             Self::Explain(e) => {
-                if e.analyze {
+                if e.suggest {
+                    write!(f, "EXPLAIN (SUGGEST) {}", e.inner)
+                } else if e.analyze {
                     write!(f, "EXPLAIN ANALYZE {}", e.inner)
                 } else {
                     write!(f, "EXPLAIN {}", e.inner)
