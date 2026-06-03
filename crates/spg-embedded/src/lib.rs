@@ -715,6 +715,18 @@ pub struct FreezerOptions {
     pub hot_tier_bytes: u64,
     /// Max rows the freezer demotes per fire.
     pub batch_rows: usize,
+    /// v7.7.4 — auto-compact threshold. When the catalog has
+    /// at least this many cold segments across all tables, the
+    /// freezer fires a compaction pass after its next freeze.
+    /// Set to `usize::MAX` to disable auto-compact entirely;
+    /// the default is `64`, matching the `spg-server` operating
+    /// point for SPG_COLD_COMPACT_SEGMENT_THRESHOLD.
+    pub compact_when_segments_exceed: usize,
+    /// v7.7.4 — target segment size for compaction merges,
+    /// in bytes. Default 64 MiB, mirroring `spg-server`. Small
+    /// segments below this size are merge candidates;
+    /// segments at or above stay untouched.
+    pub compact_target_bytes: u64,
 }
 
 impl Default for FreezerOptions {
@@ -727,11 +739,21 @@ impl Default for FreezerOptions {
             tick: Duration::from_secs(1),
             hot_tier_bytes: 4 * 1024 * 1024 * 1024,
             batch_rows: 1000,
+            compact_when_segments_exceed: 64,
+            compact_target_bytes: 64 * 1024 * 1024,
         }
     }
 }
 
 impl Database {
+    /// v7.7.4 — observe the catalog's cold-segment count.
+    /// Useful for tests + dashboards that want to verify
+    /// auto-compaction is firing.
+    #[must_use]
+    pub fn cold_segment_count(&self) -> usize {
+        self.engine.catalog().cold_segment_count()
+    }
+
     /// v7.2.1 — spawn a background thread that periodically
     /// runs `freeze_oldest_to_cold` when the catalog-wide hot
     /// tier exceeds `opts.hot_tier_bytes`. The `Arc<Mutex<_>>`
@@ -806,6 +828,24 @@ fn background_freezer_loop(
             eprintln!(
                 "spg-embedded: background freeze on {table}.{index} failed: {e:?}"
             );
+            continue;
+        }
+        // v7.7.4 — auto-compact. If the catalog now carries
+        // more cold segments than the configured threshold,
+        // run a single compaction pass. Failures are reported
+        // but don't kill the loop; the next tick will retry.
+        let count = guard.engine.catalog().cold_segment_count();
+        if count > opts.compact_when_segments_exceed {
+            if let Err(e) = guard
+                .engine
+                .compact_cold_segments_with_target(opts.compact_target_bytes)
+            {
+                eprintln!(
+                    "spg-embedded: background compact failed (segments={count}, \
+                     threshold={}): {e:?}",
+                    opts.compact_when_segments_exceed,
+                );
+            }
         }
     }
 }

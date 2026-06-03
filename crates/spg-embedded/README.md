@@ -5,6 +5,25 @@ zero external dependencies (no `proc-macro2`, no `syn`, no
 `tokio`, no `rusqlite`). PG-wire compatible when paired with
 [`spg-server`](https://crates.io/crates/spg-server).
 
+## Throughput
+
+Numbers from `cargo bench -p spg-embedded` on
+Apple M-series silicon. Reproduce with
+`crates/spg-embedded/benches/embedded.rs`.
+
+| Operation                              | Time/op   | Ops/sec    |
+|----------------------------------------|-----------|------------|
+| INSERT (in-memory)                     | ~0.6 µs   | ~1.7 M     |
+| INSERT (persistent, one fsync per row) | ~4 ms     | ~250       |
+| SELECT by PK (BTree seek)              | ~1.7 µs   | ~600 k     |
+| Vector kNN, k=10, dim=8 (HNSW)         | ~1.9 µs   | ~520 k     |
+
+Persistent INSERT is the worst case — one `fsync` per call.
+For bulk loads, wrap many INSERTs in
+`db.with_transaction(|tx| { … })`: the WAL fsyncs once at
+COMMIT instead of per statement, and throughput approaches
+the in-memory number.
+
 ```rust
 use spg_embedded::Database;
 
