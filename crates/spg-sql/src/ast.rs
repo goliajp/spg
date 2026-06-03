@@ -499,6 +499,14 @@ pub enum SelectItem {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    /// v6.10.2 — `AS OF SEGMENT '<id>'` cold-tier time-travel.
+    /// When `Some(id)`, the scan restricts to rows that live in
+    /// segment `<id>` only — useful for forensic inspection of a
+    /// specific freezer-emitted segment without exposing the hot
+    /// tier. `AS OF TIMESTAMP <ts>` (PG-flavoured time travel)
+    /// is STABILITY carve-out for v6.10 — needs the freezer to
+    /// stamp each segment with a wall-clock at creation time.
+    pub as_of_segment: Option<u32>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -1499,6 +1507,7 @@ mod tests {
                 primary: TableRef {
                     name: "users".into(),
                     alias: None,
+                    as_of_segment: None,
                 },
                 joins: vec![],
             }),
