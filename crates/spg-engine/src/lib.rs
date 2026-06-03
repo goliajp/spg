@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod eval;
 pub mod json;
 pub mod publications;
+pub mod statistics;
 pub mod subscriptions;
 pub mod users;
 
@@ -221,29 +222,57 @@ impl<'a> CancelToken<'a> {
 //   [u32 catalog_len][catalog bytes]
 //   [u32 users_len][users bytes]
 //   [u32 pubs_len][publications bytes]
-//   [u32 subs_len][subscriptions bytes]    ← NEW
+//   [u32 subs_len][subscriptions bytes]
 //   [u32 crc32]
 //
-// Writers emit v4 from v6.1.4 on. Readers accept all of {v1, v2,
-// v3, v4}: v1/v2 load with empty publications + subscriptions;
-// v3 loads with empty subscriptions; v4 deserialises both. Older
-// SPG versions reading a v4 envelope fall through the version
-// match to `EnvelopeParse::Bare`, causing the subsequent
-// catalog-deserialise to fail loudly — pre-v6.1.4 binaries
-// cannot open v6.1.4+ snapshots (matches the v6.1.2 break).
+// Layout — v5 (v6.2.0, statistics trailer):
+//   [8 bytes magic "SPGENV01"]
+//   [u8 version = 5]
+//   [u32 catalog_len][catalog bytes]
+//   [u32 users_len][users bytes]
+//   [u32 pubs_len][publications bytes]
+//   [u32 subs_len][subscriptions bytes]
+//   [u32 stats_len][statistics bytes]      ← NEW
+//   [u32 crc32]
+//
+// Writers emit v5 from v6.2.0 on. Readers accept all of {v1, v2,
+// v3, v4, v5}: v1/v2 load with empty publications / subscriptions /
+// statistics; v3 loads with empty subscriptions + statistics; v4
+// loads with empty statistics; v5 deserialises all three. Older
+// SPG versions reading a v5 envelope fall through the version
+// match to `EnvelopeParse::Bare` — pre-v6.2.0 binaries cannot
+// open v6.2.0+ snapshots (matches the v6.1.2 / v6.1.4 breaks).
 
 const ENVELOPE_MAGIC: &[u8; 8] = b"SPGENV01";
 const ENVELOPE_VERSION_V1: u8 = 1;
 const ENVELOPE_VERSION_V2: u8 = 2;
 const ENVELOPE_VERSION_V3: u8 = 3;
 const ENVELOPE_VERSION_V4: u8 = 4;
+const ENVELOPE_VERSION_V5: u8 = 5;
 
-fn build_envelope(catalog: &[u8], users: &[u8], pubs: &[u8], subs: &[u8]) -> Vec<u8> {
+fn build_envelope(
+    catalog: &[u8],
+    users: &[u8],
+    pubs: &[u8],
+    subs: &[u8],
+    stats: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        8 + 1 + 4 + catalog.len() + 4 + users.len() + 4 + pubs.len() + 4 + subs.len() + 4,
+        8 + 1
+            + 4
+            + catalog.len()
+            + 4
+            + users.len()
+            + 4
+            + pubs.len()
+            + 4
+            + subs.len()
+            + 4
+            + stats.len()
+            + 4,
     );
     out.extend_from_slice(ENVELOPE_MAGIC);
-    out.push(ENVELOPE_VERSION_V4);
+    out.push(ENVELOPE_VERSION_V5);
     out.extend_from_slice(
         &u32::try_from(catalog.len())
             .expect("≤ 4G catalog")
@@ -268,6 +297,12 @@ fn build_envelope(catalog: &[u8], users: &[u8], pubs: &[u8], subs: &[u8]) -> Vec
             .to_le_bytes(),
     );
     out.extend_from_slice(subs);
+    out.extend_from_slice(
+        &u32::try_from(stats.len())
+            .expect("≤ 4G statistics")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(stats);
     let crc = spg_crypto::crc32::crc32(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     out
@@ -286,6 +321,7 @@ enum EnvelopeParse<'a> {
         users: &'a [u8],
         publications: Option<&'a [u8]>,
         subscriptions: Option<&'a [u8]>,
+        statistics: Option<&'a [u8]>,
     },
     CrcMismatch {
         expected: u32,
@@ -304,7 +340,11 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     let version = buf[8];
     if !matches!(
         version,
-        ENVELOPE_VERSION_V1 | ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4
+        ENVELOPE_VERSION_V1
+            | ENVELOPE_VERSION_V2
+            | ENVELOPE_VERSION_V3
+            | ENVELOPE_VERSION_V4
+            | ENVELOPE_VERSION_V5
     ) {
         return EnvelopeParse::Bare;
     }
@@ -335,7 +375,10 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     }
     let users = &buf[p..p + user_len];
     p += user_len;
-    let publications = if matches!(version, ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4) {
+    let publications = if matches!(
+        version,
+        ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4 | ENVELOPE_VERSION_V5
+    ) {
         // [u32 pubs_len][publications bytes]
         let Some(pubs_len_bytes) = buf.get(p..p + 4) else {
             return EnvelopeParse::Bare;
@@ -354,7 +397,7 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     } else {
         None
     };
-    let subscriptions = if version == ENVELOPE_VERSION_V4 {
+    let subscriptions = if matches!(version, ENVELOPE_VERSION_V4 | ENVELOPE_VERSION_V5) {
         // [u32 subs_len][subscriptions bytes]
         let Some(subs_len_bytes) = buf.get(p..p + 4) else {
             return EnvelopeParse::Bare;
@@ -373,9 +416,28 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
     } else {
         None
     };
+    let statistics = if version == ENVELOPE_VERSION_V5 {
+        // [u32 stats_len][statistics bytes]
+        let Some(stats_len_bytes) = buf.get(p..p + 4) else {
+            return EnvelopeParse::Bare;
+        };
+        let Ok(stats_len_arr) = stats_len_bytes.try_into() else {
+            return EnvelopeParse::Bare;
+        };
+        let stats_len = u32::from_le_bytes(stats_len_arr) as usize;
+        p += 4;
+        if p + stats_len > buf.len() {
+            return EnvelopeParse::Bare;
+        }
+        let stats_slice = &buf[p..p + stats_len];
+        p += stats_len;
+        Some(stats_slice)
+    } else {
+        None
+    };
     if matches!(
         version,
-        ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4
+        ENVELOPE_VERSION_V2 | ENVELOPE_VERSION_V3 | ENVELOPE_VERSION_V4 | ENVELOPE_VERSION_V5
     ) {
         if p + 4 != buf.len() {
             return EnvelopeParse::Bare;
@@ -397,6 +459,7 @@ fn split_envelope(buf: &[u8]) -> EnvelopeParse<'_> {
         users,
         publications,
         subscriptions,
+        statistics,
     }
 }
 
@@ -480,6 +543,10 @@ pub struct Engine {
     /// `CREATE SUBSCRIPTION` runs. Persistence rides the v4 envelope
     /// trailer.
     subscriptions: subscriptions::Subscriptions,
+    /// v6.2.0 — per-column statistics for the cost-based optimizer.
+    /// Populated by `ANALYZE`; queried via `spg_statistic` virtual
+    /// table. Persistence rides the v5 envelope trailer.
+    statistics: statistics::Statistics,
 }
 
 impl Engine {
@@ -495,6 +562,7 @@ impl Engine {
             users: UserStore::new(),
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
+            statistics: statistics::Statistics::new(),
         }
     }
 
@@ -512,6 +580,7 @@ impl Engine {
             users: UserStore::new(),
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
+            statistics: statistics::Statistics::new(),
         }
     }
 
@@ -528,6 +597,7 @@ impl Engine {
                 users: user_bytes,
                 publications: pub_bytes,
                 subscriptions: sub_bytes,
+                statistics: stats_bytes,
             } => {
                 let catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
                 let users = users::deserialize_users(user_bytes)
@@ -544,6 +614,12 @@ impl Engine {
                     })?,
                     None => subscriptions::Subscriptions::new(),
                 };
+                let statistics = match stats_bytes {
+                    Some(b) => statistics::Statistics::deserialize(b).map_err(|e| {
+                        EngineError::Unsupported(alloc::format!("statistics restore: {e:?}"))
+                    })?,
+                    None => statistics::Statistics::new(),
+                };
                 Ok(Self {
                     catalog,
                     tx_catalogs: BTreeMap::new(),
@@ -555,6 +631,7 @@ impl Engine {
                     users,
                     publications,
                     subscriptions,
+                    statistics,
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -655,7 +732,11 @@ impl Engine {
     /// adds publications to the envelope condition: either non-empty
     /// users OR non-empty publications now triggers the envelope path.
     pub fn snapshot(&self) -> Vec<u8> {
-        if self.users.is_empty() && self.publications.is_empty() && self.subscriptions.is_empty() {
+        if self.users.is_empty()
+            && self.publications.is_empty()
+            && self.subscriptions.is_empty()
+            && self.statistics.is_empty()
+        {
             self.catalog.serialize()
         } else {
             build_envelope(
@@ -663,6 +744,7 @@ impl Engine {
                 &users::serialize_users(&self.users),
                 &self.publications.serialize(),
                 &self.subscriptions.serialize(),
+                &self.statistics.serialize(),
             )
         }
     }
@@ -930,6 +1012,8 @@ impl Engine {
             Statement::WaitForWalPosition { .. } => Err(EngineError::Unsupported(
                 "WAIT FOR WAL POSITION must be handled by the server layer".into(),
             )),
+            // v6.2.0 — ANALYZE recomputes per-column histograms.
+            Statement::Analyze(target) => self.exec_analyze(target.as_deref()),
         };
         self.enforce_row_limit(result)
     }
@@ -1064,6 +1148,141 @@ impl Engine {
             })
             .collect();
         QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.2.0 — materialise `spg_statistic` rows. One row per
+    /// `(table, column)` pair tracked in `Statistics`, with
+    /// `histogram_bounds` rendered as a `[v0, v1, ...]` string —
+    /// the same canonical form vector literals use for round-trip.
+    fn exec_spg_statistic(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("table_name", DataType::Text, false),
+            ColumnSchema::new("column_name", DataType::Text, false),
+            ColumnSchema::new("null_frac", DataType::Float, false),
+            ColumnSchema::new("n_distinct", DataType::BigInt, false),
+            ColumnSchema::new("histogram_bounds", DataType::Text, false),
+        ];
+        let rows: Vec<Row> = self
+            .statistics
+            .iter()
+            .map(|((t, c), s)| {
+                Row::new(alloc::vec![
+                    Value::Text(t.clone()),
+                    Value::Text(c.clone()),
+                    Value::Float(f64::from(s.null_frac)),
+                    Value::BigInt(i64::try_from(s.n_distinct).unwrap_or(i64::MAX)),
+                    Value::Text(render_histogram_bounds(&s.histogram_bounds)),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.2.0 — read access to the per-column statistics table.
+    /// Used by the planner (v6.2.2 selectivity functions read this),
+    /// by `SELECT * FROM spg_statistic`, and by e2e tests.
+    pub const fn statistics(&self) -> &statistics::Statistics {
+        &self.statistics
+    }
+
+    /// v6.2.0 — `ANALYZE [<table>]` runtime. Bare `ANALYZE` walks
+    /// every user table; `ANALYZE <name>` re-stats one. For each
+    /// target table, single-pass scan + per-column histogram +
+    /// `null_frac` + `n_distinct`. Replaces the table's prior
+    /// stats; resets the modified-row counter.
+    ///
+    /// v6.2.0 doesn't sample — it scans the full table. v6.2.x
+    /// can add reservoir sampling at the > 100 K-row mark; not a
+    /// scope blocker for the current commit since rows ≤ 100 K
+    /// analyse in milliseconds.
+    fn exec_analyze(&mut self, target: Option<&str>) -> Result<QueryResult, EngineError> {
+        let names: Vec<String> = if let Some(name) = target {
+            // Verify the table exists; surface a clear error if not.
+            if self.catalog.get(name).is_none() {
+                return Err(EngineError::Storage(StorageError::TableNotFound {
+                    name: name.to_string(),
+                }));
+            }
+            alloc::vec![name.to_string()]
+        } else {
+            self.catalog
+                .table_names()
+                .into_iter()
+                .filter(|n| !is_internal_table_name(n))
+                .collect()
+        };
+        let mut analysed = 0usize;
+        for table_name in &names {
+            self.analyze_one_table(table_name)?;
+            analysed += 1;
+        }
+        Ok(QueryResult::CommandOk {
+            affected: analysed,
+            modified_catalog: true,
+        })
+    }
+
+    /// Walk a single table's rows once and (re-)populate per-column
+    /// stats. Drops the existing stats for `table` first so columns
+    /// that have been DROP-ed between ANALYZEs don't leave stale
+    /// rows.
+    fn analyze_one_table(&mut self, table_name: &str) -> Result<(), EngineError> {
+        let table = self.catalog.get(table_name).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: table_name.to_string(),
+            })
+        })?;
+        let schema = table.schema().clone();
+        let row_count = table.rows().len();
+        // For each column, collect (sorted) non-NULL textual values
+        // + count NULLs; then ask `statistics::build_histogram` to
+        // produce the 101 bounds and `estimate_n_distinct` the
+        // distinct count.
+        self.statistics.clear_table(table_name);
+        for (col_pos, col_schema) in schema.columns.iter().enumerate() {
+            // v6.2.0 skip: vector columns have their own stats
+            // shape (HNSW graph topology). v6.2 deliberation #1.
+            if matches!(col_schema.ty, DataType::Vector { .. }) {
+                continue;
+            }
+            let mut non_null_values: Vec<Value> = Vec::with_capacity(row_count);
+            let mut nulls: u64 = 0;
+            for row in table.rows() {
+                match row.values.get(col_pos) {
+                    Some(Value::Null) | None => nulls += 1,
+                    Some(v) => non_null_values.push(v.clone()),
+                }
+            }
+            // Sort by type-aware ordering (Int as int, Text as
+            // lex, etc.) so histogram bounds reflect the column's
+            // natural order — not lexicographic on the string
+            // representation, which would put "9" after "49".
+            non_null_values.sort_by(|a, b| sort_values_for_histogram(a, b));
+            let non_null: Vec<String> = non_null_values
+                .iter()
+                .map(canonical_value_repr)
+                .collect();
+            let null_frac = if row_count == 0 {
+                0.0
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let f = nulls as f32 / row_count as f32;
+                f
+            };
+            let n_distinct = statistics::estimate_n_distinct(&non_null);
+            let histogram_bounds = statistics::build_histogram(&non_null);
+            self.statistics.set(
+                table_name.to_string(),
+                col_schema.name.clone(),
+                statistics::ColumnStats {
+                    null_frac,
+                    n_distinct,
+                    histogram_bounds,
+                },
+            );
+        }
+        self.statistics.reset_modified(table_name);
+        Ok(())
     }
 
     /// v6.1.3 — `SHOW PUBLICATIONS` row materialisation. Returns
@@ -1784,6 +2003,24 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v6.2.0 — `spg_statistic` virtual-table short-circuit.
+        // Detected pre-CTE because it doesn't read from the catalog
+        // and shouldn't participate in regular FROM resolution.
+        if let Some(from) = &stmt.from
+            && from.joins.is_empty()
+            && from.primary.name.eq_ignore_ascii_case("spg_statistic")
+            && stmt.where_.is_none()
+            && stmt.group_by.is_none()
+            && stmt.having.is_none()
+            && stmt.unions.is_empty()
+            && stmt.order_by.is_none()
+            && stmt.limit.is_none()
+            && stmt.offset.is_none()
+            && !stmt.distinct
+            && stmt.items.iter().all(|i| matches!(i, SelectItem::Wildcard))
+        {
+            return Ok(self.exec_spg_statistic());
+        }
         // v4.11: CTEs materialise into a temporary enriched catalog
         // *before* anything else — the body SELECT can then refer
         // to CTE names via the regular FROM-clause resolution.
@@ -4788,6 +5025,133 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
 /// type. SQ8 / HalfVector cells are NOT expected as bind params;
 /// pgwire's Bind decodes vector params to the f32 representation
 /// before they reach this helper.
+/// v6.2.0 — total ordering on `Value`s used by ANALYZE to sort a
+/// column's non-NULL sample before histogram building. Cross-type
+/// pairs (Int vs Float, Date vs Timestamp, …) compare via the
+/// same widening the eval-side `compare` operator uses; everything
+/// else (the genuinely-incompatible pairs) falls back to ordering
+/// by canonical string form so the sort is still total + stable.
+/// Vector / SQ8 / Half / Json / Numeric / Interval values reach
+/// here only via the string-fallback path because vector columns
+/// are filtered out upstream.
+fn sort_values_for_histogram(a: &Value, b: &Value) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (a, b) {
+        (Value::SmallInt(a), Value::SmallInt(b)) => a.cmp(b),
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::BigInt(a), Value::BigInt(b)) => a.cmp(b),
+        (Value::SmallInt(a), Value::Int(b)) => i32::from(*a).cmp(b),
+        (Value::Int(a), Value::SmallInt(b)) => a.cmp(&i32::from(*b)),
+        (Value::Int(a), Value::BigInt(b)) => i64::from(*a).cmp(b),
+        (Value::BigInt(a), Value::Int(b)) => a.cmp(&i64::from(*b)),
+        (Value::SmallInt(a), Value::BigInt(b)) => i64::from(*a).cmp(b),
+        (Value::BigInt(a), Value::SmallInt(b)) => a.cmp(&i64::from(*b)),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Text(a), Value::Text(b)) | (Value::Json(a), Value::Json(b)) => a.cmp(b),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        // Mixed numeric/float — widen to f64 and compare.
+        (Value::SmallInt(n), Value::Float(x)) => {
+            (f64::from(*n)).partial_cmp(x).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::SmallInt(n)) => {
+            x.partial_cmp(&f64::from(*n)).unwrap_or(Ordering::Equal)
+        }
+        (Value::Int(n), Value::Float(x)) => {
+            (f64::from(*n)).partial_cmp(x).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::Int(n)) => {
+            x.partial_cmp(&f64::from(*n)).unwrap_or(Ordering::Equal)
+        }
+        (Value::BigInt(n), Value::Float(x)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let nf = *n as f64;
+            nf.partial_cmp(x).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::BigInt(n)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let nf = *n as f64;
+            x.partial_cmp(&nf).unwrap_or(Ordering::Equal)
+        }
+        // Cross-type fallback: lexicographic on canonical form.
+        // Total + stable so the sort is well-defined.
+        _ => canonical_value_repr(a).cmp(&canonical_value_repr(b)),
+    }
+}
+
+/// v6.2.0 — render the histogram bounds list as a `[v0, v1, ...]`
+/// string for the `spg_statistic.histogram_bounds` column. Values
+/// containing `,` or `[` / `]` are JSON-style escaped so the
+/// rendering round-trips through a future parser; v6.2.0 only
+/// uses the rendered form for human consumption, so the escaping
+/// is conservative.
+fn render_histogram_bounds(bounds: &[alloc::string::String]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(bounds.len() * 8 + 2);
+    out.push('[');
+    for (i, b) in bounds.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let needs_quote = b.contains([',', '[', ']', '"']) || b.is_empty();
+        if needs_quote {
+            out.push('"');
+            for ch in b.chars() {
+                if ch == '"' || ch == '\\' {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+            out.push('"');
+        } else {
+            out.push_str(b);
+        }
+    }
+    out.push(']');
+    out
+}
+
+/// v6.2.0 — canonical textual form of a `Value` for histogram
+/// bound storage. Strings used by ANALYZE for sort + bound output.
+/// INT / BIGINT → decimal; FLOAT → shortest-round-trip via
+/// `{:?}`; TEXT pass-through; BOOL → `t` / `f`; DATE / TIMESTAMP →
+/// the same form `format_date` / `format_timestamp` produce for
+/// SQL Display. Vector / SQ8 / Half / Json / Numeric / Interval
+/// reach this only via a non-Vector column (vector columns are
+/// skipped upstream); they fall back to a Debug-derived form so
+/// stats still serialise without crashing.
+fn canonical_value_repr(v: &Value) -> alloc::string::String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::SmallInt(n) => alloc::format!("{n}"),
+        Value::Int(n) => alloc::format!("{n}"),
+        Value::BigInt(n) => alloc::format!("{n}"),
+        Value::Float(x) => alloc::format!("{x:?}"),
+        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        Value::Date(d) => eval::format_date(*d),
+        Value::Timestamp(t) => eval::format_timestamp(*t),
+        Value::Interval { months, micros } => eval::format_interval(*months, *micros),
+        Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
+        Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
+            // Unreachable in practice (vector columns are filtered
+            // out before this). Defensive fallback so a future
+            // vector-stats path doesn't crash.
+            alloc::format!("{v:?}")
+        }
+    }
+}
+
+/// v6.2.0 — true for engine-managed catalog tables that the bare
+/// `ANALYZE` (no target) should skip. v6.2.0 has no internal
+/// tables yet (publications / subscriptions / users / statistics
+/// all live as engine fields, not catalog tables), so this is a
+/// reserved future-proofing hook — every existing user table is
+/// analysed.
+const fn is_internal_table_name(_name: &str) -> bool {
+    false
+}
+
 fn value_to_literal(v: Value) -> Literal {
     match v {
         Value::Null => Literal::Null,
@@ -6373,6 +6737,156 @@ mod tests {
             .unwrap();
         e.execute("COMMIT").unwrap();
         assert!(e.subscriptions().contains("s"));
+    }
+
+    #[test]
+    // ── v6.2.0: ANALYZE + spg_statistic + envelope v5 ──────────
+
+    #[test]
+    fn analyze_populates_histogram_bounds() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+        for i in 0..50 {
+            e.execute(&alloc::format!(
+                "INSERT INTO t VALUES ({i}, 'name{i}')"
+            ))
+            .unwrap();
+        }
+        e.execute("ANALYZE t").unwrap();
+        let stats = e.statistics();
+        let id_stats = stats.get("t", "id").unwrap();
+        assert!(id_stats.histogram_bounds.len() >= 2);
+        assert_eq!(id_stats.histogram_bounds.first().unwrap(), "0");
+        assert_eq!(id_stats.histogram_bounds.last().unwrap(), "49");
+        assert!((id_stats.null_frac - 0.0).abs() < 1e-6);
+        assert_eq!(id_stats.n_distinct, 50);
+    }
+
+    #[test]
+    fn reanalyze_overwrites_prior_stats() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        for i in 0..10 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        e.execute("ANALYZE t").unwrap();
+        let n1 = e.statistics().get("t", "id").unwrap().n_distinct;
+        assert_eq!(n1, 10);
+        for i in 10..30 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        e.execute("ANALYZE t").unwrap();
+        let n2 = e.statistics().get("t", "id").unwrap().n_distinct;
+        assert_eq!(n2, 30);
+    }
+
+    #[test]
+    fn analyze_unknown_table_errors() {
+        let mut e = Engine::new();
+        let err = e.execute("ANALYZE nonexistent").unwrap_err();
+        assert!(matches!(err, EngineError::Storage(StorageError::TableNotFound { .. })));
+    }
+
+    #[test]
+    fn bare_analyze_covers_all_user_tables() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t1 (id INT NOT NULL)").unwrap();
+        e.execute("CREATE TABLE t2 (name TEXT NOT NULL)").unwrap();
+        e.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        e.execute("INSERT INTO t2 VALUES ('alice')").unwrap();
+        let r = e.execute("ANALYZE").unwrap();
+        match r {
+            QueryResult::CommandOk { affected, modified_catalog } => {
+                assert_eq!(affected, 2);
+                assert!(modified_catalog);
+            }
+            other => panic!("expected CommandOk, got {other:?}"),
+        }
+        assert!(e.statistics().get("t1", "id").is_some());
+        assert!(e.statistics().get("t2", "name").is_some());
+    }
+
+    #[test]
+    fn select_from_spg_statistic_returns_rows_per_column() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, label TEXT)")
+            .unwrap();
+        e.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        e.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        e.execute("ANALYZE t").unwrap();
+        let r = e.execute_readonly("SELECT * FROM spg_statistic").unwrap();
+        let QueryResult::Rows { rows, columns } = r else {
+            panic!()
+        };
+        assert_eq!(columns.len(), 5);
+        assert_eq!(columns[0].name, "table_name");
+        assert_eq!(columns[4].name, "histogram_bounds");
+        assert_eq!(rows.len(), 2, "one row per column of t");
+        // Sorted by (table_name, column_name).
+        match (&rows[0].values[0], &rows[0].values[1]) {
+            (Value::Text(t), Value::Text(c)) => {
+                assert_eq!(t, "t");
+                // BTreeMap orders (table, column); columns "id" < "label".
+                assert_eq!(c, "id");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn analyze_skips_vector_columns() {
+        // Vector columns have their own stats shape (HNSW graph);
+        // ANALYZE leaves them out of spg_statistic.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, v VECTOR(3) NOT NULL)")
+            .unwrap();
+        e.execute("INSERT INTO t VALUES (1, [1, 2, 3])").unwrap();
+        e.execute("ANALYZE t").unwrap();
+        assert!(e.statistics().get("t", "id").is_some());
+        assert!(e.statistics().get("t", "v").is_none());
+    }
+
+    #[test]
+    fn statistics_persist_across_envelope_v5_round_trip() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        for i in 0..20 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        e.execute("ANALYZE").unwrap();
+        let snap = e.snapshot();
+        let e2 = Engine::restore_envelope(&snap).unwrap();
+        let s = e2.statistics().get("t", "id").unwrap();
+        assert_eq!(s.n_distinct, 20);
+    }
+
+    #[test]
+    fn v4_envelope_loads_with_empty_statistics() {
+        // Forge a v4 envelope by hand: catalog + users + pubs +
+        // subs trailer, no statistics. A v6.2.0 reader must accept
+        // it and surface an empty Statistics.
+        let mut e = Engine::new();
+        e.create_user("alice", "secret", crate::users::Role::ReadOnly, [0u8; 16])
+            .unwrap();
+        let catalog = e.catalog.serialize();
+        let users = crate::users::serialize_users(&e.users);
+        let pubs = e.publications.serialize();
+        let subs = e.subscriptions.serialize();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"SPGENV01");
+        buf.push(4u8);
+        buf.extend_from_slice(&u32::try_from(catalog.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&catalog);
+        buf.extend_from_slice(&u32::try_from(users.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&users);
+        buf.extend_from_slice(&u32::try_from(pubs.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&pubs);
+        buf.extend_from_slice(&u32::try_from(subs.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&subs);
+        let crc = spg_crypto::crc32::crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        let e2 = Engine::restore_envelope(&buf).expect("v4 envelope restores");
+        assert!(e2.statistics().is_empty());
     }
 
     #[test]
