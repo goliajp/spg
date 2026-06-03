@@ -200,8 +200,20 @@ fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
     // SPG_PRELOAD_COLD_SEGMENT (or, since v5.3.1, the manifest
     // sidecar that CHECKPOINT writes).
     if let Some(db_path) = state.db_path.as_deref() {
+        // v6.6.3 — capture pre-envelope size for the metrics.
+        let raw_size = report.segment_bytes.len() as u64;
+        state
+            .metrics
+            .segment_bytes_uncompressed_in
+            .fetch_add(raw_size, std::sync::atomic::Ordering::Relaxed);
         match persist_segment(db_path, &report) {
             Ok(written_path) => {
+                if let Ok(written) = std::fs::metadata(&written_path) {
+                    state
+                        .metrics
+                        .segment_bytes_compressed_out
+                        .fetch_add(written.len(), std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Ok(mut paths) = state.cold_segment_paths.lock() {
                     paths.insert(report.segment_id, written_path);
                 }

@@ -87,6 +87,23 @@ pub struct Metrics {
     /// or the flusher hasn't ticked yet). Derives
     /// `spg_durability_lag_seconds` at render time.
     pub last_fsync_us: AtomicU64,
+    /// v6.6.3 — sum of SQL byte counts seen by the WAL encoder
+    /// since boot, before compression is applied. Derives the
+    /// `spg_wal_bytes_uncompressed_total` series. Pairs with
+    /// `wal_bytes_compressed_out` for the ratio computation.
+    pub wal_bytes_uncompressed_in: AtomicU64,
+    /// v6.6.3 — sum of bytes written to the WAL since boot, after
+    /// compression. Derives `spg_wal_bytes_compressed_total`.
+    pub wal_bytes_compressed_out: AtomicU64,
+    /// v6.6.3 — sum of cold-tier segment v1 bytes the freezer
+    /// produced since boot, BEFORE the v2 envelope. Derives
+    /// `spg_segment_bytes_uncompressed_total`.
+    pub segment_bytes_uncompressed_in: AtomicU64,
+    /// v6.6.3 — sum of bytes actually written to disk for cold-tier
+    /// segments since boot. Equals `segment_bytes_uncompressed_in`
+    /// when SPG_SEGMENT_COMPRESSION=none. Derives
+    /// `spg_segment_bytes_compressed_total`.
+    pub segment_bytes_compressed_out: AtomicU64,
 }
 
 /// JSON-safe escape: replace `"`, `\\`, and control characters per
@@ -230,6 +247,7 @@ fn render_metrics(state: &crate::ServerState) -> String {
     render_cold_tier(state, &mut out);
     render_flusher(state, &mut out);
     render_durability_lag(state, &mut out);
+    render_compression(state, &mut out);
     out
 }
 
@@ -261,6 +279,42 @@ fn render_durability_lag(state: &crate::ServerState, out: &mut String) {
     );
     out.push_str("# TYPE spg_durability_lag_seconds gauge\n");
     out.push_str(&format!("spg_durability_lag_seconds {lag_seconds:.6}\n"));
+}
+
+/// v6.6.3 — compression ratio series.
+fn render_compression(state: &crate::ServerState, out: &mut String) {
+    out.push_str(
+        "# HELP spg_wal_bytes_uncompressed_total Sum of SQL byte counts seen by the WAL encoder since boot (v6.6.3)\n",
+    );
+    out.push_str("# TYPE spg_wal_bytes_uncompressed_total counter\n");
+    out.push_str(&format!(
+        "spg_wal_bytes_uncompressed_total {}\n",
+        state.metrics.wal_bytes_uncompressed_in.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP spg_wal_bytes_compressed_total Sum of bytes written to the WAL since boot, after compression (v6.6.3)\n",
+    );
+    out.push_str("# TYPE spg_wal_bytes_compressed_total counter\n");
+    out.push_str(&format!(
+        "spg_wal_bytes_compressed_total {}\n",
+        state.metrics.wal_bytes_compressed_out.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP spg_segment_bytes_uncompressed_total Sum of cold-tier segment v1 bytes the freezer produced (v6.6.3)\n",
+    );
+    out.push_str("# TYPE spg_segment_bytes_uncompressed_total counter\n");
+    out.push_str(&format!(
+        "spg_segment_bytes_uncompressed_total {}\n",
+        state.metrics.segment_bytes_uncompressed_in.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP spg_segment_bytes_compressed_total Sum of bytes actually written to disk for cold-tier segments (v6.6.3)\n",
+    );
+    out.push_str("# TYPE spg_segment_bytes_compressed_total counter\n");
+    out.push_str(&format!(
+        "spg_segment_bytes_compressed_total {}\n",
+        state.metrics.segment_bytes_compressed_out.load(Ordering::Relaxed)
+    ));
 }
 
 fn compute_durability_lag(state: &crate::ServerState) -> (u64, f64) {
