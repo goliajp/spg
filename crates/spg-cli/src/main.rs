@@ -72,6 +72,54 @@ fn main() {
                 Err(e) => die(&format!("{verb} failed: {e}"), 1),
             }
         }
+        // v6.10.7 — audit-driven PITR. `spg revert --wal
+        // <path> --to-seq <N> --out <db_path>` replays the
+        // first N records of the WAL into a fresh engine + writes
+        // the resulting snapshot to `--out`. The `--to-audit-entry`
+        // variant (resolve N from an audit-chain entry hash) is
+        // STABILITY § "Out of v6.10" — the v6.10.7 ship freezes
+        // the CLI shape so the future revisit drops in the audit
+        // lookup without changing the operator surface.
+        Some("revert") => {
+            let mut wal_path: Option<String> = None;
+            let mut to_seq: Option<u64> = None;
+            let mut out_path: Option<String> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--wal" => wal_path = args.next(),
+                    "--to-seq" => {
+                        to_seq = args.next().and_then(|s| s.parse::<u64>().ok());
+                    }
+                    "--to-audit-entry" => {
+                        die(
+                            "--to-audit-entry is STABILITY § Out-of-v6.10; v6.10.7 \
+                             supports --to-seq <N> only",
+                            2,
+                        );
+                        return;
+                    }
+                    "--out" => out_path = args.next(),
+                    other => {
+                        die(&format!("unknown revert arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let (Some(wal_path), Some(to_seq), Some(out_path)) = (wal_path, to_seq, out_path)
+            else {
+                die(
+                    "usage: spg revert --wal <path> --to-seq <N> --out <db_path>",
+                    2,
+                );
+                return;
+            };
+            match wal_revert(&wal_path, to_seq, &out_path) {
+                Ok(applied) => {
+                    println!("OK applied={applied} → {out_path}");
+                }
+                Err(msg) => die(&format!("revert failed: {msg}"), 1),
+            }
+        }
         // v6.10.5 — WAL schema lint. `spg wal-lint <wal_path>
         // --against-schema <db_path>` parses every record in
         // the WAL file + checks each SQL statement against the
@@ -106,10 +154,44 @@ fn main() {
         }
         Some(other) => die(&format!("unknown command: {other}"), 2),
         None => die(
-            "usage: spg <ping|query|stats|backup|restore|wal-lint|version> ...",
+            "usage: spg <ping|query|stats|backup|restore|wal-lint|revert|version> ...",
             2,
         ),
     }
+}
+
+/// v6.10.7 — replay the first `to_seq` records of the WAL at
+/// `wal_path` into a fresh engine + write the resulting catalog
+/// snapshot to `out_path`. `to_seq == 0` is a special case
+/// meaning "replay no records" — the snapshot is the empty
+/// catalog. Returns the count of records applied.
+fn wal_revert(wal_path: &str, to_seq: u64, out_path: &str) -> Result<u64, String> {
+    use spg_engine::Engine;
+    let mut engine = Engine::new();
+    let wal_bytes = fs::read(wal_path).map_err(|e| format!("read wal: {e}"))?;
+    let mut applied = 0u64;
+    let mut cur = 0usize;
+    while cur < wal_bytes.len() && applied < to_seq {
+        let (sql_bytes, total) = decode_one_record(&wal_bytes[cur..])
+            .map_err(|e| format!("decode at offset {cur}: {e}"))?;
+        cur += total;
+        if sql_bytes.is_empty() {
+            // v3 durability-checkpoint marker — skips, doesn't
+            // count against the budget (matches `replay_wal_bytes`
+            // semantics).
+            continue;
+        }
+        let sql = std::str::from_utf8(&sql_bytes)
+            .map_err(|e| format!("non-UTF-8 SQL at offset {cur}: {e}"))?;
+        engine.execute(sql).map_err(|e| format!(
+            "apply rejected {sql:?} at seq {applied}: {e:?}"
+        ))?;
+        applied += 1;
+    }
+    let snapshot = engine.snapshot();
+    fs::write(out_path, &snapshot)
+        .map_err(|e| format!("write {out_path}: {e}"))?;
+    Ok(applied)
 }
 
 /// v6.10.5 — dry-run apply every WAL record at `wal_path` to
