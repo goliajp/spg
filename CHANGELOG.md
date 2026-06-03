@@ -10,6 +10,72 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.3] — 2026-06-03 (JOIN reorder)
+
+Fourth v6.2.x sub-version. Lands cost-based JOIN reorder using
+v6.2.0 statistics + v6.2.2 selectivities. Runs as a parser-time
+AST rewrite after `rewrite_clock_calls` + `resolve_order_by_
+position` — the executor consumes the reordered FROM clause
+unchanged.
+
+### Added
+
+- New module `spg_engine::reorder`. Pure-AST pass.
+- `reorder::reorder_joins(stmt, catalog, stats)` — entry point.
+  Gated on:
+    - `stmt.from.joins` non-empty
+    - every join is `INNER` (LEFT / CROSS skipped — semantics-
+      sensitive)
+    - every ON predicate resolves to a set of endpoint tables
+      via `collect_referenced_tables`
+    - **`Statistics` non-empty** — without ANALYZE the pass
+      bails, matching PG's "no stats = no optimizer" rule and
+      giving operators a deterministic on-switch.
+- Algorithm:
+    - Brute-force enumerate all `n!` orderings for `n ≤ 4`.
+    - Greedy "smallest first then smallest expected output"
+      for `n > 4` — tradeoff acknowledged in the design.
+- AND-conjunction splitter — multi-predicate ON clauses split
+  into one [`Edge`] per leaf so the optimizer can pull tight
+  predicates earlier. Trivial `1 = 1` edges (empty endpoint
+  set) round-trip as no-ops.
+- Cost model: at each step `running_size × right_size`, then
+  multiply by each newly-applicable edge's selectivity for the
+  output. Selectivity comes from `selectivity::equal` for
+  column=column predicates, defaulted to `0.333` for other
+  shapes.
+- `rewrite_from` re-attaches predicates to whichever join in
+  the chosen order makes their endpoints fully covered;
+  multiple edges at the same step `AND` together.
+
+### Tests
+
+- `spg-engine::reorder` lib (3) — no-joins / LEFT-skip /
+  5-table star puts fact first.
+- `spg-engine` lib total                    143 → 157 passing.
+- `spg-engine::perf_join_reorder` (1) —
+  `five_table_join_speedup_vs_source_order` ship gate:
+  4 big tables (40 rows each, total 40⁴ = 2.56M cartesian
+  potential) star-joined to a 3-row fact table via
+  `fact.k_i = big_i.k`. Baseline (no ANALYZE → no reorder):
+  **4.24 s**. Reordered (post-ANALYZE → fact-first): **0.47 ms**.
+  **Measured speedup: 9002.5×** (gate ≥ 10×).
+
+### Not changed
+
+- WAL on-disk format / replication protocol / snapshot envelope.
+- Executor (`exec_joined_select`) — consumes the reordered AST
+  unchanged.
+
+### Out of v6.2.3 (deferred to later v6.2.x — NOT v7)
+
+- EXPLAIN ANALYZE per-operator (rows, ns) — v6.2.4.
+- Hot/cold tier row annotation — v6.2.5.
+- Memoize node for correlated subqueries — v6.2.6.
+- TPC-H Q1-Q5 plan-stability suite — v6.2.7.
+
+---
+
 ## [6.2.2] — 2026-06-03 (selectivity functions)
 
 Third v6.2.x sub-version. Library-only addition: selectivity
