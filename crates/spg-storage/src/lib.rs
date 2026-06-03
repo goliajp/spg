@@ -289,6 +289,12 @@ pub struct ColumnSchema {
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnSchema>,
+    /// v6.7.2 — per-table hot-tier byte budget override. `None`
+    /// falls through to the global `SPG_HOT_TIER_BYTES` setting;
+    /// `Some(n)` overrides it for this specific table. Set via
+    /// `ALTER TABLE t SET hot_tier_bytes = X`. Persisted in
+    /// catalog FILE_VERSION 11+.
+    pub hot_tier_bytes: Option<u64>,
 }
 
 impl TableSchema {
@@ -685,6 +691,13 @@ impl Table {
 
     pub const fn schema(&self) -> &TableSchema {
         &self.schema
+    }
+
+    /// v6.7.2 — mutable schema accessor for ALTER TABLE paths.
+    /// Used by `Engine::exec_alter_table` to flip per-table
+    /// settings like `hot_tier_bytes`.
+    pub const fn schema_mut(&mut self) -> &mut TableSchema {
+        &mut self.schema
     }
 
     /// v4.39: returns the persistent row vector by reference. Callers that
@@ -2992,6 +3005,7 @@ impl TableSchema {
         Self {
             name: name.into(),
             columns,
+            hot_tier_bytes: None,
         }
     }
 }
@@ -3055,12 +3069,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// by version dispatch in [`Catalog::deserialize`] — every entry decodes
 /// as `RowLocator::Hot(_)` via `add_index` rebuild, identical to v5.1
 /// behaviour.
-/// v6.7.1 — bumped from 9 to 10 to add the BRIN index tag (byte 2)
-/// in the per-table index section. v9 catalog snapshots load
-/// unchanged (no BRIN tags appear); v10 snapshots written by a
-/// pre-v6.7.1 binary fail loudly at the version check, matching
-/// the v6.1.2 / v6.1.4 / v6.2.0 envelope-bump upgrade fence.
-const FILE_VERSION: u8 = 10;
+/// v6.7.2 — bumped from 10 to 11 to append per-table
+/// `hot_tier_bytes: Option<u64>` after the per-table indices
+/// section. v10 catalogs (v6.7.1) load with `hot_tier_bytes =
+/// None` for every table (the deserialiser short-circuits when
+/// version < 11). v11 snapshots written by a pre-v6.7.2 binary
+/// fail loudly at the version check, matching the v6.1.2 /
+/// v6.1.4 / v6.2.0 / v6.7.1 envelope-bump upgrade fences.
+const FILE_VERSION: u8 = 11;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -3171,6 +3187,18 @@ impl Catalog {
                     }
                 }
             }
+            // v6.7.2 — per-table hot_tier_bytes Option<u64>.
+            // Layout: [u8 has_value][u64 LE value (if has_value)].
+            // v10 readers stop before this byte (deserialise loop
+            // gated on version >= 11); v11+ readers always
+            // consume it.
+            match t.schema.hot_tier_bytes {
+                None => out.push(0),
+                Some(n) => {
+                    out.push(1);
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            }
         }
         out
     }
@@ -3215,7 +3243,8 @@ fn deserialize_table(
     cat: &mut Catalog,
     version: u8,
 ) -> Result<(), StorageError> {
-    let name = cur.read_str()?;
+    let table_name = cur.read_str()?;
+    let name = table_name.clone();
     let col_count = cur.read_u16()? as usize;
     let mut cols = Vec::with_capacity(col_count);
     for _ in 0..col_count {
@@ -3248,6 +3277,25 @@ fn deserialize_table(
     let t = cat.tables.last_mut().expect("create_table just pushed");
     deserialize_rows(cur, t, n_cols)?;
     deserialize_indices(cur, t, version)?;
+    // v6.7.2 — per-table hot_tier_bytes appendix. v11+ writes
+    // `[u8 has_value][u64 LE value (if has_value)]`. v10 / v9 / v8
+    // catalogs skip this entirely (the deserialiser reads no extra
+    // bytes; the table's hot_tier_bytes stays None from
+    // TableSchema::new).
+    if version >= 11 {
+        let has = cur.read_u8()?;
+        let hot_tier_bytes = match has {
+            0 => None,
+            1 => Some(cur.read_u64()?),
+            other => {
+                return Err(StorageError::Corrupt(format!(
+                    "hot_tier_bytes appendix: unknown has-value byte {other}"
+                )));
+            }
+        };
+        t.schema_mut().hot_tier_bytes = hot_tier_bytes;
+    }
+    let _ = table_name;
     Ok(())
 }
 
@@ -3886,6 +3934,14 @@ impl<'a> Cursor<'a> {
     fn read_i32(&mut self) -> Result<i32, StorageError> {
         let s = self.take(4)?;
         Ok(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    /// v6.7.2 — u64 LE read for the per-table `hot_tier_bytes`
+    /// catalog appendix.
+    fn read_u64(&mut self) -> Result<u64, StorageError> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
     }
     fn read_i64(&mut self) -> Result<i64, StorageError> {
         let s = self.take(8)?;

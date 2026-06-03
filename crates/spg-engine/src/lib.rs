@@ -1250,6 +1250,7 @@ impl Engine {
             Statement::DropUser(name) => self.exec_drop_user(&name),
             Statement::Explain(e) => self.exec_explain(&e, cancel),
             Statement::AlterIndex(s) => self.exec_alter_index(s),
+            Statement::AlterTable(s) => self.exec_alter_table(s),
             Statement::CreatePublication(s) => self.exec_create_publication(s),
             Statement::DropPublication(name) => self.exec_drop_publication(&name),
             Statement::CreateSubscription(s) => self.exec_create_subscription(s),
@@ -2476,6 +2477,31 @@ impl Engine {
     /// rebuild (including any encoding switch) to
     /// `Table::rebuild_nsw_index`. The "live" non-blocking
     /// optimisation is v6.0.4.1 / v6.1.x territory.
+    /// v6.7.2 — `ALTER TABLE t SET hot_tier_bytes = X`. Dispatch
+    /// arm. Currently the only setting is `hot_tier_bytes`; later
+    /// v6.7.x can extend `AlterTableTarget` without touching this
+    /// arm structure.
+    fn exec_alter_table(
+        &mut self,
+        s: spg_sql::ast::AlterTableStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&s.name)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound { name: s.name.clone() })
+            })?;
+        match s.target {
+            spg_sql::ast::AlterTableTarget::SetHotTierBytes(n) => {
+                table.schema_mut().hot_tier_bytes = Some(n);
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     fn exec_alter_index(
         &mut self,
         stmt: spg_sql::ast::AlterIndexStatement,
