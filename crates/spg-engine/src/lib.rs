@@ -3154,6 +3154,10 @@ impl Engine {
     }
 
     fn exec_insert(&mut self, stmt: InsertStatement) -> Result<QueryResult, EngineError> {
+        // v7.9.21 — snapshot the clock fn pointer before the mut
+        // borrow on the catalog opens; runtime DEFAULT eval needs
+        // it inside the row hot loop.
+        let clock = self.clock;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -3198,6 +3202,7 @@ impl Engine {
                     if map[i].is_none()
                         && !col.nullable
                         && col.default.is_none()
+                        && col.runtime_default.is_none()
                         && !col.auto_increment
                     {
                         return Err(EngineError::Storage(StorageError::NullInNotNull {
@@ -3239,7 +3244,7 @@ impl Engine {
                 for (i, col) in column_meta.iter().enumerate() {
                     let mut raw = match map[i] {
                         Some(j) => raw_tuple[j].clone(),
-                        None => col.default.clone().unwrap_or(Value::Null),
+                        None => resolve_column_default_free(col, clock)?,
                     };
                     if col.auto_increment && raw.is_null() {
                         let next = table.next_auto_value(i).ok_or_else(|| {
@@ -8486,16 +8491,80 @@ fn fk_action_sql_to_storage(a: spg_sql::ast::FkAction) -> spg_storage::FkAction 
     }
 }
 
+/// v7.9.21 — resolve a column's DEFAULT for INSERT-time
+/// default-fill. Free fn (rather than `&self`) so callers
+/// with an active `&mut Table` borrow can still use it.
+/// Literal defaults take the cached path (`col.default`);
+/// runtime defaults hit `clock_fn` at each call. mailrs G4.
+fn resolve_column_default_free(
+    col: &ColumnSchema,
+    clock_fn: Option<ClockFn>,
+) -> Result<Value, EngineError> {
+    if let Some(rt) = &col.runtime_default {
+        return eval_runtime_default_free(rt, col.ty, clock_fn);
+    }
+    Ok(col.default.clone().unwrap_or(Value::Null))
+}
+
+fn eval_runtime_default_free(
+    rt: &str,
+    ty: DataType,
+    clock_fn: Option<ClockFn>,
+) -> Result<Value, EngineError> {
+    let s = rt.trim().to_ascii_lowercase();
+    let canonical = s.trim_end_matches("()");
+    let now_us = match clock_fn {
+        Some(f) => f(),
+        None => 0,
+    };
+    let v = match canonical {
+        "now" | "current_timestamp" | "localtimestamp" => {
+            Value::Timestamp(now_us)
+        }
+        "current_date" => Value::Date((now_us / 86_400_000_000) as i32),
+        "current_time" | "localtime" => Value::Timestamp(now_us),
+        other => {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "runtime DEFAULT expression {other:?} not supported \
+                 (v7.9.21 whitelist: now() / current_timestamp / \
+                 current_date / current_time / localtimestamp / \
+                 localtime)"
+            )));
+        }
+    };
+    coerce_value(v, ty, "DEFAULT", 0)
+}
+
+/// v7.9.21 — true when a DEFAULT expression needs INSERT-time
+/// evaluation rather than being cacheable as a literal Value.
+/// FunctionCall is the immediate case (`now()`,
+/// `current_timestamp`). Literal expressions and simple sign-
+/// flipped numerics still take the static-cache path.
+fn is_runtime_default_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { .. } => true,
+        Expr::Unary { expr, .. } => is_runtime_default_expr(expr),
+        _ => false,
+    }
+}
+
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
     if let Some(default_expr) = c.default {
-        // DEFAULT must be a literal expression — evaluated at CREATE TABLE
-        // time against an empty row context. Any column ref / aggregate
-        // surfaces as the corresponding eval error.
-        let raw = literal_expr_to_value(default_expr)?;
-        let coerced = coerce_value(raw, ty, &c.name, 0)?;
-        schema = schema.with_default(coerced);
+        // v7.9.21 — distinguish literal defaults (evaluated once
+        // at CREATE TABLE) from expression defaults (deferred to
+        // INSERT). Function calls (`now()`, `current_timestamp`
+        // — see v7.9.20 keyword promotion) take the runtime path.
+        // Literals continue to cache. mailrs G4.
+        if is_runtime_default_expr(&default_expr) {
+            let display = alloc::format!("{default_expr}");
+            schema = schema.with_runtime_default(display);
+        } else {
+            let raw = literal_expr_to_value(default_expr)?;
+            let coerced = coerce_value(raw, ty, &c.name, 0)?;
+            schema = schema.with_default(coerced);
+        }
     }
     if c.auto_increment {
         // AUTO_INCREMENT only makes sense on integer-shaped columns.
@@ -8669,6 +8738,10 @@ fn coerce_value(
             (Value::Date(d), DataType::Timestamp | DataType::Timestamptz) => {
                 Some(Value::Timestamp(i64::from(d) * 86_400_000_000))
             }
+            // v7.9.21 — Value::Timestamp lands in either Timestamp
+            // or Timestamptz columns; the on-disk layout is the
+            // same i64 microseconds UTC.
+            (Value::Timestamp(t), DataType::Timestamptz) => Some(Value::Timestamp(t)),
             (Value::Timestamp(t), DataType::Date) => {
                 let days = t.div_euclid(86_400_000_000);
                 i32::try_from(days).ok().map(Value::Date)

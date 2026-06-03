@@ -77,6 +77,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     nullable: desc.nullable,
                     auto_increment: false,
                     default: None,
+                    runtime_default: None,
                 });
             }
         }

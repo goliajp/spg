@@ -3115,6 +3115,25 @@ impl Parser {
             }
             return Ok(Expr::FunctionCall { name: first, args });
         }
+        // v7.9.20 — SQL-standard parenless keyword expressions
+        // (PG treats these as functions called without parens).
+        // Resolve to a synthetic FunctionCall so the engine's
+        // eval path reuses the existing function-call routing.
+        // mailrs G3.
+        let lc = first.to_ascii_lowercase();
+        if matches!(
+            lc.as_str(),
+            "current_date"
+                | "current_time"
+                | "current_timestamp"
+                | "localtimestamp"
+                | "localtime"
+        ) {
+            return Ok(Expr::FunctionCall {
+                name: lc,
+                args: Vec::new(),
+            });
+        }
         Ok(Expr::Column(ColumnName {
             qualifier: None,
             name: first,
