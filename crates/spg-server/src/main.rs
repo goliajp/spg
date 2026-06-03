@@ -3746,7 +3746,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// replay should start. In v5.3.1 every snapshot write captures the
 /// current WAL file length; v5.3.2 wires this into the replay-skip
 /// path so 100M boot stays under 60 s.
-fn write_manifest_alongside(
+pub(crate) fn write_manifest_alongside(
     db_path: &Path,
     snapshot_bytes: &[u8],
     cold_segment_paths: &BTreeMap<u32, PathBuf>,

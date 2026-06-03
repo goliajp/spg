@@ -969,6 +969,35 @@ impl Engine {
         Ok(report)
     }
 
+    /// v6.7.5 — public shim used by the spg-server follower's
+    /// segment-forwarding receiver. Registers a cold-tier segment
+    /// at a specific id (the master's id, as transmitted on the
+    /// wire) so the follower's BTree-Cold locators stay byte-
+    /// identical with the master's. Wraps
+    /// `Catalog::load_segment_bytes_at` under the standard
+    /// clone-mutate-replace pattern.
+    ///
+    /// Returns `Ok(())` on success **and** on the "slot already
+    /// occupied" case — a follower mid-reconnect may receive a
+    /// segment chunk for a segment_id it already has on disk
+    /// (forwarded last session); the caller should treat that
+    /// path as a no-op rather than a fatal error.
+    pub fn receive_cold_segment(
+        &mut self,
+        segment_id: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), EngineError> {
+        let mut new_cat = self.catalog.clone();
+        match new_cat.load_segment_bytes_at(segment_id, bytes) {
+            Ok(()) => {
+                self.replace_catalog(new_cat);
+                Ok(())
+            }
+            Err(StorageError::Corrupt(msg)) if msg.contains("already occupied") => Ok(()),
+            Err(e) => Err(EngineError::Storage(e)),
+        }
+    }
+
     /// v6.7.3 — public shim around `Catalog::compact_cold_segments`
     /// driving every BTree index on every user table. Returns one
     /// `(table, index, report)` triple for each merge that
