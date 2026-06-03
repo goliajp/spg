@@ -361,6 +361,13 @@ pub struct Index {
     /// Empty `Vec` = no `INCLUDE` clause (the legacy shape). v12
     /// catalog snapshots deserialise with an empty vec.
     pub included_columns: Vec<usize>,
+    /// v6.8.1 — partial-index predicate stored as its canonical
+    /// Display form (the engine re-parses it on the maintenance
+    /// path). `None` = unconditional index (the legacy shape).
+    /// Persisted as `[u8 has_pred][u16 LE len][bytes]` on the
+    /// catalog snapshot (FILE_VERSION 12, appended after
+    /// `included_columns`).
+    pub partial_predicate: Option<String>,
 }
 
 /// Default neighbor degree (M) for the NSW graph. Picked at construction
@@ -584,6 +591,7 @@ impl Index {
             column_position,
             kind: IndexKind::BTree(PersistentBTreeMap::new()),
             included_columns: Vec::new(),
+            partial_predicate: None,
         }
     }
 
@@ -593,6 +601,7 @@ impl Index {
             column_position,
             kind: IndexKind::Nsw(NswGraph::new(m)),
             included_columns: Vec::new(),
+            partial_predicate: None,
         }
     }
 
@@ -605,6 +614,7 @@ impl Index {
             column_position,
             kind: IndexKind::Brin { column_type },
             included_columns: Vec::new(),
+            partial_predicate: None,
         }
     }
 
@@ -1098,6 +1108,7 @@ impl Table {
             column_position,
             kind: IndexKind::BTree(map),
             included_columns: Vec::new(),
+            partial_predicate: None,
         });
         Ok(())
     }
@@ -1501,6 +1512,7 @@ impl Table {
                 column_position,
                 kind: IndexKind::Nsw(graph),
                 included_columns: Vec::new(),
+                partial_predicate: None,
             });
             return Ok(());
         }
@@ -3859,6 +3871,16 @@ impl Catalog {
                         u16::try_from(*col_pos).expect("≤ 65k columns/table"),
                     );
                 }
+                // v6.8.1 — partial_predicate appendix per index.
+                // Layout: [u8 has_pred][u16 LE len][bytes (if has_pred)].
+                // Same v12 gate as included_columns.
+                match &idx.partial_predicate {
+                    None => out.push(0),
+                    Some(pred) => {
+                        out.push(1);
+                        write_str(&mut out, pred);
+                    }
+                }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
             // Layout: [u8 has_value][u64 LE value (if has_value)].
@@ -4072,11 +4094,23 @@ fn deserialize_indices(
                     }
                     included.push(cp);
                 }
-                // Patch the just-pushed index. The four restore_* helpers
-                // append to `t.indices`; the matching index is the last
-                // entry.
                 if let Some(last) = t.indices.last_mut() {
                     last.included_columns = included;
+                }
+            }
+            // v6.8.1 — partial_predicate appendix.
+            match cur.read_u8()? {
+                0 => {}
+                1 => {
+                    let pred = cur.read_str()?;
+                    if let Some(last) = t.indices.last_mut() {
+                        last.partial_predicate = Some(pred);
+                    }
+                }
+                other => {
+                    return Err(StorageError::Corrupt(format!(
+                        "partial_predicate tag: unknown byte {other}"
+                    )));
                 }
             }
         }

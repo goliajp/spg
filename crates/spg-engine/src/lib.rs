@@ -2747,6 +2747,24 @@ impl Engine {
         {
             idx.included_columns = included_positions;
         }
+        // v6.8.1 — persist partial-index predicate. Stored as the
+        // expression's Display form so the catalog snapshot stays
+        // pure (storage has no spg-sql dependency). The runtime
+        // maintenance path treats partial indexes identically to
+        // full indexes for v6.8.1 (over-maintenance is safe; the
+        // planner-side "use partial when query WHERE implies the
+        // predicate" pass is STABILITY carve-out).
+        if let Some(pred_expr) = &stmt.partial_predicate {
+            let canonical = pred_expr.to_string();
+            if matches!(stmt.method, IndexMethod::Hnsw | IndexMethod::Brin) {
+                return Err(EngineError::Unsupported(
+                    "WHERE predicates are not supported on HNSW or BRIN indexes".into(),
+                ));
+            }
+            if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
+                idx.partial_predicate = Some(canonical);
+            }
+        }
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.
         self.plan_cache.evict_referencing(&table_name);
