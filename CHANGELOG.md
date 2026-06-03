@@ -10,6 +10,81 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.3] — 2026-06-03 (PG-wire extended query finish — release roll-up)
+
+v6.3 closes the **eleventh-gap cluster** from the PG-19 audit:
+the PG-wire extended-query protocol that JDBC / sqlx / pgx /
+psycopg3 actually drive. v6.1.1 shipped Parse + Bind + Execute
+with a per-session AST cache, but the parts that make real
+clients fast (plan reuse across connections, batched pipelining,
+real Describe replies, binary parameter formats) were missing.
+v6.3 fills them in.
+
+The whole extended-query surface stays in-house: 0 external
+dependencies (even at dev-dep level — v6.3.5 hand-rolls
+real-client-shaped workloads instead of pulling tokio-postgres),
+no `unsafe`, WAL format unchanged from v6.0.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.3.0 | Engine plan cache (256-entry LRU) — hit path ≤ 1/3 of cold, **6.8× speedup** measured |
+| 6.3.1 | Plan cache invalidation on ANALYZE / CREATE INDEX / ALTER INDEX |
+| 6.3.2 | Pipelined query mode — server-side response buffering, **6.7× speedup** at batch=16 |
+| 6.3.3 | Describe statement pre-Execute — RowDescription + ParameterDescription |
+| 6.3.4 | Binary parameter format — 9 PG types (BOOL/INT/BIGINT/REAL/DOUBLE/TEXT/BYTEA/TIMESTAMP/NUMERIC) |
+| 6.3.5 | Client compatibility e2e (real-client-shaped workloads) |
+| 6.3.6 | series ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.3 target | measured |
+|--------|------------:|---------:|
+| Prepared statement reuse: 2nd Execute vs 1st | ≤ 1/3 | ✅ ≈ 0.15 (6.8× speedup) |
+| Pipelined batch: N Execute amortised vs single | ≤ 1.3 × | ✅ ≈ 0.15 (6.7× speedup at batch=16) |
+| Describe statement RowDescription | byte-correct for simple SELECT | ✅ |
+| Binary param decode coverage | 9 declared types | ✅ all 9 + DATE / int2 / varchar / timestamptz |
+| ANALYZE-driven plan invalidation lag | synchronous | ✅ same-transaction eviction |
+| sqllogictest 4-corpus regression | 100 % | ✅ 372/372 |
+
+### Frozen surfaces added in v6.3
+
+- `Engine::prepare_cached(sql) -> Result<Statement, ParseError>`
+- `Engine::plan_cache()` / `plan_cache_mut()` accessors
+- `Engine::describe_prepared(stmt) -> (Vec<u32>, Vec<ColumnSchema>)`
+- `Statistics::version()` / `Statistics::bump_version()`
+- `PreparedPlan { stmt, statistics_version, source_tables,
+  describe_columns }`
+- `PlanCache::get` / `insert` / `evict` / `evict_referencing` /
+  `get_snapshot`
+- Pgwire Describe statement reply shape: ParameterDescription +
+  (RowDescription | NoData)
+- Pgwire Bind binary-format dispatch by parameter OID
+
+### Known v6.3 limitations (carved out, NOT deferred)
+
+- **Server-side cursor / partial Execute** — PG `Execute(E, row_max)`
+  returns a prefix; subsequent Execute resumes. SPG returns the
+  whole result set on the first Execute. Out of v6.x.
+- **Extended-query COPY** — PG `COPY` via Parse + Bind + Execute.
+  SPG keeps COPY simple-query-only. Out of v6.x.
+- **Binary result format** — Bind result-format=1 returning binary
+  rows. v6.3.4 covers binary INPUT only; output stays text.
+- **JOIN-shape Describe** returns NoData. v6.3.3 covers simple
+  SELECT; multi-table FROM falls through to NoData (drivers
+  tolerate).
+- **Per-statement-cache TTL**. Invalidation is schema / stats only,
+  same as PG. Out of v6.x.
+- **Docker-compose multi-language client compat suite**
+  (rust-postgres / sqlx / pgx / psycopg3 containers).
+  v6.3.5 ships hand-rolled real-client-shaped workloads instead
+  because adding 4 language toolchains conflicts with the
+  workspace 0-deps rule. Picked up if a user reports client-
+  specific incompatibility.
+
+---
+
 ## [6.2] — 2026-06-03 (optimizer foundation series — release roll-up)
 
 v6.2 closes the **third gap** from the PG-19 audit: statistics-

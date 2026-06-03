@@ -795,6 +795,72 @@ WAIT FOR WAL POSITION <pos> WITH TIMEOUT <ms>
   stays at 0 and `WAIT FOR WAL POSITION 0` returns immediately.
   Larger targets block until the optional timeout fires.
 
+### PG-wire extended query finish (v6.3 series)
+
+v6.3 closes the eleventh-gap cluster from the PG-19 audit — the
+PG-wire extended-query protocol that JDBC / sqlx / pgx /
+psycopg3 actually drive. The series finishes what v6.1.1
+started: engine-level plan cache, pipelined response buffering,
+Describe statement pre-Execute returning real RowDescription,
+and binary parameter-format dispatch by OID. Frozen surfaces
+below.
+
+#### Frozen surfaces (added v6.3.x)
+
+- `Engine::prepare_cached(sql) -> Result<Statement, ParseError>`
+  — engine-level LRU plan cache (256-entry cap). Hit returns a
+  cloned `Statement`; miss runs `prepare()` + inserts. Used by
+  pgwire `handle_parse` so cross-session repeated Parse hits the
+  cache.
+- `Engine::describe_prepared(stmt) -> (Vec<u32>, Vec<ColumnSchema>)`
+  — describe a prepared `Statement` without executing. Returns
+  (param OIDs vec of zeros, output column shape vec). Empty
+  column shape = "NoData" semantics for pgwire wire reply.
+- `Statistics::version()` / `Statistics::bump_version()` — monotonic
+  counter bumped by every successful ANALYZE. Plan cache uses it
+  to evict stale entries.
+- Pgwire Describe statement reply shape:
+  `ParameterDescription { count: u16, oids: [u32; count] }`
+  + `RowDescription | NoData`. Simple SELECT with a single
+  FROM clause emits RowDescription; JOIN / non-SELECT degrade
+  to NoData (drivers tolerate). The Describe portal reply is
+  `RowDescription | NoData` (no ParameterDescription — that's
+  on the underlying statement).
+- Pgwire Bind binary-format dispatch by parameter OID:
+  - 16 BOOL, 17 BYTEA, 20 BIGINT, 21 INT2, 23 INT, 25 TEXT
+  - 700 REAL, 701 DOUBLE, 1043 VARCHAR
+  - 1082 DATE, 1114 TIMESTAMP, 1184 TIMESTAMPTZ
+  - 1700 NUMERIC (variable-precision packed-digit)
+  Per-param format codes supported (0 codes → all text; 1 code
+  → applies to all; N codes → per-param). Binary RESULT format
+  not implemented in v6.3 — drivers requesting binary results
+  get text (matches the v6.1.1 behaviour).
+
+#### Out of scope for v6 (carved out — not deferred)
+
+- **Server-side cursor / partial Execute**: PG `Execute(E, row_max)`
+  returns a result-set prefix; subsequent Execute on the same
+  portal resumes. SPG returns the whole set on the first Execute.
+  Not deferred — out of v6.x.
+- **COPY in extended-query mode**: PG allows `COPY` through Parse
+  + Bind + Execute. SPG keeps COPY simple-query-only. Out of v6.x.
+- **Binary result format**: Bind result-format=1 returning binary
+  rows. v6.3.4 covers binary INPUT only; output stays text. The
+  driver-side cost of text→typed is negligible vs the v6.3.0
+  cache + v6.3.2 pipelining wins. Out of v6.3.
+- **JOIN-shape Describe**: multi-table SELECT FROM falls through to
+  NoData rather than synthesizing the joined RowDescription. Out
+  of v6.3.
+- **Per-statement-cache TTL**: PG inherits no time-based plan
+  TTL; invalidation is schema / stats only. Same for SPG. Out of
+  v6.x.
+- **Docker-compose multi-language client compat suite** (rust-
+  postgres / sqlx / pgx / psycopg3 via pinned-digest containers).
+  v6.3.5 ships hand-rolled real-client-shaped workloads instead
+  because adding 4 language toolchains conflicts with the
+  workspace 0-deps rule. Out of v6.3 — picked up as a v6.x lane
+  if a user reports client-specific incompatibility.
+
 ### Optimizer foundation (v6.2 series)
 
 v6.2 closes the third gap from the PG-19 audit — statistics-
