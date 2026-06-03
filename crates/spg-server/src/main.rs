@@ -129,6 +129,13 @@ struct Limits {
     /// so a stuck server thread can't hold the connection open
     /// past the budget either.
     query_timeout_ms: Option<u64>,
+    /// v6.10.1 — `SPG_MAX_QUERY_NS` per-query CPU/wall budget in
+    /// nanoseconds. Finer-grained than `query_timeout_ms` (1ms
+    /// resolution): a 250µs query budget surfaces as 250000 ns
+    /// here, whereas `_MS` rounds to 1 ms. When both envs are
+    /// set, the *tighter* effective deadline wins. Defaults to
+    /// `None` (no budget, same as the legacy path).
+    max_query_ns: Option<u64>,
     /// v4.5: close a connection that has been idle (no incoming
     /// frame) for this many seconds. Implemented via the OS
     /// read timeout on the TCP socket — when `read()` returns
@@ -518,6 +525,7 @@ fn main() {
         max_query_rows: parse_env_usize("SPG_MAX_QUERY_ROWS"),
         max_query_bytes: parse_env_u64("SPG_MAX_QUERY_BYTES"),
         query_timeout_ms: parse_env_u64("SPG_QUERY_TIMEOUT_MS"),
+        max_query_ns: parse_env_u64("SPG_MAX_QUERY_NS"),
         idle_timeout_sec: parse_env_u64("SPG_IDLE_TIMEOUT_SEC"),
         slow_query_log_ms: parse_env_u64("SPG_SLOW_QUERY_LOG_MS"),
         wal_min_free_bytes: parse_env_u64("SPG_WAL_MIN_FREE_BYTES"),
@@ -3708,7 +3716,24 @@ impl Watchdog {
 
 fn spawn_query_watchdog(state: &ServerState, cancel_flag: &Arc<AtomicBool>) -> Watchdog {
     let completed = Arc::new(AtomicBool::new(false));
-    let Some(budget_ms) = state.limits.query_timeout_ms else {
+    // v6.10.1 — pick the tighter of `query_timeout_ms` and
+    // `max_query_ns` (converted to a Duration). `None` from one
+    // side defers to the other; both `None` → no budget.
+    let timeout_dur = state
+        .limits
+        .query_timeout_ms
+        .map(std::time::Duration::from_millis);
+    let cpu_dur = state
+        .limits
+        .max_query_ns
+        .map(std::time::Duration::from_nanos);
+    let total = match (timeout_dur, cpu_dur) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let Some(total) = total else {
         return Watchdog { completed };
     };
     let cancel_flag = Arc::clone(cancel_flag);
@@ -3716,9 +3741,10 @@ fn spawn_query_watchdog(state: &ServerState, cancel_flag: &Arc<AtomicBool>) -> W
     thread::spawn(move || {
         // Sleep in short slices so a finished query reclaims the
         // watchdog quickly (avoids piling up parked threads when
-        // SPG_QUERY_TIMEOUT_MS is high but queries are usually fast).
-        let total = std::time::Duration::from_millis(budget_ms);
-        let slice = std::time::Duration::from_millis(50.min(budget_ms));
+        // the budget is high but queries are usually fast). v6.10.1
+        // shortens the slice to 100µs ceiling so sub-ms budgets
+        // (via SPG_MAX_QUERY_NS) fire on time.
+        let slice = (total / 50).max(std::time::Duration::from_micros(100));
         let start = std::time::Instant::now();
         while start.elapsed() < total {
             if completed_for_thread.load(Ordering::Acquire) {
