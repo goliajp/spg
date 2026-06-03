@@ -8,6 +8,72 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.9] — 2026-06-04 (PG migration P0 unblock)
+
+Closes the six P0 blockers from the mailrs SPG-compat audit.
+Any PG schema that uses {JSONB, TIMESTAMPTZ, BIGSERIAL+RETURNING,
+ON CONFLICT} now restores into SPG without application-side
+rewrites.
+
+What lands:
+
+- **JSONB** with PG-wire OID **3802** (vs JSON OID 114). sqlx
+  / pgx / JDBC clients binding `jsonb`-typed parameters decode
+  without registering a custom type. Storage layout identical
+  to JSON (text-backed); only the type tag + wire OID differ.
+- **TIMESTAMPTZ** with PG-wire OID **1184**. Internally stores
+  microseconds-since-epoch UTC (same as PG). Choosing TIMESTAMPTZ
+  over TIMESTAMP just routes the wire OID so tz-aware decoders
+  pick the right path.
+- **INSERT / UPDATE / DELETE … RETURNING** — real DataRow
+  stream. The v6.x ⚠️ "row return TBD" placeholder is gone.
+  mailrs' IMAP UID monotonic-alloc pattern works as written.
+- **SERIAL / BIGSERIAL / SMALLSERIAL** keyword aliases mapping
+  to `INT/BIGINT/SMALLINT NOT NULL AUTO_INCREMENT`.
+- **ON CONFLICT (col) DO NOTHING** with BTree-fast-path conflict
+  resolution + within-batch dedup.
+- **ON CONFLICT (col) DO UPDATE SET … EXCLUDED.col** including
+  mixed `tbl.col + EXCLUDED.col` expressions, optional `WHERE`,
+  and `RETURNING` over the post-update row.
+- **Composite ON CONFLICT** `(uid, calendar_id)` for CalDAV /
+  CardDAV upsert.
+
+50 new e2e engine tests + 9 parser tests + 6 sqlx-against-pgwire
+smoke tests (`xtests/sqlx-pgwire`, ignored by default).
+
+A7 narrowed: `ON CONFLICT DO UPDATE` was originally on the
+"won't do" list. The mailrs feedback (47 sites) was the
+load-bearing data; PG's complexity around ON CONFLICT is the
+concurrent-write race, and SPG's single-writer model collapses
+that to a BTree-seek-then-branch — simpler than PG's. Remaining
+A7 items (triggers, stored procs, RLS, multi-writer MVCC,
+multi-master, pg_hba) are structural non-goals and stay out.
+
+Storage format: catalog FILE_VERSION 14. New tags 16 (JSONB,
+body == Json) and 17 (TIMESTAMPTZ, body == Timestamp). v13
+catalogs continue to load.
+
+Sub-versions:
+
+  v7.9.0   JSONB type tag + OID 3802
+  v7.9.1   JSONB e2e + PG_MIGRATION data-type table
+  v7.9.2   TIMESTAMPTZ keyword + OID 1184
+  v7.9.4   RETURNING engine path
+  v7.9.6   SERIAL / BIGSERIAL aliases
+  v7.9.7   ON CONFLICT parser + AST
+  v7.9.8   ON CONFLICT DO NOTHING execution
+  v7.9.9   ON CONFLICT DO UPDATE SET (EXCLUDED) + RETURNING
+  v7.9.10  ON CONFLICT composite target
+  v7.9.11  sqlx-pgwire integration smoke suite
+  v7.9.12  series ship rollup + tag + docker + crates.io
+
+This closes the blocker list in
+`.claude/notes/mailrs-migration-feedback.md`. Remaining items
+(native BYTES type, TEXT[] arrays, async spg-embedded pool)
+slip to v7.10+.
+
+---
+
 ## [7.8] — 2026-06-03 (crates.io publish + spg-server docs)
 
 First public crates.io release. All ten crates now resolve
