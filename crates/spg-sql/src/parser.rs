@@ -1776,13 +1776,132 @@ impl Parser {
                 break;
             }
         }
+        let on_conflict = self.parse_optional_on_conflict()?;
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Insert(InsertStatement {
             table,
             columns,
             rows,
+            on_conflict,
             returning,
         }))
+    }
+
+    /// v7.9.7 — parse the optional `ON CONFLICT (cols) DO …`
+    /// clause sitting between the INSERT body and the trailing
+    /// RETURNING. All keywords come in as bare idents; `ON` is
+    /// a reserved Token though.
+    fn parse_optional_on_conflict(
+        &mut self,
+    ) -> Result<Option<crate::ast::OnConflictClause>, ParseError> {
+        if !matches!(self.peek(), Token::On) {
+            return Ok(None);
+        }
+        // Peek further: we want exactly "ON CONFLICT ...". If the
+        // next ident isn't "conflict", let some other parser handle.
+        let next_is_conflict = matches!(
+            self.tokens.get(self.pos + 1),
+            Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("conflict")
+        );
+        if !next_is_conflict {
+            return Ok(None);
+        }
+        self.advance(); // ON
+        self.advance(); // CONFLICT
+        // Optional `(col [, col]*)` target list.
+        let mut target_columns: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                target_columns.push(self.expect_ident_like()?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ')' in ON CONFLICT target list, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        // Required `DO`.
+        match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do") => {}
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected DO after ON CONFLICT [(…)], got {other:?}"
+                )));
+            }
+        }
+        // Action: NOTHING | UPDATE SET …
+        let action = match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("nothing") => {
+                crate::ast::OnConflictAction::Nothing
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
+                self.parse_on_conflict_update_action()?
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected NOTHING or UPDATE after ON CONFLICT DO, got {other:?}"
+                )));
+            }
+        };
+        Ok(Some(crate::ast::OnConflictClause {
+            target_columns,
+            action,
+        }))
+    }
+
+    /// v7.9.7 — tail of `ON CONFLICT … DO UPDATE`: parse
+    /// `SET col = expr [, …] [WHERE cond]`. Caller already
+    /// consumed `UPDATE`.
+    fn parse_on_conflict_update_action(
+        &mut self,
+    ) -> Result<crate::ast::OnConflictAction, ParseError> {
+        // `SET`
+        match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("set") => {}
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected SET after ON CONFLICT DO UPDATE, got {other:?}"
+                )));
+            }
+        }
+        let mut assignments: Vec<(String, Expr)> = Vec::new();
+        loop {
+            let col = self.expect_ident_like()?;
+            if !matches!(self.peek(), Token::Eq) {
+                return Err(self.err(alloc::format!(
+                    "expected `=` after column in ON CONFLICT DO UPDATE SET, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let value = self.parse_expr(0)?;
+            assignments.push((col, value));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let where_ = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        Ok(crate::ast::OnConflictAction::Update {
+            assignments,
+            where_,
+        })
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParseError> {

@@ -500,8 +500,40 @@ pub struct InsertStatement {
     /// One or more `(expr, expr, ...)` tuples — the multi-row VALUES form.
     /// v1.3+ accepts `INSERT INTO t VALUES (a), (b)`.
     pub rows: Vec<Vec<Expr>>,
+    /// v7.9.7 — `ON CONFLICT (cols) DO { NOTHING | UPDATE SET … }`
+    /// upsert clause. None = legacy INSERT (conflict raises a
+    /// DuplicateKey error). mailrs migration blocker #2.
+    pub on_conflict: Option<OnConflictClause>,
     /// v7.9.4 — `RETURNING <projection>`.
     pub returning: Option<Vec<SelectItem>>,
+}
+
+/// v7.9.7 — INSERT upsert clause: `ON CONFLICT (target) DO action`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflictClause {
+    /// Local columns that identify the conflict (must match a
+    /// UNIQUE / PRIMARY KEY index on the target table). Empty
+    /// list means the user wrote `ON CONFLICT DO …` without a
+    /// target — engine picks the table's first BTree index by
+    /// convention.
+    pub target_columns: Vec<String>,
+    /// The action on conflict.
+    pub action: OnConflictAction,
+}
+
+/// v7.9.7 — action on conflict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflictAction {
+    /// `DO NOTHING` — INSERT proceeds for non-conflicting rows,
+    /// silently skips conflicting ones.
+    Nothing,
+    /// `DO UPDATE SET col = expr [, …] [WHERE cond]`. `assignments`
+    /// may reference `EXCLUDED.col` to read the incoming row's
+    /// value (engine wires `EXCLUDED` as a virtual table).
+    Update {
+        assignments: Vec<(String, Expr)>,
+        where_: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
