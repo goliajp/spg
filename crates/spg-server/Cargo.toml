@@ -5,6 +5,7 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
+readme       = "README.md"
 description  = "SPG daemon — listens for self-built wire-frame connections and PG-wire (libpq-compatible)."
 repository   = { workspace = true }
 categories   = ["database-implementations", "network-programming"]
@@ -15,19 +16,19 @@ name = "spg-server"
 path = "src/main.rs"
 
 [dependencies]
-spg-wire    = { path = "../spg-wire" }
+spg-wire     = { workspace = true }
 # v6.1.1: pgwire's Extended Query path stores the parsed AST in
 # the prepared-statement cache (`spg_sql::ast::Statement`), so
 # spg-server depends on spg-sql directly. Pre-v6.1.1 only used
 # the engine's opaque `execute(sql)` API.
-spg-sql     = { path = "../spg-sql" }
-spg-engine  = { path = "../spg-engine" }
-spg-storage = { path = "../spg-storage" }
-spg-audit   = { path = "../spg-audit" }
-spg-crypto  = { path = "../spg-crypto" }
+spg-sql      = { workspace = true }
+spg-engine   = { workspace = true }
+spg-storage  = { workspace = true }
+spg-audit    = { workspace = true }
+spg-crypto   = { workspace = true }
 # v7.1 — manifest format extracted into a standalone crate so
 # spg-embedded can read + write the same bytes spg-server does.
-spg-manifest = { path = "../spg-manifest" }
+spg-manifest = { workspace = true }
 # v4.33 ops three-pack uses POSIX FFI for:
 #   - signal(SIGTERM/SIGINT) to drive graceful shutdown
 #   - statvfs(2) to compute WAL volume free space for the disk water-mark
@@ -36,7 +37,7 @@ spg-manifest = { path = "../spg-manifest" }
 libc        = "0.2"
 
 [dev-dependencies]
-spg-audit   = { path = "../spg-audit" }
+spg-audit   = { workspace = true }
 # v4.33: e2e_graceful_shutdown sends SIGTERM via kill(2) — the
 # child-process abstraction defaults to SIGKILL which would
 # bypass the drain path under test.

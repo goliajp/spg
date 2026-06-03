@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "7.7.8"
+version      = "7.8.0"
 edition      = "2024"
 rust-version = "1.95"
 authors      = ["lihao <lihao@golia.jp>"]
@@ -29,6 +29,18 @@ repository   = "https://github.com/lihao/spg"
 # percentages between minor releases.
 [workspace.dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# v7.8.1 — internal crates declared once here so `cargo publish` sees
+# `version = "X.Y"` alongside the `path = …`. crates.io strips paths
+# and uses the version; `path` keeps local development from going via
+# the registry. All ten crates share the workspace version.
+spg-wire     = { path = "crates/spg-wire",     version = "7.8" }
+spg-crypto   = { path = "crates/spg-crypto",   version = "7.8" }
+spg-sql      = { path = "crates/spg-sql",      version = "7.8" }
+spg-storage  = { path = "crates/spg-storage",  version = "7.8" }
+spg-audit    = { path = "crates/spg-audit",    version = "7.8" }
+spg-manifest = { path = "crates/spg-manifest", version = "7.8" }
+spg-engine   = { path = "crates/spg-engine",   version = "7.8" }
+spg-embedded = { path = "crates/spg-embedded", version = "7.8" }
 
 [workspace.lints.rust]
 # v3.0.4: relaxed from `forbid` to `deny` so spg-crypto can drop into
