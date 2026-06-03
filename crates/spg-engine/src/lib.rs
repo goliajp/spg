@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod eval;
 pub mod json;
 pub mod publications;
+pub mod selectivity;
 pub mod statistics;
 pub mod subscriptions;
 pub mod users;
@@ -5175,7 +5176,7 @@ fn render_histogram_bounds(bounds: &[alloc::string::String]) -> alloc::string::S
 /// reach this only via a non-Vector column (vector columns are
 /// skipped upstream); they fall back to a Debug-derived form so
 /// stats still serialise without crashing.
-fn canonical_value_repr(v: &Value) -> alloc::string::String {
+pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
     match v {
         Value::Null => "NULL".to_string(),
         Value::SmallInt(n) => alloc::format!("{n}"),

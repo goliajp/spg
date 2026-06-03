@@ -10,6 +10,76 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.2] — 2026-06-03 (selectivity functions)
+
+Third v6.2.x sub-version. Library-only addition: selectivity
+estimation helpers the v6.2.3 JOIN reorder pass + v6.2.4 EXPLAIN
+ANALYZE will consume. Read-only side effect — no SQL surface
+change, no runtime hook.
+
+### Added
+
+- New module `spg_engine::selectivity` with five fraction-
+  returning functions, each in `[1e-6, 1.0]`:
+    - `equal(stats, value)` — keyed off `n_distinct` for in-
+      histogram-range values; extrapolates 1/10 down for
+      out-of-range. PG-default `0.005` when stats are absent.
+    - `range(stats, low, high, lo_incl, hi_incl)` — histogram
+      walk via `O(log n_buckets)` binary search. Defaults to
+      `0.333` (open range) or `0.005` (both-bounded) when no
+      stats; matches PG.
+    - `between(stats, low, high)` — convenience for inclusive
+      double-bounded shape.
+    - `in_list(stats, values)` — per-value equality sum, capped
+      at 1.0.
+    - `like_prefix(stats, prefix)` — string-range estimation
+      using a `prefix\u{10FFFF}` upper bound. PG-default
+      `0.005` without stats.
+- `fraction_le_value` + `value_cmp_str` histogram-walk
+  primitives. Type-aware compare against canonical-form
+  bounds (Int parses as i64, Float as f64, Text lex,
+  Date/Timestamp via ISO-lex which sorts correctly).
+
+### Constants frozen in this commit
+
+- `DEFAULT_EQ = 0.005`, `DEFAULT_RANGE = 0.333`,
+  `DEFAULT_BETWEEN = 0.005`, `DEFAULT_LIKE = 0.005`,
+  `MIN_SELECTIVITY = 1e-6`. v6.2.x can re-tune via constant
+  changes; they're internal — no SQL surface.
+
+### Tests
+
+- `spg-engine::selectivity` lib (11 tests, gate said 10 —
+  added a `null_frac_reduces_selectivity_proportionally`
+  smoke for completeness):
+    - No-stats path returns PG defaults
+    - Equal: in-range uses `1/n_distinct`; out-of-range
+      extrapolates down
+    - Range: open-both, half-range, inverted (returns
+      MIN_SELECTIVITY)
+    - Between: subrange matches bucket share
+    - In-list: sums + clamps + empty list returns
+      MIN_SELECTIVITY
+    - Like-prefix: estimates range share for any TEXT prefix
+    - `null_frac` reduces selectivity proportionally
+
+### Not changed
+
+- Snapshot envelope, SQL surface, parser, replication, WAL.
+- Engine dispatch — the planner doesn't yet *call* these
+  helpers; v6.2.3 wires JOIN reorder to consume them.
+
+### Out of v6.2.2 (deferred to later v6.2.x — NOT v7)
+
+- JOIN reorder using these selectivities — v6.2.3.
+- Subquery / EXISTS selectivity estimation — v6.2.x
+  follow-up (not in the original v6.2 design but a natural
+  extension once range / equal are in).
+- Histogram-aware extrapolation for cross-column predicates —
+  same-minor follow-up.
+
+---
+
 ## [6.2.1] — 2026-06-03 (auto-analyze background trigger)
 
 Second v6.2.x sub-version. Wires the engine's modified-row
