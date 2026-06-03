@@ -5,7 +5,9 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
-description  = "v6.10.3 — ergonomic embedded-mode entry point for SPG. Wraps spg-engine + spg-storage for in-process use, no TCP listener, no WAL fsync. The typed-query API and derive macro are STABILITY carve-outs for v6.10."
+readme       = "README.md"
+repository   = { workspace = true }
+description  = "Embedded SQL database for Rust. Single-writer, WAL-backed, crash-safe. Zero external dependencies. PG-flavoured SQL with FOREIGN KEY, JOINs, vectors (HNSW/pgvector ops), and a cold tier."
 
 [dependencies]
 spg-engine  = { path = "../spg-engine" }
