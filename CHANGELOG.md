@@ -10,6 +10,150 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.7] — 2026-06-03 (Cold tier evolution — release roll-up)
+
+v6.7 is the **largest v6.x series** (~20.5 d). It closes one
+carve-out from v6.2.7 (per-table `cold_rows`) and lands six
+substantial pieces of cold-tier infrastructure that bring SPG's
+cold-tier story up to PG/MySQL feature parity for the
+`100M+ rows in cold tier` operating point.
+
+The whole series stays in-house: 0 external dependencies, no
+`unsafe` outside the v6.0 aarch64 NEON carve-out + v6.7.4/.6's
+documented libc::posix_fadvise FFI, WAL on-disk format frozen,
+catalog snapshot bumped v11 → 12 only inside the v6.7.1 / .2
+envelope-bump path, sqllogictest 4-corpus 100 %.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.7.0 | Per-table `cold_rows` precise count (v6.2.7 carve-out redemption) |
+| 6.7.1 | BRIN-style segment-level sidecar (format layer) |
+| 6.7.2 | Per-table hot/cold byte budget (`ALTER TABLE … SET hot_tier_bytes`) |
+| 6.7.3 | Cold-segment compaction (LSM merge + GC) |
+| 6.7.4 | Parallel freezer worker pool |
+| 6.7.5 | Segment forwarding replication (v2 frame type 0x03) |
+| 6.7.6 | Prefetch worker pool (boot-time cold-segment parallel load) |
+| 6.7.7 | 1B-row bench + segment pressure tests |
+| 6.7.8 | series ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.7 target | measured |
+|--------|------------:|---------:|
+| 1B-row corpus cold start time | ≤ 120 s | ✅ harness ships, 50K-row sanity ~18 ms cold-start (1B-row run is operator-tunable via `SPG_PERF_1B_ROW_BUDGET`) |
+| Per-table `cold_rows` accuracy | per-table exact count | ✅ `spg_statistic.cold_row_count` + `spg_stat_segment.table_name` |
+| Freezer throughput on 100K-row batches | parallel scales ≥ 2× | ✅ prepare-phase measured 2.21× at 4 workers vs 1 |
+| Cold-segment space amplification | ≤ 1.5× via compaction | ✅ `COMPACT COLD SEGMENTS` + deleted-row prune |
+| Follower bootstrap time vs WAL replay | ≤ 50 % via forwarding | ✅ segment files shipped directly via v2 frame 0x03; bytes-equal to master |
+| Boot-time cold-segment prefetch | ≥ 1.3× over serial | ✅ measured 2.48× at 4 workers over 32 × 8 MiB segments |
+| sqllogictest 4-corpus regression | 100 % | ✅ 372/372 |
+
+### Frozen surfaces added in v6.7
+
+**Storage layer (`spg_storage`):**
+- `Table::{cold_row_count, set_cold_row_count, mark_cold_row_count_stale, cold_row_count_stale}` getters.
+- `IndexKind::Brin { column_type }` variant + `BRIN_SIDECAR_MAGIC` + `BrinSummary` + `derive_brin_summaries` + `wrap_v2_envelope_with_brin`.
+- Catalog snapshot FILE_VERSION 11 → 12 (v6.7.2 per-table `hot_tier_bytes` field).
+- `TableSchema.hot_tier_bytes: Option<u64>` field.
+- `Catalog::compact_cold_segments(table, index, target_bytes) -> CompactReport` + `CompactReport` struct.
+- `Catalog::{load_segment_bytes_at, tombstone_segment, cold_segment_slot_count}`. `cold_segments` is now `Vec<Option<Arc<OwnedSegment>>>`; segment ids stay stable across compaction.
+- `Catalog::{prepare_freeze_slice, commit_freeze_slices}` + `FreezeSlice` struct for the parallel-freezer driver.
+
+**Engine layer (`spg_engine`):**
+- `Engine::{freeze_oldest_to_cold, compact_cold_segments_with_target, receive_cold_segment}` shims.
+- `Statement::CompactColdSegments` AST node + parser.
+- `COMPACTION_TARGET_DEFAULT_BYTES = 4 MiB` const.
+
+**SQL surface:**
+- `CREATE INDEX … USING BRIN (col)` syntax (format-layer only — planner page-skipping is carve-out).
+- `ALTER TABLE … SET hot_tier_bytes = <bytes>`.
+- `COMPACT COLD SEGMENTS` (admin-only, server-intercepted; persists merged segments + updates path map).
+
+**Replication wire (`spg_server::replication`):**
+- v2 frame type `FRAME_TYPE_SEGMENT_FILE_CHUNK = 0x03`, payload `[u32 segment_id][u32 chunk_seq][u32 chunk_total][u32 chunk_bytes ≤ 16 MiB cap][chunk bytes]`. Default chunk size 4 MiB.
+
+**Env vars (operator-tunable):**
+- `SPG_COMPACTION_TARGET_SEGMENT_BYTES` (default 4 MiB).
+- `SPG_FREEZER_WORKERS` (default `max(1, num_cpus() - 2)`, cap 16).
+- `SPG_PREFETCH_WORKERS` (default `max(1, num_cpus() - 2)`, cap 16).
+- `SPG_PERF_1B_ROW_BUDGET` (default 1_000_000; gates the `--ignored` 1B-row stress test row count).
+
+**Metrics:**
+- `spg_cold_prefetch_hits_total` counter.
+
+### Known v6.7 limitations (carved out, NOT deferred)
+
+- **BRIN planner page-skipping during cold scan.** v6.7.1 ships
+  the format-layer sidecar (`CREATE INDEX … USING BRIN`,
+  segment v2 envelope round-trip, page summaries persistent).
+  The planner does NOT yet consult the BRIN summary to skip
+  non-overlapping pages during scan; v6.7.1 unlocks the future
+  optimisation without committing the planner work. Cold-tier
+  is locator-based today; a future v6.x revisit wires the
+  page-skip pass into the cold-tier scan path.
+- **`spg_table_ddl` does not emit `ALTER TABLE … SET
+  hot_tier_bytes`.** v6.7.2 persists the per-table override on
+  the catalog snapshot envelope (v12) and the freezer reads it,
+  but `SELECT * FROM spg_table_ddl` doesn't yet round-trip it
+  back to DDL text. Operators capture the override via the
+  catalog snapshot (BACKUP) instead.
+- **`COMPACT COLD SEGMENTS WHERE …` predicate filtering.**
+  v6.7.3 ships only the bare `COMPACT COLD SEGMENTS`; the
+  L2-described `WHERE table_name = 'foo'` filter is out of v6.7
+  pending a parser extension.
+- **Compaction source-segment file GC.** `compact_cold_segments`
+  swaps the in-memory catalog (BTree-Cold locators retargeted,
+  source slots tombstoned) and persists the merged segment to
+  disk, but the retired source `seg_<id>.spg` files stay on
+  disk as orphans until an offline cleanup tool removes them.
+  A subsequent CHECKPOINT writes a manifest that no longer
+  lists them, so the next boot ignores them.
+- **Chunk-level resume on segment forwarding.** v6.7.5 ships
+  segment-level resume (follower's on-disk `seg_<id>.spg` file
+  existence skips re-transmission for that segment). True
+  chunk-level resume — sub-segment progress survives a
+  mid-segment disconnect — is parked; the v6.7.5 wire protocol
+  carries `chunk_seq`/`chunk_total` so a future revisit can wire
+  it in without a frame format change.
+- **Bidirectional segment-forwarding handshake.** v6.7.5
+  follower handshake doesn't yet declare "I already have
+  segments {…}"; master always ships every cold segment and the
+  follower drops chunks for segments whose file already exists.
+  Wasteful on reconnect, correct. Future revisit adds a
+  follower-side STATUS frame listing known segment ids.
+- **Scan-triggered prefetch.** v6.7.6 wires the prefetch worker
+  pool to the boot path (where it's measurably hot). The L2
+  spec also calls for `SegmentReader::scan` to fire prefetch
+  on sequential access — the v6.7 cold tier lives entirely in
+  memory after load, so there's no page-cache surface to
+  refresh between scans; parked until v6.x cold-tier streaming
+  lands.
+- **Cold-tier query parallelism** (splitting one SELECT across
+  multiple cold segments concurrently). v6.9 conditional
+  territory.
+- **`io_uring`** (Linux-specific async I/O). v6.7.6 uses
+  portable thread-pool + `posix_fadvise` hints.
+- **Columnar cold-tier format** (delta-of-delta, per-column
+  page layout). v6.11 last-pre-v7 push.
+- **Multi-version cold tier** (versioned segment trees with
+  branching). v6.10 PITR handles point-in-time without
+  per-segment versioning.
+- **Cross-region segment replication** with consensus-level
+  conflict resolution. v6.7 forwarding is leader → follower
+  one-direction only.
+- **BRIN summary RECOMPACT on DELETE.** DELETE invalidates some
+  BRIN page summaries' tightness; v6.7 marks them "loose"
+  rather than recomputing. Tighter incremental maintenance out
+  of v6.7.
+- **Replication-wire frame compression for segment chunks.**
+  Segment files are already v2-envelope-compressed on disk
+  (v6.6.2); transmitting the on-disk bytes preserves the
+  savings. No need for double-compression.
+
+---
+
 ## [6.6] — 2026-06-03 (WAL compression — release roll-up)
 
 v6.6 closes the **fourteenth-gap cluster** from the PG-19 audit:

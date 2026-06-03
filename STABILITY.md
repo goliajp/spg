@@ -1400,6 +1400,139 @@ snapshots regardless of insertion order.
 
 ---
 
+### Cold tier evolution (v6.7 series)
+
+The v6.7 series adds the parts of the cold-tier story that the
+v5.x / v6.[0-6] foundation skipped: per-table accounting, BRIN
+sidecar format, per-table budget override, segment compaction,
+parallel freezer, segment forwarding, and a boot-time prefetch
+worker pool. The following surfaces are frozen as of v6.7.8.
+
+**Catalog snapshot envelope** — `FILE_VERSION = 12` (v6.7.2
+bump). Layout extension is append-only:
+- After the per-table `indices` section (unchanged) comes:
+- `[u8 has_value][u64 LE value (if has_value)]` for the
+  per-table `hot_tier_bytes: Option<u64>`.
+
+v10 / v11 snapshots load unchanged via version-dispatch in
+`Catalog::deserialize`. v6.7.0 / v6.7.1 binaries refuse v12
+snapshots loudly at the version check.
+
+**Catalog cold-segment surface** — `Catalog::cold_segments` is
+now `Vec<Option<Arc<OwnedSegment>>>` (v6.7.3). `None` slots are
+compaction tombstones; segment_id stays stable across compaction
+so on-disk `RowLocator::Cold { segment_id }` always resolves.
+New public APIs:
+- `Catalog::load_segment_bytes_at(target_id, bytes)` — register
+  a segment at a specific id, padding sparse slots with `None`.
+- `Catalog::tombstone_segment(segment_id)` — flip an active
+  slot to `None`.
+- `Catalog::cold_segment_slot_count()` — slot count including
+  tombstones (next allocatable id).
+- `Catalog::cold_segment_count()` returns the *active* count
+  (skips tombstones). v6.7 readers see sparse cold-segment
+  layouts; v6.6- binaries refuse the format because the
+  `Option`-wrapped vec serialises through a v12 catalog only.
+
+**Segment v2 envelope BRIN sidecar** (v6.7.1) — the v2 magic
+`SPGSEG\x02\x00` body now optionally carries a BRIN per-page
+summary prefix:
+```text
+[u32 brin_section_len]
+[BRIN entries: page_count × 21 bytes each]
+[u32 page_index][u8 sentinel = 0x01]
+[i64 LE min_key][i64 LE max_key]
+[v1 segment body (compressed with the envelope's algo)]
+```
+Empty `brin_section_len` (= 0) means "no sidecar"; the parser
+short-circuits and the body decodes byte-identically to a v2
+envelope without sidecar. Older v2 segments load unchanged.
+
+**`IndexKind` tag bytes** (v6.7.1):
+- 0 = `BTree` (unchanged)
+- 1 = `Nsw` (unchanged)
+- 2 = `Brin { column_type }` — body `[u8 column_type]`. Single
+  column only; the BRIN data itself lives in cold segments, not
+  the catalog snapshot.
+
+**v2 replication frame type `0x03 = SEGMENT_FILE_CHUNK`**
+(v6.7.5):
+```text
+[u32 LE segment_id]
+[u32 LE chunk_seq    ]   0-based
+[u32 LE chunk_total  ]
+[u32 LE chunk_bytes  ]   ≤ 16 MiB cap (hard)
+[chunk_bytes bytes   ]
+```
+Default chunk size is 4 MiB. `chunk_bytes > 16 MiB` is a wire
+format error; `chunk_seq >= chunk_total` is a wire format
+error. (V6_7_DESIGN.md L2 originally allocated 0x02 — v6.1.5
+had claimed 0x02 for `FRAME_TYPE_SKIP`; v6.7.5 ships at the
+next free slot. The design reference is reconciled in the
+frame-type doc comment.)
+
+**SQL surface additions** — all PG-syntax-compatible:
+- `CREATE INDEX <name> ON <table> USING BRIN (<col>)` —
+  v6.7.1, format-layer only (planner page-skipping is
+  carve-out below).
+- `ALTER TABLE <name> SET hot_tier_bytes = <n>` — v6.7.2,
+  per-table freezer budget override.
+- `COMPACT COLD SEGMENTS` — v6.7.3, admin-only via server
+  intercept (`can_manage_users()` gate, same as CHECKPOINT).
+  Bare form only; `WHERE` predicate filtering is OOS for v6.7.
+  Returns a result set with columns
+  `(table_name, index_name, sources_merged, merged_segment_id,
+   merged_rows, deleted_rows_pruned, bytes_reclaimed_estimate)`.
+
+**Env vars** (operator-tunable, defaults sized for typical
+deployments):
+- `SPG_COMPACTION_TARGET_SEGMENT_BYTES` (default 4 MiB) —
+  compaction merge threshold.
+- `SPG_FREEZER_WORKERS` (default `max(1, num_cpus()-2)`, cap
+  16) — parallel freezer prepare pool size.
+- `SPG_PREFETCH_WORKERS` (default `max(1, num_cpus()-2)`, cap
+  16) — boot-time prefetch pool size.
+- `SPG_PERF_1B_ROW_BUDGET` (default 1_000_000) — `#[ignore]`
+  1B-row stress test row count.
+
+**Metrics** (`/metrics` HTTP endpoint, Prometheus text
+exposition):
+- `spg_cold_prefetch_hits_total` — counter, increments by 1 per
+  successfully prefetched cold segment at boot.
+
+### Out of v6.7 (carved out — explicit STABILITY entries)
+
+These items remain unimplemented in v6.7 but are explicitly
+scheduled for future v6.x revisits. None of them block the v6.7
+ship contract; all of them are documented in the v6.7.8
+CHANGELOG entry's "Known limitations" section.
+
+1. **BRIN planner page-skipping during cold scan.** v6.7.1
+   ships the format layer; the planner does NOT yet consult
+   the BRIN summary to skip non-overlapping pages during scan.
+2. **`spg_table_ddl` emission of `ALTER TABLE … SET
+   hot_tier_bytes`.** v6.7.2 persists the per-table override
+   on the catalog snapshot; `SELECT * FROM spg_table_ddl`
+   doesn't yet round-trip it back to DDL text.
+3. **`COMPACT COLD SEGMENTS WHERE …` predicate filtering.**
+4. **Compaction orphan source-segment file GC.** Source
+   segment files survive on disk until an offline cleanup tool
+   removes them; subsequent CHECKPOINTs naturally exclude them
+   from the manifest.
+5. **Chunk-level resume on segment forwarding.** v6.7.5 ships
+   segment-level resume via file existence; mid-segment
+   disconnect re-transmits the whole segment.
+6. **Bidirectional segment-forwarding handshake.** Follower
+   doesn't yet declare known segment ids; master always ships
+   every cold segment.
+7. **Scan-triggered prefetch.** v6.7.6 wires the worker pool
+   to the boot path. The L2 spec also calls for scan-time
+   prefetch; parked until v6.x cold-tier streaming lands.
+8. **BRIN summary RECOMPACT on DELETE.** v6.7 marks affected
+   pages "loose" rather than recomputing min/max in-place.
+
+---
+
 ## Not frozen (free to change in any release)
 
 - Internal storage types (`Catalog`, `Table`, `Row`, `Value`)
