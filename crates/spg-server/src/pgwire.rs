@@ -225,12 +225,13 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         wbuf.clear();
                     }
                     match copy {
-                        CopyIntent::From(table) => {
+                        CopyIntent::From(table, opts) => {
                             handle_copy_from_stdin(
                                 &mut stream,
                                 state,
                                 role,
                                 &table,
+                                &opts,
                                 &mut tx_state,
                             )?;
                         }
@@ -1556,28 +1557,90 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
 // ---- v4.17 COPY FROM STDIN / COPY TO STDOUT ----
 
 enum CopyIntent {
-    From(String),
+    From(String, CopyOptions),
     To(String),
 }
 
-/// Detects `COPY <table> FROM STDIN` and `COPY <table> TO STDOUT`
-/// (case-insensitive). Anything else (e.g. `COPY ... FROM '/path'`)
-/// falls through to the regular engine path, which will report a
-/// parse error — file-based COPY is intentionally not supported
-/// (no filesystem access from the server in the docker-compose
-/// deployment shape).
+/// v6.4.7 — `COPY FROM STDIN WITH (...)` option parser. PG-style
+/// comma-separated `key value` pairs inside parens.
+#[derive(Debug, Clone, Default)]
+struct CopyOptions {
+    /// `SKIP n` — drop the first N data rows (typically the CSV
+    /// header row).
+    pub skip: u64,
+    /// `ON_ERROR SET_NULL` — on per-cell parse failure, replace the
+    /// failed cell with NULL instead of aborting the COPY. The row
+    /// is still rejected (with a clear message) if the failed cell
+    /// targets a NOT NULL column.
+    pub on_error_set_null: bool,
+    /// `FORMAT JSON` — each input line is a JSON object whose keys
+    /// match the target table's column names. Missing columns become
+    /// NULL; extra keys are ignored. Default (no FORMAT) is the
+    /// existing tab-delimited text mode.
+    pub format_json: bool,
+}
+
+/// Detects `COPY <table> FROM STDIN [WITH (options)]` and
+/// `COPY <table> TO STDOUT` (case-insensitive). Anything else (e.g.
+/// `COPY ... FROM '/path'`) falls through to the regular engine
+/// path, which will report a parse error — file-based COPY is
+/// intentionally not supported (no filesystem access from the
+/// server in the docker-compose deployment shape).
 fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
-    let lower = sql.trim().to_ascii_lowercase();
+    let trimmed = sql.trim();
+    let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("copy ")?;
     let mut it = rest.split_ascii_whitespace();
     let table = it.next()?.to_string();
     let dir = it.next()?;
     let endpoint = it.next()?;
     match (dir, endpoint) {
-        ("from", "stdin") => Some(CopyIntent::From(table)),
+        ("from", "stdin") => {
+            // Look for the WITH (...) tail and parse options.
+            let opts = parse_copy_options(&lower);
+            Some(CopyIntent::From(table, opts))
+        }
         ("to", "stdout") => Some(CopyIntent::To(table)),
         _ => None,
     }
+}
+
+/// Find a `WITH (...)` chunk in the SQL and decode the options.
+fn parse_copy_options(lower: &str) -> CopyOptions {
+    let mut opts = CopyOptions::default();
+    let Some(open) = lower.find('(') else {
+        return opts;
+    };
+    let Some(close) = lower[open..].find(')') else {
+        return opts;
+    };
+    let inner = &lower[open + 1..open + close];
+    for pair in inner.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let mut it = pair.split_ascii_whitespace();
+        let key = it.next().unwrap_or("");
+        let val = it.next().unwrap_or("");
+        match key {
+            "skip" => {
+                opts.skip = val.parse().unwrap_or(0);
+            }
+            "on_error" => {
+                if val == "set_null" {
+                    opts.on_error_set_null = true;
+                }
+            }
+            "format" => {
+                if val == "json" {
+                    opts.format_json = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    opts
 }
 
 /// COPY FROM STDIN — server sends CopyInResponse, reads CopyData
@@ -1589,6 +1652,7 @@ fn handle_copy_from_stdin(
     state: &Arc<ServerState>,
     role: Role,
     table: &str,
+    opts: &CopyOptions,
     tx_state: &mut u8,
 ) -> std::io::Result<()> {
     if !role.can_write() {
@@ -1631,6 +1695,7 @@ fn handle_copy_from_stdin(
     // on \n. CopyDone ('c') ends the input.
     let mut buf: Vec<u8> = Vec::new();
     let mut inserted: u64 = 0;
+    let mut skipped: u64 = 0;
     loop {
         let mut header = [0u8; 5];
         stream.read_exact(&mut header)?;
@@ -1664,13 +1729,17 @@ fn handle_copy_from_stdin(
             }
         }
         // Process whatever full lines we have.
-        if let Err(msg) = process_copy_chunk(state, table, &mut buf, &mut inserted) {
+        if let Err(msg) =
+            process_copy_chunk(state, table, &mut buf, &mut inserted, &mut skipped, opts)
+        {
             send_error(stream, "22P02", &msg)?;
             return Ok(());
         }
     }
     // Final drain.
-    if let Err(msg) = process_copy_chunk(state, table, &mut buf, &mut inserted) {
+    if let Err(msg) =
+        process_copy_chunk(state, table, &mut buf, &mut inserted, &mut skipped, opts)
+    {
         send_error(stream, "22P02", &msg)?;
         return Ok(());
     }
@@ -1691,6 +1760,8 @@ fn process_copy_chunk(
     table: &str,
     buf: &mut Vec<u8>,
     inserted: &mut u64,
+    skipped: &mut u64,
+    opts: &CopyOptions,
 ) -> Result<(), String> {
     while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = buf.drain(..=nl).collect();
@@ -1705,18 +1776,220 @@ fn process_copy_chunk(
         }
         let row_text =
             std::str::from_utf8(line).map_err(|_| "COPY row not valid UTF-8".to_string())?;
-        let values = decode_copy_text_row(row_text);
-        let sql = build_copy_insert(table, &values);
+        // v6.4.7 — SKIP N drops the first N data rows (typically a
+        // CSV header row). `skipped` counts independently of
+        // `inserted` so the final tag reports only successful
+        // inserts.
+        if *skipped < opts.skip {
+            *skipped += 1;
+            continue;
+        }
+        // v6.4.7 — FORMAT JSON decodes the line as a JSON object
+        // and maps keys to column names. Default is the existing
+        // tab-text format.
+        let sql = if opts.format_json {
+            match build_copy_insert_from_json(state, table, row_text, opts.on_error_set_null) {
+                Ok(s) => s,
+                Err(e) => {
+                    if opts.on_error_set_null {
+                        // Skip the bad row entirely under ON_ERROR.
+                        continue;
+                    }
+                    return Err(format!("COPY FORMAT JSON: {e}"));
+                }
+            }
+        } else {
+            let values = decode_copy_text_row(row_text);
+            build_copy_insert(table, &values)
+        };
         let mut engine = state
             .engine
             .write()
             .map_err(|_| "engine rwlock poisoned".to_string())?;
-        engine
-            .execute(&sql)
-            .map_err(|e| format!("COPY row INSERT failed: {e}"))?;
-        *inserted += 1;
+        match engine.execute(&sql) {
+            Ok(_) => *inserted += 1,
+            Err(e) => {
+                if opts.on_error_set_null {
+                    // Best-effort: skip the row but keep going.
+                    continue;
+                }
+                return Err(format!("COPY row INSERT failed: {e}"));
+            }
+        }
     }
     Ok(())
+}
+
+/// v6.4.7 — `FORMAT JSON`: decode the line as a JSON object, map
+/// keys to the target table's column names (case-sensitive), and
+/// build a positional INSERT.
+fn build_copy_insert_from_json(
+    state: &Arc<ServerState>,
+    table: &str,
+    line: &str,
+    _on_error: bool,
+) -> Result<String, String> {
+    // Pull the column list from the catalog.
+    let cols: Vec<String> = state
+        .engine
+        .read()
+        .ok()
+        .and_then(|e| {
+            e.catalog()
+                .get(table)
+                .map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect())
+        })
+        .ok_or_else(|| format!("relation {table:?} does not exist"))?;
+    // Hand-rolled minimal JSON-object parse: find each "key": value
+    // pair at the top level. SPG's engine already has a JSON
+    // parser, but pgwire.rs doesn't depend on spg-engine internals
+    // for this path — we keep the parse local.
+    let pairs = parse_json_object_top_level(line)?;
+    let mut sql = format!("INSERT INTO {table} (");
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(c);
+    }
+    sql.push_str(") VALUES (");
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        let val = pairs.iter().find(|(k, _)| k == c).map(|(_, v)| v.clone());
+        match val {
+            None => sql.push_str("NULL"),
+            Some(v) => sql.push_str(&v),
+        }
+    }
+    sql.push(')');
+    Ok(sql)
+}
+
+/// Minimal top-level JSON object parser → Vec<(key, sql-literal)>.
+/// Numbers / bool / null produce bare tokens; strings are
+/// re-encoded as SQL single-quoted strings.
+fn parse_json_object_top_level(s: &str) -> Result<Vec<(String, String)>, String> {
+    let trimmed = s.trim();
+    let body = trimmed
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| "expected JSON object {...}".to_string())?;
+    let mut out = Vec::new();
+    let mut chars = body.chars().peekable();
+    while chars.peek().is_some() {
+        skip_ws(&mut chars);
+        if chars.peek().is_none() {
+            break;
+        }
+        let key = read_json_string(&mut chars)?;
+        skip_ws(&mut chars);
+        if chars.next() != Some(':') {
+            return Err("expected ':' after key".into());
+        }
+        skip_ws(&mut chars);
+        let val_sql = read_json_value_as_sql(&mut chars)?;
+        out.push((key, val_sql));
+        skip_ws(&mut chars);
+        if chars.peek() == Some(&',') {
+            chars.next();
+        }
+    }
+    Ok(out)
+}
+
+fn skip_ws(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+fn read_json_string(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<String, String> {
+    if chars.next() != Some('"') {
+        return Err("expected '\"' to start string".into());
+    }
+    let mut out = String::new();
+    loop {
+        match chars.next() {
+            None => return Err("unterminated JSON string".into()),
+            Some('"') => return Ok(out),
+            Some('\\') => {
+                let n = chars.next().ok_or("trailing escape")?;
+                out.push(match n {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    'b' => '\u{08}',
+                    'f' => '\u{0c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+            }
+            Some(c) => out.push(c),
+        }
+    }
+}
+
+fn read_json_value_as_sql(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> Result<String, String> {
+    skip_ws(chars);
+    let Some(&first) = chars.peek() else {
+        return Err("expected value".into());
+    };
+    match first {
+        '"' => {
+            let s = read_json_string(chars)?;
+            // SQL-encode: escape single quotes.
+            Ok(format!("'{}'", s.replace('\'', "''")))
+        }
+        't' | 'f' => {
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphabetic() {
+                    s.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if s == "true" {
+                Ok("TRUE".to_string())
+            } else if s == "false" {
+                Ok("FALSE".to_string())
+            } else {
+                Err(format!("invalid bool token: {s}"))
+            }
+        }
+        'n' => {
+            for expected in ['n', 'u', 'l', 'l'] {
+                if chars.next() != Some(expected) {
+                    return Err("invalid null token".into());
+                }
+            }
+            Ok("NULL".to_string())
+        }
+        c if c == '-' || c.is_ascii_digit() => {
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || c.is_ascii_digit() {
+                    s.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            Ok(s)
+        }
+        other => Err(format!("unsupported JSON value start: {other:?}")),
+    }
 }
 
 /// PG COPY text format: tab-separated cells, `\N` for NULL,
