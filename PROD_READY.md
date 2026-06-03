@@ -150,6 +150,13 @@ without reading the source code.
 | 7.6 | CHANGELOG.md [machine] | SemVer-organized v4.x history; future PRs must update it (CI check) | ✅ | v4.30, `CHANGELOG.md` (CI enforcement is post-v4.32) |
 | 7.7 | Migration framework | Schema migrations beyond raw DDL | 🚫 | not in scope; users run DDL via standard SQL |
 | 7.8 | Config validation on startup | Server refuses to start if env vars conflict (e.g. SPG_FOLLOW_OF + SPG_REPL_ADDR on same node) | ⚠️ | (v4.30 candidate — currently warns but starts anyway) |
+| 7.9 | Logical replication: CREATE / DROP / SHOW PUBLICATION | All three forms (FOR ALL TABLES / FOR TABLE list / FOR ALL TABLES EXCEPT list) parse, persist via snapshot envelope v3+, round-trip Display | ✅ | v6.1.2 + v6.1.3, `crates/spg-server/tests/e2e_publication_ddl.rs` (9/9) + STABILITY.md §"Publication DDL" |
+| 7.10 | Logical replication: CREATE SUBSCRIPTION + worker | DDL lands the catalog row; reconcile spawns per-subscription worker that drains v2 frame stream from publisher and applies SQL to local engine; DROP shuts the worker within ~500 ms | ✅ | v6.1.4, `e2e_subscription.rs` (3/3) + STABILITY.md §"Subscription DDL" + §"MAGIC_SUB protocol" + §"Snapshot envelope v4" |
+| 7.11 | Logical replication: publisher-side filter | DML records are filtered by the requested publication's scope before they hit the wire; DDL + session-control SQL is never propagated (PG-compatible); the lightweight owner extractor runs ≤ 200 ns/record | ✅ | v6.1.5, `e2e_replication_filter.rs` (3/3) + `replication::tests::extract_owner_perf_under_200ns` measured 41 ns/call |
+| 7.12 | Logical replication: cascading + cycle detection | Three-node A → B → C chain replays correctly via MAGIC_V2 + MAGIC_SUB; direct self-loop subscriptions are aborted at handshake via the per-cluster `cluster_id` sidecar | ✅ | v6.1.6, `e2e_cascade.rs` (3/3) |
+| 7.13 | Logical replication: consistent-read barrier | `WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>]` blocks until the local apply pos reaches the target or the timeout fires; reached=1 / timed-out=0 via CommandComplete count | ✅ | v6.1.7, `e2e_wait_pos.rs` (5/5) |
+| 7.14 | Logical replication: opt-in gate | Fresh cluster boots in `replica` mode; MAGIC_SUB stays closed until `SET effective_wal_level = 'logical'` (or `SPG_WAL_LEVEL=logical` env at startup); `SHOW effective_wal_level` exposes current value | ✅ | v6.1.8, `e2e_wal_level.rs` (6/6) |
+| 7.15 | Logical replication: chaos resilience | Subscription worker reconnects across multiple netsplit + heal cycles; final row count is exactly correct (no dup, no gap) | ✅ | v6.1.9, `e2e_chaos_logical.rs` (2/2) |
 
 ## 8. Stability + compatibility
 
