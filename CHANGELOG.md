@@ -8,6 +8,41 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.4] — 2026-06-03 (PG migration guide)
+
+v7.4 is a documentation release — no code changes, no new wire
+or SQL surface. Adds `PG_MIGRATION.md`, a frank assessment of
+what migrates cleanly from PostgreSQL to SPG, what needs
+application-level rewrite, and what will never land (axiom
+A7). Covers both deployment modes:
+
+- **`spg-server`** — PG-wire compatibility, libpq / psql /
+  pgx / JDBC / ODBC client status table, SCRAM auth.
+- **`spg-embedded`** — Rust API equivalents, bulk-load via
+  `with_transaction`, in-process replacement for SQLite-style
+  embeds.
+
+The doc's compatibility matrix is mechanically derived from
+the 4-corpus regression (pg_regress 144/144, pgvector 63/63);
+won't-do items cite the A1 – A7 axioms that froze the
+decisions. Includes:
+
+- decision tree (server vs embedded vs "stay on PG")
+- SQL compatibility matrix (DDL / DML / SELECT / vector /
+  transactions / auth / replication / introspection)
+- `pg_dump` → SPG pragmatic migration recipe
+- common gotchas list (SERIAL, UUID, bytea, case-folding,
+  pg_catalog auto-introspection, COPY FROM, LISTEN/NOTIFY)
+- "validate before committing" loop using the live Docker
+  image
+
+No new code surface; the v7.3 STABILITY contract is unchanged.
+Image `goliakk/spg:7.4.0` is byte-identical to `7.3.0` — the
+re-tag exists so `docker pull goliakk/spg:7.4` matches the
+documentation version operators are reading.
+
+---
+
 ## [7.3] — 2026-06-03 (Typed-row API — spg_row! macro + query_typed)
 
 v7.3 closes the last v6.10 STABILITY carve-out in the embedded
