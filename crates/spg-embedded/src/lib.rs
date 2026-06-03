@@ -947,6 +947,115 @@ fn pick_freeze_target(db: &Database) -> Option<(String, String)> {
     best.map(|(t, i, _)| (t, i))
 }
 
+/// v7.7.6 — replay the first `to_seq` records of the WAL at
+/// `wal_path` into a fresh engine and write the resulting
+/// catalog snapshot to `out_db_path`. Same semantics as
+/// `spg revert --wal … --to-seq N --out …` from the CLI:
+///
+///   - `to_seq == 0` → snapshot is the empty catalog
+///   - WAL records beyond `to_seq` are not applied
+///   - durability-checkpoint markers (v3 type 0x02) are
+///     consumed without counting against the budget
+///
+/// Returns the number of statements actually applied
+/// (`≤ to_seq`). The output snapshot is byte-identical to
+/// what `Database::open_path(out_db_path)` would consume on
+/// a subsequent open.
+///
+/// This is the "rewind" operator for an embedded database
+/// that has been corrupted by a poison statement or a
+/// half-applied migration. Pair with `cold_segment_paths`
+/// preservation if your cold-tier files are still on disk.
+///
+/// # Errors
+///
+/// - `wal_path` unreadable or truncated mid-record
+/// - WAL record decodes to invalid UTF-8 SQL
+/// - WAL record's SQL is rejected by the engine
+/// - `out_db_path` unwritable
+pub fn revert_wal_to_seq(
+    wal_path: impl AsRef<Path>,
+    to_seq: u64,
+    out_db_path: impl AsRef<Path>,
+) -> Result<u64, EngineError> {
+    let wal_bytes = std::fs::read(wal_path.as_ref()).map_err(io_err)?;
+    let mut engine = Engine::new();
+    let mut applied = 0u64;
+    let mut cur = 0usize;
+    while cur < wal_bytes.len() && applied < to_seq {
+        let (sql_bytes, total) = decode_wal_record(&wal_bytes[cur..])?;
+        cur += total;
+        if sql_bytes.is_empty() {
+            continue;
+        }
+        let sql = core::str::from_utf8(&sql_bytes).map_err(|e| {
+            EngineError::Storage(spg_storage::StorageError::Corrupt(format!(
+                "WAL record at offset {cur}: non-UTF-8 SQL: {e}"
+            )))
+        })?;
+        engine.execute(sql)?;
+        applied += 1;
+    }
+    let snapshot = engine.snapshot();
+    std::fs::write(out_db_path.as_ref(), &snapshot).map_err(io_err)?;
+    Ok(applied)
+}
+
+/// v7.7.6 — decode one WAL record from a byte tail. Returns
+/// `(sql_bytes, header_plus_payload_len)`. Handles the three
+/// on-disk formats (v1 / v2 / v3) the same way the CLI
+/// `decode_one_record` and the engine's `replay_wal_bytes`
+/// do. CRCs are not re-validated; the caller's intent is
+/// "apply", not "validate".
+fn decode_wal_record(tail: &[u8]) -> Result<(Vec<u8>, usize), EngineError> {
+    if tail.len() < 4 {
+        return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+            format!("WAL truncated record: {} < 4 header bytes", tail.len()),
+        )));
+    }
+    let raw_len = u32::from_le_bytes(tail[..4].try_into().unwrap());
+    let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
+    let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+    let len_mask = if is_v3 {
+        !(WAL_V2_SENTINEL | WAL_V3_FLAG)
+    } else {
+        !WAL_V2_SENTINEL
+    };
+    let rec_len = (raw_len & len_mask) as usize;
+    let header_len = if is_v3 {
+        9
+    } else if is_v2 {
+        8
+    } else {
+        4
+    };
+    if tail.len() < header_len + rec_len {
+        return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+            format!(
+                "WAL truncated record: header+payload {} > available {}",
+                header_len + rec_len,
+                tail.len()
+            ),
+        )));
+    }
+    let payload = &tail[header_len..header_len + rec_len];
+    let sql_bytes = if is_v3 {
+        let type_byte = tail[8];
+        // v3 type 0x01 = auto_commit_sql (payload = SQL).
+        // v3 type 0x02 = durability marker (payload = u64
+        // offset, no SQL to apply). Anything else is unknown.
+        if type_byte == WAL_V3_TYPE_AUTO_COMMIT_SQL {
+            payload.to_vec()
+        } else {
+            // Caller treats empty payload as a skip-marker.
+            Vec::new()
+        }
+    } else {
+        payload.to_vec()
+    };
+    Ok((sql_bytes, header_len + rec_len))
+}
+
 impl Drop for Database {
     fn drop(&mut self) {
         // v7.1 — best-effort final checkpoint when a persistent
