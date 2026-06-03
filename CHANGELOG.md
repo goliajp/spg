@@ -10,6 +10,122 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.8] — 2026-06-03 (Index breadth — release roll-up)
+
+v6.8 broadens the SPG index surface to cover PG-parity index
+shapes: INCLUDE columns, partial WHERE predicates, expression
+keys, and an `EXPLAIN (SUGGEST)` advisor. The series ships
+**format-layer parity** — every shape parses, persists across
+catalog snapshot round-trips, and round-trips through the
+Display form. The runtime maintenance optimisations
+(in-BTree-leaf included payload, partial-aware planner pass,
+expression-key seek shortcut) are explicit STABILITY carve-outs:
+SPG's hot tier lives in memory today, so the
+heap-fetch-avoidance + planner-side cost wins are small until
+cold-tier streaming becomes the primary lookup path.
+
+Series total: ~11 d estimated; one catalog snapshot bump
+(FILE_VERSION 11 → 12); 0 external dependencies; sqllogictest
+4-corpus 100 % throughout.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.8.0 | INCLUDE columns on CREATE INDEX (format layer) |
+| 6.8.1 | Partial index — CREATE INDEX … WHERE <expr> (format layer) |
+| 6.8.2 | Expression index — CREATE INDEX … (lower(col)) (format layer) |
+| 6.8.3 | Index advisor — EXPLAIN (SUGGEST) <SELECT> |
+| 6.8.4 | series ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.8 target | measured |
+|--------|------------:|---------:|
+| Covered query → no heap fetch (planner-side) | EXPLAIN confirms `index only scan` | ⚠️ format only — STABILITY carve-out for v6.8 |
+| Partial index selected on matching predicate | planner picks partial idx | ⚠️ over-maintenance ensures correctness; planner pass carved out |
+| Expression index function whitelist extensible | runtime evaluates expr key | ⚠️ format only — STABILITY carve-out |
+| Index advisor on EXPLAIN (SUGGEST) | emits CREATE INDEX hints | ✅ pure-syntax heuristic, deduplicated per (table, column) |
+| sqllogictest 4-corpus regression | 100 % | ✅ 372/372 |
+
+The three `⚠️` items above are explicit
+STABILITY § "Out of v6.8" carve-outs — not hidden deferrals.
+Each unlocks a future v6.x revisit once cold-tier streaming
+gives the heap-fetch-avoidance optimisations meaningful wins.
+
+### Frozen surfaces added in v6.8
+
+**Parser surface:**
+- `CREATE INDEX <name> ON <table> [USING <method>] (<key>) [INCLUDE (<col>, …)] [WHERE <expr>]`
+- `<key>` is either a bare column ident (legacy) or any
+  expression that resolves through the Pratt parser (function
+  call, binary op, cast, etc.). Bare ident followed by `)` is
+  the legacy fast path; anything else falls through to
+  expression parsing.
+- `EXPLAIN (SUGGEST) <select>` — index-advisor opt-in.
+  `(…)` option list currently only recognises `SUGGEST`;
+  unknown options error loudly. Mutually exclusive with
+  `EXPLAIN ANALYZE` at parse time.
+
+**AST:**
+- `CreateIndexStatement.included_columns: Vec<String>`.
+- `CreateIndexStatement.partial_predicate: Option<Expr>`.
+- `CreateIndexStatement.expression: Option<Expr>` (the parsed
+  key expression; `None` for bare column references).
+- `CreateIndexStatement` no longer derives `Eq` — `Expr`
+  contains floats. `PartialEq` remains.
+- `ExplainStatement.suggest: bool`.
+
+**Storage:**
+- `Index.included_columns: Vec<usize>`.
+- `Index.partial_predicate: Option<String>` (canonical Display).
+- `Index.expression: Option<String>` (canonical Display).
+- `Table::indices_mut()` — exposed for the engine layer to
+  patch the three new fields post-construction.
+- Catalog snapshot FILE_VERSION 11 → 12. Per-index appendix is
+  append-only:
+    [u16 num_included][num × u16 col_pos]
+    [u8 has_pred][u16 LE len][bytes (if has_pred)]
+    [u8 has_expr][u16 LE len][bytes (if has_expr)]
+- v11 readers stop before the appendix; v12+ readers always
+  consume all three fields. Empty Vec / `None` serialise as
+  bare `0` bytes.
+
+**Engine:**
+- INCLUDE / WHERE / expression on HNSW or BRIN errors loudly
+  (these shapes are meaningless on vector kNN / cold-tier
+  metadata indexes).
+- `build_index_suggestions` (free function) drives
+  `EXPLAIN (SUGGEST)` — walks WHERE / JOIN-ON column refs,
+  resolves owners, dedupes by `(table, column)`, skips columns
+  already covered by an unconditional BTree index.
+
+### Known v6.8 limitations (carved out, NOT deferred)
+
+- **Planner-side `index only scan` for INCLUDE-covered
+  queries.** The included payload is not yet stored in the
+  BTree leaf; covered queries fall back to the locator + row
+  fetch path. EXPLAIN doesn't emit `index only scan`
+  annotations on covered queries.
+- **Planner-side partial-index selection.** v6.8.1 stores the
+  predicate's canonical Display form, but the planner doesn't
+  yet check "query WHERE clause ⇒ partial predicate" to opt
+  into a partial index. Maintenance is over-maintenance
+  (every row enters partial indexes); correctness preserved.
+- **Expression-key seek shortcut.** v6.8.2 stores the
+  expression's canonical Display form; the runtime
+  maintenance pass that evaluates the expression on each row
+  to derive the actual BTree key is not yet wired. Expression
+  indexes effectively behave like the primary column's index
+  for v6.8.
+- **Index advisor cost-based ranking.** v6.8.3 emits one
+  SUGGEST line per missing index in deterministic walk order.
+  Per-suggestion cost / cardinality estimates land in a future
+  v6.x once the optimiser ingests selectivity stats more
+  directly.
+
+---
+
 ## [6.7] — 2026-06-03 (Cold tier evolution — release roll-up)
 
 v6.7 is the **largest v6.x series** (~20.5 d). It closes one
