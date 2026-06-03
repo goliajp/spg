@@ -1190,17 +1190,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spg-cli"
-version = "7.8.0"
-dependencies = [
- "criterion",
- "spg-crypto",
- "spg-engine",
- "spg-storage",
- "spg-wire",
-]
-
-[[package]]
 name = "spg-crypto"
 version = "7.8.0"
 dependencies = [
@@ -1269,6 +1258,17 @@ name = "spg-wire"
 version = "7.8.0"
 dependencies = [
  "criterion",
+]
+
+[[package]]
+name = "spgctl"
+version = "7.8.0"
+dependencies = [
+ "criterion",
+ "spg-crypto",
+ "spg-engine",
+ "spg-storage",
+ "spg-wire",
 ]
 
 [[package]]
