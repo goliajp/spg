@@ -111,6 +111,14 @@ pub enum DataType {
     /// `TIMESTAMP` (a.k.a. `MySQL` `DATETIME`) — instant with microsecond
     /// precision, stored as `i64` microseconds since the Unix epoch.
     Timestamp,
+    /// v7.9.2 `TIMESTAMPTZ` — bit-identical to `Timestamp` on disk
+    /// (i64 microseconds, UTC by convention). Carried as a distinct
+    /// type tag so the PG-wire layer can advertise OID 1184 (PG's
+    /// `timestamp with time zone`) and `sqlx`/`pgx`/JDBC clients
+    /// decode into their TZ-aware datetime types. The internal
+    /// semantics are unchanged: SPG never stored per-row offsets,
+    /// and neither did PG — `TIMESTAMPTZ` in PG is also UTC i64.
+    Timestamptz,
     /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
     /// supports INTERVAL only as a runtime intermediate (literals,
     /// arithmetic results); on-disk encoding is rejected so this branch
@@ -154,6 +162,7 @@ impl fmt::Display for DataType {
             }
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
+            Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
             Self::Interval => f.write_str("INTERVAL"),
             Self::Json => f.write_str("JSON"),
             Self::Jsonb => f.write_str("JSONB"),
@@ -978,6 +987,8 @@ impl Table {
                         DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
                     ) | (DataType::Json | DataType::Jsonb, DataType::Text)
                       | (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json)
+                      | (DataType::Timestamp, DataType::Timestamptz)
+                      | (DataType::Timestamptz, DataType::Timestamp)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -1419,6 +1430,8 @@ impl Table {
                         DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
                     ) | (DataType::Json | DataType::Jsonb, DataType::Text)
                       | (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json)
+                      | (DataType::Timestamp, DataType::Timestamptz)
+                      | (DataType::Timestamptz, DataType::Timestamp)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -4451,6 +4464,10 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         }
         DataType::Date => out.push(11),
         DataType::Timestamp => out.push(12),
+        // v7.9.2 — tag 17 for TIMESTAMPTZ. Body = i64 microseconds
+        // UTC, identical to tag 12. Only the schema-side type tag
+        // differs (for wire OID advertisement).
+        DataType::Timestamptz => out.push(17),
         // INTERVAL is runtime-only — CREATE TABLE never produces a
         // column with this type, so write_data_type must not be called
         // on it. (Disk-format codepoint reserved for a future v3 where
@@ -4504,6 +4521,10 @@ impl Cursor<'_> {
             // we only carry the type tag so the wire layer can
             // emit PG OID 3802 instead of 114.
             16 => Ok(DataType::Jsonb),
+            // v7.9.2: tag 17 for `TIMESTAMPTZ`. Storage shape ==
+            // Timestamp (i64 microseconds UTC); only the wire OID
+            // (1184) differs.
+            17 => Ok(DataType::Timestamptz),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -4705,7 +4726,9 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
             out.push(scale);
         }
         (Value::Date(d), DataType::Date) => out.extend_from_slice(&d.to_le_bytes()),
-        (Value::Timestamp(t), DataType::Timestamp) => out.extend_from_slice(&t.to_le_bytes()),
+        (Value::Timestamp(t), DataType::Timestamp | DataType::Timestamptz) => {
+            out.extend_from_slice(&t.to_le_bytes())
+        }
         // v4.9: JSON stores as length-prefixed text; same shape as
         // Text — the type tag lives in the column schema, not the
         // per-cell body.
@@ -4981,6 +5004,7 @@ impl<'a> Cursor<'a> {
             }
             DataType::Date => Ok(Value::Date(self.read_i32()?)),
             DataType::Timestamp => Ok(Value::Timestamp(self.read_i64()?)),
+            DataType::Timestamptz => Ok(Value::Timestamp(self.read_i64()?)),
             DataType::Jsonb => Ok(Value::Json(self.read_str()?)),
             DataType::Interval => {
                 // Defensive — schema gate (CREATE TABLE rejects Interval

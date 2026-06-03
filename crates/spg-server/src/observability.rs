@@ -555,7 +555,11 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
             match c.ty {
                 DataType::SmallInt => 2,
                 DataType::Int => 4,
-                DataType::BigInt | DataType::Date | DataType::Timestamp | DataType::Float => 8,
+                DataType::BigInt
+                | DataType::Date
+                | DataType::Timestamp
+                | DataType::Timestamptz
+                | DataType::Float => 8,
                 DataType::Bool => 1,
                 DataType::Char(n) => u64::from(n),
                 // Average a half-full VARCHAR; the exact value is

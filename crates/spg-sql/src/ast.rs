@@ -413,6 +413,14 @@ pub enum ColumnTypeName {
     /// `TIMESTAMP` / `MySQL` `DATETIME` — instant with microsecond
     /// precision.
     Timestamp,
+    /// v7.9.2 `TIMESTAMPTZ` / `TIMESTAMP WITH TIME ZONE`. SPG
+    /// stores all timestamps as UTC microseconds-since-epoch and
+    /// does not carry per-row offset (PG's internal representation
+    /// is the same — TZ is a display convention). The distinction
+    /// from `TIMESTAMP` exists for the PG-wire layer to advertise
+    /// OID 1184 so sqlx-style clients decode into
+    /// `chrono::DateTime<Utc>` instead of `NaiveDateTime`.
+    Timestamptz,
     /// v4.9 `JSON` — text-backed JSON document. No parse-time
     /// validation; the engine round-trips the literal verbatim.
     /// PG OID 114 on the wire.
@@ -450,6 +458,7 @@ impl fmt::Display for ColumnTypeName {
             }
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
+            Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
         }
     }
 }
