@@ -3294,6 +3294,7 @@ impl Engine {
                 partition_by,
                 order_by,
                 frame,
+                null_treatment,
             } = wnode
             else {
                 unreachable!("collect_window_nodes pushes only WindowFunction");
@@ -3338,6 +3339,7 @@ impl Engine {
                     args,
                     !order_by.is_empty(),
                     frame.as_ref(),
+                    *null_treatment,
                     &indexed[p_start..p_end],
                     &filtered,
                     &ctx,
@@ -4616,11 +4618,13 @@ fn compute_window_partition(
     args: &[Expr],
     ordered: bool,
     frame: Option<&WindowFrame>,
+    null_treatment: spg_sql::ast::NullTreatment,
     slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)],
     filtered_rows: &[&Row],
     ctx: &EvalContext<'_>,
     out_vals: &mut [Value],
 ) -> Result<(), EngineError> {
+    let ignore_nulls = matches!(null_treatment, spg_sql::ast::NullTreatment::Ignore);
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "row_number" => {
@@ -4761,16 +4765,48 @@ fn compute_window_partition(
             let n = slice.len();
             for (i, (_, _, idx)) in slice.iter().enumerate() {
                 let signed_offset = if lower == "lag" { -offset } else { offset };
-                let target_signed = i64::try_from(i).unwrap_or(i64::MAX) + signed_offset;
-                let v =
-                    if target_signed < 0 || target_signed >= i64::try_from(n).unwrap_or(i64::MAX) {
+                let v = if ignore_nulls {
+                    // v6.4.2 — IGNORE NULLS: walk in the offset direction
+                    // skipping NULL values; the `offset`-th non-NULL
+                    // encountered is the result.
+                    let step: i64 = if signed_offset >= 0 { 1 } else { -1 };
+                    let needed: i64 = signed_offset.abs();
+                    if needed == 0 {
+                        values[i].clone()
+                    } else {
+                        let mut j: i64 = i as i64;
+                        let mut hits: i64 = 0;
+                        let mut found: Option<Value> = None;
+                        loop {
+                            j += step;
+                            if j < 0 || j >= n as i64 {
+                                break;
+                            }
+                            #[allow(clippy::cast_sign_loss)]
+                            let v = &values[j as usize];
+                            if !v.is_null() {
+                                hits += 1;
+                                if hits == needed {
+                                    found = Some(v.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        found.unwrap_or_else(|| default.clone())
+                    }
+                } else {
+                    let target_signed = i64::try_from(i).unwrap_or(i64::MAX) + signed_offset;
+                    if target_signed < 0
+                        || target_signed >= i64::try_from(n).unwrap_or(i64::MAX)
+                    {
                         default.clone()
                     } else {
                         #[allow(clippy::cast_sign_loss)]
                         {
                             values[target_signed as usize].clone()
                         }
-                    };
+                    }
+                };
                 out_vals[*idx] = v;
             }
             Ok(())
@@ -4822,6 +4858,25 @@ fn compute_window_partition(
                 let (_, _, idx) = &slice[i];
                 let v = if lo > hi {
                     Value::Null
+                } else if ignore_nulls && matches!(lower.as_str(), "first_value" | "last_value") {
+                    // v6.4.2 — IGNORE NULLS: skip NULL cells when
+                    // selecting the boundary value within the frame.
+                    if lower == "first_value" {
+                        (lo..=hi)
+                            .find_map(|j| {
+                                let v = &values[j];
+                                (!v.is_null()).then(|| v.clone())
+                            })
+                            .unwrap_or(Value::Null)
+                    } else {
+                        (lo..=hi)
+                            .rev()
+                            .find_map(|j| {
+                                let v = &values[j];
+                                (!v.is_null()).then(|| v.clone())
+                            })
+                            .unwrap_or(Value::Null)
+                    }
                 } else {
                     match lower.as_str() {
                         "first_value" => values[lo].clone(),
