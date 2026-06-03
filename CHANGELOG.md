@@ -71,6 +71,12 @@ Sub-versions:
   v7.9.15  F3 — CREATE EXTENSION as no-op
   v7.9.16  F4 — bare/quoted `key` column name (side effect of F1)
   v7.9.17  follow-up ship: tag v7.9.1 + crates.io 7.9.17 + docker 7.9.1
+  v7.9.18  G1+G6 parser — table-level UNIQUE / PRIMARY KEY clauses
+  v7.9.19  G1+G6 engine — composite uniqueness enforcement on INSERT
+  v7.9.20  G3 — CURRENT_DATE / CURRENT_TIMESTAMP / etc as keyword expressions
+  v7.9.21  G4 — runtime DEFAULT (now() / current_timestamp evaluated at INSERT)
+  v7.9.22  G5 — HNSW pgvector opclass syntax `(col vector_cosine_ops)`
+  v7.9.23  D-validate-2 ship: tag v7.9.2 + crates.io + docker
 
 This closes the blocker list in
 `.claude/notes/mailrs-migration-feedback.md`. Remaining items
