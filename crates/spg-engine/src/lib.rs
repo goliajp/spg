@@ -2371,6 +2371,10 @@ impl Engine {
         let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
         let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
         let mut positions: Vec<usize> = Vec::new();
+        // v7.6.3 — collect every to-delete row's full Value tuple
+        // alongside its position, so the FK enforcement pass can
+        // run after the mut borrow drops.
+        let mut to_delete_rows: Vec<Vec<Value>> = Vec::new();
         for (i, row) in table.rows().iter().enumerate() {
             if i.is_multiple_of(256) {
                 cancel.check()?;
@@ -2383,8 +2387,31 @@ impl Engine {
             };
             if !keep {
                 positions.push(i);
+                to_delete_rows.push(row.values.clone());
             }
         }
+        // v7.6.3 — Stage 2: FK enforcement on the immutable catalog.
+        // Release the mut borrow and run reverse-scan against every
+        // child table whose FK targets this table. RESTRICT / NoAction
+        // raises an error; CASCADE / SET NULL / SET DEFAULT are
+        // currently reported as not-yet-implemented until v7.6.4 /
+        // v7.6.5 land.
+        let _ = table;
+        enforce_fk_parent_deletions(
+            self.active_catalog(),
+            &stmt.table,
+            &positions,
+            &to_delete_rows,
+        )?;
+        // Stage 3 — actually delete.
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.table)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
         let affected = table.delete_rows(&positions) + cold_shadow_count;
         // v6.2.1 — auto-analyze modified-row tracking for DELETE.
         if !self.in_transaction() && affected > 0 {
@@ -7237,6 +7264,106 @@ fn enforce_fk_inserts(
                         "FOREIGN KEY violation: no parent row in {:?} matching composite key",
                         fk.parent_table,
                     )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.6.3 — DELETE-side FK enforcement (RESTRICT / NoAction).
+/// CASCADE / SetNull / SetDefault report `Unsupported` for now
+/// (v7.6.4 / v7.6.5).
+///
+/// Walks every table in the catalog looking for FKs whose
+/// `parent_table` is `parent_table_name`. For each such FK, scans
+/// the child table's rows; any child row whose FK columns match a
+/// to-be-deleted parent row triggers an action. Self-referencing
+/// FKs (child == parent) treat the to-be-deleted positions as
+/// vanishing — a child row already in `to_delete_positions` does
+/// not block its own parent's delete.
+fn enforce_fk_parent_deletions(
+    catalog: &Catalog,
+    parent_table_name: &str,
+    to_delete_positions: &[usize],
+    to_delete_rows: &[Vec<Value>],
+) -> Result<(), EngineError> {
+    if to_delete_rows.is_empty() {
+        return Ok(());
+    }
+    // Build a set of doomed-position lookups for the self-ref case.
+    let doomed: alloc::collections::BTreeSet<usize> =
+        to_delete_positions.iter().copied().collect();
+    for child_name in catalog.table_names() {
+        let child = catalog
+            .get(&child_name)
+            .expect("table_names → catalog.get round-trip is total");
+        for fk in &child.schema().foreign_keys {
+            if fk.parent_table != parent_table_name {
+                continue;
+            }
+            // For every to-delete parent row, derive the FK key
+            // (the parent FK columns' values). Then look for any
+            // child row that matches that key.
+            for (parent_row_idx, parent_row) in to_delete_rows.iter().enumerate() {
+                // Build the key tuple from the parent row.
+                let parent_key: Vec<&Value> = fk
+                    .parent_columns
+                    .iter()
+                    .map(|&pi| &parent_row[pi])
+                    .collect();
+                // Skip if any parent FK column is NULL — by SQL spec
+                // a NULL parent cannot have child references.
+                if parent_key.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                // Scan child rows looking for one that matches.
+                for (child_row_idx, child_row) in child.rows().iter().enumerate() {
+                    // Self-ref: skip the rows that are themselves
+                    // being deleted by this same DELETE — they
+                    // vanish with their parent so the reference is
+                    // not orphaned.
+                    if child_name == parent_table_name
+                        && doomed.contains(&child_row_idx)
+                    {
+                        continue;
+                    }
+                    let matches_key = fk
+                        .local_columns
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &li)| child_row.values.get(li) == Some(parent_key[i]));
+                    if !matches_key {
+                        continue;
+                    }
+                    // Found a referring child — apply the action.
+                    return match fk.on_delete {
+                        spg_storage::FkAction::Restrict
+                        | spg_storage::FkAction::NoAction => {
+                            Err(EngineError::Unsupported(alloc::format!(
+                                "FOREIGN KEY violation: DELETE on {parent_table_name:?} is \
+                                 restricted by FK from {child_name:?}.{:?} \
+                                 (row #{parent_row_idx} of the deletion set still has \
+                                 a child referent at row #{child_row_idx})",
+                                fk.local_columns,
+                            )))
+                        }
+                        spg_storage::FkAction::Cascade => Err(EngineError::Unsupported(
+                            "FOREIGN KEY ON DELETE CASCADE: not yet implemented \
+                             (lands in v7.6.4)"
+                                .into(),
+                        )),
+                        spg_storage::FkAction::SetNull => Err(EngineError::Unsupported(
+                            "FOREIGN KEY ON DELETE SET NULL: not yet implemented \
+                             (lands in v7.6.5)"
+                                .into(),
+                        )),
+                        spg_storage::FkAction::SetDefault => Err(EngineError::Unsupported(
+                            "FOREIGN KEY ON DELETE SET DEFAULT: not yet implemented \
+                             (lands in v7.6.5)"
+                                .into(),
+                        )),
+                    };
                 }
             }
         }
