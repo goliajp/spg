@@ -1,0 +1,15 @@
+[package]
+name         = "spg-embedded"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "v6.10.3 — ergonomic embedded-mode entry point for SPG. Wraps spg-engine + spg-storage for in-process use, no TCP listener, no WAL fsync. The typed-query API and derive macro are STABILITY carve-outs for v6.10."
+
+[dependencies]
+spg-engine  = { path = "../spg-engine" }
+spg-storage = { path = "../spg-storage" }
+
+[lints]
+workspace = true
