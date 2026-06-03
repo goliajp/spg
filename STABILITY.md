@@ -1408,7 +1408,7 @@ sidecar format, per-table budget override, segment compaction,
 parallel freezer, segment forwarding, and a boot-time prefetch
 worker pool. The following surfaces are frozen as of v6.7.8.
 
-**Catalog snapshot envelope** — `FILE_VERSION = 12` (v6.7.2
+**Catalog snapshot envelope** — `FILE_VERSION = 11` (v6.7.2
 bump). Layout extension is append-only:
 - After the per-table `indices` section (unchanged) comes:
 - `[u8 has_value][u64 LE value (if has_value)]` for the
@@ -1432,7 +1432,10 @@ New public APIs:
 - `Catalog::cold_segment_count()` returns the *active* count
   (skips tombstones). v6.7 readers see sparse cold-segment
   layouts; v6.6- binaries refuse the format because the
-  `Option`-wrapped vec serialises through a v12 catalog only.
+  `Option`-wrapped vec is a v6.7.3 in-memory shape only — it
+  doesn't enter the on-disk catalog snapshot, which carries
+  only `RowLocator::Cold { segment_id }` (tombstoning is recoded
+  from the manifest at boot).
 
 **Segment v2 envelope BRIN sidecar** (v6.7.1) — the v2 magic
 `SPGSEG\x02\x00` body now optionally carries a BRIN per-page

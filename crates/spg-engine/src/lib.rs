@@ -2704,13 +2704,48 @@ impl Engine {
             });
         }
         let table_name = stmt.table.clone();
+        // v6.8.0 — resolve INCLUDE column names to positions. Done
+        // before `add_index` so a typo error surfaces before any
+        // catalog mutation lands.
+        let included_positions: Vec<usize> = if stmt.included_columns.is_empty() {
+            Vec::new()
+        } else {
+            let schema = table.schema();
+            stmt.included_columns
+                .iter()
+                .map(|c| {
+                    schema.column_position(c).ok_or_else(|| {
+                        EngineError::Storage(StorageError::ColumnNotFound {
+                            column: c.clone(),
+                        })
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
         match stmt.method {
-            IndexMethod::BTree => table.add_index(stmt.name, &stmt.column)?,
+            IndexMethod::BTree => table.add_index(stmt.name.clone(), &stmt.column)?,
             IndexMethod::Hnsw => {
-                table.add_nsw_index(stmt.name, &stmt.column, spg_storage::NSW_DEFAULT_M)?;
+                if !included_positions.is_empty() {
+                    return Err(EngineError::Unsupported(
+                        "INCLUDE columns are not supported on HNSW indexes".into(),
+                    ));
+                }
+                table.add_nsw_index(stmt.name.clone(), &stmt.column, spg_storage::NSW_DEFAULT_M)?;
             }
             // v6.7.1 — BRIN. Pure metadata; no in-memory data.
-            IndexMethod::Brin => table.add_brin_index(stmt.name, &stmt.column)?,
+            IndexMethod::Brin => {
+                if !included_positions.is_empty() {
+                    return Err(EngineError::Unsupported(
+                        "INCLUDE columns are not supported on BRIN indexes".into(),
+                    ));
+                }
+                table.add_brin_index(stmt.name.clone(), &stmt.column)?;
+            }
+        }
+        if !included_positions.is_empty()
+            && let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name)
+        {
+            idx.included_columns = included_positions;
         }
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.

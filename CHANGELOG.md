@@ -21,7 +21,7 @@ cold-tier story up to PG/MySQL feature parity for the
 The whole series stays in-house: 0 external dependencies, no
 `unsafe` outside the v6.0 aarch64 NEON carve-out + v6.7.4/.6's
 documented libc::posix_fadvise FFI, WAL on-disk format frozen,
-catalog snapshot bumped v11 → 12 only inside the v6.7.1 / .2
+catalog snapshot bumped v10 → 11 inside the v6.7.2
 envelope-bump path, sqllogictest 4-corpus 100 %.
 
 ### Sub-version map
@@ -55,7 +55,7 @@ envelope-bump path, sqllogictest 4-corpus 100 %.
 **Storage layer (`spg_storage`):**
 - `Table::{cold_row_count, set_cold_row_count, mark_cold_row_count_stale, cold_row_count_stale}` getters.
 - `IndexKind::Brin { column_type }` variant + `BRIN_SIDECAR_MAGIC` + `BrinSummary` + `derive_brin_summaries` + `wrap_v2_envelope_with_brin`.
-- Catalog snapshot FILE_VERSION 11 → 12 (v6.7.2 per-table `hot_tier_bytes` field).
+- Catalog snapshot FILE_VERSION 10 → 11 (v6.7.2 per-table `hot_tier_bytes` field).
 - `TableSchema.hot_tier_bytes: Option<u64>` field.
 - `Catalog::compact_cold_segments(table, index, target_bytes) -> CompactReport` + `CompactReport` struct.
 - `Catalog::{load_segment_bytes_at, tombstone_segment, cold_segment_slot_count}`. `cold_segments` is now `Vec<Option<Arc<OwnedSegment>>>`; segment ids stay stable across compaction.

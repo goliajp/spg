@@ -219,6 +219,11 @@ pub struct CreateIndexStatement {
     /// `IF NOT EXISTS` — engine returns `CommandOk` no-op when the
     /// index name already exists, instead of raising `DuplicateIndex`.
     pub if_not_exists: bool,
+    /// v6.8.0 — `INCLUDE (col1, col2, …)` columns. Identifies the
+    /// non-key columns the planner should treat as "covered" by
+    /// this index when checking whether a query can run as an
+    /// index-only scan. Empty when no `INCLUDE` clause was given.
+    pub included_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -903,7 +908,18 @@ impl fmt::Display for CreateIndexStatement {
             IndexMethod::Brin => f.write_str("USING brin ")?,
             IndexMethod::BTree => {}
         }
-        write!(f, "({})", quote_ident(&self.column))
+        write!(f, "({})", quote_ident(&self.column))?;
+        if !self.included_columns.is_empty() {
+            f.write_str(" INCLUDE (")?;
+            for (i, c) in self.included_columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        Ok(())
     }
 }
 

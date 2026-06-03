@@ -351,6 +351,16 @@ pub struct Index {
     pub name: String,
     pub column_position: usize,
     pub kind: IndexKind,
+    /// v6.8.0 — column positions of `INCLUDE (col1, col2, …)`
+    /// non-key columns. Carries the planner's "this query is
+    /// covered by the index" signal; lookup paths still resolve
+    /// via the `RowLocator` to fetch the row body, but EXPLAIN
+    /// surfaces the covered-scan annotation so operators can
+    /// confirm the planner sees the coverage.
+    ///
+    /// Empty `Vec` = no `INCLUDE` clause (the legacy shape). v12
+    /// catalog snapshots deserialise with an empty vec.
+    pub included_columns: Vec<usize>,
 }
 
 /// Default neighbor degree (M) for the NSW graph. Picked at construction
@@ -573,6 +583,7 @@ impl Index {
             name,
             column_position,
             kind: IndexKind::BTree(PersistentBTreeMap::new()),
+            included_columns: Vec::new(),
         }
     }
 
@@ -581,6 +592,7 @@ impl Index {
             name,
             column_position,
             kind: IndexKind::Nsw(NswGraph::new(m)),
+            included_columns: Vec::new(),
         }
     }
 
@@ -592,6 +604,7 @@ impl Index {
             name,
             column_position,
             kind: IndexKind::Brin { column_type },
+            included_columns: Vec::new(),
         }
     }
 
@@ -768,6 +781,14 @@ impl Table {
 
     pub const fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// v6.8.0 — exposed for the engine layer to patch
+    /// `Index::included_columns` post-creation. Could fold into
+    /// `add_index` once the engine's IF-NOT-EXISTS guard moves up,
+    /// but the patch shape is the minimal change for v6.8.0.
+    pub fn indices_mut(&mut self) -> &mut [Index] {
+        &mut self.indices
     }
 
     pub fn indices(&self) -> &[Index] {
@@ -1076,6 +1097,7 @@ impl Table {
             name,
             column_position,
             kind: IndexKind::BTree(map),
+            included_columns: Vec::new(),
         });
         Ok(())
     }
@@ -1478,6 +1500,7 @@ impl Table {
                 name,
                 column_position,
                 kind: IndexKind::Nsw(graph),
+                included_columns: Vec::new(),
             });
             return Ok(());
         }
@@ -3703,7 +3726,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// version < 11). v11 snapshots written by a pre-v6.7.2 binary
 /// fail loudly at the version check, matching the v6.1.2 /
 /// v6.1.4 / v6.2.0 / v6.7.1 envelope-bump upgrade fences.
-const FILE_VERSION: u8 = 11;
+///
+/// v6.8.0 — bumped from 11 to 12: per-index
+/// `included_columns: Vec<u16>` appended at the tail of each
+/// index payload. v11 (= v6.7.2) catalogs load with
+/// `included_columns = Vec::new()` for every index — same
+/// "older readers, append-only extension" pattern as the v6.7.2
+/// hot_tier_bytes byte.
+const FILE_VERSION: u8 = 12;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -3812,6 +3842,22 @@ impl Catalog {
                         out.push(2);
                         write_data_type(&mut out, *column_type);
                     }
+                }
+                // v6.8.0 — included_columns appendix per index.
+                // Layout: [u16 num_included][num × u16 column_position].
+                // v11 readers stop before this u16 (deserialise loop
+                // gated on version >= 12); v12+ readers always
+                // consume it. Empty Vec serialises as a bare 0u16.
+                write_u16(
+                    &mut out,
+                    u16::try_from(idx.included_columns.len())
+                        .expect("≤ 65k INCLUDE columns/index"),
+                );
+                for col_pos in &idx.included_columns {
+                    write_u16(
+                        &mut out,
+                        u16::try_from(*col_pos).expect("≤ 65k columns/table"),
+                    );
                 }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
@@ -4007,6 +4053,31 @@ fn deserialize_indices(
                 return Err(StorageError::Corrupt(format!(
                     "unknown index kind tag: {other}"
                 )));
+            }
+        }
+        // v6.8.0 — included_columns appendix per index. v11- snapshots
+        // stop before this u16; v12+ always carries it (possibly 0).
+        if version >= 12 {
+            let num_included = cur.read_u16()? as usize;
+            if num_included > 0 {
+                let mut included: Vec<usize> = Vec::with_capacity(num_included);
+                for _ in 0..num_included {
+                    let cp = cur.read_u16()? as usize;
+                    if cp >= t.schema.columns.len() {
+                        return Err(StorageError::Corrupt(format!(
+                            "INCLUDE column position {cp} out of range \
+                             ({} schema columns)",
+                            t.schema.columns.len()
+                        )));
+                    }
+                    included.push(cp);
+                }
+                // Patch the just-pushed index. The four restore_* helpers
+                // append to `t.indices`; the matching index is the last
+                // entry.
+                if let Some(last) = t.indices.last_mut() {
+                    last.included_columns = included;
+                }
             }
         }
     }
