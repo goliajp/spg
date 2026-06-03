@@ -2250,6 +2250,17 @@ impl Catalog {
         self.cold_segments.len()
     }
 
+    /// v6.2.7 — list every cold-tier segment id known to this
+    /// catalog. Used by EXPLAIN ANALYZE to annotate scan nodes
+    /// with the segments they could have walked. Currently
+    /// returns the global set across all tables; per-table
+    /// breakdown lands in a future v6.2.x (would require
+    /// walking each table's BTree-index cold locators).
+    #[must_use]
+    pub fn cold_segment_ids_global(&self) -> Vec<u32> {
+        (0..self.cold_segments.len() as u32).collect()
+    }
+
     /// v5.2.1: sum of `Table::hot_bytes` across every table. The v5.2
     /// freezer compares this against `SPG_HOT_TIER_BYTES` (parsed at
     /// server startup; default 4 GiB) and wakes when the budget is
