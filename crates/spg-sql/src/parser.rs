@@ -281,6 +281,44 @@ impl Parser {
             // <name> → re-stats one. The argument is an optional
             // ident (or quoted ident); anything else is a parse
             // error.
+            // v6.7.3 — `COMPACT COLD SEGMENTS`. No arguments, no
+            // `WHERE` filter (carved out per V6_7_DESIGN.md
+            // STABILITY). Lex order: identifier "compact" → "cold"
+            // → "segments". Anything else after `COMPACT` is a
+            // parse error.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("compact") => {
+                self.advance();
+                let next = self.peek().clone();
+                let cold = match next {
+                    Token::Ident(s) | Token::QuotedIdent(s) => s,
+                    _ => {
+                        return Err(
+                            self.err(format!("expected COLD after COMPACT, got {:?}", self.peek()))
+                        );
+                    }
+                };
+                if !cold.eq_ignore_ascii_case("cold") {
+                    return Err(self.err(format!("expected COLD after COMPACT, got {cold:?}")));
+                }
+                self.advance();
+                let next = self.peek().clone();
+                let segments = match next {
+                    Token::Ident(s) | Token::QuotedIdent(s) => s,
+                    _ => {
+                        return Err(self.err(format!(
+                            "expected SEGMENTS after COMPACT COLD, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                };
+                if !segments.eq_ignore_ascii_case("segments") {
+                    return Err(self.err(format!(
+                        "expected SEGMENTS after COMPACT COLD, got {segments:?}"
+                    )));
+                }
+                self.advance();
+                Ok(Statement::CompactColdSegments)
+            }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("analyze") => {
                 self.advance();
                 let target = match self.peek() {

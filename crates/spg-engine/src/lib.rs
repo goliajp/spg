@@ -38,8 +38,8 @@ use spg_sql::ast::{
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
-    Catalog, ColumnSchema, DataType, IndexKey, Row, StorageError, Table, TableSchema, Value,
-    VecEncoding,
+    Catalog, ColumnSchema, CompactReport, DataType, IndexKey, IndexKind, Row, StorageError, Table,
+    TableSchema, Value, VecEncoding,
 };
 
 use crate::eval::{EvalContext, EvalError};
@@ -484,6 +484,13 @@ pub struct TxId(pub u64);
 /// Reserved slot used by `Engine::execute(sql)` — the legacy single-
 /// global-shadow path. New `alloc_tx_id` handles start at 1.
 pub const IMPLICIT_TX: TxId = TxId(0);
+
+/// v6.7.3 — default segment-size threshold used by `COMPACT COLD
+/// SEGMENTS` when no explicit target is supplied. Segments whose
+/// `OwnedSegment::bytes().len()` is **strictly** less than this
+/// value are eligible to merge. spg-server reads
+/// `SPG_COMPACTION_TARGET_SEGMENT_BYTES` to override.
+pub const COMPACTION_TARGET_DEFAULT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Per-slot transaction state. Held inside `tx_catalogs[tx_id]` for the
 /// lifetime of a BEGIN..COMMIT (or BEGIN..ROLLBACK) window. Drops when
@@ -962,6 +969,55 @@ impl Engine {
         Ok(report)
     }
 
+    /// v6.7.3 — public shim around `Catalog::compact_cold_segments`
+    /// driving every BTree index on every user table. Returns one
+    /// `(table, index, report)` triple for each merge that
+    /// actually happened (no-op (table, index) pairs are filtered
+    /// out so callers can size persist-side work to the live
+    /// merges). Caller is responsible for persisting each
+    /// `report.merged_segment_bytes` and updating the on-disk
+    /// segment registry; engine layer is no_std and never
+    /// touches disk.
+    ///
+    /// Marks every touched table's cached `cold_row_count` stale
+    /// — compaction GC'd some shadowed rows, so the count must be
+    /// re-derived on the next ANALYZE.
+    pub fn compact_cold_segments_with_target(
+        &mut self,
+        target_segment_bytes: u64,
+    ) -> Result<Vec<(String, String, CompactReport)>, EngineError> {
+        let table_names = self.active_catalog().table_names();
+        let mut reports: Vec<(String, String, CompactReport)> = Vec::new();
+        for tname in table_names {
+            if is_internal_table_name(&tname) {
+                continue;
+            }
+            let idx_names: Vec<String> = {
+                let Some(t) = self.active_catalog().get(&tname) else {
+                    continue;
+                };
+                t.indices()
+                    .iter()
+                    .filter(|i| matches!(i.kind, IndexKind::BTree(_)))
+                    .map(|i| i.name.clone())
+                    .collect()
+            };
+            for iname in idx_names {
+                let report = self
+                    .active_catalog_mut()
+                    .compact_cold_segments(&tname, &iname, target_segment_bytes)
+                    .map_err(EngineError::Storage)?;
+                if report.merged_segment_id.is_some() {
+                    if let Some(t) = self.active_catalog_mut().get_mut(&tname) {
+                        t.mark_cold_row_count_stale();
+                    }
+                    reports.push((tname.clone(), iname, report));
+                }
+            }
+        }
+        Ok(reports)
+    }
+
     fn active_catalog(&self) -> &Catalog {
         match self.current_tx {
             Some(t) => self
@@ -1266,6 +1322,8 @@ impl Engine {
             )),
             // v6.2.0 — ANALYZE recomputes per-column histograms.
             Statement::Analyze(target) => self.exec_analyze(target.as_deref()),
+            // v6.7.3 — COMPACT COLD SEGMENTS.
+            Statement::CompactColdSegments => self.exec_compact_cold_segments(),
         };
         self.enforce_row_limit(result)
     }
@@ -1882,6 +1940,49 @@ impl Engine {
             affected: analysed,
             modified_catalog: true,
         })
+    }
+
+    /// v6.7.3 — `COMPACT COLD SEGMENTS` runtime path. Drives the
+    /// engine-layer compaction shim with the default
+    /// 4 MiB segment-size threshold. spg-server intercepts the
+    /// SQL before it reaches the engine on a server build —
+    /// it reads `SPG_COMPACTION_TARGET_SEGMENT_BYTES`, calls
+    /// `Engine::compact_cold_segments_with_target` directly with
+    /// the env value, and persists every merged segment to
+    /// `<db>.spg/segments/`. This arm only fires for engine-only
+    /// callers (spg-embedded, lib tests); in that mode merged
+    /// segments live in memory and are dropped at process exit.
+    fn exec_compact_cold_segments(&mut self) -> Result<QueryResult, EngineError> {
+        let target = COMPACTION_TARGET_DEFAULT_BYTES;
+        let reports = self.compact_cold_segments_with_target(target)?;
+        let columns = alloc::vec![
+            ColumnSchema::new("table_name", DataType::Text, false),
+            ColumnSchema::new("index_name", DataType::Text, false),
+            ColumnSchema::new("sources_merged", DataType::BigInt, false),
+            ColumnSchema::new("merged_segment_id", DataType::BigInt, false),
+            ColumnSchema::new("merged_rows", DataType::BigInt, false),
+            ColumnSchema::new("deleted_rows_pruned", DataType::BigInt, false),
+            ColumnSchema::new("bytes_reclaimed_estimate", DataType::BigInt, false),
+        ];
+        let rows: Vec<Row> = reports
+            .into_iter()
+            .map(|(tname, iname, report)| {
+                Row::new(alloc::vec![
+                    Value::Text(tname),
+                    Value::Text(iname),
+                    Value::BigInt(i64::try_from(report.sources.len()).unwrap_or(i64::MAX)),
+                    Value::BigInt(i64::from(report.merged_segment_id.unwrap_or(0))),
+                    Value::BigInt(i64::try_from(report.merged_rows).unwrap_or(i64::MAX)),
+                    Value::BigInt(
+                        i64::try_from(report.deleted_rows_pruned).unwrap_or(i64::MAX),
+                    ),
+                    Value::BigInt(
+                        i64::try_from(report.bytes_reclaimed_estimate).unwrap_or(i64::MAX),
+                    ),
+                ])
+            })
+            .collect();
+        Ok(QueryResult::Rows { columns, rows })
     }
 
     /// Walk a single table's rows once and (re-)populate per-column

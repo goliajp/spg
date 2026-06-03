@@ -109,6 +109,14 @@ pub enum Statement {
     /// `spg_statistic` with per-column null_frac + n_distinct +
     /// 100-bucket equi-depth histogram.
     Analyze(Option<String>),
+    /// v6.7.3 — `COMPACT COLD SEGMENTS`. Walks every user table's
+    /// BTree-cold indices and merges small cold-tier segments
+    /// (size below `SPG_COMPACTION_TARGET_SEGMENT_BYTES`, default
+    /// 4 MiB) into a single larger segment per (table, index).
+    /// `WHERE` predicate filtering on which tables to compact is
+    /// carved out of v6.7.3 (per V6_7_DESIGN.md STABILITY entry);
+    /// v6.7.3 only supports the bare form.
+    CompactColdSegments,
 }
 
 /// v6.1.4 — `CREATE SUBSCRIPTION` AST node. v6.1.4 ships a
@@ -817,6 +825,7 @@ impl fmt::Display for Statement {
             }
             Self::Analyze(None) => f.write_str("ANALYZE"),
             Self::Analyze(Some(t)) => write!(f, "ANALYZE {}", quote_ident(t)),
+            Self::CompactColdSegments => f.write_str("COMPACT COLD SEGMENTS"),
             Self::Explain(e) => {
                 if e.analyze {
                     write!(f, "EXPLAIN ANALYZE {}", e.inner)
