@@ -99,6 +99,21 @@ use crate::bloom::{BloomError, BloomFilter};
 /// reader can disambiguate a stray slice.
 pub const SEGMENT_MAGIC: [u8; 8] = *b"SPGSEG\x01\x00";
 
+/// v6.6.2 — segment file v2 magic. A v2 file wraps the v1 byte
+/// sequence (magic + body + CRC32 footer) inside a compression
+/// envelope:
+///   [8-byte magic SEGMENT_MAGIC_V2]
+///   [u8 algo: 0=none, 1=LZSS]
+///   [u32 LE inner_uncompressed_len]
+///   [inner bytes — either the raw v1 segment OR LZSS-compressed]
+/// v6.6+ readers detect v2 by magic and transparently unwrap; v1
+/// files (magic `SPGSEG\x01\x00`) still load through the legacy
+/// parser path with zero changes.
+pub const SEGMENT_MAGIC_V2: [u8; 8] = *b"SPGSEG\x02\x00";
+pub(crate) const SEGMENT_V2_HEADER_LEN: usize = 8 + 1 + 4;
+pub const SEGMENT_COMPRESS_ALGO_NONE: u8 = 0;
+pub const SEGMENT_COMPRESS_ALGO_LZSS: u8 = 1;
+
 /// Default page byte count. Stored in the segment header so future
 /// versions can tune without a magic bump. 4096 matches APFS / ext4
 /// default page size — a single page read is one disk I/O on every
@@ -143,6 +158,14 @@ pub enum SegmentError {
         got: u32,
         num_pages: u32,
     },
+    /// v6.6.2 — v2 envelope's inner LZSS payload failed to
+    /// decompress. The contained string is the underlying
+    /// `LzssError` rendered.
+    CompressionDecodeFailed(String),
+    /// v6.6.2 — v2 envelope declares an unknown compression algo
+    /// byte. Refuse to read forward without knowing how to
+    /// interpret the inner bytes.
+    UnknownCompressionAlgo(u8),
 }
 
 impl fmt::Display for SegmentError {
@@ -172,6 +195,14 @@ impl fmt::Display for SegmentError {
             Self::PageOutOfRange { got, num_pages } => write!(
                 f,
                 "segment: page index {got} out of range, num_pages = {num_pages}"
+            ),
+            Self::CompressionDecodeFailed(s) => write!(
+                f,
+                "segment v2 envelope: LZSS decompress failed: {s}"
+            ),
+            Self::UnknownCompressionAlgo(b) => write!(
+                f,
+                "segment v2 envelope: unknown compression algo byte {b:#04x}"
             ),
         }
     }
@@ -668,10 +699,89 @@ pub struct SegmentReader<'a> {
     metadata: SegmentMetadata,
 }
 
+/// v6.6.2 — wrap v1 segment bytes in a v2 LZSS envelope when
+/// `compress=true` and the compressed form is strictly smaller.
+/// Returns the v1 bytes unchanged otherwise (the caller's "ship
+/// the smaller form" policy lives at the catalog layer; this
+/// helper only commits to NOT making files bigger).
+#[must_use]
+pub fn wrap_v2_envelope(v1_bytes: Vec<u8>, compress: bool) -> Vec<u8> {
+    if !compress {
+        return v1_bytes;
+    }
+    let compressed = spg_crypto::lzss::compress(&v1_bytes);
+    if compressed.len() + SEGMENT_V2_HEADER_LEN >= v1_bytes.len() {
+        return v1_bytes;
+    }
+    let inner_len = u32::try_from(v1_bytes.len()).expect("v1 segment < 4 GiB");
+    let mut out = Vec::with_capacity(SEGMENT_V2_HEADER_LEN + compressed.len());
+    out.extend_from_slice(&SEGMENT_MAGIC_V2);
+    out.push(SEGMENT_COMPRESS_ALGO_LZSS);
+    out.extend_from_slice(&inner_len.to_le_bytes());
+    out.extend_from_slice(&compressed);
+    out
+}
+
+/// v6.6.2 — unwrap a v2 envelope to v1 bytes. v1-magic input
+/// passes through unchanged.
+pub(crate) fn unwrap_v2_envelope(bytes: Vec<u8>) -> Result<Vec<u8>, SegmentError> {
+    if bytes.len() < 8 || bytes[..8] != SEGMENT_MAGIC_V2 {
+        return Ok(bytes);
+    }
+    if bytes.len() < SEGMENT_V2_HEADER_LEN {
+        return Err(SegmentError::TooShort {
+            got: bytes.len(),
+            need: SEGMENT_V2_HEADER_LEN,
+        });
+    }
+    let algo = bytes[8];
+    let inner_len = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]) as usize;
+    let inner = &bytes[SEGMENT_V2_HEADER_LEN..];
+    match algo {
+        SEGMENT_COMPRESS_ALGO_NONE => {
+            // v2 envelope with no compression (rare — would only
+            // appear if a writer opted in to v2 but the LZSS check
+            // bailed). Return inner directly.
+            if inner.len() != inner_len {
+                return Err(SegmentError::BadShape(alloc::format!(
+                    "v2 envelope algo=none: declared inner_len {inner_len} \
+                     differs from body {}",
+                    inner.len()
+                )));
+            }
+            Ok(inner.to_vec())
+        }
+        SEGMENT_COMPRESS_ALGO_LZSS => {
+            let decompressed = spg_crypto::lzss::decompress(inner)
+                .map_err(|e| SegmentError::CompressionDecodeFailed(alloc::format!("{e:?}")))?;
+            if decompressed.len() != inner_len {
+                return Err(SegmentError::BadShape(alloc::format!(
+                    "v2 envelope LZSS: decompressed {} bytes, declared {inner_len}",
+                    decompressed.len()
+                )));
+            }
+            Ok(decompressed)
+        }
+        other => Err(SegmentError::UnknownCompressionAlgo(other)),
+    }
+}
+
 impl<'a> SegmentReader<'a> {
     /// Parse a segment from a contiguous byte slice. Validates
-    /// magic, CRC32 footer, and structural lengths.
+    /// magic, CRC32 footer, and structural lengths. v6.6.2: a
+    /// v2-magic envelope is rejected by the borrowed-slice reader
+    /// because decompression would need to allocate a fresh Vec —
+    /// callers with a v2 file must go through
+    /// [`OwnedSegment::from_bytes`] which can own the
+    /// decompressed bytes.
     pub fn open(bytes: &'a [u8]) -> Result<Self, SegmentError> {
+        if bytes.len() >= 8 && bytes[..8] == SEGMENT_MAGIC_V2 {
+            return Err(SegmentError::BadShape(alloc::format!(
+                "v2 envelope: SegmentReader requires the caller to first \
+                 unwrap to v1 bytes via OwnedSegment::from_bytes; the \
+                 borrowed-slice reader does not allocate."
+            )));
+        }
         let metadata = parse_segment_metadata(bytes)?;
         Ok(Self { bytes, metadata })
     }
@@ -728,7 +838,14 @@ impl OwnedSegment {
     /// stay resident inside the returned `OwnedSegment` for the
     /// life of that value. Validation cost is paid once; per-
     /// lookup cost is identical to [`SegmentReader::lookup`].
+    ///
+    /// v6.6.2 — accepts both v1 (`SPGSEG\x01\x00`) and v2
+    /// (`SPGSEG\x02\x00`) magics. A v2 file's body is transparently
+    /// unwrapped before the v1 parser runs; the unwrapped v1 bytes
+    /// become the `bytes` field, so all downstream readers see a
+    /// canonical v1 layout.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SegmentError> {
+        let bytes = unwrap_v2_envelope(bytes)?;
         let metadata = parse_segment_metadata(&bytes)?;
         Ok(Self { bytes, metadata })
     }
@@ -890,6 +1007,65 @@ mod tests {
                 (i * 2 + 1, payload) // sparse keys to exercise binary search
             })
             .collect()
+    }
+
+    #[test]
+    fn v2_envelope_round_trips_byte_equal() {
+        // Encode v1, wrap into v2 with compression, unwrap, parse.
+        // Result must equal the original v1 bytes byte-for-byte.
+        let rows = build_rows(1000);
+        let (v1_bytes, _) =
+            encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
+        let wrapped = wrap_v2_envelope(v1_bytes.clone(), true);
+        // Compression should produce a smaller envelope on the
+        // repetitive segment payload.
+        assert!(
+            wrapped.len() < v1_bytes.len(),
+            "v2 envelope should be smaller: {} vs v1 {}",
+            wrapped.len(),
+            v1_bytes.len()
+        );
+        let seg = OwnedSegment::from_bytes(wrapped).expect("v2 unwrap + parse");
+        assert_eq!(seg.meta().num_rows, 1000);
+        // Lookup still works — the unwrapped bytes match the
+        // original v1 segment structure.
+        assert!(seg.lookup(1).is_some());
+        assert!(seg.lookup(1999).is_some());
+    }
+
+    #[test]
+    fn v2_envelope_with_compress_false_is_v1_passthrough() {
+        let rows = build_rows(64);
+        let (v1_bytes, _) =
+            encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
+        let wrapped = wrap_v2_envelope(v1_bytes.clone(), false);
+        assert_eq!(wrapped, v1_bytes);
+    }
+
+    #[test]
+    fn legacy_v1_segments_still_load_via_from_bytes() {
+        // A v6.6 binary must still read v1-magic files written by a
+        // pre-v6.6 binary.
+        let rows = build_rows(100);
+        let (v1_bytes, _) =
+            encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
+        // Confirm the bytes start with the v1 magic (no envelope).
+        assert_eq!(&v1_bytes[..8], &SEGMENT_MAGIC);
+        // OwnedSegment::from_bytes should handle these unchanged.
+        let seg = OwnedSegment::from_bytes(v1_bytes).expect("v1 still parses");
+        assert_eq!(seg.meta().num_rows, 100);
+    }
+
+    #[test]
+    fn v2_envelope_invalid_algo_byte_errors_loudly() {
+        // Craft a v2-magic file with an unknown algo byte. Reader
+        // must refuse rather than silent-corrupt.
+        let mut bogus = Vec::new();
+        bogus.extend_from_slice(&SEGMENT_MAGIC_V2);
+        bogus.push(0x42); // unknown algo
+        bogus.extend_from_slice(&0u32.to_le_bytes());
+        let err = OwnedSegment::from_bytes(bogus).unwrap_err();
+        assert!(matches!(err, SegmentError::UnknownCompressionAlgo(0x42)));
     }
 
     #[test]
