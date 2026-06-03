@@ -848,6 +848,11 @@ struct PreparedStmt {
     /// here so `Bind` can validate the client's parameter count
     /// before constructing the portal.
     placeholder_count: u16,
+    /// v6.3.4 — the client-declared OID for each parameter in the
+    /// Parse message. `0` means "not declared — Bind format must be
+    /// text". Used to dispatch binary-format Bind values to the
+    /// right decoder.
+    param_type_oids: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -893,12 +898,25 @@ fn handle_parse(
         .trim_end_matches(';')
         .trim()
         .to_string();
-    // Trailing u16 = param-type count, then that many u32 OIDs. We
-    // ignore the declared types; the AST itself carries the
-    // placeholder count we'll validate against the Bind.
+    // Trailing u16 = param-type count, then that many u32 OIDs.
+    // v6.3.4 — these are stored on PreparedStmt so binary-format
+    // Bind parameters can be decoded by the right type's wire
+    // format.
     if cur + 2 > body.len() {
         return Err("Parse: missing parameter type count".into());
     }
+    let oid_count = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
+    cur += 2;
+    if cur + oid_count * 4 > body.len() {
+        return Err("Parse: truncated parameter OIDs".into());
+    }
+    let mut param_type_oids: Vec<u32> = Vec::with_capacity(oid_count);
+    for _ in 0..oid_count {
+        let oid = u32::from_be_bytes([body[cur], body[cur + 1], body[cur + 2], body[cur + 3]]);
+        param_type_oids.push(oid);
+        cur += 4;
+    }
+    let _ = cur; // silence "unused" if we add fields later
     // v6.1.1: real Engine::prepare path — parse + clock-rewrite +
     // ORDER-BY position resolution once, here. Bind/Execute below
     // reuse the AST. Surfaces parser errors as a wire-level Parse
@@ -922,6 +940,7 @@ fn handle_parse(
         PreparedStmt {
             ast,
             placeholder_count,
+            param_type_oids,
         },
     );
     Ok(())
@@ -1019,8 +1038,16 @@ fn handle_bind(
             1 => formats[0],
             _ => formats.get(i).copied().unwrap_or(0),
         };
+        if fmt == 1 {
+            // v6.3.4 — binary format.
+            let oid = stmt.param_type_oids.get(i).copied().unwrap_or(0);
+            let v = decode_binary_param(oid, &body[cur..cur + len])?;
+            params.push(v);
+            cur += len;
+            continue;
+        }
         if fmt != 0 {
-            return Err("Bind: binary parameter format not supported (v6.1.1 text-only)".into());
+            return Err(format!("Bind: unsupported parameter format code {fmt}"));
         }
         let s = std::str::from_utf8(&body[cur..cur + len])
             .map_err(|_| "Bind: text parameter not valid UTF-8".to_string())?;
@@ -1070,6 +1097,186 @@ fn text_param_to_value(s: &str) -> spg_storage::Value {
         return spg_storage::Value::Vector(v);
     }
     spg_storage::Value::Text(s.to_string())
+}
+
+/// v6.3.4 — decode a binary-format Bind parameter according to its
+/// PG type OID. Returns an `EngineError`-shaped string on
+/// type/length mismatch so the wire layer can lift it into a Bind
+/// error.
+///
+/// Supported OIDs (matches `pg_type.oid` in stock Postgres):
+///   16   = bool          (1 byte: 0/1)
+///   17   = bytea         (raw bytes)
+///   20   = int8 / bigint (8 bytes BE)
+///   21   = int2          (2 bytes BE → SmallInt)
+///   23   = int4 / int    (4 bytes BE)
+///   25   = text          (UTF-8)
+///   700  = float4 / real (4 bytes BE float)
+///   701  = float8 / double precision (8 bytes BE float)
+///   1043 = varchar       (UTF-8)
+///   1082 = date          (4 bytes BE; days since 2000-01-01)
+///   1114 = timestamp     (8 bytes BE; microseconds since 2000-01-01 UTC)
+///   1184 = timestamptz   (same wire as 1114; UTC)
+///   1700 = numeric       (variable-precision packed-digit format)
+///
+/// Unknown OID + binary format → error (text is the safe default).
+fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, String> {
+    use spg_storage::Value;
+    match oid {
+        16 => {
+            if bytes.len() != 1 {
+                return Err(format!("Bind binary BOOL must be 1 byte, got {}", bytes.len()));
+            }
+            Ok(Value::Bool(bytes[0] != 0))
+        }
+        17 | 25 | 1043 => {
+            // bytea / text / varchar — for SPG's value space, raw
+            // bytes stored as UTF-8 Text. Real BYTEA support is a
+            // separate column type; v6.3.4 maps bytea wire bytes into
+            // Text via lossless escape (matches PG's text-format
+            // bytea = '\\x...' on read).
+            if oid == 17 {
+                let s = bytes
+                    .iter()
+                    .fold(String::with_capacity(2 + bytes.len() * 2), |mut acc, b| {
+                        if acc.is_empty() {
+                            acc.push('\\');
+                            acc.push('x');
+                        }
+                        acc.push_str(&format!("{b:02x}"));
+                        acc
+                    });
+                Ok(Value::Text(if s.is_empty() { "\\x".into() } else { s }))
+            } else {
+                let s = std::str::from_utf8(bytes)
+                    .map_err(|_| "Bind binary TEXT/VARCHAR: invalid UTF-8".to_string())?;
+                Ok(Value::Text(s.to_string()))
+            }
+        }
+        20 => {
+            if bytes.len() != 8 {
+                return Err(format!("Bind binary BIGINT must be 8 bytes, got {}", bytes.len()));
+            }
+            let n = i64::from_be_bytes(bytes.try_into().unwrap());
+            Ok(Value::BigInt(n))
+        }
+        21 => {
+            if bytes.len() != 2 {
+                return Err(format!("Bind binary INT2 must be 2 bytes, got {}", bytes.len()));
+            }
+            let n = i16::from_be_bytes(bytes.try_into().unwrap());
+            Ok(Value::SmallInt(n))
+        }
+        23 => {
+            if bytes.len() != 4 {
+                return Err(format!("Bind binary INT must be 4 bytes, got {}", bytes.len()));
+            }
+            let n = i32::from_be_bytes(bytes.try_into().unwrap());
+            Ok(Value::Int(n))
+        }
+        700 => {
+            if bytes.len() != 4 {
+                return Err(format!("Bind binary REAL must be 4 bytes, got {}", bytes.len()));
+            }
+            let f = f32::from_be_bytes(bytes.try_into().unwrap()) as f64;
+            Ok(Value::Float(f))
+        }
+        701 => {
+            if bytes.len() != 8 {
+                return Err(format!("Bind binary DOUBLE must be 8 bytes, got {}", bytes.len()));
+            }
+            let f = f64::from_be_bytes(bytes.try_into().unwrap());
+            Ok(Value::Float(f))
+        }
+        1082 => {
+            if bytes.len() != 4 {
+                return Err(format!("Bind binary DATE must be 4 bytes, got {}", bytes.len()));
+            }
+            // Days since 2000-01-01. SPG's Date stores days since
+            // 1970-01-01 (Unix epoch), so add the 30-year offset.
+            const PG_EPOCH_DAYS_FROM_UNIX: i32 = 10957;
+            let pg_days = i32::from_be_bytes(bytes.try_into().unwrap());
+            Ok(Value::Date(pg_days + PG_EPOCH_DAYS_FROM_UNIX))
+        }
+        1114 | 1184 => {
+            if bytes.len() != 8 {
+                return Err(format!(
+                    "Bind binary TIMESTAMP must be 8 bytes, got {}",
+                    bytes.len()
+                ));
+            }
+            // Microseconds since 2000-01-01 UTC. SPG stores
+            // microseconds since Unix epoch — add the 30-year offset.
+            const PG_EPOCH_MICROS_FROM_UNIX: i64 = 946_684_800_000_000;
+            let pg_micros = i64::from_be_bytes(bytes.try_into().unwrap());
+            Ok(Value::Timestamp(pg_micros + PG_EPOCH_MICROS_FROM_UNIX))
+        }
+        1700 => decode_binary_numeric(bytes),
+        0 => Err(
+            "Bind: binary format requires the parameter OID to be declared in Parse \
+             (got OID=0 meaning unknown)".into(),
+        ),
+        _ => Err(format!(
+            "Bind: binary format for OID {oid} not supported in v6.3.4"
+        )),
+    }
+}
+
+/// PG binary NUMERIC: `i16 ndigits; i16 weight; i16 sign; i16 dscale;
+/// i16 digits[ndigits]` (each digit is a base-10000 chunk). Reconstruct
+/// to canonical scaled-i128 form.
+fn decode_binary_numeric(bytes: &[u8]) -> Result<spg_storage::Value, String> {
+    if bytes.len() < 8 {
+        return Err("Bind binary NUMERIC: header truncated".into());
+    }
+    let ndigits = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    let weight = i16::from_be_bytes([bytes[2], bytes[3]]);
+    let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let dscale = u16::from_be_bytes([bytes[6], bytes[7]]);
+    if bytes.len() != 8 + ndigits * 2 {
+        return Err(format!(
+            "Bind binary NUMERIC: declared ndigits={ndigits} but body has {} bytes",
+            bytes.len()
+        ));
+    }
+    if sign == 0xC000 {
+        return Err("Bind binary NUMERIC: NaN sign not supported".into());
+    }
+    let mut digits: Vec<u16> = Vec::with_capacity(ndigits);
+    for i in 0..ndigits {
+        let off = 8 + i * 2;
+        let d = u16::from_be_bytes([bytes[off], bytes[off + 1]]);
+        digits.push(d);
+    }
+    // Build the integer value: sum digit[k] * 10000^(weight - k).
+    // Then rescale to `dscale` fractional digits.
+    let mut unscaled: i128 = 0;
+    let total_digits_after_weight = ndigits as i32 - 1 - weight as i32;
+    // exponent shift for each base-10000 digit
+    for (k, d) in digits.iter().enumerate() {
+        let exp = (weight as i32 - k as i32) * 4;
+        let final_exp = exp + dscale as i32;
+        if final_exp >= 0 {
+            let pow = 10i128.pow(final_exp as u32);
+            unscaled = unscaled
+                .checked_add((*d as i128).checked_mul(pow).ok_or("NUMERIC overflow")?)
+                .ok_or("NUMERIC overflow")?;
+        } else {
+            let shift = (-final_exp) as u32;
+            let pow = 10i128.pow(shift);
+            unscaled = unscaled
+                .checked_add((*d as i128) / pow)
+                .ok_or("NUMERIC overflow")?;
+        }
+    }
+    let _ = total_digits_after_weight; // diagnostic-only
+    let final_value = if sign == 0x4000 { -unscaled } else { unscaled };
+    // dscale fits in u8; precision is best-effort (38 = i128 max).
+    let scale = u8::try_from(dscale).map_err(|_| "NUMERIC dscale too large".to_string())?;
+    Ok(spg_storage::Value::Numeric {
+        scaled: final_value,
+        scale,
+    })
 }
 
 /// Parse `[f1,f2,...,fn]` into `Vec<f32>`. Returns None on any
