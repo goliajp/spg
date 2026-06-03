@@ -10,6 +10,95 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.10] — 2026-06-03 (SPG-unique abilities — release roll-up)
+
+v6.10 closes the v6.x story by lifting the SPG-specific
+capabilities from the v6 roadmap §2 ("Inspired-better
+dedicated") into shippable surfaces. Eight independent items
+deliver one substantial operator-facing change each — none
+require a catalog snapshot bump or wire-protocol break.
+
+The series sets up the v7.0 release with every
+"v6.7 → v6.10 全部 ship" prerequisite from
+[[v7-path-c]] satisfied:
+
+- v6.7 — Cold tier evolution (9 sub-versions)
+- v6.8 — Index breadth (5 sub-versions)
+- v6.9 — Concurrency expansion (2 sub-versions, decision)
+- v6.10 — SPG-unique abilities (9 sub-versions, this entry)
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.10.0 | WAL-as-SQL pub/sub publisher (NATS framing) |
+| 6.10.1 | Per-query CPU/wall budget (`SPG_MAX_QUERY_NS`) |
+| 6.10.2 | Cold-tier time travel (`AS OF SEGMENT '<id>'`) |
+| 6.10.3 | Embedded mode (`spg-embedded` crate) |
+| 6.10.4 | WAL replay sandbox (`spg-server --replay-only`) |
+| 6.10.5 | WAL schema lint (`spg wal-lint`) |
+| 6.10.6 | WAL stream tee (`SPG_WAL_TEE_PATH`) |
+| 6.10.7 | Audit-driven PITR (`spg revert --to-seq`) |
+| 6.10.8 | series ship rollup (this entry) |
+
+### Frozen surfaces added in v6.10
+
+**Env vars** (operator-tunable):
+- `SPG_PUBSUB_TARGET=log` — WAL-as-SQL fan-out target.
+- `SPG_PUBSUB_SUBJECT` — NATS subject (default `spg.wal.sql`).
+- `SPG_MAX_QUERY_NS` — per-query budget in nanoseconds.
+- `SPG_WAL_TEE_PATH` — best-effort WAL mirror file path.
+
+**SQL surface:**
+- `SELECT … FROM <tbl> AS OF SEGMENT '<id>'` — cold-tier
+  time-travel scan. Scope: projection + WHERE + LIMIT.
+
+**CLI:**
+- `spg-server --replay-only` — boot path that restores +
+  replays + exits 0 without opening any listener.
+- `spg wal-lint <wal_path> --against-schema <db_path>` —
+  dry-run apply WAL records against a catalog snapshot.
+- `spg revert --wal <p> --to-seq <N> --out <db>` — replay
+  first N records into a fresh engine and write the new
+  snapshot.
+
+**Crates:**
+- `spg-embedded` — ergonomic in-process entry point wrapping
+  `spg-engine`. `Database::open_in_memory`, `execute`,
+  `query`, `snapshot`, `restore`. Plus a `FromSpgRow` trait
+  sketch for the future `#[derive(SpgRow)]` macro.
+
+**Wire frame (replication v2):**
+- The v6.7.5 `FRAME_TYPE_SEGMENT_FILE_CHUNK = 0x03` is the
+  most recent v2 frame addition; v6.10 added none.
+
+### Known v6.10 limitations (carved out, NOT deferred)
+
+- **Real-broker TCP for `SPG_PUBSUB_TARGET`.** v6.10.0 ships
+  `log` only — emits framed `PUB <subject> <bytes>\r\n…\r\n`
+  to stderr. `tcp://host:port` / `nats://…` with INFO/CONNECT
+  handshake + reconnect logic is parked.
+- **`AS OF SEGMENT` with joins / aggregates / ORDER BY.** The
+  scan path returns an `Unsupported` error pointing at this
+  carve-out. Operators wanting joins restore the segment into
+  a regular table first.
+- **`AS OF TIMESTAMP <ts>`.** Needs the freezer to stamp each
+  segment with a wall-clock at creation time, which v6.10
+  doesn't yet do. Future v6.x revisit.
+- **Typed query API + `#[derive(SpgRow)]`.** The
+  `spg-embedded` crate exposes a `FromSpgRow` trait sketch
+  but no proc-macro yet. Lands when a `spg-embedded-macros`
+  proc-macro crate joins the workspace.
+- **`spg-embedded::Database::open_path(p)`.** v6.10.3 ships
+  in-memory + byte-slice round-trip; on-disk persistence
+  remains `spg-server`'s job.
+- **`spg revert --to-audit-entry <hash>`.** The CLI parses
+  the flag and surfaces a carve-out hint. v6.10.7 supports
+  `--to-seq <N>` only; resolving N from an audit-chain entry
+  hash needs the audit-chain provider hook from v6.5.3 to land.
+
+---
+
 ## [6.9] — 2026-06-03 (Concurrency expansion — release roll-up)
 
 v6.9 is the **conditional sub-version** from the v6.x roadmap
