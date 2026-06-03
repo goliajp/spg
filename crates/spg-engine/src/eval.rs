@@ -943,7 +943,53 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
         CastTarget::Float => cast_numeric_to_float(v),
         CastTarget::Bool => cast_to_bool(v),
         CastTarget::Date => cast_to_date(v),
-        CastTarget::Timestamp => cast_to_timestamp(v),
+        // TIMESTAMP and TIMESTAMPTZ have identical runtime
+        // representation (i64 microseconds UTC).
+        CastTarget::Timestamp | CastTarget::Timestamptz => cast_to_timestamp(v),
+        // v7.9.25 — `expr::INTERVAL`. Currently only TEXT → Interval
+        // is supported (the mailrs idiom: `$1::INTERVAL` where the
+        // bound param is a string like `'7 days'`).
+        CastTarget::Interval => cast_to_interval(v),
+        // v7.9.25 — `::json` / `::jsonb`. Routes Text → Json
+        // (validation is the producer's responsibility, same as
+        // the column-INSERT path).
+        CastTarget::Json | CastTarget::Jsonb => match v {
+            Value::Json(s) => Ok(Value::Json(s)),
+            Value::Text(s) => Ok(Value::Json(s)),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::json / ::jsonb only accepts TEXT-shape inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
+        // v7.9.26 — `::regtype` / `::regclass`. SPG has no
+        // pg_catalog; surface a clear error.
+        CastTarget::RegType | CastTarget::RegClass => Err(EvalError::TypeMismatch {
+            detail:
+                "::regtype / ::regclass not supported on SPG \
+                 (no pg_catalog); use SHOW TABLES / spg_table_ddl instead"
+                    .into(),
+        }),
+    }
+}
+
+fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Interval { months, micros } => Ok(Value::Interval { months, micros }),
+        Value::Text(s) => {
+            let (months, micros) = spg_sql::parser::parse_interval_text(&s)
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: alloc::format!("cannot parse {s:?} as INTERVAL"),
+                })?;
+            Ok(Value::Interval { months, micros })
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "::INTERVAL only accepts TEXT-shape inputs, got {:?}",
+                other.data_type()
+            ),
+        }),
     }
 }
 

@@ -145,6 +145,15 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
                 CastTarget::Vector => return None,
                 CastTarget::Date => DataType::Date,
                 CastTarget::Timestamp => DataType::Timestamp,
+                CastTarget::Timestamptz => DataType::Timestamptz,
+                CastTarget::Interval => DataType::Interval,
+                CastTarget::Json => DataType::Json,
+                CastTarget::Jsonb => DataType::Jsonb,
+                // regtype / regclass yield text-shape catalog OIDs
+                // on PG; on SPG the engine surfaces Unsupported,
+                // but for describe we still claim Text so prepare
+                // doesn't fail.
+                CastTarget::RegType | CastTarget::RegClass => DataType::Text,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),
