@@ -561,7 +561,32 @@ pub struct Engine {
     /// surfaced via `spg_stat_query` virtual table. Updated by the
     /// `execute_*` paths after a successful execute.
     query_stats: query_stats::QueryStats,
+    /// v6.5.2 — connection-state provider callback. spg-server
+    /// registers a function at startup that snapshots its
+    /// per-pgwire-connection registry into `ActivityRow`s; engine
+    /// reads through it on every `SELECT * FROM spg_stat_activity`.
+    /// `None` ⇒ no-data (returns empty rows; matches the no_std
+    /// embedded callers that don't run pgwire).
+    activity_provider: Option<ActivityProvider>,
 }
+
+/// v6.5.2 — one row of `spg_stat_activity`. Engine-public so
+/// spg-server can construct rows without re-exporting internal
+/// dispatch types.
+#[derive(Debug, Clone)]
+pub struct ActivityRow {
+    pub pid: u32,
+    pub user: String,
+    pub started_at_us: i64,
+    pub current_sql: String,
+    pub wait_event: String,
+    pub elapsed_us: i64,
+    pub in_transaction: bool,
+}
+
+/// v6.5.2 — provider callback type. Fresh snapshot returned each
+/// call; engine doesn't cache the slice.
+pub type ActivityProvider = fn() -> Vec<ActivityRow>;
 
 impl Engine {
     pub fn new() -> Self {
@@ -579,6 +604,7 @@ impl Engine {
             statistics: statistics::Statistics::new(),
             plan_cache: plan_cache::PlanCache::new(),
             query_stats: query_stats::QueryStats::new(),
+            activity_provider: None,
         }
     }
 
@@ -599,6 +625,7 @@ impl Engine {
             statistics: statistics::Statistics::new(),
             plan_cache: plan_cache::PlanCache::new(),
             query_stats: query_stats::QueryStats::new(),
+            activity_provider: None,
         }
     }
 
@@ -652,6 +679,7 @@ impl Engine {
                     statistics,
                     plan_cache: plan_cache::PlanCache::new(),
                     query_stats: query_stats::QueryStats::new(),
+                    activity_provider: None,
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1367,6 +1395,50 @@ impl Engine {
                     Value::BigInt(i64::try_from(mean).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::try_from(s.max_us).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::try_from(s.last_seen_us).unwrap_or(i64::MAX)),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.2 — register a connection-state provider. spg-server
+    /// calls this at startup with a function that snapshots its
+    /// per-pgwire-connection registry. Engine reads through the
+    /// callback on `SELECT * FROM spg_stat_activity`.
+    #[must_use]
+    pub const fn with_activity_provider(mut self, f: ActivityProvider) -> Self {
+        self.activity_provider = Some(f);
+        self
+    }
+
+    /// v6.5.2 — materialise `spg_stat_activity` rows. Pulls a fresh
+    /// snapshot from the registered `ActivityProvider`. Returns an
+    /// empty result set when no provider is registered (the no_std
+    /// embedded path with no pgwire layer).
+    fn exec_spg_stat_activity(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("pid", DataType::Int, false),
+            ColumnSchema::new("user", DataType::Text, false),
+            ColumnSchema::new("started_at_us", DataType::BigInt, false),
+            ColumnSchema::new("current_sql", DataType::Text, false),
+            ColumnSchema::new("wait_event", DataType::Text, false),
+            ColumnSchema::new("elapsed_us", DataType::BigInt, false),
+            ColumnSchema::new("in_transaction", DataType::Bool, false),
+        ];
+        let rows: Vec<Row> = self
+            .activity_provider
+            .map(|f| f())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                Row::new(alloc::vec![
+                    Value::Int(i32::try_from(r.pid).unwrap_or(i32::MAX)),
+                    Value::Text(r.user),
+                    Value::BigInt(r.started_at_us),
+                    Value::Text(r.current_sql),
+                    Value::Text(r.wait_event),
+                    Value::BigInt(r.elapsed_us),
+                    Value::Bool(r.in_transaction),
                 ])
             })
             .collect();
@@ -2324,6 +2396,7 @@ impl Engine {
                 "spg_stat_replication" => return Ok(self.exec_spg_stat_replication()),
                 "spg_stat_segment" => return Ok(self.exec_spg_stat_segment()),
                 "spg_stat_query" => return Ok(self.exec_spg_stat_query()),
+                "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
                 _ => {}
             }
         }
