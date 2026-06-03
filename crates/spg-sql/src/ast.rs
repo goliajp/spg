@@ -302,6 +302,12 @@ pub struct ColumnDef {
     /// per such column and fills the slot when INSERT leaves it
     /// unbound (omitted from a column-list INSERT or explicitly NULL).
     pub auto_increment: bool,
+    /// v7.9.13 — inline `PRIMARY KEY` column constraint. mailrs
+    /// migration follow-up F1. Implies `NOT NULL`. Engine creates
+    /// an implicit BTree index named `<table>_pkey` over this
+    /// column at CREATE TABLE time, satisfying the parent-side
+    /// index requirement for any FOREIGN KEY pointing at it.
+    pub is_primary_key: bool,
 }
 
 /// v7.6.0 — A single FOREIGN KEY constraint. Both column-level

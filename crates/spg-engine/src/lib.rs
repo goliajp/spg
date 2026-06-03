@@ -3004,6 +3004,15 @@ impl Engine {
             });
         }
         let table_name = stmt.name.clone();
+        // v7.9.13 — pluck the names of any columns marked
+        // `PRIMARY KEY` inline so the post-create-table pass can
+        // build an implicit BTree index. mailrs F1.
+        let pk_columns: Vec<String> = stmt
+            .columns
+            .iter()
+            .filter(|c| c.is_primary_key)
+            .map(|c| c.name.clone())
+            .collect();
         let cols = stmt
             .columns
             .into_iter()
@@ -3025,9 +3034,29 @@ impl Engine {
                 self.active_catalog(),
             )?);
         }
-        let mut schema = TableSchema::new(table_name, cols);
+        let mut schema = TableSchema::new(table_name.clone(), cols);
         schema.foreign_keys = fks;
         self.active_catalog_mut().create_table(schema)?;
+        // v7.9.13 — implicit BTree index per inline PRIMARY KEY
+        // column. Index name is `<table>_pkey` (matches PG's
+        // convention); duplicate names silently no-op via the
+        // `add_index` IF NOT EXISTS path.
+        if !pk_columns.is_empty() {
+            let table = self
+                .active_catalog_mut()
+                .get_mut(&table_name)
+                .expect("just created");
+            for (i, col_name) in pk_columns.iter().enumerate() {
+                let idx_name = if pk_columns.len() == 1 {
+                    alloc::format!("{table_name}_pkey")
+                } else {
+                    alloc::format!("{table_name}_pkey_{i}")
+                };
+                if let Err(e) = table.add_index(idx_name, col_name) {
+                    return Err(EngineError::Storage(e));
+                }
+            }
+        }
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),

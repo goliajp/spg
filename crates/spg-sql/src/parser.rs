@@ -1537,6 +1537,7 @@ impl Parser {
         let mut nullable = !implied_not_null;
         let mut nullability_seen = implied_not_null;
         let mut auto_increment = implied_auto_increment;
+        let mut is_primary_key = false;
         loop {
             if matches!(self.peek(), Token::Default) {
                 if default.is_some() {
@@ -1575,6 +1576,40 @@ impl Parser {
                 auto_increment = true;
                 continue;
             }
+            // v7.9.13 — inline `PRIMARY KEY` column constraint
+            // (mailrs F1). Implies `NOT NULL`. The engine creates
+            // a BTree index for the PK column at CREATE TABLE time
+            // so FK parent-side index lookups resolve.
+            if let Token::Ident(s) = self.peek()
+                && s.eq_ignore_ascii_case("primary")
+            {
+                if is_primary_key {
+                    return Err(self.err("PRIMARY KEY specified twice".into()));
+                }
+                // Peek-ahead for the required `KEY` token.
+                let next = self.tokens.get(self.pos + 1);
+                let next_is_key = matches!(
+                    next,
+                    Some(Token::Ident(k)) if k.eq_ignore_ascii_case("key")
+                );
+                if !next_is_key {
+                    return Err(self.err(format!(
+                        "expected KEY after PRIMARY in column def, got {:?}",
+                        next
+                    )));
+                }
+                self.advance(); // PRIMARY
+                self.advance(); // KEY
+                is_primary_key = true;
+                if nullability_seen && nullable {
+                    return Err(self.err(
+                        "column declared NULL but inline PRIMARY KEY implies NOT NULL".into(),
+                    ));
+                }
+                nullable = false;
+                nullability_seen = true;
+                continue;
+            }
             break;
         }
         Ok(ColumnDef {
@@ -1583,6 +1618,7 @@ impl Parser {
             nullable,
             default,
             auto_increment,
+            is_primary_key,
         })
     }
 
