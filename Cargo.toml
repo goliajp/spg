@@ -12,11 +12,12 @@ members = [
     "crates/spg-server",
     "crates/spgctl",
     "xtests/sqllogictest",
+    "xtests/sqlx-pgwire",
     "xbench/competitor",
 ]
 
 [workspace.package]
-version      = "7.9.10"
+version      = "7.9.11"
 edition      = "2024"
 rust-version = "1.95"
 authors      = ["GOLIA K.K. <lihao@golia.jp>"]

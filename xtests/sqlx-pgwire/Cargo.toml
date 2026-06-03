@@ -1,0 +1,37 @@
+[package]
+name         = "spg-sqlx-pgwire"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "sqlx 0.8 ↔ spg-server PG-wire integration tests. In-tree only; never published."
+publish      = false
+
+# Like xbench/competitor, this xtest crate intentionally takes
+# external deps. The published spg-* crates stay pure-stdlib.
+
+[dependencies]
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "chrono",
+    "json",
+    "macros",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+harness = true
+
+[lints]
+workspace = true
