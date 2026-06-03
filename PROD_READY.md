@@ -207,6 +207,7 @@ without reading the source code.
 | 7.63 | SPG-unique: audit-driven PITR | `spg revert --wal <p> --to-seq <N> --out <db>` replays first N records into a fresh engine + writes the new snapshot. `--to-audit-entry <hash>` surfaces a carve-out hint pending the audit-chain lookup integration | ✅ | v6.10.7, `e2e_revert.rs` (4/4) |
 | 7.64 | Embedded durability parity | `spg-embedded::Database::open_path(p)` — catalog snapshot + WAL append+fsync + boot-time replay + auto-checkpoint + cold-tier manifest. Byte-format compatible with `spg-server`: a database an embedded process writes boots cleanly on the server, and vice versa. `spg-manifest` crate extracted from `spg-server` to share the v10 manifest format | ✅ | v7.1.0 + v7.1.4, `e2e_open_path.rs` (7/7) + `e2e_cold_tier_manifest.rs` (3/3) |
 | 7.65 | Embedded ergonomics | `Database::with_transaction(\|tx\| …)` closure with implicit BEGIN/COMMIT/ROLLBACK; `Database::spawn_background_freezer(Arc<Mutex<_>>, FreezerOptions)` for periodic cold-tier demotion; compile-time `Database: Send` assert for `Arc<Mutex<_>>` sharing | ✅ | v7.2.0 + v7.2.1 + v7.2.2, `e2e_with_transaction.rs` (5/5) + `e2e_background_freezer.rs` (3/3) |
+| 7.66 | Embedded typed rows | `Database::query_typed::<T>(sql)` + `FromSpgRow` / `FromSpgValue` traits + `spg_row! { struct … }` declarative macro. Decodes i16 / i32 / i64 / f32 / f64 / bool / String / Vec<f32> / Option<T>. 0 external deps (declarative macro instead of proc-macro derive) | ✅ | v7.3.0, `e2e_typed_query.rs` (6/6) |
 
 ## 8. Stability + compatibility
 

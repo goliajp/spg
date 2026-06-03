@@ -8,6 +8,61 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.3] — 2026-06-03 (Typed-row API — spg_row! macro + query_typed)
+
+v7.3 closes the last v6.10 STABILITY carve-out in the embedded
+ergonomic cluster: typed rows. Two new surfaces:
+
+```rust
+use spg_embedded::{Database, spg_row};
+
+spg_row! {
+    pub struct User {
+        pub id: i32,
+        pub name: Option<String>,    // nullable column
+    }
+}
+
+let users: Vec<User> = db.query_typed("SELECT id, name FROM users")?;
+```
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 7.3.0 | `Database::query_typed::<T>(sql)` + `FromSpgRow` + `FromSpgValue` + `spg_row!` declarative macro |
+| 7.3.1 | series ship rollup + tag (this entry) |
+
+### Why declarative macro vs `#[derive]`
+
+The proc-macro path (`#[derive(SpgRow)]`) needs at least
+`proc-macro2`, and typically `syn` + `quote` — three external
+dependencies on the workspace. SPG's 0-deps policy holds across
+v7.0 and we kept it through v7.1+v7.2. `spg_row!` is a
+declarative `macro_rules!` that takes the entire struct
+definition (fields + types) and generates the `FromSpgRow`
+impl. Trade-off:
+- ✅ 0 dependencies, no compile-time impact, expansion is local
+- ⚠️ Macro takes struct definition rather than annotating an
+  existing struct. Hand-written `impl FromSpgRow` still works
+  for callers who need custom decoding logic — the test suite
+  covers both paths.
+
+### Frozen surfaces added in v7.3
+
+- `Database::query_typed::<T>(sql: &str) -> Result<Vec<T>, EngineError>` where `T: FromSpgRow`.
+- `trait FromSpgValue` — per-column decoder (impl'd for `i16` / `i32` / `i64` / `f32` / `f64` / `bool` / `String` / `Vec<f32>` / `Option<T>`).
+- `spg_row! { pub struct Name { pub field: Type, … } }` declarative macro.
+
+### Known v7.3 limitations (carved out to future v7.x)
+
+- **Multi-reader concurrent `&Database`** (still v7.x "Choice A" territory, same as v7.2).
+- **Auto-ANALYZE background worker** — same shape as v7.2.1's freezer, not built yet.
+- **`#[derive(SpgRow)]` proc-macro** — explicitly NOT shipped; the declarative macro covers the use case at 0 deps.
+- **`Numeric` / `Date` / `Timestamp` / `Json` / vector quantised variants** in `FromSpgValue`. v7.3 covers the primitive types most callers need; richer mappings can land as v7.4 additions (`FromSpgValue` is a public trait, callers can `impl` it for their own types today).
+
+---
+
 ## [7.2] — 2026-06-03 (Embedded ergonomics — closures, background workers, sharing)
 
 v7.2 closes the embedded ergonomic carve-outs from v6.10

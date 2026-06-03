@@ -565,6 +565,17 @@ impl Database {
         Ok(result)
     }
 
+    /// v7.3.0 — typed-row variant of [`Database::query`]. Each
+    /// row decodes into a `T: FromSpgRow` so callers don't
+    /// pattern-match on `Value` themselves. Use [`spg_row!`] to
+    /// generate the impl, or write it by hand.
+    pub fn query_typed<T: FromSpgRow>(&mut self, sql: &str) -> Result<Vec<T>, EngineError> {
+        let rows = self.query(sql)?;
+        rows.into_iter()
+            .map(|r| T::from_spg_row(&r))
+            .collect()
+    }
+
     /// Run a SELECT and return rows as a `Vec<Vec<Value>>` —
     /// strips the column-schema metadata for read-side
     /// ergonomics. Errors on non-Rows results (DML / DDL
@@ -863,17 +874,180 @@ fn _database_is_send() {
     assert_send::<Database>();
 }
 
-/// v6.10.3 — sketch trait for the future `#[derive(SpgRow)]`
-/// proc-macro to implement. The trait shape is reserved now so
-/// downstream callers can write impl blocks by hand against a
-/// stable signature; the proc-macro crate lands as a
-/// STABILITY carve-out follow-up.
+/// v6.10.3 — trait that maps a row's columns onto a user
+/// struct's fields. v7.3.0 ships the [`spg_row!`] declarative
+/// macro that generates `impl FromSpgRow for YourStruct` from
+/// a struct definition (no proc-macro, no syn/quote/
+/// proc-macro2 deps — the workspace's "0 external deps"
+/// policy holds).
 ///
 /// Implementors map a row's columns onto a user struct's
 /// fields. Errors surface as `EngineError::Unsupported` so the
 /// caller's error type stays uniform.
 pub trait FromSpgRow: Sized {
     fn from_spg_row(row: &[Value]) -> Result<Self, EngineError>;
+}
+
+/// v7.3.0 — declarative macro that generates `FromSpgRow` impl
+/// for a user struct. Avoids proc-macro deps
+/// (syn/quote/proc-macro2) so the workspace's 0-deps policy
+/// holds; the trade-off vs `#[derive(SpgRow)]` is that the
+/// macro takes the entire struct definition (fields + types)
+/// as input rather than annotating an existing struct.
+///
+/// ```no_run
+/// use spg_embedded::{Database, spg_row, FromSpgRow};
+///
+/// spg_row! {
+///     pub struct User {
+///         pub id: i32,
+///         pub name: String,
+///     }
+/// }
+///
+/// let mut db = Database::open_in_memory();
+/// db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+/// db.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+/// let users: Vec<User> = db.query_typed("SELECT id, name FROM users").unwrap();
+/// ```
+///
+/// Supported field types: `i16`, `i32`, `i64`, `f32`, `f64`,
+/// `bool`, `String`, `Vec<f32>` (for `VECTOR(N)` columns),
+/// `Option<T>` of any of the above.
+#[macro_export]
+macro_rules! spg_row {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $(
+                $(#[$fmeta:meta])*
+                $fvis:vis $field:ident : $ty:ty,
+            )*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone)]
+        $vis struct $name {
+            $(
+                $(#[$fmeta])*
+                $fvis $field : $ty,
+            )*
+        }
+
+        impl $crate::FromSpgRow for $name {
+            fn from_spg_row(row: &[$crate::Value]) -> ::core::result::Result<Self, $crate::EngineError> {
+                let mut __spg_row_iter = row.iter();
+                $(
+                    let $field: $ty = {
+                        let v = __spg_row_iter
+                            .next()
+                            .ok_or_else(|| $crate::EngineError::Unsupported(
+                                ::std::format!(
+                                    "spg_row! {}: missing column for field `{}`",
+                                    ::core::stringify!($name),
+                                    ::core::stringify!($field)
+                                )
+                            ))?;
+                        <$ty as $crate::FromSpgValue>::from_spg_value(v)
+                            .map_err(|e| $crate::EngineError::Unsupported(
+                                ::std::format!(
+                                    "spg_row! {}: column `{}`: {}",
+                                    ::core::stringify!($name),
+                                    ::core::stringify!($field),
+                                    e
+                                )
+                            ))?
+                    };
+                )*
+                Ok(Self { $($field,)* })
+            }
+        }
+    };
+}
+
+/// v7.3.0 — per-column decoder used by `spg_row!`. Surface
+/// covers every numeric / text / bytes / bool variant in
+/// `Value`, plus `Option<T>` for nullable columns.
+pub trait FromSpgValue: Sized {
+    fn from_spg_value(v: &Value) -> Result<Self, &'static str>;
+}
+
+macro_rules! impl_from_value_int {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl FromSpgValue for $t {
+                fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
+                    match v {
+                        Value::SmallInt(n) => <$t>::try_from(*n).map_err(|_| "SmallInt does not fit target int type"),
+                        Value::Int(n)      => <$t>::try_from(*n).map_err(|_| "Int does not fit target int type"),
+                        Value::BigInt(n)   => <$t>::try_from(*n).map_err(|_| "BigInt does not fit target int type"),
+                        Value::Null        => Err("NULL in non-Option int column"),
+                        _ => Err("non-integer value in int column"),
+                    }
+                }
+            }
+        )*
+    };
+}
+impl_from_value_int!(i16, i32, i64);
+
+impl FromSpgValue for f32 {
+    fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
+        match v {
+            Value::Float(f) => Ok(*f as f32),
+            Value::Null => Err("NULL in non-Option float column"),
+            _ => Err("non-float value in float column"),
+        }
+    }
+}
+
+impl FromSpgValue for f64 {
+    fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
+        match v {
+            Value::Float(f) => Ok(*f),
+            Value::Null => Err("NULL in non-Option float column"),
+            _ => Err("non-float value in float column"),
+        }
+    }
+}
+
+impl FromSpgValue for bool {
+    fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
+        match v {
+            Value::Bool(b) => Ok(*b),
+            Value::Null => Err("NULL in non-Option bool column"),
+            _ => Err("non-bool value in bool column"),
+        }
+    }
+}
+
+impl FromSpgValue for String {
+    fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
+        match v {
+            Value::Text(s) => Ok(s.clone()),
+            Value::Null => Err("NULL in non-Option text column"),
+            _ => Err("non-text value in String column"),
+        }
+    }
+}
+
+impl FromSpgValue for Vec<f32> {
+    fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
+        match v {
+            Value::Vector(xs) => Ok(xs.clone()),
+            Value::Null => Err("NULL in non-Option vector column"),
+            _ => Err("non-vector value in Vec<f32> column"),
+        }
+    }
+}
+
+impl<T: FromSpgValue> FromSpgValue for Option<T> {
+    fn from_spg_value(v: &Value) -> Result<Self, &'static str> {
+        match v {
+            Value::Null => Ok(None),
+            other => T::from_spg_value(other).map(Some),
+        }
+    }
 }
 
 #[cfg(test)]
