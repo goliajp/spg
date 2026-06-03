@@ -3007,7 +3007,43 @@ fn append_wal_v3_group(state: &ServerState, entries: &[Vec<u8>]) -> std::io::Res
     if !synchronous_commit_disabled() {
         f.sync_data()?;
     }
+    // v6.10.6 — best-effort WAL tee. When `SPG_WAL_TEE_PATH` is
+    // set, append the same group bytes to the tee path so an
+    // offline observer can mirror the WAL stream without
+    // intercepting the primary durability path. Failures are
+    // logged + swallowed: the primary WAL append has already
+    // succeeded; a tee outage must not roll back committed
+    // state.
+    if let Some(tee_path) = wal_tee_path() {
+        if let Err(e) = append_to_tee(tee_path, &batched) {
+            eprintln!("spg-server: WAL tee append to {tee_path:?} failed: {e}");
+        }
+    }
     Ok(())
+}
+
+/// v6.10.6 — read `SPG_WAL_TEE_PATH` once + cache. Returns
+/// `Some(&str)` to a 'static path string when the env is set,
+/// `None` otherwise.
+fn wal_tee_path() -> Option<&'static str> {
+    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| env::var("SPG_WAL_TEE_PATH").ok().filter(|s| !s.is_empty()))
+        .as_deref()
+}
+
+/// v6.10.6 — append `bytes` to the tee file. Opens with O_APPEND
+/// + creates if missing. Does NOT fsync — the tee is a
+/// best-effort mirror, not a durability surface. (Operators
+/// fronting the tee with a remote-mounted filesystem get
+/// "sync-after-batch" semantics from the OS's page cache
+/// flush.)
+fn append_to_tee(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(bytes)
 }
 
 /// v4.42 — `io::Error` is intentionally not `Clone` (the OS error
