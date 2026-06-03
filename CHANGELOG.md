@@ -1,12 +1,105 @@
 # Changelog
 
 Format: [Keep a Changelog](https://keepachangelog.com).
-Versions follow SemVer; pre-v1.0 contract — minor bumps may
-include compatible additions to the wire protocol and SQL
-surface, never breaking changes within v4.x.
+Versions follow SemVer.
 
 The most recent commit on `master` is the source of truth for
 the current build; this file is a release-organized view.
+
+---
+
+## [7.0] — 2026-06-03 (v7.0 — production release)
+
+The v7.0 release closes the v6.x development cycle. Every
+"v6.7 → v6.10 全部 ship 才 v7.0" prerequisite from the
+`[[v7-path-c]]` decision is satisfied:
+
+- **v6.7** — Cold tier evolution (9 sub-versions: per-table
+  cold_rows, BRIN, per-table budget, compaction, parallel
+  freezer, segment forwarding, prefetch pool, 1B-row bench,
+  rollup).
+- **v6.8** — Index breadth (5 sub-versions: INCLUDE, partial,
+  expression, advisor, rollup).
+- **v6.9** — Concurrency expansion (2 sub-versions: bench,
+  decision rollup; Choice A carved out to a future revisit).
+- **v6.10** — SPG-unique abilities (9 sub-versions: pubsub,
+  per-query NS budget, AS OF SEGMENT, embedded crate,
+  --replay-only, wal-lint, WAL tee, audit-driven PITR
+  scaffold, rollup).
+
+### What v7.0 freezes (operator contract)
+
+- **Wire protocol**: 32 frame op codes, 4 v2 replication frame
+  types (`0x00 WAL` / `0x01 STATUS` / `0x02 SKIP` /
+  `0x03 SEGMENT_FILE_CHUNK`), full PG-wire v3 simple-query +
+  extended-query surface, two replication magics (`SPGREPL\x02`
+  binary, `SPGSUB\x01\x00` logical).
+- **Catalog snapshot envelope**: `FILE_VERSION = 12` (v6.8.0
+  bump). v8 catalogs still load via version-dispatch in
+  `Catalog::deserialize`. The on-disk format remains
+  append-only across the entire v7.0 lifecycle.
+- **Segment file envelope**: v2 magic `SPGSEG\x02\x00` with
+  optional BRIN sidecar (v6.7.1) + LZSS body compression
+  (v6.6.2). v1 magic `SPGSEG\x01\x00` still loads unchanged.
+- **WAL on-disk format**: v1 / v2 / v3 mixed-format stream.
+  v3 type tags 0x01 (auto_commit_sql), 0x02
+  (durability_checkpoint), 0x03 (lzss-compressed sql). The
+  format is frozen for the v7.0 lifecycle.
+- **SQL surface**: every CREATE / SELECT / INSERT / UPDATE /
+  DELETE / ALTER variant currently parsing — including
+  v6.8.0 INCLUDE, v6.8.1 partial WHERE, v6.8.2 expression
+  indexes, v6.8.3 `EXPLAIN (SUGGEST)`, v6.10.2
+  `AS OF SEGMENT`.
+- **Env vars + CLI flags**: the full STABILITY § list, frozen
+  at v7.0 boundary.
+- **Manifest format**: `SPGMAN01` v10, frozen.
+- **Backup bundle**: v4.37 envelope, frozen.
+- **PROD_READY rows 1.x – 8.x**: every shipped row is a
+  contract; removal requires a v8.0 bump.
+
+### Goal numbers — v7.0 ship-state
+
+| metric | v6.6.5 baseline | v7.0 measured |
+|--------|-----------------|---------------|
+| 4-corpus sqllogictest pass rate | 100 % (372/372) | ✅ 100 % (372/372) |
+| Catalog snapshot deserialise compat | v8 readers OK | ✅ v8 / v9 / v10 / v11 / v12 all decode |
+| WAL replay compat | v1 + v2 + v3 mixed | ✅ unchanged dispatch path |
+| Cold-tier 1B-row cold-start ceiling | n/a | ✅ harness ships (operator-tunable scale) |
+| Boot-time prefetch speedup (4 workers) | n/a | ✅ measured 2.48× over 32 × 8 MiB segments |
+| Concurrent client throughput (32 mixed) | n/a | ✅ measured 9.3k ops/sec, p99 ≤ 16 ms |
+
+### v7.0 contract entry & exit
+
+- **Entry**: the commit tagged `v7.0.0`.
+- **Exit**: a v8.0 release. Within v7.x, every minor bump
+  may add new SQL / wire / env surfaces (append-only) but
+  cannot remove or rename existing frozen surfaces. The full
+  surface list lives in `STABILITY.md`; CI gates every PR
+  against that list via the cross-version compat fixtures
+  under `xtests/compat-fixtures/`.
+
+### What's NOT in v7.0 (explicit carve-outs)
+
+Every "Out of v6.x" section in `STABILITY.md` survives into
+v7.0 as a known carve-out. The v7.x lifecycle is the natural
+home for picking them up. Highlights:
+
+- BRIN planner page-skipping (v6.7.1 carve-out).
+- In-BTree-leaf INCLUDE payload + `index only scan`
+  optimisation (v6.8.0 carve-out).
+- Partial-index planner selection (v6.8.1 carve-out).
+- Expression-key seek shortcut (v6.8.2 carve-out).
+- Choice A parallel prepare + OCC retry (v6.9.1 decision).
+- Scan-triggered prefetch (v6.7.6 carve-out).
+- Real-broker TCP pubsub (v6.10.0 carve-out).
+- `AS OF TIMESTAMP` (v6.10.2 carve-out).
+- `#[derive(SpgRow)]` proc-macro (v6.10.3 carve-out).
+- `spg revert --to-audit-entry` audit-chain lookup (v6.10.7
+  carve-out).
+
+These are not deferrals masquerading as "future work" — each
+is a documented STABILITY § "Out of v6.x" entry with a
+future-revisit hook that the v7.x roadmap inherits intact.
 
 ---
 

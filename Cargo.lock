@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "spg-audit"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
  "spg-crypto",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "spg-bench-competitor"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
  "spg-engine",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "spg-cli"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
  "spg-crypto",
@@ -1202,14 +1202,14 @@ dependencies = [
 
 [[package]]
 name = "spg-crypto"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "spg-embedded"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "spg-engine",
  "spg-storage",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "spg-engine"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
  "spg-crypto",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "spg-server"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "libc",
  "spg-audit",
@@ -1240,14 +1240,14 @@ dependencies = [
 
 [[package]]
 name = "spg-sql"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "spg-storage"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
  "spg-crypto",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "spg-wire"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "criterion",
 ]
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "sqllogictest"
-version = "1.0.0"
+version = "7.0.0"
 dependencies = [
  "spg-engine",
  "spg-storage",
