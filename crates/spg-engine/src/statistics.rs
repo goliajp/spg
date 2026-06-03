@@ -58,6 +58,14 @@ pub struct Statistics {
     /// that table. v6.2.1 auto-analyze fires when this fraction
     /// crosses 10 % of the live row count.
     modified_since: BTreeMap<String, u64>,
+    /// v6.3.1 — monotonic version bumped on every successful
+    /// ANALYZE. The plan cache snapshots this at prepare time;
+    /// cache lookup compares and evicts on mismatch.
+    ///
+    /// In-memory only. Does NOT ride the envelope (plan cache is
+    /// in-memory only too, so version starts at 0 on every Engine
+    /// boot).
+    version: u64,
 }
 
 // Statistics holds f32 (null_frac) so it can't auto-derive `Eq`.
@@ -123,6 +131,18 @@ impl Statistics {
 
     pub fn modified_since_last_analyze(&self, table: &str) -> u64 {
         self.modified_since.get(table).copied().unwrap_or(0)
+    }
+
+    /// v6.3.1 — current monotonic version. Plan cache snapshots this
+    /// at prepare time; lookup compares and evicts on mismatch.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// v6.3.1 — bumps the version. Called by `exec_analyze` after a
+    /// successful ANALYZE on any table.
+    pub fn bump_version(&mut self) {
+        self.version = self.version.saturating_add(1);
     }
 
     // ── serialisation (envelope v5 trailer) ─────────────────────
@@ -214,6 +234,7 @@ impl Statistics {
         Ok(Self {
             inner,
             modified_since,
+            version: 0,
         })
     }
 }

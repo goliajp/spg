@@ -971,14 +971,21 @@ impl Engine {
     /// Clone cost on a 5-table JOIN AST is well under the parse cost
     /// it replaces.
     pub fn prepare_cached(&mut self, sql: &str) -> Result<Statement, ParseError> {
+        // v6.3.1 — version-aware lookup. If the cached plan was
+        // prepared before the most recent ANALYZE, evict and replan.
+        let current_version = self.statistics.version();
         if let Some(plan) = self.plan_cache.get(sql) {
-            return Ok(plan.stmt.clone());
+            if plan.statistics_version == current_version {
+                return Ok(plan.stmt.clone());
+            }
+            // Stale entry — fall through to evict + re-prepare.
         }
+        self.plan_cache.evict(sql);
         let stmt = self.prepare(sql)?;
         let source_tables = plan_cache::collect_source_tables(&stmt);
         let plan = plan_cache::PreparedPlan {
             stmt: stmt.clone(),
-            statistics_version: 0, // v6.3.1 will populate.
+            statistics_version: current_version,
             source_tables,
             describe_columns: alloc::vec::Vec::new(),
         };
@@ -1305,6 +1312,21 @@ impl Engine {
         for table_name in &names {
             self.analyze_one_table(table_name)?;
             analysed += 1;
+        }
+        // v6.3.1 — plan cache invalidation. Bump stats version so
+        // future lookups see the new generation, and selectively
+        // evict every plan whose `source_tables` overlap with the
+        // ANALYZE target set. Bare ANALYZE (all tables) clears the
+        // whole cache.
+        if analysed > 0 {
+            self.statistics.bump_version();
+            if target.is_some() {
+                for t in &names {
+                    self.plan_cache.evict_referencing(t);
+                }
+            } else {
+                self.plan_cache.clear();
+            }
         }
         Ok(QueryResult::CommandOk {
             affected: analysed,
@@ -1931,6 +1953,9 @@ impl Engine {
             .get_mut(&table_name)
             .expect("table found above");
         table.rebuild_nsw_index(&idx_name, target)?;
+        // v6.3.1 — ALTER INDEX REBUILD potentially with new encoding
+        // changes cost characteristics; evict any cached plans.
+        self.plan_cache.evict_referencing(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
@@ -1956,12 +1981,16 @@ impl Engine {
                 modified_catalog: false,
             });
         }
+        let table_name = stmt.table.clone();
         match stmt.method {
             IndexMethod::BTree => table.add_index(stmt.name, &stmt.column)?,
             IndexMethod::Hnsw => {
                 table.add_nsw_index(stmt.name, &stmt.column, spg_storage::NSW_DEFAULT_M)?;
             }
         }
+        // v6.3.1 — adding an index can change the optimal plan for
+        // any cached query that references this table.
+        self.plan_cache.evict_referencing(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
