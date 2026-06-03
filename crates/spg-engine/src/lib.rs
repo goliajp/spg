@@ -1185,6 +1185,43 @@ impl Engine {
         &self.statistics
     }
 
+    /// v6.2.1 — return tables whose modified-row count crossed the
+    /// auto-analyze threshold since the last ANALYZE on that table.
+    /// The threshold is `0.1 × max(row_count, MIN_ROWS_FOR_AUTO_
+    /// ANALYZE)` — combines PG-style fractional + absolute lower
+    /// bound so a fresh / tiny table doesn't get hammered on every
+    /// INSERT.
+    ///
+    /// Designed to be cheap: walks every user table's
+    /// `Catalog::table_names()` + reads `statistics::modified_
+    /// since_last_analyze()` (BTreeMap lookup). The background
+    /// worker calls this under `engine.read()` then drops the lock
+    /// before re-acquiring `engine.write()` for the actual ANALYZE.
+    pub fn tables_needing_analyze(&self) -> Vec<String> {
+        const MIN_ROWS: u64 = 100;
+        let mut out = Vec::new();
+        for name in self.catalog.table_names() {
+            if is_internal_table_name(&name) {
+                continue;
+            }
+            let Some(table) = self.catalog.get(&name) else {
+                continue;
+            };
+            let row_count = table.rows().len() as u64;
+            let modified = self.statistics.modified_since_last_analyze(&name);
+            // Threshold: ceil(0.1 × max(row_count, MIN_ROWS)),
+            // computed in integer arithmetic so spg-engine stays
+            // no_std without pulling in libm. `(n + 9) / 10` is
+            // `ceil(n / 10)` for non-negative `n`.
+            let base = row_count.max(MIN_ROWS);
+            let threshold = base.saturating_add(9) / 10;
+            if modified >= threshold {
+                out.push(name);
+            }
+        }
+        out
+    }
+
     /// v6.2.0 — `ANALYZE [<table>]` runtime. Bare `ANALYZE` walks
     /// every user table; `ANALYZE <name>` re-stats one. For each
     /// target table, single-pass scan + per-column histogram +
@@ -1492,6 +1529,11 @@ impl Engine {
         for (pos, vals) in planned {
             table.update_row(pos, vals)?;
         }
+        // v6.2.1 — auto-analyze modified-row tracking for UPDATE.
+        if !self.in_transaction() && affected > 0 {
+            self.statistics
+                .record_modifications(&stmt.table, affected as u64);
+        }
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: !self.in_transaction(),
@@ -1565,6 +1607,11 @@ impl Engine {
             }
         }
         let affected = table.delete_rows(&positions) + cold_shadow_count;
+        // v6.2.1 — auto-analyze modified-row tracking for DELETE.
+        if !self.in_transaction() && affected > 0 {
+            self.statistics
+                .record_modifications(&stmt.table, affected as u64);
+        }
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: !self.in_transaction(),
@@ -1985,6 +2032,14 @@ impl Engine {
             };
             table.insert(Row::new(values))?;
             affected += 1;
+        }
+        // v6.2.1 — auto-analyze: track per-table modified-row
+        // counter so the background sweep can decide when to
+        // re-ANALYZE. Cheap path on the autocommit-wrap hot loop
+        // — one BTreeMap entry update per INSERT batch.
+        if !self.in_transaction() && affected > 0 {
+            self.statistics
+                .record_modifications(&stmt.table, affected as u64);
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -6858,6 +6913,89 @@ mod tests {
         let e2 = Engine::restore_envelope(&snap).unwrap();
         let s = e2.statistics().get("t", "id").unwrap();
         assert_eq!(s.n_distinct, 20);
+    }
+
+    // ── v6.2.1 auto-analyze threshold ───────────────────────────
+
+    #[test]
+    fn auto_analyze_threshold_fires_after_10pct_of_min_rows_on_small_table() {
+        // For a table with 0 rows then 10 inserts → modified=10,
+        // row_count=10. Threshold = 0.1 × max(10, 100) = 10. So
+        // after the 10th INSERT the threshold is met.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        for i in 0..9 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        assert!(e.tables_needing_analyze().is_empty(), "9 < threshold");
+        e.execute("INSERT INTO t VALUES (9)").unwrap();
+        let needs = e.tables_needing_analyze();
+        assert_eq!(needs, alloc::vec!["t".to_string()]);
+    }
+
+    #[test]
+    fn auto_analyze_threshold_uses_10pct_of_row_count_for_large_tables() {
+        // After ANALYZE on 1000 rows, threshold = 0.1 × row_count.
+        // Each new INSERT bumps both modified and row_count, so to
+        // trigger from N=1000 we need modifications ≥ 0.1 × (1000+M),
+        // i.e. M ≥ 112. The test inserts 50 (no fire), then 150
+        // more (200 total mods, row_count=1200, threshold=120 → fire).
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        for i in 0..1000 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        e.execute("ANALYZE t").unwrap();
+        assert!(e.tables_needing_analyze().is_empty(), "fresh ANALYZE");
+        for i in 1000..1050 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        assert!(
+            e.tables_needing_analyze().is_empty(),
+            "50 inserts < threshold of ~105"
+        );
+        for i in 1050..1200 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        assert_eq!(
+            e.tables_needing_analyze(),
+            alloc::vec!["t".to_string()],
+            "200 inserts > 0.1 × 1200 threshold"
+        );
+    }
+
+    #[test]
+    fn auto_analyze_threshold_resets_after_analyze() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        for i in 0..200 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        assert!(!e.tables_needing_analyze().is_empty());
+        e.execute("ANALYZE").unwrap();
+        assert!(
+            e.tables_needing_analyze().is_empty(),
+            "ANALYZE must reset the counter"
+        );
+    }
+
+    #[test]
+    fn auto_analyze_threshold_tracks_updates_and_deletes() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, label TEXT)").unwrap();
+        for i in 0..50 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i}, 'x')"))
+                .unwrap();
+        }
+        e.execute("ANALYZE t").unwrap();
+        // UPDATE 20 rows + DELETE 5 → modified=25. Threshold = 0.1
+        // × max(50, 100) = 10. So 25 >= 10 → trigger.
+        e.execute("UPDATE t SET label = 'y' WHERE id < 20").unwrap();
+        e.execute("DELETE FROM t WHERE id >= 45").unwrap();
+        assert_eq!(
+            e.tables_needing_analyze(),
+            alloc::vec!["t".to_string()]
+        );
     }
 
     #[test]

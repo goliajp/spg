@@ -10,6 +10,73 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.2.1] — 2026-06-03 (auto-analyze background trigger)
+
+Second v6.2.x sub-version. Wires the engine's modified-row
+counter into INSERT / UPDATE / DELETE auto-commit paths and adds
+a background worker that ANALYZE-s tables once their modified
+fraction crosses 10 %.
+
+### Added
+
+- Engine
+  - `Engine::tables_needing_analyze()` — walks every user
+    table; returns those whose `modified_since_last_analyze`
+    is ≥ `ceil(0.1 × max(row_count, 100))`. Combines PG's
+    fractional + absolute threshold so a fresh / tiny table
+    doesn't get hammered on every INSERT.
+  - `exec_insert` / `exec_update_cancel` / `exec_delete_cancel`
+    feed `statistics::record_modifications` at the end of the
+    auto-commit path. Inside-TX changes accumulate but don't
+    feed the counter (a v6.2.x cleanup — known gap).
+- spg-server
+  - `spawn_auto_analyze_worker` — single thread per server.
+    Sleeps in 200 ms ticks; every `SPG_AUTO_ANALYZE_INTERVAL_
+    MS` (default 30 s) reads the engine's
+    `tables_needing_analyze()` under a read-lock, then takes
+    a per-table write-lock to run ANALYZE. Holding briefly is
+    critical — ANALYZE on small tables is sub-ms.
+  - `SPG_AUTO_ANALYZE_INTERVAL_MS=0` opts the worker out
+    entirely.
+  - `quote_ident_simple` helper escapes table names containing
+    non-ident characters so the worker's `ANALYZE <name>`
+    command-build is safe (no SQL injection surface — even a
+    table called `"; DROP TABLE …` round-trips correctly).
+
+### Tests
+
+- `spg-engine` lib (4 new) — threshold fires after 10 % of
+  small / large tables; resets after ANALYZE; UPDATE + DELETE
+  also feed the counter.
+- `spg-server::e2e_auto_analyze` (4):
+    - `sweep_fires_after_10pct_threshold` — 10 inserts trigger
+      a sweep within ~400 ms of the interval boundary.
+    - `no_sweep_when_under_threshold` — 5 inserts stays
+      below threshold over 1 s of sweep cycles.
+    - `sweep_concurrent_with_reads_does_not_block` — 30
+      reads spaced 50 ms total ≤ 5 s, proving the worker's
+      write-lock is brief.
+    - `interval_zero_disables_worker` — opt-out env flag.
+
+### Not changed
+
+- Snapshot envelope (v5 unchanged from v6.2.0).
+- WAL on-disk format / replication protocol.
+- `ANALYZE` SQL surface itself (only auto-trigger added).
+
+### Out of v6.2.1 (deferred to later v6.2.x — NOT v7)
+
+- Auto-analyze tracking inside-TX changes — the
+  `record_modifications` hook only fires on auto-commit paths
+  today. v6.2.x cleanup will move it into the commit path so
+  explicit transactions feed the counter too. Same-minor
+  follow-up per V6_2_DESIGN.md L0 no-defer rule.
+- Reservoir sampling for very large tables — v6.2.x can swap
+  the full-table scan for a 100K-row reservoir without changing
+  the histogram's wire surface.
+
+---
+
 ## [6.2.0] — 2026-06-03 (spg_statistic + ANALYZE + envelope v5)
 
 First v6.2.x sub-version on the optimizer-foundation path. Lands
