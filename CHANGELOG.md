@@ -8,6 +8,103 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.1] — 2026-06-03 (Embedded durability parity)
+
+v7.1 closes the `spg-embedded` carve-outs from the v6.10
+STABILITY § "Out of v6.10" list, lifting the in-memory
+`Database` to full disk-backed durability that matches
+`spg-server`'s sync-commit story byte-for-byte.
+
+One new public entry point — `Database::open_path(p)` —
+unlocks every server-grade durability surface in a single
+call:
+
+```rust
+let mut db = Database::open_path("./data/spg.db")?;
+db.execute("CREATE TABLE t (...)")?;
+db.execute("INSERT INTO t VALUES (1)")?;   // WAL+fsync inline
+db.freeze_oldest_to_cold("t", "by_id", 1000)?;  // cold-tier persistence
+drop(db);                                        // Drop checkpoints
+```
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 7.1.0 | `Database::open_path(p)` — catalog snapshot + WAL append+fsync + boot replay + auto-checkpoint (4 carve-outs in one ship) |
+| 7.1.4 | `spg-manifest` crate extraction + cold-tier manifest reload |
+| 7.1.5 | series ship rollup + tag (this entry) |
+
+(.1 — .3 collapsed into .0 because the four surfaces are
+tightly coupled: WAL bytes are meaningless without boot
+replay, replay is meaningless without a baseline snapshot to
+replay onto, and auto-checkpoint is meaningless without a WAL
+to truncate. Shipping them separately would have produced
+intermediate states with no operator surface.)
+
+### Frozen surfaces added in v7.1
+
+**`spg-embedded` API:**
+- `Database::open_path(path)` — open or create persistent DB.
+- `Database::checkpoint()` — explicit snapshot + WAL truncate.
+- `Database::set_checkpoint_threshold_bytes(n)` — per-instance
+  auto-checkpoint ceiling.
+- `Database::freeze_oldest_to_cold(table, index, max_rows)` —
+  synchronous cold-tier freeze + segment persistence.
+- `Database::engine()` / `engine_mut()` — escape hatches
+  (unchanged from v6.10.3).
+
+**Env vars:**
+- `SPG_EMBEDDED_CHECKPOINT_BYTES` (default 4 MiB) — global
+  auto-checkpoint threshold.
+
+**WAL format:**
+- Embedded writes v3 `auto_commit_sql` records using the
+  same header / CRC32 / type-tag layout as `spg-server`.
+  Cross-binary compatible — an embedded-written database
+  boots cleanly on `spg-server`, and vice versa.
+
+**New workspace crate:**
+- `spg-manifest` — standalone `SPGMAN01` v10 manifest format
+  shared by `spg-server` (via `pub use spg_manifest::*` shim)
+  and `spg-embedded` (manifest-driven cold-segment reload).
+  No new wire bytes — just a refactor that unblocks
+  cross-binary compatibility.
+
+**On-disk layout (matches `spg-server`):**
+- `<db_path>` — catalog snapshot.
+- `<db_path>.wal` — WAL.
+- `<db_path stem>.spg/segments/seg_<id>.spg` — cold segments.
+- `<db_path stem>.spg/manifest.v10` — manifest sidecar.
+
+### Goal numbers — measured vs target
+
+| metric | v7.1 target | measured |
+|--------|------------:|---------:|
+| Durability after `execute()` returns | every write durable | ✅ fsync inline |
+| Crash recovery (forget `Drop`) | recover via WAL replay | ✅ |
+| Vector / HNSW state persistence | restorable on next open | ✅ |
+| Cold-tier (frozen segments) persistence | restorable on next open | ✅ via manifest |
+| WAL kept bounded under high write load | ≤ checkpoint threshold | ✅ auto-fires at 4 MiB default |
+| 4-corpus sqllogictest | 100% | ✅ 372/372 |
+
+### Known v7.1 limitations (carved out to future v7.x)
+
+The v6.10 STABILITY carve-out list that survived into v7.0
+still applies to `spg-embedded`. The v7.1 ship closes the
+durability cluster — the remaining items remain:
+
+- **Background freezer / auto-ANALYZE / prefetch worker pool.**
+  v7.1 ships synchronous `freeze_oldest_to_cold`; the
+  spawn-a-thread version is v7.2 territory.
+- **`Database::with_transaction(|tx| …)` ergonomic.** Today's
+  flow goes through SQL `BEGIN` / `COMMIT`.
+- **`Send + Sync`-friendly shared `Database`.** Today's flow
+  is `Arc<Mutex<Database>>` if the caller needs sharing.
+- **`#[derive(SpgRow)]` proc-macro** — v7.3 candidate.
+
+---
+
 ## [7.0] — 2026-06-03 (v7.0 — production release)
 
 The v7.0 release closes the v6.x development cycle. Every

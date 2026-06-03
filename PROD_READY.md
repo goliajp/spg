@@ -205,6 +205,7 @@ without reading the source code.
 | 7.61 | SPG-unique: WAL schema lint | `spg wal-lint <wal_path> --against-schema <db_path>` dry-run-applies every WAL record against a catalog snapshot. `OK <n>` on success, `FAIL <offset>: <msg>` on first rejection. Handles v1/v2/v3 record formats incl. v6.6.1 LZSS-compressed v3 type=0x03 | ✅ | v6.10.5, `e2e_wal_lint.rs` (4/4) |
 | 7.62 | SPG-unique: WAL stream tee | `SPG_WAL_TEE_PATH` mirrors every group-committed WAL append to a second file (append+create, no fsync). Best-effort: tee failure is logged + swallowed, primary durability path unaffected | ✅ | v6.10.6, `e2e_wal_tee.rs` (2/2) |
 | 7.63 | SPG-unique: audit-driven PITR | `spg revert --wal <p> --to-seq <N> --out <db>` replays first N records into a fresh engine + writes the new snapshot. `--to-audit-entry <hash>` surfaces a carve-out hint pending the audit-chain lookup integration | ✅ | v6.10.7, `e2e_revert.rs` (4/4) |
+| 7.64 | Embedded durability parity | `spg-embedded::Database::open_path(p)` — catalog snapshot + WAL append+fsync + boot-time replay + auto-checkpoint + cold-tier manifest. Byte-format compatible with `spg-server`: a database an embedded process writes boots cleanly on the server, and vice versa. `spg-manifest` crate extracted from `spg-server` to share the v10 manifest format | ✅ | v7.1.0 + v7.1.4, `e2e_open_path.rs` (7/7) + `e2e_cold_tier_manifest.rs` (3/3) |
 
 ## 8. Stability + compatibility
 
