@@ -1194,6 +1194,8 @@ name = "spg-cli"
 version = "1.0.0"
 dependencies = [
  "criterion",
+ "spg-crypto",
+ "spg-engine",
  "spg-storage",
  "spg-wire",
 ]
