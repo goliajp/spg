@@ -368,6 +368,11 @@ pub struct SelectStatement {
     pub from: Option<FromClause>,
     pub where_: Option<Expr>,
     pub group_by: Option<Vec<Expr>>,
+    /// v6.4.1 — `GROUP BY ALL` shortcut: when true, the planner
+    /// expands `group_by` to every non-aggregate SELECT-list item
+    /// before the executor runs. Mutually exclusive with an
+    /// explicit `group_by` list (the parser sets exactly one).
+    pub group_by_all: bool,
     /// `HAVING <expr>` — filter applied *after* `GROUP BY` aggregation.
     /// Supports aggregate calls (e.g. `HAVING count(*) > 1`); the
     /// aggregate executor resolves them through the same synthetic
@@ -1374,6 +1379,7 @@ mod tests {
             }),
             where_: None,
             group_by: None,
+            group_by_all: false,
             having: None,
             unions: vec![],
             order_by: Vec::new(),

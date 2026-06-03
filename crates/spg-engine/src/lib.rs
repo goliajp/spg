@@ -952,6 +952,10 @@ impl Engine {
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
         if let Statement::Select(s) = &mut stmt {
+            // v6.4.1 — expand `GROUP BY ALL` to every non-aggregate
+            // SELECT-list item BEFORE position / alias resolution so
+            // downstream passes see the explicit list.
+            expand_group_by_all(s);
             resolve_order_by_position(s);
             // v6.2.3 — cost-based JOIN reorder. No-op for
             // single-table FROMs or any non-INNER join shape.
@@ -5621,6 +5625,34 @@ enum ClockSite {
 /// Swap the integer literal for the matching item's expression so the
 /// executor doesn't need a special-case branch. Recurses into UNION
 /// peers because each peer keeps its own SELECT list.
+/// v6.4.1 — expand `GROUP BY ALL` to every non-aggregate SELECT-list
+/// item. Mirrors DuckDB / PG 19 semantics. Wildcards (`SELECT * …`)
+/// are NOT expanded by GROUP BY ALL (PG 19 leaves the wildcard intact
+/// and groups by whatever explicit non-aggregates remain — none in
+/// the wildcard-only case, which still works for non-aggregate
+/// queries).
+fn expand_group_by_all(s: &mut SelectStatement) {
+    if !s.group_by_all {
+        for (_, peer) in &mut s.unions {
+            expand_group_by_all(peer);
+        }
+        return;
+    }
+    let mut groups: Vec<Expr> = Vec::new();
+    for item in &s.items {
+        if let SelectItem::Expr { expr, .. } = item
+            && !aggregate::contains_aggregate(expr)
+        {
+            groups.push(expr.clone());
+        }
+    }
+    s.group_by = Some(groups);
+    s.group_by_all = false;
+    for (_, peer) in &mut s.unions {
+        expand_group_by_all(peer);
+    }
+}
+
 fn resolve_order_by_position(s: &mut SelectStatement) {
     // v6.4.0 — iterate every ORDER BY key. Position references
     // (`ORDER BY 2`) bind to the 1-based projection index;

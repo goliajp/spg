@@ -775,22 +775,31 @@ impl Parser {
         } else {
             None
         };
+        let mut group_by_all = false;
         let group_by = if matches!(self.peek(), Token::Group) {
             self.advance();
             if !matches!(self.peek(), Token::By) {
                 return Err(self.err(format!("expected BY after GROUP, got {:?}", self.peek())));
             }
             self.advance();
-            let mut groups = Vec::new();
-            loop {
-                groups.push(self.parse_expr(0)?);
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                } else {
-                    break;
+            // v6.4.1 — `GROUP BY ALL` shortcut. Planner expands to
+            // every non-aggregate SELECT-list item later.
+            if matches!(self.peek(), Token::All) {
+                self.advance();
+                group_by_all = true;
+                None
+            } else {
+                let mut groups = Vec::new();
+                loop {
+                    groups.push(self.parse_expr(0)?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
                 }
+                Some(groups)
             }
-            Some(groups)
         } else {
             None
         };
@@ -807,6 +816,7 @@ impl Parser {
             from,
             where_,
             group_by,
+            group_by_all,
             having,
             unions: Vec::new(),
             order_by: Vec::new(),
