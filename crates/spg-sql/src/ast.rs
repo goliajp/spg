@@ -255,6 +255,15 @@ pub struct CreateIndexStatement {
     /// column position stay valid. `None` = plain
     /// column-reference index (the legacy shape).
     pub expression: Option<Expr>,
+    /// v7.9.14 — extra column names after the leading column in a
+    /// multi-column `CREATE INDEX … (a, b, c)`. mailrs F2. The
+    /// planner today still only uses the leading column for index
+    /// seeks; the extras are tracked verbatim so the same DDL
+    /// round-trips through WAL replay + catalog snapshot, and so
+    /// the engine can emit a clear warning at INDEX CREATE time
+    /// that only the leading column is currently honoured.
+    /// Composite BTree index keys land in v7.10.
+    pub extra_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
