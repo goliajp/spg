@@ -82,20 +82,6 @@ fn delete_with_explicit_no_action_is_also_restricted() {
 }
 
 #[test]
-fn delete_with_set_null_currently_reports_not_implemented() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE u (id INT NOT NULL)",
-        "CREATE INDEX u_pk ON u (id)",
-        "CREATE TABLE o (id INT NOT NULL, uid INT, \
-         FOREIGN KEY (uid) REFERENCES u(id) ON DELETE SET NULL)",
-        "INSERT INTO u VALUES (1)",
-        "INSERT INTO o VALUES (10, 1)",
-    ]);
-    let r = eng.execute("DELETE FROM u WHERE id = 1");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("SET NULL")));
-}
-
-#[test]
 fn self_referencing_delete_of_orphan_succeeds() {
     // org: id=1 is root (parent_id NULL), id=2 references 1.
     // Deleting id=2 leaves no children → succeeds.
