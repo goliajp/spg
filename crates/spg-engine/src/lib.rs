@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod eval;
 pub mod json;
 pub mod publications;
+pub mod reorder;
 pub mod selectivity;
 pub mod statistics;
 pub mod subscriptions;
@@ -847,6 +848,8 @@ impl Engine {
         rewrite_clock_calls(&mut stmt, now_micros);
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
+            // v6.2.3 — cost-based JOIN reorder (read path).
+            reorder::reorder_joins(s, &self.catalog, &self.statistics);
         }
         let result = match stmt {
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
@@ -940,6 +943,9 @@ impl Engine {
         rewrite_clock_calls(&mut stmt, now_micros);
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
+            // v6.2.3 — cost-based JOIN reorder. No-op for
+            // single-table FROMs or any non-INNER join shape.
+            reorder::reorder_joins(s, &self.catalog, &self.statistics);
         }
         Ok(stmt)
     }
