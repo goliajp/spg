@@ -6,6 +6,9 @@ rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "SPG command-line client — speaks the self-built wire protocol."
+repository   = { workspace = true }
+categories   = ["command-line-utilities", "database"]
+keywords     = ["spg", "cli", "database", "client"]
 
 [[bin]]
 name = "spg"

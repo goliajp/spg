@@ -5,7 +5,10 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
-description  = "SPG daemon — listens for self-built wire-frame connections."
+description  = "SPG daemon — listens for self-built wire-frame connections and PG-wire (libpq-compatible)."
+repository   = { workspace = true }
+categories   = ["database-implementations", "network-programming"]
+keywords     = ["spg", "database", "server", "sql", "postgres"]
 
 [[bin]]
 name = "spg-server"

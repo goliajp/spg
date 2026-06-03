@@ -5,7 +5,10 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
-description  = "v7.1 — SPGMAN01 v10 catalog manifest format. Frozen wire/disk surface shared by spg-server (boot, CHECKPOINT, segment forwarding) and spg-embedded (open_path durability)."
+description  = "SPGMAN01 v10 catalog manifest format. Frozen wire/disk surface shared by spg-server and spg-embedded."
+repository   = { workspace = true }
+categories   = ["database-implementations", "filesystem"]
+keywords     = ["spg", "catalog", "manifest", "wal", "cold-tier"]
 
 [dependencies]
 spg-crypto = { path = "../spg-crypto" }

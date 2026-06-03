@@ -5,7 +5,10 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
-description  = "In-memory storage primitives for SPG: values, rows, table schema, catalog."
+description  = "In-memory storage primitives for SPG: values, rows, table schema, catalog with foreign-key constraints."
+repository   = { workspace = true }
+categories   = ["database-implementations", "data-structures"]
+keywords     = ["spg", "storage", "btree", "catalog", "no-std"]
 
 [lints]
 workspace = true

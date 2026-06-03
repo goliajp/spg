@@ -5,7 +5,10 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
-description  = "Self-built cryptographic primitives for SPG: BLAKE3 hash."
+description  = "Self-built cryptographic primitives for SPG: BLAKE3 hash, CRC32, no_std."
+repository   = { workspace = true }
+categories   = ["cryptography", "no-std"]
+keywords     = ["spg", "blake3", "crc32", "no-std", "hash"]
 
 [lints]
 workspace = true

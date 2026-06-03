@@ -5,7 +5,10 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
-description  = "Execution engine for SPG: glues spg-sql parsing to spg-storage."
+description  = "Execution engine for SPG: glues spg-sql parsing to spg-storage. Foreign keys, joins, vectors, cold tier."
+repository   = { workspace = true }
+categories   = ["database-implementations"]
+keywords     = ["spg", "sql", "engine", "executor", "no-std"]
 
 [dependencies]
 spg-crypto  = { path = "../spg-crypto" }
