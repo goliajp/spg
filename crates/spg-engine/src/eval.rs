@@ -1008,6 +1008,9 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
 
 fn value_to_text(v: &Value) -> String {
     match v {
+        // v7.5.0 — Value is #[non_exhaustive]; any future variant
+        // without explicit text rendering hits the Debug fallback
+        // at the end.
         Value::SmallInt(n) => format!("{n}"),
         Value::Int(n) => format!("{n}"),
         Value::BigInt(n) => format!("{n}"),
@@ -1041,6 +1044,8 @@ fn value_to_text(v: &Value) -> String {
         Value::Timestamp(t) => format_timestamp(*t),
         Value::Interval { months, micros } => format_interval(*months, *micros),
         Value::Null => "NULL".into(),
+        // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
+        _ => format!("{v:?}"),
     }
 }
 

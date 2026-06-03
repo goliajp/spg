@@ -643,6 +643,15 @@ fn encode_key(vals: &[Value]) -> String {
                 out.push_str(s);
                 out.push('|');
             }
+            // v7.5.0 — Value is #[non_exhaustive] for downstream
+            // forward-compat. Any future variant lacking explicit
+            // handling here will share a debug-derived group key,
+            // which is observably wrong but won't crash.
+            _ => {
+                out.push('?');
+                out.push_str(&format!("{v:?}"));
+                out.push('|');
+            }
         }
     }
     out

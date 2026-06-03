@@ -4117,6 +4117,8 @@ fn emit_result(
             stream.write_all(&out)
         }
         Err(e) => write_frame(stream, &build_error_response(&e.to_string())),
+        // v7.5.0 — QueryResult is #[non_exhaustive].
+        Ok(_) => write_frame(stream, &build_error_response("unexpected QueryResult variant")),
     }
 }
 
@@ -4191,6 +4193,8 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Interval { months, micros } => {
             WireValue::Text(spg_engine::eval::format_interval(*months, *micros))
         }
+        // v7.5.0 — Value is #[non_exhaustive].
+        _ => WireValue::Text(format!("{v:?}")),
     }
 }
 
