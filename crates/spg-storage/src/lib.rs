@@ -296,6 +296,73 @@ pub struct TableSchema {
     /// `ALTER TABLE t SET hot_tier_bytes = X`. Persisted in
     /// catalog FILE_VERSION 11+.
     pub hot_tier_bytes: Option<u64>,
+    /// v7.6.1 — FOREIGN KEY constraints declared on this table.
+    /// Engine maintains this in lock-step with `spg-sql`'s parser
+    /// AST; the storage layer carries the on-disk shape so a
+    /// catalog snapshot round-trips without external mapping.
+    /// Persisted in catalog FILE_VERSION 13+. Older catalogs
+    /// deserialise with an empty vec.
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
+}
+
+/// v7.6.1 — Storage-layer mirror of `spg_sql::ast::ForeignKeyConstraint`.
+/// The engine's CREATE TABLE path translates between the two; keeping
+/// them separate preserves the no-deps boundary between
+/// `spg-storage` and `spg-sql`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyConstraint {
+    /// Optional user-supplied constraint name (`CONSTRAINT <name>`
+    /// prefix). Used by `ALTER TABLE DROP CONSTRAINT <name>` in
+    /// v7.6.8; ignored by enforcement.
+    pub name: Option<String>,
+    /// Positions of local columns in this table's column list.
+    /// Same arity as `parent_columns`.
+    pub local_columns: Vec<usize>,
+    /// Referenced parent table name.
+    pub parent_table: String,
+    /// Positions of parent columns in the parent's column list.
+    /// Engine resolves these at CREATE TABLE time (after the parent
+    /// schema is known) so enforcement paths can skip the name
+    /// lookup on every row.
+    pub parent_columns: Vec<usize>,
+    /// Referential action when a parent row is deleted.
+    pub on_delete: FkAction,
+    /// Referential action when a parent row's referenced columns
+    /// are updated.
+    pub on_update: FkAction,
+}
+
+/// v7.6.1 — referential action tag. Mirrors `spg_sql::ast::FkAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+    NoAction,
+}
+
+impl FkAction {
+    /// On-disk tag byte (v13 catalog appendix).
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Restrict => 0,
+            Self::Cascade => 1,
+            Self::SetNull => 2,
+            Self::SetDefault => 3,
+            Self::NoAction => 4,
+        }
+    }
+    pub const fn from_tag(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Self::Restrict,
+            1 => Self::Cascade,
+            2 => Self::SetNull,
+            3 => Self::SetDefault,
+            4 => Self::NoAction,
+            _ => return None,
+        })
+    }
 }
 
 impl TableSchema {
@@ -3680,6 +3747,7 @@ impl TableSchema {
             name: name.into(),
             columns,
             hot_tier_bytes: None,
+            foreign_keys: Vec::new(),
         }
     }
 }
@@ -3757,7 +3825,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 12;
+const FILE_VERSION: u8 = 13;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -3915,6 +3983,52 @@ impl Catalog {
                     out.extend_from_slice(&n.to_le_bytes());
                 }
             }
+            // v7.6.1 — FOREIGN KEY appendix (catalog FILE_VERSION 13+).
+            // Layout: [u16 LE fk_count]
+            //   per fk:
+            //     [u8 has_name] [str name (if has_name)]
+            //     [u16 LE local_arity] [u16 LE local_pos]*arity
+            //     [str parent_table]
+            //     [u16 LE parent_arity] [u16 LE parent_pos]*arity
+            //     [u8 on_delete_tag] [u8 on_update_tag]
+            // Older catalogs (v12 and below) skip this block entirely;
+            // their reader stops before this byte.
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.foreign_keys.len()).expect("≤ 65k FKs/table"),
+            );
+            for fk in &t.schema.foreign_keys {
+                match &fk.name {
+                    None => out.push(0),
+                    Some(n) => {
+                        out.push(1);
+                        write_str(&mut out, n);
+                    }
+                }
+                write_u16(
+                    &mut out,
+                    u16::try_from(fk.local_columns.len()).expect("≤ 65k FK columns"),
+                );
+                for &p in &fk.local_columns {
+                    write_u16(
+                        &mut out,
+                        u16::try_from(p).expect("≤ 65k columns/table"),
+                    );
+                }
+                write_str(&mut out, &fk.parent_table);
+                write_u16(
+                    &mut out,
+                    u16::try_from(fk.parent_columns.len()).expect("≤ 65k FK parent columns"),
+                );
+                for &p in &fk.parent_columns {
+                    write_u16(
+                        &mut out,
+                        u16::try_from(p).expect("≤ 65k columns/table"),
+                    );
+                }
+                out.push(fk.on_delete.tag());
+                out.push(fk.on_update.tag());
+            }
         }
         out
     }
@@ -4010,6 +4124,54 @@ fn deserialize_table(
             }
         };
         t.schema_mut().hot_tier_bytes = hot_tier_bytes;
+    }
+    // v7.6.1 — FOREIGN KEY appendix (FILE_VERSION 13+). v12 / v11 / …
+    // catalogs skip this entirely.
+    if version >= 13 {
+        let fk_count = cur.read_u16()? as usize;
+        let mut fks = Vec::with_capacity(fk_count);
+        for _ in 0..fk_count {
+            let name = match cur.read_u8()? {
+                0 => None,
+                1 => Some(cur.read_str()?),
+                other => {
+                    return Err(StorageError::Corrupt(format!(
+                        "FK appendix: unknown has-name byte {other}"
+                    )));
+                }
+            };
+            let local_arity = cur.read_u16()? as usize;
+            let mut local_columns = Vec::with_capacity(local_arity);
+            for _ in 0..local_arity {
+                local_columns.push(cur.read_u16()? as usize);
+            }
+            let parent_table = cur.read_str()?;
+            let parent_arity = cur.read_u16()? as usize;
+            if parent_arity != local_arity {
+                return Err(StorageError::Corrupt(format!(
+                    "FK arity mismatch in catalog: local {local_arity} vs parent {parent_arity}"
+                )));
+            }
+            let mut parent_columns = Vec::with_capacity(parent_arity);
+            for _ in 0..parent_arity {
+                parent_columns.push(cur.read_u16()? as usize);
+            }
+            let on_delete = FkAction::from_tag(cur.read_u8()?).ok_or_else(|| {
+                StorageError::Corrupt("FK appendix: unknown on_delete tag".into())
+            })?;
+            let on_update = FkAction::from_tag(cur.read_u8()?).ok_or_else(|| {
+                StorageError::Corrupt("FK appendix: unknown on_update tag".into())
+            })?;
+            fks.push(ForeignKeyConstraint {
+                name,
+                local_columns,
+                parent_table,
+                parent_columns,
+                on_delete,
+                on_update,
+            });
+        }
+        t.schema_mut().foreign_keys = fks;
     }
     let _ = table_name;
     Ok(())
