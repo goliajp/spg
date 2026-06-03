@@ -472,6 +472,11 @@ pub struct UpdateStatement {
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
     pub where_: Option<Expr>,
+    /// v7.9.4 — `RETURNING <projection>`. None = no RETURNING
+    /// clause (legacy CommandComplete path). Some = engine
+    /// evaluates the projection over each mutated row and
+    /// streams the result as a Rows QueryResult.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 /// `DELETE FROM <table> [WHERE cond]`. v4.4 — removes matched rows
@@ -480,6 +485,8 @@ pub struct UpdateStatement {
 pub struct DeleteStatement {
     pub table: String,
     pub where_: Option<Expr>,
+    /// v7.9.4 — `RETURNING <projection>`.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -493,6 +500,8 @@ pub struct InsertStatement {
     /// One or more `(expr, expr, ...)` tuples — the multi-row VALUES form.
     /// v1.3+ accepts `INSERT INTO t VALUES (a), (b)`.
     pub rows: Vec<Vec<Expr>>,
+    /// v7.9.4 — `RETURNING <projection>`.
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

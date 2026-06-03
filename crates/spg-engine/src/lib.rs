@@ -2344,13 +2344,29 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
+        // v7.9.4 — snapshot post-update values for RETURNING.
+        let updated_for_returning: Vec<Vec<Value>> =
+            if stmt.returning.is_some() {
+                planned.iter().map(|(_pos, vals)| vals.clone()).collect()
+            } else {
+                Vec::new()
+            };
         for (pos, vals) in planned {
             table.update_row(pos, vals)?;
         }
+        let _ = table;
         // v6.2.1 — auto-analyze modified-row tracking for UPDATE.
         if !self.in_transaction() && affected > 0 {
             self.statistics
                 .record_modifications(&stmt.table, affected as u64);
+        }
+        // v7.9.4 — RETURNING projection.
+        if let Some(items) = &stmt.returning {
+            return self.build_returning_rows(
+                &stmt.table,
+                items,
+                updated_for_returning,
+            );
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -2461,10 +2477,23 @@ impl Engine {
                 })
             })?;
         let affected = table.delete_rows(&positions) + cold_shadow_count;
+        let _ = table;
         // v6.2.1 — auto-analyze modified-row tracking for DELETE.
         if !self.in_transaction() && affected > 0 {
             self.statistics
                 .record_modifications(&stmt.table, affected as u64);
+        }
+        // v7.9.4 — RETURNING projection over the soon-to-be-gone
+        // rows. `to_delete_rows` was snapshotted in stage 1 before
+        // mutation, so the projection sees the pre-delete state
+        // (matches PG semantics: DELETE RETURNING returns the row
+        // as it was just before removal).
+        if let Some(items) = &stmt.returning {
+            return self.build_returning_rows(
+                &stmt.table,
+                items,
+                to_delete_rows,
+            );
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -3142,9 +3171,23 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
+        // v7.9.4 — keep a snapshot of inserted rows for RETURNING.
+        let inserted_for_returning: Vec<Vec<Value>> =
+            if stmt.returning.is_some() { all_values.clone() } else { Vec::new() };
         for values in all_values {
             table.insert(Row::new(values))?;
             affected += 1;
+        }
+        // v7.9.4 — if RETURNING was specified, project each
+        // inserted row and stream as Rows result instead of
+        // CommandOk.
+        if let Some(items) = &stmt.returning {
+            let _ = table;
+            return self.build_returning_rows(
+                &stmt.table,
+                items,
+                inserted_for_returning,
+            );
         }
         // v6.2.1 — auto-analyze: track per-table modified-row
         // counter so the background sweep can decide when to
@@ -3260,6 +3303,37 @@ impl Engine {
     ) -> Result<Value, EngineError> {
         let cancel = CancelToken::none();
         self.eval_expr_with_correlated(expr, row, ctx, cancel, None)
+    }
+
+    /// v7.9.4 — INSERT / UPDATE / DELETE RETURNING projector.
+    /// Given the table name, the user-supplied projection items,
+    /// and the mutated rows (post-insert / post-update values, or
+    /// pre-delete snapshot), build a `QueryResult::Rows` whose
+    /// schema describes the projected columns. Mailrs migration
+    /// blocker #1.
+    fn build_returning_rows(
+        &self,
+        table_name: &str,
+        items: &[SelectItem],
+        mutated_rows: Vec<Vec<Value>>,
+    ) -> Result<QueryResult, EngineError> {
+        let table = self.active_catalog().get(table_name).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: table_name.into(),
+            })
+        })?;
+        let schema_cols = table.schema().columns.clone();
+        let columns = self.derive_output_columns(items, &schema_cols, table_name);
+        let mut out_rows: Vec<Row> = Vec::with_capacity(mutated_rows.len());
+        for values in mutated_rows {
+            let row = Row::new(values);
+            let projected = self.project_row_simple(&row, items, &schema_cols, table_name)?;
+            out_rows.push(projected);
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: out_rows,
+        })
     }
 
     /// v6.10.2 — projection for AS OF SEGMENT. Resolves

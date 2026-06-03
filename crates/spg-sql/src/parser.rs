@@ -598,10 +598,12 @@ impl Parser {
         } else {
             None
         };
+        let returning = self.parse_optional_returning()?;
         Ok(Statement::Update(crate::ast::UpdateStatement {
             table,
             assignments,
             where_,
+            returning,
         }))
     }
 
@@ -619,10 +621,37 @@ impl Parser {
         } else {
             None
         };
+        let returning = self.parse_optional_returning()?;
         Ok(Statement::Delete(crate::ast::DeleteStatement {
             table,
             where_,
+            returning,
         }))
+    }
+
+    /// v7.9.4 — parse the optional trailing `RETURNING <projection>`
+    /// clause on INSERT / UPDATE / DELETE. Same projection grammar
+    /// as SELECT, so `RETURNING *`, `RETURNING col`,
+    /// `RETURNING expr AS alias`, and `RETURNING a, b, c` all work.
+    fn parse_optional_returning(&mut self) -> Result<Option<Vec<crate::ast::SelectItem>>, ParseError> {
+        let is_returning_kw = matches!(
+            self.peek(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("returning")
+        );
+        if !is_returning_kw {
+            return Ok(None);
+        }
+        self.advance();
+        let mut items = Vec::new();
+        loop {
+            items.push(self.parse_select_item()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(Some(items))
     }
 
     /// v6.0.4 — parse the tail of an ALTER statement after the
@@ -1723,10 +1752,12 @@ impl Parser {
                 break;
             }
         }
+        let returning = self.parse_optional_returning()?;
         Ok(Statement::Insert(InsertStatement {
             table,
             columns,
             rows,
+            returning,
         }))
     }
 
