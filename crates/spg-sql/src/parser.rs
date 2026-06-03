@@ -390,10 +390,59 @@ impl Parser {
                 self.advance();
                 self.parse_create_user_after_keyword()
             }
+            // v7.9.15 — `CREATE EXTENSION [IF NOT EXISTS] <name>
+            // [WITH SCHEMA …] [VERSION '…'] [CASCADE]` as a
+            // no-op. mailrs follow-up F3.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("extension") => {
+                self.advance();
+                self.parse_create_extension_after_keyword()
+            }
             other => Err(self.err(format!(
-                "expected TABLE / INDEX / USER / PUBLICATION / SUBSCRIPTION after CREATE, got {other:?}"
+                "expected TABLE / INDEX / USER / EXTENSION / PUBLICATION / SUBSCRIPTION after CREATE, got {other:?}"
             ))),
         }
+    }
+
+    /// v7.9.15 — accept and discard `CREATE EXTENSION` DDL.
+    /// SPG doesn't have a registry; pgvector / similar are
+    /// either builtin (VECTOR(N) ↔ pgvector) or n/a. Parsing
+    /// the syntax lets dual-target schemas keep the line.
+    fn parse_create_extension_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        // Optional `IF NOT EXISTS`.
+        self.consume_if_not_exists();
+        let name = self.expect_ident_like()?;
+        // Drain optional WITH SCHEMA <ident> / VERSION '<v>' /
+        // CASCADE / FROM '<v>' clauses; we don't model them.
+        loop {
+            match self.peek() {
+                Token::Ident(s) if s.eq_ignore_ascii_case("with") => {
+                    self.advance();
+                    continue;
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("schema") => {
+                    self.advance();
+                    let _ = self.expect_ident_like()?;
+                    continue;
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("version") => {
+                    self.advance();
+                    // String or ident literal.
+                    let _ = self.advance();
+                    continue;
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("from") => {
+                    self.advance();
+                    let _ = self.advance();
+                    continue;
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("cascade") => {
+                    self.advance();
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        Ok(Statement::CreateExtension(name))
     }
 
     /// v6.1.2 → v6.1.3 — `CREATE PUBLICATION <name>` body. Accepts:
