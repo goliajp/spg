@@ -552,6 +552,25 @@ pub struct Table {
     rows: PersistentVec<Row>,
     indices: Vec<Index>,
     hot_bytes: u64,
+    /// v6.7.0 — cached count of rows currently materialised in the
+    /// cold tier via `RowLocator::Cold` entries across THIS table's
+    /// indices. Populated by `ANALYZE` (walks every BTree index and
+    /// counts Cold locators); the count survives until the next
+    /// ANALYZE recomputes it. Surfaced via `spg_statistic.cold_row_count`
+    /// and `spg_stat_segment.table_name`.
+    ///
+    /// Honest scope: this is a CACHED count, not a live one.
+    /// Freezer / promote / DELETE don't currently update the cache
+    /// incrementally — they invalidate it by setting the
+    /// `cold_row_count_stale` flag, and the next ANALYZE re-walks.
+    /// Incremental maintenance is a v6.7.x candidate if observation
+    /// shows the ANALYZE walk cost dominates.
+    cold_row_count: u64,
+    /// v6.7.0 — set when the cached `cold_row_count` may be wrong
+    /// because rows moved into / out of the cold tier since the last
+    /// ANALYZE. The virtual-table surface reports the cached value
+    /// regardless (operators run ANALYZE to refresh).
+    cold_row_count_stale: bool,
 }
 
 impl Table {
@@ -561,6 +580,8 @@ impl Table {
             rows: PersistentVec::new(),
             indices: Vec::new(),
             hot_bytes: 0,
+            cold_row_count: 0,
+            cold_row_count_stale: false,
         }
     }
 
@@ -570,6 +591,63 @@ impl Table {
     #[must_use]
     pub const fn hot_bytes(&self) -> u64 {
         self.hot_bytes
+    }
+
+    /// v6.7.0 — cached count of cold-tier rows. See struct field
+    /// docs for the staleness contract.
+    #[must_use]
+    pub const fn cold_row_count(&self) -> u64 {
+        self.cold_row_count
+    }
+
+    /// v6.7.0 — overwrite the cached count. Called by the engine's
+    /// `analyze_one_table` after walking the indices.
+    pub fn set_cold_row_count(&mut self, n: u64) {
+        self.cold_row_count = n;
+        self.cold_row_count_stale = false;
+    }
+
+    /// v6.7.0 — mark the cached count as potentially out of date.
+    /// Called by freezer / promote / DELETE paths so a subsequent
+    /// `spg_statistic` read knows the number may not reflect the
+    /// current state.
+    pub fn mark_cold_row_count_stale(&mut self) {
+        self.cold_row_count_stale = true;
+    }
+
+    /// v6.7.0 — report whether the cached count is known to be out
+    /// of date. Exposed for completeness; the virtual table surface
+    /// returns the cached value regardless.
+    #[must_use]
+    pub const fn cold_row_count_stale(&self) -> bool {
+        self.cold_row_count_stale
+    }
+
+    /// v6.7.0 — walk every BTree index and count `RowLocator::Cold`
+    /// entries; return the MAX across indices. The freeze path
+    /// (`freeze_oldest_to_cold`) writes cold locators to ONE
+    /// designated index — that index ends up with the full per-row
+    /// count. MAX-across-indices yields the precise count when a
+    /// PK-style index exists; for multi-index tables without a
+    /// covering index it's a lower bound (rare in practice).
+    /// Caller responsibility: only invoke under `engine.write()`
+    /// or after taking ownership; the walk is O(N) over every
+    /// (key, locator) pair.
+    #[must_use]
+    pub fn count_cold_locators(&self) -> u64 {
+        let mut best: u64 = 0;
+        for idx in &self.indices {
+            if let IndexKind::BTree(map) = &idx.kind {
+                let n: u64 = map
+                    .iter()
+                    .map(|(_, locs)| locs.iter().filter(|l| l.is_cold()).count() as u64)
+                    .sum();
+                if n > best {
+                    best = n;
+                }
+            }
+        }
+        best
     }
 
     pub const fn schema(&self) -> &TableSchema {
