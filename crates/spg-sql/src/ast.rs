@@ -1001,6 +1001,13 @@ pub enum BinOp {
     And,
     Eq,
     NotEq,
+    /// v7.9.27b — PG `a IS DISTINCT FROM b` / `a IS NOT DISTINCT
+    /// FROM b`. NULL-safe equality: NULL IS NOT DISTINCT FROM
+    /// NULL → true, NULL IS DISTINCT FROM NULL → false. The
+    /// non-NULL behaviour matches `<>` / `=` exactly. Common in
+    /// PG-style JOIN ON predicates and pg_dump output.
+    IsDistinctFrom,
+    IsNotDistinctFrom,
     Lt,
     LtEq,
     Gt,
@@ -1661,6 +1668,8 @@ impl fmt::Display for BinOp {
             Self::And => "AND",
             Self::Eq => "=",
             Self::NotEq => "<>",
+            Self::IsDistinctFrom => "IS DISTINCT FROM",
+            Self::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
             Self::Lt => "<",
             Self::LtEq => "<=",
             Self::Gt => ">",

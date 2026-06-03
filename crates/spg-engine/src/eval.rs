@@ -1562,6 +1562,16 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value, EvalError> {
     }
 }
 
+/// v7.9.27b — true when two values are "not distinct" per PG:
+/// both NULL counts as equal; otherwise reduces to regular Eq.
+fn values_not_distinct(l: &Value, r: &Value) -> bool {
+    match (l, r) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => l == r,
+    }
+}
+
 fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
     // SQL three-valued logic for AND / OR with NULL is special — handle before
     // the general NULL-propagation rule.
@@ -1570,6 +1580,14 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
     }
     if let BinOp::Or = op {
         return or_3vl(l, r);
+    }
+    // v7.9.27b — IS [NOT] DISTINCT FROM. NULL-safe equality:
+    // `NULL IS NOT DISTINCT FROM NULL` → true. mailrs pg_dump.
+    if let BinOp::IsNotDistinctFrom = op {
+        return Ok(Value::Bool(values_not_distinct(&l, &r)));
+    }
+    if let BinOp::IsDistinctFrom = op {
+        return Ok(Value::Bool(!values_not_distinct(&l, &r)));
     }
     // Everything else: any NULL operand → NULL.
     if l.is_null() || r.is_null() {
@@ -1607,7 +1625,10 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
-        BinOp::And | BinOp::Or => unreachable!("handled above"),
+        BinOp::And
+        | BinOp::Or
+        | BinOp::IsDistinctFrom
+        | BinOp::IsNotDistinctFrom => unreachable!("handled above"),
     }
 }
 
@@ -2281,7 +2302,9 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::JsonGetText
         | BinOp::JsonGetPath
         | BinOp::JsonGetPathText
-        | BinOp::JsonContains => {
+        | BinOp::JsonContains
+        | BinOp::IsDistinctFrom
+        | BinOp::IsNotDistinctFrom => {
             unreachable!("compare() only called with comparison ops")
         }
     };
