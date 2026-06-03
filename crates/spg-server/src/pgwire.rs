@@ -803,11 +803,18 @@ fn handle_parse(
     // ORDER-BY position resolution once, here. Bind/Execute below
     // reuse the AST. Surfaces parser errors as a wire-level Parse
     // failure instead of deferring to the first Execute.
-    let eng = state
+    //
+    // v6.3.0: routes through `prepare_cached` so repeat Parse for
+    // the same SQL across sessions hits the engine-wide plan cache
+    // and skips re-parse + JOIN reorder. Needs `write()` because the
+    // cache's LRU promote is `&mut`.
+    let mut eng = state
         .engine
-        .read()
+        .write()
         .map_err(|_| "Parse: engine lock poisoned".to_string())?;
-    let ast = eng.prepare(&sql).map_err(|e| format!("Parse: {e}"))?;
+    let ast = eng
+        .prepare_cached(&sql)
+        .map_err(|e| format!("Parse: {e}"))?;
     drop(eng);
     let placeholder_count = count_placeholders(&sql);
     prepared.insert(
