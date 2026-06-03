@@ -43,7 +43,7 @@ fn every_operator_reports_stats() {
     // `Total: rows=…`.
     for line in &lines {
         let ok = line.contains("(rows=")
-            || line.contains("(rows_scanned")
+            || line.contains("(hot_rows")
             || line.starts_with("Total: rows=");
         assert!(ok, "no stats annotation on line: {line:?}");
     }
@@ -76,14 +76,14 @@ fn scan_reports_catalog_row_count() {
         .unwrap();
     let lines = rows_of(&r);
     // The "From: big [full scan]" line should report
-    // `(rows_scanned=40)` — every catalog row was a candidate.
+    // `(hot_rows=40)` — every catalog row was a candidate.
     let from_line = lines
         .iter()
         .find(|l| l.contains("From: big"))
         .expect("From line present");
     assert!(
-        from_line.contains("rows_scanned=40"),
-        "From line reports rows_scanned; got {from_line:?}"
+        from_line.contains("hot_rows=40"),
+        "From line reports hot_rows; got {from_line:?}"
     );
 }
 
@@ -125,6 +125,28 @@ fn no_unknown_operator_in_top_level() {
             "unknown top operator {stripped:?} for query {q:?}"
         );
     }
+}
+
+#[test]
+fn scan_omits_cold_marker_when_no_cold_segments() {
+    // A freshly-created table with only hot rows must NOT advertise
+    // cold_tier=present (catalog cold_segment_count() == 0).
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE warm (id INT NOT NULL)").unwrap();
+    e.execute("INSERT INTO warm VALUES (1)").unwrap();
+    let r = e
+        .execute("EXPLAIN ANALYZE SELECT * FROM warm")
+        .unwrap();
+    let lines = rows_of(&r);
+    let from = lines.iter().find(|l| l.contains("From: warm")).unwrap();
+    assert!(
+        from.contains("hot_rows=1"),
+        "From line shows hot_rows=1; got {from:?}"
+    );
+    assert!(
+        !from.contains("cold_tier"),
+        "no cold marker without cold segments; got {from:?}"
+    );
 }
 
 #[test]

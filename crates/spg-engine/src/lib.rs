@@ -3995,14 +3995,12 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
 /// complete-by-construction; v6.2.5 fills these in via inline
 /// executor counters.
 fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engine) {
+    let catalog = engine.active_catalog();
+    let any_cold_segments = catalog.cold_segment_count() > 0;
     for (idx, line) in lines.iter_mut().enumerate() {
         let trimmed = line.trim_start();
         let is_top_level = idx == 0;
         if is_top_level {
-            // Every top-level node — Result / TableScan / Aggregate
-            // / Distinct / WindowAgg / UnionScan / CTEScan — gets
-            // the final result row count + the total elapsed line
-            // (appended at exec_explain).
             line.push_str(&alloc::format!(" (rows={total_rows})"));
             continue;
         }
@@ -4012,29 +4010,39 @@ fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engi
                 Some((n, k)) => (n.trim(), k.trim_end_matches(']')),
                 None => (rest.trim(), ""),
             };
-            // Strip an `AS alias` suffix from the table name.
             let bare = name.split_whitespace().next().unwrap_or(name);
-            let rows = engine
-                .active_catalog()
-                .get(bare)
-                .map(|t| t.rows().len());
-            let annot = match (rows, scan_kind) {
-                (Some(n), "full scan") => alloc::format!(" (rows_scanned={n})"),
-                (Some(n), "index seek") => {
-                    // For an index seek the engine reads ≤ n rows;
-                    // the actual hit count needs inline
-                    // instrumentation (v6.2.5). Mark as upper-
-                    // bounded.
-                    alloc::format!(" (rows_scanned≤{n})")
+            // v6.2.5 — split scan stats into hot vs cold. Hot rows
+            // are the in-memory rows the executor walks. The cold
+            // tier currently exposes its row count only through
+            // index-side locators; v6.2.5 reports the global
+            // cold-segment presence flag so operators know whether
+            // the table COULD have cold rows. Precise per-table
+            // cold_rows count lands in v6.2.6 alongside the
+            // Memoize inline-instrumentation refactor.
+            let hot = catalog.get(bare).map(|t| t.rows().len());
+            let annot = match (hot, scan_kind) {
+                (Some(h), "full scan") => {
+                    let mut s = alloc::format!(" (hot_rows={h}");
+                    if any_cold_segments {
+                        s.push_str(", cold_tier=present");
+                    }
+                    s.push(')');
+                    s
+                }
+                (Some(h), "index seek") => {
+                    let mut s = alloc::format!(" (hot_rows≤{h}");
+                    if any_cold_segments {
+                        s.push_str(", cold_tier=present");
+                    }
+                    s.push(')');
+                    s
                 }
                 _ => " (rows=—)".to_string(),
             };
             line.push_str(&annot);
             continue;
         }
-        // Filter / GroupBy / Having / OrderBy / Limit / Join etc.:
-        // not computable from catalog-level reads alone. Marker
-        // makes the line shape consistent.
+        // Filter / GroupBy / Having / OrderBy / Limit / Join etc.
         line.push_str(" (rows=—)");
     }
 }
