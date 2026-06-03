@@ -1561,6 +1561,83 @@ pre-v6.8.0 binary fail loudly at the version check. Empty Vec
 - `Index.expression: Option<String>` — canonical Display of an
   expression-key index. `None` = bare column-reference index.
 
+### SPG-unique abilities (v6.10 series)
+
+The v6.10 series lifts the SPG-specific roadmap items from
+§2 ("Inspired-better dedicated") into shippable surfaces.
+Each ship freezes one operator-facing surface; runtime
+complexity that didn't make the v6.10 budget is parked in
+the "Out of v6.10" carve-out list below.
+
+**SQL surface additions:**
+- `SELECT … FROM <tbl> AS OF SEGMENT '<id>'` — v6.10.2
+  cold-tier time-travel scan. `<id>` is a string literal
+  (operator ergonomics) or an integer; engine resolves it to
+  a `cold_segment_id`. Scope is intentionally narrow
+  (projection + WHERE + LIMIT); other shapes return an
+  `EngineError::Unsupported` pointing at the carve-out.
+
+**Env vars** (operator-tunable):
+- `SPG_PUBSUB_TARGET` (default unset = pubsub off) — v6.10.0.
+  Currently accepts `log` only.
+- `SPG_PUBSUB_SUBJECT` (default `spg.wal.sql`) — v6.10.0.
+- `SPG_MAX_QUERY_NS` (default unset) — v6.10.1. Combines
+  with `SPG_QUERY_TIMEOUT_MS` via `min`; tighter wins.
+- `SPG_WAL_TEE_PATH` (default unset = tee off) — v6.10.6.
+
+**CLI surfaces:**
+- `spg-server --replay-only` — v6.10.4.
+- `spg wal-lint <wal_path> --against-schema <db_path>` —
+  v6.10.5. Output is `OK <count>` (stdout) or
+  `FAIL <byte_offset>: <error>` (stderr).
+- `spg revert --wal <p> --to-seq <N> --out <db>` — v6.10.7.
+  Output is `OK applied=<n> → <out>` (stdout).
+
+**Crates:**
+- `spg-embedded` — v6.10.3. Public surface:
+  - `Database::open_in_memory() -> Database`
+  - `Database::restore(&[u8]) -> Result<Database, EngineError>`
+  - `Database::snapshot() -> Vec<u8>`
+  - `Database::execute(&str) -> Result<QueryResult, EngineError>`
+  - `Database::query(&str) -> Result<Vec<Vec<Value>>, EngineError>`
+  - `Database::engine() / engine_mut()` escape hatches.
+  - `trait FromSpgRow { fn from_spg_row(&[Value]) -> Result<Self, EngineError>; }`
+
+**Wire frame additions:**
+- None. v6.10 reused existing frame types throughout (pubsub
+  is a side-channel; WAL tee is a file-level mirror).
+
+### Out of v6.10 (carved out — explicit STABILITY entries)
+
+The v6.10 sub-versions ship the operator surface + the
+in-process or format-layer plumbing. The following are
+explicitly parked for future v6.x or v7.x revisits:
+
+1. **`SPG_PUBSUB_TARGET=tcp://host:port` / `nats://…`.**
+   v6.10.0 ships only the `log` target. Real-broker TCP
+   needs the INFO/CONNECT handshake, TLS, reconnect, and a
+   bounded outbound queue — sized work, parked.
+2. **`AS OF TIMESTAMP <ts>`.** v6.10.2 ships
+   `AS OF SEGMENT '<id>'` only. Timestamp lookup needs the
+   freezer to stamp each segment with a wall-clock at
+   creation time, a v6.7-era change carve-out.
+3. **`AS OF SEGMENT` with joins / aggregates / ORDER BY.**
+   Surfaces `EngineError::Unsupported` today. Workaround:
+   `INSERT INTO restored SELECT … FROM <tbl> AS OF SEGMENT`,
+   then query `restored` with the full SQL surface.
+4. **Typed query API + `#[derive(SpgRow)]`.** The
+   `spg-embedded::FromSpgRow` trait sketch freezes the
+   signature; the proc-macro crate
+   (`spg-embedded-macros`) lands as a separate ship.
+5. **`spg-embedded::Database::open_path(p)`.** v6.10.3
+   ships in-memory + byte-slice round-trip; on-disk
+   persistence stays `spg-server`'s job.
+6. **`spg revert --to-audit-entry <hash>`.** The CLI
+   recognises the flag and emits a carve-out hint. Resolving
+   `<hash>` to a sequence number needs the audit-chain
+   provider hook from v6.5.3 to be live in the CLI's
+   load-from-snapshot path.
+
 ### Concurrency model (v6.9 series)
 
 The v6.9 series is **measurement + decision** — it adds no
