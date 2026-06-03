@@ -3493,7 +3493,7 @@ impl Engine {
             })?;
         let mut out_rows: Vec<Row> = Vec::new();
         let mut limit_remaining: Option<usize> =
-            stmt.limit.as_ref().and_then(|n| usize::try_from(*n).ok());
+            stmt.limit_literal().and_then(|n| usize::try_from(n).ok());
         for (_key, body) in seg.scan() {
             let (row, _consumed) = spg_storage::decode_row_body_dense(&body, &schema)
                 .map_err(EngineError::Storage)?;
@@ -3746,7 +3746,7 @@ impl Engine {
             sort_by_keys(&mut tagged, &descs);
             rows = tagged.into_iter().map(|(_, r)| r).collect();
         }
-        apply_offset_and_limit(&mut rows, stmt.offset, stmt.limit);
+        apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
         Ok(QueryResult::Rows { columns, rows })
     }
 
@@ -3868,7 +3868,7 @@ impl Engine {
                 }
             }
             let mut agg = aggregate::run(stmt, &filtered, schema_cols, Some(alias))?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset, stmt.limit);
+            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
                 rows: agg.rows,
@@ -3930,8 +3930,8 @@ impl Engine {
             let keep = if stmt.distinct {
                 None
             } else {
-                stmt.limit
-                    .map(|l| l as usize + stmt.offset.map_or(0, |o| o as usize))
+                stmt.limit_literal()
+                    .map(|l| l as usize + stmt.offset_literal().map_or(0, |o| o as usize))
             };
             let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
             partial_sort_tagged(&mut tagged, keep, &descs);
@@ -3941,7 +3941,7 @@ impl Engine {
         if stmt.distinct {
             output_rows = dedup_rows(output_rows);
         }
-        apply_offset_and_limit(&mut output_rows, stmt.offset, stmt.limit);
+        apply_offset_and_limit(&mut output_rows, stmt.offset_literal(), stmt.limit_literal());
 
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
@@ -4076,7 +4076,7 @@ impl Engine {
         if aggregate::uses_aggregate(stmt) {
             let refs: Vec<&Row> = filtered.iter().collect();
             let mut agg = aggregate::run(stmt, &refs, &combined_schema, None)?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset, stmt.limit);
+            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
                 rows: agg.rows,
@@ -4101,8 +4101,8 @@ impl Engine {
             let keep = if stmt.distinct {
                 None
             } else {
-                stmt.limit
-                    .map(|l| l as usize + stmt.offset.map_or(0, |o| o as usize))
+                stmt.limit_literal()
+                    .map(|l| l as usize + stmt.offset_literal().map_or(0, |o| o as usize))
             };
             let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
             partial_sort_tagged(&mut tagged, keep, &descs);
@@ -4111,7 +4111,7 @@ impl Engine {
         if stmt.distinct {
             output_rows = dedup_rows(output_rows);
         }
-        apply_offset_and_limit(&mut output_rows, stmt.offset, stmt.limit);
+        apply_offset_and_limit(&mut output_rows, stmt.offset_literal(), stmt.limit_literal());
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
             .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
@@ -4231,7 +4231,7 @@ fn try_nsw_knn(
     if stmt.distinct {
         return None;
     }
-    let limit = usize::try_from(stmt.limit?).ok()?;
+    let limit = usize::try_from(stmt.limit_literal()?).ok()?;
     if limit == 0 {
         return None;
     }
@@ -4333,7 +4333,7 @@ fn materialise_in_order(
         }
         output_rows.push(Row::new(values));
     }
-    apply_offset_and_limit(&mut output_rows, stmt.offset, stmt.limit);
+    apply_offset_and_limit(&mut output_rows, stmt.offset_literal(), stmt.limit_literal());
     let columns: Vec<ColumnSchema> = projection
         .into_iter()
         .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
@@ -4904,7 +4904,7 @@ impl Engine {
             sort_by_keys(&mut tagged, &descs);
         }
         let mut out_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
-        apply_offset_and_limit(&mut out_rows, stmt.offset, stmt.limit);
+        apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
             .into_iter()
             .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
@@ -6893,7 +6893,58 @@ fn substitute_select(
     for (_, peer) in &mut s.unions {
         substitute_select(peer, params)?;
     }
+    // v7.9.24 — LIMIT $N / OFFSET $N placeholder resolution.
+    // mailrs H2. After this pass each LIMIT/OFFSET that was a
+    // Placeholder is rewritten to Literal so the existing
+    // `LimitExpr::as_literal` path consumes a concrete u32.
+    if let Some(le) = s.limit {
+        s.limit = Some(resolve_limit_placeholder(le, params)?);
+    }
+    if let Some(le) = s.offset {
+        s.offset = Some(resolve_limit_placeholder(le, params)?);
+    }
     Ok(())
+}
+
+fn resolve_limit_placeholder(
+    le: spg_sql::ast::LimitExpr,
+    params: &[Value],
+) -> Result<spg_sql::ast::LimitExpr, EngineError> {
+    use spg_sql::ast::LimitExpr;
+    match le {
+        LimitExpr::Literal(_) => Ok(le),
+        LimitExpr::Placeholder(n) => {
+            let idx = usize::from(n).saturating_sub(1);
+            let v = params.get(idx).ok_or_else(|| {
+                EngineError::Eval(EvalError::PlaceholderOutOfRange {
+                    n,
+                    bound: u16::try_from(params.len()).unwrap_or(u16::MAX),
+                })
+            })?;
+            let int = match v {
+                Value::SmallInt(x) => Some(i64::from(*x)),
+                Value::Int(x) => Some(i64::from(*x)),
+                Value::BigInt(x) => Some(*x),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "LIMIT/OFFSET ${n} bound to non-integer {v:?}"
+                ))
+            })?;
+            if int < 0 {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "LIMIT/OFFSET ${n} bound to negative value {int}"
+                )));
+            }
+            let bounded = u32::try_from(int).map_err(|_| {
+                EngineError::Unsupported(alloc::format!(
+                    "LIMIT/OFFSET ${n} value {int} exceeds u32 range"
+                ))
+            })?;
+            Ok(LimitExpr::Literal(bounded))
+        }
+    }
 }
 
 fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {

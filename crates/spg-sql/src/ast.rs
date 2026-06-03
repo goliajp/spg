@@ -617,10 +617,63 @@ pub struct SelectStatement {
     /// Keys are matched left-to-right: first key decides, ties break
     /// to the second, etc.
     pub order_by: Vec<OrderBy>,
-    pub limit: Option<u32>,
+    /// `LIMIT <n>` — bound on row output. `n` is an integer
+    /// literal **or** (v7.9.24) a placeholder `$N` resolved
+    /// against the prepared-statement Bind values. mailrs
+    /// migration follow-up H2.
+    pub limit: Option<LimitExpr>,
     /// `OFFSET <n>` — drop the first `n` rows after ORDER BY but
     /// before LIMIT (so `LIMIT 10 OFFSET 5` keeps rows 6..=15).
-    pub offset: Option<u32>,
+    pub offset: Option<LimitExpr>,
+}
+
+/// v7.9.24 — LIMIT / OFFSET value. Integer literal at parse
+/// time or a placeholder `$N` resolved during extended-query
+/// Bind. mailrs migration follow-up H2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitExpr {
+    /// `LIMIT 10` — value known at parse time.
+    Literal(u32),
+    /// `LIMIT $N` — the 1-based parameter index, resolved against
+    /// the bind values when the prepared statement executes.
+    Placeholder(u16),
+}
+
+impl fmt::Display for LimitExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Literal(n) => write!(f, "{n}"),
+            Self::Placeholder(n) => write!(f, "${n}"),
+        }
+    }
+}
+
+impl LimitExpr {
+    /// Convenience for the simple-query path where no placeholders
+    /// can possibly exist. Returns the literal value or `None` if
+    /// this is a placeholder (caller must surface as Unsupported).
+    pub fn as_literal(self) -> Option<u32> {
+        match self {
+            Self::Literal(n) => Some(n),
+            Self::Placeholder(_) => None,
+        }
+    }
+}
+
+/// v7.9.24 — extract LIMIT / OFFSET as a `u32` literal. After
+/// the engine's `substitute_placeholders` pass these are
+/// always Literal; in the simple-query path a Placeholder
+/// shape returns None (executor surfaces as
+/// "LIMIT/OFFSET ${n} requires prepared-statement binding").
+impl SelectStatement {
+    #[must_use]
+    pub fn limit_literal(&self) -> Option<u32> {
+        self.limit.and_then(LimitExpr::as_literal)
+    }
+    #[must_use]
+    pub fn offset_literal(&self) -> Option<u32> {
+        self.offset.and_then(LimitExpr::as_literal)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
