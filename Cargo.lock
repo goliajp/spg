@@ -1206,6 +1206,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spg-embedded"
+version = "1.0.0"
+dependencies = [
+ "spg-engine",
+ "spg-storage",
+]
+
+[[package]]
 name = "spg-engine"
 version = "1.0.0"
 dependencies = [
