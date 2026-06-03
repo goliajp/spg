@@ -22,5 +22,12 @@ spg-crypto  = { path = "../spg-crypto" }
 # vice versa) even with cold-tier state.
 spg-manifest = { path = "../spg-manifest" }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name    = "embedded"
+harness = false
+
 [lints]
 workspace = true
