@@ -576,6 +576,55 @@ pub struct Engine {
     audit_verifier: Option<AuditVerifier>,
 }
 
+/// v6.5.4 — synthesise a `CREATE TABLE` statement from catalog
+/// state. Round-trips through `Engine::execute` to recreate the
+/// same schema (sans data + indexes — indexes are emitted as a
+/// separate `CREATE INDEX` chain in `spg_database_ddl`).
+fn render_create_table(name: &str, columns: &[ColumnSchema]) -> String {
+    let mut out = alloc::format!("CREATE TABLE {name} (");
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&col.name);
+        out.push(' ');
+        out.push_str(&render_data_type(col.ty));
+        if !col.nullable {
+            out.push_str(" NOT NULL");
+        }
+        if col.auto_increment {
+            out.push_str(" AUTO_INCREMENT");
+        }
+    }
+    out.push(')');
+    out
+}
+
+fn render_data_type(ty: DataType) -> String {
+    match ty {
+        DataType::SmallInt => "SMALLINT".into(),
+        DataType::Int => "INT".into(),
+        DataType::BigInt => "BIGINT".into(),
+        DataType::Float => "FLOAT".into(),
+        DataType::Text => "TEXT".into(),
+        DataType::Varchar(n) => alloc::format!("VARCHAR({n})"),
+        DataType::Char(n) => alloc::format!("CHAR({n})"),
+        DataType::Bool => "BOOL".into(),
+        DataType::Vector { dim, encoding } => match encoding {
+            spg_storage::VecEncoding::F32 => alloc::format!("VECTOR({dim})"),
+            spg_storage::VecEncoding::Sq8 => alloc::format!("VECTOR({dim}) USING SQ8"),
+            spg_storage::VecEncoding::F16 => alloc::format!("VECTOR({dim}) USING HALF"),
+        },
+        DataType::Numeric { precision, scale } => {
+            alloc::format!("NUMERIC({precision},{scale})")
+        }
+        DataType::Date => "DATE".into(),
+        DataType::Timestamp => "TIMESTAMP".into(),
+        DataType::Interval => "INTERVAL".into(),
+        DataType::Json => "JSON".into(),
+    }
+}
+
 /// v6.5.2 — one row of `spg_stat_activity`. Engine-public so
 /// spg-server can construct rows without re-exporting internal
 /// dispatch types.
@@ -1485,6 +1534,82 @@ impl Engine {
             })
             .collect();
         QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.4 — materialise `spg_table_ddl` rows. One row per user
+    /// table with `(table_name, ddl)`. Reconstructed from catalog
+    /// state on demand.
+    fn exec_spg_table_ddl(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("table_name", DataType::Text, false),
+            ColumnSchema::new("ddl", DataType::Text, false),
+        ];
+        let rows: Vec<Row> = self
+            .catalog
+            .table_names()
+            .into_iter()
+            .filter(|n| !is_internal_table_name(n))
+            .filter_map(|name| {
+                let table = self.catalog.get(&name)?;
+                let ddl = render_create_table(&name, &table.schema().columns);
+                Some(Row::new(alloc::vec![
+                    Value::Text(name),
+                    Value::Text(ddl),
+                ]))
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.4 — materialise `spg_role_ddl` rows. One row per user
+    /// with `(role_name, ddl)`. Password is redacted (matches the
+    /// `Statement::CreateUser` Display which prints `'<redacted>'`).
+    fn exec_spg_role_ddl(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("role_name", DataType::Text, false),
+            ColumnSchema::new("ddl", DataType::Text, false),
+        ];
+        let rows: Vec<Row> = self
+            .users
+            .iter()
+            .map(|(name, rec)| {
+                let ddl = alloc::format!(
+                    "CREATE USER {name} WITH PASSWORD '<redacted>' ROLE '{}'",
+                    rec.role.as_str(),
+                );
+                Row::new(alloc::vec![Value::Text(String::from(name)), Value::Text(ddl)])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.4 — materialise `spg_database_ddl`: single row whose
+    /// `ddl` column concatenates every user table's CREATE +
+    /// every role's CREATE in deterministic catalog order. Suitable
+    /// for piping back through `Engine::execute` to recreate a
+    /// schema-equivalent database.
+    fn exec_spg_database_ddl(&self) -> QueryResult {
+        let columns = alloc::vec![ColumnSchema::new("ddl", DataType::Text, false)];
+        let mut out = String::new();
+        for (name, rec) in self.users.iter() {
+            out.push_str(&alloc::format!(
+                "CREATE USER {name} WITH PASSWORD '<redacted>' ROLE '{}';\n",
+                rec.role.as_str(),
+            ));
+        }
+        for name in self.catalog.table_names() {
+            if is_internal_table_name(&name) {
+                continue;
+            }
+            if let Some(table) = self.catalog.get(&name) {
+                out.push_str(&render_create_table(&name, &table.schema().columns));
+                out.push_str(";\n");
+            }
+        }
+        QueryResult::Rows {
+            columns,
+            rows: alloc::vec![Row::new(alloc::vec![Value::Text(out)])],
+        }
     }
 
     /// v6.5.3 — materialise `spg_audit_chain` rows. Pulls a fresh
@@ -2491,6 +2616,9 @@ impl Engine {
                 "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
                 "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
                 "spg_audit_verify" => return Ok(self.exec_spg_audit_verify()),
+                "spg_table_ddl" => return Ok(self.exec_spg_table_ddl()),
+                "spg_role_ddl" => return Ok(self.exec_spg_role_ddl()),
+                "spg_database_ddl" => return Ok(self.exec_spg_database_ddl()),
                 _ => {}
             }
         }
