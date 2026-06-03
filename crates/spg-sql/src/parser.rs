@@ -26,6 +26,26 @@ use crate::ast::{
 };
 use crate::lexer::{self, LexError, Token};
 
+/// v7.9.22 — recognise pgvector / SPG vector-index opclass names
+/// in CREATE INDEX. SPG's HNSW already routes by query operator;
+/// the opclass is accepted for `pg_dump` compatibility (mailrs
+/// migration follow-up G5).
+fn is_vector_opclass_name(name: &str) -> bool {
+    let lc = name.to_ascii_lowercase();
+    matches!(
+        lc.as_str(),
+        "vector_cosine_ops"
+            | "vector_l2_ops"
+            | "vector_ip_ops"
+            | "halfvec_cosine_ops"
+            | "halfvec_l2_ops"
+            | "halfvec_ip_ops"
+            | "sq8_cosine_ops"
+            | "sq8_l2_ops"
+            | "sq8_ip_ops"
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub message: String,
@@ -1495,10 +1515,29 @@ impl Parser {
         // slot, so we can't save+rewind cleanly — peek-ahead via
         // direct index avoids the mutation.)
         let (column, expression): (String, Option<Expr>) = match self.peek().clone() {
+            // Single column with `)` immediately after — fast path.
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(self.tokens.get(self.pos + 1), Some(Token::RParen)) =>
             {
                 self.advance();
+                (s, None)
+            }
+            // v7.9.22 — single column followed by a pgvector
+            // opclass ident: `(col vector_cosine_ops)`. mailrs G5.
+            // SPG's HNSW currently picks its distance metric from
+            // the query's operator (`<->` / `<#>` / `<=>`), so the
+            // opclass is informational — accepted and discarded.
+            // Recognised opclasses: vector_cosine_ops, vector_l2_ops,
+            // vector_ip_ops, halfvec_*_ops, sq8_*_ops.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(op) | Token::QuotedIdent(op))
+                        if is_vector_opclass_name(op)
+                ) =>
+            {
+                self.advance(); // column name
+                self.advance(); // opclass ident — drop
                 (s, None)
             }
             Token::Ident(_) | Token::QuotedIdent(_) => {
