@@ -705,25 +705,61 @@ impl Parser {
     /// more SET subjects without changing the dispatch shape.
     fn parse_alter_table_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let table_name = self.expect_ident_like()?;
-        self.expect_keyword_ident("set")?;
-        let setting = self.expect_ident_like()?;
-        if !setting.eq_ignore_ascii_case("hot_tier_bytes") {
-            return Err(self.err(alloc::format!(
-                "ALTER TABLE SET: unknown setting {setting:?}; supported: hot_tier_bytes"
-            )));
+        // v7.6.8 — dispatch on the next keyword: SET / ADD / DROP.
+        // SET kept identical to v6.7.x. ADD / DROP CONSTRAINT routes
+        // to FK installation / removal.
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
+                self.advance();
+                let setting = self.expect_ident_like()?;
+                if !setting.eq_ignore_ascii_case("hot_tier_bytes") {
+                    return Err(self.err(alloc::format!(
+                        "ALTER TABLE SET: unknown setting {setting:?}; supported: hot_tier_bytes"
+                    )));
+                }
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(self.err(alloc::format!(
+                        "expected '=' after hot_tier_bytes, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let n = self.expect_u64_literal()?;
+                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
+                    name: table_name,
+                    target: crate::ast::AlterTableTarget::SetHotTierBytes(n),
+                }))
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
+                self.advance();
+                // Optional `CONSTRAINT <name>` prefix, then the same
+                // FK clause shape as table-level CREATE TABLE FK.
+                let fk = self.parse_table_level_fk()?;
+                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
+                    name: table_name,
+                    target: crate::ast::AlterTableTarget::AddForeignKey(fk),
+                }))
+            }
+            Token::Drop => {
+                self.advance();
+                match self.advance() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("constraint") => {}
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected CONSTRAINT after DROP in ALTER TABLE, got {other:?}"
+                        )));
+                    }
+                }
+                let cname = self.expect_ident_like()?;
+                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
+                    name: table_name,
+                    target: crate::ast::AlterTableTarget::DropForeignKey(cname),
+                }))
+            }
+            other => Err(self.err(alloc::format!(
+                "expected SET / ADD / DROP in ALTER TABLE, got {other:?}"
+            ))),
         }
-        if !matches!(self.peek(), Token::Eq) {
-            return Err(self.err(alloc::format!(
-                "expected '=' after hot_tier_bytes, got {:?}",
-                self.peek()
-            )));
-        }
-        self.advance();
-        let n = self.expect_u64_literal()?;
-        Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
-            name: table_name,
-            target: crate::ast::AlterTableTarget::SetHotTierBytes(n),
-        }))
     }
 
     /// Consume a bare ident if its lowercase matches `kw`, else err.
