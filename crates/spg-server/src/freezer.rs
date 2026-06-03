@@ -33,7 +33,7 @@ use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use spg_storage::{Catalog, DataType, FreezeReport, IndexKind};
+use spg_storage::{Catalog, DataType, FreezeReport, FreezeSlice, IndexKind};
 
 use crate::{SHUTDOWN_FLAG, ServerState};
 
@@ -51,6 +51,12 @@ pub(crate) struct FreezerConfig {
     pub(crate) tick: Duration,
     pub(crate) batch_rows: usize,
     pub(crate) disabled: bool,
+    /// v6.7.4 — number of worker threads that run
+    /// `Catalog::prepare_freeze_slice` in parallel before the
+    /// coordinator's single-segment commit. `1` keeps the legacy
+    /// single-threaded path. Defaults to `max(1, num_cpus() - 2)`
+    /// reserving 2 cores for the I/O / dispatch threads.
+    pub(crate) workers: usize,
 }
 
 impl FreezerConfig {
@@ -70,12 +76,31 @@ impl FreezerConfig {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_BATCH_ROWS);
+        let workers = env::var("SPG_FREEZER_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(default_worker_count);
         Self {
             tick: Duration::from_millis(tick_ms),
             batch_rows,
             disabled,
+            workers,
         }
     }
+}
+
+/// v6.7.4 — default worker pool size: `max(1, num_cpus() - 2)`.
+/// Reserves 2 cores for the request dispatch / WAL / replication
+/// threads so a freeze tick doesn't starve foreground load. Caps
+/// at 16 because beyond that the coordinator's k-way merge starts
+/// dominating wall-time and the worker spawn overhead eats the
+/// per-slice parallelism gain.
+fn default_worker_count() -> usize {
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    cores.saturating_sub(2).max(1).min(16)
 }
 
 /// Spawn the background freezer. Returns `None` when the freezer is
@@ -102,7 +127,7 @@ fn run(state: &ServerState, config: FreezerConfig) {
         if SHUTDOWN_FLAG.load(Ordering::Acquire) {
             break;
         }
-        if let Err(e) = tick(state, config.batch_rows) {
+        if let Err(e) = tick(state, config.batch_rows, config.workers) {
             eprintln!("spg-freezer: tick error: {e}");
         }
     }
@@ -151,7 +176,7 @@ fn pick_target(cat: &Catalog) -> Option<FreezeTarget> {
     best.map(|(t, _)| t)
 }
 
-fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
+fn tick(state: &ServerState, batch_rows: usize, workers: usize) -> std::io::Result<()> {
     let mut engine = state
         .engine
         .write()
@@ -206,9 +231,14 @@ fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
     // a TX slot. `Catalog::clone` is O(N segments) Arc bumps + O(1)
     // PV/PB structural-sharing bumps thanks to v4.39 / v4.40 / v5.1.
     let mut new_cat = engine.catalog().clone();
-    let report = new_cat
-        .freeze_oldest_to_cold(&target.table, &target.index, to_freeze)
-        .map_err(|e| std::io::Error::other(format!("freeze: {e}")))?;
+    let report = freeze_with_workers(
+        &mut new_cat,
+        &target.table,
+        &target.index,
+        to_freeze,
+        workers,
+    )
+    .map_err(|e| std::io::Error::other(format!("freeze: {e}")))?;
     engine.replace_catalog(new_cat);
     // Reflect the new segment count on the /metrics surface
     // (`spg_cold_segments_total`) via the Metrics gauge.
@@ -254,6 +284,62 @@ fn tick(state: &ServerState, batch_rows: usize) -> std::io::Result<()> {
         engine.catalog().hot_tier_bytes(),
     );
     Ok(())
+}
+
+/// v6.7.4 — driver around the parallel-freezer storage API. Slices
+/// the `[0, to_freeze)` row range into `workers` near-equal
+/// partitions, calls `Catalog::prepare_freeze_slice` on each one
+/// in a `std::thread::scope` worker, then commits the slices via
+/// `Catalog::commit_freeze_slices`. `workers == 1` skips the
+/// scope and runs the single-slice path inline, so the legacy
+/// single-threaded freeze stays a zero-thread-spawn path.
+fn freeze_with_workers(
+    cat: &mut Catalog,
+    table: &str,
+    index: &str,
+    to_freeze: usize,
+    workers: usize,
+) -> Result<FreezeReport, spg_storage::StorageError> {
+    let workers = workers.max(1).min(to_freeze.max(1));
+    let ranges = partition_range(to_freeze, workers);
+    let slices: Vec<FreezeSlice> = if workers == 1 {
+        ranges
+            .into_iter()
+            .map(|r| cat.prepare_freeze_slice(table, index, r))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        // Borrow `cat` immutably across the worker scope. Workers
+        // never mutate; the commit step does, after the scope ends.
+        let cat_ref: &Catalog = cat;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = ranges
+                .into_iter()
+                .map(|r| s.spawn(move || cat_ref.prepare_freeze_slice(table, index, r)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("prepare_freeze_slice worker panicked"))
+                .collect::<Result<Vec<_>, _>>()
+        })?
+    };
+    cat.commit_freeze_slices(table, index, slices)
+}
+
+/// Split `n` items into `parts` contiguous half-open ranges. Earlier
+/// ranges get the extra items if `n % parts != 0`. `parts == 1`
+/// always returns `[0..n]`. `parts == 0` is impossible here —
+/// `freeze_with_workers` clamps.
+fn partition_range(n: usize, parts: usize) -> Vec<core::ops::Range<usize>> {
+    let mut out = Vec::with_capacity(parts);
+    let base = n / parts;
+    let extra = n % parts;
+    let mut start = 0;
+    for i in 0..parts {
+        let len = base + usize::from(i < extra);
+        out.push(start..start + len);
+        start += len;
+    }
+    out
 }
 
 /// Write a segment to `<parent>/<db_stem>.spg/segments/seg_<id>.spg`
