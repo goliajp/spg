@@ -118,6 +118,197 @@ fn write_json(v: &JsonValue, out: &mut String) {
     }
 }
 
+/// v6.4.5 — PG `json #> path_text` / `json #>> path_text`. The
+/// right-hand side is a PG text-array literal `'{a,0,b}'` whose
+/// elements are walked left-to-right; each element is either an
+/// object key or (when it parses as a non-negative integer) an
+/// array index. Missing or non-existent steps return `Value::Null`.
+pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value, EvalError> {
+    let src = match lhs {
+        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON path walk: left side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let path_text = match rhs {
+        Value::Text(s) | Value::Json(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON path walk: right side must be TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let path = parse_text_array(path_text)?;
+    let mut cur = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON for path walk: {e}"),
+    })?;
+    for step in &path {
+        let next = match (&cur, step.as_str()) {
+            (JsonValue::Object(entries), key) => entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone()),
+            (JsonValue::Array(items), key) => {
+                let Ok(idx) = key.parse::<i64>() else {
+                    return Ok(Value::Null);
+                };
+                if idx >= 0 {
+                    items.get(idx as usize).cloned()
+                } else {
+                    let from_end = items.len() as i64 + idx;
+                    if from_end >= 0 {
+                        items.get(from_end as usize).cloned()
+                    } else {
+                        None
+                    }
+                }
+            }
+            _ => return Ok(Value::Null),
+        };
+        cur = match next {
+            None => return Ok(Value::Null),
+            Some(v) => v,
+        };
+    }
+    if matches!(cur, JsonValue::Null) {
+        return Ok(Value::Null);
+    }
+    if as_text {
+        Ok(Value::Text(cur.as_text()))
+    } else {
+        Ok(Value::Json(cur.to_json_text()))
+    }
+}
+
+/// v6.4.5 — PG `json @> sub_json` containment. Returns BOOL.
+/// `lhs @> rhs` is true when every member of `rhs` is structurally
+/// contained in `lhs`:
+///   - Scalars: equal
+///   - Objects: every (key, value) in rhs exists in lhs with a
+///     containing value
+///   - Arrays: every element in rhs has a containing element in lhs
+pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
+    let lhs_text = match lhs {
+        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON @>: left side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let rhs_text = match rhs {
+        Value::Json(s) | Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON @>: right side must be JSON or TEXT, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let lhs_doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on left of @>: {e}"),
+    })?;
+    let rhs_doc = parse(rhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on right of @>: {e}"),
+    })?;
+    Ok(Value::Bool(json_contains(&lhs_doc, &rhs_doc)))
+}
+
+fn json_contains(lhs: &JsonValue, rhs: &JsonValue) -> bool {
+    match (lhs, rhs) {
+        (JsonValue::Object(l), JsonValue::Object(r)) => r.iter().all(|(rk, rv)| {
+            l.iter()
+                .any(|(lk, lv)| lk == rk && json_contains(lv, rv))
+        }),
+        (JsonValue::Array(l), JsonValue::Array(r)) => r
+            .iter()
+            .all(|rv| l.iter().any(|lv| json_contains(lv, rv))),
+        _ => json_eq(lhs, rhs),
+    }
+}
+
+fn json_eq(a: &JsonValue, b: &JsonValue) -> bool {
+    match (a, b) {
+        (JsonValue::Null, JsonValue::Null) => true,
+        (JsonValue::Bool(x), JsonValue::Bool(y)) => x == y,
+        (JsonValue::String(x), JsonValue::String(y)) => x == y,
+        (JsonValue::Number(x), JsonValue::Number(y)) => (x - y).abs() < 1e-12,
+        (JsonValue::NumberText(x), JsonValue::NumberText(y)) => x == y,
+        (JsonValue::NumberText(x), JsonValue::Number(y))
+        | (JsonValue::Number(y), JsonValue::NumberText(x)) => {
+            x.parse::<f64>().is_ok_and(|xn| (xn - y).abs() < 1e-12)
+        }
+        (JsonValue::Array(x), JsonValue::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_eq(a, b))
+        }
+        (JsonValue::Object(x), JsonValue::Object(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| {
+                    y.iter().any(|(k2, v2)| k == k2 && json_eq(v, v2))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Parse PG's text-array literal `'{a,b,c}'` into a Vec<String>.
+/// Whitespace around elements is trimmed; quoted elements (`"x,y"`)
+/// preserve embedded commas (minimal support — full PG array
+/// escaping is OOS).
+fn parse_text_array(s: &str) -> Result<Vec<String>, EvalError> {
+    let trimmed = s.trim();
+    let inner = if let Some(stripped) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+    {
+        stripped
+    } else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("path walk: expected PG array literal `{{…}}`, got {s:?}"),
+        });
+    };
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                out.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    cur.push(next);
+                    chars.next();
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur.trim().to_string());
+    Ok(out)
+}
+
 /// PG `json -> key` / `json ->> key`. `lhs` must be JSON or TEXT
 /// containing JSON. `rhs` is either a TEXT key (object access) or
 /// an INT index (array access). `as_text=true` for `->>` (returns

@@ -2253,6 +2253,9 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // Same rung as the multiplicative ops.
         Token::JsonGet => (BinOp::JsonGet, 7),
         Token::JsonGetText => (BinOp::JsonGetText, 7),
+        Token::JsonGetPath => (BinOp::JsonGetPath, 7),
+        Token::JsonGetPathText => (BinOp::JsonGetPathText, 7),
+        Token::JsonContains => (BinOp::JsonContains, 7),
         _ => return None,
     };
     Some(pair)
