@@ -3162,26 +3162,21 @@ impl Engine {
         if !fks.is_empty() {
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
         }
-        // v7.9.8 — ON CONFLICT DO NOTHING: split `all_values` into
-        // {inserts, skipped}. The conflict target column position
-        // is resolved against the table's BTree indices; a row whose
-        // value already lives in that index goes to `skipped`.
-        // Self-batch deduplication (two rows in the same VALUES that
-        // would collide with each other) follows the same rule:
-        // first wins, rest skip.
+        // v7.9.8 / v7.9.9 — ON CONFLICT handling.
+        //   - `DO NOTHING` filters `all_values` to non-conflicting
+        //     rows + drops within-batch duplicates.
+        //   - `DO UPDATE SET …` ALSO filters, but for each
+        //     conflicting row it queues an UPDATE on the existing
+        //     row using the incoming row's values as `EXCLUDED.*`.
+        let mut pending_updates: Vec<(usize, Vec<Value>)> = Vec::new();
         let mut skipped_count = 0usize;
-        if matches!(
-            stmt.on_conflict.as_ref().map(|c| &c.action),
-            Some(spg_sql::ast::OnConflictAction::Nothing)
-        ) {
+        if let Some(clause) = &stmt.on_conflict {
             let conflict_col = resolve_on_conflict_column(
                 self.active_catalog(),
                 &stmt.table,
-                stmt.on_conflict.as_ref().expect("checked").target_columns.as_slice(),
+                clause.target_columns.as_slice(),
             )?;
             let mut kept: Vec<Vec<Value>> = Vec::with_capacity(all_values.len());
-            // Value isn't Ord; use Vec + linear contains. Batches
-            // are typically ≤ 100 rows so this is fine.
             let mut seen_keys: Vec<Value> = Vec::new();
             for values in all_values {
                 let key = &values[conflict_col];
@@ -3194,12 +3189,64 @@ impl Engine {
                     );
                 let collides_with_batch =
                     !matches!(key, Value::Null) && seen_keys.iter().any(|k| k == key);
-                if collides_with_table || collides_with_batch {
-                    skipped_count += 1;
-                    continue;
+                let collides = collides_with_table || collides_with_batch;
+                match (&clause.action, collides) {
+                    (_, false) => {
+                        seen_keys.push(key.clone());
+                        kept.push(values);
+                    }
+                    (spg_sql::ast::OnConflictAction::Nothing, true) => {
+                        skipped_count += 1;
+                    }
+                    (
+                        spg_sql::ast::OnConflictAction::Update {
+                            assignments,
+                            where_,
+                        },
+                        true,
+                    ) => {
+                        // Only the table-side collision triggers an
+                        // UPDATE; batch-internal collisions still skip
+                        // (PG: the second incoming row goes into the
+                        // UPDATE's incoming-row pool, not into the
+                        // first row's update).
+                        if !collides_with_table {
+                            skipped_count += 1;
+                            continue;
+                        }
+                        // Find the existing row position. With a
+                        // BTree index on `conflict_col`, lookup_eq
+                        // hands back the row locator.
+                        let target_pos = lookup_row_position_by_pk(
+                            self.active_catalog(),
+                            &stmt.table,
+                            conflict_col,
+                            key,
+                        )
+                        .ok_or_else(|| {
+                            EngineError::Unsupported(
+                                "ON CONFLICT DO UPDATE: conflict detected but row \
+                                 position could not be resolved (cold-tier row?)"
+                                    .into(),
+                            )
+                        })?;
+                        // Build the post-update row by starting from
+                        // the existing row and applying each assignment.
+                        let updated = apply_on_conflict_assignments(
+                            self.active_catalog(),
+                            &stmt.table,
+                            target_pos,
+                            &values,
+                            assignments,
+                            where_.as_ref(),
+                        )?;
+                        if let Some(new_row) = updated {
+                            pending_updates.push((target_pos, new_row));
+                        } else {
+                            skipped_count += 1;
+                        }
+                    }
                 }
-                seen_keys.push(key.clone());
-                kept.push(values);
             }
             all_values = kept;
         }
@@ -3212,23 +3259,37 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
-        // v7.9.4 — keep a snapshot of inserted rows for RETURNING.
-        let inserted_for_returning: Vec<Vec<Value>> =
-            if stmt.returning.is_some() { all_values.clone() } else { Vec::new() };
+        // v7.9.4 — keep RETURNING projection rows separate per
+        // INSERT and per UPDATE branch so DO UPDATE pushes the new
+        // post-update state, not the incoming-only values.
+        let mut returning_rows: Vec<Vec<Value>> = Vec::new();
         for values in all_values {
+            if stmt.returning.is_some() {
+                returning_rows.push(values.clone());
+            }
             table.insert(Row::new(values))?;
             affected += 1;
         }
-        let _ = skipped_count; // available if we need to surface it later
-        // v7.9.4 — if RETURNING was specified, project each
-        // inserted row and stream as Rows result instead of
-        // CommandOk.
+        // v7.9.9 — apply ON CONFLICT DO UPDATE rewrites collected
+        // in the conflict-resolution pass. update_row handles
+        // index maintenance + body re-encoding.
+        for (pos, new_row) in pending_updates {
+            if stmt.returning.is_some() {
+                returning_rows.push(new_row.clone());
+            }
+            table.update_row(pos, new_row)?;
+            affected += 1;
+        }
+        let _ = skipped_count;
+        // v7.9.4/v7.9.9 — RETURNING streams the rows that ended
+        // up in the table after this statement (insert or
+        // post-update on conflict).
         if let Some(items) = &stmt.returning {
             let _ = table;
             return self.build_returning_rows(
                 &stmt.table,
                 items,
-                inserted_for_returning,
+                returning_rows,
             );
         }
         // v6.2.1 — auto-analyze: track per-table modified-row
@@ -7485,6 +7546,134 @@ fn on_conflict_key_exists(
             && idx.partial_predicate.is_none()
             && !idx.lookup_eq(&idx_key).is_empty()
     })
+}
+
+/// v7.9.9 — look up an existing row's `Table::rows()` position by
+/// scanning the table for the row whose `column_pos` cell equals
+/// `key`. Returns the first match; on a UNIQUE BTree the first
+/// match is the only match. Cold-tier rows surface as None (the
+/// caller treats that as "can't ON CONFLICT this row").
+fn lookup_row_position_by_pk(
+    catalog: &Catalog,
+    table_name: &str,
+    column_pos: usize,
+    key: &Value,
+) -> Option<usize> {
+    let table = catalog.get(table_name)?;
+    table
+        .rows()
+        .iter()
+        .position(|r| r.values.get(column_pos) == Some(key))
+}
+
+/// v7.9.9 — apply ON CONFLICT DO UPDATE SET assignments to an
+/// existing row.
+///
+/// `incoming` is the rejected INSERT row (used to resolve
+/// `EXCLUDED.col` references in the assignment exprs);
+/// `target_pos` is the position of the existing row in the table.
+/// Each assignment substitutes `EXCLUDED.col` with the matching
+/// incoming value, evaluates the resulting expression against
+/// the existing row, and writes the new value into the
+/// corresponding column of the returned `Vec<Value>`. If
+/// `where_` evaluates falsy, returns Ok(None) — PG behaviour:
+/// the conflicting row is silently kept unchanged.
+fn apply_on_conflict_assignments(
+    catalog: &Catalog,
+    table_name: &str,
+    target_pos: usize,
+    incoming: &[Value],
+    assignments: &[(String, Expr)],
+    where_: Option<&Expr>,
+) -> Result<Option<Vec<Value>>, EngineError> {
+    let table = catalog.get(table_name).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: table_name.into(),
+        })
+    })?;
+    let schema_cols = table.schema().columns.clone();
+    let existing = table
+        .rows()
+        .get(target_pos)
+        .ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!(
+                "ON CONFLICT DO UPDATE: row position {target_pos} out of bounds on {table_name:?}"
+            ))
+        })?
+        .clone();
+    let ctx = eval::EvalContext::new(&schema_cols, Some(table_name));
+    // Optional WHERE filter on the conflict row.
+    if let Some(w) = where_ {
+        let pred = w.clone();
+        let pred = substitute_excluded_refs(pred, &schema_cols, incoming);
+        let v = eval::eval_expr(&pred, &existing, &ctx)?;
+        if !matches!(v, Value::Bool(true)) {
+            return Ok(None);
+        }
+    }
+    let mut new_values = existing.values.clone();
+    for (col_name, expr) in assignments {
+        let target_idx = schema_cols
+            .iter()
+            .position(|c| c.name == *col_name)
+            .ok_or_else(|| {
+                EngineError::Eval(EvalError::ColumnNotFound {
+                    name: col_name.clone(),
+                })
+            })?;
+        let sub = substitute_excluded_refs(expr.clone(), &schema_cols, incoming);
+        let v = eval::eval_expr(&sub, &existing, &ctx)?;
+        new_values[target_idx] =
+            coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
+    }
+    Ok(Some(new_values))
+}
+
+/// v7.9.9 — walk an `Expr` tree replacing any `Column { qualifier:
+/// "EXCLUDED", name }` reference with a `Literal` of the matching
+/// value from the incoming-row vec. Resolution against the
+/// child-table column list (by name).
+fn substitute_excluded_refs(
+    expr: Expr,
+    schema_cols: &[ColumnSchema],
+    incoming: &[Value],
+) -> Expr {
+    use spg_sql::ast::ColumnName;
+    match expr {
+        Expr::Column(ColumnName { qualifier, name })
+            if qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case("excluded")) =>
+        {
+            let pos = schema_cols.iter().position(|c| c.name == name);
+            match pos {
+                Some(p) => {
+                    let v = incoming.get(p).cloned().unwrap_or(Value::Null);
+                    value_to_literal_expr(v).unwrap_or_else(|_| {
+                        Expr::Literal(spg_sql::ast::Literal::Null)
+                    })
+                }
+                None => Expr::Column(ColumnName { qualifier, name }),
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op,
+            lhs: Box::new(substitute_excluded_refs(*lhs, schema_cols, incoming)),
+            rhs: Box::new(substitute_excluded_refs(*rhs, schema_cols, incoming)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op,
+            expr: Box::new(substitute_excluded_refs(*expr, schema_cols, incoming)),
+        },
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| substitute_excluded_refs(a, schema_cols, incoming))
+                .collect(),
+        },
+        other => other,
+    }
 }
 
 /// v7.6.2 / v7.6.7 — INSERT-side FK enforcement. For every row
