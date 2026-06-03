@@ -3020,17 +3020,33 @@ impl Engine {
         // v7.9.13 — pluck the names of any columns marked
         // `PRIMARY KEY` inline so the post-create-table pass can
         // build an implicit BTree index. mailrs F1.
-        let pk_columns: Vec<String> = stmt
+        let inline_pk_columns: Vec<String> = stmt
             .columns
             .iter()
             .filter(|c| c.is_primary_key)
             .map(|c| c.name.clone())
             .collect();
+        // v7.9.19 — table-level constraints: PRIMARY KEY (a, b, ...)
+        // and UNIQUE (a, b, ...). Each builds a BTree index on the
+        // leading column (the existing single-column storage tier)
+        // and registers a UniquenessConstraint on the schema for
+        // INSERT-time enforcement of the full tuple. mailrs G1/G6.
         let cols = stmt
             .columns
             .into_iter()
             .map(column_def_to_schema)
             .collect::<Result<Vec<_>, _>>()?;
+        // Composite NOT-NULL implication for PRIMARY KEY columns.
+        let mut cols = cols;
+        for tc in &stmt.table_constraints {
+            if let spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } = tc {
+                for col_name in columns {
+                    if let Some(col) = cols.iter_mut().find(|c| c.name == *col_name) {
+                        col.nullable = false;
+                    }
+                }
+            }
+        }
         // v7.6.1 — resolve every FK in the statement against the
         // already-known catalog. Validates: parent table exists,
         // parent column names exist, arity matches, parent columns
@@ -3049,25 +3065,86 @@ impl Engine {
         }
         let mut schema = TableSchema::new(table_name.clone(), cols);
         schema.foreign_keys = fks;
-        self.active_catalog_mut().create_table(schema)?;
-        // v7.9.13 — implicit BTree index per inline PRIMARY KEY
-        // column. Index name is `<table>_pkey` (matches PG's
-        // convention); duplicate names silently no-op via the
-        // `add_index` IF NOT EXISTS path.
-        if !pk_columns.is_empty() {
-            let table = self
-                .active_catalog_mut()
-                .get_mut(&table_name)
-                .expect("just created");
-            for (i, col_name) in pk_columns.iter().enumerate() {
-                let idx_name = if pk_columns.len() == 1 {
-                    alloc::format!("{table_name}_pkey")
-                } else {
-                    alloc::format!("{table_name}_pkey_{i}")
-                };
-                if let Err(e) = table.add_index(idx_name, col_name) {
-                    return Err(EngineError::Storage(e));
+        // v7.9.19 — translate AST table_constraints to storage
+        // UniquenessConstraints (column name → position) so the
+        // INSERT enforcement helper sees positions directly.
+        let mut uc_storage: Vec<spg_storage::UniquenessConstraint> = Vec::new();
+        for tc in &stmt.table_constraints {
+            let (is_pk, names) = match tc {
+                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
+                    (true, columns.clone())
                 }
+                spg_sql::ast::TableConstraint::Unique { columns, .. } => {
+                    (false, columns.clone())
+                }
+            };
+            let mut positions = Vec::with_capacity(names.len());
+            for n in &names {
+                let pos = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *n)
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "table constraint references unknown column {n:?}"
+                        ))
+                    })?;
+                positions.push(pos);
+            }
+            uc_storage.push(spg_storage::UniquenessConstraint {
+                is_primary_key: is_pk,
+                columns: positions,
+            });
+        }
+        schema.uniqueness_constraints = uc_storage.clone();
+        self.active_catalog_mut().create_table(schema)?;
+        // v7.9.13 — implicit BTree per inline PK column +
+        // v7.9.19 — implicit BTree on the leading column of every
+        // table-level PRIMARY KEY / UNIQUE constraint.
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&table_name)
+            .expect("just created");
+        for (i, col_name) in inline_pk_columns.iter().enumerate() {
+            let idx_name = if inline_pk_columns.len() == 1 {
+                alloc::format!("{table_name}_pkey")
+            } else {
+                alloc::format!("{table_name}_pkey_{i}")
+            };
+            if let Err(e) = table.add_index(idx_name, col_name) {
+                return Err(EngineError::Storage(e));
+            }
+        }
+        for (i, tc) in stmt.table_constraints.iter().enumerate() {
+            let (is_pk, names) = match tc {
+                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
+                    (true, columns)
+                }
+                spg_sql::ast::TableConstraint::Unique { columns, .. } => {
+                    (false, columns)
+                }
+            };
+            let leading = &names[0];
+            // Skip if a same-column BTree already exists (e.g.
+            // inline PK on the leading column).
+            let already = table
+                .indices()
+                .iter()
+                .any(|idx| {
+                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                        && table.schema().columns[idx.column_position].name == *leading
+                });
+            if already {
+                continue;
+            }
+            let suffix = if is_pk { "pkey" } else { "key" };
+            let idx_name = if names.len() == 1 {
+                alloc::format!("{table_name}_{leading}_{suffix}")
+            } else {
+                alloc::format!("{table_name}_{leading}_{suffix}_{i}")
+            };
+            if let Err(e) = table.add_index(idx_name, leading) {
+                return Err(EngineError::Storage(e));
             }
         }
         Ok(QueryResult::CommandOk {
@@ -3200,10 +3277,18 @@ impl Engine {
         // Non-lexical lifetimes release the mutable borrow on
         // `table` here since stage 1 was the last use. The
         // parent-table lookup runs before any row is committed.
+        let uniqueness = table.schema().uniqueness_constraints.clone();
         let _ = table;
         if !fks.is_empty() {
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
         }
+        // v7.9.19 — composite UNIQUE / PRIMARY KEY enforcement.
+        enforce_uniqueness_inserts(
+            self.active_catalog(),
+            &stmt.table,
+            &uniqueness,
+            &all_values,
+        )?;
         // v7.9.8 / v7.9.9 — ON CONFLICT handling.
         //   - `DO NOTHING` filters `all_values` to non-conflicting
         //     rows + drops within-batch duplicates.
@@ -7760,6 +7845,64 @@ fn substitute_excluded_refs(
 /// This makes `INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2)`
 /// work in a single statement — common pattern for bulk-loading
 /// hierarchies.
+/// v7.9.19 — enforce table-level UNIQUE / PRIMARY KEY tuple
+/// constraints at INSERT time. For each constraint declared on
+/// the target table, check that no existing row + no earlier row
+/// in the same batch has the same full-column tuple. NULL in
+/// any column lifts the row out of the check (SQL spec: NULL
+/// ≠ NULL for uniqueness). mailrs G1 + G6.
+fn enforce_uniqueness_inserts(
+    catalog: &Catalog,
+    child_table: &str,
+    constraints: &[spg_storage::UniquenessConstraint],
+    rows: &[Vec<Value>],
+) -> Result<(), EngineError> {
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    let table = catalog.get(child_table).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: child_table.into(),
+        })
+    })?;
+    for uc in constraints {
+        for (batch_idx, row_values) in rows.iter().enumerate() {
+            let key: Vec<&Value> = uc.columns.iter().map(|&i| &row_values[i]).collect();
+            let has_null = key.iter().any(|v| matches!(v, Value::Null));
+            if has_null {
+                continue;
+            }
+            // Table-side collision: scan existing rows.
+            let collides_in_table = table.rows().iter().any(|prow| {
+                uc.columns
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &p)| prow.values.get(p) == Some(key[i]))
+            });
+            // Batch-side collision: earlier rows in the same INSERT.
+            let collides_in_batch = rows[..batch_idx].iter().any(|earlier| {
+                uc.columns
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &p)| earlier.get(p) == Some(key[i]))
+            });
+            if collides_in_table || collides_in_batch {
+                let kind = if uc.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+                let col_names: Vec<String> = uc
+                    .columns
+                    .iter()
+                    .map(|&i| table.schema().columns[i].name.clone())
+                    .collect();
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "{kind} violation on {child_table:?} columns {col_names:?}: \
+                     row #{batch_idx} duplicates an existing key"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn enforce_fk_inserts(
     catalog: &Catalog,
     child_table: &str,

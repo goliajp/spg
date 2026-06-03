@@ -318,6 +318,30 @@ pub struct TableSchema {
     /// Persisted in catalog FILE_VERSION 13+. Older catalogs
     /// deserialise with an empty vec.
     pub foreign_keys: Vec<ForeignKeyConstraint>,
+    /// v7.9.19 — composite UNIQUE / PRIMARY KEY constraints
+    /// declared at the table level. Each entry's leading column
+    /// has a BTree index (created via the constraint), and INSERT
+    /// path enforces the full-tuple uniqueness via a scan keyed
+    /// by the leading column. Persisted in catalog FILE_VERSION
+    /// 15+. Older catalogs (≤ 14) deserialise with an empty vec.
+    pub uniqueness_constraints: Vec<UniquenessConstraint>,
+}
+
+/// v7.9.19 — composite UNIQUE / PRIMARY KEY constraint persisted
+/// on the table schema. The leading column always has a BTree
+/// index (created at CREATE TABLE time); INSERT enforcement
+/// scans that index for collisions on the full column tuple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniquenessConstraint {
+    /// `true` when this constraint was declared as `PRIMARY KEY`
+    /// (vs `UNIQUE`). Semantically PK implies NOT NULL on all
+    /// referenced columns; the engine enforces that at CREATE
+    /// TABLE time.
+    pub is_primary_key: bool,
+    /// Column positions on the parent table. ≥ 1 element. For
+    /// single-column UNIQUE this is exactly one position; the
+    /// BTree index alone enforces it.
+    pub columns: Vec<usize>,
 }
 
 /// v7.6.1 — Storage-layer mirror of `spg_sql::ast::ForeignKeyConstraint`.
@@ -3769,6 +3793,7 @@ impl TableSchema {
             columns,
             hot_tier_bytes: None,
             foreign_keys: Vec::new(),
+            uniqueness_constraints: Vec::new(),
         }
     }
 }
@@ -3846,7 +3871,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 14;
+const FILE_VERSION: u8 = 15;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4050,6 +4075,33 @@ impl Catalog {
                 out.push(fk.on_delete.tag());
                 out.push(fk.on_update.tag());
             }
+            // v7.9.19 — UniquenessConstraint appendix (catalog
+            // FILE_VERSION 15+). Layout per table after the FK
+            // block:
+            //   [u16 count]
+            //     per constraint:
+            //       [u8 is_primary_key]
+            //       [u16 arity][u16 col_pos]*arity
+            // Older catalogs (v14 and below) skip this block.
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.uniqueness_constraints.len())
+                    .expect("≤ 65k uniqueness constraints/table"),
+            );
+            for uc in &t.schema.uniqueness_constraints {
+                out.push(u8::from(uc.is_primary_key));
+                write_u16(
+                    &mut out,
+                    u16::try_from(uc.columns.len())
+                        .expect("≤ 65k cols in uniqueness constraint"),
+                );
+                for &p in &uc.columns {
+                    write_u16(
+                        &mut out,
+                        u16::try_from(p).expect("≤ 65k columns/table"),
+                    );
+                }
+            }
         }
         out
     }
@@ -4193,6 +4245,25 @@ fn deserialize_table(
             });
         }
         t.schema_mut().foreign_keys = fks;
+    }
+    // v7.9.19 — UniquenessConstraint appendix (FILE_VERSION 15+).
+    // v14 and below skip this entirely.
+    if version >= 15 {
+        let uc_count = cur.read_u16()? as usize;
+        let mut ucs = Vec::with_capacity(uc_count);
+        for _ in 0..uc_count {
+            let is_pk = cur.read_u8()? != 0;
+            let arity = cur.read_u16()? as usize;
+            let mut cols = Vec::with_capacity(arity);
+            for _ in 0..arity {
+                cols.push(cur.read_u16()? as usize);
+            }
+            ucs.push(UniquenessConstraint {
+                is_primary_key: is_pk,
+                columns: cols,
+            });
+        }
+        t.schema_mut().uniqueness_constraints = ucs;
     }
     let _ = table_name;
     Ok(())
