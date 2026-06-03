@@ -944,19 +944,39 @@ impl Parser {
         };
         head.limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
-            let n = self.expect_u32_literal("LIMIT")?;
-            Some(n)
+            Some(self.parse_limit_expr("LIMIT")?)
         } else {
             None
         };
         head.offset = if matches!(self.peek(), Token::Offset) {
             self.advance();
-            let n = self.expect_u32_literal("OFFSET")?;
-            Some(n)
+            Some(self.parse_limit_expr("OFFSET")?)
         } else {
             None
         };
         Ok(Statement::Select(head))
+    }
+
+    /// v7.9.24 — accept `LIMIT <int>` or `LIMIT $N`. mailrs H2.
+    /// Bind value gets resolved during prepared-statement Execute;
+    /// the Pratt expression parser would over-accept here (e.g.
+    /// `LIMIT 5 + 5`), so we narrowly accept only the two PG forms.
+    fn parse_limit_expr(&mut self, label: &str) -> Result<crate::ast::LimitExpr, ParseError> {
+        match self.advance() {
+            Token::Integer(n) if n >= 0 => u32::try_from(n)
+                .map(crate::ast::LimitExpr::Literal)
+                .map_err(|_| ParseError {
+                    message: alloc::format!("{label} value too large: {n}"),
+                    token_pos: self.pos.saturating_sub(1),
+                }),
+            Token::Placeholder(n) => Ok(crate::ast::LimitExpr::Placeholder(n)),
+            other => Err(ParseError {
+                message: alloc::format!(
+                    "expected non-negative integer or $N placeholder after {label}, got {other:?}"
+                ),
+                token_pos: self.pos.saturating_sub(1),
+            }),
+        }
     }
 
     fn expect_u32_literal(&mut self, label: &str) -> Result<u32, ParseError> {
