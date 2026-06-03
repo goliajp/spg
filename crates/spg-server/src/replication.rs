@@ -183,6 +183,15 @@ fn serve_follower(mut stream: TcpStream, state: &ServerState) -> std::io::Result
     // problem). `start_offset = 0` means "tail from the current
     // master WAL end"; non-zero means "resume from this byte".
     if matches!(protocol, Protocol::Sub) {
+        // v6.1.8 — MAGIC_SUB requires effective_wal_level = logical.
+        // Replica mode (the default) is the bare streaming
+        // surface — operators opt in to logical replication via
+        // SET / SPG_WAL_LEVEL before subscribers can attach.
+        if state.wal_level.load(Ordering::Acquire) != crate::WAL_LEVEL_LOGICAL {
+            return Err(std::io::Error::other(
+                "MAGIC_SUB rejected: effective_wal_level must be `logical`",
+            ));
+        }
         // v6.1.5: subscription handshake grows a publication-name
         // tail so the master can filter records before sending.
         //   [u16 num_publications]

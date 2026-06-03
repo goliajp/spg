@@ -37,7 +37,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -263,6 +263,16 @@ pub(crate) struct ServerState {
     /// chain) need WAL-record-level originator tagging — out of
     /// v6.1 scope.
     pub(crate) cluster_id: u64,
+    /// v6.1.8 — `effective_wal_level`. `0` = replica (default,
+    /// legacy MAGIC_V1 / MAGIC_V2 followers only); `1` = logical
+    /// (MAGIC_SUB subscriptions accepted in addition). Flipped
+    /// at runtime via `SET effective_wal_level = 'logical'` /
+    /// `SET effective_wal_level = 'replica'` and observable via
+    /// `SHOW effective_wal_level`. Initial value comes from the
+    /// `SPG_WAL_LEVEL` env var (`logical` / `replica`); defaults
+    /// to `replica` so a fresh cluster doesn't expose the
+    /// MAGIC_SUB surface until an operator opts in.
+    pub(crate) wal_level: AtomicU8,
     /// v4.29: optional failure-injection knobs used by chaos tests.
     /// All branches default-off and skip the check entirely when
     /// the env var wasn't set on startup.
@@ -880,6 +890,7 @@ fn run(
         cold_segment_paths: Mutex::new(cold_segment_paths),
         sub_workers: Mutex::new(BTreeMap::new()),
         cluster_id,
+        wal_level: AtomicU8::new(parse_wal_level_env()),
     });
 
     // v6.1.4: spawn subscriber threads for any subscriptions
@@ -1289,6 +1300,126 @@ fn sql_is_read_only(sql: &str) -> bool {
     }
 }
 
+/// v6.1.8 — `effective_wal_level` discriminant. `replica`
+/// (default) and `logical` are the only legal values, matching
+/// PG semantics. Stored as a `u8` in `ServerState::wal_level`
+/// so reads are lock-free; transitions go through `SET`.
+pub(crate) const WAL_LEVEL_REPLICA: u8 = 0;
+pub(crate) const WAL_LEVEL_LOGICAL: u8 = 1;
+
+/// v6.1.8 — parse the `SPG_WAL_LEVEL` env var at startup.
+/// Defaults to `replica` on absence or unknown value (loud
+/// warning so a typo doesn't silently downgrade).
+fn parse_wal_level_env() -> u8 {
+    match std::env::var("SPG_WAL_LEVEL")
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("replica") => WAL_LEVEL_REPLICA,
+        Some("logical") => WAL_LEVEL_LOGICAL,
+        Some(other) => {
+            eprintln!(
+                "spg-server: SPG_WAL_LEVEL={other:?} unknown — defaulting to replica. \
+                 Valid values: replica, logical"
+            );
+            WAL_LEVEL_REPLICA
+        }
+    }
+}
+
+/// v6.1.8 — render the current wal_level as the SQL-surface
+/// string. Used by `SHOW effective_wal_level`.
+pub(crate) fn wal_level_label(v: u8) -> &'static str {
+    match v {
+        WAL_LEVEL_LOGICAL => "logical",
+        _ => "replica",
+    }
+}
+
+/// v6.1.8 — cheap prefix-match for `SET effective_wal_level`.
+fn sql_looks_like_set_wal_level(sql: &str) -> bool {
+    let trimmed = sql.trim_start().to_ascii_lowercase();
+    trimmed.starts_with("set effective_wal_level")
+}
+
+/// v6.1.8 — cheap prefix-match for `SHOW effective_wal_level`.
+fn sql_looks_like_show_wal_level(sql: &str) -> bool {
+    let trimmed = sql.trim_start().to_ascii_lowercase();
+    trimmed == "show effective_wal_level"
+        || trimmed.starts_with("show effective_wal_level ")
+        || trimmed.starts_with("show effective_wal_level;")
+}
+
+/// v6.1.8 — extract the value side of `SET effective_wal_level = '<v>'`.
+/// Trims surrounding quotes (PG-style) and case-folds. Returns
+/// `Err(msg)` for malformed input.
+fn parse_set_wal_level_value(sql: &str) -> Result<u8, String> {
+    let lower = sql.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("set effective_wal_level")
+        .ok_or_else(|| "expected `set effective_wal_level …`".to_string())?
+        .trim_start();
+    // Accept `=` or `to` between the name and the value.
+    let val_part = if let Some(r) = rest.strip_prefix('=') {
+        r.trim()
+    } else if let Some(r) = rest.strip_prefix("to ") {
+        r.trim()
+    } else {
+        return Err("expected `=` or `TO` after effective_wal_level".to_string());
+    };
+    let value = val_part
+        .trim_matches(|c: char| matches!(c, '\'' | '"' | ';'))
+        .trim();
+    match value {
+        "replica" => Ok(WAL_LEVEL_REPLICA),
+        "logical" => Ok(WAL_LEVEL_LOGICAL),
+        other => Err(format!(
+            "unknown effective_wal_level {other:?}; expected `replica` or `logical`"
+        )),
+    }
+}
+
+/// v6.1.8 — handler for the SET intercept. Updates the global
+/// `wal_level` atomic and emits CommandComplete.
+fn handle_set_wal_level(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    sql: &str,
+) -> std::io::Result<()> {
+    match parse_set_wal_level_value(sql) {
+        Ok(level) => {
+            state.wal_level.store(level, Ordering::Release);
+            emit_result(
+                stream,
+                Ok(spg_engine::QueryResult::CommandOk {
+                    affected: 1,
+                    modified_catalog: false,
+                }),
+            )
+        }
+        Err(msg) => write_frame(stream, &build_error_response(&msg)),
+    }
+}
+
+/// v6.1.8 — handler for the SHOW intercept. Returns a single
+/// row `(effective_wal_level TEXT NOT NULL)`.
+fn handle_show_wal_level(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+) -> std::io::Result<()> {
+    let level = state.wal_level.load(Ordering::Acquire);
+    let row = vec![Row::new(vec![Value::Text(
+        wal_level_label(level).to_string(),
+    )])];
+    let columns = vec![ColumnSchema::new(
+        "effective_wal_level",
+        DataType::Text,
+        false,
+    )];
+    emit_result(stream, Ok(spg_engine::QueryResult::Rows { columns, rows: row }))
+}
+
 /// v6.1.7 — cheap prefix-match for `WAIT FOR`. The wire-layer
 /// intercept only re-parses the SQL when this returns true, so
 /// the cost on every non-WAIT query is a tiny first-word scan.
@@ -1450,6 +1581,18 @@ fn dispatch(
                 && let spg_sql::ast::Statement::WaitForWalPosition { pos, timeout_ms } = stmt
             {
                 return handle_wait_for_wal_position(stream, state, pos, timeout_ms);
+            }
+            // v6.1.8 — server-layer intercept for
+            //   SET   effective_wal_level = 'logical' | 'replica'
+            //   SHOW  effective_wal_level
+            // wal_level is global server state, not a session var,
+            // so the engine's pgwire-style session-settings map
+            // isn't the right home for it.
+            if sql_looks_like_show_wal_level(&sql) {
+                return handle_show_wal_level(stream, state);
+            }
+            if sql_looks_like_set_wal_level(&sql) {
+                return handle_set_wal_level(stream, state, &sql);
             }
             // v4.0 fast path: SELECT / SHOW outside an active TX take
             // the engine *read* lock and run in parallel with other

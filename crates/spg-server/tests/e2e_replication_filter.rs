@@ -49,6 +49,7 @@ fn spawn_publisher(
         .arg("-")
         .arg_path(wal)
         .with_repl()
+        .with_logical_wal()
         .spawn()
 }
 
