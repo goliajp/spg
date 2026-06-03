@@ -146,6 +146,28 @@ implemented; further breakdown follows the table.
 | Partition tables (`PARTITION BY`) | ❌ | Cold-tier covers time-series natively |
 | Row-Level Security (`RLS`) | ❌ | A5 — process isolation instead |
 
+### Data types
+
+| Type | SPG | Notes |
+|---|---|---|
+| `SMALLINT` / `INT` / `BIGINT` | ✅ | Integer types |
+| `REAL` / `DOUBLE PRECISION` / `FLOAT` | ✅ | All map to `Float` (f64) |
+| `NUMERIC(p, s)` | ✅ | Exact decimal up to p=38 |
+| `BOOLEAN` | ✅ | |
+| `TEXT` / `VARCHAR(n)` / `CHAR(n)` | ✅ | |
+| `DATE` | ✅ | Days since epoch |
+| `TIMESTAMP` | ✅ | Microseconds since epoch |
+| `TIMESTAMPTZ` | ✅ v7.9.2 | Internally UTC `TIMESTAMP`; PG-wire OID 1184 |
+| `INTERVAL` | ⚠️ | Runtime literals only, no column storage |
+| `JSON` | ✅ | Text-backed; PG-wire OID 114 |
+| `JSONB` | ✅ v7.9.0 | Same storage as JSON; PG-wire OID 3802 for sqlx-style clients |
+| `SERIAL` / `BIGSERIAL` | ✅ v7.9.6 | Aliased to `INT/BIGINT NOT NULL AUTO_INCREMENT` |
+| `UUID` | ❌ | Store as `TEXT(36)` |
+| `BYTEA` | ❌ | Store as base64 `TEXT` (or wait on native BYTES type) |
+| `VECTOR(N)` | ✅ | pgvector-flavoured; HNSW + SQ8/HALF encodings |
+| `tsvector` + GIN | ❌ | Use Meilisearch / external full-text search |
+| Array columns (`TEXT[]`, `INT[]`) | ❌ | Store as CSV `TEXT` or JSON array |
+
 ### Data manipulation (DML)
 
 | Feature | SPG | Notes |
