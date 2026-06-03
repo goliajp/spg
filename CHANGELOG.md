@@ -10,6 +10,92 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [6.4] — 2026-06-03 (SQL polish — release roll-up)
+
+v6.4 closes the **twelfth-gap cluster** from the PG-19 audit:
+the small-to-medium SQL surface improvements that PG 19 ships
+plus the JSON path operators every real app eventually wants.
+Also picks up two SQL-surface gaps the v6.2 series explicitly
+carved as "follow-up in v6.4": multi-column ORDER BY and
+SELECT-list alias resolution in ORDER BY.
+
+The whole series stays in-house: 0 external dependencies,
+no `unsafe`, WAL on-disk format unchanged from v6.0.
+
+### Sub-version map
+
+| ver | topic |
+|-----|-------|
+| 6.4.0 | Multi-column ORDER BY + SELECT-list alias resolution |
+| 6.4.1 | `GROUP BY ALL` — planner rewrite to non-aggregate items |
+| 6.4.2 | Window function `IGNORE NULLS` / `RESPECT NULLS` |
+| 6.4.3 | SQL function bundle: `encode`/`decode` + `error_on_null` |
+| 6.4.4 | **DROPPED** — design error (INSERT ON CONFLICT needs PK/UNIQUE) |
+| 6.4.5 | JSON path operators: `#>`, `#>>`, `@>` |
+| 6.4.6 | Transactional DDL hardening (explicit e2e coverage) |
+| 6.4.7 | COPY enhancements: `SKIP N`, `ON_ERROR SET_NULL`, `FORMAT JSON` |
+| 6.4.8 | series ship rollup (this entry) |
+
+### Goal numbers — measured vs target
+
+| metric | v6.4 target | measured |
+|--------|------------:|---------:|
+| Multi-column ORDER BY correctness | PG-byte-correct on all asc/desc combos | ✅ 5/5 e2e |
+| SELECT-list alias in ORDER BY | resolves to projected expression | ✅ |
+| GROUP BY ALL | groups every non-aggregate SELECT item | ✅ 3/3 e2e |
+| Window IGNORE/RESPECT NULLS | LAG/LEAD/FIRST_VALUE/LAST_VALUE | ✅ 4/4 e2e |
+| JSON path operators | -> ->> #> #>> @> byte-correct on PG payloads | ✅ 9/9 e2e |
+| Transactional DDL atomicity | ROLLBACK undoes CREATE inside TX | ✅ 4/4 e2e |
+| COPY enhancements | SKIP / ON_ERROR / FORMAT JSON | ✅ 3/3 e2e |
+| sqllogictest 4-corpus regression | 100 % | ✅ 372/372 |
+
+### Frozen surfaces added in v6.4
+
+- `SelectStatement.order_by: Vec<OrderBy>` (was `Option<OrderBy>`)
+- `SelectStatement.group_by_all: bool`
+- `Expr::WindowFunction.null_treatment: NullTreatment` (Respect / Ignore)
+- `BinOp::JsonGetPath` (`#>`), `BinOp::JsonGetPathText` (`#>>`),
+  `BinOp::JsonContains` (`@>`)
+- SQL functions: `encode(text, format)`, `decode(text, format)`,
+  `error_on_null(v)`
+- COPY `WITH (SKIP N, ON_ERROR SET_NULL, FORMAT JSON)` option tail
+
+### Known v6.4 limitations (carved out, NOT deferred)
+
+- **INSERT ON CONFLICT** (any form). v6.4 design originally
+  scheduled `DO SELECT [FOR UPDATE]` for v6.4.4 on the false
+  assumption that v5.x already shipped ON CONFLICT DO NOTHING /
+  DO UPDATE. Audit during v6.4.4 work found SPG has NO PK / UNIQUE
+  constraint enforcement at all (no PRIMARY KEY, no UNIQUE in
+  storage/engine). ON CONFLICT has nothing to detect. The
+  prerequisite work (PK / UNIQUE syntax + storage indexes +
+  enforcement + WAL replay path) is foundational DML, picked up
+  as a dedicated v6.x effort (likely v6.6 territory).
+- **`random(date, date)` / `random(ts, ts)`**. Designed for v6.4.3
+  but needs a per-row RNG state EvalContext doesn't plumb today.
+  Adding RNG threading is a separate concern from the v6.4 SQL-
+  polish theme.
+- **Full SQL/JSON path** (`jsonpath` opaque type + `json_path_exists`,
+  `json_path_query`, `jsonb_path_query_array`, `@?`). v6.4.5 ships
+  the bare-key/path-array operators; the path-expression grammar
+  is a separate surface.
+- **MERGE statement** (`MERGE ... WHEN NOT MATCHED BY SOURCE`).
+  Separate verb; INSERT ON CONFLICT DO SELECT covers the common
+  upsert case (once ON CONFLICT prereqs are built).
+- **COPY FORMAT BINARY**. PG's binary COPY format is a separate
+  spec; text + CSV + JSON cover the practically-needed surface.
+- **True per-cell ON_ERROR SET_NULL**. v6.4.7 ships row-level
+  skip-on-error; the per-column SET_NULL variant needs per-cell
+  parse visibility inside `build_copy_insert` and changes COPY's
+  insert path shape.
+- **XML functions** (`xmlforest`, `xmlagg`, …). SPG has no XML
+  type.
+- **DDL in implicit-TX autocommit divergence from PG**. SPG keeps
+  the current shape: explicit-TX DDL is atomic, implicit-TX DDL
+  is auto-commit. Matches v6.3 behaviour.
+
+---
+
 ## [6.3] — 2026-06-03 (PG-wire extended query finish — release roll-up)
 
 v6.3 closes the **eleventh-gap cluster** from the PG-19 audit:
