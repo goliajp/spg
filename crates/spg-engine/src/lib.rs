@@ -1255,6 +1255,69 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
+    /// v6.5.0 — materialise `spg_stat_replication` rows. One row
+    /// per subscription with `(name, conn_str, publications,
+    /// last_received_pos, enabled)`. Surface mirrors
+    /// `SHOW SUBSCRIPTIONS` but follows the virtual-table dispatch
+    /// shape so it composes with SELECT clauses (WHERE, projection
+    /// onto specific columns, etc).
+    fn exec_spg_stat_replication(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("conn_str", DataType::Text, false),
+            ColumnSchema::new("publications", DataType::Text, false),
+            ColumnSchema::new("last_received_pos", DataType::BigInt, false),
+            ColumnSchema::new("enabled", DataType::Bool, false),
+        ];
+        let rows: Vec<Row> = self
+            .subscriptions
+            .iter()
+            .map(|(name, sub)| {
+                Row::new(alloc::vec![
+                    Value::Text(name.clone()),
+                    Value::Text(sub.conn_str.clone()),
+                    Value::Text(sub.publications.join(",")),
+                    Value::BigInt(i64::try_from(sub.last_received_pos).unwrap_or(i64::MAX)),
+                    Value::Bool(sub.enabled),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.5.0 — materialise `spg_stat_segment` rows. One row per
+    /// cold-tier segment with `(segment_id, num_rows, num_pages,
+    /// total_bytes)`. The `table_name` column is intentionally NOT
+    /// part of v6.5.0: SPG's storage layer doesn't persist a
+    /// segment→table mapping (segments are looked up by id off
+    /// `RowLocator::Cold`; resolving back to a table requires
+    /// walking every table's BTree-index keys). Surface
+    /// carve-out documented in STABILITY.
+    fn exec_spg_stat_segment(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("segment_id", DataType::BigInt, false),
+            ColumnSchema::new("num_rows", DataType::BigInt, false),
+            ColumnSchema::new("num_pages", DataType::BigInt, false),
+            ColumnSchema::new("total_bytes", DataType::BigInt, false),
+        ];
+        let rows: Vec<Row> = self
+            .catalog
+            .cold_segment_ids_global()
+            .iter()
+            .filter_map(|&id| {
+                let seg = self.catalog.cold_segment(id)?;
+                let meta = seg.meta();
+                Some(Row::new(alloc::vec![
+                    Value::BigInt(i64::from(id)),
+                    Value::BigInt(i64::try_from(meta.num_rows).unwrap_or(i64::MAX)),
+                    Value::BigInt(i64::from(meta.num_pages)),
+                    Value::BigInt(i64::try_from(meta.total_bytes).unwrap_or(i64::MAX)),
+                ]))
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
     /// v6.2.0 — read access to the per-column statistics table.
     /// Used by the planner (v6.2.2 selectivity functions read this),
     /// by `SELECT * FROM spg_statistic`, and by e2e tests.
@@ -2174,12 +2237,11 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
-        // v6.2.0 — `spg_statistic` virtual-table short-circuit.
-        // Detected pre-CTE because it doesn't read from the catalog
-        // and shouldn't participate in regular FROM resolution.
+        // v6.2.0 / v6.5.0 — virtual-table short-circuits. Detected
+        // pre-CTE because they don't read from the catalog and
+        // shouldn't participate in regular FROM resolution.
         if let Some(from) = &stmt.from
             && from.joins.is_empty()
-            && from.primary.name.eq_ignore_ascii_case("spg_statistic")
             && stmt.where_.is_none()
             && stmt.group_by.is_none()
             && stmt.having.is_none()
@@ -2190,7 +2252,14 @@ impl Engine {
             && !stmt.distinct
             && stmt.items.iter().all(|i| matches!(i, SelectItem::Wildcard))
         {
-            return Ok(self.exec_spg_statistic());
+            let lower = from.primary.name.to_ascii_lowercase();
+            match lower.as_str() {
+                "spg_statistic" => return Ok(self.exec_spg_statistic()),
+                // v6.5.0 — observability v2 virtual tables.
+                "spg_stat_replication" => return Ok(self.exec_spg_stat_replication()),
+                "spg_stat_segment" => return Ok(self.exec_spg_stat_segment()),
+                _ => {}
+            }
         }
         // v4.11: CTEs materialise into a temporary enriched catalog
         // *before* anything else — the body SELECT can then refer
