@@ -8,6 +8,102 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.6] — 2026-06-03 (Foreign keys)
+
+Adds the full SQL `FOREIGN KEY` surface. Together with the
+v7.5 API-stability ground, this is the release operators
+asked for since v7.0 — `pg_dump` schemas with `REFERENCES …
+ON DELETE/UPDATE …` clauses now restore into SPG without
+manual edits.
+
+Surface accepted:
+
+- Column-level inline: `col INT REFERENCES tbl(pcol) [actions]`
+- Table-level: `[CONSTRAINT name] FOREIGN KEY (cols)
+  REFERENCES tbl[(pcols)] [ON DELETE …] [ON UPDATE …]`
+- Actions: `CASCADE | RESTRICT | SET NULL | SET DEFAULT |
+  NO ACTION` for both ON DELETE and ON UPDATE
+- Composite (multi-column) FKs
+- Self-referencing FKs, including bulk INSERT batches that
+  reference earlier rows in the same statement
+- `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY …` — verifies
+  existing rows before installation
+- `ALTER TABLE t DROP CONSTRAINT name`
+- `[NOT] DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE}` — NOT
+  DEFERRABLE accepted silently; positive DEFERRABLE rejected
+  at parse time (SPG single-writer has no deferred window)
+
+Enforcement matrix:
+
+| Path   | Outbound (child writes new FK value) | Inbound (parent PK changes / row goes) |
+|--------|--------------------------------------|----------------------------------------|
+| INSERT | parent existence check (BTree O(log n)) | n/a |
+| UPDATE | parent existence check on new value  | per-FK on_update action |
+| DELETE | n/a                                  | per-FK on_delete action |
+
+Atomicity:
+
+- Multi-row INSERT batches are all-or-nothing on FK violation
+- DELETE plans cascade across the FK graph before applying
+  anything; a RESTRICT branch blocks the whole plan
+- `ALTER ADD CONSTRAINT` validates existing rows before
+  installation; rejected ALTER leaves catalog identical
+
+Storage format:
+
+- Catalog FILE_VERSION 12 → 13. Per-table appendix carries
+  the FK list after the hot_tier_bytes block. Older catalogs
+  deserialise with empty FK vec (backward-compatible read).
+- WAL replay reconstructs FK state bit-identically.
+
+A7 axiom narrowed: `PG_MIGRATION.md` removes "Foreign keys"
+from the "won't do" list. Triggers, stored procs, RLS,
+multi-writer, multi-master, `pg_hba.conf` remain structural
+non-goals.
+
+Implementation notes:
+
+- spg-storage carries its own `ForeignKeyConstraint` /
+  `FkAction` so the no-deps boundary between SQL and storage
+  stays clean; spg-engine bridges between the two.
+- 60 e2e tests across 9 files (catalog, insert, delete
+  restrict, delete cascade, delete set, update, advanced,
+  alter, chaos). All green.
+- Single-writer architecture lets FK enforcement skip the
+  whole PG category of deferred-constraint complexity — no
+  commit-time re-check, no isolation interactions, no
+  per-action immediacy mode.
+
+Sub-versions:
+
+  v7.6.0  Parser — REFERENCES + ON DELETE/UPDATE
+  v7.6.1  Catalog — ForeignKeyConstraint + FILE_VERSION 13
+  v7.6.2  INSERT path — parent existence
+  v7.6.3  DELETE path — RESTRICT / NO ACTION
+  v7.6.4  DELETE path — CASCADE
+  v7.6.5  DELETE/UPDATE — SET NULL / SET DEFAULT
+  v7.6.6  UPDATE path — parent PK + child FK changes
+  v7.6.7  Self-ref bulk insert + composite + DEFERRABLE
+  v7.6.8  ALTER TABLE ADD / DROP CONSTRAINT
+  v7.6.9  Chaos + persistence coverage
+  v7.6.10 Series rollup + tag + docker push
+
+---
+
+## [7.5] — 2026-06-03 (API stability)
+
+API-stability ground for the v7.x append-only contract.
+
+- `#[non_exhaustive]` on `EngineError` / `QueryResult` /
+  `Value` / `StorageError` — future variants are minor bumps,
+  not breaking changes.
+- Embedded crate-level docs documented the panic contract:
+  user-input paths never panic; release profile is
+  `panic = abort`; unwind callers should build with
+  `--profile release-dbg` and `catch_unwind`.
+
+---
+
 ## [7.4] — 2026-06-03 (PG migration guide)
 
 v7.4 is a documentation release — no code changes, no new wire
