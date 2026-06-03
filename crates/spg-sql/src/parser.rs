@@ -1510,9 +1510,18 @@ impl Parser {
                 "hnsw" => IndexMethod::Hnsw,
                 "btree" => IndexMethod::BTree,
                 "brin" => IndexMethod::Brin,
+                // v7.9.26b — PG `pg_dump` emits `USING gin` /
+                // `USING gist` / `USING spgist` / `USING hash` for
+                // their built-in index AMs. SPG doesn't have a
+                // matching implementation; degrade to BTree on the
+                // leading column so the schema loads + the index
+                // catalogue stays consistent. Operator pays the
+                // planner cost only for the queries that would have
+                // used the specialised AM.
+                "gin" | "gist" | "spgist" | "hash" => IndexMethod::BTree,
                 other => {
                     return Err(self.err(alloc::format!(
-                        "unknown index method {other:?}; supported: hnsw, btree, brin"
+                        "unknown index method {other:?}; supported: hnsw, btree, brin (gin/gist/spgist/hash accepted as BTree fallback)"
                     )));
                 }
             }
@@ -2521,9 +2530,37 @@ impl Parser {
                 } else {
                     false
                 };
+                // v7.9.27b — `IS [NOT] DISTINCT FROM <rhs>`.
+                // mailrs pg_dump.
+                if matches!(self.peek(), Token::Distinct) {
+                    self.advance();
+                    if !matches!(self.peek(), Token::From) {
+                        return Err(self.err(format!(
+                            "expected FROM after IS{} DISTINCT, got {:?}",
+                            if negated { " NOT" } else { "" },
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    // Right-hand side: parse at the same precedence
+                    // tier as comparison so `x IS DISTINCT FROM a + b`
+                    // groups as `x IS DISTINCT FROM (a + b)`.
+                    let rhs = self.parse_expr(20)?;
+                    let op = if negated {
+                        BinOp::IsNotDistinctFrom
+                    } else {
+                        BinOp::IsDistinctFrom
+                    };
+                    expr = Expr::Binary {
+                        op,
+                        lhs: Box::new(expr),
+                        rhs: Box::new(rhs),
+                    };
+                    continue;
+                }
                 if !matches!(self.peek(), Token::Null) {
                     return Err(self.err(format!(
-                        "expected NULL after IS{}, got {:?}",
+                        "expected NULL or DISTINCT after IS{}, got {:?}",
                         if negated { " NOT" } else { "" },
                         self.peek()
                     )));
