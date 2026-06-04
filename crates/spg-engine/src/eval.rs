@@ -169,22 +169,62 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
         Expr::WindowFunction { .. } => Err(EvalError::TypeMismatch {
             detail: "window function reached row eval — engine rewrite bug".into(),
         }),
-        // v7.10.10 — `ARRAY[expr, expr, …]` constructor. Build a
-        // `Value::TextArray` where each NULL maps to `None` and
-        // each Text element maps to `Some(...)`. Non-TEXT
-        // elements get coerced via `to_string()` here so the
-        // user can write `ARRAY[1, 2, 3]` against a TEXT[]
-        // column (PG also accepts this in many positions).
+        // v7.10.10 — `ARRAY[expr, expr, …]` constructor.
+        // v7.11.13 — element-type detection: all integers →
+        // IntArray (or BigIntArray when widening), any Text →
+        // TextArray. Non-TEXT non-integer elements (Bool, Float)
+        // stringify into TextArray as the safe default.
         Expr::Array(items) => {
-            let mut out: Vec<Option<String>> = Vec::with_capacity(items.len());
+            let mut materialised: Vec<Value> = Vec::with_capacity(items.len());
             for elem in items {
-                match eval_expr(elem, row, ctx)? {
-                    Value::Null => out.push(None),
-                    Value::Text(s) => out.push(Some(s)),
-                    other => out.push(Some(value_to_text_for_array(&other))),
+                materialised.push(eval_expr(elem, row, ctx)?);
+            }
+            let mut has_text = false;
+            let mut has_bigint = false;
+            let mut has_int = false;
+            for v in &materialised {
+                match v {
+                    Value::Null => {}
+                    Value::Int(_) | Value::SmallInt(_) => has_int = true,
+                    Value::BigInt(_) => has_bigint = true,
+                    Value::Text(_) | Value::Json(_) => has_text = true,
+                    _ => has_text = true,
                 }
             }
-            Ok(Value::TextArray(out))
+            if has_text || (!has_int && !has_bigint) {
+                let out: Vec<Option<String>> = materialised
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Text(s) | Value::Json(s) => Some(s),
+                        other => Some(value_to_text_for_array(&other)),
+                    })
+                    .collect();
+                return Ok(Value::TextArray(out));
+            }
+            if has_bigint {
+                let out: Vec<Option<i64>> = materialised
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Int(n) => Some(i64::from(n)),
+                        Value::SmallInt(n) => Some(i64::from(n)),
+                        Value::BigInt(n) => Some(n),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                return Ok(Value::BigIntArray(out));
+            }
+            let out: Vec<Option<i32>> = materialised
+                .into_iter()
+                .map(|v| match v {
+                    Value::Null => None,
+                    Value::Int(n) => Some(n),
+                    Value::SmallInt(n) => Some(i32::from(n)),
+                    _ => unreachable!(),
+                })
+                .collect();
+            Ok(Value::IntArray(out))
         }
         // v7.10.12 — `arr[i]` PG-style 1-based indexing.
         // Out-of-range indices (including i ≤ 0) return NULL.
@@ -194,14 +234,6 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             if matches!(target_v, Value::Null) || matches!(idx_v, Value::Null) {
                 return Ok(Value::Null);
             }
-            let Value::TextArray(items) = target_v else {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "subscript target must be an array, got {:?}",
-                        target_v.data_type()
-                    ),
-                });
-            };
             let i: i64 = match idx_v {
                 Value::Int(n) => i64::from(n),
                 Value::BigInt(n) => n,
@@ -219,9 +251,25 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                 return Ok(Value::Null);
             }
             let pos = (i - 1) as usize;
-            match items.get(pos) {
-                Some(Some(s)) => Ok(Value::Text(s.clone())),
-                Some(None) | None => Ok(Value::Null),
+            match target_v {
+                Value::TextArray(items) => match items.get(pos) {
+                    Some(Some(s)) => Ok(Value::Text(s.clone())),
+                    Some(None) | None => Ok(Value::Null),
+                },
+                Value::IntArray(items) => match items.get(pos) {
+                    Some(Some(n)) => Ok(Value::Int(*n)),
+                    Some(None) | None => Ok(Value::Null),
+                },
+                Value::BigIntArray(items) => match items.get(pos) {
+                    Some(Some(n)) => Ok(Value::BigInt(*n)),
+                    Some(None) | None => Ok(Value::Null),
+                },
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "subscript target must be an array, got {:?}",
+                        other.data_type()
+                    ),
+                }),
             }
         }
         // v7.10.12 — `x op ANY(arr)` / `x op ALL(arr)`. PG
@@ -240,20 +288,34 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             if matches!(arr, Value::Null) {
                 return Ok(Value::Null);
             }
-            let Value::TextArray(items) = arr else {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "ANY/ALL right-hand side must be an array, got {:?}",
-                        arr.data_type()
-                    ),
-                });
+            let elems: Vec<Option<Value>> = match arr {
+                Value::TextArray(items) => items
+                    .into_iter()
+                    .map(|o| o.map(Value::Text))
+                    .collect(),
+                Value::IntArray(items) => items
+                    .into_iter()
+                    .map(|o| o.map(Value::Int))
+                    .collect(),
+                Value::BigIntArray(items) => items
+                    .into_iter()
+                    .map(|o| o.map(Value::BigInt))
+                    .collect(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "ANY/ALL right-hand side must be an array, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
             };
             let mut saw_null = matches!(lhs, Value::Null);
             let mut saw_match = false;
             let mut saw_mismatch = false;
-            for elem in items {
+            for elem in elems {
                 let elem_v = match elem {
-                    Some(s) => Value::Text(s),
+                    Some(v) => v,
                     None => {
                         saw_null = true;
                         continue;
@@ -518,13 +580,18 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Value::TextArray(items) = &args[0] else {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "array_length() first arg must be an array, got {:?}",
-                        args[0].data_type()
-                    ),
-                });
+            let len = match &args[0] {
+                Value::TextArray(items) => items.len(),
+                Value::IntArray(items) => items.len(),
+                Value::BigIntArray(items) => items.len(),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_length() first arg must be an array, got {:?}",
+                            args[0].data_type()
+                        ),
+                    });
+                }
             };
             let dim: i64 = match args[1] {
                 Value::Int(n) => i64::from(n),
@@ -542,7 +609,7 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             if dim != 1 {
                 return Ok(Value::Null);
             }
-            let n = i32::try_from(items.len()).unwrap_or(i32::MAX);
+            let n = i32::try_from(len).unwrap_or(i32::MAX);
             Ok(Value::Int(n))
         }
         // v7.11.6 — `array_position(arr, val)` returns 1-based
@@ -558,34 +625,249 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
-            let Value::TextArray(items) = &args[0] else {
-                return Err(EvalError::TypeMismatch {
+            if matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::TextArray(items), Value::Text(needle)) => {
+                    for (idx, item) in items.iter().enumerate() {
+                        if let Some(s) = item
+                            && s == needle
+                        {
+                            return Ok(Value::Int(
+                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                (Value::IntArray(items), needle_v)
+                    if matches!(
+                        needle_v,
+                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
+                    ) =>
+                {
+                    let needle: i64 = match *needle_v {
+                        Value::Int(n) => i64::from(n),
+                        Value::SmallInt(n) => i64::from(n),
+                        Value::BigInt(n) => n,
+                        _ => unreachable!(),
+                    };
+                    for (idx, item) in items.iter().enumerate() {
+                        if let Some(n) = item
+                            && i64::from(*n) == needle
+                        {
+                            return Ok(Value::Int(
+                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                (Value::BigIntArray(items), needle_v)
+                    if matches!(
+                        needle_v,
+                        Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)
+                    ) =>
+                {
+                    let needle: i64 = match *needle_v {
+                        Value::Int(n) => i64::from(n),
+                        Value::SmallInt(n) => i64::from(n),
+                        Value::BigInt(n) => n,
+                        _ => unreachable!(),
+                    };
+                    for (idx, item) in items.iter().enumerate() {
+                        if let Some(n) = item
+                            && *n == needle
+                        {
+                            return Ok(Value::Int(
+                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                (arr @ (Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_)), other) => {
+                    Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_position() needle type {:?} doesn't match array {:?}",
+                            other.data_type(),
+                            arr.data_type()
+                        ),
+                    })
+                }
+                (other, _) => Err(EvalError::TypeMismatch {
                     detail: format!(
                         "array_position() first arg must be an array, got {:?}",
-                        args[0].data_type()
+                        other.data_type()
                     ),
+                }),
+            }
+        }
+        // v7.11.15 — `substring(s, start)` / `substring(s, start, length)`
+        // for both TEXT and BYTEA. PG semantics: `start` is 1-based;
+        // values ≤ 0 clamp into the string (i.e. effective start is
+        // adjusted so the window still begins at index 1 — but
+        // `length` is reduced by the clipped prefix). A NULL arg
+        // makes the result NULL. Out-of-range windows return an
+        // empty value, not NULL.
+        "substring" => {
+            if !matches!(args.len(), 2 | 3) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("substring() takes 2 or 3 args, got {}", args.len()),
                 });
-            };
-            let needle = match &args[1] {
-                Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
-                other => {
+            }
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let start: i64 = match args[1] {
+                Value::Int(n) => i64::from(n),
+                Value::BigInt(n) => n,
+                Value::SmallInt(n) => i64::from(n),
+                _ => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "array_position() needle must be text, got {:?}",
-                            other.data_type()
+                            "substring() start must be integer, got {:?}",
+                            args[1].data_type()
                         ),
                     });
                 }
             };
-            for (idx, item) in items.iter().enumerate() {
-                if let Some(s) = item
-                    && s == &needle
-                {
-                    return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
+            let length: Option<i64> = if args.len() == 3 {
+                match args[2] {
+                    Value::Int(n) => Some(i64::from(n)),
+                    Value::BigInt(n) => Some(n),
+                    Value::SmallInt(n) => Some(i64::from(n)),
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "substring() length must be integer, got {:?}",
+                                args[2].data_type()
+                            ),
+                        });
+                    }
                 }
+            } else {
+                None
+            };
+            // PG: when length is given, end = start + length; if
+            // end < start the result is empty. Clip start to 1.
+            let (effective_start, effective_length): (i64, Option<i64>) = match length {
+                Some(len) => {
+                    let end = start.saturating_add(len);
+                    if end <= 1 || len < 0 {
+                        return Ok(match &args[0] {
+                            Value::Text(_) => Value::Text(String::new()),
+                            Value::Bytes(_) => Value::Bytes(Vec::new()),
+                            other => {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: format!(
+                                        "substring() needs text or bytea, got {:?}",
+                                        other.data_type()
+                                    ),
+                                });
+                            }
+                        });
+                    }
+                    let eff_start = start.max(1);
+                    let eff_len = end - eff_start;
+                    (eff_start, Some(eff_len.max(0)))
+                }
+                None => (start.max(1), None),
+            };
+            match &args[0] {
+                Value::Text(s) => {
+                    // PG counts in characters (codepoints) for TEXT.
+                    let chars: Vec<char> = s.chars().collect();
+                    let skip = (effective_start - 1) as usize;
+                    if skip >= chars.len() {
+                        return Ok(Value::Text(String::new()));
+                    }
+                    let take = match effective_length {
+                        Some(n) => (n as usize).min(chars.len() - skip),
+                        None => chars.len() - skip,
+                    };
+                    Ok(Value::Text(chars[skip..skip + take].iter().collect()))
+                }
+                Value::Bytes(b) => {
+                    let skip = (effective_start - 1) as usize;
+                    if skip >= b.len() {
+                        return Ok(Value::Bytes(Vec::new()));
+                    }
+                    let take = match effective_length {
+                        Some(n) => (n as usize).min(b.len() - skip),
+                        None => b.len() - skip,
+                    };
+                    Ok(Value::Bytes(b[skip..skip + take].to_vec()))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "substring() needs text or bytea, got {:?}",
+                        other.data_type()
+                    ),
+                }),
             }
-            Ok(Value::Null)
+        }
+        // v7.11.15 — `position(needle, haystack)`. PG semantics:
+        // 1-based byte/char index of first occurrence, or 0 if
+        // absent. NULL on either operand → NULL. Empty needle
+        // returns 1 (PG convention). Works on TEXT (char positions)
+        // and BYTEA (byte positions). (The PG-spec syntax `position(
+        // needle IN haystack)` is not parsed in v7.11; clients must
+        // call the function-call form.)
+        "position" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("position() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            match (&args[0], &args[1]) {
+                (Value::Text(needle), Value::Text(haystack)) => {
+                    if needle.is_empty() {
+                        return Ok(Value::Int(1));
+                    }
+                    // Char-based position (PG uses character count).
+                    let h_chars: Vec<char> = haystack.chars().collect();
+                    let n_chars: Vec<char> = needle.chars().collect();
+                    if n_chars.len() > h_chars.len() {
+                        return Ok(Value::Int(0));
+                    }
+                    for i in 0..=h_chars.len() - n_chars.len() {
+                        if h_chars[i..i + n_chars.len()] == n_chars[..] {
+                            return Ok(Value::Int(
+                                i32::try_from(i + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                    Ok(Value::Int(0))
+                }
+                (Value::Bytes(needle), Value::Bytes(haystack)) => {
+                    if needle.is_empty() {
+                        return Ok(Value::Int(1));
+                    }
+                    if needle.len() > haystack.len() {
+                        return Ok(Value::Int(0));
+                    }
+                    for i in 0..=haystack.len() - needle.len() {
+                        if &haystack[i..i + needle.len()] == needle.as_slice() {
+                            return Ok(Value::Int(
+                                i32::try_from(i + 1).unwrap_or(i32::MAX),
+                            ));
+                        }
+                    }
+                    Ok(Value::Int(0))
+                }
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "position() operands must both be text or both bytea, got {:?} and {:?}",
+                        a.data_type(),
+                        b.data_type()
+                    ),
+                }),
+            }
         }
         "upper" => {
             if args.len() != 1 {
@@ -1253,7 +1535,149 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                 ),
             }),
         },
+        // v7.11.13 — `::INT[]` / `::BIGINT[]`. Decode PG external
+        // form `{1,2,3}` when input is Text; widen TextArray /
+        // IntArray as appropriate.
+        CastTarget::IntArray => cast_to_int_array(v),
+        CastTarget::BigIntArray => cast_to_bigint_array(v),
     }
+}
+
+fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::IntArray(items) => Ok(Value::IntArray(items)),
+        Value::BigIntArray(items) => {
+            let mut out: Vec<Option<i32>> = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    None => out.push(None),
+                    Some(n) => match i32::try_from(n) {
+                        Ok(x) => out.push(Some(x)),
+                        Err(_) => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "::INT[] element {n} overflows i32"
+                                ),
+                            });
+                        }
+                    },
+                }
+            }
+            Ok(Value::IntArray(out))
+        }
+        Value::Text(s) => decode_int_array_external(&s).map(Value::IntArray),
+        Value::TextArray(items) => {
+            let mut out: Vec<Option<i32>> = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    None => out.push(None),
+                    Some(s) => match s.parse::<i32>() {
+                        Ok(n) => out.push(Some(n)),
+                        Err(_) => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!("::INT[] cannot parse {s:?}"),
+                            });
+                        }
+                    },
+                }
+            }
+            Ok(Value::IntArray(out))
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "::INT[] does not accept {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
+    match v {
+        Value::BigIntArray(items) => Ok(Value::BigIntArray(items)),
+        Value::IntArray(items) => Ok(Value::BigIntArray(
+            items
+                .into_iter()
+                .map(|x| x.map(i64::from))
+                .collect(),
+        )),
+        Value::Text(s) => decode_bigint_array_external(&s).map(Value::BigIntArray),
+        Value::TextArray(items) => {
+            let mut out: Vec<Option<i64>> = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    None => out.push(None),
+                    Some(s) => match s.parse::<i64>() {
+                        Ok(n) => out.push(Some(n)),
+                        Err(_) => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!("::BIGINT[] cannot parse {s:?}"),
+                            });
+                        }
+                    },
+                }
+            }
+            Ok(Value::BigIntArray(out))
+        }
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "::BIGINT[] does not accept {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or_else(|| EvalError::TypeMismatch {
+            detail: alloc::format!("INT[] literal {s:?} must be enclosed in '{{...}}'"),
+        })?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let p = part.trim();
+            if p.eq_ignore_ascii_case("NULL") {
+                Ok(None)
+            } else {
+                p.parse::<i32>().map(Some).map_err(|_| EvalError::TypeMismatch {
+                    detail: alloc::format!("INT[] element {p:?} is not an i32"),
+                })
+            }
+        })
+        .collect()
+}
+
+fn decode_bigint_array_external(s: &str) -> Result<Vec<Option<i64>>, EvalError> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or_else(|| EvalError::TypeMismatch {
+            detail: alloc::format!("BIGINT[] literal {s:?} must be enclosed in '{{...}}'"),
+        })?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let p = part.trim();
+            if p.eq_ignore_ascii_case("NULL") {
+                Ok(None)
+            } else {
+                p.parse::<i64>().map(Some).map_err(|_| EvalError::TypeMismatch {
+                    detail: alloc::format!("BIGINT[] element {p:?} is not an i64"),
+                })
+            }
+        })
+        .collect()
 }
 
 /// v7.10.11 — same decoder as `decode_text_array_literal` in
@@ -1702,6 +2126,43 @@ pub fn format_text_array(items: &[Option<String>]) -> String {
                     out.push_str(s);
                 }
             }
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.11.14 — render an INT[] in PG's external array form
+/// (`{1,2,NULL}`). Integer payloads never need quoting. NULL
+/// elements use the literal token `NULL`.
+pub fn format_int_array(items: &[Option<i32>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 4);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(n) => out.push_str(&n.to_string()),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v7.11.14 — render a BIGINT[] in PG's external array form
+/// (`{1,2,NULL}`).
+pub fn format_bigint_array(items: &[Option<i64>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 6);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(n) => out.push_str(&n.to_string()),
         }
     }
     out.push('}');
@@ -2414,7 +2875,13 @@ fn text_concat(l: &Value, r: &Value) -> Value {
             // PG text concat: NULL || x = NULL. Array concat: NULL || x = NULL.
             // Keep the legacy text path (value_to_text handles Null as ""),
             // but for arrays we surface real NULL to match PG.
-            if matches!(l, Value::TextArray(_)) || matches!(r, Value::TextArray(_)) {
+            if matches!(
+                l,
+                Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_) | Value::Bytes(_)
+            ) || matches!(
+                r,
+                Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_) | Value::Bytes(_)
+            ) {
                 return Value::Null;
             }
         }
@@ -2434,6 +2901,92 @@ fn text_concat(l: &Value, r: &Value) -> Value {
             out.push(Some(s.clone()));
             out.extend(b.iter().cloned());
             return Value::TextArray(out);
+        }
+        // v7.11.13 — IntArray / BigIntArray `||` overloads. Same
+        // PG semantics as TEXT[]: array||array concatenates, and
+        // array||scalar appends/prepends. Mixed Int/BigInt widens
+        // to BigIntArray.
+        (Value::IntArray(a), Value::IntArray(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().copied());
+            return Value::IntArray(out);
+        }
+        (Value::IntArray(a), Value::Int(n)) => {
+            let mut out = a.clone();
+            out.push(Some(*n));
+            return Value::IntArray(out);
+        }
+        (Value::IntArray(a), Value::SmallInt(n)) => {
+            let mut out = a.clone();
+            out.push(Some(i32::from(*n)));
+            return Value::IntArray(out);
+        }
+        (Value::Int(n), Value::IntArray(b)) => {
+            let mut out: alloc::vec::Vec<Option<i32>> = alloc::vec::Vec::with_capacity(1 + b.len());
+            out.push(Some(*n));
+            out.extend(b.iter().copied());
+            return Value::IntArray(out);
+        }
+        (Value::SmallInt(n), Value::IntArray(b)) => {
+            let mut out: alloc::vec::Vec<Option<i32>> = alloc::vec::Vec::with_capacity(1 + b.len());
+            out.push(Some(i32::from(*n)));
+            out.extend(b.iter().copied());
+            return Value::IntArray(out);
+        }
+        (Value::BigIntArray(a), Value::BigIntArray(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().copied());
+            return Value::BigIntArray(out);
+        }
+        (Value::BigIntArray(a), Value::IntArray(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().map(|o| o.map(i64::from)));
+            return Value::BigIntArray(out);
+        }
+        (Value::IntArray(a), Value::BigIntArray(b)) => {
+            let mut out: alloc::vec::Vec<Option<i64>> =
+                a.iter().map(|o| o.map(i64::from)).collect();
+            out.extend(b.iter().copied());
+            return Value::BigIntArray(out);
+        }
+        (Value::BigIntArray(a), Value::BigInt(n)) => {
+            let mut out = a.clone();
+            out.push(Some(*n));
+            return Value::BigIntArray(out);
+        }
+        (Value::BigIntArray(a), Value::Int(n)) => {
+            let mut out = a.clone();
+            out.push(Some(i64::from(*n)));
+            return Value::BigIntArray(out);
+        }
+        (Value::BigIntArray(a), Value::SmallInt(n)) => {
+            let mut out = a.clone();
+            out.push(Some(i64::from(*n)));
+            return Value::BigIntArray(out);
+        }
+        (Value::BigInt(n), Value::BigIntArray(b)) => {
+            let mut out: alloc::vec::Vec<Option<i64>> = alloc::vec::Vec::with_capacity(1 + b.len());
+            out.push(Some(*n));
+            out.extend(b.iter().copied());
+            return Value::BigIntArray(out);
+        }
+        (Value::Int(n), Value::BigIntArray(b)) => {
+            let mut out: alloc::vec::Vec<Option<i64>> = alloc::vec::Vec::with_capacity(1 + b.len());
+            out.push(Some(i64::from(*n)));
+            out.extend(b.iter().copied());
+            return Value::BigIntArray(out);
+        }
+        (Value::SmallInt(n), Value::BigIntArray(b)) => {
+            let mut out: alloc::vec::Vec<Option<i64>> = alloc::vec::Vec::with_capacity(1 + b.len());
+            out.push(Some(i64::from(*n)));
+            out.extend(b.iter().copied());
+            return Value::BigIntArray(out);
+        }
+        // v7.11.15 — BYTEA `||` is byte concatenation.
+        (Value::Bytes(a), Value::Bytes(b)) => {
+            let mut out = a.clone();
+            out.extend_from_slice(b);
+            return Value::Bytes(out);
         }
         _ => {}
     }

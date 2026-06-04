@@ -504,6 +504,13 @@ pub enum ColumnTypeName {
     ///   - `'{a,b,NULL}'::TEXT[]` (engine decodes the external
     ///     form at coerce time)
     TextArray,
+    /// v7.11.13 `INT[]` — single-dimension i32 array. PG wire OID
+    /// 1007. Same literal forms as TEXT[] (substituting integer
+    /// elements).
+    IntArray,
+    /// v7.11.13 `BIGINT[]` — single-dimension i64 array. PG wire
+    /// OID 1016.
+    BigIntArray,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -526,6 +533,8 @@ impl fmt::Display for ColumnTypeName {
             Self::Jsonb => f.write_str("JSONB"),
             Self::Bytes => f.write_str("BYTEA"),
             Self::TextArray => f.write_str("TEXT[]"),
+            Self::IntArray => f.write_str("INT[]"),
+            Self::BigIntArray => f.write_str("BIGINT[]"),
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
@@ -1010,6 +1019,11 @@ pub enum CastTarget {
     /// v7.10.11 — `::TEXT[]`. Engine decodes the LHS Text into
     /// the PG external array form `{a,b,NULL}`.
     TextArray,
+    /// v7.11.13 — `::INT[]` / `::BIGINT[]`. Decodes PG external
+    /// `{1,2,3}` or widens a `TextArray` whose elements are
+    /// integer-shaped.
+    IntArray,
+    BigIntArray,
 }
 
 impl fmt::Display for CastTarget {
@@ -1030,6 +1044,8 @@ impl fmt::Display for CastTarget {
             Self::Date => "date",
             Self::Timestamp => "timestamp",
             Self::TextArray => "TEXT[]",
+            Self::IntArray => "INT[]",
+            Self::BigIntArray => "BIGINT[]",
         })
     }
 }

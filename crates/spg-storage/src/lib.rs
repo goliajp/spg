@@ -152,6 +152,13 @@ pub enum DataType {
     /// (forward-only by design — TEXT[] columns aren't readable
     /// on a pre-v7.10 binary).
     TextArray,
+    /// v7.11.12: `INT[]` — single-dimension i32 array. PG wire
+    /// OID 1007 (_int4). Same `ARRAY[...]` / `'{1,2,3}'::INT[]`
+    /// literal surface as TEXT[]. Catalog FILE_VERSION 19+.
+    IntArray,
+    /// v7.11.12: `BIGINT[]` — single-dimension i64 array. PG
+    /// wire OID 1016 (_int8). Catalog FILE_VERSION 19+.
+    BigIntArray,
 }
 
 impl fmt::Display for DataType {
@@ -185,6 +192,8 @@ impl fmt::Display for DataType {
             Self::Jsonb => f.write_str("JSONB"),
             Self::Bytes => f.write_str("BYTEA"),
             Self::TextArray => f.write_str("TEXT[]"),
+            Self::IntArray => f.write_str("INT[]"),
+            Self::BigIntArray => f.write_str("BIGINT[]"),
         }
     }
 }
@@ -248,6 +257,13 @@ pub enum Value {
     /// arrays under `=`, so `[NULL] != [NULL]` (the engine
     /// honours this).
     TextArray(Vec<Option<String>>),
+    /// v7.11.12 `INT[]` — single-dimension i32 array with optional
+    /// NULL elements. Codec mirrors TextArray with i32 LE per
+    /// element instead of length-prefixed UTF-8.
+    IntArray(Vec<Option<i32>>),
+    /// v7.11.12 `BIGINT[]` — single-dimension i64 array with optional
+    /// NULL elements.
+    BigIntArray(Vec<Option<i64>>),
     Null,
 }
 
@@ -289,6 +305,8 @@ impl Value {
             Self::Json(_) => Some(DataType::Json),
             Self::Bytes(_) => Some(DataType::Bytes),
             Self::TextArray(_) => Some(DataType::TextArray),
+            Self::IntArray(_) => Some(DataType::IntArray),
+            Self::BigIntArray(_) => Some(DataType::BigIntArray),
             Self::Null => None,
         }
     }
@@ -488,7 +506,9 @@ impl IndexKey {
             | Value::Interval { .. }
             | Value::Json(_)
             | Value::Bytes(_)
-            | Value::TextArray(_) => None,
+            | Value::TextArray(_)
+            | Value::IntArray(_)
+            | Value::BigIntArray(_) => None,
         }
     }
 }
@@ -3946,7 +3966,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 18;
+const FILE_VERSION: u8 = 19;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4702,6 +4722,12 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.10.9: tag 19 for `TEXT[]`. Body = [u16 count][per
         // element: u8 null + (if non-null) u16 len + utf-8].
         DataType::TextArray => out.push(19),
+        // v7.11.12: tag 20 for `INT[]`. Body = [u16 count][per
+        // element: u8 null + (if non-null) i32 LE].
+        DataType::IntArray => out.push(20),
+        // v7.11.12: tag 21 for `BIGINT[]`. Body = [u16 count][per
+        // element: u8 null + (if non-null) i64 LE].
+        DataType::BigIntArray => out.push(21),
     }
 }
 
@@ -4752,6 +4778,9 @@ impl Cursor<'_> {
             18 => Ok(DataType::Bytes),
             // v7.10.9: tag 19 for `TEXT[]`. Catalog FILE_VERSION 18+.
             19 => Ok(DataType::TextArray),
+            // v7.11.12: tags 20/21 for INT[]/BIGINT[]. FILE_VERSION 19+.
+            20 => Ok(DataType::IntArray),
+            21 => Ok(DataType::BigIntArray),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -4828,6 +4857,10 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
             }
             n
         }
+        // v7.11.12: INT[] / BIGINT[] — [u16 count][per element:
+        // u8 null + (when non-null) fixed-width LE].
+        Value::IntArray(items) => 2 + items.iter().map(|x| if x.is_some() { 5 } else { 1 }).sum::<usize>(),
+        Value::BigIntArray(items) => 2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>(),
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -5002,6 +5035,36 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 }
             }
         }
+        // v7.11.12: INT[] dense body — [u16 count][per element:
+        // u8 null + (when non-null) i32 LE].
+        (Value::IntArray(items), DataType::IntArray) => {
+            let count = u16::try_from(items.len()).expect("INT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(n) => {
+                        out.push(0);
+                        out.extend_from_slice(&n.to_le_bytes());
+                    }
+                }
+            }
+        }
+        // v7.11.12: BIGINT[] dense body — [u16 count][per element:
+        // u8 null + (when non-null) i64 LE].
+        (Value::BigIntArray(items), DataType::BigIntArray) => {
+            let count = u16::try_from(items.len()).expect("BIGINT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(n) => {
+                        out.push(0);
+                        out.extend_from_slice(&n.to_le_bytes());
+                    }
+                }
+            }
+        }
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -5120,6 +5183,38 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
                         let len = u16::try_from(s.len()).expect("TEXT[] element ≤ 64 KiB");
                         out.extend_from_slice(&len.to_le_bytes());
                         out.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
+        }
+        // v7.11.12: INT[] — tag 16. [u16 count][per elem: u8 null +
+        // (if non-null) i32 LE].
+        Value::IntArray(items) => {
+            out.push(16);
+            let count = u16::try_from(items.len()).expect("INT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(n) => {
+                        out.push(0);
+                        out.extend_from_slice(&n.to_le_bytes());
+                    }
+                }
+            }
+        }
+        // v7.11.12: BIGINT[] — tag 17. [u16 count][per elem: u8 null +
+        // (if non-null) i64 LE].
+        Value::BigIntArray(items) => {
+            out.push(17);
+            let count = u16::try_from(items.len()).expect("BIGINT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(n) => {
+                        out.push(0);
+                        out.extend_from_slice(&n.to_le_bytes());
                     }
                 }
             }
@@ -5337,6 +5432,40 @@ impl<'a> Cursor<'a> {
                 }
                 Ok(Value::TextArray(items))
             }
+            // v7.11.12: INT[] dense body.
+            DataType::IntArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i32>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i32()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "INT[] null flag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::IntArray(items))
+            }
+            // v7.11.12: BIGINT[] dense body.
+            DataType::BigIntArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i64>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i64()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "BIGINT[] null flag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::BigIntArray(items))
+            }
         }
     }
 
@@ -5412,6 +5541,39 @@ impl<'a> Cursor<'a> {
                     }
                 }
                 Ok(Value::TextArray(items))
+            }
+            // v7.11.12: tags 16/17 — INT[] / BIGINT[].
+            16 => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i32>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i32()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "INT[] null flag in value tag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::IntArray(items))
+            }
+            17 => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i64>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i64()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "BIGINT[] null flag in value tag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::BigIntArray(items))
             }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }

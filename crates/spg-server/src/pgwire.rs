@@ -2654,6 +2654,8 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Jsonb => 3802,     // PG `jsonb` — v7.9.0 mailrs blocker fix
         DataType::Bytes => 17,       // PG `bytea` — v7.10.4 Epic 1
         DataType::TextArray => 1009, // PG `_text` (TEXT[]) — v7.10.9 Epic 2
+        DataType::IntArray => 1007,  // PG `_int4` (INT[]) — v7.11.12 Epic 3
+        DataType::BigIntArray => 1016, // PG `_int8` (BIGINT[]) — v7.11.12 Epic 3
     }
 }
 

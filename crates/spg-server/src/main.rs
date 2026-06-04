@@ -4153,8 +4153,12 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Bytes
         // v7.10.9 — TEXT[] collapses to Text on the wire as the
         // PG external array form `{a,b,NULL}`. OID 1009 is set
-        // via `pg_type_oid`. Binary array format lands in v7.11.
-        | DataType::TextArray => WireType::Text,
+        // via `pg_type_oid`. Binary array format lands in v7.12+.
+        | DataType::TextArray
+        // v7.11.12 — INT[] / BIGINT[] same text-mode collapse;
+        // OIDs 1007 / 1016 via `pg_type_oid`.
+        | DataType::IntArray
+        | DataType::BigIntArray => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -4210,6 +4214,12 @@ fn value_to_wire(v: &Value) -> WireValue {
         // v7.10.9 — TEXT[] goes on the wire as PG external array
         // form (`{a,b,NULL}`). RowDescription advertises OID 1009.
         Value::TextArray(items) => WireValue::Text(spg_engine::eval::format_text_array(items)),
+        // v7.11.14 — INT[] / BIGINT[] external form `{1,2,NULL}`.
+        // RowDescription advertises OIDs 1007 / 1016.
+        Value::IntArray(items) => WireValue::Text(spg_engine::eval::format_int_array(items)),
+        Value::BigIntArray(items) => {
+            WireValue::Text(spg_engine::eval::format_bigint_array(items))
+        }
         // v7.5.0 — Value is #[non_exhaustive].
         _ => WireValue::Text(format!("{v:?}")),
     }

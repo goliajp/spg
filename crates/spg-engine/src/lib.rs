@@ -667,6 +667,8 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Timestamptz => "TIMESTAMPTZ".into(),
         DataType::Bytes => "BYTEA".into(),
         DataType::TextArray => "TEXT[]".into(),
+        DataType::IntArray => "INT[]".into(),
+        DataType::BigIntArray => "BIGINT[]".into(),
     }
 }
 
@@ -3841,13 +3843,50 @@ impl Engine {
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
         let ctx = EvalContext::new(&empty_schema, None);
         let dummy_row = Row::new(alloc::vec::Vec::new());
-        let items: alloc::vec::Vec<Option<alloc::string::String>> =
+        // v7.11.13 — unnest dispatches per array element type so
+        // INT[] / BIGINT[] surface their PG types in projection.
+        let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row>) =
             match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
-                Value::Null => alloc::vec::Vec::new(),
-                Value::TextArray(items) => items,
+                Value::Null => (DataType::Text, alloc::vec::Vec::new()),
+                Value::TextArray(items) => {
+                    let rows = items
+                        .into_iter()
+                        .map(|item| {
+                            Row::new(alloc::vec![match item {
+                                Some(s) => Value::Text(s),
+                                None => Value::Null,
+                            }])
+                        })
+                        .collect();
+                    (DataType::Text, rows)
+                }
+                Value::IntArray(items) => {
+                    let rows = items
+                        .into_iter()
+                        .map(|item| {
+                            Row::new(alloc::vec![match item {
+                                Some(n) => Value::Int(n),
+                                None => Value::Null,
+                            }])
+                        })
+                        .collect();
+                    (DataType::Int, rows)
+                }
+                Value::BigIntArray(items) => {
+                    let rows = items
+                        .into_iter()
+                        .map(|item| {
+                            Row::new(alloc::vec![match item {
+                                Some(n) => Value::BigInt(n),
+                                None => Value::Null,
+                            }])
+                        })
+                        .collect();
+                    (DataType::BigInt, rows)
+                }
                 other => {
                     return Err(EngineError::Unsupported(alloc::format!(
-                        "unnest() expects a TEXT[] argument, got {:?}",
+                        "unnest() expects an array argument, got {:?}",
                         other.data_type()
                     )));
                 }
@@ -3856,19 +3895,9 @@ impl Engine {
             .alias
             .clone()
             .unwrap_or_else(|| "unnest".to_string());
-        let col_schema = ColumnSchema::new(alias.clone(), DataType::Text, true);
+        let col_schema = ColumnSchema::new(alias.clone(), elem_dtype, true);
         let schema_cols = alloc::vec![col_schema.clone()];
         let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
-        // Materialise the synthetic rows.
-        let rows: alloc::vec::Vec<Row> = items
-            .into_iter()
-            .map(|item| {
-                Row::new(alloc::vec![match item {
-                    Some(s) => Value::Text(s),
-                    None => Value::Null,
-                }])
-            })
-            .collect();
         // Apply WHERE.
         let filtered: alloc::vec::Vec<Row> = if let Some(w) = &stmt.where_ {
             let mut out = alloc::vec::Vec::with_capacity(rows.len());
@@ -9139,6 +9168,62 @@ fn hex_nibble(b: u8) -> Result<u8, &'static str> {
 /// Quoted elements (`"hello, world"`) preserve embedded commas;
 /// `\\` and `\"` decode to literal backslash / quote. Plain
 /// unquoted `NULL` (case-insensitive) maps to `None`.
+/// v7.11.13 — pick the array type for `ARRAY[lit, …]` from the
+/// element values. Single-element-type rules:
+///   - all NULL / all Text → TextArray
+///   - all Int (or Int+NULL) → IntArray
+///   - any BigInt without Text → BigIntArray (widening)
+///   - any Text → TextArray (fallback; non-string elements
+///     render as text)
+fn array_literal_widen(items: alloc::vec::Vec<Value>) -> Value {
+    let mut has_text = false;
+    let mut has_bigint = false;
+    let mut has_int = false;
+    for v in &items {
+        match v {
+            Value::Null => {}
+            Value::Text(_) | Value::Json(_) => has_text = true,
+            Value::BigInt(_) => has_bigint = true,
+            Value::Int(_) | Value::SmallInt(_) => has_int = true,
+            _ => has_text = true,
+        }
+    }
+    if has_text || (!has_bigint && !has_int) {
+        let out: alloc::vec::Vec<Option<alloc::string::String>> = items
+            .into_iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::Text(s) | Value::Json(s) => Some(s),
+                other => Some(alloc::format!("{other:?}")),
+            })
+            .collect();
+        return Value::TextArray(out);
+    }
+    if has_bigint {
+        let out: alloc::vec::Vec<Option<i64>> = items
+            .into_iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::Int(n) => Some(i64::from(n)),
+                Value::SmallInt(n) => Some(i64::from(n)),
+                Value::BigInt(n) => Some(n),
+                _ => unreachable!("widen: unexpected non-integer in BigInt path"),
+            })
+            .collect();
+        return Value::BigIntArray(out);
+    }
+    let out: alloc::vec::Vec<Option<i32>> = items
+        .into_iter()
+        .map(|v| match v {
+            Value::Null => None,
+            Value::Int(n) => Some(n),
+            Value::SmallInt(n) => Some(i32::from(n)),
+            _ => unreachable!("widen: unexpected non-i32-compatible in Int path"),
+        })
+        .collect();
+    Value::IntArray(out)
+}
+
 fn decode_text_array_literal(
     s: &str,
 ) -> Result<alloc::vec::Vec<Option<alloc::string::String>>, &'static str> {
@@ -9290,6 +9375,8 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Jsonb => DataType::Jsonb,
         ColumnTypeName::Bytes => DataType::Bytes,
         ColumnTypeName::TextArray => DataType::TextArray,
+        ColumnTypeName::IntArray => DataType::IntArray,
+        ColumnTypeName::BigIntArray => DataType::BigIntArray,
     }
 }
 
@@ -9323,19 +9410,16 @@ fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
         // v7.10.10 — `ARRAY[lit, lit, …]` constructor accepted at
         // INSERT-time. Each element must reduce to a Value through
         // `literal_expr_to_value`; NULL elements become `None`.
-        // Casts (e.g. `ARRAY[]::TEXT[]`) flow through the outer
-        // Cast arm before reaching here.
+        // v7.11.13 — deduce shape from element values: all Int →
+        // IntArray; any BigInt → BigIntArray (widening); any Text
+        // → TextArray. Cast targets (`ARRAY[]::INT[]`) flow through
+        // the outer Cast arm before reaching here and re-coerce.
         Expr::Array(items) => {
-            let mut out: alloc::vec::Vec<Option<alloc::string::String>> =
-                alloc::vec::Vec::with_capacity(items.len());
+            let mut materialised: alloc::vec::Vec<Value> = alloc::vec::Vec::with_capacity(items.len());
             for elem in items {
-                match literal_expr_to_value(elem)? {
-                    Value::Null => out.push(None),
-                    Value::Text(s) => out.push(Some(s)),
-                    other => out.push(Some(alloc::format!("{other:?}"))),
-                }
+                materialised.push(literal_expr_to_value(elem)?);
             }
-            Ok(Value::TextArray(out))
+            Ok(array_literal_widen(materialised))
         }
         other => Err(EngineError::Unsupported(alloc::format!(
             "non-literal INSERT value expression: {other:?}"

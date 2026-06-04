@@ -155,6 +155,8 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
                 // doesn't fail.
                 CastTarget::RegType | CastTarget::RegClass => DataType::Text,
                 CastTarget::TextArray => DataType::TextArray,
+                CastTarget::IntArray => DataType::IntArray,
+                CastTarget::BigIntArray => DataType::BigIntArray,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),

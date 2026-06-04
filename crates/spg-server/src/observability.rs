@@ -584,6 +584,10 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v7.10.9 — TEXT[] sized like a small array of TEXT
                 // cells; rough heuristic (~4 elements × 16 chars).
                 DataType::TextArray => 64,
+                // v7.11.12 — INT[] / BIGINT[] rough heuristic
+                // (~4 elements × element size).
+                DataType::IntArray => 16,
+                DataType::BigIntArray => 32,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),
