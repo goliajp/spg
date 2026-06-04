@@ -22,7 +22,7 @@
 #![allow(
     clippy::uninlined_format_args,
     clippy::used_underscore_binding,
-    unsafe_code,
+    unsafe_code
 )]
 
 use std::path::PathBuf;
