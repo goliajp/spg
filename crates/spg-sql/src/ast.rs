@@ -752,6 +752,15 @@ pub struct TableRef {
     /// is STABILITY carve-out for v6.10 — needs the freezer to
     /// stamp each segment with a wall-clock at creation time.
     pub as_of_segment: Option<u32>,
+    /// v7.11.7 — `FROM unnest(<expr>) [AS] <alias>` set-returning
+    /// source. When `Some`, `name` is the alias (defaulting to
+    /// `"unnest"` when no `AS` is given) and the engine builds a
+    /// synthetic single-column table by evaluating the expression
+    /// once at SELECT entry. Each TEXT[] element becomes one row;
+    /// NULL elements become NULL cells. v7.11 supports
+    /// uncorrelated UNNEST only (the expr cannot reference outer
+    /// columns) and only as the FROM primary (no JOINs).
+    pub unnest_expr: Option<Box<Expr>>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -1909,6 +1918,7 @@ mod tests {
                     name: "users".into(),
                     alias: None,
                     as_of_segment: None,
+                    unnest_expr: None,
                 },
                 joins: vec![],
             }),

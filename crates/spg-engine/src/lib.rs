@@ -33,7 +33,7 @@ use spg_sql::ast::{
     BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
     CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement,
     CreateUserStatement, Expr, FrameBound, FrameKind, FromClause, IndexMethod, InsertStatement,
-    JoinKind, Literal, OrderBy, SelectItem, SelectStatement, Statement, UnOp, UnionKind,
+    JoinKind, Literal, OrderBy, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
     VecEncoding as SqlVecEncoding, WindowFrame,
 };
 use spg_sql::parser::{self, ParseError};
@@ -3887,6 +3887,134 @@ impl Engine {
 
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_lines)] // huge match — splitting fragments the planner
+    /// v7.11.7 — execute `SELECT … FROM unnest(expr) [AS] alias …`.
+    /// Synthesises a single-column virtual table whose column type
+    /// is TEXT and whose rows are the array elements. Routes
+    /// through the regular projection / WHERE / ORDER BY / LIMIT
+    /// machinery so set-returning UNNEST composes naturally with
+    /// the rest of the SELECT surface.
+    fn exec_select_unnest(
+        &self,
+        stmt: &SelectStatement,
+        primary: &TableRef,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let expr = primary
+            .unnest_expr
+            .as_deref()
+            .expect("caller guards unnest_expr.is_some()");
+        // Evaluate the array expression once. Empty schema / empty
+        // row — uncorrelated UNNEST cannot reference outer columns.
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = EvalContext::new(&empty_schema, None);
+        let dummy_row = Row::new(alloc::vec::Vec::new());
+        let items: alloc::vec::Vec<Option<alloc::string::String>> =
+            match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
+                Value::Null => alloc::vec::Vec::new(),
+                Value::TextArray(items) => items,
+                other => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "unnest() expects a TEXT[] argument, got {:?}",
+                        other.data_type()
+                    )));
+                }
+            };
+        let alias = primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| "unnest".to_string());
+        let col_schema = ColumnSchema::new(alias.clone(), DataType::Text, true);
+        let schema_cols = alloc::vec![col_schema.clone()];
+        let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
+        // Materialise the synthetic rows.
+        let rows: alloc::vec::Vec<Row> = items
+            .into_iter()
+            .map(|item| {
+                Row::new(alloc::vec![match item {
+                    Some(s) => Value::Text(s),
+                    None => Value::Null,
+                }])
+            })
+            .collect();
+        // Apply WHERE.
+        let filtered: alloc::vec::Vec<Row> = if let Some(w) = &stmt.where_ {
+            let mut out = alloc::vec::Vec::with_capacity(rows.len());
+            for row in rows {
+                cancel.check()?;
+                let v = eval::eval_expr(w, &row, &scan_ctx).map_err(EngineError::Eval)?;
+                if matches!(v, Value::Bool(true)) {
+                    out.push(row);
+                }
+            }
+            out
+        } else {
+            rows
+        };
+        // Projection.
+        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let mut projected_rows: alloc::vec::Vec<Row> =
+            alloc::vec::Vec::with_capacity(filtered.len());
+        for row in &filtered {
+            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+            for p in &projection {
+                vals.push(eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?);
+            }
+            projected_rows.push(Row::new(vals));
+        }
+        // ORDER BY / LIMIT — apply on the projected rows (cheap;
+        // unnest result sets are small by design).
+        let columns: alloc::vec::Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+        // Re-evaluate ORDER BY against the source schema (pre-projection
+        // so col refs by name still resolve through `scan_ctx`).
+        if !stmt.order_by.is_empty() {
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value>)> = filtered
+                .iter()
+                .enumerate()
+                .map(|(i, r)| -> Result<_, EngineError> {
+                    let keys: Result<Vec<Value>, EngineError> = stmt
+                        .order_by
+                        .iter()
+                        .map(|ob| {
+                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
+                        })
+                        .collect();
+                    Ok((i, keys?))
+                })
+                .collect::<Result<_, _>>()?;
+            indexed.sort_by(|a, b| {
+                for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
+                    let mut cmp = value_cmp(ka, kb);
+                    if stmt.order_by[idx].desc {
+                        cmp = cmp.reverse();
+                    }
+                    if cmp != core::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            projected_rows = indexed
+                .into_iter()
+                .map(|(i, _)| projected_rows[i].clone())
+                .collect();
+        }
+        // LIMIT / OFFSET — apply at the tail.
+        if let Some(offset) = stmt.offset_literal() {
+            let off = (offset as usize).min(projected_rows.len());
+            projected_rows.drain(..off);
+        }
+        if let Some(limit) = stmt.limit_literal() {
+            projected_rows.truncate(limit as usize);
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: projected_rows,
+        })
+    }
+
     fn exec_bare_select_cancel(
         &self,
         stmt: &SelectStatement,
@@ -3926,6 +4054,15 @@ impl Engine {
         // existing scan + index-seek path.
         if !from.joins.is_empty() {
             return self.exec_joined_select(stmt, from);
+        }
+        // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>`. Synthesise a
+        // single-column table at SELECT entry by evaluating the
+        // expression once against the empty row (UNNEST is
+        // uncorrelated in v7.11; correlated / LATERAL unnest is a
+        // v7.12 carve-out). Build a virtual `Table` in a heap-only
+        // catalog, then route to the regular scan path.
+        if from.primary.unnest_expr.is_some() {
+            return self.exec_select_unnest(stmt, &from.primary, cancel);
         }
         let primary = &from.primary;
         let table = self.active_catalog().get(&primary.name).ok_or_else(|| {

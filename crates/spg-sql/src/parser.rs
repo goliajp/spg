@@ -2317,6 +2317,31 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+        // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>` set-returning
+        // source. Detect at the head before the bare-ident fallback;
+        // unnest is not a reserved token.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("unnest"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // unnest
+            self.advance(); // (
+            let expr = self.parse_expr(0)?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after unnest() argument, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let alias_ident = self.parse_optional_alias();
+            let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: Some(Box::new(expr)),
+            });
+        }
         let name = self.expect_ident_like()?;
         // v6.10.2 — optional `AS OF SEGMENT '<id>'` cold-tier
         // time-travel clause. Parse BEFORE the alias so the
@@ -2366,6 +2391,7 @@ impl Parser {
             name,
             alias,
             as_of_segment,
+            unnest_expr: None,
         })
     }
 

@@ -53,7 +53,37 @@ Sub-versions:
   v7.11.4  README "Fan-out reads" + examples/multi_reader.rs
   v7.11.5  Epic 1 ship rollup — tag v7.11.0 + crates.io + docker
 
-Epics 2 (array ops) and 3 (type widening) follow.
+**Epic 2 — array ops (this release).** Without these, v7.10.2
+TEXT[] is a write-only blob — you can store an array but
+can't iterate it, search it, or extend it. Closes that gap:
+
+  * `array_length(arr, dim)` — element count for dim 1; NULL for
+    other dims (v7.11 is single-dim only).
+  * `array_position(arr, val)` — 1-based first-match index;
+    NULL on absent / NULL operand. NULL elements never match.
+  * `unnest(arr)` — set-returning at FROM position:
+    `SELECT u FROM unnest(labels) u`. NULL elements emit
+    NULL-valued rows. v7.11 supports uncorrelated UNNEST only
+    (no LATERAL, no JOIN); composes with WHERE / ORDER BY /
+    LIMIT through the standard scan path. `'{a,b}'::TEXT[]` cast
+    works inside unnest() too.
+  * `||` (array concat) — three overloads: `arr1 || arr2`,
+    `arr || elem`, `elem || arr`. NULL operand → NULL result
+    (PG semantics).
+
+13 e2e tests cover all four operators + edge cases (NULL
+elements, other dimensions, WHERE/LIMIT compose with unnest,
+quoted-PG-form decode inside unnest).
+
+Sub-versions:
+
+  v7.11.6  array_length + array_position builtins
+  v7.11.7  unnest set-returning at FROM position
+  v7.11.8  || array concat (3 overloads)
+  v7.11.9  13 e2e tests
+  v7.11.10 Epic 2 ship rollup — tag v7.11.1 + crates.io + docker
+
+Epic 3 (INT[] / BIGINT[] + BYTEA scalar ops) follows.
 
 ---
 

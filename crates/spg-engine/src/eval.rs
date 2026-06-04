@@ -485,6 +485,90 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 }),
             }
         }
+        // v7.11.6 — `array_length(arr, dim)` returns the element
+        // count of `arr` along dimension `dim`. v7.11 only models
+        // single-dimension arrays so dim must be 1 (otherwise NULL,
+        // matching PG semantics for unsupported dimensions). NULL
+        // array → NULL. v7.11 TEXT[] only; non-array operand is
+        // a type mismatch.
+        "array_length" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_length() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Value::TextArray(items) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_length() first arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
+            };
+            let dim: i64 = match args[1] {
+                Value::Int(n) => i64::from(n),
+                Value::BigInt(n) => n,
+                Value::SmallInt(n) => i64::from(n),
+                _ => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_length() second arg must be integer, got {:?}",
+                            args[1].data_type()
+                        ),
+                    });
+                }
+            };
+            if dim != 1 {
+                return Ok(Value::Null);
+            }
+            let n = i32::try_from(items.len()).unwrap_or(i32::MAX);
+            Ok(Value::Int(n))
+        }
+        // v7.11.6 — `array_position(arr, val)` returns 1-based
+        // index of the first element of `arr` equal to `val`, or
+        // NULL if not found. PG NULL semantics: NULL array → NULL;
+        // NULL val never matches (returns NULL if absent).
+        "array_position" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("array_position() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Value::TextArray(items) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_position() first arg must be an array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
+            };
+            let needle = match &args[1] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_position() needle must be text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            for (idx, item) in items.iter().enumerate() {
+                if let Some(s) = item
+                    && s == &needle
+                {
+                    return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
+                }
+            }
+            Ok(Value::Null)
+        }
         "upper" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -2314,6 +2398,38 @@ const fn cmp_to_bool(op: BinOp, ord: core::cmp::Ordering) -> bool {
 /// rule as `::text` cast. NULL propagates (handled above; this function only
 /// runs with non-NULL operands).
 fn text_concat(l: &Value, r: &Value) -> Value {
+    // v7.11.8 — PG `||` overloads: TEXT[] || TEXT[] = concatenated array;
+    // TEXT[] || TEXT (or TEXT || TEXT[]) prepends/appends the single
+    // element. NULL || anything = NULL (PG semantics for arrays;
+    // text concat treats NULL the same way after value_to_text).
+    match (l, r) {
+        (Value::Null, _) | (_, Value::Null) => {
+            // PG text concat: NULL || x = NULL. Array concat: NULL || x = NULL.
+            // Keep the legacy text path (value_to_text handles Null as ""),
+            // but for arrays we surface real NULL to match PG.
+            if matches!(l, Value::TextArray(_)) || matches!(r, Value::TextArray(_)) {
+                return Value::Null;
+            }
+        }
+        (Value::TextArray(a), Value::TextArray(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().cloned());
+            return Value::TextArray(out);
+        }
+        (Value::TextArray(a), Value::Text(s)) => {
+            let mut out = a.clone();
+            out.push(Some(s.clone()));
+            return Value::TextArray(out);
+        }
+        (Value::Text(s), Value::TextArray(b)) => {
+            let mut out: alloc::vec::Vec<Option<alloc::string::String>> =
+                alloc::vec::Vec::with_capacity(1 + b.len());
+            out.push(Some(s.clone()));
+            out.extend(b.iter().cloned());
+            return Value::TextArray(out);
+        }
+        _ => {}
+    }
     let a = value_to_text(l);
     let b = value_to_text(r);
     Value::Text(a + &b)
