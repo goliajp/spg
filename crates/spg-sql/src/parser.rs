@@ -613,13 +613,11 @@ impl Parser {
             self.advance();
             publications.push(self.expect_ident_like()?);
         }
-        Ok(Statement::CreateSubscription(
-            CreateSubscriptionStatement {
-                name,
-                conn_str,
-                publications,
-            },
-        ))
+        Ok(Statement::CreateSubscription(CreateSubscriptionStatement {
+            name,
+            conn_str,
+            publications,
+        }))
     }
 
     /// v6.1.7 — `WAIT FOR WAL POSITION <pos> [WITH TIMEOUT <ms>]`.
@@ -631,10 +629,7 @@ impl Parser {
         // other two are bare idents — they've never needed lexer
         // support and we keep it that way.
         if !matches!(self.peek(), Token::For) {
-            return Err(self.err(format!(
-                "expected FOR after WAIT, got {:?}",
-                self.peek()
-            )));
+            return Err(self.err(format!("expected FOR after WAIT, got {:?}", self.peek())));
         }
         self.advance();
         self.expect_keyword_ident("wal")?;
@@ -755,7 +750,9 @@ impl Parser {
     /// clause on INSERT / UPDATE / DELETE. Same projection grammar
     /// as SELECT, so `RETURNING *`, `RETURNING col`,
     /// `RETURNING expr AS alias`, and `RETURNING a, b, c` all work.
-    fn parse_optional_returning(&mut self) -> Result<Option<Vec<crate::ast::SelectItem>>, ParseError> {
+    fn parse_optional_returning(
+        &mut self,
+    ) -> Result<Option<Vec<crate::ast::SelectItem>>, ParseError> {
         let is_returning_kw = matches!(
             self.peek(),
             Token::Ident(s) if s.eq_ignore_ascii_case("returning")
@@ -794,7 +791,9 @@ impl Parser {
                 return self.parse_alter_table_after_keyword();
             }
             other => {
-                return Err(self.err(format!("expected INDEX or TABLE after ALTER, got {other:?}")));
+                return Err(self.err(format!(
+                    "expected INDEX or TABLE after ALTER, got {other:?}"
+                )));
             }
         }
         let name = self.expect_ident_like()?;
@@ -1032,19 +1031,6 @@ impl Parser {
         }
     }
 
-    fn expect_u32_literal(&mut self, label: &str) -> Result<u32, ParseError> {
-        match self.advance() {
-            Token::Integer(n) if n >= 0 => u32::try_from(n).map_err(|_| ParseError {
-                message: format!("{label} value too large: {n}"),
-                token_pos: self.pos.saturating_sub(1),
-            }),
-            other => Err(ParseError {
-                message: format!("expected non-negative integer after {label}, got {other:?}"),
-                token_pos: self.pos.saturating_sub(1),
-            }),
-        }
-    }
-
     /// Parse one SELECT block without ORDER BY / LIMIT / UNION chaining —
     /// just `[DISTINCT] items [FROM] [WHERE] [GROUP BY]`. Returned with
     /// `unions` empty and `order_by` / `limit` `None`; the top-level
@@ -1211,9 +1197,7 @@ impl Parser {
         is_unique && is_lparen
     }
 
-    fn parse_table_level_primary_key(
-        &mut self,
-    ) -> Result<crate::ast::TableConstraint, ParseError> {
+    fn parse_table_level_primary_key(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
         self.advance(); // PRIMARY
         self.advance(); // KEY
         let columns = self.parse_paren_ident_list("PRIMARY KEY")?;
@@ -1223,9 +1207,7 @@ impl Parser {
         })
     }
 
-    fn parse_table_level_unique(
-        &mut self,
-    ) -> Result<crate::ast::TableConstraint, ParseError> {
+    fn parse_table_level_unique(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
         self.advance(); // UNIQUE
         let columns = self.parse_paren_ident_list("UNIQUE")?;
         Ok(crate::ast::TableConstraint::Unique {
@@ -1234,10 +1216,7 @@ impl Parser {
         })
     }
 
-    fn parse_paren_ident_list(
-        &mut self,
-        ctx: &str,
-    ) -> Result<Vec<String>, ParseError> {
+    fn parse_paren_ident_list(&mut self, ctx: &str) -> Result<Vec<String>, ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(alloc::format!(
                 "expected '(' after {ctx}, got {:?}",
@@ -1306,7 +1285,10 @@ impl Parser {
         }
         // `(col, col, ...)`
         if !matches!(self.peek(), Token::LParen) {
-            return Err(self.err(format!("expected '(' after FOREIGN KEY, got {:?}", self.peek())));
+            return Err(self.err(format!(
+                "expected '(' after FOREIGN KEY, got {:?}",
+                self.peek()
+            )));
         }
         self.advance();
         let mut columns = Vec::new();
@@ -1320,7 +1302,11 @@ impl Parser {
                     self.advance();
                     break;
                 }
-                other => return Err(self.err(format!("expected ',' or ')' in FK column list, got {other:?}"))),
+                other => {
+                    return Err(self.err(format!(
+                        "expected ',' or ')' in FK column list, got {other:?}"
+                    )));
+                }
             }
         }
         if columns.is_empty() {
@@ -1364,7 +1350,11 @@ impl Parser {
                         self.advance();
                         break;
                     }
-                    other => return Err(self.err(format!("expected ',' or ')' in REFERENCES column list, got {other:?}"))),
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in REFERENCES column list, got {other:?}"
+                        )));
+                    }
                 }
             }
         }
@@ -1444,9 +1434,9 @@ impl Parser {
                     on_update = action;
                 }
                 other => {
-                    return Err(self.err(format!(
-                        "expected DELETE or UPDATE after ON, got {other:?}"
-                    )));
+                    return Err(
+                        self.err(format!("expected DELETE or UPDATE after ON, got {other:?}"))
+                    );
                 }
             }
         }
@@ -1459,23 +1449,19 @@ impl Parser {
         match self.advance() {
             Token::Ident(s) if s.eq_ignore_ascii_case("cascade") => Ok(FkAction::Cascade),
             Token::Ident(s) if s.eq_ignore_ascii_case("restrict") => Ok(FkAction::Restrict),
-            Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
-                match self.advance() {
-                    Token::Null => Ok(FkAction::SetNull),
-                    Token::Default => Ok(FkAction::SetDefault),
-                    other => Err(self.err(format!(
-                        "expected NULL or DEFAULT after SET in FK action, got {other:?}"
-                    ))),
-                }
-            }
-            Token::Ident(s) if s.eq_ignore_ascii_case("no") => {
-                match self.advance() {
-                    Token::Ident(s) if s.eq_ignore_ascii_case("action") => Ok(FkAction::NoAction),
-                    other => Err(self.err(format!(
-                        "expected ACTION after NO in FK action, got {other:?}"
-                    ))),
-                }
-            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("set") => match self.advance() {
+                Token::Null => Ok(FkAction::SetNull),
+                Token::Default => Ok(FkAction::SetDefault),
+                other => Err(self.err(format!(
+                    "expected NULL or DEFAULT after SET in FK action, got {other:?}"
+                ))),
+            },
+            Token::Ident(s) if s.eq_ignore_ascii_case("no") => match self.advance() {
+                Token::Ident(s) if s.eq_ignore_ascii_case("action") => Ok(FkAction::NoAction),
+                other => Err(self.err(format!(
+                    "expected ACTION after NO in FK action, got {other:?}"
+                ))),
+            },
             other => Err(self.err(format!(
                 "expected CASCADE | RESTRICT | SET NULL | SET DEFAULT | NO ACTION, got {other:?}"
             ))),
@@ -1636,9 +1622,7 @@ impl Parser {
             Token::Ident(_) | Token::QuotedIdent(_) => {
                 let key_expr = self.parse_expr(0)?;
                 let primary = extract_first_column(&key_expr).ok_or_else(|| {
-                    self.err(
-                        "expression index key must reference at least one column".into(),
-                    )
+                    self.err("expression index key must reference at least one column".into())
                 })?;
                 (primary, Some(key_expr))
             }
@@ -1675,38 +1659,35 @@ impl Parser {
         // v6.8.0 — optional `INCLUDE (col1, col2, …)` clause for
         // index-only-scan annotation. Bare ident (not a reserved
         // keyword) so we test by case-insensitive string match.
-        let included_columns =
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("include")) {
-                self.advance();
-                if !matches!(self.peek(), Token::LParen) {
-                    return Err(self.err(format!(
-                        "expected '(' after INCLUDE, got {:?}",
-                        self.peek()
-                    )));
-                }
-                self.advance();
-                let mut cols = Vec::new();
-                loop {
-                    cols.push(self.expect_ident_like()?);
-                    match self.peek() {
-                        Token::Comma => {
-                            self.advance();
-                        }
-                        Token::RParen => {
-                            self.advance();
-                            break;
-                        }
-                        other => {
-                            return Err(self.err(format!(
-                                "expected ',' or ')' in INCLUDE list, got {other:?}"
-                            )));
-                        }
+        let included_columns = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("include"))
+        {
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(format!("expected '(' after INCLUDE, got {:?}", self.peek())));
+            }
+            self.advance();
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_ident_like()?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in INCLUDE list, got {other:?}"
+                        )));
                     }
                 }
-                cols
-            } else {
-                Vec::new()
-            };
+            }
+            cols
+        } else {
+            Vec::new()
+        };
         // v6.8.1 — optional `WHERE <expr>` partial-index predicate.
         let partial_predicate = if matches!(self.peek(), Token::Where) {
             self.advance();
@@ -1754,8 +1735,7 @@ impl Parser {
         if !inline_references {
             return Ok((col, None));
         }
-        let (parent_table, parent_columns, on_delete, on_update) =
-            self.parse_references_tail(1)?;
+        let (parent_table, parent_columns, on_delete, on_update) = self.parse_references_tail(1)?;
         let fk = ForeignKeyConstraint {
             name: None,
             columns: vec![col.name.clone()],
@@ -1877,9 +1857,7 @@ impl Parser {
             }
             self.advance();
             if !matches!(ty, ColumnTypeName::Text) {
-                return Err(self.err(alloc::format!(
-                    "v7.10 only supports TEXT[]; got {ty:?}[]"
-                )));
+                return Err(self.err(alloc::format!("v7.10 only supports TEXT[]; got {ty:?}[]")));
             }
             ty = ColumnTypeName::TextArray;
         }
@@ -2356,9 +2334,7 @@ impl Parser {
             let kw = match self.peek().clone() {
                 Token::Ident(s) | Token::QuotedIdent(s) => s,
                 other => {
-                    return Err(self.err(format!(
-                        "expected SEGMENT after AS OF, got {other:?}"
-                    )));
+                    return Err(self.err(format!("expected SEGMENT after AS OF, got {other:?}")));
                 }
             };
             if !kw.eq_ignore_ascii_case("segment") {
@@ -2373,9 +2349,8 @@ impl Parser {
                 Token::String(s) => s
                     .parse::<u32>()
                     .map_err(|e| self.err(format!("AS OF SEGMENT id parse: {e}")))?,
-                Token::Integer(n) => u32::try_from(n).map_err(|e| {
-                    self.err(format!("AS OF SEGMENT id parse: {e}"))
-                })?,
+                Token::Integer(n) => u32::try_from(n)
+                    .map_err(|e| self.err(format!("AS OF SEGMENT id parse: {e}")))?,
                 other => {
                     return Err(self.err(format!(
                         "expected segment id literal after AS OF SEGMENT, got {other:?}"
@@ -3449,11 +3424,7 @@ impl Parser {
         let lc = first.to_ascii_lowercase();
         if matches!(
             lc.as_str(),
-            "current_date"
-                | "current_time"
-                | "current_timestamp"
-                | "localtimestamp"
-                | "localtime"
+            "current_date" | "current_time" | "current_timestamp" | "localtimestamp" | "localtime"
         ) {
             return Ok(Expr::FunctionCall {
                 name: lc,
@@ -4199,7 +4170,10 @@ mod tests {
         };
         assert!(c.is_unique);
         assert_eq!(c.column, "calendar_id");
-        assert_eq!(c.extra_columns, vec!["uid".to_string(), "recurrence_id".to_string()]);
+        assert_eq!(
+            c.extra_columns,
+            vec!["uid".to_string(), "recurrence_id".to_string()]
+        );
         assert!(c.partial_predicate.is_some());
     }
 
@@ -4211,10 +4185,8 @@ mod tests {
 
     #[test]
     fn create_unique_index_using_hnsw_rejected() {
-        let err = parse_statement(
-            "CREATE UNIQUE INDEX uq_v ON t USING hnsw (embedding)",
-        )
-        .unwrap_err();
+        let err =
+            parse_statement("CREATE UNIQUE INDEX uq_v ON t USING hnsw (embedding)").unwrap_err();
         assert!(err.message.contains("UNIQUE"), "{}", err.message);
     }
 
@@ -4464,7 +4436,9 @@ mod tests {
 
     #[test]
     fn parser_recognises_create_subscription_single_publication() {
-        let s = parse("CREATE SUBSCRIPTION sub_a CONNECTION 'host=127.0.0.1 port=20002' PUBLICATION pub_a");
+        let s = parse(
+            "CREATE SUBSCRIPTION sub_a CONNECTION 'host=127.0.0.1 port=20002' PUBLICATION pub_a",
+        );
         let Statement::CreateSubscription(c) = s else {
             panic!("expected CreateSubscription, got {s:?}")
         };
@@ -4475,9 +4449,7 @@ mod tests {
 
     #[test]
     fn parser_recognises_create_subscription_multi_publication() {
-        let s = parse(
-            "CREATE SUBSCRIPTION sub_a CONNECTION 'host=h' PUBLICATION p1, p2, p3",
-        );
+        let s = parse("CREATE SUBSCRIPTION sub_a CONNECTION 'host=h' PUBLICATION p1, p2, p3");
         let Statement::CreateSubscription(c) = s else {
             panic!()
         };

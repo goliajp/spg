@@ -420,9 +420,10 @@ pub(crate) fn audit_verify_snapshot() -> (i64, i64) {
         Ok(()) => (n, -1),
         Err(spg_audit::AuditError::BrokenChain { seq })
         | Err(spg_audit::AuditError::HashMismatch { seq })
-        | Err(spg_audit::AuditError::InvalidUtf8 { seq }) => {
-            (i64::try_from(seq).unwrap_or(i64::MAX), i64::try_from(seq).unwrap_or(i64::MAX))
-        }
+        | Err(spg_audit::AuditError::InvalidUtf8 { seq }) => (
+            i64::try_from(seq).unwrap_or(i64::MAX),
+            i64::try_from(seq).unwrap_or(i64::MAX),
+        ),
         Err(_) => (0, 0),
     }
 }
@@ -461,11 +462,7 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
     conns
         .iter()
         .map(|c| {
-            let current_sql = c
-                .current_sql
-                .read()
-                .map(|g| g.clone())
-                .unwrap_or_default();
+            let current_sql = c.current_sql.read().map(|g| g.clone()).unwrap_or_default();
             spg_engine::ActivityRow {
                 pid: c.pid,
                 user: c.user.clone(),
@@ -562,10 +559,7 @@ fn main() {
 /// is dropped at fn exit. Sandboxed by design: a WAL containing
 /// poisonous SQL still bubbles up the exec error here, but
 /// can't push state into a live deployment.
-fn run_replay_only(
-    db_path: Option<PathBuf>,
-    wal_path: Option<PathBuf>,
-) -> std::io::Result<()> {
+fn run_replay_only(db_path: Option<PathBuf>, wal_path: Option<PathBuf>) -> std::io::Result<()> {
     let mut engine = match db_path.as_deref() {
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;
@@ -1775,10 +1769,7 @@ fn handle_set_wal_level(
 
 /// v6.1.8 — handler for the SHOW intercept. Returns a single
 /// row `(effective_wal_level TEXT NOT NULL)`.
-fn handle_show_wal_level(
-    stream: &mut TcpStream,
-    state: &Arc<ServerState>,
-) -> std::io::Result<()> {
+fn handle_show_wal_level(stream: &mut TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let level = state.wal_level.load(Ordering::Acquire);
     let row = vec![Row::new(vec![Value::Text(
         wal_level_label(level).to_string(),
@@ -1788,7 +1779,10 @@ fn handle_show_wal_level(
         DataType::Text,
         false,
     )];
-    emit_result(stream, Ok(spg_engine::QueryResult::Rows { columns, rows: row }))
+    emit_result(
+        stream,
+        Ok(spg_engine::QueryResult::Rows { columns, rows: row }),
+    )
 }
 
 /// v6.1.7 — cheap prefix-match for `WAIT FOR`. The wire-layer
@@ -1821,12 +1815,10 @@ fn handle_wait_for_wal_position(
     timeout_ms: Option<u64>,
 ) -> std::io::Result<()> {
     const POLL: std::time::Duration = std::time::Duration::from_millis(5);
-    let deadline = timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    let deadline =
+        timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     loop {
-        let current = state
-            .lag_state
-            .follower_applied_pos
-            .load(Ordering::Acquire);
+        let current = state.lag_state.follower_applied_pos.load(Ordering::Acquire);
         if current >= target {
             return emit_result(
                 stream,
@@ -2555,8 +2547,7 @@ fn run_compact_cold_segments_command(
             let Some(merged_id) = report.merged_segment_id else {
                 continue;
             };
-            match persist_compact_merged_segment(db_path, merged_id, &report.merged_segment_bytes)
-            {
+            match persist_compact_merged_segment(db_path, merged_id, &report.merged_segment_bytes) {
                 Ok(merged_path) => {
                     if let Ok(mut paths) = state.cold_segment_paths.lock() {
                         for src in &report.sources {
@@ -2838,8 +2829,7 @@ pub(crate) fn wal_compression_min_bytes() -> usize {
 pub(crate) fn wal_compression_enabled() -> bool {
     static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECKED.get_or_init(|| {
-        std::env::var("SPG_WAL_COMPRESSION")
-            .map_or(true, |v| !v.eq_ignore_ascii_case("none"))
+        std::env::var("SPG_WAL_COMPRESSION").map_or(true, |v| !v.eq_ignore_ascii_case("none"))
     })
 }
 
@@ -3266,7 +3256,8 @@ fn run_leader_commit_round(state: &ServerState) {
                 // uncompressed (type=0x01) and LZSS-compressed
                 // (type=0x03) based on payload size + env knob.
                 // v6.6.3 — tracks bytes-in/bytes-out via Metrics.
-                let wal_bytes = match encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics) {
+                let wal_bytes = match encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics)
+                {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = engine.execute_in("ROLLBACK", tx_id);
@@ -4118,7 +4109,10 @@ fn emit_result(
         }
         Err(e) => write_frame(stream, &build_error_response(&e.to_string())),
         // v7.5.0 — QueryResult is #[non_exhaustive].
-        Ok(_) => write_frame(stream, &build_error_response("unexpected QueryResult variant")),
+        Ok(_) => write_frame(
+            stream,
+            &build_error_response("unexpected QueryResult variant"),
+        ),
     }
 }
 

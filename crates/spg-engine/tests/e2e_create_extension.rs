@@ -3,8 +3,13 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(eng: &mut Engine, sql: &str) {
-    let r = eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
-    assert!(matches!(r, QueryResult::CommandOk { affected: 0, .. }), "{sql:?}");
+    let r = eng
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
+    assert!(
+        matches!(r, QueryResult::CommandOk { affected: 0, .. }),
+        "{sql:?}"
+    );
 }
 
 #[test]
@@ -38,7 +43,9 @@ fn create_extension_does_not_modify_catalog() {
     let mut eng = Engine::new();
     let r = eng.execute("CREATE EXTENSION vector").unwrap();
     match r {
-        QueryResult::CommandOk { modified_catalog, .. } => {
+        QueryResult::CommandOk {
+            modified_catalog, ..
+        } => {
             assert!(!modified_catalog);
         }
         _ => panic!("expected CommandOk"),
@@ -52,6 +59,8 @@ fn dual_target_dump_friendly() {
     // both backends.
     let mut eng = Engine::new();
     ok(&mut eng, "CREATE EXTENSION IF NOT EXISTS vector");
-    ok(&mut eng,
-        "CREATE TABLE docs (id INT NOT NULL, emb VECTOR(4) NOT NULL)");
+    ok(
+        &mut eng,
+        "CREATE TABLE docs (id INT NOT NULL, emb VECTOR(4) NOT NULL)",
+    );
 }

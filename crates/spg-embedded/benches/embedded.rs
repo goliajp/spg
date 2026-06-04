@@ -65,7 +65,8 @@ fn bench_select_by_pk(c: &mut Criterion) {
 
 fn bench_select_range(c: &mut Criterion) {
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE t (id INT NOT NULL, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL, v INT)")
+        .unwrap();
     db.execute("CREATE INDEX t_pk ON t (id)").unwrap();
     db.with_transaction(|tx| {
         for i in 0..10_000 {
@@ -95,7 +96,8 @@ fn bench_vector_knn(c: &mut Criterion) {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE docs (id INT NOT NULL, emb VECTOR(8) NOT NULL)")
         .unwrap();
-    db.execute("CREATE INDEX docs_emb ON docs USING hnsw (emb)").unwrap();
+    db.execute("CREATE INDEX docs_emb ON docs USING hnsw (emb)")
+        .unwrap();
     db.with_transaction(|tx| {
         for i in 0..2_000 {
             let v: Vec<f32> = (0..8).map(|j| ((i + j) as f32) * 0.01).collect();

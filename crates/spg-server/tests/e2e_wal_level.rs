@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use spg_wire::{
-    Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch,
-};
+use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
 mod common;
 
@@ -24,7 +22,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-wal-lvl-e2e-{tag}-{pid}-{nanos}-{serial}"));
     std::fs::create_dir_all(&dir).expect("create tmpdir");
@@ -162,11 +162,20 @@ fn set_logical_then_show_returns_logical() {
     let _guard = common::ChildGuard(raw);
     let mut client = common::connect_to(&addrs.native);
     client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    assert_eq!(select_text(&mut client, "SHOW effective_wal_level"), "replica");
+    assert_eq!(
+        select_text(&mut client, "SHOW effective_wal_level"),
+        "replica"
+    );
     exec_ok(&mut client, "SET effective_wal_level = 'logical'");
-    assert_eq!(select_text(&mut client, "SHOW effective_wal_level"), "logical");
+    assert_eq!(
+        select_text(&mut client, "SHOW effective_wal_level"),
+        "logical"
+    );
     exec_ok(&mut client, "SET effective_wal_level = 'replica'");
-    assert_eq!(select_text(&mut client, "SHOW effective_wal_level"), "replica");
+    assert_eq!(
+        select_text(&mut client, "SHOW effective_wal_level"),
+        "replica"
+    );
 }
 
 #[test]
@@ -204,9 +213,7 @@ fn replica_mode_rejects_subscription_traffic() {
     let (h, p) = repl.split_once(':').unwrap();
     exec_ok(
         &mut s_client,
-        &format!(
-            "CREATE SUBSCRIPTION sub_a CONNECTION 'host={h} port={p}' PUBLICATION pub_a"
-        ),
+        &format!("CREATE SUBSCRIPTION sub_a CONNECTION 'host={h} port={p}' PUBLICATION pub_a"),
     );
     // Give multiple handshake attempts time to fail.
     std::thread::sleep(Duration::from_millis(1500));
@@ -247,9 +254,7 @@ fn flip_to_logical_unblocks_existing_subscription() {
     let (h, port) = repl.split_once(':').unwrap();
     exec_ok(
         &mut s_client,
-        &format!(
-            "CREATE SUBSCRIPTION sub_a CONNECTION 'host={h} port={port}' PUBLICATION pub_a"
-        ),
+        &format!("CREATE SUBSCRIPTION sub_a CONNECTION 'host={h} port={port}' PUBLICATION pub_a"),
     );
     std::thread::sleep(Duration::from_millis(500));
 
@@ -297,11 +302,17 @@ fn set_invalid_value_errors() {
     let _guard = common::ChildGuard(raw);
     let mut client = common::connect_to(&addrs.native);
     client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    send(&mut client, &build_query("SET effective_wal_level = 'nope'"));
+    send(
+        &mut client,
+        &build_query("SET effective_wal_level = 'nope'"),
+    );
     let f = read_frame(&mut client);
     assert_eq!(f.op, Op::ErrorResponse);
     let msg = spg_wire::parse_error_response(&f).unwrap_or("<undecodable>");
-    assert!(msg.contains("nope") || msg.contains("expected"), "got: {msg}");
+    assert!(
+        msg.contains("nope") || msg.contains("expected"),
+        "got: {msg}"
+    );
 }
 
 #[test]

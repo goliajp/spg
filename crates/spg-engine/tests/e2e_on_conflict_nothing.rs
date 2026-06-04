@@ -53,10 +53,8 @@ fn do_nothing_with_mixed_batch() {
         "INSERT INTO u VALUES (1)",
     ]);
     // Of (1), (2), (3): (1) collides; 2 and 3 new.
-    eng.execute(
-        "INSERT INTO u VALUES (1), (2), (3) ON CONFLICT (id) DO NOTHING",
-    )
-    .unwrap();
+    eng.execute("INSERT INTO u VALUES (1), (2), (3) ON CONFLICT (id) DO NOTHING")
+        .unwrap();
     assert_eq!(count(&mut eng, "SELECT id FROM u"), 3);
 }
 

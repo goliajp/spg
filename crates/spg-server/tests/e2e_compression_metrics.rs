@@ -61,10 +61,7 @@ fn drain_until_cc(s: &mut TcpStream, sql: &str) {
         match op {
             Op::CommandComplete => return,
             Op::ErrorResponse | Op::Error => {
-                let f = spg_wire::Frame {
-                    op,
-                    payload: body,
-                };
+                let f = spg_wire::Frame { op, payload: body };
                 panic!(
                     "SQL failed: {sql:?} → {}",
                     parse_error_response(&f).unwrap_or("<undecodable>")

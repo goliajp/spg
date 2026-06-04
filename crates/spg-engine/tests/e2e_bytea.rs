@@ -4,7 +4,8 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
-    eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
+    eng.execute(sql)
+        .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
 fn select_value(eng: &mut Engine, sql: &str) -> Value {
@@ -97,7 +98,10 @@ fn odd_length_hex_rejected() {
 #[test]
 fn bytea_persists_across_snapshot() {
     let mut eng = Engine::new();
-    ok(&mut eng, "CREATE TABLE t (id INT NOT NULL, b BYTEA NOT NULL)");
+    ok(
+        &mut eng,
+        "CREATE TABLE t (id INT NOT NULL, b BYTEA NOT NULL)",
+    );
     ok(&mut eng, "INSERT INTO t VALUES (1, '\\xDEADBEEF')");
     ok(&mut eng, "INSERT INTO t VALUES (2, '\\xCAFE')");
     let bytes = eng.snapshot();

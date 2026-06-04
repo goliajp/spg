@@ -83,8 +83,8 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -182,7 +182,8 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
             }
         }
         let sql_bytes = &wal_bytes[cur + header_len..cur + header_len + rec_len];
-        let sql = std::str::from_utf8(sql_bytes).map_err(|e| format!("WAL replay: non-UTF-8 SQL at offset {cur}: {e}"))?;
+        let sql = std::str::from_utf8(sql_bytes)
+            .map_err(|e| format!("WAL replay: non-UTF-8 SQL at offset {cur}: {e}"))?;
         engine
             .execute(sql)
             .map_err(|e| format!("WAL replay: apply {sql:?} at offset {cur} rejected: {e:?}"))?;
@@ -348,18 +349,14 @@ impl Database {
                                 );
                                 continue;
                             }
-                            if engine
-                                .catalog()
-                                .cold_segment(entry.segment_id)
-                                .is_some()
-                            {
+                            if engine.catalog().cold_segment(entry.segment_id).is_some() {
                                 // Already loaded via Catalog::clone path (shouldn't happen
                                 // since Engine::new + restore_envelope don't populate cold).
                                 continue;
                             }
                             let mut new_cat = engine.catalog().clone();
-                            if let Err(e) = new_cat
-                                .load_segment_bytes_at(entry.segment_id, seg_bytes)
+                            if let Err(e) =
+                                new_cat.load_segment_bytes_at(entry.segment_id, seg_bytes)
                             {
                                 eprintln!(
                                     "spg-embedded: manifest load segment {} failed: {e}",
@@ -368,8 +365,7 @@ impl Database {
                                 continue;
                             }
                             engine.replace_catalog(new_cat);
-                            cold_segment_paths
-                                .insert(entry.segment_id, entry.path.clone());
+                            cold_segment_paths.insert(entry.segment_id, entry.path.clone());
                         } else {
                             eprintln!(
                                 "spg-embedded: manifest skip segment {}: file unreadable",
@@ -535,8 +531,9 @@ impl Database {
     /// round-tripping in-memory state without going through
     /// the `spg-server` WAL.
     pub fn restore(snapshot: &[u8]) -> Result<Self, EngineError> {
-        let engine = Engine::restore_envelope(snapshot)
-            .map_err(|e| EngineError::Storage(spg_storage::StorageError::Corrupt(format!("restore: {e}"))))?;
+        let engine = Engine::restore_envelope(snapshot).map_err(|e| {
+            EngineError::Storage(spg_storage::StorageError::Corrupt(format!("restore: {e}")))
+        })?;
         Ok(Self {
             engine,
             persistence: None,
@@ -567,7 +564,13 @@ impl Database {
         let result = self.engine.execute(sql)?;
         if self.persistence.is_some()
             && !sql_is_read_only(sql)
-            && matches!(&result, QueryResult::CommandOk { modified_catalog: true, .. })
+            && matches!(
+                &result,
+                QueryResult::CommandOk {
+                    modified_catalog: true,
+                    ..
+                }
+            )
         {
             // Append + sync the v3 record AFTER the in-memory
             // exec succeeds, so a WAL record never describes a
@@ -595,9 +598,7 @@ impl Database {
     /// generate the impl, or write it by hand.
     pub fn query_typed<T: FromSpgRow>(&mut self, sql: &str) -> Result<Vec<T>, EngineError> {
         let rows = self.query(sql)?;
-        rows.into_iter()
-            .map(|r| T::from_spg_row(&r))
-            .collect()
+        rows.into_iter().map(|r| T::from_spg_row(&r)).collect()
     }
 
     /// Run a SELECT and return rows as a `Vec<Vec<Value>>` —
@@ -886,9 +887,7 @@ fn background_freezer_loop(
             continue;
         }
         if let Err(e) = guard.freeze_oldest_to_cold(&table, &index, to_freeze) {
-            eprintln!(
-                "spg-embedded: background freeze on {table}.{index} failed: {e:?}"
-            );
+            eprintln!("spg-embedded: background freeze on {table}.{index} failed: {e:?}");
             continue;
         }
         // v7.7.4 — auto-compact. If the catalog now carries
@@ -1303,7 +1302,8 @@ mod tests {
     #[test]
     fn in_memory_create_insert_select() {
         let mut db = Database::open_in_memory();
-        db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
         db.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
         let rows = db.query("SELECT id FROM t WHERE id = 1").unwrap();

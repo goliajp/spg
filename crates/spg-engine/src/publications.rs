@@ -237,7 +237,8 @@ mod tests {
     #[test]
     fn single_all_tables_roundtrips() {
         let mut p = Publications::new();
-        p.create("pub_a".into(), PublicationScope::AllTables).unwrap();
+        p.create("pub_a".into(), PublicationScope::AllTables)
+            .unwrap();
         let bytes = p.serialize();
         let p2 = Publications::deserialize(&bytes).unwrap();
         assert_eq!(p, p2);
@@ -248,7 +249,8 @@ mod tests {
     #[test]
     fn duplicate_create_errors() {
         let mut p = Publications::new();
-        p.create("pub_a".into(), PublicationScope::AllTables).unwrap();
+        p.create("pub_a".into(), PublicationScope::AllTables)
+            .unwrap();
         let err = p
             .create("pub_a".into(), PublicationScope::AllTables)
             .unwrap_err();
@@ -258,7 +260,8 @@ mod tests {
     #[test]
     fn drop_present_returns_true_drop_absent_false() {
         let mut p = Publications::new();
-        p.create("pub_a".into(), PublicationScope::AllTables).unwrap();
+        p.create("pub_a".into(), PublicationScope::AllTables)
+            .unwrap();
         assert!(p.drop("pub_a"));
         assert!(!p.drop("pub_a"));
         assert!(!p.drop("never_existed"));
@@ -308,7 +311,8 @@ mod tests {
     #[test]
     fn trailing_bytes_errors() {
         let mut p = Publications::new();
-        p.create("pub_a".into(), PublicationScope::AllTables).unwrap();
+        p.create("pub_a".into(), PublicationScope::AllTables)
+            .unwrap();
         let mut bytes = p.serialize();
         bytes.push(0xCC);
         let err = Publications::deserialize(&bytes).unwrap_err();

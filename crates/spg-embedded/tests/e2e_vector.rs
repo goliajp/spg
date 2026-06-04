@@ -37,7 +37,8 @@ fn knn_topk_via_l2_distance() {
         (5, "[1.0, 2.0, 3.0, 5.0]"),
     ];
     for (id, v) in rows {
-        db.execute(&format!("INSERT INTO emb VALUES ({id}, {v})")).unwrap();
+        db.execute(&format!("INSERT INTO emb VALUES ({id}, {v})"))
+            .unwrap();
     }
     // Order-by L2 distance, top 3.
     let got = db
@@ -60,7 +61,8 @@ fn hnsw_index_kkn_picks_index_over_full_scan() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE emb (id INT NOT NULL, v VECTOR(4) NOT NULL)")
         .unwrap();
-    db.execute("CREATE INDEX emb_idx ON emb USING hnsw (v)").unwrap();
+    db.execute("CREATE INDEX emb_idx ON emb USING hnsw (v)")
+        .unwrap();
     for (id, v) in [
         (1, "[1.0, 2.0, 3.0, 4.0]"),
         (2, "[4.0, 5.0, 6.0, 7.0]"),
@@ -68,7 +70,8 @@ fn hnsw_index_kkn_picks_index_over_full_scan() {
         (4, "[2.0, 3.0, 4.0, 5.0]"),
         (5, "[1.0, 2.0, 3.0, 5.0]"),
     ] {
-        db.execute(&format!("INSERT INTO emb VALUES ({id}, {v})")).unwrap();
+        db.execute(&format!("INSERT INTO emb VALUES ({id}, {v})"))
+            .unwrap();
     }
     // Same top-K as full-scan baseline above — HNSW returns rows in
     // ascending-distance order so the order is preserved.

@@ -30,11 +30,11 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use spg_sql::ast::{
-    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement,
-    CreateUserStatement, Expr, FrameBound, FrameKind, FromClause, IndexMethod, InsertStatement,
-    JoinKind, Literal, OrderBy, SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind,
-    VecEncoding as SqlVecEncoding, WindowFrame,
+    BinOp, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement, CreatePublicationStatement,
+    CreateSubscriptionStatement, CreateTableStatement, CreateUserStatement, Expr, FrameBound,
+    FrameKind, FromClause, IndexMethod, InsertStatement, JoinKind, Literal, OrderBy, SelectItem,
+    SelectStatement, Statement, TableRef, UnOp, UnionKind, VecEncoding as SqlVecEncoding,
+    WindowFrame,
 };
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
@@ -263,13 +263,7 @@ const ENVELOPE_VERSION_V3: u8 = 3;
 const ENVELOPE_VERSION_V4: u8 = 4;
 const ENVELOPE_VERSION_V5: u8 = 5;
 
-fn build_envelope(
-    catalog: &[u8],
-    users: &[u8],
-    pubs: &[u8],
-    subs: &[u8],
-    stats: &[u8],
-) -> Vec<u8> {
+fn build_envelope(catalog: &[u8], users: &[u8], pubs: &[u8], subs: &[u8], stats: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         8 + 1
             + 4
@@ -1339,10 +1333,7 @@ impl Engine {
     /// `output_columns` means the statement has no row-producing
     /// shape we could resolve here (JOIN, subquery, non-SELECT, …)
     /// — pgwire layer maps that to a `NoData` reply.
-    pub fn describe_prepared(
-        &self,
-        stmt: &Statement,
-    ) -> (Vec<u32>, Vec<ColumnSchema>) {
+    pub fn describe_prepared(&self, stmt: &Statement) -> (Vec<u32>, Vec<ColumnSchema>) {
         describe::describe_prepared(stmt, self.active_catalog())
     }
 
@@ -1692,7 +1683,9 @@ impl Engine {
                     for (_, locs) in map.iter() {
                         for loc in locs {
                             if let spg_storage::RowLocator::Cold { segment_id, .. } = loc {
-                                segment_owners.entry(*segment_id).or_insert_with(|| tname.clone());
+                                segment_owners
+                                    .entry(*segment_id)
+                                    .or_insert_with(|| tname.clone());
                             }
                         }
                     }
@@ -1706,10 +1699,7 @@ impl Engine {
             .filter_map(|&id| {
                 let seg = self.catalog.cold_segment(id)?;
                 let meta = seg.meta();
-                let owner = segment_owners
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default();
+                let owner = segment_owners.get(&id).cloned().unwrap_or_default();
                 Some(Row::new(alloc::vec![
                     Value::BigInt(i64::from(id)),
                     Value::Text(owner),
@@ -1786,11 +1776,7 @@ impl Engine {
     /// fire the callback. spg-server wires this from
     /// `SPG_SLOW_QUERY_THRESHOLD_MS` (default 100 ms).
     #[must_use]
-    pub const fn with_slow_query_log(
-        mut self,
-        threshold_us: u64,
-        logger: SlowQueryLogger,
-    ) -> Self {
+    pub const fn with_slow_query_log(mut self, threshold_us: u64, logger: SlowQueryLogger) -> Self {
         self.slow_query_threshold_us = Some(threshold_us);
         self.slow_query_logger = Some(logger);
         self
@@ -1853,10 +1839,7 @@ impl Engine {
             .filter_map(|name| {
                 let table = self.catalog.get(&name)?;
                 let ddl = render_create_table(&name, &table.schema().columns);
-                Some(Row::new(alloc::vec![
-                    Value::Text(name),
-                    Value::Text(ddl),
-                ]))
+                Some(Row::new(alloc::vec![Value::Text(name), Value::Text(ddl),]))
             })
             .collect();
         QueryResult::Rows { columns, rows }
@@ -1878,7 +1861,10 @@ impl Engine {
                     "CREATE USER {name} WITH PASSWORD '<redacted>' ROLE '{}'",
                     rec.role.as_str(),
                 );
-                Row::new(alloc::vec![Value::Text(String::from(name)), Value::Text(ddl)])
+                Row::new(alloc::vec![
+                    Value::Text(String::from(name)),
+                    Value::Text(ddl)
+                ])
             })
             .collect();
         QueryResult::Rows { columns, rows }
@@ -1953,10 +1939,7 @@ impl Engine {
             ColumnSchema::new("broken_at_seq", DataType::BigInt, false),
         ];
         let (verified, broken) = self.audit_verifier.map(|f| f()).unwrap_or((0, -1));
-        let row = Row::new(alloc::vec![
-            Value::BigInt(verified),
-            Value::BigInt(broken),
-        ]);
+        let row = Row::new(alloc::vec![Value::BigInt(verified), Value::BigInt(broken),]);
         QueryResult::Rows {
             columns,
             rows: alloc::vec![row],
@@ -2100,9 +2083,7 @@ impl Engine {
                     Value::BigInt(i64::try_from(report.sources.len()).unwrap_or(i64::MAX)),
                     Value::BigInt(i64::from(report.merged_segment_id.unwrap_or(0))),
                     Value::BigInt(i64::try_from(report.merged_rows).unwrap_or(i64::MAX)),
-                    Value::BigInt(
-                        i64::try_from(report.deleted_rows_pruned).unwrap_or(i64::MAX),
-                    ),
+                    Value::BigInt(i64::try_from(report.deleted_rows_pruned).unwrap_or(i64::MAX),),
                     Value::BigInt(
                         i64::try_from(report.bytes_reclaimed_estimate).unwrap_or(i64::MAX),
                     ),
@@ -2148,10 +2129,7 @@ impl Engine {
             // natural order — not lexicographic on the string
             // representation, which would put "9" after "49".
             non_null_values.sort_by(|a, b| sort_values_for_histogram(a, b));
-            let non_null: Vec<String> = non_null_values
-                .iter()
-                .map(canonical_value_repr)
-                .collect();
+            let non_null: Vec<String> = non_null_values.iter().map(canonical_value_repr).collect();
             let null_frac = if row_count == 0 {
                 0.0
             } else {
@@ -2419,7 +2397,8 @@ impl Engine {
         // v7.6.6 — Stage 2b: inbound FK check. For every row that
         // changed value in a column that *some other table* uses as
         // a FK parent column, react per `on_update` action.
-        let child_plan = plan_fk_parent_updates(self.active_catalog(), &stmt.table, &plan_with_old)?;
+        let child_plan =
+            plan_fk_parent_updates(self.active_catalog(), &stmt.table, &plan_with_old)?;
         // Stage 3a — apply each child-side action.
         for step in &child_plan {
             apply_fk_child_step(self.active_catalog_mut(), step)?;
@@ -2434,12 +2413,11 @@ impl Engine {
                 })
             })?;
         // v7.9.4 — snapshot post-update values for RETURNING.
-        let updated_for_returning: Vec<Vec<Value>> =
-            if stmt.returning.is_some() {
-                planned.iter().map(|(_pos, vals)| vals.clone()).collect()
-            } else {
-                Vec::new()
-            };
+        let updated_for_returning: Vec<Vec<Value>> = if stmt.returning.is_some() {
+            planned.iter().map(|(_pos, vals)| vals.clone()).collect()
+        } else {
+            Vec::new()
+        };
         for (pos, vals) in planned {
             table.update_row(pos, vals)?;
         }
@@ -2451,11 +2429,7 @@ impl Engine {
         }
         // v7.9.4 — RETURNING projection.
         if let Some(items) = &stmt.returning {
-            return self.build_returning_rows(
-                &stmt.table,
-                items,
-                updated_for_returning,
-            );
+            return self.build_returning_rows(&stmt.table, items, updated_for_returning);
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -2578,11 +2552,7 @@ impl Engine {
         // (matches PG semantics: DELETE RETURNING returns the row
         // as it was just before removal).
         if let Some(items) = &stmt.returning {
-            return self.build_returning_rows(
-                &stmt.table,
-                items,
-                to_delete_rows,
-            );
+            return self.build_returning_rows(&stmt.table, items, to_delete_rows);
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -2830,14 +2800,11 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         match s.target {
             spg_sql::ast::AlterTableTarget::SetHotTierBytes(n) => {
-                let table = self
-                    .active_catalog_mut()
-                    .get_mut(&s.name)
-                    .ok_or_else(|| {
-                        EngineError::Storage(StorageError::TableNotFound {
-                            name: s.name.clone(),
-                        })
-                    })?;
+                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.clone(),
+                    })
+                })?;
                 table.schema_mut().hot_tier_bytes = Some(n);
             }
             spg_sql::ast::AlterTableTarget::AddForeignKey(fk) => {
@@ -2856,12 +2823,8 @@ impl Engine {
                     .schema()
                     .columns
                     .clone();
-                let storage_fk = resolve_foreign_key(
-                    &s.name,
-                    &cols_snapshot,
-                    fk,
-                    self.active_catalog(),
-                )?;
+                let storage_fk =
+                    resolve_foreign_key(&s.name, &cols_snapshot, fk, self.active_catalog())?;
                 // Verify existing rows. Treat them as a virtual
                 // INSERT batch — reusing the v7.6.2 enforce helper.
                 let existing_rows: Vec<Vec<Value>> = self
@@ -2897,14 +2860,11 @@ impl Engine {
                 table.schema_mut().foreign_keys.push(storage_fk);
             }
             spg_sql::ast::AlterTableTarget::DropForeignKey(name) => {
-                let table = self
-                    .active_catalog_mut()
-                    .get_mut(&s.name)
-                    .ok_or_else(|| {
-                        EngineError::Storage(StorageError::TableNotFound {
-                            name: s.name.clone(),
-                        })
-                    })?;
+                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.clone(),
+                    })
+                })?;
                 let fks = &mut table.schema_mut().foreign_keys;
                 let before = fks.len();
                 fks.retain(|f| f.name.as_ref() != Some(&name));
@@ -3011,9 +2971,7 @@ impl Engine {
                 .iter()
                 .map(|c| {
                     schema.column_position(c).ok_or_else(|| {
-                        EngineError::Storage(StorageError::ColumnNotFound {
-                            column: c.clone(),
-                        })
+                        EngineError::Storage(StorageError::ColumnNotFound { column: c.clone() })
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -3098,7 +3056,8 @@ impl Engine {
                     .ok_or_else(|| {
                         EngineError::Unsupported(alloc::format!(
                             "UNIQUE INDEX {:?}: extra column {col_name:?} not in table {:?}",
-                            stmt.name, stmt.table
+                            stmt.name,
+                            stmt.table
                         ))
                     })?;
                 extra_positions.push(pos);
@@ -3198,9 +3157,7 @@ impl Engine {
                 spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
                     (true, columns.clone())
                 }
-                spg_sql::ast::TableConstraint::Unique { columns, .. } => {
-                    (false, columns.clone())
-                }
+                spg_sql::ast::TableConstraint::Unique { columns, .. } => (false, columns.clone()),
             };
             let mut positions = Vec::with_capacity(names.len());
             for n in &names {
@@ -3241,23 +3198,16 @@ impl Engine {
         }
         for (i, tc) in stmt.table_constraints.iter().enumerate() {
             let (is_pk, names) = match tc {
-                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
-                    (true, columns)
-                }
-                spg_sql::ast::TableConstraint::Unique { columns, .. } => {
-                    (false, columns)
-                }
+                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => (true, columns),
+                spg_sql::ast::TableConstraint::Unique { columns, .. } => (false, columns),
             };
             let leading = &names[0];
             // Skip if a same-column BTree already exists (e.g.
             // inline PK on the leading column).
-            let already = table
-                .indices()
-                .iter()
-                .any(|idx| {
-                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                        && table.schema().columns[idx.column_position].name == *leading
-                });
+            let already = table.indices().iter().any(|idx| {
+                matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                    && table.schema().columns[idx.column_position].name == *leading
+            });
             if already {
                 continue;
             }
@@ -3412,23 +3362,14 @@ impl Engine {
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
         }
         // v7.9.19 — composite UNIQUE / PRIMARY KEY enforcement.
-        enforce_uniqueness_inserts(
-            self.active_catalog(),
-            &stmt.table,
-            &uniqueness,
-            &all_values,
-        )?;
+        enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
         // v7.9.29 — CREATE UNIQUE INDEX [WHERE pred] enforcement.
         // Independent of table-level UniquenessConstraint (which
         // can't carry a predicate). Walks the table's indexes;
         // for each `is_unique` index, only rows whose
         // partial_predicate evaluates truthy are checked for
         // collision. mailrs K1.
-        enforce_unique_index_inserts(
-            self.active_catalog(),
-            &stmt.table,
-            &all_values,
-        )?;
+        enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
         // v7.9.8 / v7.9.9 — ON CONFLICT handling.
         //   - `DO NOTHING` filters `all_values` to non-conflicting
         //     rows + drops within-batch duplicates.
@@ -3446,8 +3387,7 @@ impl Engine {
             let mut kept: Vec<Vec<Value>> = Vec::with_capacity(all_values.len());
             let mut seen_keys: Vec<Vec<Value>> = Vec::new();
             for values in all_values {
-                let key_tuple: Vec<&Value> =
-                    conflict_cols.iter().map(|&c| &values[c]).collect();
+                let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
                 // SQL spec: NULL in any conflict column means "no
                 // conflict possible" (NULL ≠ NULL for uniqueness).
                 let has_null_key = key_tuple.iter().any(|v| matches!(v, Value::Null));
@@ -3458,10 +3398,9 @@ impl Engine {
                         &conflict_cols,
                         &key_tuple,
                     );
-                let key_tuple_owned: Vec<Value> =
-                    key_tuple.iter().map(|v| (*v).clone()).collect();
-                let collides_with_batch = !has_null_key
-                    && seen_keys.iter().any(|k| k == &key_tuple_owned);
+                let key_tuple_owned: Vec<Value> = key_tuple.iter().map(|v| (*v).clone()).collect();
+                let collides_with_batch =
+                    !has_null_key && seen_keys.iter().any(|k| k == &key_tuple_owned);
                 let collides = collides_with_table || collides_with_batch;
                 match (&clause.action, collides) {
                     (_, false) => {
@@ -3549,11 +3488,7 @@ impl Engine {
         // post-update on conflict).
         if let Some(items) = &stmt.returning {
             let _ = table;
-            return self.build_returning_rows(
-                &stmt.table,
-                items,
-                returning_rows,
-            );
+            return self.build_returning_rows(&stmt.table, items, returning_rows);
         }
         // v6.2.1 — auto-analyze: track per-table modified-row
         // counter so the background sweep can decide when to
@@ -3630,8 +3565,8 @@ impl Engine {
         let mut limit_remaining: Option<usize> =
             stmt.limit_literal().and_then(|n| usize::try_from(n).ok());
         for (_key, body) in seg.scan() {
-            let (row, _consumed) = spg_storage::decode_row_body_dense(&body, &schema)
-                .map_err(EngineError::Storage)?;
+            let (row, _consumed) =
+                spg_storage::decode_row_body_dense(&body, &schema).map_err(EngineError::Storage)?;
             if let Some(where_expr) = &stmt.where_ {
                 let cond = self.eval_expr_simple(where_expr, &row, &ctx)?;
                 if !matches!(cond, Value::Bool(true)) {
@@ -3746,9 +3681,7 @@ impl Engine {
                     out.extend(schema_cols.iter().cloned());
                 }
                 SelectItem::Expr { alias, .. } => {
-                    let name = alias
-                        .clone()
-                        .unwrap_or_else(|| "?column?".to_string());
+                    let name = alias.clone().unwrap_or_else(|| "?column?".to_string());
                     // Default to Text; the caller's row values
                     // carry the actual type. v6.10.2 scope.
                     out.push(ColumnSchema::new(name, DataType::Text, true));
@@ -4161,13 +4094,8 @@ impl Engine {
                 cancel.check()?;
             }
             if let Some(where_expr) = &stmt.where_ {
-                let cond = self.eval_expr_with_correlated(
-                    where_expr,
-                    row,
-                    &ctx,
-                    cancel,
-                    Some(&mut memo),
-                )?;
+                let cond =
+                    self.eval_expr_with_correlated(where_expr, row, &ctx, cancel, Some(&mut memo))?;
                 if !matches!(cond, Value::Bool(true)) {
                     return Ok(());
                 }
@@ -4213,7 +4141,11 @@ impl Engine {
         if stmt.distinct {
             output_rows = dedup_rows(output_rows);
         }
-        apply_offset_and_limit(&mut output_rows, stmt.offset_literal(), stmt.limit_literal());
+        apply_offset_and_limit(
+            &mut output_rows,
+            stmt.offset_literal(),
+            stmt.limit_literal(),
+        );
 
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
@@ -4383,7 +4315,11 @@ impl Engine {
         if stmt.distinct {
             output_rows = dedup_rows(output_rows);
         }
-        apply_offset_and_limit(&mut output_rows, stmt.offset_literal(), stmt.limit_literal());
+        apply_offset_and_limit(
+            &mut output_rows,
+            stmt.offset_literal(),
+            stmt.limit_literal(),
+        );
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
             .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
@@ -4605,7 +4541,11 @@ fn materialise_in_order(
         }
         output_rows.push(Row::new(values));
     }
-    apply_offset_and_limit(&mut output_rows, stmt.offset_literal(), stmt.limit_literal());
+    apply_offset_and_limit(
+        &mut output_rows,
+        stmt.offset_literal(),
+        stmt.limit_literal(),
+    );
     let columns: Vec<ColumnSchema> = projection
         .into_iter()
         .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
@@ -5662,7 +5602,10 @@ impl Engine {
             Expr::Extract { source, .. } => {
                 self.resolve_correlated_in_expr(source, row, ctx, cancel, memo.as_deref_mut())?;
             }
-            Expr::WindowFunction { .. } | Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
+            Expr::WindowFunction { .. }
+            | Expr::Literal(_)
+            | Expr::Placeholder(_)
+            | Expr::Column(_) => {}
             // v7.10.10 — recurse children.
             Expr::Array(items) => {
                 for elem in items {
@@ -6393,12 +6336,8 @@ fn expr_has_window(e: &Expr) -> bool {
         | Expr::Placeholder(_)
         | Expr::Column(_) => false,
         Expr::Array(items) => items.iter().any(expr_has_window),
-        Expr::ArraySubscript { target, index } => {
-            expr_has_window(target) || expr_has_window(index)
-        }
-        Expr::AnyAll { expr, array, .. } => {
-            expr_has_window(expr) || expr_has_window(array)
-        }
+        Expr::ArraySubscript { target, index } => expr_has_window(target) || expr_has_window(index),
+        Expr::AnyAll { expr, array, .. } => expr_has_window(expr) || expr_has_window(array),
     }
 }
 
@@ -6713,9 +6652,7 @@ fn compute_window_partition(
                     }
                 } else {
                     let target_signed = i64::try_from(i).unwrap_or(i64::MAX) + signed_offset;
-                    if target_signed < 0
-                        || target_signed >= i64::try_from(n).unwrap_or(i64::MAX)
-                    {
+                    if target_signed < 0 || target_signed >= i64::try_from(n).unwrap_or(i64::MAX) {
                         default.clone()
                     } else {
                         #[allow(clippy::cast_sign_loss)]
@@ -7129,9 +7066,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::ArraySubscript { target, index } => {
             expr_has_subquery(target) || expr_has_subquery(index)
         }
-        Expr::AnyAll { expr, array, .. } => {
-            expr_has_subquery(expr) || expr_has_subquery(array)
-        }
+        Expr::AnyAll { expr, array, .. } => expr_has_subquery(expr) || expr_has_subquery(array),
     }
 }
 
@@ -7201,10 +7136,7 @@ fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result<(),
     Ok(())
 }
 
-fn substitute_select(
-    s: &mut SelectStatement,
-    params: &[Value],
-) -> Result<(), EngineError> {
+fn substitute_select(s: &mut SelectStatement, params: &[Value]) -> Result<(), EngineError> {
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
             substitute_expr(expr, params)?;
@@ -7502,9 +7434,7 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Text(s) | Value::Json(s) => Literal::String(s),
         Value::Bool(b) => Literal::Bool(b),
         Value::Vector(v) => Literal::Vector(v),
-        Value::Numeric { scaled, scale } => {
-            Literal::String(eval::format_numeric(scaled, scale))
-        }
+        Value::Numeric { scaled, scale } => Literal::String(eval::format_numeric(scaled, scale)),
         Value::Date(d) => Literal::String(eval::format_date(d)),
         Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
         Value::Interval { months, micros } => Literal::Interval {
@@ -7768,11 +7698,7 @@ fn resolve_order_by_position(s: &mut SelectStatement) {
 ///
 /// `tagged` holds `(Option<f64>, Row)` (the SELECT path) — `None` keys
 /// sort last in ascending order, mirroring NULL-sorts-last in SQL.
-fn partial_sort_tagged(
-    tagged: &mut Vec<(Vec<f64>, Row)>,
-    keep: Option<usize>,
-    descs: &[bool],
-) {
+fn partial_sort_tagged(tagged: &mut Vec<(Vec<f64>, Row)>, keep: Option<usize>, descs: &[bool]) {
     let cmp = |a: &(Vec<f64>, Row), b: &(Vec<f64>, Row)| cmp_multi_key(&a.0, &b.0, descs);
     match keep {
         Some(k) if k < tagged.len() && k > 0 => {
@@ -7886,7 +7812,10 @@ fn resolve_foreign_key(
                 name: fk.parent_table.clone(),
             })
         })?;
-        (parent_table.schema().columns.as_slice(), fk.parent_table.as_str())
+        (
+            parent_table.schema().columns.as_slice(),
+            fk.parent_table.as_str(),
+        )
     };
     // Resolve parent column names → positions. If the FK omitted the
     // parent column list, fall back to the parent's primary index
@@ -7942,19 +7871,18 @@ fn resolve_foreign_key(
     // matches the first parent column (multi-column BTree indices
     // are not in the v7.x roadmap).
     if !is_self_ref {
-        let parent_table = catalog
-            .get(&fk.parent_table)
-            .expect("checked above");
+        let parent_table = catalog.get(&fk.parent_table).expect("checked above");
         let primary_parent_col = parent_columns[0];
-        let has_btree = parent_table.schema().columns.get(primary_parent_col).is_some()
-            && parent_table
-                .indices()
-                .iter()
-                .any(|idx| {
-                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                        && idx.column_position == primary_parent_col
-                        && idx.partial_predicate.is_none()
-                });
+        let has_btree = parent_table
+            .schema()
+            .columns
+            .get(primary_parent_col)
+            .is_some()
+            && parent_table.indices().iter().any(|idx| {
+                matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                    && idx.column_position == primary_parent_col
+                    && idx.partial_predicate.is_none()
+            });
         if !has_btree {
             return Err(EngineError::Unsupported(alloc::format!(
                 "FOREIGN KEY parent column on {:?} is not covered by an unconditional BTree \
@@ -8117,12 +8045,7 @@ fn on_conflict_keys_exist(
     key: &[&Value],
 ) -> bool {
     if column_positions.len() == 1 {
-        return on_conflict_key_exists(
-            catalog,
-            table_name,
-            column_positions[0],
-            key[0],
-        );
+        return on_conflict_key_exists(catalog, table_name, column_positions[0], key[0]);
     }
     let Some(table) = catalog.get(table_name) else {
         return false;
@@ -8192,8 +8115,7 @@ fn apply_on_conflict_assignments(
             })?;
         let sub = substitute_excluded_refs(expr.clone(), &schema_cols, incoming);
         let v = eval::eval_expr(&sub, &existing, &ctx)?;
-        new_values[target_idx] =
-            coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
+        new_values[target_idx] = coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
     }
     Ok(Some(new_values))
 }
@@ -8202,11 +8124,7 @@ fn apply_on_conflict_assignments(
 /// "EXCLUDED", name }` reference with a `Literal` of the matching
 /// value from the incoming-row vec. Resolution against the
 /// child-table column list (by name).
-fn substitute_excluded_refs(
-    expr: Expr,
-    schema_cols: &[ColumnSchema],
-    incoming: &[Value],
-) -> Expr {
+fn substitute_excluded_refs(expr: Expr, schema_cols: &[ColumnSchema], incoming: &[Value]) -> Expr {
     use spg_sql::ast::ColumnName;
     match expr {
         Expr::Column(ColumnName { qualifier, name })
@@ -8218,9 +8136,8 @@ fn substitute_excluded_refs(
             match pos {
                 Some(p) => {
                     let v = incoming.get(p).cloned().unwrap_or(Value::Null);
-                    value_to_literal_expr(v).unwrap_or_else(|_| {
-                        Expr::Literal(spg_sql::ast::Literal::Null)
-                    })
+                    value_to_literal_expr(v)
+                        .unwrap_or_else(|_| Expr::Literal(spg_sql::ast::Literal::Null))
                 }
                 None => Expr::Column(ColumnName { qualifier, name }),
             }
@@ -8303,7 +8220,11 @@ fn enforce_uniqueness_inserts(
                     .all(|(i, &p)| earlier.get(p) == Some(key[i]))
             });
             if collides_in_table || collides_in_batch {
-                let kind = if uc.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+                let kind = if uc.is_primary_key {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                };
                 let col_names: Vec<String> = uc
                     .columns
                     .iter()
@@ -8438,12 +8359,7 @@ fn enforce_unique_index_inserts(
         let key_of = |values: &[spg_storage::Value]| -> alloc::vec::Vec<spg_storage::Value> {
             key_positions
                 .iter()
-                .map(|&p| {
-                    values
-                        .get(p)
-                        .cloned()
-                        .unwrap_or(spg_storage::Value::Null)
-                })
+                .map(|&p| values.get(p).cloned().unwrap_or(spg_storage::Value::Null))
                 .collect()
         };
         // Helper: does `values` participate in this index? (predicate
@@ -8552,9 +8468,9 @@ fn enforce_fk_inserts(
                 // against earlier rows in this same batch when the
                 // FK points at the table being inserted into.
                 let present_in_batch = parent_is_self
-                    && rows[..batch_idx].iter().any(|earlier| {
-                        earlier.get(parent_col) == Some(v)
-                    });
+                    && rows[..batch_idx]
+                        .iter()
+                        .any(|earlier| earlier.get(parent_col) == Some(v));
                 if !(present_committed || present_in_batch) {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "FOREIGN KEY violation: no parent row in {:?} where {} = {:?}",
@@ -8571,7 +8487,8 @@ fn enforce_fk_inserts(
                 // Composite FK: scan parent rows. v7.6.7 also
                 // accepts a match against earlier rows in the same
                 // batch (self-ref bulk-loading of hierarchies).
-                if fk.local_columns
+                if fk
+                    .local_columns
                     .iter()
                     .all(|&i| matches!(row_values.get(i), Some(Value::Null)))
                 {
@@ -8661,8 +8578,7 @@ fn plan_fk_parent_deletions(
     let mut delete_plan: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
     // setnull / setdefault keyed by child_table → (row_idx, col_idx) → optional default
     let mut setnull_plan: BTreeMap<String, BTreeSet<(usize, usize)>> = BTreeMap::new();
-    let mut setdefault_plan: BTreeMap<String, BTreeMap<(usize, usize), Value>> =
-        BTreeMap::new();
+    let mut setdefault_plan: BTreeMap<String, BTreeMap<(usize, usize), Value>> = BTreeMap::new();
     let mut visited: BTreeSet<(String, usize)> = BTreeSet::new();
     for &p in to_delete_positions {
         visited.insert((parent_table_name.to_string(), p));
@@ -8703,8 +8619,7 @@ fn plan_fk_parent_deletions(
                         continue;
                     }
                     match fk.on_delete {
-                        spg_storage::FkAction::Restrict
-                        | spg_storage::FkAction::NoAction => {
+                        spg_storage::FkAction::Restrict | spg_storage::FkAction::NoAction => {
                             return Err(EngineError::Unsupported(alloc::format!(
                                 "FOREIGN KEY violation: DELETE on {cur_parent:?} is \
                                  restricted by FK from {child_name:?}.{:?}",
@@ -8743,8 +8658,7 @@ fn plan_fk_parent_deletions(
                         }
                         spg_storage::FkAction::SetDefault => {
                             // Resolve the DEFAULT for every local FK col.
-                            let entry =
-                                setdefault_plan.entry(child_name.clone()).or_default();
+                            let entry = setdefault_plan.entry(child_name.clone()).or_default();
                             for &li in &fk.local_columns {
                                 let col = child.schema().columns.get(li).ok_or_else(|| {
                                     EngineError::Unsupported(alloc::format!(
@@ -8840,12 +8754,9 @@ fn plan_fk_parent_updates(
     // empty here but is kept structurally aligned with
     // `plan_fk_parent_deletions` for future use.
     let delete_plan: BTreeMap<String, alloc::collections::BTreeSet<usize>> = BTreeMap::new();
-    let mut setnull_plan: BTreeMap<
-        String,
-        alloc::collections::BTreeSet<(usize, usize)>,
-    > = BTreeMap::new();
-    let mut setdefault_plan: BTreeMap<String, BTreeMap<(usize, usize), Value>> =
+    let mut setnull_plan: BTreeMap<String, alloc::collections::BTreeSet<(usize, usize)>> =
         BTreeMap::new();
+    let mut setdefault_plan: BTreeMap<String, BTreeMap<(usize, usize), Value>> = BTreeMap::new();
     // Cascade-update plan: child_table → row_idx → col_idx → new_value
     let mut cascade_plan: BTreeMap<String, BTreeMap<(usize, usize), Value>> = BTreeMap::new();
 
@@ -8867,27 +8778,19 @@ fn plan_fk_parent_updates(
                     continue;
                 }
                 // The OLD parent key — used to find referring children.
-                let old_key: Vec<&Value> = fk
-                    .parent_columns
-                    .iter()
-                    .map(|&pi| &old_row[pi])
-                    .collect();
+                let old_key: Vec<&Value> =
+                    fk.parent_columns.iter().map(|&pi| &old_row[pi]).collect();
                 if old_key.iter().any(|v| matches!(v, Value::Null)) {
                     // NULL parent has no children — skip.
                     continue;
                 }
-                let new_key: Vec<&Value> = fk
-                    .parent_columns
-                    .iter()
-                    .map(|&pi| &new_row[pi])
-                    .collect();
+                let new_key: Vec<&Value> =
+                    fk.parent_columns.iter().map(|&pi| &new_row[pi]).collect();
                 for (child_row_idx, child_row) in child.rows().iter().enumerate() {
                     // Self-ref same-row updates: a row updating its
                     // own PK doesn't restrict itself.
                     if child_name == parent_table_name
-                        && plan_with_old
-                            .iter()
-                            .any(|(p, _, _)| *p == child_row_idx)
+                        && plan_with_old.iter().any(|(p, _, _)| *p == child_row_idx)
                     {
                         continue;
                     }
@@ -8900,8 +8803,7 @@ fn plan_fk_parent_updates(
                         continue;
                     }
                     match fk.on_update {
-                        spg_storage::FkAction::Restrict
-                        | spg_storage::FkAction::NoAction => {
+                        spg_storage::FkAction::Restrict | spg_storage::FkAction::NoAction => {
                             return Err(EngineError::Unsupported(alloc::format!(
                                 "FOREIGN KEY violation: UPDATE on {parent_table_name:?} PK is \
                                  restricted by FK from {child_name:?}.{:?}",
@@ -8936,8 +8838,7 @@ fn plan_fk_parent_updates(
                             }
                         }
                         spg_storage::FkAction::SetDefault => {
-                            let entry =
-                                setdefault_plan.entry(child_name.clone()).or_default();
+                            let entry = setdefault_plan.entry(child_name.clone()).or_default();
                             for &li in &fk.local_columns {
                                 let col = child.schema().columns.get(li).ok_or_else(|| {
                                     EngineError::Unsupported(alloc::format!(
@@ -9016,10 +8917,7 @@ fn plan_fk_parent_updates(
 /// v7.6.5 — apply one FK child step to the catalog. Encapsulates
 /// the three action variants so the DELETE executor stays a
 /// simple loop over the planned steps.
-fn apply_fk_child_step(
-    catalog: &mut Catalog,
-    step: &FkChildStep,
-) -> Result<(), EngineError> {
+fn apply_fk_child_step(catalog: &mut Catalog, step: &FkChildStep) -> Result<(), EngineError> {
     let child = catalog.get_mut(&step.child_table).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
             name: step.child_table.clone(),
@@ -9113,9 +9011,7 @@ fn eval_runtime_default_free(
         None => 0,
     };
     let v = match canonical {
-        "now" | "current_timestamp" | "localtimestamp" => {
-            Value::Timestamp(now_us)
-        }
+        "now" | "current_timestamp" | "localtimestamp" => Value::Timestamp(now_us),
         "current_date" => Value::Date((now_us / 86_400_000_000) as i32),
         "current_time" | "localtime" => Value::Timestamp(now_us),
         other => {
@@ -9208,7 +9104,9 @@ fn decode_bytea_literal(s: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
                 i += 2;
                 continue;
             }
-            if n.is_ascii_digit() && i + 3 < bytes.len() && bytes[i + 2].is_ascii_digit()
+            if n.is_ascii_digit()
+                && i + 3 < bytes.len()
+                && bytes[i + 2].is_ascii_digit()
                 && bytes[i + 3].is_ascii_digit()
             {
                 let oct = |x: u8| (x - b'0') as u32;
@@ -9322,9 +9220,8 @@ fn encode_text_array(items: &[Option<alloc::string::String>]) -> alloc::string::
             Some(s) => {
                 let needs_quote = s.is_empty()
                     || s.eq_ignore_ascii_case("NULL")
-                    || s.chars().any(|c| {
-                        matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ' | '\t')
-                    });
+                    || s.chars()
+                        .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ' | '\t'));
                 if needs_quote {
                     out.push('"');
                     for c in s.chars() {
@@ -9488,203 +9385,202 @@ fn coerce_value(
     if actual == expected {
         return Ok(v);
     }
-    let coerced =
-        match (v, expected) {
-            (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
-            (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
-            (Value::Int(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
-            (Value::Int(n), DataType::Numeric { precision, scale }) => Some(numeric_from_integer(
-                i128::from(n),
-                precision,
-                scale,
-                col_name,
-            )?),
-            (Value::SmallInt(n), DataType::Int) => Some(Value::Int(i32::from(n))),
-            (Value::SmallInt(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
-            (Value::SmallInt(n), DataType::Float) => Some(Value::Float(f64::from(n))),
-            (Value::SmallInt(n), DataType::Numeric { precision, scale }) => Some(
-                numeric_from_integer(i128::from(n), precision, scale, col_name)?,
-            ),
-            (Value::BigInt(n), DataType::Int) => i32::try_from(n).ok().map(Value::Int),
-            (Value::BigInt(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
-            #[allow(clippy::cast_precision_loss)]
-            (Value::BigInt(n), DataType::Float) => Some(Value::Float(n as f64)),
-            (Value::BigInt(n), DataType::Numeric { precision, scale }) => Some(
-                numeric_from_integer(i128::from(n), precision, scale, col_name)?,
-            ),
-            (Value::Float(x), DataType::Numeric { precision, scale }) => {
-                Some(numeric_from_float(x, precision, scale, col_name)?)
+    let coerced = match (v, expected) {
+        (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
+        (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
+        (Value::Int(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
+        (Value::Int(n), DataType::Numeric { precision, scale }) => Some(numeric_from_integer(
+            i128::from(n),
+            precision,
+            scale,
+            col_name,
+        )?),
+        (Value::SmallInt(n), DataType::Int) => Some(Value::Int(i32::from(n))),
+        (Value::SmallInt(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
+        (Value::SmallInt(n), DataType::Float) => Some(Value::Float(f64::from(n))),
+        (Value::SmallInt(n), DataType::Numeric { precision, scale }) => Some(numeric_from_integer(
+            i128::from(n),
+            precision,
+            scale,
+            col_name,
+        )?),
+        (Value::BigInt(n), DataType::Int) => i32::try_from(n).ok().map(Value::Int),
+        (Value::BigInt(n), DataType::SmallInt) => i16::try_from(n).ok().map(Value::SmallInt),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::BigInt(n), DataType::Float) => Some(Value::Float(n as f64)),
+        (Value::BigInt(n), DataType::Numeric { precision, scale }) => Some(numeric_from_integer(
+            i128::from(n),
+            precision,
+            scale,
+            col_name,
+        )?),
+        (Value::Float(x), DataType::Numeric { precision, scale }) => {
+            Some(numeric_from_float(x, precision, scale, col_name)?)
+        }
+        // Text → DATE / TIMESTAMP: parse canonical text forms.
+        (Value::Text(s), DataType::Date) => {
+            let d = eval::parse_date_literal(&s).ok_or_else(|| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("cannot parse {s:?} as DATE for column `{col_name}`"),
+                })
+            })?;
+            Some(Value::Date(d))
+        }
+        // v4.9: Text ↔ JSON coercion. No structural validation —
+        // any text literal is accepted; the responsibility for
+        // valid JSON lies with the producer.
+        (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::Json(s)),
+        (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
+        // v7.10.4 — Text → BYTEA. Decode PG-style literal forms:
+        //   - Hex:    `\x48656c6c6f`  (case-insensitive hex pairs)
+        //   - Escape: `Hello\\000world`  (backslash + octal triples)
+        //   - Plain:  any string → raw UTF-8 bytes (PG also accepts)
+        // Errors surface as TypeMismatch so the operator gets a
+        // clear "this literal isn't a bytea literal" hint.
+        (Value::Text(s), DataType::Bytes) => {
+            let bytes = decode_bytea_literal(&s).map_err(|e| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as BYTEA for column `{col_name}`: {e}"
+                    ),
+                })
+            })?;
+            Some(Value::Bytes(bytes))
+        }
+        // v7.10.4 — BYTEA → Text round-trip uses the PG hex
+        // output (lowercase, `\x` prefix). Important when a
+        // SELECT pulls a bytea cell through a Text column path.
+        (Value::Bytes(b), DataType::Text) => Some(Value::Text(encode_bytea_hex(&b))),
+        // v7.10.11 — Text → TEXT[]. Decode PG's external array
+        // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
+        // is the literal `NULL`; everything else is a quoted or
+        // unquoted text element. mailrs `'{label1,label2}'::TEXT[]`.
+        (Value::Text(s), DataType::TextArray) => {
+            let arr = decode_text_array_literal(&s).map_err(|e| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as TEXT[] for column `{col_name}`: {e}"
+                    ),
+                })
+            })?;
+            Some(Value::TextArray(arr))
+        }
+        // v7.10.11 — TEXT[] → Text round-trip uses PG's
+        // external array form (`{a,b,NULL}`). Lets a SELECT
+        // pull an array column through any Text-side codepath.
+        (Value::TextArray(items), DataType::Text) => Some(Value::Text(encode_text_array(&items))),
+        (Value::Text(s), DataType::Timestamp | DataType::Timestamptz) => {
+            let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as TIMESTAMP for column `{col_name}`"
+                    ),
+                })
+            })?;
+            Some(Value::Timestamp(t))
+        }
+        // DATE ↔ TIMESTAMP convertibility (DATE → midnight,
+        // TIMESTAMP → day truncation).
+        (Value::Date(d), DataType::Timestamp | DataType::Timestamptz) => {
+            Some(Value::Timestamp(i64::from(d) * 86_400_000_000))
+        }
+        // v7.9.21 — Value::Timestamp lands in either Timestamp
+        // or Timestamptz columns; the on-disk layout is the
+        // same i64 microseconds UTC.
+        (Value::Timestamp(t), DataType::Timestamptz) => Some(Value::Timestamp(t)),
+        (Value::Timestamp(t), DataType::Date) => {
+            let days = t.div_euclid(86_400_000_000);
+            i32::try_from(days).ok().map(Value::Date)
+        }
+        (
+            Value::Numeric {
+                scaled,
+                scale: src_scale,
+            },
+            DataType::Numeric { precision, scale },
+        ) => Some(numeric_rescale(
+            scaled, src_scale, precision, scale, col_name,
+        )?),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Numeric { scaled, scale }, DataType::Float) => {
+            let mut div = 1.0_f64;
+            for _ in 0..scale {
+                div *= 10.0;
             }
-            // Text → DATE / TIMESTAMP: parse canonical text forms.
-            (Value::Text(s), DataType::Date) => {
-                let d = eval::parse_date_literal(&s).ok_or_else(|| {
-                    EngineError::Eval(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "cannot parse {s:?} as DATE for column `{col_name}`"
-                        ),
-                    })
-                })?;
-                Some(Value::Date(d))
-            }
-            // v4.9: Text ↔ JSON coercion. No structural validation —
-            // any text literal is accepted; the responsibility for
-            // valid JSON lies with the producer.
-            (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::Json(s)),
-            (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
-            // v7.10.4 — Text → BYTEA. Decode PG-style literal forms:
-            //   - Hex:    `\x48656c6c6f`  (case-insensitive hex pairs)
-            //   - Escape: `Hello\\000world`  (backslash + octal triples)
-            //   - Plain:  any string → raw UTF-8 bytes (PG also accepts)
-            // Errors surface as TypeMismatch so the operator gets a
-            // clear "this literal isn't a bytea literal" hint.
-            (Value::Text(s), DataType::Bytes) => {
-                let bytes = decode_bytea_literal(&s).map_err(|e| {
-                    EngineError::Eval(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "cannot parse {s:?} as BYTEA for column `{col_name}`: {e}"
-                        ),
-                    })
-                })?;
-                Some(Value::Bytes(bytes))
-            }
-            // v7.10.4 — BYTEA → Text round-trip uses the PG hex
-            // output (lowercase, `\x` prefix). Important when a
-            // SELECT pulls a bytea cell through a Text column path.
-            (Value::Bytes(b), DataType::Text) => Some(Value::Text(encode_bytea_hex(&b))),
-            // v7.10.11 — Text → TEXT[]. Decode PG's external array
-            // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
-            // is the literal `NULL`; everything else is a quoted or
-            // unquoted text element. mailrs `'{label1,label2}'::TEXT[]`.
-            (Value::Text(s), DataType::TextArray) => {
-                let arr = decode_text_array_literal(&s).map_err(|e| {
-                    EngineError::Eval(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "cannot parse {s:?} as TEXT[] for column `{col_name}`: {e}"
-                        ),
-                    })
-                })?;
-                Some(Value::TextArray(arr))
-            }
-            // v7.10.11 — TEXT[] → Text round-trip uses PG's
-            // external array form (`{a,b,NULL}`). Lets a SELECT
-            // pull an array column through any Text-side codepath.
-            (Value::TextArray(items), DataType::Text) => {
-                Some(Value::Text(encode_text_array(&items)))
-            }
-            (Value::Text(s), DataType::Timestamp | DataType::Timestamptz) => {
-                let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
-                    EngineError::Eval(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "cannot parse {s:?} as TIMESTAMP for column `{col_name}`"
-                        ),
-                    })
-                })?;
-                Some(Value::Timestamp(t))
-            }
-            // DATE ↔ TIMESTAMP convertibility (DATE → midnight,
-            // TIMESTAMP → day truncation).
-            (Value::Date(d), DataType::Timestamp | DataType::Timestamptz) => {
-                Some(Value::Timestamp(i64::from(d) * 86_400_000_000))
-            }
-            // v7.9.21 — Value::Timestamp lands in either Timestamp
-            // or Timestamptz columns; the on-disk layout is the
-            // same i64 microseconds UTC.
-            (Value::Timestamp(t), DataType::Timestamptz) => Some(Value::Timestamp(t)),
-            (Value::Timestamp(t), DataType::Date) => {
-                let days = t.div_euclid(86_400_000_000);
-                i32::try_from(days).ok().map(Value::Date)
-            }
-            (
-                Value::Numeric {
-                    scaled,
-                    scale: src_scale,
-                },
-                DataType::Numeric { precision, scale },
-            ) => Some(numeric_rescale(
-                scaled, src_scale, precision, scale, col_name,
-            )?),
-            #[allow(clippy::cast_precision_loss)]
-            (Value::Numeric { scaled, scale }, DataType::Float) => {
-                let mut div = 1.0_f64;
-                for _ in 0..scale {
-                    div *= 10.0;
-                }
-                Some(Value::Float((scaled as f64) / div))
-            }
-            (Value::Numeric { scaled, scale }, DataType::Int) => {
-                let truncated = numeric_truncate_to_integer(scaled, scale);
-                i32::try_from(truncated).ok().map(Value::Int)
-            }
-            (Value::Numeric { scaled, scale }, DataType::BigInt) => {
-                let truncated = numeric_truncate_to_integer(scaled, scale);
-                i64::try_from(truncated).ok().map(Value::BigInt)
-            }
-            (Value::Numeric { scaled, scale }, DataType::SmallInt) => {
-                let truncated = numeric_truncate_to_integer(scaled, scale);
-                i16::try_from(truncated).ok().map(Value::SmallInt)
-            }
-            // VARCHAR(n) enforces an upper bound on character count.
-            (Value::Text(s), DataType::Varchar(max)) => {
-                if u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
-                    Some(Value::Text(s))
-                } else {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "value for VARCHAR({max}) column `{col_name}` exceeds length: \
+            Some(Value::Float((scaled as f64) / div))
+        }
+        (Value::Numeric { scaled, scale }, DataType::Int) => {
+            let truncated = numeric_truncate_to_integer(scaled, scale);
+            i32::try_from(truncated).ok().map(Value::Int)
+        }
+        (Value::Numeric { scaled, scale }, DataType::BigInt) => {
+            let truncated = numeric_truncate_to_integer(scaled, scale);
+            i64::try_from(truncated).ok().map(Value::BigInt)
+        }
+        (Value::Numeric { scaled, scale }, DataType::SmallInt) => {
+            let truncated = numeric_truncate_to_integer(scaled, scale);
+            i16::try_from(truncated).ok().map(Value::SmallInt)
+        }
+        // VARCHAR(n) enforces an upper bound on character count.
+        (Value::Text(s), DataType::Varchar(max)) => {
+            if u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
+                Some(Value::Text(s))
+            } else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "value for VARCHAR({max}) column `{col_name}` exceeds length: \
                      {} chars",
-                        s.chars().count()
-                    )));
-                }
+                    s.chars().count()
+                )));
             }
-            // v6.0.1: f32 → SQ8 INSERT-time quantisation. Triggered
-            // when the column declares `VECTOR(N) USING SQ8` and
-            // the INSERT VALUES expression yields a raw f32 vector
-            // (the normal pgvector-shape literal). Dim mismatch
-            // falls through the `_ => None` arm and surfaces as
-            // `TypeMismatch` with the expected SQ8 column type —
-            // matching the F32 path's existing error.
-            (
-                Value::Vector(v),
-                DataType::Vector {
-                    dim,
-                    encoding: VecEncoding::Sq8,
-                },
-            ) if v.len() == dim as usize => {
-                Some(Value::Sq8Vector(spg_storage::quantize::quantize(&v)))
-            }
-            // v6.0.3: f32 → f16 INSERT-time conversion for HALF
-            // columns. Bit-exact at the storage layer (modulo
-            // half-precision rounding); no rerank pass needed at
-            // search time.
-            (
-                Value::Vector(v),
-                DataType::Vector {
-                    dim,
-                    encoding: VecEncoding::F16,
-                },
-            ) if v.len() == dim as usize => Some(Value::HalfVector(
-                spg_storage::halfvec::HalfVector::from_f32_slice(&v),
-            )),
-            // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
-            // is already longer we reject (PG truncates trailing-space-only;
-            // staying strict for v1).
-            (Value::Text(s), DataType::Char(size)) => {
-                let len = u32::try_from(s.chars().count()).unwrap_or(u32::MAX);
-                if len > size {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "value for CHAR({size}) column `{col_name}` exceeds length: \
+        }
+        // v6.0.1: f32 → SQ8 INSERT-time quantisation. Triggered
+        // when the column declares `VECTOR(N) USING SQ8` and
+        // the INSERT VALUES expression yields a raw f32 vector
+        // (the normal pgvector-shape literal). Dim mismatch
+        // falls through the `_ => None` arm and surfaces as
+        // `TypeMismatch` with the expected SQ8 column type —
+        // matching the F32 path's existing error.
+        (
+            Value::Vector(v),
+            DataType::Vector {
+                dim,
+                encoding: VecEncoding::Sq8,
+            },
+        ) if v.len() == dim as usize => Some(Value::Sq8Vector(spg_storage::quantize::quantize(&v))),
+        // v6.0.3: f32 → f16 INSERT-time conversion for HALF
+        // columns. Bit-exact at the storage layer (modulo
+        // half-precision rounding); no rerank pass needed at
+        // search time.
+        (
+            Value::Vector(v),
+            DataType::Vector {
+                dim,
+                encoding: VecEncoding::F16,
+            },
+        ) if v.len() == dim as usize => Some(Value::HalfVector(
+            spg_storage::halfvec::HalfVector::from_f32_slice(&v),
+        )),
+        // CHAR(n) right-pads with U+0020 to exactly n chars; if the input
+        // is already longer we reject (PG truncates trailing-space-only;
+        // staying strict for v1).
+        (Value::Text(s), DataType::Char(size)) => {
+            let len = u32::try_from(s.chars().count()).unwrap_or(u32::MAX);
+            if len > size {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "value for CHAR({size}) column `{col_name}` exceeds length: \
                      {len} chars"
-                    )));
-                }
-                let need = (size - len) as usize;
-                let mut padded = s;
-                padded.reserve(need);
-                for _ in 0..need {
-                    padded.push(' ');
-                }
-                Some(Value::Text(padded))
+                )));
             }
-            _ => None,
-        };
+            let need = (size - len) as usize;
+            let mut padded = s;
+            padded.reserve(need);
+            for _ in 0..need {
+                padded.push(' ');
+            }
+            Some(Value::Text(padded))
+        }
+        _ => None,
+    };
     coerced.ok_or(EngineError::Storage(StorageError::TypeMismatch {
         column: col_name.into(),
         expected,
@@ -9901,11 +9797,8 @@ mod tests {
             .unwrap();
         let stmt = e.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
         for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {
-            e.execute_prepared(
-                stmt.clone(),
-                &[Value::Int(id), Value::Text(name.into())],
-            )
-            .unwrap();
+            e.execute_prepared(stmt.clone(), &[Value::Int(id), Value::Text(name.into())])
+                .unwrap();
         }
         // Read back via simple-query SELECT.
         let rows_result = e.execute("SELECT id, name FROM t").unwrap();
@@ -9924,12 +9817,8 @@ mod tests {
             e.execute(&alloc::format!("INSERT INTO t VALUES ({i}, {})", i * 7))
                 .unwrap();
         }
-        let stmt = e
-            .prepare("SELECT id FROM t WHERE v = $1")
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = e
-            .execute_prepared(stmt, &[Value::Int(35)])
-            .unwrap()
+        let stmt = e.prepare("SELECT id FROM t WHERE v = $1").unwrap();
+        let QueryResult::Rows { rows, .. } = e.execute_prepared(stmt, &[Value::Int(35)]).unwrap()
         else {
             panic!("expected Rows")
         };
@@ -10462,7 +10351,8 @@ mod tests {
         // process-restart variant.
         let mut e = Engine::new();
         e.execute("CREATE PUBLICATION pub_a").unwrap();
-        e.execute("CREATE PUBLICATION pub_b FOR ALL TABLES").unwrap();
+        e.execute("CREATE PUBLICATION pub_b FOR ALL TABLES")
+            .unwrap();
         let snap = e.snapshot();
         let e2 = Engine::restore_envelope(&snap).unwrap();
         assert_eq!(e2.publications().len(), 2);
@@ -10695,7 +10585,10 @@ mod tests {
         assert_eq!(e2.subscriptions().len(), 2);
         let s1 = e2.subscriptions().get("s1").unwrap();
         assert_eq!(s1.conn_str, "h=A");
-        assert_eq!(s1.publications, alloc::vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(
+            s1.publications,
+            alloc::vec!["p1".to_string(), "p2".to_string()]
+        );
         assert_eq!(s1.last_received_pos, 0);
         let s2 = e2.subscriptions().get("s2").unwrap();
         assert_eq!(s2.last_received_pos, 42);
@@ -10738,18 +10631,15 @@ mod tests {
         assert!(e.subscriptions().contains("s"));
     }
 
-    #[test]
     // ── v6.2.0: ANALYZE + spg_statistic + envelope v5 ──────────
-
     #[test]
     fn analyze_populates_histogram_bounds() {
         let mut e = Engine::new();
-        e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
-        for i in 0..50 {
-            e.execute(&alloc::format!(
-                "INSERT INTO t VALUES ({i}, 'name{i}')"
-            ))
+        e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
             .unwrap();
+        for i in 0..50 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i}, 'name{i}')"))
+                .unwrap();
         }
         e.execute("ANALYZE t").unwrap();
         let stats = e.statistics();
@@ -10766,13 +10656,15 @@ mod tests {
         let mut e = Engine::new();
         e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
         for i in 0..10 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         e.execute("ANALYZE t").unwrap();
         let n1 = e.statistics().get("t", "id").unwrap().n_distinct;
         assert_eq!(n1, 10);
         for i in 10..30 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         e.execute("ANALYZE t").unwrap();
         let n2 = e.statistics().get("t", "id").unwrap().n_distinct;
@@ -10783,7 +10675,10 @@ mod tests {
     fn analyze_unknown_table_errors() {
         let mut e = Engine::new();
         let err = e.execute("ANALYZE nonexistent").unwrap_err();
-        assert!(matches!(err, EngineError::Storage(StorageError::TableNotFound { .. })));
+        assert!(matches!(
+            err,
+            EngineError::Storage(StorageError::TableNotFound { .. })
+        ));
     }
 
     #[test]
@@ -10795,7 +10690,10 @@ mod tests {
         e.execute("INSERT INTO t2 VALUES ('alice')").unwrap();
         let r = e.execute("ANALYZE").unwrap();
         match r {
-            QueryResult::CommandOk { affected, modified_catalog } => {
+            QueryResult::CommandOk {
+                affected,
+                modified_catalog,
+            } => {
                 assert_eq!(affected, 2);
                 assert!(modified_catalog);
             }
@@ -10852,7 +10750,8 @@ mod tests {
         let mut e = Engine::new();
         e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
         for i in 0..20 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         e.execute("ANALYZE").unwrap();
         let snap = e.snapshot();
@@ -10871,7 +10770,8 @@ mod tests {
         let mut e = Engine::new();
         e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
         for i in 0..9 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         assert!(e.tables_needing_analyze().is_empty(), "9 < threshold");
         e.execute("INSERT INTO t VALUES (9)").unwrap();
@@ -10889,19 +10789,22 @@ mod tests {
         let mut e = Engine::new();
         e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
         for i in 0..1000 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         e.execute("ANALYZE t").unwrap();
         assert!(e.tables_needing_analyze().is_empty(), "fresh ANALYZE");
         for i in 1000..1050 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         assert!(
             e.tables_needing_analyze().is_empty(),
             "50 inserts < threshold of ~105"
         );
         for i in 1050..1200 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         assert_eq!(
             e.tables_needing_analyze(),
@@ -10915,7 +10818,8 @@ mod tests {
         let mut e = Engine::new();
         e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
         for i in 0..200 {
-            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})")).unwrap();
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
         }
         assert!(!e.tables_needing_analyze().is_empty());
         e.execute("ANALYZE").unwrap();
@@ -10928,7 +10832,8 @@ mod tests {
     #[test]
     fn auto_analyze_threshold_tracks_updates_and_deletes() {
         let mut e = Engine::new();
-        e.execute("CREATE TABLE t (id INT NOT NULL, label TEXT)").unwrap();
+        e.execute("CREATE TABLE t (id INT NOT NULL, label TEXT)")
+            .unwrap();
         for i in 0..50 {
             e.execute(&alloc::format!("INSERT INTO t VALUES ({i}, 'x')"))
                 .unwrap();
@@ -10938,10 +10843,7 @@ mod tests {
         // × max(50, 100) = 10. So 25 >= 10 → trigger.
         e.execute("UPDATE t SET label = 'y' WHERE id < 20").unwrap();
         e.execute("DELETE FROM t WHERE id >= 45").unwrap();
-        assert_eq!(
-            e.tables_needing_analyze(),
-            alloc::vec!["t".to_string()]
-        );
+        assert_eq!(e.tables_needing_analyze(), alloc::vec!["t".to_string()]);
     }
 
     #[test]
@@ -10984,13 +10886,8 @@ mod tests {
         let mut e = Engine::new();
         // Force users to be non-empty so the snapshot takes the
         // envelope path rather than the bare-catalog fallback.
-        e.create_user(
-            "alice",
-            "secret",
-            crate::users::Role::ReadOnly,
-            [0u8; 16],
-        )
-        .unwrap();
+        e.create_user("alice", "secret", crate::users::Role::ReadOnly, [0u8; 16])
+            .unwrap();
 
         // Forge an envelope v2: same shape as v3 but no pubs trailer.
         let catalog = e.catalog.serialize();
@@ -10998,13 +10895,9 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"SPGENV01");
         buf.push(2u8); // v2
-        buf.extend_from_slice(
-            &u32::try_from(catalog.len()).unwrap().to_le_bytes(),
-        );
+        buf.extend_from_slice(&u32::try_from(catalog.len()).unwrap().to_le_bytes());
         buf.extend_from_slice(&catalog);
-        buf.extend_from_slice(
-            &u32::try_from(users.len()).unwrap().to_le_bytes(),
-        );
+        buf.extend_from_slice(&u32::try_from(users.len()).unwrap().to_le_bytes());
         buf.extend_from_slice(&users);
         let crc = spg_crypto::crc32::crc32(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());

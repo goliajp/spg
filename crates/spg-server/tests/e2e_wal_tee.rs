@@ -99,7 +99,8 @@ fn tee_mirrors_primary_wal_bytes() {
     let tee_bytes = std::fs::read(&tee).expect("read tee");
     assert!(!wal_bytes.is_empty(), "wal must have content");
     assert_eq!(
-        wal_bytes, tee_bytes,
+        wal_bytes,
+        tee_bytes,
         "tee bytes ({}) must match primary WAL bytes ({}) verbatim",
         tee_bytes.len(),
         wal_bytes.len()

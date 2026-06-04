@@ -21,7 +21,9 @@ fn snapshot_catalog(eng: &Engine) -> spg_storage::Catalog {
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
         assert!(
             matches!(r, QueryResult::CommandOk { .. }),
             "expected CommandOk for {sql:?}"
@@ -49,7 +51,8 @@ fn fk_with_btree_parent_index_succeeds() {
 #[test]
 fn fk_without_parent_index_is_rejected() {
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE u (id INT NOT NULL, name TEXT)").unwrap();
+    eng.execute("CREATE TABLE u (id INT NOT NULL, name TEXT)")
+        .unwrap();
     let r = eng.execute("CREATE TABLE o (uid INT NOT NULL REFERENCES u(id))");
     assert!(matches!(r, Err(EngineError::Unsupported(_))));
 }
@@ -57,9 +60,8 @@ fn fk_without_parent_index_is_rejected() {
 #[test]
 fn fk_against_missing_parent_table_is_rejected() {
     let mut eng = Engine::new();
-    let r = eng.execute(
-        "CREATE TABLE o (uid INT NOT NULL, FOREIGN KEY (uid) REFERENCES ghost(id))",
-    );
+    let r =
+        eng.execute("CREATE TABLE o (uid INT NOT NULL, FOREIGN KEY (uid) REFERENCES ghost(id))");
     assert!(matches!(r, Err(EngineError::Storage(_))));
 }
 
@@ -69,9 +71,7 @@ fn fk_against_unknown_parent_column_is_rejected() {
         "CREATE TABLE u (id INT NOT NULL)",
         "CREATE INDEX u_pk ON u (id)",
     ]);
-    let r = eng.execute(
-        "CREATE TABLE o (uid INT NOT NULL, FOREIGN KEY (uid) REFERENCES u(ghost))",
-    );
+    let r = eng.execute("CREATE TABLE o (uid INT NOT NULL, FOREIGN KEY (uid) REFERENCES u(ghost))");
     assert!(matches!(r, Err(EngineError::Unsupported(_))));
 }
 
@@ -104,10 +104,8 @@ fn fk_default_parent_columns_uses_pk_index() {
 
 #[test]
 fn fk_self_referencing_with_explicit_parent_column() {
-    let eng = engine_with(&[
-        "CREATE TABLE org (id INT NOT NULL, parent_id INT, \
-         FOREIGN KEY (parent_id) REFERENCES org(id))",
-    ]);
+    let eng = engine_with(&["CREATE TABLE org (id INT NOT NULL, parent_id INT, \
+         FOREIGN KEY (parent_id) REFERENCES org(id))"]);
     let cat = snapshot_catalog(&eng);
     let fk = &cat.get("org").unwrap().schema().foreign_keys[0];
     assert_eq!(fk.parent_table, "org");

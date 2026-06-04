@@ -31,9 +31,11 @@ fn rows_of(r: &QueryResult) -> Vec<String> {
 #[test]
 fn every_operator_reports_stats() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
     for i in 0..10 {
-        e.execute(&format!("INSERT INTO t VALUES ({i}, 'n{i}')")).unwrap();
+        e.execute(&format!("INSERT INTO t VALUES ({i}, 'n{i}')"))
+            .unwrap();
     }
     let r = e.execute("EXPLAIN ANALYZE SELECT * FROM t").unwrap();
     let lines = rows_of(&r);
@@ -59,8 +61,14 @@ fn top_level_rows_match_result_count() {
     let r = e.execute("EXPLAIN ANALYZE SELECT * FROM t").unwrap();
     let lines = rows_of(&r);
     let top = &lines[0];
-    assert!(top.contains("(rows=7)"), "top reports result rows; got {top:?}");
-    let total = lines.iter().find(|l| l.starts_with("Total: rows=")).unwrap();
+    assert!(
+        top.contains("(rows=7)"),
+        "top reports result rows; got {top:?}"
+    );
+    let total = lines
+        .iter()
+        .find(|l| l.starts_with("Total: rows="))
+        .unwrap();
     assert!(total.contains("rows=7"));
 }
 
@@ -117,9 +125,7 @@ fn no_unknown_operator_in_top_level() {
         let r = e.execute(q).unwrap();
         let lines = rows_of(&r);
         let top = &lines[0];
-        let stripped = top
-            .split_once(' ')
-            .map_or(top.as_str(), |(head, _)| head);
+        let stripped = top.split_once(' ').map_or(top.as_str(), |(head, _)| head);
         assert!(
             known.iter().any(|k| stripped.starts_with(k)),
             "unknown top operator {stripped:?} for query {q:?}"
@@ -134,9 +140,7 @@ fn scan_omits_cold_marker_when_no_cold_segments() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE warm (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO warm VALUES (1)").unwrap();
-    let r = e
-        .execute("EXPLAIN ANALYZE SELECT * FROM warm")
-        .unwrap();
+    let r = e.execute("EXPLAIN ANALYZE SELECT * FROM warm").unwrap();
     let lines = rows_of(&r);
     let from = lines.iter().find(|l| l.contains("From: warm")).unwrap();
     assert!(

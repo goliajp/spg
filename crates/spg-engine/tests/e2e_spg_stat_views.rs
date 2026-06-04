@@ -24,10 +24,8 @@ fn replication_lists_subscriptions() {
     // Create a publication so the subscription has something to
     // point at, then a subscription itself.
     eng.execute("CREATE PUBLICATION p FOR ALL TABLES").unwrap();
-    eng.execute(
-        "CREATE SUBSCRIPTION s CONNECTION 'host=localhost port=5432' PUBLICATION p",
-    )
-    .unwrap();
+    eng.execute("CREATE SUBSCRIPTION s CONNECTION 'host=localhost port=5432' PUBLICATION p")
+        .unwrap();
 
     let res = eng.execute("SELECT * FROM spg_stat_replication").unwrap();
     let cols = columns_of(eng.execute("SELECT * FROM spg_stat_replication").unwrap());

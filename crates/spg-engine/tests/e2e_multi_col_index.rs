@@ -71,7 +71,13 @@ fn single_column_index_still_works_after_widening() {
     ]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
-    assert!(cat.get("u").unwrap().indices().iter().any(|i| i.name == "u_id"));
+    assert!(
+        cat.get("u")
+            .unwrap()
+            .indices()
+            .iter()
+            .any(|i| i.name == "u_id")
+    );
 }
 
 #[test]

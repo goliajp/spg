@@ -171,8 +171,13 @@ fn value_in_histogram_range(stats: &ColumnStats, value: &Value) -> bool {
         .expect("first present implies last present");
     let cmp_lo = value_cmp_str(value, lo);
     let cmp_hi = value_cmp_str(value, hi);
-    matches!(cmp_lo, core::cmp::Ordering::Equal | core::cmp::Ordering::Greater)
-        && matches!(cmp_hi, core::cmp::Ordering::Equal | core::cmp::Ordering::Less)
+    matches!(
+        cmp_lo,
+        core::cmp::Ordering::Equal | core::cmp::Ordering::Greater
+    ) && matches!(
+        cmp_hi,
+        core::cmp::Ordering::Equal | core::cmp::Ordering::Less
+    )
 }
 
 /// `fraction of rows with column-value ≤ value`. Performs binary
@@ -240,9 +245,7 @@ fn value_cmp_str(value: &Value, bound: &str) -> core::cmp::Ordering {
         Value::Int(n) => bound
             .parse::<i64>()
             .map_or(Ordering::Equal, |b| i64::from(*n).cmp(&b)),
-        Value::BigInt(n) => bound
-            .parse::<i64>()
-            .map_or(Ordering::Equal, |b| n.cmp(&b)),
+        Value::BigInt(n) => bound.parse::<i64>().map_or(Ordering::Equal, |b| n.cmp(&b)),
         Value::Float(x) => bound
             .parse::<f64>()
             .ok()
@@ -310,7 +313,10 @@ mod tests {
     #[test]
     fn no_stats_returns_pg_defaults() {
         assert_eq!(equal(None, &Value::Int(1)), DEFAULT_EQ);
-        assert_eq!(range(None, Some(&Value::Int(1)), None, true, true), DEFAULT_RANGE);
+        assert_eq!(
+            range(None, Some(&Value::Int(1)), None, true, true),
+            DEFAULT_RANGE
+        );
         assert_eq!(
             range(None, Some(&Value::Int(1)), Some(&Value::Int(2)), true, true),
             DEFAULT_BETWEEN
@@ -375,10 +381,7 @@ mod tests {
     #[test]
     fn in_list_sums_and_clamps() {
         let s = mk_int_stats(0, 100, 100, 0.0);
-        let est = in_list(
-            Some(&s),
-            &[Value::Int(1), Value::Int(2), Value::Int(3)],
-        );
+        let est = in_list(Some(&s), &[Value::Int(1), Value::Int(2), Value::Int(3)]);
         // 3 × (1 / 100) = 0.03
         assert!((est - 0.03).abs() < 1e-6);
         // Empty list → MIN_SELECTIVITY, never 0.

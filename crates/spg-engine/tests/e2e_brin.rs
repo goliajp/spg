@@ -21,15 +21,20 @@ fn rows_of(res: QueryResult) -> Vec<Vec<spg_storage::Value>> {
 #[test]
 fn create_index_brin_succeeds() {
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
+    eng.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+        .unwrap();
     // Parser + dispatch path.
-    eng.execute("CREATE INDEX ix_t_brin ON t USING brin (id)").unwrap();
+    eng.execute("CREATE INDEX ix_t_brin ON t USING brin (id)")
+        .unwrap();
     // Idempotency via IF NOT EXISTS.
     eng.execute("CREATE INDEX IF NOT EXISTS ix_t_brin ON t USING brin (id)")
         .unwrap();
     // Duplicate without IF NOT EXISTS errors.
     let err = eng.execute("CREATE INDEX ix_t_brin ON t USING brin (id)");
-    assert!(err.is_err(), "expected DuplicateIndex without IF NOT EXISTS");
+    assert!(
+        err.is_err(),
+        "expected DuplicateIndex without IF NOT EXISTS"
+    );
 }
 
 #[test]
@@ -37,7 +42,8 @@ fn brin_coexists_with_btree_on_same_column() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     eng.execute("CREATE INDEX ix_t_btree ON t (id)").unwrap();
-    eng.execute("CREATE INDEX ix_t_brin ON t USING brin (id)").unwrap();
+    eng.execute("CREATE INDEX ix_t_brin ON t USING brin (id)")
+        .unwrap();
     // Insert + select still works.
     for i in 0..5 {
         eng.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
@@ -52,8 +58,10 @@ fn brin_index_does_not_break_full_table_scan() {
     // for cold segments). A SELECT on a table with only a BRIN
     // index should still work via the regular row scan.
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
-    eng.execute("CREATE INDEX ix_t_brin ON t USING brin (id)").unwrap();
+    eng.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+        .unwrap();
+    eng.execute("CREATE INDEX ix_t_brin ON t USING brin (id)")
+        .unwrap();
     eng.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     eng.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
     eng.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
@@ -71,8 +79,8 @@ fn brin_summaries_get_emitted_at_freeze_when_brin_index_exists() {
     // round-trips with summaries intact.
 
     use spg_storage::{
-        Catalog, ColumnSchema, DataType, TableSchema, derive_brin_summaries, encode_segment,
-        wrap_v2_envelope_with_brin, OwnedSegment, SEGMENT_PAGE_BYTES,
+        Catalog, ColumnSchema, DataType, OwnedSegment, SEGMENT_PAGE_BYTES, TableSchema,
+        derive_brin_summaries, encode_segment, wrap_v2_envelope_with_brin,
     };
 
     let _cat: Catalog = Catalog::new();
@@ -89,8 +97,7 @@ fn brin_summaries_get_emitted_at_freeze_when_brin_index_exists() {
     let pairs: Vec<(u64, Vec<u8>)> = (0..100u64)
         .map(|i| (i * 3 + 1, vec![b'r', b'-', i as u8]))
         .collect();
-    let (v1, meta) = encode_segment(pairs.into_iter(), 0.01, SEGMENT_PAGE_BYTES)
-        .expect("encode");
+    let (v1, meta) = encode_segment(pairs.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
     let summaries = derive_brin_summaries(&v1).expect("derive");
     assert_eq!(summaries.len(), meta.num_pages as usize);
 

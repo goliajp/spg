@@ -38,7 +38,11 @@ fn key_column_insert_and_select() {
         .unwrap();
     eng.execute("INSERT INTO config VALUES ('host', 'localhost')")
         .unwrap();
-    let r = eng.execute("SELECT value FROM config WHERE key = 'host'").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    let r = eng
+        .execute("SELECT value FROM config WHERE key = 'host'")
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert_eq!(rows.len(), 1);
 }

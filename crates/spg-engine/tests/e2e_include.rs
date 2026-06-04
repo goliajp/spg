@@ -18,7 +18,8 @@ fn create_index_with_include_persists_columns() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, age INT NOT NULL)")
         .unwrap();
-    e.execute("CREATE INDEX by_id ON t (id) INCLUDE (name, age)").unwrap();
+    e.execute("CREATE INDEX by_id ON t (id) INCLUDE (name, age)")
+        .unwrap();
     let t = e.catalog().get("t").expect("table");
     let idx = t
         .indices()
@@ -76,7 +77,8 @@ fn included_columns_survive_catalog_snapshot_roundtrip() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, age INT NOT NULL)")
         .unwrap();
-    e.execute("CREATE INDEX by_id ON t (id) INCLUDE (name, age)").unwrap();
+    e.execute("CREATE INDEX by_id ON t (id) INCLUDE (name, age)")
+        .unwrap();
     let bytes = e.catalog().serialize();
     let restored = Catalog::deserialize(&bytes).expect("deserialize");
     let idx = restored
@@ -97,7 +99,8 @@ fn legacy_v11_snapshot_loads_with_empty_included() {
     // with no INCLUDE clauses and verify deserialise via the v12
     // path returns the same empty Vec.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+        .unwrap();
     e.execute("CREATE INDEX by_id ON t (id)").unwrap();
     let bytes = e.catalog().serialize();
     let restored = Catalog::deserialize(&bytes).expect("deserialize");
@@ -120,7 +123,10 @@ fn create_index_display_round_trips_include() {
     let Statement::CreateIndex(ref s) = stmt else {
         panic!("expected CreateIndex");
     };
-    assert_eq!(s.included_columns, vec!["name".to_string(), "age".to_string()]);
+    assert_eq!(
+        s.included_columns,
+        vec!["name".to_string(), "age".to_string()]
+    );
     // Display + re-parse round-trip.
     let s2 = parse_statement(&stmt.to_string()).unwrap();
     assert_eq!(s2, stmt);

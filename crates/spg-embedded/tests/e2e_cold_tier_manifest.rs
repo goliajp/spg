@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 
 use spg_embedded::Database;
-use spg_storage::Value;
 
 fn unique_tmpdir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -77,8 +76,7 @@ fn manifest_persists_across_drop_without_explicit_checkpoint() {
         db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
         db.execute("CREATE INDEX by_id ON t (id)").unwrap();
         for id in 0..5i64 {
-            db.execute(&format!("INSERT INTO t VALUES ({id})"))
-                .unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({id})")).unwrap();
         }
         db.freeze_oldest_to_cold("t", "by_id", 3).unwrap();
         // No explicit checkpoint — rely on Drop.

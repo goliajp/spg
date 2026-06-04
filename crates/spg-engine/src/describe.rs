@@ -163,7 +163,10 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
             })
         }
         // Unary minus preserves the operand's type.
-        Expr::Unary { op: UnOp::Neg, expr } => {
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => {
             let inner = describe_expr(expr, schema_cols)?;
             Some(ExprShape {
                 name: "?column?".to_string(),
@@ -264,7 +267,12 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 walk_expr(a, f);
             }
         }
-        Expr::WindowFunction { args, partition_by, order_by, .. } => {
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for a in args {
                 walk_expr(a, f);
             }
@@ -348,7 +356,9 @@ mod tests {
         let mut eng = Engine::new();
         eng.execute("CREATE TABLE a (id INT)").unwrap();
         eng.execute("CREATE TABLE b (id INT)").unwrap();
-        let stmt = eng.prepare("SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
+        let stmt = eng
+            .prepare("SELECT * FROM a JOIN b ON a.id = b.id")
+            .unwrap();
         let (_, cols) = describe_prepared(&stmt, eng_catalog(&eng));
         // JOIN shape falls through to NoData → empty Vec.
         assert!(cols.is_empty());

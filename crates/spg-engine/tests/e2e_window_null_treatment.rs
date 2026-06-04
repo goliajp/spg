@@ -28,9 +28,7 @@ fn lag_ignore_nulls_skips_nulls() {
     eng.execute("INSERT INTO t VALUES (5, 30)").unwrap();
 
     let res = eng
-        .execute(
-            "SELECT id, LAG(v) IGNORE NULLS OVER (ORDER BY id) FROM t ORDER BY id",
-        )
+        .execute("SELECT id, LAG(v) IGNORE NULLS OVER (ORDER BY id) FROM t ORDER BY id")
         .unwrap();
     let got = rows_of(res);
     // Expected LAG(v) IGNORE NULLS:
@@ -62,9 +60,7 @@ fn first_value_respect_nulls_default() {
     eng.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
     let res = eng
-        .execute(
-            "SELECT id, FIRST_VALUE(v) OVER (ORDER BY id) FROM t ORDER BY id",
-        )
+        .execute("SELECT id, FIRST_VALUE(v) OVER (ORDER BY id) FROM t ORDER BY id")
         .unwrap();
     let got = rows_of(res);
     // First value in the running frame is always row 1's v = NULL.
@@ -82,9 +78,7 @@ fn first_value_ignore_nulls_picks_first_non_null() {
     eng.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
     let res = eng
-        .execute(
-            "SELECT id, FIRST_VALUE(v) IGNORE NULLS OVER (ORDER BY id) FROM t ORDER BY id",
-        )
+        .execute("SELECT id, FIRST_VALUE(v) IGNORE NULLS OVER (ORDER BY id) FROM t ORDER BY id")
         .unwrap();
     let got = rows_of(res);
     // FIRST_VALUE IGNORE NULLS in a running frame (start..current):
@@ -106,9 +100,7 @@ fn last_value_ignore_nulls() {
     eng.execute("INSERT INTO t VALUES (4, NULL)").unwrap();
 
     let res = eng
-        .execute(
-            "SELECT id, LAST_VALUE(v) IGNORE NULLS OVER (ORDER BY id) FROM t ORDER BY id",
-        )
+        .execute("SELECT id, LAST_VALUE(v) IGNORE NULLS OVER (ORDER BY id) FROM t ORDER BY id")
         .unwrap();
     let got = rows_of(res);
     // Running frame [row 1..current]; last non-NULL in each window:

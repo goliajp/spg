@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use spg_wire::{
-    Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch,
-};
+use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
 mod common;
 
@@ -35,7 +33,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-chaos-lr-e2e-{tag}-{pid}-{nanos}-{serial}"));
     std::fs::create_dir_all(&dir).expect("create tmpdir");
@@ -303,7 +303,10 @@ fn subscription_survives_netsplit_heal_cycle() {
     let mut s_probe = common::connect_to(&s_addrs.native);
     s_probe.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let mid = select_int(&mut s_probe, "SELECT count(*) FROM t");
-    assert!(mid < 1000, "subscriber should be behind mid-split; got {mid}");
+    assert!(
+        mid < 1000,
+        "subscriber should be behind mid-split; got {mid}"
+    );
 
     // Phase 3 — heal. Subscriber must converge to 1000.
     proxy_ctrl.heal();

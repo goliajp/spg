@@ -72,10 +72,8 @@ fn setup_tpch() -> Engine {
     .unwrap();
     // ── DML ────────────────────────────────────────────────────
     for r in 0..N_REGIONS {
-        e.execute(&format!(
-            "INSERT INTO region VALUES ({r}, 'REGION{r}')"
-        ))
-        .unwrap();
+        e.execute(&format!("INSERT INTO region VALUES ({r}, 'REGION{r}')"))
+            .unwrap();
     }
     for n in 0..N_NATIONS {
         e.execute(&format!(

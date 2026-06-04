@@ -79,7 +79,9 @@ fn http_get_body(addr: &str, path: &str) -> String {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).unwrap();
     let s = String::from_utf8_lossy(&buf).to_string();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+    s.split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default()
 }
 
 fn metric_value(body: &str, name: &str) -> Option<u64> {
@@ -104,8 +106,7 @@ fn wait_for_cold_segments(s: &mut TcpStream, want: usize) {
         loop {
             let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
             s.read_exact(&mut header).unwrap();
-            let len =
-                u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
             let op = Op::from_byte(header[4]).unwrap();
             let mut body = vec![0u8; len];
             if len > 0 {
@@ -154,7 +155,10 @@ fn sequential_scan_triggers_prefetch() {
         {
             let mut s = common::connect_to(&addrs.native);
             s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-            exec_ok(&mut s, "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)");
+            exec_ok(
+                &mut s,
+                "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)",
+            );
             exec_ok(&mut s, "CREATE INDEX by_id ON t (id)");
             for i in 0..20i64 {
                 exec_ok(&mut s, &format!("INSERT INTO t VALUES ({i}, 'row-{i}')"));

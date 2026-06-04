@@ -84,9 +84,11 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     // v6.5.2 — register this connection in the activity registry.
     // Removed when `_conn_guard` drops at function exit.
     let conn_state = Arc::new(crate::ConnState {
-        pid: std::process::id().wrapping_add(state.active_connections.load(
-            std::sync::atomic::Ordering::Relaxed,
-        ) as u32),
+        pid: std::process::id().wrapping_add(
+            state
+                .active_connections
+                .load(std::sync::atomic::Ordering::Relaxed) as u32,
+        ),
         user: user.clone(),
         started_at_us: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -322,7 +324,10 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         }
                         send_command_complete(&mut wbuf, &format!("SELECT {n}"))?;
                     }
-                    Ok(QueryResult::CommandOk { affected, modified_catalog }) => {
+                    Ok(QueryResult::CommandOk {
+                        affected,
+                        modified_catalog,
+                    }) => {
                         let tag = command_tag(&sql, affected);
                         send_command_complete(&mut wbuf, &tag)?;
                         // v6.5.3 — audit-log every catalog-mutating
@@ -409,9 +414,10 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                     // on the underlying statement).
                     let (param_oids, columns): (Vec<u32>, Vec<ColumnSchema>) = if kind == b'S' {
                         if let Some(stmt) = prepared.get(&name) {
-                            let eng = state.engine.read().map_err(|_| {
-                                std::io::Error::other("engine lock poisoned")
-                            })?;
+                            let eng = state
+                                .engine
+                                .read()
+                                .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
                             eng.describe_prepared(&stmt.ast)
                         } else {
                             (Vec::new(), Vec::new())
@@ -419,9 +425,10 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                     } else if kind == b'P' {
                         let cols = if let Some(portal) = portals.get(&name) {
                             if let Some(stmt) = prepared.get(&portal.stmt_name) {
-                                let eng = state.engine.read().map_err(|_| {
-                                    std::io::Error::other("engine lock poisoned")
-                                })?;
+                                let eng = state
+                                    .engine
+                                    .read()
+                                    .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
                                 let (_, c) = eng.describe_prepared(&stmt.ast);
                                 c
                             } else {
@@ -435,9 +442,8 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         (Vec::new(), Vec::new())
                     };
                     if kind == b'S' {
-                        let n = u16::try_from(param_oids.len()).map_err(|_| {
-                            std::io::Error::other("too many parameters")
-                        })?;
+                        let n = u16::try_from(param_oids.len())
+                            .map_err(|_| std::io::Error::other("too many parameters"))?;
                         let mut pd = Vec::with_capacity(2 + param_oids.len() * 4);
                         pd.extend_from_slice(&n.to_be_bytes());
                         for oid in &param_oids {
@@ -1128,13 +1134,7 @@ fn handle_bind(
     }
     // Trailing result-format-codes — we always return text on the
     // wire, so ignore them here.
-    Ok((
-        portal_name,
-        Portal {
-            stmt_name,
-            params,
-        },
-    ))
+    Ok((portal_name, Portal { stmt_name, params }))
 }
 
 /// v6.1.1 — convert a pgwire text-format bind parameter into a
@@ -1197,7 +1197,10 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
     match oid {
         16 => {
             if bytes.len() != 1 {
-                return Err(format!("Bind binary BOOL must be 1 byte, got {}", bytes.len()));
+                return Err(format!(
+                    "Bind binary BOOL must be 1 byte, got {}",
+                    bytes.len()
+                ));
             }
             Ok(Value::Bool(bytes[0] != 0))
         }
@@ -1208,16 +1211,17 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
             // Text via lossless escape (matches PG's text-format
             // bytea = '\\x...' on read).
             if oid == 17 {
-                let s = bytes
-                    .iter()
-                    .fold(String::with_capacity(2 + bytes.len() * 2), |mut acc, b| {
-                        if acc.is_empty() {
-                            acc.push('\\');
-                            acc.push('x');
-                        }
-                        acc.push_str(&format!("{b:02x}"));
-                        acc
-                    });
+                let s =
+                    bytes
+                        .iter()
+                        .fold(String::with_capacity(2 + bytes.len() * 2), |mut acc, b| {
+                            if acc.is_empty() {
+                                acc.push('\\');
+                                acc.push('x');
+                            }
+                            acc.push_str(&format!("{b:02x}"));
+                            acc
+                        });
                 Ok(Value::Text(if s.is_empty() { "\\x".into() } else { s }))
             } else {
                 let s = std::str::from_utf8(bytes)
@@ -1227,42 +1231,60 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
         }
         20 => {
             if bytes.len() != 8 {
-                return Err(format!("Bind binary BIGINT must be 8 bytes, got {}", bytes.len()));
+                return Err(format!(
+                    "Bind binary BIGINT must be 8 bytes, got {}",
+                    bytes.len()
+                ));
             }
             let n = i64::from_be_bytes(bytes.try_into().unwrap());
             Ok(Value::BigInt(n))
         }
         21 => {
             if bytes.len() != 2 {
-                return Err(format!("Bind binary INT2 must be 2 bytes, got {}", bytes.len()));
+                return Err(format!(
+                    "Bind binary INT2 must be 2 bytes, got {}",
+                    bytes.len()
+                ));
             }
             let n = i16::from_be_bytes(bytes.try_into().unwrap());
             Ok(Value::SmallInt(n))
         }
         23 => {
             if bytes.len() != 4 {
-                return Err(format!("Bind binary INT must be 4 bytes, got {}", bytes.len()));
+                return Err(format!(
+                    "Bind binary INT must be 4 bytes, got {}",
+                    bytes.len()
+                ));
             }
             let n = i32::from_be_bytes(bytes.try_into().unwrap());
             Ok(Value::Int(n))
         }
         700 => {
             if bytes.len() != 4 {
-                return Err(format!("Bind binary REAL must be 4 bytes, got {}", bytes.len()));
+                return Err(format!(
+                    "Bind binary REAL must be 4 bytes, got {}",
+                    bytes.len()
+                ));
             }
             let f = f32::from_be_bytes(bytes.try_into().unwrap()) as f64;
             Ok(Value::Float(f))
         }
         701 => {
             if bytes.len() != 8 {
-                return Err(format!("Bind binary DOUBLE must be 8 bytes, got {}", bytes.len()));
+                return Err(format!(
+                    "Bind binary DOUBLE must be 8 bytes, got {}",
+                    bytes.len()
+                ));
             }
             let f = f64::from_be_bytes(bytes.try_into().unwrap());
             Ok(Value::Float(f))
         }
         1082 => {
             if bytes.len() != 4 {
-                return Err(format!("Bind binary DATE must be 4 bytes, got {}", bytes.len()));
+                return Err(format!(
+                    "Bind binary DATE must be 4 bytes, got {}",
+                    bytes.len()
+                ));
             }
             // Days since 2000-01-01. SPG's Date stores days since
             // 1970-01-01 (Unix epoch), so add the 30-year offset.
@@ -1286,7 +1308,8 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value, Str
         1700 => decode_binary_numeric(bytes),
         0 => Err(
             "Bind: binary format requires the parameter OID to be declared in Parse \
-             (got OID=0 meaning unknown)".into(),
+             (got OID=0 meaning unknown)"
+                .into(),
         ),
         _ => Err(format!(
             "Bind: binary format for OID {oid} not supported in v6.3.4"
@@ -1810,8 +1833,7 @@ fn handle_copy_from_stdin(
         }
     }
     // Final drain.
-    if let Err(msg) =
-        process_copy_chunk(state, table, &mut buf, &mut inserted, &mut skipped, opts)
+    if let Err(msg) = process_copy_chunk(state, table, &mut buf, &mut inserted, &mut skipped, opts)
     {
         send_error(stream, "22P02", &msg)?;
         return Ok(());
@@ -2628,9 +2650,9 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Date => 1082,
         DataType::Interval => 1186,
         DataType::Numeric { .. } => 1700,
-        DataType::Json => 114,  // PG `json`
-        DataType::Jsonb => 3802, // PG `jsonb` — v7.9.0 mailrs blocker fix
-        DataType::Bytes => 17,   // PG `bytea` — v7.10.4 Epic 1
+        DataType::Json => 114,       // PG `json`
+        DataType::Jsonb => 3802,     // PG `jsonb` — v7.9.0 mailrs blocker fix
+        DataType::Bytes => 17,       // PG `bytea` — v7.10.4 Epic 1
         DataType::TextArray => 1009, // PG `_text` (TEXT[]) — v7.10.9 Epic 2
     }
 }

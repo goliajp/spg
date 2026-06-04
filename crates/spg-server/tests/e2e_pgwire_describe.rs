@@ -131,7 +131,11 @@ fn describe_statement_returns_row_description_for_simple_select() {
     exec_simple(&mut s, "CREATE TABLE t (id INT, name TEXT)");
 
     let mut q = Vec::new();
-    write_msg(&mut q, b'P', &parse_msg_body("s1", "SELECT id, name FROM t"));
+    write_msg(
+        &mut q,
+        b'P',
+        &parse_msg_body("s1", "SELECT id, name FROM t"),
+    );
     write_msg(&mut q, b'D', &describe_msg_body(b'S', "s1"));
     write_msg(&mut q, b'S', &[]);
     s.write_all(&q).unwrap();
@@ -196,7 +200,11 @@ fn describe_statement_returns_nodata_for_non_select() {
     exec_simple(&mut s, "CREATE TABLE t (id INT)");
 
     let mut q = Vec::new();
-    write_msg(&mut q, b'P', &parse_msg_body("s3", "INSERT INTO t VALUES (1)"));
+    write_msg(
+        &mut q,
+        b'P',
+        &parse_msg_body("s3", "INSERT INTO t VALUES (1)"),
+    );
     write_msg(&mut q, b'D', &describe_msg_body(b'S', "s3"));
     write_msg(&mut q, b'S', &[]);
     s.write_all(&q).unwrap();

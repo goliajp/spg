@@ -212,10 +212,9 @@ impl fmt::Display for SegmentError {
                 f,
                 "segment: page index {got} out of range, num_pages = {num_pages}"
             ),
-            Self::CompressionDecodeFailed(s) => write!(
-                f,
-                "segment v2 envelope: LZSS decompress failed: {s}"
-            ),
+            Self::CompressionDecodeFailed(s) => {
+                write!(f, "segment v2 envelope: LZSS decompress failed: {s}")
+            }
             Self::UnknownCompressionAlgo(b) => write!(
                 f,
                 "segment v2 envelope: unknown compression algo byte {b:#04x}"
@@ -731,7 +730,12 @@ pub fn derive_brin_summaries(v1_bytes: &[u8]) -> Result<Vec<BrinSummary>, Segmen
     // Page-index entries' first_pk values bound the pages. Walk
     // the scan iterator; group keys by the page whose first_pk is
     // the greatest one ≤ the current key.
-    let page_starts: Vec<u64> = reader.metadata.page_index.iter().map(|e| e.first_pk).collect();
+    let page_starts: Vec<u64> = reader
+        .metadata
+        .page_index
+        .iter()
+        .map(|e| e.first_pk)
+        .collect();
     let mut min_by_page: Vec<Option<u64>> = alloc::vec![None; num_pages];
     let mut max_by_page: Vec<Option<u64>> = alloc::vec![None; num_pages];
     let mut current_page: usize = 0;
@@ -880,8 +884,7 @@ fn parse_brin_sidecar_then_v1(
             decoded.len()
         )));
     }
-    let n_summaries =
-        u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]) as usize;
+    let n_summaries = u32::from_le_bytes([decoded[4], decoded[5], decoded[6], decoded[7]]) as usize;
     let summaries_end = 8 + n_summaries * 20;
     if decoded.len() < summaries_end {
         return Err(SegmentError::BadShape(alloc::format!(
@@ -892,8 +895,12 @@ fn parse_brin_sidecar_then_v1(
     let mut summaries = Vec::with_capacity(n_summaries);
     for i in 0..n_summaries {
         let off = 8 + i * 20;
-        let page_index =
-            u32::from_le_bytes([decoded[off], decoded[off + 1], decoded[off + 2], decoded[off + 3]]);
+        let page_index = u32::from_le_bytes([
+            decoded[off],
+            decoded[off + 1],
+            decoded[off + 2],
+            decoded[off + 3],
+        ]);
         let mut k = [0u8; 8];
         k.copy_from_slice(&decoded[off + 4..off + 12]);
         let min_key = u64::from_le_bytes(k);
@@ -920,11 +927,12 @@ impl<'a> SegmentReader<'a> {
     /// decompressed bytes.
     pub fn open(bytes: &'a [u8]) -> Result<Self, SegmentError> {
         if bytes.len() >= 8 && bytes[..8] == SEGMENT_MAGIC_V2 {
-            return Err(SegmentError::BadShape(alloc::format!(
+            return Err(SegmentError::BadShape(
                 "v2 envelope: SegmentReader requires the caller to first \
                  unwrap to v1 bytes via OwnedSegment::from_bytes; the \
                  borrowed-slice reader does not allocate."
-            )));
+                    .into(),
+            ));
         }
         let metadata = parse_segment_metadata(bytes)?;
         Ok(Self { bytes, metadata })

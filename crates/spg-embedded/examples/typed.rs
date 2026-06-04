@@ -13,11 +13,13 @@ spg_row! {
 
 fn main() -> Result<(), spg_embedded::EngineError> {
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE products (
+    db.execute(
+        "CREATE TABLE products (
         id INT NOT NULL,
         name TEXT NOT NULL,
         price_cents BIGINT
-    )")?;
+    )",
+    )?;
     db.execute("INSERT INTO products VALUES (1, 'widget', 1999), (2, 'gizmo', NULL)")?;
 
     let products: Vec<Product> = db.query_typed("SELECT id, name, price_cents FROM products")?;

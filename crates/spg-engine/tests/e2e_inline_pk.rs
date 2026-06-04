@@ -17,9 +17,8 @@ fn engine_with(sqls: &[&str]) -> Engine {
 
 #[test]
 fn bigserial_primary_key_creates_pkey_index_and_implies_not_null() {
-    let eng = engine_with(&[
-        "CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, address TEXT NOT NULL)",
-    ]);
+    let eng =
+        engine_with(&["CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, address TEXT NOT NULL)"]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let table = cat.get("accounts").unwrap();
@@ -45,10 +44,20 @@ fn inline_pk_supports_text_columns_too() {
     ]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
-    assert!(cat.get("config").unwrap().indices().iter().any(|i| i.name == "config_pkey"));
+    assert!(
+        cat.get("config")
+            .unwrap()
+            .indices()
+            .iter()
+            .any(|i| i.name == "config_pkey")
+    );
     // PK lookup works (proves index is functional).
-    let r = eng.execute("SELECT value FROM config WHERE config_key = 'host'").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    let r = eng
+        .execute("SELECT value FROM config WHERE config_key = 'host'")
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert_eq!(rows[0].values[0], Value::Text("localhost".into()));
 }
 
@@ -103,13 +112,15 @@ fn inline_pk_lets_fk_in_other_table_resolve() {
 
 #[test]
 fn returning_id_after_inline_pk_yields_auto_value() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, subject TEXT)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, subject TEXT)"]);
     let r = eng
         .execute("INSERT INTO messages (subject) VALUES ('hello') RETURNING id")
         .unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
-    let Value::BigInt(id) = rows[0].values[0] else { panic!() };
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
+    let Value::BigInt(id) = rows[0].values[0] else {
+        panic!()
+    };
     assert!(id > 0);
 }

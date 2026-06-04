@@ -22,7 +22,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir() -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-stat-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
@@ -99,9 +101,15 @@ fn analyze_populates_spg_statistic_rows() {
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
-    exec_ok(&mut s, "CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)");
+    exec_ok(
+        &mut s,
+        "CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)",
+    );
     for i in 0..30 {
-        exec_ok(&mut s, &format!("INSERT INTO users VALUES ({i}, 'name{i}')"));
+        exec_ok(
+            &mut s,
+            &format!("INSERT INTO users VALUES ({i}, 'name{i}')"),
+        );
     }
     exec_ok(&mut s, "ANALYZE users");
 

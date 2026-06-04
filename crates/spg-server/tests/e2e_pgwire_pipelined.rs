@@ -159,7 +159,11 @@ fn setup_session(addr: &str) -> TcpStream {
     // Parse statement once (named).
     {
         let mut q = Vec::new();
-        write_msg(&mut q, b'P', &parse_msg_body("stmt", "SELECT id, name FROM pl"));
+        write_msg(
+            &mut q,
+            b'P',
+            &parse_msg_body("stmt", "SELECT id, name FROM pl"),
+        );
         write_msg(&mut q, b'S', &sync_msg_body());
         s.write_all(&q).unwrap();
         read_until_ready(&mut s);

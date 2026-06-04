@@ -15,7 +15,10 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        p.push(format!("spg-embedded-autocompact-{label}-{nanos}-{}", std::process::id()));
+        p.push(format!(
+            "spg-embedded-autocompact-{label}-{nanos}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         Self { path: p }
     }
@@ -38,10 +41,12 @@ fn freezer_produces_segments_then_compacts_them() {
     // Schema + bulk seed so the freezer has plenty to demote.
     {
         let mut g = db.lock().unwrap();
-        g.execute("CREATE TABLE t (id INT NOT NULL, payload TEXT)").unwrap();
+        g.execute("CREATE TABLE t (id INT NOT NULL, payload TEXT)")
+            .unwrap();
         g.execute("CREATE INDEX t_pk ON t (id)").unwrap();
         for i in 0..2_000 {
-            g.execute(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
+            g.execute(&format!("INSERT INTO t VALUES ({i}, 'x')"))
+                .unwrap();
         }
     }
 
@@ -52,9 +57,9 @@ fn freezer_produces_segments_then_compacts_them() {
         FreezerOptions {
             tick: Duration::from_millis(10),
             hot_tier_bytes: 256,
-            batch_rows: 20,   // ~100 segments expected → compact must fire
+            batch_rows: 20, // ~100 segments expected → compact must fire
             compact_when_segments_exceed: 8,
-            compact_target_bytes: 1 << 30,  // huge → all small segments mergeable
+            compact_target_bytes: 1 << 30, // huge → all small segments mergeable
         },
     );
 
@@ -82,7 +87,10 @@ fn freezer_produces_segments_then_compacts_them() {
     for probe in [0, 500, 1000, 1500, 1999] {
         let count = {
             let mut g = db.lock().unwrap();
-            match g.execute(&format!("SELECT id FROM t WHERE id = {probe}")).unwrap() {
+            match g
+                .execute(&format!("SELECT id FROM t WHERE id = {probe}"))
+                .unwrap()
+            {
                 spg_embedded::QueryResult::Rows { rows, .. } => rows.len(),
                 _ => 0,
             }
@@ -108,10 +116,12 @@ fn auto_compact_disabled_when_threshold_is_max() {
     let db = Arc::new(Mutex::new(Database::open_path(&p).unwrap()));
     {
         let mut g = db.lock().unwrap();
-        g.execute("CREATE TABLE t (id INT NOT NULL, payload TEXT)").unwrap();
+        g.execute("CREATE TABLE t (id INT NOT NULL, payload TEXT)")
+            .unwrap();
         g.execute("CREATE INDEX t_pk ON t (id)").unwrap();
         for i in 0..500 {
-            g.execute(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
+            g.execute(&format!("INSERT INTO t VALUES ({i}, 'x')"))
+                .unwrap();
         }
     }
     let mut freezer = Database::spawn_background_freezer(
@@ -130,5 +140,8 @@ fn auto_compact_disabled_when_threshold_is_max() {
         g.cold_segment_count()
     };
     freezer.stop();
-    assert!(count >= 4, "expected ≥ 4 segments when compaction disabled, got {count}");
+    assert!(
+        count >= 4,
+        "expected ≥ 4 segments when compaction disabled, got {count}"
+    );
 }

@@ -42,7 +42,8 @@ fn commit_persists_table_and_rows_atomically() {
     let mut eng = Engine::new();
     eng.execute("BEGIN").unwrap();
     eng.execute("CREATE TABLE m (k INT, v TEXT)").unwrap();
-    eng.execute("INSERT INTO m VALUES (1, 'a'), (2, 'b')").unwrap();
+    eng.execute("INSERT INTO m VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
     eng.execute("COMMIT").unwrap();
 
     let res = rows_of(eng.execute("SELECT k, v FROM m ORDER BY k").unwrap());
@@ -59,7 +60,8 @@ fn commit_persists_table_and_rows_atomically() {
 fn rollback_after_create_index_drops_the_index() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
-    eng.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+    eng.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
 
     eng.execute("BEGIN").unwrap();
     eng.execute("CREATE INDEX ix_t_id ON t (id)").unwrap();
@@ -82,10 +84,7 @@ fn ddl_inside_tx_invisible_to_implicit_tx_before_commit() {
     eng.execute("CREATE TABLE t (id INT)").unwrap();
     // Same write-lock holder still sees the shadow.
     let r = eng.execute("SELECT id FROM t");
-    assert!(
-        r.is_ok(),
-        "in-TX queries can read the shadow catalog"
-    );
+    assert!(r.is_ok(), "in-TX queries can read the shadow catalog");
     eng.execute("COMMIT").unwrap();
     // After commit it's globally visible.
     let r2 = eng.execute("SELECT id FROM t");

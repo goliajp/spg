@@ -1,0 +1,16 @@
+# SPG cargo-audit config.
+# Mirrors `deny.toml::[advisories]::ignore` so `rustsec/audit-check`
+# (CI: ci.yml::audit) and `cargo audit` (local) share the same
+# allowlist.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin timing sidechannel in `rsa`.
+    # Pulled in transitively by `sqlx-postgres` (xtests/sqlx-pgwire)
+    # for PG md5 / scram-sha-256 password hashing. xtests run only
+    # against loopback test fixtures; no shipped binary or library
+    # exposes the rsa code path. Will drop the ignore once sqlx
+    # ships a fix or we replace sqlx in xtests with a hand-rolled
+    # PG protocol harness.
+    "RUSTSEC-2023-0071",
+]

@@ -73,9 +73,7 @@ fn composite_target_partial_match_inserts() {
 
 #[test]
 fn composite_target_within_batch_dedup() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE cal (uid INT NOT NULL, calendar_id INT NOT NULL)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE cal (uid INT NOT NULL, calendar_id INT NOT NULL)"]);
     // Two rows with the same (uid, calendar_id) in the same batch.
     eng.execute(
         "INSERT INTO cal VALUES (1, 100), (1, 100), (1, 101) \
@@ -88,11 +86,7 @@ fn composite_target_within_batch_dedup() {
 
 #[test]
 fn composite_target_unknown_column_is_rejected() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE cal (uid INT NOT NULL, calendar_id INT NOT NULL)",
-    ]);
-    let r = eng.execute(
-        "INSERT INTO cal VALUES (1, 100) ON CONFLICT (uid, ghost) DO NOTHING",
-    );
+    let mut eng = engine_with(&["CREATE TABLE cal (uid INT NOT NULL, calendar_id INT NOT NULL)"]);
+    let r = eng.execute("INSERT INTO cal VALUES (1, 100) ON CONFLICT (uid, ghost) DO NOTHING");
     assert!(r.is_err());
 }

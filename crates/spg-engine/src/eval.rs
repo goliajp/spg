@@ -57,14 +57,23 @@ impl<'a> EvalContext<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalError {
-    ColumnNotFound { name: String },
-    UnknownQualifier { qualifier: String },
+    ColumnNotFound {
+        name: String,
+    },
+    UnknownQualifier {
+        qualifier: String,
+    },
     DivisionByZero,
-    TypeMismatch { detail: String },
+    TypeMismatch {
+        detail: String,
+    },
     /// v6.1.1 — `$N` reference past the number of bound parameters.
     /// Either the client sent too few in Bind, or the SQL has a
     /// placeholder the prepared statement didn't account for.
-    PlaceholderOutOfRange { n: u16, bound: u16 },
+    PlaceholderOutOfRange {
+        n: u16,
+        bound: u16,
+    },
 }
 
 impl core::fmt::Display for EvalError {
@@ -199,7 +208,10 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                 Value::SmallInt(n) => i64::from(n),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("array subscript must be integer, got {:?}", other.data_type()),
+                        detail: format!(
+                            "array subscript must be integer, got {:?}",
+                            other.data_type()
+                        ),
                     });
                 }
             };
@@ -298,7 +310,13 @@ fn value_to_text_for_array(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::SmallInt(n) => n.to_string(),
-        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Value::Bool(b) => {
+            if *b {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
         Value::Float(x) => format!("{x}"),
         Value::Date(d) => format_date(*d),
         Value::Timestamp(t) => format_timestamp(*t),
@@ -653,10 +671,7 @@ fn encode_text(args: &[Value]) -> Result<Value, EvalError> {
         Value::Text(s) => s.as_bytes(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!(
-                    "encode() expects text bytes, got {:?}",
-                    other.data_type()
-                ),
+                detail: format!("encode() expects text bytes, got {:?}", other.data_type()),
             });
         }
     };
@@ -664,10 +679,7 @@ fn encode_text(args: &[Value]) -> Result<Value, EvalError> {
         Value::Text(s) => s.to_ascii_lowercase(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!(
-                    "encode() format must be text, got {:?}",
-                    other.data_type()
-                ),
+                detail: format!("encode() format must be text, got {:?}", other.data_type()),
             });
         }
     };
@@ -709,10 +721,7 @@ fn decode_text(args: &[Value]) -> Result<Value, EvalError> {
         Value::Text(s) => s.to_ascii_lowercase(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!(
-                    "decode() format must be text, got {:?}",
-                    other.data_type()
-                ),
+                detail: format!("decode() format must be text, got {:?}", other.data_type()),
             });
         }
     };
@@ -752,10 +761,8 @@ fn error_on_null(args: &[Value]) -> Result<Value, EvalError> {
 
 // ── byte-level encoders ───────────────────────────────────────────
 
-const B64_STD: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const B64_URL: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const B32HEX_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
 
 fn b64_encode(bytes: &[u8], alpha: &[u8; 64]) -> String {
@@ -1229,10 +1236,9 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
         // v7.9.26 — `::regtype` / `::regclass`. SPG has no
         // pg_catalog; surface a clear error.
         CastTarget::RegType | CastTarget::RegClass => Err(EvalError::TypeMismatch {
-            detail:
-                "::regtype / ::regclass not supported on SPG \
+            detail: "::regtype / ::regclass not supported on SPG \
                  (no pg_catalog); use SHOW TABLES / spg_table_ddl instead"
-                    .into(),
+                .into(),
         }),
         // v7.10.11 — `::TEXT[]`. Decode PG external array form
         // when input is Text; pass through unchanged when it is
@@ -1323,10 +1329,11 @@ fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::Interval { months, micros } => Ok(Value::Interval { months, micros }),
         Value::Text(s) => {
-            let (months, micros) = spg_sql::parser::parse_interval_text(&s)
-                .ok_or_else(|| EvalError::TypeMismatch {
+            let (months, micros) = spg_sql::parser::parse_interval_text(&s).ok_or_else(|| {
+                EvalError::TypeMismatch {
                     detail: alloc::format!("cannot parse {s:?} as INTERVAL"),
-                })?;
+                }
+            })?;
             Ok(Value::Interval { months, micros })
         }
         other => Err(EvalError::TypeMismatch {
@@ -1680,7 +1687,8 @@ pub fn format_text_array(items: &[Option<String>]) -> String {
             Some(s) => {
                 let needs_quote = s.is_empty()
                     || s.eq_ignore_ascii_case("NULL")
-                    || s.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ' | '\t'));
+                    || s.chars()
+                        .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ' | '\t'));
                 if needs_quote {
                     out.push('"');
                     for c in s.chars() {
@@ -2021,10 +2029,9 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
-        BinOp::And
-        | BinOp::Or
-        | BinOp::IsDistinctFrom
-        | BinOp::IsNotDistinctFrom => unreachable!("handled above"),
+        BinOp::And | BinOp::Or | BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom => {
+            unreachable!("handled above")
+        }
     }
 }
 

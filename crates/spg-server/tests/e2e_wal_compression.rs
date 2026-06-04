@@ -44,8 +44,7 @@ fn local_spawn(
 ) -> (std::process::Child, common::ServerAddrs) {
     let mut b = common::ServerBuilder::new()
         .arg_path(db)
-        .env("SPG_WAL", wal.to_string_lossy().into_owned())
-        ;
+        .env("SPG_WAL", wal.to_string_lossy().into_owned());
     if let Some(v) = compression {
         b = b.env("SPG_WAL_COMPRESSION", v.to_string());
     }

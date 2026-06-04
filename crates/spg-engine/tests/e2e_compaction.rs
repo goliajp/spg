@@ -88,7 +88,11 @@ fn compaction_drops_deleted_rows() {
     assert_eq!(rows.len(), 1);
     let report = &rows[0];
     assert_eq!(report[2], Value::BigInt(2), "2 sources merged");
-    assert_eq!(report[4], Value::BigInt(4), "6 frozen − 2 shadowed = 4 live");
+    assert_eq!(
+        report[4],
+        Value::BigInt(4),
+        "6 frozen − 2 shadowed = 4 live"
+    );
     assert_eq!(report[5], Value::BigInt(2), "2 deleted rows pruned");
 
     // The deleted PKs do NOT come back through the merged segment.

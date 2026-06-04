@@ -1030,9 +1030,9 @@ impl Table {
             .iter()
             .find(|i| i.column_position == column_position && matches!(i.kind, IndexKind::BTree(_)))
             .or_else(|| {
-                self.indices
-                    .iter()
-                    .find(|i| i.column_position == column_position && matches!(i.kind, IndexKind::Nsw(_)))
+                self.indices.iter().find(|i| {
+                    i.column_position == column_position && matches!(i.kind, IndexKind::Nsw(_))
+                })
             })
     }
 
@@ -1076,9 +1076,10 @@ impl Table {
                         DataType::Text,
                         DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
                     ) | (DataType::Json | DataType::Jsonb, DataType::Text)
-                      | (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json)
-                      | (DataType::Timestamp, DataType::Timestamptz)
-                      | (DataType::Timestamptz, DataType::Timestamp)
+                        | (DataType::Json, DataType::Jsonb)
+                        | (DataType::Jsonb, DataType::Json)
+                        | (DataType::Timestamp, DataType::Timestamptz)
+                        | (DataType::Timestamptz, DataType::Timestamp)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -1318,18 +1319,15 @@ impl Table {
                 column: column_name.into(),
             }
         })?;
-        self.indices.push(Index::new_brin(name, column_position, column_type));
+        self.indices
+            .push(Index::new_brin(name, column_position, column_type));
         Ok(())
     }
 
     /// v6.7.1 — public CREATE INDEX counterpart for BRIN. Creates
     /// the index entry with a snapshot of the indexed column's
     /// current `DataType`.
-    pub fn add_brin_index(
-        &mut self,
-        name: String,
-        column_name: &str,
-    ) -> Result<(), StorageError> {
+    pub fn add_brin_index(&mut self, name: String, column_name: &str) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
         }
@@ -1339,7 +1337,8 @@ impl Table {
             }
         })?;
         let column_type = self.schema.columns[column_position].ty;
-        self.indices.push(Index::new_brin(name, column_position, column_type));
+        self.indices
+            .push(Index::new_brin(name, column_position, column_type));
         Ok(())
     }
 
@@ -1521,9 +1520,10 @@ impl Table {
                         DataType::Text,
                         DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
                     ) | (DataType::Json | DataType::Jsonb, DataType::Text)
-                      | (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json)
-                      | (DataType::Timestamp, DataType::Timestamptz)
-                      | (DataType::Timestamptz, DataType::Timestamp)
+                        | (DataType::Json, DataType::Jsonb)
+                        | (DataType::Jsonb, DataType::Json)
+                        | (DataType::Timestamp, DataType::Timestamptz)
+                        | (DataType::Timestamptz, DataType::Timestamp)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -1637,7 +1637,8 @@ impl Table {
                 RebuildKind::Brin(column_type) => {
                     // BRIN has no in-memory rebuild — the summaries
                     // live in cold segments which freeze emits.
-                    self.indices.push(Index::new_brin(name, column_position, column_type));
+                    self.indices
+                        .push(Index::new_brin(name, column_position, column_type));
                 }
                 RebuildKind::BTree => {
                     let mut idx = Index::new_btree(name, column_position);
@@ -1704,8 +1705,8 @@ impl Table {
                 included_columns: Vec::new(),
                 partial_predicate: None,
                 expression: None,
-            is_unique: false,
-            extra_column_positions: Vec::new(),
+                is_unique: false,
+                extra_column_positions: Vec::new(),
             });
             return Ok(());
         }
@@ -3409,15 +3410,11 @@ impl Catalog {
             }
         }
         let post_swap_keys: Vec<IndexKey> = merged.iter().map(|(_, _, k)| k.clone()).collect();
-        let seg_rows: Vec<(u64, Vec<u8>)> = merged
-            .into_iter()
-            .map(|(k, body, _)| (k, body))
-            .collect();
+        let seg_rows: Vec<(u64, Vec<u8>)> =
+            merged.into_iter().map(|(k, body, _)| (k, body)).collect();
         let frozen_rows = seg_rows.len();
-        let (seg_bytes, _meta) =
-            encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).map_err(|e| {
-                StorageError::Corrupt(format!("commit_freeze_slices: encode: {e}"))
-            })?;
+        let (seg_bytes, _meta) = encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES)
+            .map_err(|e| StorageError::Corrupt(format!("commit_freeze_slices: encode: {e}")))?;
 
         // --- atomic swap phase: mutations only past this point ---
         let bytes_before = self.get(table_name).expect("just validated").hot_bytes();
@@ -3564,8 +3561,7 @@ impl Catalog {
                 .as_ref()
                 .expect("candidate selected only when slot is Some");
             source_row_count = source_row_count.saturating_add(seg.meta().num_rows as usize);
-            source_byte_total =
-                source_byte_total.saturating_add(seg.bytes().len() as u64);
+            source_byte_total = source_byte_total.saturating_add(seg.bytes().len() as u64);
         }
         // Step D: collect (key, body) pairs from every live Cold
         // locator pointing at a candidate. dedupe by key — one
@@ -3610,10 +3606,8 @@ impl Catalog {
             .iter()
             .map(|(k, (body, _))| (*k, body.clone()))
             .collect();
-        let (seg_bytes, _meta) =
-            encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).map_err(|e| {
-                StorageError::Corrupt(format!("compact_cold_segments: encode: {e}"))
-            })?;
+        let (seg_bytes, _meta) = encode_segment(seg_rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES)
+            .map_err(|e| StorageError::Corrupt(format!("compact_cold_segments: encode: {e}")))?;
         let merged_bytes_len = seg_bytes.len() as u64;
 
         // --- atomic mutation phase ------------------------------
@@ -4069,8 +4063,7 @@ impl Catalog {
                 // consume it. Empty Vec serialises as a bare 0u16.
                 write_u16(
                     &mut out,
-                    u16::try_from(idx.included_columns.len())
-                        .expect("≤ 65k INCLUDE columns/index"),
+                    u16::try_from(idx.included_columns.len()).expect("≤ 65k INCLUDE columns/index"),
                 );
                 for col_pos in &idx.included_columns {
                     write_u16(
@@ -4109,10 +4102,7 @@ impl Catalog {
                         .expect("≤ 65k extra cols / index"),
                 );
                 for cp in &idx.extra_column_positions {
-                    write_u16(
-                        &mut out,
-                        u16::try_from(*cp).expect("≤ 65k columns/table"),
-                    );
+                    write_u16(&mut out, u16::try_from(*cp).expect("≤ 65k columns/table"));
                 }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
@@ -4154,10 +4144,7 @@ impl Catalog {
                     u16::try_from(fk.local_columns.len()).expect("≤ 65k FK columns"),
                 );
                 for &p in &fk.local_columns {
-                    write_u16(
-                        &mut out,
-                        u16::try_from(p).expect("≤ 65k columns/table"),
-                    );
+                    write_u16(&mut out, u16::try_from(p).expect("≤ 65k columns/table"));
                 }
                 write_str(&mut out, &fk.parent_table);
                 write_u16(
@@ -4165,10 +4152,7 @@ impl Catalog {
                     u16::try_from(fk.parent_columns.len()).expect("≤ 65k FK parent columns"),
                 );
                 for &p in &fk.parent_columns {
-                    write_u16(
-                        &mut out,
-                        u16::try_from(p).expect("≤ 65k columns/table"),
-                    );
+                    write_u16(&mut out, u16::try_from(p).expect("≤ 65k columns/table"));
                 }
                 out.push(fk.on_delete.tag());
                 out.push(fk.on_update.tag());
@@ -4190,14 +4174,10 @@ impl Catalog {
                 out.push(u8::from(uc.is_primary_key));
                 write_u16(
                     &mut out,
-                    u16::try_from(uc.columns.len())
-                        .expect("≤ 65k cols in uniqueness constraint"),
+                    u16::try_from(uc.columns.len()).expect("≤ 65k cols in uniqueness constraint"),
                 );
                 for &p in &uc.columns {
-                    write_u16(
-                        &mut out,
-                        u16::try_from(p).expect("≤ 65k columns/table"),
-                    );
+                    write_u16(&mut out, u16::try_from(p).expect("≤ 65k columns/table"));
                 }
             }
             // v7.9.21 — runtime_default appendix per table.
@@ -4214,14 +4194,10 @@ impl Catalog {
             }
             write_u16(
                 &mut out,
-                u16::try_from(rt_defaults.len())
-                    .expect("≤ 65k runtime defaults/table"),
+                u16::try_from(rt_defaults.len()).expect("≤ 65k runtime defaults/table"),
             );
             for (pos, expr) in rt_defaults {
-                write_u16(
-                    &mut out,
-                    u16::try_from(pos).expect("≤ 65k columns/table"),
-                );
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, expr);
             }
         }

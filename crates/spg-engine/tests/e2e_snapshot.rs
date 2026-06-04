@@ -6,7 +6,8 @@ use spg_engine::{CatalogSnapshot, Engine, EngineError, QueryResult};
 use spg_storage::Value;
 
 fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
-    eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
+    eng.execute(sql)
+        .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
 fn read_rows(snap: &CatalogSnapshot, sql: &str) -> Vec<Vec<Value>> {
@@ -78,9 +79,7 @@ fn many_snapshots_concurrent_reads() {
     let snaps: Vec<_> = (0..8).map(|_| eng.clone_snapshot()).collect();
     let handles: Vec<_> = snaps
         .into_iter()
-        .map(|snap| {
-            std::thread::spawn(move || read_rows(&snap, "SELECT COUNT(*) FROM t"))
-        })
+        .map(|snap| std::thread::spawn(move || read_rows(&snap, "SELECT COUNT(*) FROM t")))
         .collect();
     for h in handles {
         let rows = h.join().expect("thread");

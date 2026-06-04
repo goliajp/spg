@@ -5,7 +5,9 @@ use spg_engine::{Engine, EngineError, QueryResult};
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng
@@ -26,7 +28,8 @@ fn insert_matching_parent_succeeds() {
         "CREATE TABLE o (id INT NOT NULL, uid INT NOT NULL REFERENCES u(id))",
         "INSERT INTO u VALUES (1), (2)",
     ]);
-    eng.execute("INSERT INTO o VALUES (10, 1), (11, 2)").unwrap();
+    eng.execute("INSERT INTO o VALUES (10, 1), (11, 2)")
+        .unwrap();
     assert_eq!(count(&mut eng, "SELECT id FROM o"), 2);
 }
 
@@ -39,7 +42,9 @@ fn insert_missing_parent_is_rejected() {
         "INSERT INTO u VALUES (1)",
     ]);
     let r = eng.execute("INSERT INTO o VALUES (10, 99)");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+    );
     // No row persisted.
     assert_eq!(count(&mut eng, "SELECT id FROM o"), 0);
 }

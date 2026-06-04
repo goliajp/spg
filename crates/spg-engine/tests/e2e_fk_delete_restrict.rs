@@ -6,7 +6,9 @@ use spg_engine::{Engine, EngineError, QueryResult};
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng
@@ -106,7 +108,9 @@ fn self_referencing_delete_root_with_child_is_restricted() {
         "INSERT INTO org VALUES (2, 1)",
     ]);
     let r = eng.execute("DELETE FROM org WHERE id = 1");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+    );
 }
 
 #[test]

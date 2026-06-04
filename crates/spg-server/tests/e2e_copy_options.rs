@@ -125,7 +125,10 @@ fn skip_drops_first_data_row() {
     let _child = common::ChildGuard(raw);
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
-    exec_simple(&mut s, "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)");
+    exec_simple(
+        &mut s,
+        "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)",
+    );
 
     // SKIP 1 drops the header row.
     send_query(&mut s, "COPY t FROM STDIN WITH (SKIP 1)");
@@ -176,8 +179,7 @@ fn format_json_one_row_per_line() {
     send_query(&mut s, "COPY t FROM STDIN WITH (FORMAT JSON)");
     let g = read_message(&mut s);
     assert_eq!(g.ty, b'G');
-    let payload =
-        "{\"id\":1,\"name\":\"alice\"}\n{\"id\":2,\"name\":\"bob\"}\n{\"id\":3,\"name\":\"carol\"}\n";
+    let payload = "{\"id\":1,\"name\":\"alice\"}\n{\"id\":2,\"name\":\"bob\"}\n{\"id\":3,\"name\":\"carol\"}\n";
     send_msg(&mut s, b'd', payload.as_bytes());
     send_msg(&mut s, b'c', &[]);
     let _ = read_until_ready(&mut s);

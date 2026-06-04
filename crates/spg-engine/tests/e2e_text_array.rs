@@ -4,7 +4,8 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
-    eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
+    eng.execute(sql)
+        .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
 fn select_value(eng: &mut Engine, sql: &str) -> Value {
@@ -28,7 +29,10 @@ fn select_rows(eng: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn text_array_column_create_insert_select() {
     let mut eng = Engine::new();
-    ok(&mut eng, "CREATE TABLE messages (id INT NOT NULL, labels TEXT[] NOT NULL)");
+    ok(
+        &mut eng,
+        "CREATE TABLE messages (id INT NOT NULL, labels TEXT[] NOT NULL)",
+    );
     ok(
         &mut eng,
         "INSERT INTO messages VALUES (1, ARRAY['inbox', 'work'])",
@@ -62,7 +66,10 @@ fn array_literal_with_null() {
 fn pg_external_array_form_cast() {
     let mut eng = Engine::new();
     ok(&mut eng, "CREATE TABLE t (a TEXT[] NOT NULL)");
-    ok(&mut eng, "INSERT INTO t VALUES ('{red,green,blue}'::TEXT[])");
+    ok(
+        &mut eng,
+        "INSERT INTO t VALUES ('{red,green,blue}'::TEXT[])",
+    );
     let v = select_value(&mut eng, "SELECT a FROM t");
     let Value::TextArray(items) = v else {
         panic!();
@@ -102,7 +109,10 @@ fn pg_external_form_with_null_and_quoted() {
 #[test]
 fn equals_any_filters_rows() {
     let mut eng = Engine::new();
-    ok(&mut eng, "CREATE TABLE t (id INT NOT NULL, labels TEXT[] NOT NULL)");
+    ok(
+        &mut eng,
+        "CREATE TABLE t (id INT NOT NULL, labels TEXT[] NOT NULL)",
+    );
     ok(&mut eng, "INSERT INTO t VALUES (1, ARRAY['a', 'b'])");
     ok(&mut eng, "INSERT INTO t VALUES (2, ARRAY['c', 'd'])");
     ok(&mut eng, "INSERT INTO t VALUES (3, ARRAY['a', 'd'])");
@@ -118,7 +128,10 @@ fn equals_any_filters_rows() {
 #[test]
 fn not_equals_all_filters_rows() {
     let mut eng = Engine::new();
-    ok(&mut eng, "CREATE TABLE t (id INT NOT NULL, labels TEXT[] NOT NULL)");
+    ok(
+        &mut eng,
+        "CREATE TABLE t (id INT NOT NULL, labels TEXT[] NOT NULL)",
+    );
     ok(&mut eng, "INSERT INTO t VALUES (1, ARRAY['a', 'b'])");
     ok(&mut eng, "INSERT INTO t VALUES (2, ARRAY['c', 'd'])");
     // <> ALL: id 2 has no 'a' or 'b' — true.
@@ -134,7 +147,10 @@ fn not_equals_all_filters_rows() {
 fn array_subscript_one_based() {
     let mut eng = Engine::new();
     ok(&mut eng, "CREATE TABLE t (a TEXT[] NOT NULL)");
-    ok(&mut eng, "INSERT INTO t VALUES (ARRAY['alpha', 'beta', 'gamma'])");
+    ok(
+        &mut eng,
+        "INSERT INTO t VALUES (ARRAY['alpha', 'beta', 'gamma'])",
+    );
     let v = select_value(&mut eng, "SELECT a[2] FROM t");
     assert!(matches!(v, Value::Text(ref s) if s == "beta"), "{v:?}");
 }
@@ -153,9 +169,15 @@ fn array_subscript_out_of_range_returns_null() {
 #[test]
 fn text_array_persists_across_snapshot() {
     let mut eng = Engine::new();
-    ok(&mut eng, "CREATE TABLE t (id INT NOT NULL, labels TEXT[] NOT NULL)");
+    ok(
+        &mut eng,
+        "CREATE TABLE t (id INT NOT NULL, labels TEXT[] NOT NULL)",
+    );
     ok(&mut eng, "INSERT INTO t VALUES (1, ARRAY['one', 'two'])");
-    ok(&mut eng, "INSERT INTO t VALUES (2, ARRAY['three', NULL, 'four'])");
+    ok(
+        &mut eng,
+        "INSERT INTO t VALUES (2, ARRAY['three', NULL, 'four'])",
+    );
     let bytes = eng.snapshot();
     let mut eng2 = Engine::restore_envelope(&bytes).expect("reload");
     let v = select_value(&mut eng2, "SELECT labels FROM t WHERE id = 2");

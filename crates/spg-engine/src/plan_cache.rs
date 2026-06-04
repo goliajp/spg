@@ -273,7 +273,12 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
                 collect_expr(a, out);
             }
         }
-        Expr::WindowFunction { args, partition_by, order_by, .. } => {
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for a in args {
                 collect_expr(a, out);
             }
@@ -386,7 +391,10 @@ mod tests {
             cache.insert(alloc::format!("filler{i}"), dummy_plan(0, &[]));
         }
         cache.insert("trigger".into(), dummy_plan(0, &[]));
-        assert!(cache.get("a").is_some(), "a was MRU after get(); should survive");
+        assert!(
+            cache.get("a").is_some(),
+            "a was MRU after get(); should survive"
+        );
         assert!(cache.get("b").is_none(), "b should be evicted");
     }
 
@@ -422,10 +430,9 @@ mod tests {
 
     #[test]
     fn collect_source_tables_from_join() {
-        let stmt = parse_statement(
-            "SELECT * FROM t1 JOIN t2 ON t1.a = t2.b JOIN t3 ON t2.c = t3.d",
-        )
-        .expect("parses");
+        let stmt =
+            parse_statement("SELECT * FROM t1 JOIN t2 ON t1.a = t2.b JOIN t3 ON t2.c = t3.d")
+                .expect("parses");
         let tables = collect_source_tables(&stmt);
         assert_eq!(
             tables,

@@ -22,7 +22,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-wait-e2e-{tag}-{pid}-{nanos}-{serial}"));
     std::fs::create_dir_all(&dir).expect("create tmpdir");

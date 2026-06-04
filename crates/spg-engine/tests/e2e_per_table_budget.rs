@@ -6,7 +6,8 @@ use spg_engine::{Engine, QueryResult};
 fn alter_table_set_hot_tier_bytes_round_trips() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
-    eng.execute("ALTER TABLE t SET hot_tier_bytes = 4096").unwrap();
+    eng.execute("ALTER TABLE t SET hot_tier_bytes = 4096")
+        .unwrap();
     let table = eng.catalog().get("t").expect("table present");
     assert_eq!(table.schema().hot_tier_bytes, Some(4096));
 }
@@ -15,8 +16,10 @@ fn alter_table_set_hot_tier_bytes_round_trips() {
 fn alter_table_overwrites_previous_setting() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
-    eng.execute("ALTER TABLE t SET hot_tier_bytes = 1000").unwrap();
-    eng.execute("ALTER TABLE t SET hot_tier_bytes = 2000").unwrap();
+    eng.execute("ALTER TABLE t SET hot_tier_bytes = 1000")
+        .unwrap();
+    eng.execute("ALTER TABLE t SET hot_tier_bytes = 2000")
+        .unwrap();
     let table = eng.catalog().get("t").expect("table present");
     assert_eq!(table.schema().hot_tier_bytes, Some(2000));
 }
@@ -41,7 +44,8 @@ fn hot_tier_bytes_survives_snapshot_round_trip() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     eng.execute("CREATE TABLE u (id INT NOT NULL)").unwrap();
-    eng.execute("ALTER TABLE t SET hot_tier_bytes = 12345").unwrap();
+    eng.execute("ALTER TABLE t SET hot_tier_bytes = 12345")
+        .unwrap();
     // u has no override → should round-trip as None.
     let snapshot = eng.snapshot();
     // Reload via the catalog deserialiser by constructing a fresh
@@ -51,10 +55,7 @@ fn hot_tier_bytes_survives_snapshot_round_trip() {
         restored_cat.get("t").unwrap().schema().hot_tier_bytes,
         Some(12345)
     );
-    assert_eq!(
-        restored_cat.get("u").unwrap().schema().hot_tier_bytes,
-        None
-    );
+    assert_eq!(restored_cat.get("u").unwrap().schema().hot_tier_bytes, None);
 }
 
 #[test]
@@ -67,7 +68,8 @@ fn ddl_via_spg_table_ddl_does_not_include_hot_tier_bytes_yet() {
     // works without it.
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
-    eng.execute("ALTER TABLE t SET hot_tier_bytes = 999").unwrap();
+    eng.execute("ALTER TABLE t SET hot_tier_bytes = 999")
+        .unwrap();
     let res = eng.execute("SELECT * FROM spg_table_ddl").unwrap();
     let rows = match res {
         QueryResult::Rows { rows, .. } => rows,
@@ -76,10 +78,8 @@ fn ddl_via_spg_table_ddl_does_not_include_hot_tier_bytes_yet() {
     let ddl = rows
         .iter()
         .find_map(|r| {
-            if let (
-                spg_storage::Value::Text(name),
-                spg_storage::Value::Text(ddl),
-            ) = (&r.values[0], &r.values[1])
+            if let (spg_storage::Value::Text(name), spg_storage::Value::Text(ddl)) =
+                (&r.values[0], &r.values[1])
                 && name == "t"
             {
                 Some(ddl.clone())

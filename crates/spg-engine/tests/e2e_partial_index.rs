@@ -25,7 +25,10 @@ fn create_index_with_where_persists_predicate() {
         .iter()
         .find(|i| i.name == "active_only")
         .expect("index");
-    let pred = idx.partial_predicate.as_ref().expect("partial predicate set");
+    let pred = idx
+        .partial_predicate
+        .as_ref()
+        .expect("partial predicate set");
     assert!(
         pred.contains("active") && pred.contains("1"),
         "unexpected canonical Display: {pred}"
@@ -126,10 +129,8 @@ fn create_index_with_include_and_where_together() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL)")
         .unwrap();
-    e.execute(
-        "CREATE INDEX live ON t (id) INCLUDE (name) WHERE status = 'live'",
-    )
-    .unwrap();
+    e.execute("CREATE INDEX live ON t (id) INCLUDE (name) WHERE status = 'live'")
+        .unwrap();
     let idx = e
         .catalog()
         .get("t")

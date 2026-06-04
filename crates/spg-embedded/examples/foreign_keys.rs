@@ -9,11 +9,13 @@ fn main() -> Result<(), EngineError> {
     db.execute("CREATE TABLE customers (id INT NOT NULL)")?;
     db.execute("CREATE INDEX customers_pk ON customers (id)")?;
 
-    db.execute("CREATE TABLE orders (
+    db.execute(
+        "CREATE TABLE orders (
         id INT NOT NULL AUTO_INCREMENT,
         customer_id INT NOT NULL,
         FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
-    )")?;
+    )",
+    )?;
 
     db.execute("INSERT INTO customers VALUES (1), (2)")?;
     db.execute("INSERT INTO orders (customer_id) VALUES (1), (1), (2)")?;

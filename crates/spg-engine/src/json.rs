@@ -233,13 +233,12 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value, EvalError> {
 
 fn json_contains(lhs: &JsonValue, rhs: &JsonValue) -> bool {
     match (lhs, rhs) {
-        (JsonValue::Object(l), JsonValue::Object(r)) => r.iter().all(|(rk, rv)| {
-            l.iter()
-                .any(|(lk, lv)| lk == rk && json_contains(lv, rv))
-        }),
-        (JsonValue::Array(l), JsonValue::Array(r)) => r
+        (JsonValue::Object(l), JsonValue::Object(r)) => r
             .iter()
-            .all(|rv| l.iter().any(|lv| json_contains(lv, rv))),
+            .all(|(rk, rv)| l.iter().any(|(lk, lv)| lk == rk && json_contains(lv, rv))),
+        (JsonValue::Array(l), JsonValue::Array(r)) => {
+            r.iter().all(|rv| l.iter().any(|lv| json_contains(lv, rv)))
+        }
         _ => json_eq(lhs, rhs),
     }
 }
@@ -260,9 +259,8 @@ fn json_eq(a: &JsonValue, b: &JsonValue) -> bool {
         }
         (JsonValue::Object(x), JsonValue::Object(y)) => {
             x.len() == y.len()
-                && x.iter().all(|(k, v)| {
-                    y.iter().any(|(k2, v2)| k == k2 && json_eq(v, v2))
-                })
+                && x.iter()
+                    .all(|(k, v)| y.iter().any(|(k2, v2)| k == k2 && json_eq(v, v2)))
         }
         _ => false,
     }

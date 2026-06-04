@@ -14,12 +14,11 @@ use spg_embedded_tokio::{AsyncDatabase, EngineError, Value};
 async fn main() -> Result<(), EngineError> {
     let db = AsyncDatabase::open_in_memory();
 
-    db.execute("CREATE TABLE events (id INT NOT NULL, body TEXT NOT NULL)").await?;
-    for i in 0..1_000 {
-        db.execute(&format!(
-            "INSERT INTO events VALUES ({i}, 'event-{i}')"
-        ))
+    db.execute("CREATE TABLE events (id INT NOT NULL, body TEXT NOT NULL)")
         .await?;
+    for i in 0..1_000 {
+        db.execute(&format!("INSERT INTO events VALUES ({i}, 'event-{i}')"))
+            .await?;
     }
 
     // Concurrent writer keeps appending while readers fan out.
@@ -27,9 +26,7 @@ async fn main() -> Result<(), EngineError> {
     let writer = tokio::spawn(async move {
         for i in 1_000..2_000 {
             writer_db
-                .execute(&format!(
-                    "INSERT INTO events VALUES ({i}, 'event-{i}')"
-                ))
+                .execute(&format!("INSERT INTO events VALUES ({i}, 'event-{i}')"))
                 .await
                 .unwrap();
         }

@@ -19,8 +19,8 @@ use std::time::Duration;
 use spg_storage::Catalog;
 use spg_wire::{
     ColumnDesc, Frame, FrameError, Op, WireValue, build_auth, build_query, build_stats_request,
-    encode, parse_command_complete, parse_data_row, parse_data_row_batch, parse_error_response, parse_row_description,
-    parse_stats_response,
+    encode, parse_command_complete, parse_data_row, parse_data_row_batch, parse_error_response,
+    parse_row_description, parse_stats_response,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
@@ -128,7 +128,10 @@ fn main() {
         // <msg>` on the first rejected record.
         Some("wal-lint") => {
             let Some(wal_path) = args.next() else {
-                die("usage: spg wal-lint <wal_path> --against-schema <db_path>", 2);
+                die(
+                    "usage: spg wal-lint <wal_path> --against-schema <db_path>",
+                    2,
+                );
                 return;
             };
             let mut db_path: Option<String> = None;
@@ -183,14 +186,13 @@ fn wal_revert(wal_path: &str, to_seq: u64, out_path: &str) -> Result<u64, String
         }
         let sql = std::str::from_utf8(&sql_bytes)
             .map_err(|e| format!("non-UTF-8 SQL at offset {cur}: {e}"))?;
-        engine.execute(sql).map_err(|e| format!(
-            "apply rejected {sql:?} at seq {applied}: {e:?}"
-        ))?;
+        engine
+            .execute(sql)
+            .map_err(|e| format!("apply rejected {sql:?} at seq {applied}: {e:?}"))?;
         applied += 1;
     }
     let snapshot = engine.snapshot();
-    fs::write(out_path, &snapshot)
-        .map_err(|e| format!("write {out_path}: {e}"))?;
+    fs::write(out_path, &snapshot).map_err(|e| format!("write {out_path}: {e}"))?;
     Ok(applied)
 }
 
@@ -202,12 +204,10 @@ fn wal_revert(wal_path: &str, to_seq: u64, out_path: &str) -> Result<u64, String
 /// fn exit.
 fn wal_lint(wal_path: &str, db_path: &str) -> Result<usize, (u64, String)> {
     use spg_engine::Engine;
-    let snapshot = fs::read(db_path)
-        .map_err(|e| (0u64, format!("read schema {db_path}: {e}")))?;
-    let mut engine = Engine::restore_envelope(&snapshot)
-        .map_err(|e| (0u64, format!("restore schema: {e}")))?;
-    let wal_bytes = fs::read(wal_path)
-        .map_err(|e| (0u64, format!("read wal {wal_path}: {e}")))?;
+    let snapshot = fs::read(db_path).map_err(|e| (0u64, format!("read schema {db_path}: {e}")))?;
+    let mut engine =
+        Engine::restore_envelope(&snapshot).map_err(|e| (0u64, format!("restore schema: {e}")))?;
+    let wal_bytes = fs::read(wal_path).map_err(|e| (0u64, format!("read wal {wal_path}: {e}")))?;
     // Iterate records via the same v1/v2/v3 dispatch the server
     // boot path uses. We track offsets so a rejection points at
     // the exact byte where the offending record starts.
@@ -450,8 +450,8 @@ fn query(addr: &str, sql: &str) -> Result<(), String> {
                     // v3.3.1 server batches result rows when len > 1.
                     // Decode every row in the batch and append.
                     Op::DataRowBatch => {
-                        let batch = parse_data_row_batch(&f)
-                            .map_err(|e| format!("decode DRB: {e}"))?;
+                        let batch =
+                            parse_data_row_batch(&f).map_err(|e| format!("decode DRB: {e}"))?;
                         rows.extend(batch);
                     }
                     Op::CommandComplete => break,

@@ -170,7 +170,10 @@ fn run_pipeline_and_measure_cold_start(rows: i64, db: &Path, wal: &Path) -> Dura
         {
             let mut s = common::connect_to(&addrs.native);
             s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-            exec_ok(&mut s, "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)");
+            exec_ok(
+                &mut s,
+                "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)",
+            );
             exec_ok(&mut s, "CREATE INDEX by_id ON t (id)");
             // Ingest in batches via INSERT … VALUES (…), (…), (…)
             // — the multi-row form lets us cut wire frames by
@@ -272,9 +275,7 @@ fn cold_start_under_120s() {
     let db = dir.join("spg.db");
     let wal = dir.join("wal.log");
     let cold_start = run_pipeline_and_measure_cold_start(rows, &db, &wal);
-    println!(
-        "perf_1b_rows cold_start_under_120s (rows={rows}): cold_start={cold_start:?}"
-    );
+    println!("perf_1b_rows cold_start_under_120s (rows={rows}): cold_start={cold_start:?}");
     assert!(
         cold_start < Duration::from_secs(120),
         "{rows}-row cold-start took {cold_start:?} (gate 120s)"

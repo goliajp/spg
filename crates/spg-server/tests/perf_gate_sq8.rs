@@ -1,3 +1,4 @@
+#![cfg(not(debug_assertions))]
 //! v6.0.1 ship-gate perf tests for `VECTOR(N) USING SQ8` columns.
 //!
 //! Both tests are `#[ignore]` by default — they take minutes and

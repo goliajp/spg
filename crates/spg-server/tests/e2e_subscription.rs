@@ -16,9 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use spg_wire::{
-    Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch,
-};
+use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
 mod common;
 
@@ -29,7 +27,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-sub-e2e-{tag}-{pid}-{nanos}-{serial}"));
     std::fs::create_dir_all(&dir).expect("create tmpdir");
@@ -160,7 +160,10 @@ fn subscription_replicates_inserts_from_publisher() {
     }
 
     // Publisher: set up table + publication.
-    exec_ok(&mut pub_client, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    exec_ok(
+        &mut pub_client,
+        "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)",
+    );
     exec_ok(&mut pub_client, "CREATE PUBLICATION pub_a FOR ALL TABLES");
 
     // Boot subscriber. Same target schema (subscription doesn't
@@ -169,14 +172,19 @@ fn subscription_replicates_inserts_from_publisher() {
     let mut sub_guard = common::ChildGuard(sub_raw);
     let mut sub_client = common::connect_to(&sub_addrs.native);
     sub_client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    exec_ok(&mut sub_client, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    exec_ok(
+        &mut sub_client,
+        "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)",
+    );
 
     // Subscribe.
     let repl_host_port = repl_addr.clone();
     let (host, port) = repl_host_port.split_once(':').unwrap();
     exec_ok(
         &mut sub_client,
-        &format!("CREATE SUBSCRIPTION sub_a CONNECTION 'host={host} port={port}' PUBLICATION pub_a"),
+        &format!(
+            "CREATE SUBSCRIPTION sub_a CONNECTION 'host={host} port={port}' PUBLICATION pub_a"
+        ),
     );
 
     // Give the subscriber worker a moment to handshake.
@@ -184,7 +192,10 @@ fn subscription_replicates_inserts_from_publisher() {
 
     // Publisher writes 10 rows.
     for i in 0..10 {
-        exec_ok(&mut pub_client, &format!("INSERT INTO t VALUES ({i}, {})", i * 7));
+        exec_ok(
+            &mut pub_client,
+            &format!("INSERT INTO t VALUES ({i}, {})", i * 7),
+        );
     }
 
     // Subscriber must converge to 10 rows.
@@ -223,7 +234,9 @@ fn drop_subscription_stops_the_worker() {
     let (host, port) = repl_addr.split_once(':').unwrap();
     exec_ok(
         &mut sub_client,
-        &format!("CREATE SUBSCRIPTION sub_a CONNECTION 'host={host} port={port}' PUBLICATION pub_a"),
+        &format!(
+            "CREATE SUBSCRIPTION sub_a CONNECTION 'host={host} port={port}' PUBLICATION pub_a"
+        ),
     );
 
     std::thread::sleep(Duration::from_millis(500));
@@ -246,7 +259,10 @@ fn drop_subscription_stops_the_worker() {
     }
     std::thread::sleep(Duration::from_millis(800));
     let got = select_int(&mut sub_client, "SELECT count(*) FROM t");
-    assert_eq!(got, 1, "subscriber must stay at 1 row after DROP SUBSCRIPTION");
+    assert_eq!(
+        got, 1,
+        "subscriber must stay at 1 row after DROP SUBSCRIPTION"
+    );
 }
 
 #[test]
@@ -279,7 +295,9 @@ fn subscription_survives_publisher_restart() {
     let (host, port) = repl_addr.split_once(':').unwrap();
     exec_ok(
         &mut sub_client,
-        &format!("CREATE SUBSCRIPTION sub_a CONNECTION 'host={host} port={port}' PUBLICATION pub_a"),
+        &format!(
+            "CREATE SUBSCRIPTION sub_a CONNECTION 'host={host} port={port}' PUBLICATION pub_a"
+        ),
     );
 
     std::thread::sleep(Duration::from_millis(500));

@@ -3,8 +3,13 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(eng: &mut Engine, sql: &str) {
-    let r = eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
-    assert!(matches!(r, QueryResult::CommandOk { affected: 0, .. }), "{sql:?}");
+    let r = eng
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
+    assert!(
+        matches!(r, QueryResult::CommandOk { affected: 0, .. }),
+        "{sql:?}"
+    );
 }
 
 #[test]

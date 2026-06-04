@@ -17,9 +17,7 @@ fn engine_with(sqls: &[&str]) -> Engine {
 
 #[test]
 fn bigserial_creates_bigint_not_null_auto_increment() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE u (id BIGSERIAL, name TEXT)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE u (id BIGSERIAL, name TEXT)"]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let id_col = &cat.get("u").unwrap().schema().columns[0];
@@ -42,9 +40,7 @@ fn bigserial_creates_bigint_not_null_auto_increment() {
 
 #[test]
 fn serial_creates_int_not_null_auto_increment() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (id SERIAL, name TEXT)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE t (id SERIAL, name TEXT)"]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let id_col = &cat.get("t").unwrap().schema().columns[0];
@@ -55,9 +51,7 @@ fn serial_creates_int_not_null_auto_increment() {
 
 #[test]
 fn smallserial_creates_smallint_not_null_auto_increment() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (id SMALLSERIAL, name TEXT)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE t (id SMALLSERIAL, name TEXT)"]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let id_col = &cat.get("t").unwrap().schema().columns[0];
@@ -68,9 +62,7 @@ fn smallserial_creates_smallint_not_null_auto_increment() {
 
 #[test]
 fn bigserial_aliases_serial8() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (id SERIAL8, name TEXT)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE t (id SERIAL8, name TEXT)"]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     assert!(matches!(
@@ -86,19 +78,20 @@ fn serial_with_explicit_not_null_is_rejected() {
     // think they're "reinforcing" something.
     let mut eng = Engine::new();
     let r = eng.execute("CREATE TABLE t (id BIGSERIAL NOT NULL)");
-    assert!(r.is_err(), "expected parse error for redundant NOT NULL on BIGSERIAL");
+    assert!(
+        r.is_err(),
+        "expected parse error for redundant NOT NULL on BIGSERIAL"
+    );
 }
 
 #[test]
 fn pg_dump_style_serial_with_returning() {
     // mailrs IMAP UID alloc shape, but using PG-source SERIAL.
-    let mut eng = engine_with(&[
-        "CREATE TABLE messages (
+    let mut eng = engine_with(&["CREATE TABLE messages (
             id BIGSERIAL,
             mailbox_id INT NOT NULL,
             subject TEXT
-        )",
-    ]);
+        )"]);
     let r = eng
         .execute("INSERT INTO messages (mailbox_id, subject) VALUES (1, 'hello') RETURNING id")
         .unwrap();

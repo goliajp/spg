@@ -24,7 +24,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir() -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-auto-an-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
@@ -156,11 +158,7 @@ fn sweep_fires_after_10pct_threshold() {
         exec_ok(&mut s, &format!("INSERT INTO t VALUES ({i})"));
     }
 
-    let got = wait_for_spg_statistic_rows(
-        &addrs.native,
-        1,
-        Instant::now() + PROBE_TIMEOUT,
-    );
+    let got = wait_for_spg_statistic_rows(&addrs.native, 1, Instant::now() + PROBE_TIMEOUT);
     assert_eq!(got, 1, "auto-analyze must populate spg_statistic");
 
     fs::remove_dir_all(&dir).ok();
@@ -196,7 +194,10 @@ fn sweep_concurrent_with_reads_does_not_block() {
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
-    exec_ok(&mut s, "CREATE TABLE t (id INT NOT NULL, label TEXT NOT NULL)");
+    exec_ok(
+        &mut s,
+        "CREATE TABLE t (id INT NOT NULL, label TEXT NOT NULL)",
+    );
     for i in 0..20 {
         exec_ok(&mut s, &format!("INSERT INTO t VALUES ({i}, 'x')"));
     }

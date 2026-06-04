@@ -20,9 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use spg_wire::{
-    Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch,
-};
+use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
 mod common;
 
@@ -33,7 +31,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-filt-e2e-{tag}-{pid}-{nanos}-{serial}"));
     std::fs::create_dir_all(&dir).expect("create tmpdir");
@@ -129,12 +129,7 @@ fn wire_to_i64(v: &WireValue) -> i64 {
     }
 }
 
-fn wait_until_pos(
-    sub_client: &mut TcpStream,
-    sub_name: &str,
-    target_pos: u64,
-    deadline: Instant,
-) {
+fn wait_until_pos(sub_client: &mut TcpStream, sub_name: &str, target_pos: u64, deadline: Instant) {
     // Poll SHOW SUBSCRIPTIONS for last_received_pos ≥ target. Used
     // when we expect the subscriber to advance the offset (via
     // SKIP) without ANY new rows landing in the target table.
@@ -171,9 +166,7 @@ fn wait_until_pos(
             return;
         }
         if Instant::now() >= deadline {
-            panic!(
-                "subscription {sub_name:?} last_pos {last_pos} never reached {target_pos}"
-            );
+            panic!("subscription {sub_name:?} last_pos {last_pos} never reached {target_pos}");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -220,7 +213,10 @@ fn for_table_filter_propagates_only_published_tables() {
     // Interleave 5 inserts into t1 and 5 into t2.
     for i in 0..5 {
         exec_ok(&mut pub_client, &format!("INSERT INTO t1 VALUES ({})", i));
-        exec_ok(&mut pub_client, &format!("INSERT INTO t2 VALUES ({})", 100 + i));
+        exec_ok(
+            &mut pub_client,
+            &format!("INSERT INTO t2 VALUES ({})", 100 + i),
+        );
     }
 
     // Wait for sub_a to converge on t1 = 5.
@@ -280,9 +276,18 @@ fn for_all_tables_except_blocks_only_excepted() {
     std::thread::sleep(Duration::from_millis(500));
 
     for i in 0..3 {
-        exec_ok(&mut pub_client, &format!("INSERT INTO keep_a VALUES ({})", i));
-        exec_ok(&mut pub_client, &format!("INSERT INTO drop_me VALUES ({})", i));
-        exec_ok(&mut pub_client, &format!("INSERT INTO keep_b VALUES ({})", i));
+        exec_ok(
+            &mut pub_client,
+            &format!("INSERT INTO keep_a VALUES ({})", i),
+        );
+        exec_ok(
+            &mut pub_client,
+            &format!("INSERT INTO drop_me VALUES ({})", i),
+        );
+        exec_ok(
+            &mut pub_client,
+            &format!("INSERT INTO keep_b VALUES ({})", i),
+        );
     }
 
     let deadline = Instant::now() + CATCHUP_TIMEOUT;
@@ -322,7 +327,10 @@ fn skip_frame_advances_subscriber_offset() {
     }
     exec_ok(&mut pub_client, "CREATE TABLE t_only (id INT NOT NULL)");
     exec_ok(&mut pub_client, "CREATE TABLE t_filtered (id INT NOT NULL)");
-    exec_ok(&mut pub_client, "CREATE PUBLICATION pub_only FOR TABLE t_only");
+    exec_ok(
+        &mut pub_client,
+        "CREATE PUBLICATION pub_only FOR TABLE t_only",
+    );
 
     let (sub_raw, sub_addrs) = spawn_subscriber(&dir_s.join("s.db"), &dir_s.join("s.wal"));
     let mut sub_guard = common::ChildGuard(sub_raw);
@@ -343,7 +351,10 @@ fn skip_frame_advances_subscriber_offset() {
     // see ZERO row in t_filtered but its last_received_pos must
     // advance (proving SKIP frames flow).
     for i in 0..10 {
-        exec_ok(&mut pub_client, &format!("INSERT INTO t_filtered VALUES ({})", i));
+        exec_ok(
+            &mut pub_client,
+            &format!("INSERT INTO t_filtered VALUES ({})", i),
+        );
     }
     // Each INSERT produces one auto-commit SQL record. The exact
     // byte count is implementation-dependent; just assert pos > 0.

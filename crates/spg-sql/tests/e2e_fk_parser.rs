@@ -20,9 +20,8 @@ fn no_fk_means_empty_vec() {
 
 #[test]
 fn column_level_references_normalises_to_table_level() {
-    let fks = parse_create_table(
-        "CREATE TABLE o (id INT NOT NULL, uid INT NOT NULL REFERENCES u(id))",
-    );
+    let fks =
+        parse_create_table("CREATE TABLE o (id INT NOT NULL, uid INT NOT NULL REFERENCES u(id))");
     assert_eq!(fks.len(), 1);
     let fk = &fks[0];
     assert_eq!(fk.name, None);
@@ -128,14 +127,14 @@ fn repeated_on_delete_is_rejected() {
 
 #[test]
 fn display_round_trips_simple_fk() {
-    let sql_in = "CREATE TABLE o (uid INT NOT NULL, FOREIGN KEY (uid) REFERENCES u(id) ON DELETE CASCADE)";
+    let sql_in =
+        "CREATE TABLE o (uid INT NOT NULL, FOREIGN KEY (uid) REFERENCES u(id) ON DELETE CASCADE)";
     let stmt = parse_statement(sql_in).unwrap();
     let rendered = format!("{stmt}");
     // Round-trip through parser — guarantees the WAL replay path
     // can reconstruct any FK shape we accept.
-    let stmt2 = parse_statement(&rendered).unwrap_or_else(|e| {
-        panic!("re-parse failed for {rendered:?}: {e:?}")
-    });
+    let stmt2 = parse_statement(&rendered)
+        .unwrap_or_else(|e| panic!("re-parse failed for {rendered:?}: {e:?}"));
     assert_eq!(stmt, stmt2);
 }
 
