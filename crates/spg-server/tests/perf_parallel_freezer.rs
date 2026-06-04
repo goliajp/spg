@@ -61,6 +61,8 @@ fn wide_users_schema() -> TableSchema {
             ColumnSchema::new("payload".to_string(), DataType::Text, false),
         ],
         hot_tier_bytes: None,
+        foreign_keys: Vec::new(),
+        uniqueness_constraints: Vec::new(),
     }
 }
 

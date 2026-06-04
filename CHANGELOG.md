@@ -8,6 +8,45 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.10] — 2026-06-04 (async embedded + post-mailrs widening)
+
+Opens the v7.10 series with the three carve-outs slipped from v7.9
+(`(native BYTES type, TEXT[] arrays, async spg-embedded pool)`).
+Each lands as its own epic; v7.10.0 ships the first one.
+
+**Epic 3 — async `spg-embedded` (this release).** mailrs's cement
+is tokio-based; the sync `Database::execute` inside `async fn`
+triggers `block_in_place`. New crate **`spg-embedded-tokio`**
+wraps `Database` in a `tokio::sync::Mutex` + dispatches every
+engine call through `tokio::task::spawn_blocking`. The Mutex
+matches the engine's single-writer invariant; `spawn_blocking`
+insulates the runtime's worker pool from WAL fsync stalls.
+
+`spg-embedded` itself stays 0-deps. tokio enters the workspace
+*only* through this new adapter crate, so anyone who doesn't
+need async stays untouched.
+
+Surface (`AsyncDatabase`):
+- `open_in_memory()` / `open_path(path).await`
+- `execute(sql).await` / `query(sql).await` / `checkpoint().await`
+- `Clone` shares the engine like `Arc<Mutex<…>>`
+
+6 e2e tests including a "runtime not blocked" check that pumps
+200 INSERTs against the engine while a 2 ms-tick ticker runs and
+asserts ≥ 30 ticks landed.
+
+Sub-versions:
+
+  v7.10.0  spg-embedded-tokio crate skeleton + workspace member
+  v7.10.1  AsyncDatabase: open_in_memory / open_path / execute / query / checkpoint
+  v7.10.2  README + hello_async example
+  v7.10.3  ship rollup — tag v7.10.0 + crates.io + docker
+
+Epic 1 (native BYTES type) and Epic 2 (TEXT[] arrays) follow.
+The full v7.10 sub-version index lives in `.claude/internal-docs/V7_10_DESIGN.md`.
+
+---
+
 ## [7.9] — 2026-06-04 (PG migration P0 unblock)
 
 Closes the six P0 blockers from the mailrs SPG-compat audit.
