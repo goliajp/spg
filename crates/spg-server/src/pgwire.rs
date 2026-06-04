@@ -2630,6 +2630,7 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Numeric { .. } => 1700,
         DataType::Json => 114,  // PG `json`
         DataType::Jsonb => 3802, // PG `jsonb` — v7.9.0 mailrs blocker fix
+        DataType::Bytes => 17,   // PG `bytea` — v7.10.4 Epic 1
     }
 }
 

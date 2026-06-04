@@ -4150,7 +4150,13 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Timestamptz
         | DataType::Interval
         | DataType::Json
-        | DataType::Jsonb => WireType::Text,
+        | DataType::Jsonb
+        // v7.10.4 — BYTEA serialises to Text on the wire as the
+        // PG hex form (`\xDEADBEEF`). pg_type OID 17 is set
+        // elsewhere via `pg_type_oid`; the WireType collapses
+        // to the catch-all Text path so the existing encoder
+        // emits the hex-formatted body.
+        | DataType::Bytes => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -4195,6 +4201,14 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Interval { months, micros } => {
             WireValue::Text(spg_engine::eval::format_interval(*months, *micros))
         }
+        // v7.10.4 — BYTEA goes on the wire as PG hex text
+        // (`\x` + lowercase hex). RowDescription advertises OID 17
+        // (`pg_type_oid` covers that), and PG text-mode clients
+        // expect this exact format. Binary-mode (sqlx/pgx Bind)
+        // path lands when the wire layer grows BYTEA binary
+        // codec — for now binary fetches surface as the hex text
+        // and clients decode normally.
+        Value::Bytes(b) => WireValue::Text(spg_engine::eval::format_bytea_hex(b)),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => WireValue::Text(format!("{v:?}")),
     }

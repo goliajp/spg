@@ -493,6 +493,11 @@ pub enum ColumnTypeName {
     /// PG OID 3802 on the wire so sqlx-style binary-typed clients
     /// decode without a custom type registration.
     Jsonb,
+    /// v7.10.4 `BYTES` / `BYTEA` — raw binary blob. PG wire OID 17.
+    /// Literal forms (decoded by the engine at coercion time):
+    ///   - PG hex form: `'\xDEADBEEF'`
+    ///   - Escape form: `'foo\\000bar'` (backslash octal triples)
+    Bytes,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -513,6 +518,7 @@ impl fmt::Display for ColumnTypeName {
             },
             Self::Json => f.write_str("JSON"),
             Self::Jsonb => f.write_str("JSONB"),
+            Self::Bytes => f.write_str("BYTEA"),
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
