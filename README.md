@@ -10,8 +10,8 @@ written from scratch on top of `std`/`alloc`/`core`.
 | Layer | What's there |
 |---|---|
 | **Wire protocol** | Self-built little-endian frame: `[u32 len][u8 op][payload]`. PING/PONG, Query, RowDescription, DataRow, CommandComplete, ErrorResponse, Stats. |
-| **SQL front-end (PG dialect)** | Self-built lexer + recursive-descent + Pratt parser. `CREATE TABLE`, `CREATE INDEX`, `INSERT … VALUES`, `SELECT … [WHERE … [ORDER BY … LIMIT N]]`, `BEGIN`/`COMMIT`/`ROLLBACK`. Quoted idents, `''` string escape, `--` and `/* */` comments, full operator precedence including `<->`. |
-| **Type system** | `INT` / `BIGINT` / `FLOAT` / `TEXT` / `BOOL` / `VECTOR(N)`. SQL three-valued NULL logic. Integer widening on INSERT. |
+| **SQL front-end (PG dialect)** | Self-built lexer + recursive-descent + Pratt parser. DDL (`CREATE TABLE` / `INDEX` / `USER` / `PUBLICATION` / `SUBSCRIPTION` / `EXTENSION`), DML (multi-row `INSERT` / `UPDATE` / `DELETE`, `RETURNING`), full `SELECT` surface (JOINs incl. `LATERAL`/cross/full-outer-rewritten, CTEs incl. `WITH RECURSIVE`, window functions with `OVER (PARTITION BY … ORDER BY … frame)`, correlated subqueries, `GROUP BY`/`HAVING`/`DISTINCT [ON]`, `UNION`/`UNION ALL`, `EXISTS`/`IN (subq)`), transactions + savepoints, prepared statements (PG-wire extended query). |
+| **Type system** | `INT` / `BIGINT` / `SMALLINT` / `FLOAT` / `NUMERIC(p,s)` / `TEXT` / `BOOL` / `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` / `INTERVAL` / `JSON` / `JSONB` / `BYTEA` (v7.10.4) / `TEXT[]` (v7.10.9) / `INT[]` / `BIGINT[]` (v7.11.2) / `VECTOR(N)` (pgvector-flavoured incl. `USING SQ8` and `USING HALF`). SQL three-valued NULL logic. PG-wire OIDs on RowDescription. |
 | **Storage** | In-memory page-less heap, atomic snapshot via tmpfile+rename, secondary B-tree indices (`alloc::collections::BTreeMap`), append-only catalog binary format with magic+version. |
 | **Persistence** | Two modes: atomic full-snapshot per writeful query *or* append-only WAL with fsync. WAL replay handles partial transactions via auto-rollback. |
 | **Executor** | Volcano-style row pipeline. WHERE filter, projection with column aliases, table aliases, ORDER BY (any expression), LIMIT, single-column-equality index seek, kNN via `<->` + ORDER BY. |
@@ -41,9 +41,12 @@ written from scratch on top of `std`/`alloc`/`core`.
 | `spg-crypto` | Self-built BLAKE3 | `no_std + alloc` |
 | `spg-storage` | Catalog / table / row / index / on-disk format | `no_std + alloc` |
 | `spg-audit` | BLAKE3 hash-chain audit log | `no_std + alloc` |
+| `spg-manifest` | Snapshot / WAL / backup envelope metadata | `no_std + alloc` |
 | `spg-engine` | SQL executor + expression evaluator | `no_std + alloc` |
-| `spg-server` | TCP daemon binary | `std` |
-| `spg-cli` | `spg` client binary | `std` |
+| `spg-embedded` | In-process embedded database (`Database::execute`) | `no_std + alloc` |
+| `spg-embedded-tokio` | Async wrapper with `spawn_blocking` + read-snapshot fan-out | `std` (tokio) |
+| `spg-server` | TCP + PG-wire daemon binary | `std` |
+| `spgctl` | `spgctl` client binary + WAL utilities | `std` |
 
 ## Quick start
 
@@ -91,23 +94,44 @@ cargo fmt --all --check
 
 ## Status
 
-**v1.0**. The 11 L2 work units are all in:
+**v7.11** (current). PG-port-ready surface, used in production
+embedded scenarios. Highlights since v1.0:
 
-- ✓ wire + network
-- ✓ SQL front-end
-- ✓ type system + expression eval (incl. SQL three-valued NULL)
-- ✓ storage engine + persistence
-- ✓ WAL + crash recovery
-- ✓ B-tree secondary indices
-- ✓ vector type + L2 distance + brute-force kNN
-- ✓ executor + index-seek planner
-- ✓ BEGIN/COMMIT/ROLLBACK transactions
-- ✓ BLAKE3 hash-chain audit log
-- ✓ operational basics (CLI args, env vars, stats opcode)
+- PG-wire protocol on `SPG_PG_ADDR` — simple + extended query,
+  Parse / Bind / Execute / Describe, binary-format Bind params
+  (13 PG types), prepared-statement plan cache.
+- pgvector-flavoured `VECTOR(N)` with HNSW indices; `USING SQ8`
+  8-bit and `USING HALF` (binary16) on-disk encodings.
+- Full SQL: JOIN (incl. LEFT/cross), CTE incl. WITH RECURSIVE,
+  window functions with frames + NULL treatment, correlated
+  subqueries (memoised), `EXPLAIN ANALYZE`, optimizer with
+  ANALYZE + JOIN reorder + Memoize node.
+- Native types: BYTEA (v7.10.4), TEXT[] / INT[] / BIGINT[]
+  arrays (v7.10.9 / v7.11.2) with full op surface (subscript,
+  ANY / ALL, `array_length` / `array_position` / `unnest` /
+  `||`), `substring` / `position` on TEXT + BYTEA.
+- Logical replication (v6.1) — publications, subscriptions,
+  segment forwarding.
+- WAL compression (v6.6) — LZSS, no-deps hand-rolled, with
+  torn-write resilience.
+- Cold-tier segments + `AS OF SEGMENT '<id>'` time-travel
+  (v6.10.2).
+- Observability v2 — `spg_stat_*` virtual tables for
+  replication, segments, per-query stats, per-connection
+  activity, audit chain, DDL emit.
+- `spg-embedded` for in-process use; `spg-embedded-tokio` for
+  async with snapshot-based read fan-out (v7.11.0).
 
-Out of scope for v1.0 (tracked for v1.x): HNSW index (currently linear scan),
-MVCC, JOIN / aggregates / window functions, multiple databases, on-disk
-incremental B-tree, page cache, query plan visualisation.
+See [`STABILITY.md`](STABILITY.md) for the wire-frozen surface
+matrix and [`CHANGELOG.md`](CHANGELOG.md) for the full minor /
+patch history.
+
+Carved out (not currently in scope): `tsvector` + GIN (use
+external FTS), multi-master / quorum replication, INTERSECT /
+EXCEPT, `ON CONFLICT` upsert, server-side cursor / partial
+Execute, multi-dimensional arrays, SMALLINT[] / NUMERIC[] /
+BOOLEAN[] arrays. See [`PG_MIGRATION.md`](PG_MIGRATION.md) for
+the full migration matrix.
 
 ## License
 
