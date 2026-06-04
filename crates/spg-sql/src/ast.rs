@@ -277,6 +277,13 @@ pub struct CreateIndexStatement {
     /// that only the leading column is currently honoured.
     /// Composite BTree index keys land in v7.10.
     pub extra_columns: Vec<String>,
+    /// v7.9.29 — `CREATE UNIQUE INDEX …`. When true the engine
+    /// enforces uniqueness on the indexed key (combined with the
+    /// `partial_predicate` filter — only rows where the predicate
+    /// evaluates truthy enter the uniqueness check). Standard SQL
+    /// and PG's canonical way to express conditional uniqueness.
+    /// mailrs K1.
+    pub is_unique: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1186,7 +1193,11 @@ impl fmt::Display for Statement {
 
 impl fmt::Display for CreateIndexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("CREATE INDEX ")?;
+        if self.is_unique {
+            f.write_str("CREATE UNIQUE INDEX ")?;
+        } else {
+            f.write_str("CREATE INDEX ")?;
+        }
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ")?;
         }
@@ -1203,8 +1214,17 @@ impl fmt::Display for CreateIndexStatement {
         }
         if let Some(expr) = &self.expression {
             write!(f, "({})", expr)?;
-        } else {
+        } else if self.extra_columns.is_empty() {
             write!(f, "({})", quote_ident(&self.column))?;
+        } else {
+            // v7.9.14 — multi-column key. Emit each column quoted
+            // so the round-tripped form re-parses to identical AST.
+            f.write_str("(")?;
+            write!(f, "{}", quote_ident(&self.column))?;
+            for c in &self.extra_columns {
+                write!(f, ", {}", quote_ident(c))?;
+            }
+            f.write_str(")")?;
         }
         if !self.included_columns.is_empty() {
             f.write_str(" INCLUDE (")?;

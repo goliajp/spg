@@ -72,6 +72,19 @@ impl From<LexError> for ParseError {
     }
 }
 
+/// v7.9.30 — parse a single expression (no trailing junk). Used by
+/// the engine to re-hydrate stored partial-index / unique-index
+/// predicates from their canonical Display form. The same Pratt
+/// parser the statement path uses; this entry point just skips the
+/// statement dispatch.
+pub fn parse_expression(input: &str) -> Result<Expr, ParseError> {
+    let tokens = lexer::tokenize(input)?;
+    let mut p = Parser::new(tokens);
+    let expr = p.parse_expr(0)?;
+    p.expect_eof()?;
+    Ok(expr)
+}
+
 /// Parse exactly one statement, swallow an optional trailing `;`, and require
 /// the token stream to end there.
 pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
@@ -418,7 +431,23 @@ impl Parser {
         self.advance();
         match self.peek() {
             Token::Table => self.parse_create_table_stmt_after_create(),
-            Token::Index => self.parse_create_index_stmt_after_create(),
+            Token::Index => self.parse_create_index_stmt_after_create(false),
+            // v7.9.29 — `CREATE UNIQUE INDEX … [WHERE pred]`.
+            // The `UNIQUE` modifier turns a partial index into a
+            // partial-uniqueness invariant (only rows matching the
+            // WHERE predicate are checked for duplicates). mailrs
+            // K1 (3 hits: email_templates default, calendar_events
+            // master, calendar_events instance).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("unique") => {
+                self.advance();
+                if !matches!(self.peek(), Token::Index) {
+                    return Err(self.err(alloc::format!(
+                        "expected INDEX after CREATE UNIQUE, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.parse_create_index_stmt_after_create(true)
+            }
             Token::Publication => {
                 self.advance();
                 self.parse_create_publication_after_keyword()
@@ -1509,8 +1538,11 @@ impl Parser {
         }
     }
 
-    fn parse_create_index_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
-        // Caller consumed CREATE; we're on INDEX.
+    fn parse_create_index_stmt_after_create(
+        &mut self,
+        is_unique: bool,
+    ) -> Result<Statement, ParseError> {
+        // Caller consumed CREATE (and the optional UNIQUE); we're on INDEX.
         debug_assert!(matches!(self.peek(), Token::Index));
         self.advance();
         let if_not_exists = self.consume_if_not_exists();
@@ -1569,8 +1601,16 @@ impl Parser {
         // direct index avoids the mutation.)
         let (column, expression): (String, Option<Expr>) = match self.peek().clone() {
             // Single column with `)` immediately after — fast path.
+            // v7.9.29 — also: bare column followed by `,` (the
+            // multi-column form `(a, b, c)`). Without this branch
+            // the leading ident gets pulled into `parse_expr`
+            // which then sets `expression = Some(Column(a))` and
+            // breaks Display round-trip on the multi-column shape.
             Token::Ident(s) | Token::QuotedIdent(s)
-                if matches!(self.tokens.get(self.pos + 1), Some(Token::RParen)) =>
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::RParen | Token::Comma)
+                ) =>
             {
                 self.advance();
                 (s, None)
@@ -1674,6 +1714,16 @@ impl Parser {
         } else {
             None
         };
+        // v7.9.29 — UNIQUE on a vector index (HNSW) makes no
+        // sense: uniqueness over an ANN structure has no clean
+        // semantics. Reject early. (BRIN UNIQUE is similarly
+        // meaningless — block both.)
+        if is_unique && !matches!(method, IndexMethod::BTree) {
+            return Err(self.err(alloc::format!(
+                "UNIQUE is only supported on BTree indexes, got USING {:?}",
+                method
+            )));
+        }
         Ok(Statement::CreateIndex(CreateIndexStatement {
             name,
             table,
@@ -1684,6 +1734,7 @@ impl Parser {
             partial_predicate,
             extra_columns: extra_columns.clone(),
             expression,
+            is_unique,
         }))
     }
 
@@ -3960,6 +4011,83 @@ mod tests {
         let original = parse("CREATE INDEX by_name ON users (name)");
         let again = parse_statement(&original.to_string()).unwrap();
         assert_eq!(original, again);
+    }
+
+    // --- v7.9.29 CREATE UNIQUE INDEX [WHERE pred] (mailrs K1) -------------
+
+    #[test]
+    fn create_unique_index_basic() {
+        let s = parse("CREATE UNIQUE INDEX uq_x ON t (a)");
+        let Statement::CreateIndex(c) = s else {
+            panic!("expected CreateIndex");
+        };
+        assert!(c.is_unique);
+        assert_eq!(c.column, "a");
+        assert!(c.partial_predicate.is_none());
+    }
+
+    #[test]
+    fn create_unique_index_partial() {
+        // mailrs's email_templates "one default per user" shape.
+        let s = parse(
+            "CREATE UNIQUE INDEX idx_email_templates_user_default \
+             ON email_templates (user_address) WHERE is_default = true",
+        );
+        let Statement::CreateIndex(c) = s else {
+            panic!("expected CreateIndex");
+        };
+        assert!(c.is_unique);
+        assert_eq!(c.table, "email_templates");
+        assert_eq!(c.column, "user_address");
+        assert!(c.partial_predicate.is_some());
+    }
+
+    #[test]
+    fn create_unique_index_composite_with_predicate() {
+        // mailrs's calendar_events instance: composite columns.
+        let s = parse(
+            "CREATE UNIQUE INDEX uq_calendar_events_instance \
+             ON calendar_events (calendar_id, uid, recurrence_id) \
+             WHERE recurrence_id IS NOT NULL",
+        );
+        let Statement::CreateIndex(c) = s else {
+            panic!("expected CreateIndex");
+        };
+        assert!(c.is_unique);
+        assert_eq!(c.column, "calendar_id");
+        assert_eq!(c.extra_columns, vec!["uid".to_string(), "recurrence_id".to_string()]);
+        assert!(c.partial_predicate.is_some());
+    }
+
+    #[test]
+    fn create_unique_index_using_btree_ok() {
+        let s = parse("CREATE UNIQUE INDEX uq_x ON t USING btree (a)");
+        assert!(matches!(s, Statement::CreateIndex(ref c) if c.is_unique));
+    }
+
+    #[test]
+    fn create_unique_index_using_hnsw_rejected() {
+        let err = parse_statement(
+            "CREATE UNIQUE INDEX uq_v ON t USING hnsw (embedding)",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("UNIQUE"), "{}", err.message);
+    }
+
+    #[test]
+    fn create_unique_index_round_trip() {
+        let original = parse(
+            "CREATE UNIQUE INDEX uq_calendar_events_master \
+             ON calendar_events (calendar_id, uid) WHERE recurrence_id IS NULL",
+        );
+        let again = parse_statement(&original.to_string()).unwrap();
+        assert_eq!(original, again);
+    }
+
+    #[test]
+    fn create_unique_without_index_errors() {
+        let err = parse_statement("CREATE UNIQUE TABLE t (a INT)").unwrap_err();
+        assert!(err.message.contains("INDEX"), "{}", err.message);
     }
 
     // --- v0.9 transactions -------------------------------------------------
