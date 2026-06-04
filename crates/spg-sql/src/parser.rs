@@ -1843,6 +1843,12 @@ impl Parser {
             // the two (no path-operator perf advantage to model).
             "json" => ColumnTypeName::Json,
             "jsonb" => ColumnTypeName::Jsonb,
+            // v7.10.4 — PG `BYTEA` and the SPG `BYTES` alias both
+            // surface here. Same storage shape; mapping happens at
+            // the engine side via the ColumnTypeName → DataType
+            // resolver. Literal forms are handled at coerce_value
+            // time so the lexer stays untouched.
+            "bytea" | "bytes" => ColumnTypeName::Bytes,
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),
@@ -4088,6 +4094,35 @@ mod tests {
     fn create_unique_without_index_errors() {
         let err = parse_statement("CREATE UNIQUE TABLE t (a INT)").unwrap_err();
         assert!(err.message.contains("INDEX"), "{}", err.message);
+    }
+
+    // --- v7.10.4 BYTES / BYTEA column type (Epic 1) ----------------------
+
+    #[test]
+    fn create_table_bytea_column() {
+        let s = parse("CREATE TABLE t (id INT NOT NULL, payload BYTEA NOT NULL)");
+        let Statement::CreateTable(c) = s else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(c.columns.len(), 2);
+        assert_eq!(c.columns[1].ty, ColumnTypeName::Bytes);
+        assert!(!c.columns[1].nullable);
+    }
+
+    #[test]
+    fn create_table_bytes_alias_column() {
+        let s = parse("CREATE TABLE t (blob BYTES)");
+        let Statement::CreateTable(c) = s else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(c.columns[0].ty, ColumnTypeName::Bytes);
+    }
+
+    #[test]
+    fn bytea_round_trip_display() {
+        let original = parse("CREATE TABLE t (a BYTEA NOT NULL)");
+        let again = parse_statement(&original.to_string()).unwrap();
+        assert_eq!(original, again);
     }
 
     // --- v0.9 transactions -------------------------------------------------

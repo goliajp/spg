@@ -301,8 +301,43 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                     let n = i32::try_from(s.chars().count()).unwrap_or(i32::MAX);
                     Ok(Value::Int(n))
                 }
+                // v7.10.4 — PG semantics: length(bytea) returns
+                // byte count (= octet_length). Without this branch
+                // mailrs's INSERT … SELECT length(body) … against a
+                // BYTEA column would type-mismatch.
+                Value::Bytes(b) => {
+                    let n = i32::try_from(b.len()).unwrap_or(i32::MAX);
+                    Ok(Value::Int(n))
+                }
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("length() needs text, got {:?}", other.data_type()),
+                    detail: format!("length() needs text or bytea, got {:?}", other.data_type()),
+                }),
+            }
+        }
+        // v7.10.4 — `OCTET_LENGTH(x)` returns byte count for both
+        // TEXT (UTF-8 byte length) and BYTEA. PG-spec name; aliases
+        // to length() for bytea by design.
+        "octet_length" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("octet_length() takes 1 arg, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let n = i32::try_from(s.len()).unwrap_or(i32::MAX);
+                    Ok(Value::Int(n))
+                }
+                Value::Bytes(b) => {
+                    let n = i32::try_from(b.len()).unwrap_or(i32::MAX);
+                    Ok(Value::Int(n))
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "octet_length() needs text or bytea, got {:?}",
+                        other.data_type()
+                    ),
                 }),
             }
         }
@@ -1316,6 +1351,20 @@ const fn days_in_month(y: i32, m: u32) -> u32 {
         // first, but be defensive) get the 30-day fallback.
         _ => 30,
     }
+}
+
+/// v7.10.4 — render a BYTEA payload in PG's hex output format
+/// (`\x` prefix, lowercase hex pairs). Public so the wire layer
+/// can emit the canonical bytea-as-text representation.
+pub fn format_bytea_hex(b: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + 2 * b.len());
+    out.push_str("\\x");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in b {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
 }
 
 /// Render a `Numeric { scaled, scale }` as its decimal text form.

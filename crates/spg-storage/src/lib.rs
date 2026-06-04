@@ -135,6 +135,14 @@ pub enum DataType {
     /// so `sqlx`-style clients that bind `jsonb` columns
     /// decode correctly. mailrs migration blocker #3.
     Jsonb,
+    /// v7.10.4: `BYTES` / `BYTEA` — variable-length raw binary.
+    /// Backed by `Value::Bytes(Vec<u8>)`. PG wire OID 17. Literal
+    /// forms accepted by parser/engine: PG hex form `'\xDEADBEEF'`
+    /// (case-insensitive hex pairs) and escape form
+    /// `'foo\\000bar'` (the latter decoded at coercion time when
+    /// the target column is BYTEA — TEXT columns leave the
+    /// backslash sequence verbatim).
+    Bytes,
 }
 
 impl fmt::Display for DataType {
@@ -166,6 +174,7 @@ impl fmt::Display for DataType {
             Self::Interval => f.write_str("INTERVAL"),
             Self::Json => f.write_str("JSON"),
             Self::Jsonb => f.write_str("JSONB"),
+            Self::Bytes => f.write_str("BYTEA"),
         }
     }
 }
@@ -217,6 +226,12 @@ pub enum Value {
     /// happens at the storage layer; whatever the parser hands us
     /// round-trips verbatim. Equality is byte-wise.
     Json(String),
+    /// v7.10.4 `BYTEA` — raw binary blob. Equality is byte-wise.
+    /// Layout matches `Text`'s length-prefixed shape (`[u32 LE
+    /// len][bytes]`) under tag 18; the engine accepts PG hex
+    /// literals (`'\xDEADBEEF'`) and escape literals at the
+    /// coercion boundary.
+    Bytes(Vec<u8>),
     Null,
 }
 
@@ -256,6 +271,7 @@ impl Value {
             Self::Timestamp(_) => Some(DataType::Timestamp),
             Self::Interval { .. } => Some(DataType::Interval),
             Self::Json(_) => Some(DataType::Json),
+            Self::Bytes(_) => Some(DataType::Bytes),
             Self::Null => None,
         }
     }
@@ -453,7 +469,8 @@ impl IndexKey {
             | Value::HalfVector(_)
             | Value::Numeric { .. }
             | Value::Interval { .. }
-            | Value::Json(_) => None,
+            | Value::Json(_)
+            | Value::Bytes(_) => None,
         }
     }
 }
@@ -3917,7 +3934,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 16;
+const FILE_VERSION: u8 = 17;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4686,6 +4703,8 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
         DataType::Jsonb => out.push(16),
+        // v7.10.4: tag 18 for `BYTEA`. Body = [u16 len][bytes].
+        DataType::Bytes => out.push(18),
     }
 }
 
@@ -4732,6 +4751,8 @@ impl Cursor<'_> {
             // Timestamp (i64 microseconds UTC); only the wire OID
             // (1184) differs.
             17 => Ok(DataType::Timestamptz),
+            // v7.10.4: tag 18 for `BYTEA`. Catalog FILE_VERSION 17+.
+            18 => Ok(DataType::Bytes),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -4790,6 +4811,12 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::HalfVector(h) => 4 + h.bytes.len(),
         // [i128 scaled][u8 scale]
         Value::Numeric { .. } => 16 + 1,
+        // v7.10.4: BYTEA on-disk shape mirrors Text — [u16 len][bytes].
+        // The 16-bit length cap is the same TEXT/JSON limit (~65 KB);
+        // larger blobs need toast-style chunking which is a v7.11
+        // carve-out (kept aligned with TEXT for now so the catalog
+        // snapshot stays simple).
+        Value::Bytes(b) => 2 + b.len(),
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -4940,6 +4967,13 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         // Text — the type tag lives in the column schema, not the
         // per-cell body.
         (Value::Json(s), DataType::Json | DataType::Jsonb) => write_str(out, s),
+        // v7.10.4: BYTEA shares the [u16 len][bytes] shape with
+        // Text but writes raw bytes (no UTF-8 invariant).
+        (Value::Bytes(b), DataType::Bytes) => {
+            let len = u16::try_from(b.len()).expect("BYTEA cell ≤ 64 KiB");
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(b);
+        }
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -5033,6 +5067,16 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             unreachable!(
                 "Value::Interval has no on-disk encoding; engine must reject it before write"
             )
+        }
+        // v7.10.4: BYTEA — [u8 tag=13_b][u16 len][bytes]. Tag
+        // distinct from Text (4) so the schema-agnostic
+        // read_value path can disambiguate. (Tag 11 is taken by
+        // the WAL `auto_commit_sql` shape elsewhere, hence 14.)
+        Value::Bytes(b) => {
+            out.push(14);
+            let len = u16::try_from(b.len()).expect("BYTEA value ≤ 64 KiB");
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(b);
         }
     }
 }
@@ -5223,6 +5267,13 @@ impl<'a> Cursor<'a> {
                 ))
             }
             DataType::Json => Ok(Value::Json(self.read_str()?)),
+            // v7.10.4: BYTEA on-disk is [u16 len][bytes]. Same wire
+            // shape as Text, but read as raw Vec<u8>.
+            DataType::Bytes => {
+                let len = self.read_u16()? as usize;
+                let bytes = self.take(len)?.to_vec();
+                Ok(Value::Bytes(bytes))
+            }
         }
     }
 
@@ -5274,6 +5325,12 @@ impl<'a> Cursor<'a> {
                 let dim = self.read_u32()? as usize;
                 let bytes = self.take(dim * 2)?.to_vec();
                 Ok(Value::HalfVector(halfvec::HalfVector { bytes }))
+            }
+            // v7.10.4: tag 14 — BYTEA. [u16 len][bytes].
+            14 => {
+                let len = self.read_u16()? as usize;
+                let bytes = self.take(len)?.to_vec();
+                Ok(Value::Bytes(bytes))
             }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }

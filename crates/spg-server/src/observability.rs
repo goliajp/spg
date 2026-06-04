@@ -566,6 +566,9 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // operator-knowable but not in the catalog.
                 DataType::Varchar(n) => u64::from(n).max(1) / 2,
                 DataType::Text | DataType::Json | DataType::Jsonb => 64,
+                // v7.10.4 — same rough sizing as Text. Exact value
+                // is operator-knowable; this is a snapshot heuristic.
+                DataType::Bytes => 64,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

@@ -35,15 +35,40 @@ Surface (`AsyncDatabase`):
 200 INSERTs against the engine while a 2 ms-tick ticker runs and
 asserts ≥ 30 ticks landed.
 
+**Epic 1 — native `BYTEA` type (this release).** PG wire OID 17.
+Replaces the TEXT-with-encoding hack for IMAP message bodies,
+attachment payloads, password hashes, anything binary. Two
+literal forms accepted by parser/engine:
+
+  * PG hex form:    `'\xDEADBEEF'`  (case-insensitive)
+  * Escape form:    `'foo\\000bar'` (octal triples + `\\`)
+
+Storage. New `DataType::Bytes` (tag 18) + `Value::Bytes(Vec<u8>)`.
+Row codec: `[u16 len][bytes]`. Catalog FILE_VERSION 16 → 17.
+v16 readers continue to load (Bytes only appears on new catalogs).
+
+Engine. `coerce_value` decodes hex / escape literals at INSERT
+time. `LENGTH(bytea)` returns byte count; new `OCTET_LENGTH(x)`
+covers both TEXT (UTF-8 byte count) and BYTEA.
+
+Wire. PG OID 17 advertised in RowDescription; DataRow emits the
+PG hex output form (`\x` + lowercase hex) so any psql / sqlx /
+JDBC / pgx client renders the column correctly.
+
 Sub-versions:
 
   v7.10.0  spg-embedded-tokio crate skeleton + workspace member
   v7.10.1  AsyncDatabase: open_in_memory / open_path / execute / query / checkpoint
   v7.10.2  README + hello_async example
-  v7.10.3  ship rollup — tag v7.10.0 + crates.io + docker
+  v7.10.3  Epic 3 ship rollup — tag v7.10.0 + crates.io + docker
+  v7.10.4  Epic 1 — storage Bytes DataType + Value variant + row codec (FILE_VERSION 17)
+  v7.10.5  Epic 1 — parser BYTES/BYTEA keyword + literal forms
+  v7.10.6  Epic 1 — engine coercion + OCTET_LENGTH builtin
+  v7.10.7  Epic 1 — wire OID 17 (text mode; binary follows in v7.11)
+  v7.10.8  Epic 1 ship rollup — tag v7.10.1 + crates.io + docker
 
-Epic 1 (native BYTES type) and Epic 2 (TEXT[] arrays) follow.
-The full v7.10 sub-version index lives in `.claude/internal-docs/V7_10_DESIGN.md`.
+Epic 2 (TEXT[] arrays) follows in v7.10.9-15. The full v7.10
+sub-version index lives in `.claude/internal-docs/V7_10_DESIGN.md`.
 
 ---
 

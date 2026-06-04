@@ -650,6 +650,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Json => "JSON".into(),
         DataType::Jsonb => "JSONB".into(),
         DataType::Timestamptz => "TIMESTAMPTZ".into(),
+        DataType::Bytes => "BYTEA".into(),
     }
 }
 
@@ -8872,6 +8873,91 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     Ok(schema)
 }
 
+/// v7.10.4 — decode a BYTEA literal. Accepts:
+///   * `\xDEADBEEF` (case-insensitive hex; whitespace stripped)
+///   * `Hello\000world` (backslash escape form; `\\` for literal backslash)
+///   * Anything else → raw UTF-8 bytes of the input (PG accepts this too).
+fn decode_bytea_literal(s: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
+        // Hex form. Each pair of hex digits → one byte.
+        let cleaned: alloc::string::String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        if cleaned.len() % 2 != 0 {
+            return Err("odd-length hex literal");
+        }
+        let mut out = alloc::vec::Vec::with_capacity(cleaned.len() / 2);
+        let cleaned_bytes = cleaned.as_bytes();
+        for i in (0..cleaned_bytes.len()).step_by(2) {
+            let hi = hex_nibble(cleaned_bytes[i])?;
+            let lo = hex_nibble(cleaned_bytes[i + 1])?;
+            out.push((hi << 4) | lo);
+        }
+        return Ok(out);
+    }
+    // Escape form or raw. Walk char-by-char; `\\` and `\NNN` octal
+    // sequences decode; anything else is a literal byte.
+    let bytes = s.as_bytes();
+    let mut out = alloc::vec::Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() {
+            let n = bytes[i + 1];
+            if n == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+            if n.is_ascii_digit() && i + 3 < bytes.len() && bytes[i + 2].is_ascii_digit()
+                && bytes[i + 3].is_ascii_digit()
+            {
+                let oct = |x: u8| (x - b'0') as u32;
+                let v = oct(n) * 64 + oct(bytes[i + 2]) * 8 + oct(bytes[i + 3]);
+                if v <= 0xFF {
+                    out.push(v as u8);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, &'static str> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("invalid hex digit"),
+    }
+}
+
+/// v7.10.4 — encode BYTEA bytes in PG hex output format
+/// (`\x` prefix, lowercase hex pairs). Used by Text-side
+/// round-trip + the wire layer's text-mode encoder.
+fn encode_bytea_hex(b: &[u8]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(2 + 2 * b.len());
+    out.push_str("\\x");
+    for byte in b {
+        let hi = byte >> 4;
+        let lo = byte & 0x0F;
+        out.push(hex_digit(hi));
+        out.push(hex_digit(lo));
+    }
+    out
+}
+
+const fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        10..=15 => (b'a' + n - 10) as char,
+        _ => '?',
+    }
+}
+
 const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
     match t {
         ColumnTypeName::SmallInt => DataType::SmallInt,
@@ -8896,6 +8982,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Timestamptz => DataType::Timestamptz,
         ColumnTypeName::Json => DataType::Json,
         ColumnTypeName::Jsonb => DataType::Jsonb,
+        ColumnTypeName::Bytes => DataType::Bytes,
     }
 }
 
@@ -9017,6 +9104,26 @@ fn coerce_value(
             // valid JSON lies with the producer.
             (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::Json(s)),
             (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
+            // v7.10.4 — Text → BYTEA. Decode PG-style literal forms:
+            //   - Hex:    `\x48656c6c6f`  (case-insensitive hex pairs)
+            //   - Escape: `Hello\\000world`  (backslash + octal triples)
+            //   - Plain:  any string → raw UTF-8 bytes (PG also accepts)
+            // Errors surface as TypeMismatch so the operator gets a
+            // clear "this literal isn't a bytea literal" hint.
+            (Value::Text(s), DataType::Bytes) => {
+                let bytes = decode_bytea_literal(&s).map_err(|e| {
+                    EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot parse {s:?} as BYTEA for column `{col_name}`: {e}"
+                        ),
+                    })
+                })?;
+                Some(Value::Bytes(bytes))
+            }
+            // v7.10.4 — BYTEA → Text round-trip uses the PG hex
+            // output (lowercase, `\x` prefix). Important when a
+            // SELECT pulls a bytea cell through a Text column path.
+            (Value::Bytes(b), DataType::Text) => Some(Value::Text(encode_bytea_hex(&b))),
             (Value::Text(s), DataType::Timestamp | DataType::Timestamptz) => {
                 let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
                     EngineError::Eval(EvalError::TypeMismatch {
