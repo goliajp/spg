@@ -84,6 +84,9 @@ Sub-versions:
   v7.9.27  H1 — `DO $$ … $$ [LANGUAGE plpgsql]` no-op (dollar-quoted lexer + DO statement)
   v7.9.27b pg_dump — `IS [NOT] DISTINCT FROM` NULL-safe equality
   v7.9.28  D-validate-3 ship: tag v7.9.3 + crates.io + docker
+  v7.9.29  K1 parser — CREATE UNIQUE INDEX [WHERE pred] (partial unique)
+  v7.9.30  K1 engine + storage — partial-unique enforcement on INSERT (FILE_VERSION 16)
+  v7.9.31  D-validate-4 ship: tag v7.9.4 + crates.io + docker
 
 This closes the blocker list in
 `.claude/notes/mailrs-migration-feedback.md`. Remaining items
