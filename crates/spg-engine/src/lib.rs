@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod aggregate;
 pub mod describe;
 pub mod eval;
+pub mod fts;
 pub mod json;
 pub mod memoize;
 pub mod plan_cache;
@@ -610,6 +611,13 @@ pub struct Engine {
     /// = no slow-query logging.
     slow_query_threshold_us: Option<u64>,
     slow_query_logger: Option<SlowQueryLogger>,
+    /// v7.12.1 — session parameters set via `SET <name> = <value>`.
+    /// Only `default_text_search_config` is consumed by the engine
+    /// today (the FTS function dispatcher reads it when
+    /// `to_tsvector(text)` is called without an explicit config).
+    /// All other names are accepted + recorded so PG-dump output
+    /// loads, but have no behavioural effect.
+    session_params: BTreeMap<String, String>,
 }
 
 /// v6.5.6 — callback signature for slow-query log emission. Called
@@ -731,6 +739,7 @@ impl Engine {
             audit_verifier: None,
             slow_query_threshold_us: None,
             slow_query_logger: None,
+            session_params: BTreeMap::new(),
         }
     }
 
@@ -809,6 +818,7 @@ impl Engine {
             audit_verifier: None,
             slow_query_threshold_us: None,
             slow_query_logger: None,
+            session_params: BTreeMap::new(),
         }
     }
 
@@ -867,6 +877,7 @@ impl Engine {
                     audit_verifier: None,
                     slow_query_threshold_us: None,
                     slow_query_logger: None,
+                    session_params: BTreeMap::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1446,6 +1457,29 @@ impl Engine {
             Statement::Analyze(target) => self.exec_analyze(target.as_deref()),
             // v6.7.3 — COMPACT COLD SEGMENTS.
             Statement::CompactColdSegments => self.exec_compact_cold_segments(),
+            // v7.12.1 — SET / RESET session parameter. Engine
+            // tracks the value in `session_params`; FTS dispatcher
+            // reads `default_text_search_config`. Everything else
+            // is a recorded no-op (PG dump compat).
+            Statement::SetParameter { name, value } => {
+                self.set_session_param(name, value);
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
+            Statement::ResetParameter(target) => {
+                match target {
+                    None => self.session_params.clear(),
+                    Some(name) => {
+                        self.session_params.remove(&name.to_ascii_lowercase());
+                    }
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
         };
         self.enforce_row_limit(result)
     }
@@ -2063,6 +2097,45 @@ impl Engine {
     /// it reads `SPG_COMPACTION_TARGET_SEGMENT_BYTES`, calls
     /// `Engine::compact_cold_segments_with_target` directly with
     /// the env value, and persists every merged segment to
+    /// v7.12.1 — record a `SET <name> = <value>` parameter. Names
+    /// are case-folded to lowercase to match PG; values keep their
+    /// caller-supplied form so observability paths see what was
+    /// requested. Only `default_text_search_config` is consulted by
+    /// the engine today.
+    fn set_session_param(&mut self, name: String, value: spg_sql::ast::SetValue) {
+        let normalised = match value {
+            spg_sql::ast::SetValue::String(s) => s,
+            spg_sql::ast::SetValue::Ident(s) => s,
+            spg_sql::ast::SetValue::Number(s) => s,
+            spg_sql::ast::SetValue::Default => String::new(),
+        };
+        self.session_params
+            .insert(name.to_ascii_lowercase(), normalised);
+    }
+
+    /// v7.12.1 — read a session parameter set via `SET`. Used by
+    /// the FTS function dispatcher to resolve the default config
+    /// for `to_tsvector(text)` / `plainto_tsquery(text)` etc.
+    #[must_use]
+    pub fn session_param(&self, name: &str) -> Option<&str> {
+        self.session_params
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    /// v7.12.1 — build an `EvalContext` chained with the session's
+    /// `default_text_search_config`. Engine-internal callers use
+    /// this instead of `EvalContext::new` so the FTS function
+    /// dispatcher sees the SET configuration.
+    fn ev_ctx<'a>(
+        &'a self,
+        columns: &'a [ColumnSchema],
+        alias: Option<&'a str>,
+    ) -> EvalContext<'a> {
+        EvalContext::new(columns, alias)
+            .with_default_text_search_config(self.session_param("default_text_search_config"))
+    }
+
     /// `<db>.spg/segments/`. This arm only fires for engine-only
     /// callers (spg-embedded, lib tests); in that mode merged
     /// segments live in memory and are dropped at process exit.
@@ -2327,6 +2400,11 @@ impl Engine {
             }
         }
 
+        // v7.12.1 — cache session FTS config before the table
+        // mut-borrow (same reason as exec_delete).
+        let ts_cfg: Option<String> = self
+            .session_param("default_text_search_config")
+            .map(String::from);
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -2349,7 +2427,8 @@ impl Engine {
                 })?;
             targets.push((pos, expr));
         }
-        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
+            .with_default_text_search_config(ts_cfg.as_deref());
         // Walk every row, evaluate WHERE then SET expressions. We
         // gather (position, new_values) tuples first and apply them
         // afterwards so the WHERE/RHS evaluation reads the original
@@ -2482,6 +2561,14 @@ impl Engine {
             }
         }
 
+        // v7.12.1 — cache the session FTS config as an owned
+        // String before the mutable table borrow below; the
+        // ctx-builder then references it via `as_deref` so the
+        // immutable read of `session_params` doesn't conflict
+        // with the mut borrow chain.
+        let ts_cfg: Option<String> = self
+            .session_param("default_text_search_config")
+            .map(String::from);
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -2491,7 +2578,8 @@ impl Engine {
                 })
             })?;
         let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
-        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
+            .with_default_text_search_config(ts_cfg.as_deref());
         let mut positions: Vec<usize> = Vec::new();
         // v7.6.3 — collect every to-delete row's full Value tuple
         // alongside its position, so the FK enforcement pass can
@@ -3997,7 +4085,7 @@ impl Engine {
         // ColumnNotFound on eval since the schema is empty.
         let Some(from) = &stmt.from else {
             let empty_schema: Vec<ColumnSchema> = Vec::new();
-            let ctx = EvalContext::new(&empty_schema, None);
+            let ctx = self.ev_ctx(&empty_schema, None);
             let projection = build_projection(&stmt.items, &empty_schema, "")?;
             let dummy_row = Row::new(Vec::new());
             let mut values = Vec::with_capacity(projection.len());
@@ -4038,7 +4126,7 @@ impl Engine {
         // The qualifier accepted on column refs is the alias (if any) else the
         // bare table name.
         let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
-        let ctx = EvalContext::new(schema_cols, Some(alias));
+        let ctx = self.ev_ctx(schema_cols, Some(alias));
 
         // NSW kNN planner: `ORDER BY col <-> literal LIMIT k` with no
         // WHERE and an NSW index on `col` skips the full scan. The
@@ -5007,7 +5095,7 @@ impl Engine {
         })?;
         let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
         let schema_cols = &table.schema().columns;
-        let ctx = EvalContext::new(schema_cols, Some(alias));
+        let ctx = self.ev_ctx(schema_cols, Some(alias));
 
         // 1) Filter pass.
         let mut filtered: Vec<&Row> = Vec::new();

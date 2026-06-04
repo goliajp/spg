@@ -130,6 +130,31 @@ pub enum Statement {
     /// carved out of v6.7.3 (per V6_7_DESIGN.md STABILITY entry);
     /// v6.7.3 only supports the bare form.
     CompactColdSegments,
+    /// v7.12.1 — `SET <name> [TO|=] <value>`. Records a session
+    /// parameter on the engine; v7.12.1 honours
+    /// `default_text_search_config` (consumed by `to_tsvector` /
+    /// `plainto_tsquery` family when called without an explicit
+    /// config arg). All other names are accepted as a no-op so PG
+    /// dumps with `SET client_encoding`, `SET search_path` etc.
+    /// load cleanly.
+    SetParameter {
+        name: String,
+        value: SetValue,
+    },
+    /// v7.12.1 — `RESET <name>` / `RESET ALL`. Restores parameter
+    /// to its default. No-op for parameters SPG does not track.
+    ResetParameter(Option<String>),
+}
+
+/// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
+/// a string literal, an identifier (often a config name), an
+/// integer/float, or the bare `DEFAULT` keyword.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetValue {
+    String(String),
+    Ident(String),
+    Number(String),
+    Default,
 }
 
 /// v6.1.4 — `CREATE SUBSCRIPTION` AST node. v6.1.4 ships a
@@ -1270,6 +1295,16 @@ impl fmt::Display for Statement {
             Self::DropPublication(name) => {
                 write!(f, "DROP PUBLICATION {}", quote_ident(name))
             }
+            Self::SetParameter { name, value } => {
+                write!(f, "SET {name} = ")?;
+                match value {
+                    SetValue::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
+                    SetValue::Ident(s) | SetValue::Number(s) => f.write_str(s),
+                    SetValue::Default => f.write_str("DEFAULT"),
+                }
+            }
+            Self::ResetParameter(None) => f.write_str("RESET ALL"),
+            Self::ResetParameter(Some(name)) => write!(f, "RESET {name}"),
         }
     }
 }

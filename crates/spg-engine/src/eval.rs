@@ -35,6 +35,13 @@ pub struct EvalContext<'a> {
     /// prepared-statement Execute path with Bind values converted
     /// to `Value`. Index N (1-based per PG) hits `params[N-1]`.
     pub params: &'a [Value],
+    /// v7.12.1 — session text-search config (from `SET
+    /// default_text_search_config = '<name>'`). Resolved when the
+    /// engine builds an `EvalContext` and consumed by the FTS
+    /// function dispatcher when `to_tsvector(text)` /
+    /// `plainto_tsquery(text)` etc are called without an explicit
+    /// config arg. `None` falls through to `simple`.
+    pub default_text_search_config: Option<&'a str>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -43,6 +50,7 @@ impl<'a> EvalContext<'a> {
             columns,
             table_alias,
             params: &[],
+            default_text_search_config: None,
         }
     }
 
@@ -52,6 +60,15 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     pub const fn with_params(mut self, params: &'a [Value]) -> Self {
         self.params = params;
+        self
+    }
+
+    /// v7.12.1 — attach the session's
+    /// `default_text_search_config`. Used by the FTS function
+    /// dispatcher when no explicit config arg is given.
+    #[must_use]
+    pub const fn with_default_text_search_config(mut self, cfg: Option<&'a str>) -> Self {
+        self.default_text_search_config = cfg;
         self
     }
 }
@@ -129,7 +146,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
         Expr::FunctionCall { name, args } => {
             let evaluated: Result<Vec<Value>, _> =
                 args.iter().map(|a| eval_expr(a, row, ctx)).collect();
-            apply_function(name, &evaluated?)
+            apply_function(name, &evaluated?, ctx)
         }
         Expr::Like {
             expr,
@@ -512,7 +529,11 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
 
 /// Dispatch on lowercased function name. v1.4 implements only a handful of
 /// scalar functions; aggregates land in v1.5 alongside GROUP BY.
-fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_function(
+    name: &str,
+    args: &[Value],
+    ctx: &EvalContext<'_>,
+) -> Result<Value, EvalError> {
     match name.to_ascii_lowercase().as_str() {
         "length" => {
             if args.len() != 1 {
@@ -930,10 +951,124 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "encode" => encode_text(args),
         "decode" => decode_text(args),
         "error_on_null" => error_on_null(args),
+        // v7.12.1 — PG full-text search lexer / tsquery builders.
+        // mailrs G-CRIT-3 acceptance path: `to_tsvector('english',
+        // … || ' ' || … || …)` runs end-to-end against a tsvector
+        // column with Porter stemming + standard english stopwords.
+        "to_tsvector" => fts_to_tsvector(args, ctx),
+        "plainto_tsquery" => fts_plainto_tsquery(args, ctx),
+        "phraseto_tsquery" => fts_phraseto_tsquery(args, ctx),
+        "websearch_to_tsquery" => fts_websearch_to_tsquery(args, ctx),
+        "to_tsquery" => fts_to_tsquery(args, ctx),
         other => Err(EvalError::TypeMismatch {
             detail: format!("unknown function `{other}`"),
         }),
     }
+}
+
+/// v7.12.1 — `to_tsvector([config,] text)`. With one arg the
+/// session-resolved `default_text_search_config` is used (defaults
+/// to `simple` when unset); with two args the first picks the
+/// config. NULL text → NULL.
+fn fts_to_tsvector(args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
+    let (config, text) = parse_fts_args("to_tsvector", args, ctx)?;
+    match text {
+        None => Ok(Value::Null),
+        Some(t) => Ok(Value::TsVector(crate::fts::to_tsvector(config, &t))),
+    }
+}
+
+fn fts_plainto_tsquery(args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
+    let (config, text) = parse_fts_args("plainto_tsquery", args, ctx)?;
+    match text {
+        None => Ok(Value::Null),
+        Some(t) => Ok(Value::TsQuery(crate::fts::plainto_tsquery(config, &t))),
+    }
+}
+
+fn fts_phraseto_tsquery(args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
+    let (config, text) = parse_fts_args("phraseto_tsquery", args, ctx)?;
+    match text {
+        None => Ok(Value::Null),
+        Some(t) => Ok(Value::TsQuery(crate::fts::phraseto_tsquery(config, &t))),
+    }
+}
+
+fn fts_websearch_to_tsquery(args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
+    let (config, text) = parse_fts_args("websearch_to_tsquery", args, ctx)?;
+    match text {
+        None => Ok(Value::Null),
+        Some(t) => Ok(Value::TsQuery(crate::fts::websearch_to_tsquery(config, &t))),
+    }
+}
+
+fn fts_to_tsquery(args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
+    let (config, text) = parse_fts_args("to_tsquery", args, ctx)?;
+    match text {
+        None => Ok(Value::Null),
+        Some(t) => Ok(Value::TsQuery(crate::fts::to_tsquery(config, &t)?)),
+    }
+}
+
+/// Parse the `(config, text)` / `(text)` argument pair shared by
+/// all FTS builders. Returns the resolved config + the text
+/// payload (None when text is NULL). The one-arg form pulls the
+/// config from the session's `default_text_search_config`.
+fn parse_fts_args(
+    name: &str,
+    args: &[Value],
+    ctx: &EvalContext<'_>,
+) -> Result<(crate::fts::TsConfig, Option<String>), EvalError> {
+    let (config_arg, text_arg) = match args {
+        [t] => (None, t),
+        [c, t] => (Some(c), t),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!("{name}() takes 1 or 2 args, got {}", args.len()),
+            });
+        }
+    };
+    let config = match config_arg {
+        None => match ctx.default_text_search_config {
+            Some(name_str) => crate::fts::TsConfig::from_name(name_str).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: format!(
+                        "text search config not implemented: {name_str:?} (supported: simple, english)"
+                    ),
+                }
+            })?,
+            None => crate::fts::TsConfig::Simple,
+        },
+        Some(Value::Null) => return Ok((crate::fts::TsConfig::Simple, None)),
+        Some(Value::Text(name_str)) => crate::fts::TsConfig::from_name(name_str).ok_or_else(|| {
+            EvalError::TypeMismatch {
+                detail: format!(
+                    "text search config not implemented: {name_str:?} (supported: simple, english)"
+                ),
+            }
+        })?,
+        Some(other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "{name}() config arg must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let text = match text_arg {
+        Value::Null => None,
+        Value::Text(s) => Some(s.clone()),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "{name}() text arg must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    Ok((config, text))
 }
 
 /// v6.4.3 — `encode(bytes_as_text, format)`. PG works on bytea
