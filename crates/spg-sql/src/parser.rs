@@ -419,6 +419,55 @@ impl Parser {
                 };
                 Ok(Statement::Analyze(target))
             }
+            // v7.12.1 — `SET <name> [TO|=] <value>`. The
+            // `default_text_search_config` parameter is consumed
+            // by the FTS function dispatcher; other parameter
+            // names are recorded but treated as a no-op so PG
+            // dump output loads.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("set") => {
+                self.advance();
+                // PG allows `SET LOCAL` / `SET SESSION` qualifiers
+                // — accept and ignore.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("local") || s.eq_ignore_ascii_case("session"))
+                {
+                    self.advance();
+                }
+                let name = self.parse_set_param_name()?;
+                // Accept either `=` or the bare `TO` keyword.
+                match self.peek() {
+                    Token::Eq => {
+                        self.advance();
+                    }
+                    Token::To => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected `=` or TO after SET {name}, got {other:?}"
+                        )));
+                    }
+                }
+                let value = self.parse_set_value()?;
+                Ok(Statement::SetParameter { name, value })
+            }
+            // v7.12.1 — `RESET <name>` / `RESET ALL`.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("reset") => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::All => {
+                        self.advance();
+                        Ok(Statement::ResetParameter(None))
+                    }
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("all") => {
+                        self.advance();
+                        Ok(Statement::ResetParameter(None))
+                    }
+                    _ => {
+                        let name = self.parse_set_param_name()?;
+                        Ok(Statement::ResetParameter(Some(name)))
+                    }
+                }
+            }
             other => Err(self.err(format!(
                 "expected SELECT / CREATE / DROP / INSERT / UPDATE / DELETE / ALTER / BEGIN / COMMIT / \
                  ROLLBACK / SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
@@ -624,6 +673,43 @@ impl Parser {
     /// All keywords after `WAIT` are bare idents in v6.1.x; no
     /// lexer churn. Both `<pos>` and `<ms>` are positive integers
     /// that fit `u64`.
+    /// v7.12.1 — parameter name in `SET <name>` may be dotted
+    /// (`pg_catalog.default_text_search_config` etc).
+    fn parse_set_param_name(&mut self) -> Result<String, ParseError> {
+        let mut name = self.expect_ident_like()?;
+        while matches!(self.peek(), Token::Dot) {
+            self.advance();
+            let next = self.expect_ident_like()?;
+            name.push('.');
+            name.push_str(&next);
+        }
+        Ok(name.to_ascii_lowercase())
+    }
+
+    fn parse_set_value(&mut self) -> Result<crate::ast::SetValue, ParseError> {
+        match self.advance() {
+            Token::String(s) => Ok(crate::ast::SetValue::String(s)),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("default") => {
+                Ok(crate::ast::SetValue::Default)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) => {
+                let mut accum = s;
+                while matches!(self.peek(), Token::Dot) {
+                    self.advance();
+                    let next = self.expect_ident_like()?;
+                    accum.push('.');
+                    accum.push_str(&next);
+                }
+                Ok(crate::ast::SetValue::Ident(accum))
+            }
+            Token::Integer(n) => Ok(crate::ast::SetValue::Number(n.to_string())),
+            Token::Float(f) => Ok(crate::ast::SetValue::Number(f.to_string())),
+            other => Err(self.err(format!(
+                "expected literal, identifier, or DEFAULT after `=` in SET, got {other:?}"
+            ))),
+        }
+    }
+
     fn parse_wait_after_keyword(&mut self) -> Result<Statement, ParseError> {
         // FOR is a v6.1.2-reserved keyword (Token::For). The
         // other two are bare idents — they've never needed lexer
