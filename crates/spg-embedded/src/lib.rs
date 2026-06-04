@@ -86,7 +86,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// v7.11.3 — wall-clock provider injected into every embedded
+/// `Engine`. Microseconds since the Unix epoch; clamps to
+/// `i64::MAX` if the system clock is far-future. Used by SQL's
+/// `NOW()` / `CURRENT_TIMESTAMP` / `CURRENT_DATE` rewrite layer
+/// so PG-idiomatic time queries work without the caller wiring
+/// their own clock.
+fn wall_clock_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
 
 use spg_manifest::{CatalogManifest, ColdSegmentEntry, manifest_path as spg_manifest_path};
 
@@ -264,7 +276,7 @@ impl Database {
     #[must_use]
     pub fn open_in_memory() -> Self {
         Self {
-            engine: Engine::new(),
+            engine: Engine::new().with_clock(wall_clock_micros),
             persistence: None,
         }
     }
@@ -313,9 +325,9 @@ impl Database {
                     db_path.display()
                 )))
             })?;
-            engine
+            engine.with_clock(wall_clock_micros)
         } else {
-            Engine::new()
+            Engine::new().with_clock(wall_clock_micros)
         };
         // v7.1.4 — manifest-driven cold-segment reload. The
         // manifest sidecar pairs the catalog snapshot CRC with a

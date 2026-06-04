@@ -4592,6 +4592,25 @@ fn try_index_seek<'a>(
     table: &'a Table,
     table_alias: &str,
 ) -> Option<Vec<Cow<'a, Row>>> {
+    // v7.11.3 — recurse through top-level `AND` so a PG-style
+    // composite predicate like `WHERE id = 1 AND created_at > $1`
+    // still hits the index on `id`. The caller re-applies the
+    // full WHERE expression to each returned row, so dropping the
+    // residual conjuncts here is correct — the index just narrows
+    // the candidate set.
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::And,
+        rhs,
+    } = where_expr
+    {
+        // Try LHS first (typical convention: leading equality on
+        // the indexed column comes first in user-written SQL).
+        if let Some(rows) = try_index_seek(lhs, schema_cols, catalog, table, table_alias) {
+            return Some(rows);
+        }
+        return try_index_seek(rhs, schema_cols, catalog, table, table_alias);
+    }
     let Expr::Binary {
         lhs,
         op: BinOp::Eq,
