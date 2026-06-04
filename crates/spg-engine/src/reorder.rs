@@ -267,8 +267,7 @@ fn collect_referenced_tables(
 ) -> bool {
     match expr {
         Expr::Column(ColumnName {
-            qualifier: Some(q),
-            ..
+            qualifier: Some(q), ..
         }) => {
             if let Some(&i) = alias_to_idx.get(q) {
                 out.push(i);
@@ -397,10 +396,7 @@ fn best_order_greedy(n: usize, sizes: &[u64], edges: &[Edge]) -> Vec<usize> {
     // Seed: smallest table.
     let mut chosen: Vec<usize> = Vec::with_capacity(n);
     let mut remaining: Vec<usize> = (0..n).collect();
-    let &first = remaining
-        .iter()
-        .min_by_key(|&&i| sizes[i])
-        .expect("n > 0");
+    let &first = remaining.iter().min_by_key(|&&i| sizes[i]).expect("n > 0");
     chosen.push(first);
     remaining.retain(|&x| x != first);
     while !remaining.is_empty() {
@@ -443,11 +439,7 @@ fn plan_cost(order: &[usize], sizes: &[u64], edges: &[Edge]) -> f64 {
         // Apply every edge whose endpoints just became fully
         // covered by the prefix.
         for edge in edges {
-            if edge
-                .endpoints
-                .iter()
-                .all(|&e| in_prefix[e])
-            {
+            if edge.endpoints.iter().all(|&e| in_prefix[e]) {
                 // Apply selectivity only if at least one endpoint
                 // is this step's `table_idx` — otherwise the
                 // selectivity was already applied at an earlier
@@ -462,12 +454,7 @@ fn plan_cost(order: &[usize], sizes: &[u64], edges: &[Edge]) -> f64 {
     cost
 }
 
-fn rewrite_from(
-    from: &mut FromClause,
-    tables: &[TableRef],
-    edges: &[Edge],
-    order: &[usize],
-) {
+fn rewrite_from(from: &mut FromClause, tables: &[TableRef], edges: &[Edge], order: &[usize]) {
     from.primary = tables[order[0]].clone();
     from.joins.clear();
     let mut in_prefix: Vec<bool> = alloc::vec![false; tables.len()];
@@ -483,9 +470,7 @@ fn rewrite_from(
             if edges_used[ei] {
                 continue;
             }
-            if edge.endpoints.contains(&table_idx)
-                && edge.endpoints.iter().all(|&e| in_prefix[e])
-            {
+            if edge.endpoints.contains(&table_idx) && edge.endpoints.iter().all(|&e| in_prefix[e]) {
                 edges_used[ei] = true;
                 combined = Some(match combined {
                     None => edge.predicate.clone(),
@@ -501,9 +486,7 @@ fn rewrite_from(
         // so the join shape stays valid. (Shouldn't happen on a
         // connected join graph; the reorder pass only takes
         // connected graphs anyway.)
-        let on = combined.unwrap_or_else(|| {
-            Expr::Literal(spg_sql::ast::Literal::Bool(true))
-        });
+        let on = combined.unwrap_or_else(|| Expr::Literal(spg_sql::ast::Literal::Bool(true)));
         from.joins.push(FromJoin {
             kind: JoinKind::Inner,
             table: tables[table_idx].clone(),
@@ -562,7 +545,9 @@ mod tests {
              INNER JOIN fact ON fact.k1 = big1.k AND fact.k2 = big2.k AND fact.k3 = big3.k AND fact.k4 = big4.k",
         )
         .unwrap();
-        let spg_sql::ast::Statement::Select(sel) = stmt else { panic!() };
+        let spg_sql::ast::Statement::Select(sel) = stmt else {
+            panic!()
+        };
         let from = sel.from.unwrap();
         assert_eq!(
             from.primary.name, "fact",

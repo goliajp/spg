@@ -51,7 +51,8 @@ fn plan_cache_cap_overridable_via_engine_api() {
     // Fill past the new cap; cache should retain only 8.
     for i in 0..32 {
         eng.execute(&format!("CREATE TABLE t{i} (id INT)")).unwrap();
-        eng.execute(&format!("INSERT INTO t{i} VALUES (1)")).unwrap();
+        eng.execute(&format!("INSERT INTO t{i} VALUES (1)"))
+            .unwrap();
     }
     // The plan cache is now bounded at 8. Verify via the introspect
     // accessor.

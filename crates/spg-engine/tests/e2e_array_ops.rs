@@ -5,7 +5,8 @@ use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn ok(eng: &mut Engine, sql: &str) -> QueryResult {
-    eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
+    eng.execute(sql)
+        .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"))
 }
 
 fn select_value(eng: &mut Engine, sql: &str) -> Value {
@@ -48,7 +49,10 @@ fn array_length_other_dim_returns_null() {
 fn array_position_finds_match() {
     let mut eng = Engine::new();
     ok(&mut eng, "CREATE TABLE t (labels TEXT[] NOT NULL)");
-    ok(&mut eng, "INSERT INTO t VALUES (ARRAY['alpha', 'beta', 'gamma'])");
+    ok(
+        &mut eng,
+        "INSERT INTO t VALUES (ARRAY['alpha', 'beta', 'gamma'])",
+    );
     let v = select_value(&mut eng, "SELECT array_position(labels, 'beta') FROM t");
     assert!(matches!(v, Value::Int(2)));
 }
@@ -66,7 +70,10 @@ fn array_position_returns_null_when_absent() {
 fn array_position_skips_null_elements() {
     let mut eng = Engine::new();
     ok(&mut eng, "CREATE TABLE t (labels TEXT[] NOT NULL)");
-    ok(&mut eng, "INSERT INTO t VALUES (ARRAY['a', NULL, 'b', 'c'])");
+    ok(
+        &mut eng,
+        "INSERT INTO t VALUES (ARRAY['a', NULL, 'b', 'c'])",
+    );
     let v = select_value(&mut eng, "SELECT array_position(labels, 'b') FROM t");
     assert!(matches!(v, Value::Int(3)));
 }
@@ -74,10 +81,7 @@ fn array_position_skips_null_elements() {
 #[test]
 fn array_concat_array_array() {
     let mut eng = Engine::new();
-    let v = select_value(
-        &mut eng,
-        "SELECT ARRAY['a', 'b'] || ARRAY['c', 'd']",
-    );
+    let v = select_value(&mut eng, "SELECT ARRAY['a', 'b'] || ARRAY['c', 'd']");
     let Value::TextArray(items) = v else {
         panic!();
     };
@@ -142,10 +146,7 @@ fn unnest_basic() {
 #[test]
 fn unnest_emits_null_elements_as_null_rows() {
     let mut eng = Engine::new();
-    let rows = select_rows(
-        &mut eng,
-        "SELECT u FROM unnest(ARRAY['a', NULL, 'b']) u",
-    );
+    let rows = select_rows(&mut eng, "SELECT u FROM unnest(ARRAY['a', NULL, 'b']) u");
     assert_eq!(rows.len(), 3);
     assert!(matches!(rows[0][0], Value::Text(ref s) if s == "a"));
     assert!(matches!(rows[1][0], Value::Null));
@@ -176,9 +177,6 @@ fn unnest_with_limit() {
 #[test]
 fn unnest_from_pg_external_form_cast() {
     let mut eng = Engine::new();
-    let rows = select_rows(
-        &mut eng,
-        "SELECT u FROM unnest('{x,y,z}'::TEXT[]) u",
-    );
+    let rows = select_rows(&mut eng, "SELECT u FROM unnest('{x,y,z}'::TEXT[]) u");
     assert_eq!(rows.len(), 3);
 }

@@ -43,7 +43,8 @@ fn snapshot_to_file_then_restore_round_trips_data() {
     // "Session 1": populate + snapshot to file.
     {
         let mut db = Database::open_in_memory();
-        db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
         for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {
             db.execute(&format!("INSERT INTO users VALUES ({id}, '{name}')"))
                 .unwrap();
@@ -68,8 +69,10 @@ fn snapshot_round_trip_preserves_vector_kNN_ranking() {
     let db_path = unique_tmpfile("vec");
     {
         let mut db = Database::open_in_memory();
-        db.execute("CREATE TABLE emb (id INT NOT NULL, v VECTOR(4) NOT NULL)").unwrap();
-        db.execute("CREATE INDEX emb_idx ON emb USING hnsw (v)").unwrap();
+        db.execute("CREATE TABLE emb (id INT NOT NULL, v VECTOR(4) NOT NULL)")
+            .unwrap();
+        db.execute("CREATE INDEX emb_idx ON emb USING hnsw (v)")
+            .unwrap();
         for (id, v) in [
             (1, "[1.0, 2.0, 3.0, 4.0]"),
             (2, "[4.0, 5.0, 6.0, 7.0]"),
@@ -77,7 +80,8 @@ fn snapshot_round_trip_preserves_vector_kNN_ranking() {
             (4, "[2.0, 3.0, 4.0, 5.0]"),
             (5, "[1.0, 2.0, 3.0, 5.0]"),
         ] {
-            db.execute(&format!("INSERT INTO emb VALUES ({id}, {v})")).unwrap();
+            db.execute(&format!("INSERT INTO emb VALUES ({id}, {v})"))
+                .unwrap();
         }
         std::fs::write(&db_path, db.snapshot()).unwrap();
     }

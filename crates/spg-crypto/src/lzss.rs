@@ -72,9 +72,8 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
         let (match_off, match_len) = find_longest_match(input, i);
         if match_len >= MIN_MATCH {
             // Encode back-reference: offset (12 bits) | (len-3) (4 bits).
-            let packed: u16 =
-                u16::try_from(match_off).expect("offset < 4096") << LENGTH_BITS
-                    | u16::try_from(match_len - MIN_MATCH).expect("length < 16");
+            let packed: u16 = u16::try_from(match_off).expect("offset < 4096") << LENGTH_BITS
+                | u16::try_from(match_len - MIN_MATCH).expect("length < 16");
             // flag bit = 0 (default); just push the 2 bytes.
             frame.extend_from_slice(&packed.to_le_bytes());
             i += match_len;
@@ -349,12 +348,7 @@ mod tests {
         // back-ref against the first 2 bytes. The decoder must
         // produce 256 bytes correctly even though the source region
         // overlaps the destination.
-        let input: Vec<u8> = b"AB"
-            .iter()
-            .cycle()
-            .take(256)
-            .copied()
-            .collect();
+        let input: Vec<u8> = b"AB".iter().cycle().take(256).copied().collect();
         let c = compress(&input);
         let d = decompress(&c).unwrap();
         assert_eq!(d, input);

@@ -30,7 +30,12 @@ fn background_freezer_demotes_when_hot_tier_exceeds_budget() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         std::thread::sleep(Duration::from_millis(100));
-        let cold = shared.lock().unwrap().engine().catalog().cold_segment_count();
+        let cold = shared
+            .lock()
+            .unwrap()
+            .engine()
+            .catalog()
+            .cold_segment_count();
         if cold >= 1 {
             return;
         }
@@ -85,7 +90,12 @@ fn freezer_no_op_when_no_freezable_table() {
     std::thread::sleep(Duration::from_millis(300));
     // The freezer didn't crash; cold_segment_count stays 0.
     assert_eq!(
-        shared.lock().unwrap().engine().catalog().cold_segment_count(),
+        shared
+            .lock()
+            .unwrap()
+            .engine()
+            .catalog()
+            .cold_segment_count(),
         0
     );
 }

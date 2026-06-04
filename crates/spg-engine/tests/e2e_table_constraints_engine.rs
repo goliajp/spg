@@ -59,14 +59,14 @@ fn composite_pk_implies_not_null_and_rejects_duplicate() {
         "INSERT INTO snoozed VALUES ('t1', 'a@x.com')",
     ]);
     let r = eng.execute("INSERT INTO snoozed VALUES ('t1', 'a@x.com')");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("PRIMARY KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("PRIMARY KEY violation"))
+    );
 }
 
 #[test]
 fn composite_unique_within_same_batch_caught() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b))",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b))"]);
     let r = eng.execute("INSERT INTO t VALUES (1, 100), (1, 100)");
     assert!(r.is_err());
 }
@@ -84,14 +84,12 @@ fn composite_unique_null_skips_check() {
 
 #[test]
 fn pk_index_is_created_for_table_level_pk() {
-    let eng = engine_with(&[
-        "CREATE TABLE config (\
+    let eng = engine_with(&["CREATE TABLE config (\
             namespace TEXT NOT NULL,\
             cfg_key TEXT NOT NULL,\
             value TEXT NOT NULL,\
             PRIMARY KEY (namespace, cfg_key)\
-        )",
-    ]);
+        )"]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let table = cat.get("config").unwrap();
@@ -133,9 +131,7 @@ fn table_with_pk_and_separate_unique_lands_both() {
 
 #[test]
 fn uniqueness_constraints_round_trip_snapshot() {
-    let eng = engine_with(&[
-        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b))",
-    ]);
+    let eng = engine_with(&["CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b))"]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let ucs = &cat.get("t").unwrap().schema().uniqueness_constraints;

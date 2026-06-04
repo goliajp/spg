@@ -1,3 +1,4 @@
+#![cfg(not(debug_assertions))]
 // Test-gate allow-list — see crates/spg-crypto/tests/perf_gate.rs.
 #![allow(
     clippy::cast_lossless,

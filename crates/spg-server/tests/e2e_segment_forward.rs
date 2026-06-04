@@ -42,7 +42,9 @@ fn unique_tmpdir(label: &str) -> PathBuf {
 }
 
 fn segments_dir_of(db_path: &std::path::Path) -> PathBuf {
-    let parent = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let stem = db_path
         .file_stem()
         .unwrap_or_else(|| std::ffi::OsStr::new("db"))
@@ -211,10 +213,7 @@ fn wait_for_master_freezer_quiescence(s: &mut TcpStream) {
 /// Count how many PKs in `range` resolve. Returns `None` if the
 /// table doesn't exist yet (follower mid-snapshot), so callers
 /// can retry; otherwise the hit count.
-fn count_reachable_pks(
-    s: &mut TcpStream,
-    range: impl IntoIterator<Item = i64>,
-) -> Option<usize> {
+fn count_reachable_pks(s: &mut TcpStream, range: impl IntoIterator<Item = i64>) -> Option<usize> {
     let mut hit = 0;
     for id in range {
         match count_rows(s, &format!("SELECT id FROM t WHERE id = {id}")) {
@@ -266,8 +265,11 @@ fn follower_bootstrap_via_forwarding() {
     // Attach follower.
     let follower_db = dir.join("follower.db");
     let follower_wal = dir.join("follower.wal");
-    let (raw, follower_addrs) =
-        spawn_follower(&follower_db, &follower_wal, master_addrs.repl.as_ref().unwrap());
+    let (raw, follower_addrs) = spawn_follower(
+        &follower_db,
+        &follower_wal,
+        master_addrs.repl.as_ref().unwrap(),
+    );
     let _follower_guard = common::ChildGuard(raw);
     let mut fs = common::connect_to(&follower_addrs.native);
     fs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -281,9 +283,7 @@ fn follower_bootstrap_via_forwarding() {
                 break;
             }
             if Instant::now() > deadline {
-                panic!(
-                    "follower never bootstrapped via forwarding: {hit}/{N_ROWS} PKs reachable"
-                );
+                panic!("follower never bootstrapped via forwarding: {hit}/{N_ROWS} PKs reachable");
             }
         } else if Instant::now() > deadline {
             panic!("follower never restored snapshot (table still missing)");
@@ -305,8 +305,14 @@ fn follower_bootstrap_via_forwarding() {
         "follower segment count {} ≠ master {}: {:?} vs {:?}",
         follower_segs.len(),
         master_segs.len(),
-        follower_segs.iter().map(|p| p.file_name()).collect::<Vec<_>>(),
-        master_segs.iter().map(|p| p.file_name()).collect::<Vec<_>>(),
+        follower_segs
+            .iter()
+            .map(|p| p.file_name())
+            .collect::<Vec<_>>(),
+        master_segs
+            .iter()
+            .map(|p| p.file_name())
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -318,8 +324,11 @@ fn byte_equal_segment_after_transfer() {
 
     let follower_db = dir.join("follower.db");
     let follower_wal = dir.join("follower.wal");
-    let (raw, follower_addrs) =
-        spawn_follower(&follower_db, &follower_wal, master_addrs.repl.as_ref().unwrap());
+    let (raw, follower_addrs) = spawn_follower(
+        &follower_db,
+        &follower_wal,
+        master_addrs.repl.as_ref().unwrap(),
+    );
     let _follower_guard = common::ChildGuard(raw);
     let mut fs = common::connect_to(&follower_addrs.native);
     fs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -366,7 +375,8 @@ fn byte_equal_segment_after_transfer() {
         let master_bytes = std::fs::read(master_path).expect("read master seg");
         let follower_bytes = std::fs::read(&follower_path).expect("read follower seg");
         assert_eq!(
-            master_bytes, follower_bytes,
+            master_bytes,
+            follower_bytes,
             "byte mismatch for {}: master {} bytes vs follower {} bytes",
             name.to_string_lossy(),
             master_bytes.len(),
@@ -386,8 +396,11 @@ fn resumable_after_disconnect() {
 
     // Phase 1: bootstrap follower fully so segment files land.
     {
-        let (raw, follower_addrs) =
-            spawn_follower(&follower_db, &follower_wal, master_addrs.repl.as_ref().unwrap());
+        let (raw, follower_addrs) = spawn_follower(
+            &follower_db,
+            &follower_wal,
+            master_addrs.repl.as_ref().unwrap(),
+        );
         let mut follower_guard = common::ChildGuard(raw);
         let mut fs = common::connect_to(&follower_addrs.native);
         fs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -426,8 +439,11 @@ fn resumable_after_disconnect() {
     // v6.7.5); the follower's segment-level resume skips chunks
     // whose `seg_<id>.spg` files already exist.
     {
-        let (raw, follower_addrs) =
-            spawn_follower(&follower_db, &follower_wal, master_addrs.repl.as_ref().unwrap());
+        let (raw, follower_addrs) = spawn_follower(
+            &follower_db,
+            &follower_wal,
+            master_addrs.repl.as_ref().unwrap(),
+        );
         let _follower_guard = common::ChildGuard(raw);
         let mut fs = common::connect_to(&follower_addrs.native);
         fs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();

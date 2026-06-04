@@ -234,13 +234,8 @@ mod tests {
         let mut c = MemoizeCache::new().with_max_bytes(128);
         // Big strings exceed 128 bytes fast.
         for i in 0..10 {
-            let big_str = alloc::string::String::from_iter(
-                core::iter::repeat_n('x', 64),
-            );
-            c.insert(
-                key("q", &[Value::Int(i)]),
-                Value::Text(big_str),
-            );
+            let big_str = alloc::string::String::from_iter(core::iter::repeat_n('x', 64));
+            c.insert(key("q", &[Value::Int(i)]), Value::Text(big_str));
         }
         assert!(c.len() < 10, "len={}", c.len());
     }

@@ -41,11 +41,7 @@ fn build_v3_wal(sqls: &[&str]) -> Vec<u8> {
     out
 }
 
-fn run_revert(
-    wal: &std::path::Path,
-    to_seq: u64,
-    out: &std::path::Path,
-) -> (i32, String, String) {
+fn run_revert(wal: &std::path::Path, to_seq: u64, out: &std::path::Path) -> (i32, String, String) {
     let cmd_out = Command::new(env!("CARGO_BIN_EXE_spg"))
         .arg("revert")
         .arg("--wal")

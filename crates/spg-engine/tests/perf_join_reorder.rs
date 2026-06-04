@@ -47,7 +47,8 @@ fn setup_engine(with_stats: bool) -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE fact (id INT NOT NULL, k1 INT NOT NULL, k2 INT NOT NULL, k3 INT NOT NULL, k4 INT NOT NULL)").unwrap();
     for tag in ["big1", "big2", "big3", "big4"] {
-        e.execute(&format!("CREATE TABLE {tag} (k INT NOT NULL)")).unwrap();
+        e.execute(&format!("CREATE TABLE {tag} (k INT NOT NULL)"))
+            .unwrap();
     }
     for i in 0..N_FACT {
         e.execute(&format!(
@@ -57,7 +58,8 @@ fn setup_engine(with_stats: bool) -> Engine {
     }
     for tag in ["big1", "big2", "big3", "big4"] {
         for i in 0..N_BIG {
-            e.execute(&format!("INSERT INTO {tag} VALUES ({i})")).unwrap();
+            e.execute(&format!("INSERT INTO {tag} VALUES ({i})"))
+                .unwrap();
         }
     }
     if with_stats {

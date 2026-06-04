@@ -36,7 +36,9 @@ fn with_transaction_rolls_back_on_err() {
     assert_eq!(got.len(), 1);
     // In-TX rows are gone.
     for id in [1, 2] {
-        let got = db.query(&format!("SELECT id FROM t WHERE id = {id}")).unwrap();
+        let got = db
+            .query(&format!("SELECT id FROM t WHERE id = {id}"))
+            .unwrap();
         assert!(got.is_empty(), "row {id} survived rollback");
     }
 }

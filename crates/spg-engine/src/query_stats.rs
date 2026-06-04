@@ -191,6 +191,9 @@ mod tests {
         qs.record("c", 1, 300);
         let snap = qs.snapshot();
         let keys: Vec<String> = snap.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(keys, alloc::vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            keys,
+            alloc::vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }

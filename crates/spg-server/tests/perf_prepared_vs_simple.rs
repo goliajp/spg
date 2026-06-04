@@ -186,9 +186,13 @@ fn vec_literal(rng_seed: u64, dim: usize) -> String {
     out.push('[');
     let mut x = rng_seed;
     for i in 0..dim {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let f = (x >> 40) as f32 / (1u32 << 24) as f32;
-        if i > 0 { out.push(','); }
+        if i > 0 {
+            out.push(',');
+        }
         // 4 decimals — same shape as a typical embedding row
         out.push_str(&format!("{:.4}", f));
     }
@@ -257,13 +261,19 @@ fn perf_prepared_vs_simple_select_p50() {
 
     println!();
     println!("── v6.1.1 PG-wire Simple Q vs Extended Q  (short SELECT, N={N}) ──");
-    println!("  Simple   p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
-        simple_p50, simple_p90, simple_p99);
-    println!("  Prepared p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
-        prep_p50, prep_p90, prep_p99);
+    println!(
+        "  Simple   p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
+        simple_p50, simple_p90, simple_p99
+    );
+    println!(
+        "  Prepared p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
+        prep_p50, prep_p90, prep_p99
+    );
     let win = (simple_p50 as f64 - prep_p50 as f64) / simple_p50 as f64 * 100.0;
-    println!("  p50 win  = {:.1}%  ({}ns → {}ns)",
-        win, simple_p50, prep_p50);
+    println!(
+        "  p50 win  = {:.1}%  ({}ns → {}ns)",
+        win, simple_p50, prep_p50
+    );
     println!();
 }
 
@@ -285,7 +295,10 @@ fn perf_prepared_vs_simple_vector_knn_p50() {
     let _child = common::ChildGuard(raw);
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
-    send_query(&mut s, &format!("CREATE TABLE v (id INT NOT NULL, e VECTOR({DIM}) NOT NULL)"));
+    send_query(
+        &mut s,
+        &format!("CREATE TABLE v (id INT NOT NULL, e VECTOR({DIM}) NOT NULL)"),
+    );
     let _ = read_until_ready(&mut s);
     for i in 0..ROWS {
         let lit = vec_literal(i as u64 + 1, DIM);
@@ -302,11 +315,17 @@ fn perf_prepared_vs_simple_vector_knn_p50() {
         send_query(&mut s, &sql);
         let _ = read_until_ready(&mut s);
         let dt = t0.elapsed().as_nanos();
-        if i >= WARMUP { simple.push(dt); }
+        if i >= WARMUP {
+            simple.push(dt);
+        }
     }
 
     // Extended-Q: Parse once, Bind+Execute+Sync per round.
-    send_parse(&mut s, "ps_knn", "SELECT id FROM v ORDER BY e <-> $1 LIMIT 10");
+    send_parse(
+        &mut s,
+        "ps_knn",
+        "SELECT id FROM v ORDER BY e <-> $1 LIMIT 10",
+    );
     send_sync(&mut s);
     let _ = read_until_ready(&mut s);
 
@@ -317,7 +336,9 @@ fn perf_prepared_vs_simple_vector_knn_p50() {
         send_bind_execute_sync(&mut s, "ps_knn", &[&q]);
         let _ = read_until_ready(&mut s);
         let dt = t0.elapsed().as_nanos();
-        if i >= WARMUP { prep.push(dt); }
+        if i >= WARMUP {
+            prep.push(dt);
+        }
     }
 
     let simple_p50 = pct(&mut simple.clone(), 0.50);
@@ -328,13 +349,21 @@ fn perf_prepared_vs_simple_vector_knn_p50() {
     let prep_p99 = pct(&mut prep, 0.99);
 
     println!();
-    println!("── v6.1.1 PG-wire Simple Q vs Extended Q  (vector kNN dim={DIM}, rows={ROWS}, N={N}) ──");
-    println!("  Simple   p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
-        simple_p50, simple_p90, simple_p99);
-    println!("  Prepared p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
-        prep_p50, prep_p90, prep_p99);
+    println!(
+        "── v6.1.1 PG-wire Simple Q vs Extended Q  (vector kNN dim={DIM}, rows={ROWS}, N={N}) ──"
+    );
+    println!(
+        "  Simple   p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
+        simple_p50, simple_p90, simple_p99
+    );
+    println!(
+        "  Prepared p50={:>7} ns  p90={:>7} ns  p99={:>7} ns",
+        prep_p50, prep_p90, prep_p99
+    );
     let win = (simple_p50 as f64 - prep_p50 as f64) / simple_p50 as f64 * 100.0;
-    println!("  p50 win  = {:.1}%  ({}ns → {}ns)",
-        win, simple_p50, prep_p50);
+    println!(
+        "  p50 win  = {:.1}%  ({}ns → {}ns)",
+        win, simple_p50, prep_p50
+    );
     println!();
 }

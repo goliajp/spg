@@ -194,11 +194,7 @@ fn run_binary_param_test(
 
     let mut q = Vec::new();
     write_msg(&mut q, b'P', &parse_with_oids("p", select_sql, oids));
-    write_msg(
-        &mut q,
-        b'B',
-        &bind_binary("", "p", &[1], bind_params),
-    );
+    write_msg(&mut q, b'B', &bind_binary("", "p", &[1], bind_params));
     write_msg(&mut q, b'E', &execute_body(""));
     write_msg(&mut q, b'S', &[]);
     s.write_all(&q).unwrap();
@@ -217,7 +213,7 @@ fn binary_int_round_trip() {
         "int",
         "CREATE TABLE x (v INT)",
         "SELECT $1::int",
-        &[23],                                    // INT4
+        &[23], // INT4
         &[(4, (42_i32).to_be_bytes().to_vec())],
         "42",
     );
@@ -346,7 +342,8 @@ fn mixed_text_and_binary_params_in_one_bind() {
         let m = read_message(&mut s);
         match m.ty {
             b'D' => {
-                let len_a = i32::from_be_bytes([m.body[2], m.body[3], m.body[4], m.body[5]]) as usize;
+                let len_a =
+                    i32::from_be_bytes([m.body[2], m.body[3], m.body[4], m.body[5]]) as usize;
                 got_a = String::from_utf8_lossy(&m.body[6..6 + len_a]).to_string();
                 let off_b = 6 + len_a;
                 let len_b = i32::from_be_bytes([

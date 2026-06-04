@@ -16,7 +16,8 @@ fn rows_of(res: QueryResult) -> Vec<Vec<Value>> {
 #[test]
 fn sums_with_group_by_all() {
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE sales (region TEXT, qty INT)").unwrap();
+    eng.execute("CREATE TABLE sales (region TEXT, qty INT)")
+        .unwrap();
     for (r, q) in [("east", 10), ("west", 20), ("east", 5), ("west", 30)] {
         eng.execute(&format!("INSERT INTO sales VALUES ('{r}', {q})"))
             .unwrap();
@@ -40,16 +41,19 @@ fn sums_with_group_by_all() {
 #[test]
 fn group_by_all_with_two_non_aggregate_keys() {
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (a TEXT, b TEXT, n INT)").unwrap();
-    for (a, b, n) in [("x", "1", 100), ("x", "1", 50), ("x", "2", 30), ("y", "1", 7)]
-    {
+    eng.execute("CREATE TABLE t (a TEXT, b TEXT, n INT)")
+        .unwrap();
+    for (a, b, n) in [
+        ("x", "1", 100),
+        ("x", "1", 50),
+        ("x", "2", 30),
+        ("y", "1", 7),
+    ] {
         eng.execute(&format!("INSERT INTO t VALUES ('{a}', '{b}', {n})"))
             .unwrap();
     }
     let res = eng
-        .execute(
-            "SELECT a, b, SUM(n) FROM t GROUP BY ALL ORDER BY a, b",
-        )
+        .execute("SELECT a, b, SUM(n) FROM t GROUP BY ALL ORDER BY a, b")
         .unwrap();
     let got = rows_of(res);
     assert_eq!(
@@ -83,9 +87,7 @@ fn group_by_all_only_aggregates_yields_single_row() {
     }
     // No non-aggregate items → GROUP BY ALL expands to empty list,
     // same as plain `SELECT SUM(n) FROM t` (one row covering all).
-    let res = eng
-        .execute("SELECT SUM(n) FROM t GROUP BY ALL")
-        .unwrap();
+    let res = eng.execute("SELECT SUM(n) FROM t GROUP BY ALL").unwrap();
     let got = rows_of(res);
     assert_eq!(got, vec![vec![Value::BigInt(10)]]);
 }

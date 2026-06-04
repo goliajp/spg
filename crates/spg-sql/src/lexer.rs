@@ -392,9 +392,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 // Tagged form: `$foo$ … $foo$`. Scan the tag
                 // ident, find the closing copy.
                 let mut j = i + 1;
-                while j < bytes.len()
-                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-                {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                     j += 1;
                 }
                 if j >= bytes.len() || bytes[j] != b'$' {
@@ -427,7 +425,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 let mut j = i + 1;
                 let mut n: u32 = 0;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    n = n.saturating_mul(10).saturating_add(u32::from(bytes[j] - b'0'));
+                    n = n
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(bytes[j] - b'0'));
                     j += 1;
                 }
                 if n == 0 || n > u32::from(u16::MAX) {

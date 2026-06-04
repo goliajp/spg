@@ -199,17 +199,13 @@ fn tick(state: &ServerState, batch_rows: usize, workers: usize) -> std::io::Resu
     // Either condition fires; the per-table check runs first so
     // operators can shrink a specific table without raising the
     // global watermark.
-    let any_table_over = engine
-        .catalog()
-        .table_names()
-        .iter()
-        .any(|n| {
-            engine
-                .catalog()
-                .get(n)
-                .and_then(|t| t.schema().hot_tier_bytes.map(|cap| t.hot_bytes() > cap))
-                .unwrap_or(false)
-        });
+    let any_table_over = engine.catalog().table_names().iter().any(|n| {
+        engine
+            .catalog()
+            .get(n)
+            .and_then(|t| t.schema().hot_tier_bytes.map(|cap| t.hot_bytes() > cap))
+            .unwrap_or(false)
+    });
     let used = engine.catalog().hot_tier_bytes();
     if !any_table_over && used <= state.hot_tier_byte_budget {
         return Ok(());
@@ -381,8 +377,7 @@ fn persist_segment(db_path: &Path, report: &FreezeReport) -> std::io::Result<std
 fn segment_compression_enabled() -> bool {
     static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECKED.get_or_init(|| {
-        std::env::var("SPG_SEGMENT_COMPRESSION")
-            .map_or(true, |v| !v.eq_ignore_ascii_case("none"))
+        std::env::var("SPG_SEGMENT_COMPRESSION").map_or(true, |v| !v.eq_ignore_ascii_case("none"))
     })
 }
 

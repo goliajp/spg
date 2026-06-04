@@ -144,9 +144,7 @@ fn measure_prepare_wall(cat: &Catalog, workers: usize, reps: usize) -> std::time
                 let handles: Vec<_> = ranges
                     .into_iter()
                     .map(|r| {
-                        s.spawn(move || {
-                            cat.prepare_freeze_slice("users", "by_id", r).unwrap()
-                        })
+                        s.spawn(move || cat.prepare_freeze_slice("users", "by_id", r).unwrap())
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()

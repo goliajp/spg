@@ -38,7 +38,9 @@ fn read_response(s: &mut TcpStream) -> Result<(), String> {
             Op::CommandComplete => return Ok(()),
             Op::ErrorResponse | Op::Error => {
                 let f = spg_wire::Frame { op, payload: body };
-                return Err(parse_error_response(&f).unwrap_or("<undecodable>").to_string());
+                return Err(parse_error_response(&f)
+                    .unwrap_or("<undecodable>")
+                    .to_string());
             }
             _ => continue,
         }

@@ -17,8 +17,10 @@ fn metrics_in_memory_baseline() {
 #[test]
 fn metrics_tracks_inserts() {
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
     let m = db.metrics();
     assert_eq!(m.tables, 1);
     assert_eq!(m.hot_rows, 3);
@@ -32,13 +34,19 @@ fn metrics_persistent_flag_set_on_open_path() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    p.push(format!("spg-embedded-metrics-{nanos}-{}.db", std::process::id()));
+    p.push(format!(
+        "spg-embedded-metrics-{nanos}-{}.db",
+        std::process::id()
+    ));
     let mut db = Database::open_path(&p).unwrap();
     db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     let m = db.metrics();
     assert!(m.persistent);
-    assert!(m.wal_bytes > 0, "WAL should have at least one fsynced record");
+    assert!(
+        m.wal_bytes > 0,
+        "WAL should have at least one fsynced record"
+    );
     drop(db);
     let mut wal = p.clone();
     wal.set_extension("db.wal");
@@ -49,10 +57,12 @@ fn metrics_persistent_flag_set_on_open_path() {
 #[test]
 fn metrics_cold_segments_after_freeze() {
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX t_pk ON t (id)").unwrap();
     for i in 0..40 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'x')"))
+            .unwrap();
     }
     let before = db.metrics();
     assert_eq!(before.cold_segments, 0);

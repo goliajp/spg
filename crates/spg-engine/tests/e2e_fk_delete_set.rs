@@ -6,7 +6,9 @@ use spg_storage::Value;
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng

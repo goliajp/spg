@@ -6,7 +6,9 @@ use spg_storage::Value;
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng
@@ -44,7 +46,9 @@ fn self_ref_forward_reference_in_same_batch_is_rejected() {
     ]);
     // (2, 3) references row 3 which hasn't appeared yet.
     let r = eng.execute("INSERT INTO org VALUES (2, 3), (3, NULL)");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+    );
 }
 
 #[test]
@@ -72,7 +76,8 @@ fn composite_fk_batch_self_ref_supported() {
         "CREATE INDEX tree_a ON tree (a)",
     ]);
     // Root + one child referencing the root by composite key.
-    eng.execute("INSERT INTO tree VALUES (1, 10, NULL, NULL), (2, 20, 1, 10)").unwrap();
+    eng.execute("INSERT INTO tree VALUES (1, 10, NULL, NULL), (2, 20, 1, 10)")
+        .unwrap();
     assert_eq!(count(&mut eng, "SELECT a FROM tree"), 2);
 }
 
@@ -101,7 +106,7 @@ fn not_deferrable_clause_is_accepted_silently() {
         "INSERT INTO u VALUES (1)",
         "INSERT INTO o VALUES (1)",
     ]);
-    let _ = eng;  // build asserted by `engine_with` succeeding.
+    let _ = eng; // build asserted by `engine_with` succeeding.
 }
 
 #[test]

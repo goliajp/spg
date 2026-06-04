@@ -6,7 +6,9 @@ use spg_storage::Value;
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng
@@ -43,9 +45,14 @@ fn updating_child_fk_to_missing_parent_is_rejected() {
         "INSERT INTO o VALUES (10, 1)",
     ]);
     let r = eng.execute("UPDATE o SET uid = 99 WHERE id = 10");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+    );
     // No change committed.
-    assert_eq!(select(&mut eng, "SELECT uid FROM o")[0], vec![Value::Int(1)]);
+    assert_eq!(
+        select(&mut eng, "SELECT uid FROM o")[0],
+        vec![Value::Int(1)]
+    );
 }
 
 #[test]
@@ -58,7 +65,9 @@ fn updating_parent_pk_with_default_restrict_is_rejected_when_child_references() 
         "INSERT INTO o VALUES (10, 1)",
     ]);
     let r = eng.execute("UPDATE u SET id = 2 WHERE id = 1");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+    );
 }
 
 #[test]
@@ -105,7 +114,8 @@ fn updating_parent_unrelated_column_does_not_trigger_fk_action() {
         "INSERT INTO u VALUES (1, 'alice')",
         "INSERT INTO o VALUES (10, 1)",
     ]);
-    eng.execute("UPDATE u SET name = 'bob' WHERE id = 1").unwrap();
+    eng.execute("UPDATE u SET name = 'bob' WHERE id = 1")
+        .unwrap();
     // o unchanged.
     let rows = select(&mut eng, "SELECT uid FROM o");
     assert_eq!(rows[0], vec![Value::Int(1)]);
@@ -121,7 +131,8 @@ fn updating_child_fk_to_null_does_not_require_parent() {
         "INSERT INTO u VALUES (1)",
         "INSERT INTO o VALUES (10, 1)",
     ]);
-    eng.execute("UPDATE o SET uid = NULL WHERE id = 10").unwrap();
+    eng.execute("UPDATE o SET uid = NULL WHERE id = 10")
+        .unwrap();
     let rows = select(&mut eng, "SELECT uid FROM o");
     assert_eq!(rows[0], vec![Value::Null]);
 }

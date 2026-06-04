@@ -85,9 +85,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::ArraySubscript { target, index } => {
             contains_aggregate(target) || contains_aggregate(index)
         }
-        Expr::AnyAll { expr, array, .. } => {
-            contains_aggregate(expr) || contains_aggregate(array)
-        }
+        Expr::AnyAll { expr, array, .. } => contains_aggregate(expr) || contains_aggregate(array),
     }
 }
 

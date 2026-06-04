@@ -31,9 +31,7 @@ fn as_of_segment_returns_only_frozen_rows() {
     // Freeze the first 3 rows into seg 0; keep the rest hot.
     e.freeze_oldest_to_cold("t", "by_id", 3).unwrap();
     // AS OF SEGMENT '0' returns the 3 frozen rows only — no hot rows.
-    let rows = rows_of(
-        e.execute("SELECT id FROM t AS OF SEGMENT '0'").unwrap(),
-    );
+    let rows = rows_of(e.execute("SELECT id FROM t AS OF SEGMENT '0'").unwrap());
     assert_eq!(rows.len(), 3);
     let mut ids: Vec<i64> = rows
         .into_iter()
@@ -102,10 +100,11 @@ fn as_of_segment_rejects_join() {
     e.execute("CREATE INDEX by_id ON t (id)").unwrap();
     e.execute("INSERT INTO t VALUES (1)").unwrap();
     e.freeze_oldest_to_cold("t", "by_id", 1).unwrap();
-    let r = e.execute(
-        "SELECT t.id FROM t AS OF SEGMENT '0' JOIN u ON t.id = u.id",
+    let r = e.execute("SELECT t.id FROM t AS OF SEGMENT '0' JOIN u ON t.id = u.id");
+    assert!(
+        r.is_err(),
+        "AS OF SEGMENT + JOIN must surface STABILITY carve-out error"
     );
-    assert!(r.is_err(), "AS OF SEGMENT + JOIN must surface STABILITY carve-out error");
 }
 
 #[test]

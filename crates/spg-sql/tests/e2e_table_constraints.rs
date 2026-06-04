@@ -17,7 +17,9 @@ fn table_level_unique_single_column_parses() {
         "CREATE TABLE u (id INT NOT NULL, address TEXT NOT NULL, UNIQUE (address))",
     );
     assert_eq!(cs.len(), 1);
-    let TableConstraint::Unique { columns, .. } = &cs[0] else { panic!() };
+    let TableConstraint::Unique { columns, .. } = &cs[0] else {
+        panic!()
+    };
     assert_eq!(columns, &vec!["address".to_string()]);
 }
 
@@ -33,7 +35,9 @@ fn table_level_unique_composite_parses() {
         )",
     );
     assert_eq!(cs.len(), 1);
-    let TableConstraint::Unique { columns, .. } = &cs[0] else { panic!() };
+    let TableConstraint::Unique { columns, .. } = &cs[0] else {
+        panic!()
+    };
     assert_eq!(columns.len(), 2);
 }
 
@@ -48,8 +52,13 @@ fn composite_primary_key_parses() {
         )",
     );
     assert_eq!(cs.len(), 1);
-    let TableConstraint::PrimaryKey { columns, .. } = &cs[0] else { panic!() };
-    assert_eq!(columns, &vec!["thread_id".to_string(), "account_address".to_string()]);
+    let TableConstraint::PrimaryKey { columns, .. } = &cs[0] else {
+        panic!()
+    };
+    assert_eq!(
+        columns,
+        &vec!["thread_id".to_string(), "account_address".to_string()]
+    );
 }
 
 #[test]
@@ -79,7 +88,9 @@ fn table_constraints_interleaved_with_inline_fk() {
         )",
     )
     .unwrap();
-    let Statement::CreateTable(t) = stmt else { panic!() };
+    let Statement::CreateTable(t) = stmt else {
+        panic!()
+    };
     assert_eq!(t.foreign_keys.len(), 1);
     assert_eq!(t.table_constraints.len(), 1);
 }
@@ -109,6 +120,8 @@ fn table_level_unique_after_many_columns() {
             UNIQUE (d, e)\
         )",
     );
-    let TableConstraint::Unique { columns, .. } = &cs[0] else { panic!() };
+    let TableConstraint::Unique { columns, .. } = &cs[0] else {
+        panic!()
+    };
     assert_eq!(columns, &vec!["d".to_string(), "e".to_string()]);
 }

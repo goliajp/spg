@@ -66,10 +66,8 @@ fn suggest_dedupes_repeated_columns() {
     e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
         .unwrap();
     let body = join_lines(rows_of(
-        e.execute(
-            "EXPLAIN (SUGGEST) SELECT * FROM t WHERE name = 'a' OR name = 'b' OR name = 'c'",
-        )
-        .unwrap(),
+        e.execute("EXPLAIN (SUGGEST) SELECT * FROM t WHERE name = 'a' OR name = 'b' OR name = 'c'")
+            .unwrap(),
     ));
     let suggest_count = body.lines().filter(|l| l.contains("SUGGEST:")).count();
     assert_eq!(
@@ -123,7 +121,8 @@ fn explain_without_suggest_keeps_legacy_behaviour() {
     e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
         .unwrap();
     let body = join_lines(rows_of(
-        e.execute("EXPLAIN SELECT * FROM t WHERE name = 'alice'").unwrap(),
+        e.execute("EXPLAIN SELECT * FROM t WHERE name = 'alice'")
+            .unwrap(),
     ));
     assert!(
         !body.contains("SUGGEST:"),

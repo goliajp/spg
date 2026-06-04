@@ -5,7 +5,9 @@ use spg_engine::{Engine, EngineError, QueryResult};
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng
@@ -86,13 +88,15 @@ fn cascade_mixed_with_restrict_still_errors_on_restrict_branch() {
         "CREATE TABLE b (id INT NOT NULL, a_id INT NOT NULL, \
          FOREIGN KEY (a_id) REFERENCES a(id) ON DELETE CASCADE)",
         "CREATE TABLE c (id INT NOT NULL, a_id INT NOT NULL, \
-         FOREIGN KEY (a_id) REFERENCES a(id))",  // default RESTRICT
+         FOREIGN KEY (a_id) REFERENCES a(id))", // default RESTRICT
         "INSERT INTO a VALUES (1)",
         "INSERT INTO b VALUES (10, 1)",
         "INSERT INTO c VALUES (100, 1)",
     ]);
     let r = eng.execute("DELETE FROM a WHERE id = 1");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+    );
     // Nothing changed.
     assert_eq!(rows(&mut eng, "SELECT id FROM a"), 1);
     assert_eq!(rows(&mut eng, "SELECT id FROM b"), 1);

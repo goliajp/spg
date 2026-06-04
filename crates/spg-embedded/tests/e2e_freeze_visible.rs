@@ -10,10 +10,12 @@ use spg_embedded::{Database, QueryResult};
 #[test]
 fn full_scan_sees_only_hot_pk_lookup_sees_cold() {
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX t_pk ON t (id)").unwrap();
     for i in 0..100 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'x')"))
+            .unwrap();
     }
     db.freeze_oldest_to_cold("t", "t_pk", 50).unwrap();
     // Full scan = hot tier only.

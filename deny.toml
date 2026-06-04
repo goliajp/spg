@@ -10,6 +10,19 @@ no-default-features = false
 db-path = "$CARGO_HOME/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
+# Ignored advisories — limit to vulns that only surface through
+# transitive deps of `xtests/`/`xbench/` (test-only, never shipped
+# in published crates).
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin timing sidechannel in `rsa`.
+    # Pulled in transitively by `sqlx-postgres` (xtests/sqlx-pgwire)
+    # for PG md5 / scram-sha-256 password hashing. xtests run only
+    # against loopback test fixtures; no shipped binary or library
+    # exposes the rsa code path. Will drop the ignore once sqlx
+    # ships a fix or we replace sqlx in xtests with a hand-rolled
+    # PG protocol harness.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 # spg-* crates are MIT OR Apache-2.0 (workspace-wide). Bench-only

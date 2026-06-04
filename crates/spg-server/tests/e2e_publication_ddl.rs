@@ -66,7 +66,12 @@ fn expect_cc(stream: &mut TcpStream) -> u64 {
 
 fn expect_err(stream: &mut TcpStream) -> String {
     let f = read_frame(stream);
-    assert_eq!(f.op, Op::ErrorResponse, "expected ErrorResponse, got {:?}", f.op);
+    assert_eq!(
+        f.op,
+        Op::ErrorResponse,
+        "expected ErrorResponse, got {:?}",
+        f.op
+    );
     spg_wire::parse_error_response(&f)
         .unwrap_or("<undecodable>")
         .to_string()
@@ -265,7 +270,10 @@ fn for_all_tables_except_succeeds_and_shows_scope() {
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
-    send_query(&mut s, "CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t3, t4");
+    send_query(
+        &mut s,
+        "CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t3, t4",
+    );
     expect_cc(&mut s);
 
     send_query(&mut s, "SHOW PUBLICATIONS");
@@ -291,7 +299,10 @@ fn show_publications_returns_all_scope_variants_ordered_by_name() {
     expect_cc(&mut s);
     send_query(&mut s, "CREATE PUBLICATION a_list FOR TABLE t1");
     expect_cc(&mut s);
-    send_query(&mut s, "CREATE PUBLICATION m_except FOR ALL TABLES EXCEPT bad");
+    send_query(
+        &mut s,
+        "CREATE PUBLICATION m_except FOR ALL TABLES EXCEPT bad",
+    );
     expect_cc(&mut s);
 
     send_query(&mut s, "SHOW PUBLICATIONS");

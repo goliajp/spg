@@ -65,7 +65,10 @@ async fn concurrent_inserts_serialise() {
 #[tokio::test]
 async fn error_propagates() {
     let db = AsyncDatabase::open_in_memory();
-    let err = db.execute("SELECT * FROM does_not_exist").await.unwrap_err();
+    let err = db
+        .execute("SELECT * FROM does_not_exist")
+        .await
+        .unwrap_err();
     let msg = format!("{err:?}");
     assert!(msg.contains("does_not_exist"), "{msg}");
 }

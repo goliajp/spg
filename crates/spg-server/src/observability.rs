@@ -297,7 +297,10 @@ fn render_compression(state: &crate::ServerState, out: &mut String) {
     out.push_str("# TYPE spg_wal_bytes_uncompressed_total counter\n");
     out.push_str(&format!(
         "spg_wal_bytes_uncompressed_total {}\n",
-        state.metrics.wal_bytes_uncompressed_in.load(Ordering::Relaxed)
+        state
+            .metrics
+            .wal_bytes_uncompressed_in
+            .load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP spg_wal_bytes_compressed_total Sum of bytes written to the WAL since boot, after compression (v6.6.3)\n",
@@ -305,7 +308,10 @@ fn render_compression(state: &crate::ServerState, out: &mut String) {
     out.push_str("# TYPE spg_wal_bytes_compressed_total counter\n");
     out.push_str(&format!(
         "spg_wal_bytes_compressed_total {}\n",
-        state.metrics.wal_bytes_compressed_out.load(Ordering::Relaxed)
+        state
+            .metrics
+            .wal_bytes_compressed_out
+            .load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP spg_segment_bytes_uncompressed_total Sum of cold-tier segment v1 bytes the freezer produced (v6.6.3)\n",
@@ -313,7 +319,10 @@ fn render_compression(state: &crate::ServerState, out: &mut String) {
     out.push_str("# TYPE spg_segment_bytes_uncompressed_total counter\n");
     out.push_str(&format!(
         "spg_segment_bytes_uncompressed_total {}\n",
-        state.metrics.segment_bytes_uncompressed_in.load(Ordering::Relaxed)
+        state
+            .metrics
+            .segment_bytes_uncompressed_in
+            .load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP spg_segment_bytes_compressed_total Sum of bytes actually written to disk for cold-tier segments (v6.6.3)\n",
@@ -321,7 +330,10 @@ fn render_compression(state: &crate::ServerState, out: &mut String) {
     out.push_str("# TYPE spg_segment_bytes_compressed_total counter\n");
     out.push_str(&format!(
         "spg_segment_bytes_compressed_total {}\n",
-        state.metrics.segment_bytes_compressed_out.load(Ordering::Relaxed)
+        state
+            .metrics
+            .segment_bytes_compressed_out
+            .load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP spg_cold_prefetch_hits_total Cold-segment files loaded via the boot-time prefetch worker pool (v6.7.6)\n",

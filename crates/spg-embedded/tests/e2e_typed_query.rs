@@ -42,7 +42,8 @@ fn typed_query_basic_user() {
 #[test]
 fn typed_query_with_optional_field_handles_null() {
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute("CREATE TABLE users (id INT NOT NULL, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
     db.execute("INSERT INTO users VALUES (2, NULL)").unwrap();
     let mut users: Vec<UserOpt> = db.query_typed("SELECT id, name FROM users").unwrap();
@@ -58,7 +59,9 @@ fn typed_query_with_vector_column() {
         .unwrap();
     db.execute("INSERT INTO emb VALUES (1, [1.0, 2.0, 3.0, 4.0])")
         .unwrap();
-    let rows: Vec<Embedding> = db.query_typed("SELECT id, v FROM emb WHERE id = 1").unwrap();
+    let rows: Vec<Embedding> = db
+        .query_typed("SELECT id, v FROM emb WHERE id = 1")
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, 1);
     assert_eq!(rows[0].v, vec![1.0, 2.0, 3.0, 4.0]);
@@ -104,7 +107,8 @@ fn type_mismatch_surfaces_error() {
         }
     }
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)")
+        .unwrap();
     db.execute("INSERT INTO u VALUES (1, 'alice')").unwrap();
     let r: Result<Vec<Wrong>, _> = db.query_typed("SELECT id, name FROM u");
     assert!(r.is_err());
@@ -114,7 +118,8 @@ fn type_mismatch_surfaces_error() {
 fn missing_column_surfaces_error() {
     // SELECT one column but FromSpgRow expects two → error.
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)")
+        .unwrap();
     db.execute("INSERT INTO u VALUES (1, 'alice')").unwrap();
     let r: Result<Vec<User>, _> = db.query_typed("SELECT id FROM u");
     assert!(r.is_err());

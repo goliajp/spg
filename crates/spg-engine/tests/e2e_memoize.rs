@@ -35,8 +35,10 @@ const INNER_ROWS: usize = 200;
 
 fn setup() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE outer_t (id INT NOT NULL, k INT NOT NULL)").unwrap();
-    e.execute("CREATE TABLE inner_t (id INT NOT NULL, k INT NOT NULL, v INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE outer_t (id INT NOT NULL, k INT NOT NULL)")
+        .unwrap();
+    e.execute("CREATE TABLE inner_t (id INT NOT NULL, k INT NOT NULL, v INT NOT NULL)")
+        .unwrap();
     for i in 0..OUTER_ROWS {
         e.execute(&format!(
             "INSERT INTO outer_t VALUES ({i}, {})",

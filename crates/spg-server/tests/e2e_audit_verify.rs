@@ -107,6 +107,7 @@ fn exec_simple(s: &mut TcpStream, sql: &str) {
     let _ = read_until_ready(s);
 }
 
+#[allow(dead_code)]
 fn count_rows(s: &mut TcpStream, sql: &str) -> i64 {
     send_query(s, sql);
     let msgs = read_until_ready(s);
@@ -136,10 +137,11 @@ fn clean_chain_verifies() {
     // 2 cells: verified_count, broken_at_seq.
     let cell_count = u16::from_be_bytes([dr.body[0], dr.body[1]]) as usize;
     assert_eq!(cell_count, 2);
-    let len_a =
-        i32::from_be_bytes([dr.body[2], dr.body[3], dr.body[4], dr.body[5]]) as usize;
-    let verified =
-        std::str::from_utf8(&dr.body[6..6 + len_a]).unwrap().parse::<i64>().unwrap();
+    let len_a = i32::from_be_bytes([dr.body[2], dr.body[3], dr.body[4], dr.body[5]]) as usize;
+    let verified = std::str::from_utf8(&dr.body[6..6 + len_a])
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
     let off_b = 6 + len_a;
     let len_b = i32::from_be_bytes([
         dr.body[off_b],
@@ -151,7 +153,10 @@ fn clean_chain_verifies() {
         .unwrap()
         .parse::<i64>()
         .unwrap();
-    assert!(verified >= 3, "≥3 audit entries (1 CREATE + 2 INSERT), got {verified}");
+    assert!(
+        verified >= 3,
+        "≥3 audit entries (1 CREATE + 2 INSERT), got {verified}"
+    );
     assert_eq!(broken, -1, "clean chain → broken_at_seq = -1");
 }
 
@@ -190,7 +195,9 @@ fn empty_log_verifies_with_zero_count() {
     let msgs = read_until_ready(&mut s);
     let dr = msgs.iter().find(|m| m.ty == b'D').expect("DataRow");
     let len = i32::from_be_bytes([dr.body[2], dr.body[3], dr.body[4], dr.body[5]]) as usize;
-    let verified =
-        std::str::from_utf8(&dr.body[6..6 + len]).unwrap().parse::<i64>().unwrap();
+    let verified = std::str::from_utf8(&dr.body[6..6 + len])
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
     assert_eq!(verified, 0, "no DML/DDL → 0 verified entries");
 }

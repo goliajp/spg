@@ -67,8 +67,8 @@ fn config() -> Option<&'static Config> {
                     return None;
                 }
             };
-            let subject = env::var("SPG_PUBSUB_SUBJECT")
-                .unwrap_or_else(|_| DEFAULT_SUBJECT.to_string());
+            let subject =
+                env::var("SPG_PUBSUB_SUBJECT").unwrap_or_else(|_| DEFAULT_SUBJECT.to_string());
             Some(Config { target, subject })
         })
         .as_ref()

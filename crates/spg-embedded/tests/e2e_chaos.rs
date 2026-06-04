@@ -33,7 +33,10 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        p.push(format!("spg-embedded-chaos-{label}-{nanos}-{}", std::process::id()));
+        p.push(format!(
+            "spg-embedded-chaos-{label}-{nanos}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         Self { path: p }
     }
@@ -53,8 +56,10 @@ fn reopen_after_clean_close_reads_all_rows() {
     let p = scratch.db_path();
     {
         let mut db = Database::open_path(&p).unwrap();
-        db.execute("CREATE TABLE t (id INT NOT NULL, n INT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)").unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)")
+            .unwrap();
     }
     let mut db = Database::open_path(&p).unwrap();
     let rows = db.query("SELECT n FROM t ORDER BY id").unwrap();
@@ -83,10 +88,7 @@ fn reopen_after_truncated_wal_tail_drops_partial_record() {
     // Truncate off the trailing 4 bytes — guaranteed to leave
     // the last record header partial. Embedded's boot replay
     // should treat this as a clean half-write and drop it.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&wal)
-        .unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
     file.set_len(len - 4).unwrap();
     drop(file);
     // Reopen — must NOT panic; must replay everything up to the
@@ -113,7 +115,8 @@ fn reopen_after_stray_tmp_checkpoint_ignores_it() {
     // Drop a junk .tmp file next to the DB.
     let tmp = catalog_tmp_path(&p);
     let mut f = std::fs::File::create(&tmp).unwrap();
-    f.write_all(b"\x00\x01\x02\x03BOGUS CATALOG SNAPSHOT").unwrap();
+    f.write_all(b"\x00\x01\x02\x03BOGUS CATALOG SNAPSHOT")
+        .unwrap();
     drop(f);
     // Reopen.
     let mut db = Database::open_path(&p).unwrap();
@@ -132,7 +135,9 @@ fn dropping_database_while_freezer_runs_is_clean() {
     let db = Arc::new(Mutex::new(Database::open_path(&p).unwrap()));
     {
         let mut guard = db.lock().unwrap();
-        guard.execute("CREATE TABLE t (id INT NOT NULL, payload TEXT)").unwrap();
+        guard
+            .execute("CREATE TABLE t (id INT NOT NULL, payload TEXT)")
+            .unwrap();
         for i in 0..500 {
             guard
                 .execute(&format!("INSERT INTO t VALUES ({i}, 'x')"))

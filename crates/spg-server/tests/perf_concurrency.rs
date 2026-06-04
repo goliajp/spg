@@ -205,7 +205,10 @@ fn concurrency_bench() {
     {
         let mut s = common::connect_to(&addrs.native);
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-        exec_native(&mut s, "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)");
+        exec_native(
+            &mut s,
+            "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)",
+        );
         exec_native(&mut s, "CREATE INDEX by_id ON t (id)");
         const BATCH: i64 = 256;
         let mut i: i64 = 0;
@@ -234,20 +237,14 @@ fn concurrency_bench() {
     println!("\n[SELECT-only]");
     for &n in CLIENT_COUNTS {
         let (ops, p99) = run_select_only(&addrs.native, n);
-        println!(
-            "  clients={n}  → {:>9.0} ops/sec   p99={:?}",
-            ops, p99
-        );
+        println!("  clients={n}  → {:>9.0} ops/sec   p99={:?}", ops, p99);
     }
 
     let mut seed: u64 = 1_000_000;
     println!("\n[Mixed 75% SELECT / 25% INSERT]");
     for &n in CLIENT_COUNTS {
         let (ops, p99) = run_mixed(&addrs.native, n, seed);
-        println!(
-            "  clients={n}  → {:>9.0} ops/sec   p99={:?}",
-            ops, p99
-        );
+        println!("  clients={n}  → {:>9.0} ops/sec   p99={:?}", ops, p99);
         seed += 10_000_000;
     }
     println!();

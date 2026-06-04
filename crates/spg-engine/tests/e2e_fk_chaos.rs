@@ -14,7 +14,9 @@ use spg_engine::{Engine, EngineError, QueryResult};
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("setup {sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng
@@ -34,7 +36,7 @@ fn snapshot_restore_preserves_all_actions() {
         "CREATE TABLE c2 (id INT NOT NULL, b INT DEFAULT 0 NOT NULL, \
          FOREIGN KEY (b) REFERENCES v(id) ON DELETE SET DEFAULT)",
         "CREATE TABLE c3 (id INT NOT NULL, x INT NOT NULL, y INT NOT NULL, \
-         FOREIGN KEY (x, y) REFERENCES u(id, id))",  // composite (silly but exercises code)
+         FOREIGN KEY (x, y) REFERENCES u(id, id))", // composite (silly but exercises code)
         "CREATE TABLE tree (id INT NOT NULL, parent_id INT, \
          FOREIGN KEY (parent_id) REFERENCES tree(id) ON DELETE CASCADE)",
         "CREATE INDEX tree_pk ON tree (id)",
@@ -75,7 +77,9 @@ fn restored_engine_enforces_fk_identically() {
     let mut b = Engine::restore(cat);
     // Restored engine: missing-parent INSERT must reject.
     let r = b.execute("INSERT INTO o VALUES (11, 99)");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.contains("FOREIGN KEY violation"))
+    );
     // Existing-parent INSERT must accept.
     b.execute("INSERT INTO o VALUES (12, 2)").unwrap();
 }
@@ -89,11 +93,9 @@ fn alter_add_against_violating_data_leaves_catalog_clean() {
         "CREATE INDEX u_pk ON u (id)",
         "CREATE TABLE o (id INT NOT NULL, uid INT NOT NULL)",
         "INSERT INTO u VALUES (1)",
-        "INSERT INTO o VALUES (10, 99)",  // 99 doesn't exist in u
+        "INSERT INTO o VALUES (10, 99)", // 99 doesn't exist in u
     ]);
-    let r = eng.execute(
-        "ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (uid) REFERENCES u(id)",
-    );
+    let r = eng.execute("ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (uid) REFERENCES u(id)");
     assert!(r.is_err());
     // Verify the catalog has no FK on `o`.
     let bytes = eng.snapshot();
@@ -115,7 +117,7 @@ fn restrict_branch_blocks_cascade_branch_atomically() {
         "CREATE TABLE b (id INT NOT NULL, a_id INT NOT NULL, \
          FOREIGN KEY (a_id) REFERENCES u(id) ON DELETE CASCADE)",
         "CREATE TABLE c (id INT NOT NULL, a_id INT NOT NULL, \
-         FOREIGN KEY (a_id) REFERENCES u(id))",  // RESTRICT
+         FOREIGN KEY (a_id) REFERENCES u(id))", // RESTRICT
         "INSERT INTO u VALUES (1)",
         "INSERT INTO b VALUES (10, 1)",
         "INSERT INTO c VALUES (100, 1)",
@@ -148,7 +150,8 @@ fn deep_cascade_chain_handles_subtree_size() {
     for i in 1..50 {
         values.push_str(&alloc::format!(", ({i}, {})", i - 1));
     }
-    eng.execute(&alloc::format!("INSERT INTO node VALUES {values}")).unwrap();
+    eng.execute(&alloc::format!("INSERT INTO node VALUES {values}"))
+        .unwrap();
     eng.execute("DELETE FROM node WHERE id = 0").unwrap();
     let rows = match eng.execute("SELECT id FROM node").unwrap() {
         QueryResult::Rows { rows, .. } => rows,

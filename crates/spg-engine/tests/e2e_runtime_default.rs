@@ -19,18 +19,24 @@ fn default_now_is_filled_at_insert_time() {
         .unwrap();
     eng.execute("INSERT INTO t (id) VALUES (1)").unwrap();
     let r = eng.execute("SELECT created_at FROM t").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert_eq!(rows[0].values[0], Value::Timestamp(fake_clock()));
 }
 
 #[test]
 fn default_current_timestamp_keyword_no_parens() {
     let mut eng = engine_with_clock();
-    eng.execute("CREATE TABLE t (id INT NOT NULL, ts TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)")
-        .unwrap();
+    eng.execute(
+        "CREATE TABLE t (id INT NOT NULL, ts TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .unwrap();
     eng.execute("INSERT INTO t (id) VALUES (1)").unwrap();
     let r = eng.execute("SELECT ts FROM t").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert!(matches!(rows[0].values[0], Value::Timestamp(_)));
 }
 
@@ -41,17 +47,22 @@ fn default_current_date_yields_a_date() {
         .unwrap();
     eng.execute("INSERT INTO t (id) VALUES (1)").unwrap();
     let r = eng.execute("SELECT report_date FROM t").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert!(matches!(rows[0].values[0], Value::Date(_)));
 }
 
 #[test]
 fn literal_default_still_works() {
     let mut eng = engine_with_clock();
-    eng.execute("CREATE TABLE t (id INT NOT NULL, name TEXT DEFAULT 'unset' NOT NULL)").unwrap();
+    eng.execute("CREATE TABLE t (id INT NOT NULL, name TEXT DEFAULT 'unset' NOT NULL)")
+        .unwrap();
     eng.execute("INSERT INTO t (id) VALUES (1)").unwrap();
     let r = eng.execute("SELECT name FROM t").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert_eq!(rows[0].values[0], Value::Text("unset".into()));
 }
 
@@ -67,9 +78,14 @@ fn multiple_runtime_defaults_in_same_row() {
         )",
     )
     .unwrap();
-    eng.execute("INSERT INTO accounts (id) VALUES (42)").unwrap();
-    let r = eng.execute("SELECT created_at, updated_at FROM accounts").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    eng.execute("INSERT INTO accounts (id) VALUES (42)")
+        .unwrap();
+    let r = eng
+        .execute("SELECT created_at, updated_at FROM accounts")
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert_eq!(rows[0].values[0], Value::Timestamp(fake_clock()));
     assert_eq!(rows[0].values[1], Value::Timestamp(fake_clock()));
 }
@@ -94,7 +110,9 @@ fn explicit_value_overrides_runtime_default() {
     eng.execute("INSERT INTO t (id, created_at) VALUES (1, '2020-01-01 00:00:00')")
         .unwrap();
     let r = eng.execute("SELECT created_at FROM t").unwrap();
-    let QueryResult::Rows { rows, .. } = r else { panic!() };
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     // Not the clock's value.
     assert_ne!(rows[0].values[0], Value::Timestamp(fake_clock()));
 }

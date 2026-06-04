@@ -174,8 +174,7 @@ impl Statistics {
                 write_str(&mut out, b);
             }
         }
-        let m =
-            u16::try_from(self.modified_since.len()).expect("≤ 65,535 modified-row counters");
+        let m = u16::try_from(self.modified_since.len()).expect("≤ 65,535 modified-row counters");
         out.extend_from_slice(&m.to_le_bytes());
         for (table, count) in &self.modified_since {
             write_str(&mut out, table);
@@ -192,10 +191,11 @@ impl Statistics {
             let table = read_str(buf, &mut p)?;
             let col = read_str(buf, &mut p)?;
             let null_frac_bytes = read_bytes(buf, &mut p, 4)?;
-            let null_frac =
-                f32::from_le_bytes(null_frac_bytes.try_into().map_err(|_| {
-                    StatisticsError::Corrupt("null_frac slice".to_string())
-                })?);
+            let null_frac = f32::from_le_bytes(
+                null_frac_bytes
+                    .try_into()
+                    .map_err(|_| StatisticsError::Corrupt("null_frac slice".to_string()))?,
+            );
             let n_distinct = read_u64(buf, &mut p)?;
             let nb = read_u16(buf, &mut p)? as usize;
             let mut bounds = Vec::with_capacity(nb);
@@ -297,20 +297,15 @@ pub fn estimate_n_distinct(sorted_values: &[String]) -> u64 {
 // ── byte-codec helpers ──────────────────────────────────────────
 
 fn write_str(out: &mut Vec<u8>, s: &str) {
-    let n = u16::try_from(s.len())
-        .expect("table / column / bound names ≤ 65,535 bytes");
+    let n = u16::try_from(s.len()).expect("table / column / bound names ≤ 65,535 bytes");
     out.extend_from_slice(&n.to_le_bytes());
     out.extend_from_slice(s.as_bytes());
 }
 
-fn read_bytes<'a>(
-    buf: &'a [u8],
-    p: &mut usize,
-    n: usize,
-) -> Result<&'a [u8], StatisticsError> {
-    let slice = buf.get(*p..*p + n).ok_or_else(|| {
-        StatisticsError::Corrupt(alloc::format!("short read ({n} bytes)"))
-    })?;
+fn read_bytes<'a>(buf: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8], StatisticsError> {
+    let slice = buf
+        .get(*p..*p + n)
+        .ok_or_else(|| StatisticsError::Corrupt(alloc::format!("short read ({n} bytes)")))?;
     *p += n;
     Ok(slice)
 }
@@ -375,7 +370,11 @@ mod tests {
     #[test]
     fn multi_column_roundtrips_with_modified_counter() {
         let mut s = Statistics::new();
-        s.set("users".into(), "id".into(), mk_cs(0.0, 100, &["1", "50", "100"]));
+        s.set(
+            "users".into(),
+            "id".into(),
+            mk_cs(0.0, 100, &["1", "50", "100"]),
+        );
         s.set(
             "users".into(),
             "name".into(),

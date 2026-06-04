@@ -5,33 +5,29 @@ use spg_sql::parser::parse_statement;
 
 fn parse_insert_on_conflict(sql: &str) -> spg_sql::ast::OnConflictClause {
     let stmt = parse_statement(sql).expect("parses");
-    let Statement::Insert(ins) = stmt else { panic!("expected INSERT") };
+    let Statement::Insert(ins) = stmt else {
+        panic!("expected INSERT")
+    };
     ins.on_conflict.expect("ON CONFLICT clause present")
 }
 
 #[test]
 fn do_nothing_with_single_target() {
-    let oc = parse_insert_on_conflict(
-        "INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING",
-    );
+    let oc = parse_insert_on_conflict("INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING");
     assert_eq!(oc.target_columns, vec!["id"]);
     assert!(matches!(oc.action, OnConflictAction::Nothing));
 }
 
 #[test]
 fn do_nothing_with_composite_target() {
-    let oc = parse_insert_on_conflict(
-        "INSERT INTO t VALUES (1, 2) ON CONFLICT (a, b) DO NOTHING",
-    );
+    let oc = parse_insert_on_conflict("INSERT INTO t VALUES (1, 2) ON CONFLICT (a, b) DO NOTHING");
     assert_eq!(oc.target_columns, vec!["a", "b"]);
 }
 
 #[test]
 fn do_nothing_without_target() {
     // mailrs idiom — let the engine pick the conflict index.
-    let oc = parse_insert_on_conflict(
-        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
-    );
+    let oc = parse_insert_on_conflict("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING");
     assert!(oc.target_columns.is_empty());
     assert!(matches!(oc.action, OnConflictAction::Nothing));
 }
@@ -44,7 +40,11 @@ fn do_update_set_single_assignment() {
          ON CONFLICT (address) DO UPDATE SET password_hash = EXCLUDED.password_hash",
     );
     assert_eq!(oc.target_columns, vec!["address"]);
-    let OnConflictAction::Update { assignments, where_ } = &oc.action else {
+    let OnConflictAction::Update {
+        assignments,
+        where_,
+    } = &oc.action
+    else {
         panic!("expected Update")
     };
     assert_eq!(assignments.len(), 1);
@@ -89,7 +89,9 @@ fn returning_after_on_conflict_works() {
          RETURNING id, v",
     )
     .unwrap();
-    let Statement::Insert(ins) = stmt else { panic!() };
+    let Statement::Insert(ins) = stmt else {
+        panic!()
+    };
     assert!(ins.on_conflict.is_some());
     assert!(ins.returning.is_some());
 }

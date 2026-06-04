@@ -8,7 +8,9 @@ use spg_storage::Value;
 fn engine_with(sqls: &[&str]) -> Engine {
     let mut eng = Engine::new();
     for sql in sqls {
-        let r = eng.execute(sql).unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
+        let r = eng
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("{sql:?}: {e:?}"));
         assert!(matches!(r, QueryResult::CommandOk { .. }), "{sql:?}");
     }
     eng
@@ -29,7 +31,13 @@ fn gin_index_accepted_as_btree_fallback() {
     ]);
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
-    assert!(cat.get("docs").unwrap().indices().iter().any(|i| i.name == "docs_payload"));
+    assert!(
+        cat.get("docs")
+            .unwrap()
+            .indices()
+            .iter()
+            .any(|i| i.name == "docs_payload")
+    );
 }
 
 #[test]
@@ -49,9 +57,9 @@ fn is_not_distinct_from_null_null_is_true() {
         "INSERT INTO t VALUES (NULL, NULL), (1, 1), (1, NULL)",
     ]);
     let r = rows(&mut eng, "SELECT a IS NOT DISTINCT FROM b FROM t");
-    assert_eq!(r[0][0], Value::Bool(true));   // (NULL, NULL)
-    assert_eq!(r[1][0], Value::Bool(true));   // (1, 1)
-    assert_eq!(r[2][0], Value::Bool(false));  // (1, NULL)
+    assert_eq!(r[0][0], Value::Bool(true)); // (NULL, NULL)
+    assert_eq!(r[1][0], Value::Bool(true)); // (1, 1)
+    assert_eq!(r[2][0], Value::Bool(false)); // (1, NULL)
 }
 
 #[test]
@@ -61,9 +69,9 @@ fn is_distinct_from_inverts() {
         "INSERT INTO t VALUES (NULL, NULL), (1, 1), (1, NULL)",
     ]);
     let r = rows(&mut eng, "SELECT a IS DISTINCT FROM b FROM t");
-    assert_eq!(r[0][0], Value::Bool(false));  // (NULL, NULL)
-    assert_eq!(r[1][0], Value::Bool(false));  // (1, 1)
-    assert_eq!(r[2][0], Value::Bool(true));   // (1, NULL)
+    assert_eq!(r[0][0], Value::Bool(false)); // (NULL, NULL)
+    assert_eq!(r[1][0], Value::Bool(false)); // (1, 1)
+    assert_eq!(r[2][0], Value::Bool(true)); // (1, NULL)
 }
 
 #[test]
@@ -73,16 +81,16 @@ fn is_not_distinct_from_in_where_clause() {
         "INSERT INTO u VALUES (1, NULL), (2, 1), (3, NULL)",
     ]);
     // NULL = NULL via IS NOT DISTINCT FROM.
-    let r = rows(&mut eng, "SELECT id FROM u WHERE parent IS NOT DISTINCT FROM NULL ORDER BY id");
+    let r = rows(
+        &mut eng,
+        "SELECT id FROM u WHERE parent IS NOT DISTINCT FROM NULL ORDER BY id",
+    );
     assert_eq!(r.len(), 2);
 }
 
 #[test]
 fn is_null_still_works_after_widening() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (a INT)",
-        "INSERT INTO t VALUES (NULL), (1)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE t (a INT)", "INSERT INTO t VALUES (NULL), (1)"]);
     let r = rows(&mut eng, "SELECT a IS NULL FROM t");
     assert_eq!(r[0][0], Value::Bool(true));
     assert_eq!(r[1][0], Value::Bool(false));

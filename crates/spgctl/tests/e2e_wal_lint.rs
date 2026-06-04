@@ -44,10 +44,7 @@ fn build_pair(dir: &std::path::Path, populate_table: bool) -> (PathBuf, PathBuf)
     //   [u32 LE (len | 0xC000_0000)] [u32 LE crc] [u8 type=0x01] [sql bytes]
     let wal = dir.join("wal.log");
     let mut wal_bytes = Vec::new();
-    let sqls = [
-        "INSERT INTO t VALUES (1)",
-        "INSERT INTO t VALUES (2)",
-    ];
+    let sqls = ["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"];
     for sql in sqls {
         let payload = sql.as_bytes();
         let mut crc_buf = Vec::with_capacity(1 + payload.len());

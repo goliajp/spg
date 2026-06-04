@@ -22,9 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use spg_wire::{
-    Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch,
-};
+use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
 
 mod common;
 
@@ -35,7 +33,9 @@ static TMPDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("spg-cascade-e2e-{tag}-{pid}-{nanos}-{serial}"));
     std::fs::create_dir_all(&dir).expect("create tmpdir");
@@ -192,8 +192,11 @@ fn three_node_chain_replays_correctly() {
     // Spawn B as A's follower AND a publisher. B will receive A's
     // CREATE TABLE via the v2 follower path (which DOES replicate
     // DDL — it's a byte-stream of A's WAL).
-    let (b_raw, b_addrs) =
-        spawn_follower_with_repl(&dir_b.join("b.db"), &dir_b.join("b.wal"), a_addrs.repl.as_ref().unwrap());
+    let (b_raw, b_addrs) = spawn_follower_with_repl(
+        &dir_b.join("b.db"),
+        &dir_b.join("b.wal"),
+        a_addrs.repl.as_ref().unwrap(),
+    );
     let _b_guard = common::ChildGuard(b_raw);
     let mut b_client = common::connect_to(&b_addrs.native);
     b_client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -234,7 +237,10 @@ fn three_node_chain_replays_correctly() {
         if saw_t {
             break;
         }
-        assert!(Instant::now() < deadline, "B never received A's CREATE TABLE");
+        assert!(
+            Instant::now() < deadline,
+            "B never received A's CREATE TABLE"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -423,7 +429,10 @@ fn cluster_id_persists_across_restart() {
 
     // The sidecar file is at <wal_path>.cluster_id — must exist.
     let sidecar = dir.join("s.wal.cluster_id");
-    assert!(sidecar.exists(), "cluster_id sidecar missing after first boot");
+    assert!(
+        sidecar.exists(),
+        "cluster_id sidecar missing after first boot"
+    );
     let sidecar_bytes = std::fs::read(&sidecar).unwrap();
     assert_eq!(sidecar_bytes.len(), 8, "cluster_id sidecar must be 8 bytes");
 

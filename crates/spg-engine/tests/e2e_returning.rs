@@ -27,9 +27,7 @@ fn rows_of(eng: &mut Engine, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
 
 #[test]
 fn insert_returning_single_column() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE api_keys (id INT NOT NULL, label TEXT)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE api_keys (id INT NOT NULL, label TEXT)"]);
     let (cols, vals) = rows_of(
         &mut eng,
         "INSERT INTO api_keys VALUES (1, 'production') RETURNING id",
@@ -41,13 +39,8 @@ fn insert_returning_single_column() {
 
 #[test]
 fn insert_returning_star() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)",
-    ]);
-    let (cols, vals) = rows_of(
-        &mut eng,
-        "INSERT INTO u VALUES (10, 'alice') RETURNING *",
-    );
+    let mut eng = engine_with(&["CREATE TABLE u (id INT NOT NULL, name TEXT NOT NULL)"]);
+    let (cols, vals) = rows_of(&mut eng, "INSERT INTO u VALUES (10, 'alice') RETURNING *");
     assert_eq!(vals.len(), 1);
     assert_eq!(vals[0], vec![Value::Int(10), Value::Text("alice".into())]);
     assert_eq!(cols.len(), 2);
@@ -55,13 +48,8 @@ fn insert_returning_star() {
 
 #[test]
 fn insert_returning_multi_row() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (id INT NOT NULL)",
-    ]);
-    let (_cols, vals) = rows_of(
-        &mut eng,
-        "INSERT INTO t VALUES (1), (2), (3) RETURNING id",
-    );
+    let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL)"]);
+    let (_cols, vals) = rows_of(&mut eng, "INSERT INTO t VALUES (1), (2), (3) RETURNING id");
     assert_eq!(vals.len(), 3);
     assert_eq!(vals[0][0], Value::Int(1));
     assert_eq!(vals[1][0], Value::Int(2));
@@ -71,9 +59,7 @@ fn insert_returning_multi_row() {
 #[test]
 fn insert_returning_aliased_expr() {
     // mailrs IMAP UID allocation pattern: `RETURNING expr AS alias`.
-    let mut eng = engine_with(&[
-        "CREATE TABLE mb (id INT NOT NULL, uidnext INT NOT NULL)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE mb (id INT NOT NULL, uidnext INT NOT NULL)"]);
     let (cols, vals) = rows_of(
         &mut eng,
         "INSERT INTO mb VALUES (1, 100) RETURNING id, uidnext - 1 AS prev_uid",
@@ -106,10 +92,7 @@ fn delete_returning_pre_delete_state() {
         "CREATE TABLE t (id INT NOT NULL, payload TEXT)",
         "INSERT INTO t VALUES (1, 'a'), (2, 'b')",
     ]);
-    let (_cols, vals) = rows_of(
-        &mut eng,
-        "DELETE FROM t WHERE id = 1 RETURNING id, payload",
-    );
+    let (_cols, vals) = rows_of(&mut eng, "DELETE FROM t WHERE id = 1 RETURNING id, payload");
     assert_eq!(vals.len(), 1);
     assert_eq!(vals[0], vec![Value::Int(1), Value::Text("a".into())]);
     // Sanity: actually gone.
@@ -122,9 +105,7 @@ fn delete_returning_pre_delete_state() {
 
 #[test]
 fn insert_without_returning_still_returns_command_ok() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (id INT NOT NULL)",
-    ]);
+    let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL)"]);
     let r = eng.execute("INSERT INTO t VALUES (1)").unwrap();
     assert!(matches!(r, QueryResult::CommandOk { affected: 1, .. }));
 }

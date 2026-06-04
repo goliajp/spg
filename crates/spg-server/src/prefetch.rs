@@ -27,8 +27,8 @@
 //! successfully prefetched segment.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::ServerState;
 
@@ -76,9 +76,7 @@ pub(crate) fn parallel_read_segments(
                 if r.is_ok()
                     && let Some(s) = state
                 {
-                    s.metrics
-                        .cold_prefetch_hits
-                        .fetch_add(1, Ordering::Relaxed);
+                    s.metrics.cold_prefetch_hits.fetch_add(1, Ordering::Relaxed);
                 }
                 (*id, r)
             })
@@ -97,9 +95,7 @@ pub(crate) fn parallel_read_segments(
                             if r.is_ok()
                                 && let Some(ref s) = state
                             {
-                                s.metrics
-                                    .cold_prefetch_hits
-                                    .fetch_add(1, Ordering::Relaxed);
+                                s.metrics.cold_prefetch_hits.fetch_add(1, Ordering::Relaxed);
                             }
                             (*id, r)
                         })
@@ -134,14 +130,8 @@ fn read_with_hint(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
         // it never mutates the file, just seeds the page cache.
         // Errors are logged + ignored: the read still works without
         // the hint.
-        let rc = unsafe {
-            libc::posix_fadvise(
-                fd,
-                0,
-                len as libc::off_t,
-                libc::POSIX_FADV_WILLNEED,
-            )
-        };
+        let rc =
+            unsafe { libc::posix_fadvise(fd, 0, len as libc::off_t, libc::POSIX_FADV_WILLNEED) };
         if rc != 0 {
             // EBADF/EINVAL/ESPIPE — fall through to plain read.
             eprintln!(
@@ -177,10 +167,7 @@ mod tests {
 
     #[test]
     fn parallel_read_segments_returns_every_input() {
-        let dir = std::env::temp_dir().join(format!(
-            "spg-test-prefetch-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("spg-test-prefetch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let paths: Vec<(u32, PathBuf)> = (0..8)
             .map(|i| {
@@ -200,10 +187,8 @@ mod tests {
 
     #[test]
     fn parallel_read_segments_single_worker_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "spg-test-prefetch-single-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("spg-test-prefetch-single-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let paths: Vec<(u32, PathBuf)> = (0..3)
             .map(|i| {

@@ -30,10 +30,7 @@ fn encode_base64_round_trip() {
     let mut eng = Engine::new();
     let v = one_value(&mut eng, "SELECT encode('Hello, World!', 'base64')");
     assert_eq!(v, Value::Text("SGVsbG8sIFdvcmxkIQ==".to_string()));
-    let v2 = one_value(
-        &mut eng,
-        "SELECT decode('SGVsbG8sIFdvcmxkIQ==', 'base64')",
-    );
+    let v2 = one_value(&mut eng, "SELECT decode('SGVsbG8sIFdvcmxkIQ==', 'base64')");
     assert_eq!(v2, Value::Text("Hello, World!".to_string()));
 }
 
@@ -103,5 +100,8 @@ fn error_on_null_errors_on_null() {
     let r = eng.execute("SELECT error_on_null(NULL)");
     assert!(r.is_err(), "error_on_null(NULL) must error");
     let msg = format!("{:?}", r.err().unwrap());
-    assert!(msg.contains("error_on_null"), "error mentions function name");
+    assert!(
+        msg.contains("error_on_null"),
+        "error mentions function name"
+    );
 }

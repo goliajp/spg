@@ -97,8 +97,8 @@ async fn many_handles_fan_out_concurrently() {
 
 #[tokio::test]
 async fn read_handle_does_not_block_writer() {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     let db = AsyncDatabase::open_in_memory();
     db.execute("CREATE TABLE t (a INT NOT NULL)").await.unwrap();
     for i in 0..50i64 {
@@ -145,7 +145,9 @@ async fn read_handle_after_database_clone() {
     // from either clone see the same state.
     let db_a = AsyncDatabase::open_in_memory();
     let db_b = db_a.clone();
-    db_a.execute("CREATE TABLE t (a INT NOT NULL)").await.unwrap();
+    db_a.execute("CREATE TABLE t (a INT NOT NULL)")
+        .await
+        .unwrap();
     db_a.execute("INSERT INTO t VALUES (1), (2)").await.unwrap();
     let h_b = db_b.read_handle().await;
     let r = h_b.query("SELECT COUNT(*) FROM t").await.unwrap();

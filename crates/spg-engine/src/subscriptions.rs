@@ -75,11 +75,7 @@ impl Subscriptions {
         self.inner.iter()
     }
 
-    pub fn create(
-        &mut self,
-        name: String,
-        sub: Subscription,
-    ) -> Result<(), SubscriptionError> {
+    pub fn create(&mut self, name: String, sub: Subscription) -> Result<(), SubscriptionError> {
         if self.inner.contains_key(&name) {
             return Err(SubscriptionError::DuplicateName(name));
         }
@@ -128,8 +124,8 @@ impl Subscriptions {
         for (name, sub) in &self.inner {
             write_short_str(&mut out, name);
             write_long_str(&mut out, &sub.conn_str);
-            let np =
-                u16::try_from(sub.publications.len()).expect("≤ 65,535 publications per subscription");
+            let np = u16::try_from(sub.publications.len())
+                .expect("≤ 65,535 publications per subscription");
             out.extend_from_slice(&np.to_le_bytes());
             for p in &sub.publications {
                 write_short_str(&mut out, p);
@@ -271,7 +267,13 @@ fn read_long_str(buf: &[u8], p: &mut usize) -> Result<String, SubscriptionError>
 mod tests {
     use super::*;
 
-    fn mk(name: &str, host: &str, pubs: &[&str], enabled: bool, pos: u64) -> (String, Subscription) {
+    fn mk(
+        name: &str,
+        host: &str,
+        pubs: &[&str],
+        enabled: bool,
+        pos: u64,
+    ) -> (String, Subscription) {
         (
             name.to_string(),
             Subscription {

@@ -72,7 +72,9 @@ fn prepared_plan_runs_correctly_after_cache_hit() {
     eng.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')")
         .expect("insert");
 
-    let r1 = eng.execute("SELECT name FROM t1 WHERE id = 1").expect("exec1");
+    let r1 = eng
+        .execute("SELECT name FROM t1 WHERE id = 1")
+        .expect("exec1");
     // Force a cache hit by preparing the same SQL twice; second
     // execution path goes through the cached AST via the engine's
     // own execute() (since the engine internally calls prepare()).

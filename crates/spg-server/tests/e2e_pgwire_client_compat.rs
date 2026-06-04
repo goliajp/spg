@@ -118,12 +118,7 @@ fn describe_msg(kind: u8, name: &str) -> Vec<u8> {
     b
 }
 
-fn bind_mixed(
-    portal: &str,
-    stmt: &str,
-    formats: &[u16],
-    params: &[(i32, Vec<u8>)],
-) -> Vec<u8> {
+fn bind_mixed(portal: &str, stmt: &str, formats: &[u16], params: &[(i32, Vec<u8>)]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(portal.as_bytes());
     b.push(0);
@@ -223,7 +218,10 @@ fn jdbc_style_prepared_reuse_describe_then_repeated_execute() {
             break;
         }
     }
-    assert_eq!(rows, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    assert_eq!(
+        rows,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
 }
 
 #[test]
@@ -243,10 +241,7 @@ fn concurrent_connections_share_plan_cache_correctly() {
         exec_simple(&mut s, "CREATE TABLE conc (worker INT, n INT)");
         for w in 0..4_i32 {
             for n in 0..8_i32 {
-                exec_simple(
-                    &mut s,
-                    &format!("INSERT INTO conc VALUES ({w}, {n})"),
-                );
+                exec_simple(&mut s, &format!("INSERT INTO conc VALUES ({w}, {n})"));
             }
         }
     }
@@ -287,8 +282,8 @@ fn concurrent_connections_share_plan_cache_correctly() {
                 loop {
                     let m = read_message(&mut s);
                     if m.ty == b'D' {
-                        let len =
-                            i32::from_be_bytes([m.body[2], m.body[3], m.body[4], m.body[5]]) as usize;
+                        let len = i32::from_be_bytes([m.body[2], m.body[3], m.body[4], m.body[5]])
+                            as usize;
                         let v = String::from_utf8_lossy(&m.body[6..6 + len]).to_string();
                         got = Some(v.parse::<i32>().unwrap());
                     }
@@ -342,9 +337,16 @@ fn psycopg3_style_pipeline_with_mixed_text_and_binary() {
         let params = if i % 2 == 0 {
             vec![(4_i32, bin_int), (text_str.len() as i32, text_str)]
         } else {
-            vec![(text_int.len() as i32, text_int), (bin_str.len() as i32, bin_str)]
+            vec![
+                (text_int.len() as i32, text_int),
+                (bin_str.len() as i32, bin_str),
+            ]
         };
-        write_msg(&mut batch, b'B', &bind_mixed("", &stmt_name, &formats, &params));
+        write_msg(
+            &mut batch,
+            b'B',
+            &bind_mixed("", &stmt_name, &formats, &params),
+        );
         write_msg(&mut batch, b'E', &execute_body(""));
     }
     write_msg(&mut batch, b'S', &[]);

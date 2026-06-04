@@ -13,7 +13,10 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        p.push(format!("spg-embedded-revert-{label}-{nanos}-{}", std::process::id()));
+        p.push(format!(
+            "spg-embedded-revert-{label}-{nanos}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         Self { path: p }
     }
