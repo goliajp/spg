@@ -22,6 +22,7 @@ fn background_freezer_demotes_when_hot_tier_exceeds_budget() {
         tick: Duration::from_millis(50),
         hot_tier_bytes: 256,
         batch_rows: 32,
+        ..Default::default()
     };
     let _handle = Database::spawn_background_freezer(Arc::clone(&shared), opts);
     // Wait up to 5 s for the freezer to produce at least one
@@ -55,6 +56,7 @@ fn freezer_handle_drop_stops_thread_cleanly() {
         tick: Duration::from_millis(50),
         hot_tier_bytes: 32,
         batch_rows: 20,
+        ..Default::default()
     };
     {
         let _handle1 = Database::spawn_background_freezer(Arc::clone(&shared), opts.clone());
@@ -77,6 +79,7 @@ fn freezer_no_op_when_no_freezable_table() {
         tick: Duration::from_millis(50),
         hot_tier_bytes: 1,
         batch_rows: 10,
+        ..Default::default()
     };
     let _h = Database::spawn_background_freezer(Arc::clone(&shared), opts);
     std::thread::sleep(Duration::from_millis(300));

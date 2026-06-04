@@ -8,6 +8,7 @@ members = [
     "crates/spg-audit",
     "crates/spg-engine",
     "crates/spg-embedded",
+    "crates/spg-embedded-tokio",
     "crates/spg-manifest",
     "crates/spg-server",
     "crates/spgctl",
@@ -17,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "7.9.31"
+version      = "7.10.3"
 edition      = "2024"
 rust-version = "1.95"
 authors      = ["GOLIA K.K. <lihao@golia.jp>"]
@@ -42,6 +43,10 @@ spg-audit    = { path = "crates/spg-audit",    version = "7.9" }
 spg-manifest = { path = "crates/spg-manifest", version = "7.9" }
 spg-engine   = { path = "crates/spg-engine",   version = "7.9" }
 spg-embedded = { path = "crates/spg-embedded", version = "7.9" }
+# v7.10.0 — tokio adapter for spg-embedded. Bumps the published
+# version to 7.10 right at introduction; spg-embedded stays 0-deps
+# and this is the *only* crate that pulls tokio.
+spg-embedded-tokio = { path = "crates/spg-embedded-tokio", version = "7.10" }
 
 [workspace.lints.rust]
 # v3.0.4: relaxed from `forbid` to `deny` so spg-crypto can drop into
