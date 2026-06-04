@@ -518,6 +518,27 @@ struct TxState {
     savepoints: Vec<(String, Catalog)>,
 }
 
+/// v7.11.0 — frozen read-only view of the engine's committed state.
+/// Constructed via [`Engine::clone_snapshot`]. Holds clones of the
+/// catalog, statistics, clock function, and row-cap config — the
+/// four fields the `execute_readonly` path actually reads. Cheap to
+/// `Clone` (each clone shares the underlying `PersistentVec` row
+/// storage; only the trie root pointers copy). Send + Sync so a
+/// snapshot can be moved across `tokio::task::spawn_blocking`
+/// boundaries without coordination.
+///
+/// The contract: a snapshot reflects the engine's state at the
+/// moment `clone_snapshot()` returned. Subsequent writes to the
+/// engine are NOT visible. Callers who need fresher data take a
+/// new snapshot.
+#[derive(Debug, Clone)]
+pub struct CatalogSnapshot {
+    catalog: Catalog,
+    statistics: statistics::Statistics,
+    clock: Option<ClockFn>,
+    max_query_rows: Option<usize>,
+}
+
 #[derive(Debug, Default)]
 pub struct Engine {
     /// Committed catalog — what survives `Engine::snapshot()` and what
@@ -713,6 +734,59 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
         }
+    }
+
+    /// v7.11.0 — clone the engine's committed catalog + read-time
+    /// state into a frozen `CatalogSnapshot`. Cheap (`Catalog` is
+    /// backed by `PersistentVec`; cloning is O(log n) per table).
+    /// Subsequent writes to this engine are invisible to the
+    /// snapshot; the snapshot is self-contained and can be moved
+    /// to another thread for concurrent `execute_readonly_on_snapshot`
+    /// calls. The basis for [`AsyncReadHandle`] in spg-embedded-tokio
+    /// and any other read-fanout pattern.
+    #[must_use]
+    pub fn clone_snapshot(&self) -> CatalogSnapshot {
+        CatalogSnapshot {
+            catalog: self.active_catalog().clone(),
+            statistics: self.statistics.clone(),
+            clock: self.clock,
+            max_query_rows: self.max_query_rows,
+        }
+    }
+
+    /// v7.11.1 — execute a read-only SQL statement against a
+    /// `CatalogSnapshot` without touching this engine. Same
+    /// semantics as `execute_readonly` but parameterised on the
+    /// snapshot's catalog. Reject DDL/DML the same way
+    /// `execute_readonly` does. Static-on-Self so the caller can
+    /// dispatch without holding an `Engine` borrow alongside the
+    /// snapshot.
+    pub fn execute_readonly_on_snapshot(
+        snapshot: &CatalogSnapshot,
+        sql: &str,
+    ) -> Result<QueryResult, EngineError> {
+        Self::execute_readonly_on_snapshot_with_cancel(snapshot, sql, CancelToken::none())
+    }
+
+    /// v7.11.1 — `execute_readonly_on_snapshot` with cooperative
+    /// cancellation. Builds a transient `Engine` over the snapshot
+    /// state, runs `execute_readonly_with_cancel`, drops. The
+    /// transient engine is cheap to construct (no I/O; everything
+    /// is just struct moves) and lets the existing read path stay
+    /// untouched.
+    pub fn execute_readonly_on_snapshot_with_cancel(
+        snapshot: &CatalogSnapshot,
+        sql: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let transient = Engine {
+            catalog: snapshot.catalog.clone(),
+            statistics: snapshot.statistics.clone(),
+            clock: snapshot.clock,
+            max_query_rows: snapshot.max_query_rows,
+            ..Engine::default()
+        };
+        transient.execute_readonly_with_cancel(sql, cancel)
     }
 
     /// Construct an engine restored from a previously-snapshotted catalog

@@ -32,6 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use spg_embedded::{Database, EngineError, QueryResult, Value};
+pub use spg_engine::CatalogSnapshot;
 
 use tokio::sync::Mutex;
 
@@ -120,5 +121,78 @@ impl AsyncDatabase {
         })
         .await
         .expect("spawn_blocking join")
+    }
+
+    /// v7.11.2 — fan-out reader. Clones the engine's committed
+    /// catalog under the writer lock, releases the lock, and
+    /// hands back an `AsyncReadHandle` that runs SELECTs against
+    /// the snapshot **without ever re-acquiring the writer
+    /// lock**. Multiple read handles can run concurrently — they
+    /// share nothing mutable. mailrs's IMAP fetch pattern lands
+    /// here.
+    ///
+    /// Contract: the snapshot is frozen at the moment this call
+    /// returns. Subsequent writes are NOT visible. Call
+    /// `AsyncReadHandle::refresh().await` to re-snapshot when
+    /// you need fresher data.
+    pub async fn read_handle(&self) -> AsyncReadHandle {
+        let inner = Arc::clone(&self.inner);
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_lock();
+            guard.engine().clone_snapshot()
+        })
+        .await
+        .expect("spawn_blocking join");
+        AsyncReadHandle {
+            db: Arc::clone(&self.inner),
+            snapshot,
+        }
+    }
+}
+
+/// v7.11.2 — read-only handle backed by a frozen
+/// `CatalogSnapshot`. Multiple handles can run concurrently; they
+/// don't acquire the writer lock at query time. Refresh-on-demand
+/// — the contract is that the handle reflects committed state at
+/// the moment of construction or the last `refresh()`.
+///
+/// Holds a reference to the underlying `AsyncDatabase` (via the
+/// shared `Arc<Mutex<Database>>`) only so `refresh()` can briefly
+/// re-acquire the lock to take a fresh snapshot. Read paths never
+/// touch the Database directly.
+#[derive(Debug)]
+pub struct AsyncReadHandle {
+    db: Arc<Mutex<Database>>,
+    snapshot: CatalogSnapshot,
+}
+
+impl AsyncReadHandle {
+    /// Run a read-only SQL statement against the frozen snapshot.
+    /// DDL / DML reject with `EngineError::WriteRequired`.
+    ///
+    /// # Errors
+    /// Propagates `EngineError` from the engine's read path.
+    pub async fn query(&self, sql: &str) -> Result<QueryResult, EngineError> {
+        let snapshot = self.snapshot.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            spg_engine::Engine::execute_readonly_on_snapshot(&snapshot, &sql)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// Re-snapshot the underlying engine. Briefly takes the
+    /// writer lock; subsequent `query()` calls see the new state.
+    /// Idempotent on a quiet engine (clones the same trie roots).
+    pub async fn refresh(&mut self) {
+        let inner = Arc::clone(&self.db);
+        let new_snapshot = tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_lock();
+            guard.engine().clone_snapshot()
+        })
+        .await
+        .expect("spawn_blocking join");
+        self.snapshot = new_snapshot;
     }
 }

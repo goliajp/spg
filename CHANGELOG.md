@@ -8,6 +8,55 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.11] — 2026-06-04 (read fan-out + v7.11 series open)
+
+Opens the v7.11 series. Three epics planned: read concurrency
+(this release), array operators / `unnest`, and type widening
+(`INT[]` / `BIGINT[]` / BYTEA scalar ops). Full plan in
+`.claude/internal-docs/V7_11_DESIGN.md`.
+
+**Epic 1 — read fan-out (this release).** mailrs's tokio cement
+is read-heavy (IMAP FETCH traffic per session). v7.10's
+`AsyncDatabase` serialises EVERY call on a single tokio `Mutex`,
+including SELECTs — a slow read blocks every concurrent reader.
+
+What lands:
+
+  * `Engine::clone_snapshot() -> CatalogSnapshot` — frozen,
+    Send+Sync view of the committed catalog. Backed by the
+    existing `PersistentVec` row storage so cloning is O(log n)
+    per table; no row body copies.
+  * `Engine::execute_readonly_on_snapshot(&snap, sql)` — runs
+    SELECT against a snapshot without touching the live engine.
+    DDL / DML returns `EngineError::WriteRequired`.
+  * `AsyncDatabase::read_handle().await` (spg-embedded-tokio) —
+    clones the catalog under the writer lock, hands back an
+    `AsyncReadHandle` that runs SELECTs through `spawn_blocking`
+    without ever re-acquiring the writer lock.
+  * `AsyncReadHandle::query(sql).await` /
+    `AsyncReadHandle::refresh().await` — same `spawn_blocking`
+    discipline as the rest of the crate.
+
+Snapshot contract: frozen at construction or last refresh.
+Subsequent writes are NOT visible. Refresh on demand.
+
+8 engine e2e tests + 8 async e2e tests including a
+"32 concurrent readers × 10 queries while writer hammers the
+engine" check that asserts 320 reads land without deadlock.
+
+Sub-versions:
+
+  v7.11.0  engine — Engine::clone_snapshot() + CatalogSnapshot struct
+  v7.11.1  engine — execute_readonly_on_snapshot[_with_cancel]
+  v7.11.2  spg-embedded-tokio — AsyncReadHandle + read_handle()
+  v7.11.3  spg-embedded-tokio — query / refresh + 8 e2e tests
+  v7.11.4  README "Fan-out reads" + examples/multi_reader.rs
+  v7.11.5  Epic 1 ship rollup — tag v7.11.0 + crates.io + docker
+
+Epics 2 (array ops) and 3 (type widening) follow.
+
+---
+
 ## [7.10] — 2026-06-04 (async embedded + post-mailrs widening)
 
 Opens the v7.10 series with the three carve-outs slipped from v7.9
