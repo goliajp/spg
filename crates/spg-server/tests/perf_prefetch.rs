@@ -1,3 +1,11 @@
+// Release-mode-only — the gate measures real wall-clock and uses
+// `posix_fadvise` via `unsafe libc::*` on Linux. Both signals are
+// useless under debug builds, and clippy / cargo test default to
+// debug. Gating the whole binary to `cfg(not(debug_assertions))`
+// keeps CI debug runs clean while release builds still exercise
+// the gate.
+#![cfg(not(debug_assertions))]
+
 //! v6.7.6 ship gate #2 — `4_worker_pool_speedup_at_least_1_3x`.
 //!
 //! Measures the boot-time prefetch pool's wall-clock improvement
@@ -11,7 +19,11 @@
 //! gate over CPU; run explicitly with `--ignored` (same pattern
 //! as `tests/perf_parallel_freezer`).
 
-#![allow(clippy::uninlined_format_args)]
+#![allow(
+    clippy::uninlined_format_args,
+    clippy::used_underscore_binding,
+    unsafe_code,
+)]
 
 use std::path::PathBuf;
 use std::time::Instant;
