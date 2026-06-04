@@ -64,9 +64,39 @@ engine and lock, like `Arc<Mutex<…>>` would.
 The single-writer invariant is **not** about thread safety —
 it's a correctness guarantee from SPG's design. There is at
 most one in-flight engine call at any moment, even under
-concurrent callers. The Tokio `Mutex` enforces it. If you
-need to fan out reads, that's a future v7.11 feature
-(`AsyncReadHandle` with snapshot isolation).
+concurrent callers. The Tokio `Mutex` enforces it.
+
+## Fan-out reads — `AsyncReadHandle`
+
+Read-heavy workloads (mailrs IMAP fetch, scan-heavy analytics)
+should NOT serialise on the same `Mutex` as writes. Use
+`AsyncReadHandle` to take a snapshot-isolated read view:
+
+```rust
+let h = db.read_handle().await;
+let rows = h.query("SELECT * FROM messages WHERE folder = 'inbox'").await?;
+```
+
+Multiple `AsyncReadHandle`s run concurrently — they don't acquire
+the writer lock at query time. The snapshot is frozen at the
+moment `read_handle()` returns; subsequent writes are NOT
+visible. Call `handle.refresh().await` to re-snapshot when you
+need fresher data:
+
+```rust
+let mut h = db.read_handle().await;
+loop {
+    let rows = h.query("SELECT * FROM messages").await?;
+    if rows_changed(&rows) { break; }
+    h.refresh().await;
+}
+```
+
+Snapshots are cheap (catalog is backed by `PersistentVec`; clone
+is O(log n) per table). Take one per concurrent reader.
+
+DDL / DML through a read handle returns
+`EngineError::WriteRequired` — go through `db.execute()` instead.
 
 ## Versioning
 
