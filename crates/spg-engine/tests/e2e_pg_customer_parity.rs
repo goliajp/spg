@@ -205,14 +205,51 @@ fn hnsw_with_vector_cosine_ops_opclass() {
     );
 }
 
-// OPEN — G-CRIT-3 tsvector / GIN / @@ / triggers.
-// Status: tracked for v7.12 (full-text search epic).
+// v7.12.0 — G-CRIT-3 entry: tsvector / tsquery column types load.
+// Full `@@` / `to_tsvector` / GIN / triggers land across v7.12.1–7.
 #[test]
-#[ignore]
 fn tsvector_column_type_accepted() {
     let mut e = eng();
-    // TODO(v7.12): full PG FTS — tsvector + tsquery + to_tsvector +
-    // plainto_tsquery + @@ + ts_rank + GIN-inverted index + AFTER
-    // INSERT/UPDATE row-level triggers to maintain search_vector.
     ok(&mut e, "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)");
+    // tsquery column too — both types should parse cleanly.
+    ok(
+        &mut e,
+        "CREATE TABLE q (id INT NOT NULL, query tsquery NOT NULL)",
+    );
+}
+
+// v7.12.0 — `'..'::tsvector` cast (pg_dump form). Round-trip of a
+// dumped-row literal back through SELECT must preserve the lexeme set.
+#[test]
+fn tsvector_cast_literal_round_trip() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)");
+    ok(
+        &mut e,
+        "INSERT INTO m VALUES (1, 'cat:1 fat:2 rat:3,5A'::tsvector)",
+    );
+    let cell = first_value(&mut e, "SELECT v FROM m WHERE id = 1");
+    let rendered = match cell {
+        Value::TsVector(items) => spg_engine::eval::format_tsvector(&items),
+        other => panic!("expected tsvector, got {other:?}"),
+    };
+    assert_eq!(rendered, "'cat':1 'fat':2 'rat':3,5A");
+}
+
+// v7.12.0 — `'..'::tsquery` cast (`to_tsquery` literal surface).
+#[test]
+fn tsquery_cast_literal_round_trip() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE q (id INT NOT NULL, query tsquery NOT NULL)");
+    ok(
+        &mut e,
+        "INSERT INTO q VALUES (1, 'cat & dog | !fish'::tsquery)",
+    );
+    let cell = first_value(&mut e, "SELECT query FROM q WHERE id = 1");
+    let rendered = match cell {
+        Value::TsQuery(ast) => spg_engine::eval::format_tsquery(&ast),
+        other => panic!("expected tsquery, got {other:?}"),
+    };
+    // Or-of-And-of-Not: parser builds `(cat & dog) | !fish`.
+    assert_eq!(rendered, "'cat' & 'dog' | !'fish'");
 }

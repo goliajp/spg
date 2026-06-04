@@ -4158,7 +4158,11 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // v7.11.12 — INT[] / BIGINT[] same text-mode collapse;
         // OIDs 1007 / 1016 via `pg_type_oid`.
         | DataType::IntArray
-        | DataType::BigIntArray => WireType::Text,
+        | DataType::BigIntArray
+        // v7.12.0 — tsvector / tsquery collapse to Text on the
+        // wire; OIDs 3614 / 3615 advertised via `pg_type_oid`.
+        | DataType::TsVector
+        | DataType::TsQuery => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -4220,6 +4224,10 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::BigIntArray(items) => {
             WireValue::Text(spg_engine::eval::format_bigint_array(items))
         }
+        // v7.12.0 — tsvector / tsquery on the wire as PG external
+        // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
+        Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),
+        Value::TsQuery(ast) => WireValue::Text(spg_engine::eval::format_tsquery(ast)),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => WireValue::Text(format!("{v:?}")),
     }

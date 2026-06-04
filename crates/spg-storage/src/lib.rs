@@ -28,6 +28,7 @@ pub use self::segment::{
     wrap_v2_envelope_with_brin,
 };
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
@@ -159,6 +160,18 @@ pub enum DataType {
     /// v7.11.12: `BIGINT[]` — single-dimension i64 array. PG
     /// wire OID 1016 (_int8). Catalog FILE_VERSION 19+.
     BigIntArray,
+    /// v7.12.0: PG `tsvector` — ordered, deduplicated set of
+    /// `(lexeme, positions, weight)` tuples. PG wire OID 3614.
+    /// Catalog FILE_VERSION 20+. Storage shape is row-codec
+    /// tag 22; the schema-agnostic `write_value` path emits tag
+    /// 18. Literal: `'foo:1 bar:2,3'::tsvector` (PG external
+    /// form). G-CRIT-3 entry — v7.12.0 only ships the type +
+    /// codec; matching `@@` lands in v7.12.2.
+    TsVector,
+    /// v7.12.0: PG `tsquery` — parse tree of lexemes joined by
+    /// `&` `|` `!` and phrase operators. PG wire OID 3615.
+    /// Catalog FILE_VERSION 20+.
+    TsQuery,
 }
 
 impl fmt::Display for DataType {
@@ -194,8 +207,43 @@ impl fmt::Display for DataType {
             Self::TextArray => f.write_str("TEXT[]"),
             Self::IntArray => f.write_str("INT[]"),
             Self::BigIntArray => f.write_str("BIGINT[]"),
+            Self::TsVector => f.write_str("TSVECTOR"),
+            Self::TsQuery => f.write_str("TSQUERY"),
         }
     }
+}
+
+/// v7.12.0 — one entry in a `Value::TsVector`. The lexeme is the
+/// (already-tokenised + stemmed in v7.12.1+) word; `positions` is
+/// a strictly-ascending list of 1-based positions; `weight` is the
+/// PG weight letter (A=3, B=2, C=1, D=0) — v7.12.0 defaults every
+/// lexeme to D, the v7.12.2 ranking path consumes the weight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsLexeme {
+    pub word: String,
+    pub positions: Vec<u16>,
+    pub weight: u8,
+}
+
+/// v7.12.0 — parse tree for a PG `tsquery`. v7.12.0 ships the
+/// type + codec only; the `to_tsquery` / `plainto_tsquery` lexer
+/// lands in v7.12.1 and the `@@` evaluator in v7.12.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TsQueryAst {
+    /// Single lexeme term. The `weight_mask` is the PG-style
+    /// bitmask of accepted weights (`A=1<<3`, `B=1<<2`, `C=1<<1`,
+    /// `D=1<<0`); `0` = any weight. v7.12.0 always sets it to 0.
+    Term { word: String, weight_mask: u8 },
+    And(Box<TsQueryAst>, Box<TsQueryAst>),
+    Or(Box<TsQueryAst>, Box<TsQueryAst>),
+    Not(Box<TsQueryAst>),
+    /// `phrase <distance> phrase`. v7.12.0 only persists this; the
+    /// match semantics arrive in v7.12.2 alongside `@@`.
+    Phrase {
+        left: Box<TsQueryAst>,
+        right: Box<TsQueryAst>,
+        distance: u16,
+    },
 }
 
 /// A row-cell value, including SQL `NULL`. `Float` uses `f64`; NaN compares
@@ -264,6 +312,14 @@ pub enum Value {
     /// v7.11.12 `BIGINT[]` — single-dimension i64 array with optional
     /// NULL elements.
     BigIntArray(Vec<Option<i64>>),
+    /// v7.12.0 `tsvector` — sorted-by-word, deduped lexeme set with
+    /// positions + weights. The engine enforces sort/dedup on
+    /// construction; consumers can rely on `lexemes.windows(2)`
+    /// being strictly ascending by `word`.
+    TsVector(Vec<TsLexeme>),
+    /// v7.12.0 `tsquery` — boolean / phrase parse tree over
+    /// lexemes. Engine builds via `to_tsquery` family.
+    TsQuery(TsQueryAst),
     Null,
 }
 
@@ -307,6 +363,8 @@ impl Value {
             Self::TextArray(_) => Some(DataType::TextArray),
             Self::IntArray(_) => Some(DataType::IntArray),
             Self::BigIntArray(_) => Some(DataType::BigIntArray),
+            Self::TsVector(_) => Some(DataType::TsVector),
+            Self::TsQuery(_) => Some(DataType::TsQuery),
             Self::Null => None,
         }
     }
@@ -508,7 +566,9 @@ impl IndexKey {
             | Value::Bytes(_)
             | Value::TextArray(_)
             | Value::IntArray(_)
-            | Value::BigIntArray(_) => None,
+            | Value::BigIntArray(_)
+            | Value::TsVector(_)
+            | Value::TsQuery(_) => None,
         }
     }
 }
@@ -3966,7 +4026,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 19;
+const FILE_VERSION: u8 = 20;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4728,6 +4788,12 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.11.12: tag 21 for `BIGINT[]`. Body = [u16 count][per
         // element: u8 null + (if non-null) i64 LE].
         DataType::BigIntArray => out.push(21),
+        // v7.12.0: tag 22 for `tsvector`. No body — type identity
+        // alone. Catalog FILE_VERSION 20+.
+        DataType::TsVector => out.push(22),
+        // v7.12.0: tag 23 for `tsquery`. No body. Catalog
+        // FILE_VERSION 20+.
+        DataType::TsQuery => out.push(23),
     }
 }
 
@@ -4781,6 +4847,10 @@ impl Cursor<'_> {
             // v7.11.12: tags 20/21 for INT[]/BIGINT[]. FILE_VERSION 19+.
             20 => Ok(DataType::IntArray),
             21 => Ok(DataType::BigIntArray),
+            // v7.12.0: tags 22/23 for tsvector / tsquery. Catalog
+            // FILE_VERSION 20+.
+            22 => Ok(DataType::TsVector),
+            23 => Ok(DataType::TsQuery),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -4861,6 +4931,19 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         // u8 null + (when non-null) fixed-width LE].
         Value::IntArray(items) => 2 + items.iter().map(|x| if x.is_some() { 5 } else { 1 }).sum::<usize>(),
         Value::BigIntArray(items) => 2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>(),
+        // v7.12.0: tsvector dense body — [u16 lexeme_count][per
+        // lex: u16 word_len + utf-8 word + u16 pos_count + (u16
+        // LE * pos_count) + u8 weight].
+        Value::TsVector(lexs) => {
+            let mut n = 2;
+            for l in lexs {
+                n += 2 + l.word.len() + 2 + 2 * l.positions.len() + 1;
+            }
+            n
+        }
+        // v7.12.0: tsquery dense body — prefix-coded tree.
+        // Sizing must match `write_tsquery_body` walker.
+        Value::TsQuery(ast) => tsquery_encoded_len(ast),
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -5065,6 +5148,11 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 }
             }
         }
+        // v7.12.0: tsvector dense body — see `value_body_encoded_len`
+        // for layout. Lexemes are written in their already-sorted order.
+        (Value::TsVector(lexs), DataType::TsVector) => write_tsvector_body(out, lexs),
+        // v7.12.0: tsquery dense body — prefix-coded tree.
+        (Value::TsQuery(ast), DataType::TsQuery) => write_tsquery_body(out, ast),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -5218,6 +5306,85 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
                     }
                 }
             }
+        }
+        // v7.12.0: tsvector — tag 18. Body shape matches
+        // `write_tsvector_body`.
+        Value::TsVector(lexs) => {
+            out.push(18);
+            write_tsvector_body(out, lexs);
+        }
+        // v7.12.0: tsquery — tag 19. Body shape matches
+        // `write_tsquery_body`.
+        Value::TsQuery(ast) => {
+            out.push(19);
+            write_tsquery_body(out, ast);
+        }
+    }
+}
+
+/// v7.12.0: shared tsvector body writer (used by both dense and
+/// schema-agnostic codecs).
+fn write_tsvector_body(out: &mut Vec<u8>, lexs: &[TsLexeme]) {
+    let count = u16::try_from(lexs.len()).expect("tsvector ≤ 65k lexemes");
+    out.extend_from_slice(&count.to_le_bytes());
+    for l in lexs {
+        let wlen = u16::try_from(l.word.len()).expect("tsvector word ≤ 64 KiB");
+        out.extend_from_slice(&wlen.to_le_bytes());
+        out.extend_from_slice(l.word.as_bytes());
+        let plen = u16::try_from(l.positions.len()).expect("tsvector pos count ≤ 65k");
+        out.extend_from_slice(&plen.to_le_bytes());
+        for p in &l.positions {
+            out.extend_from_slice(&p.to_le_bytes());
+        }
+        out.push(l.weight);
+    }
+}
+
+/// v7.12.0: shared tsquery body writer. Prefix-coded tree: each
+/// node starts with `[u8 tag]` then a tag-specific payload. Tags:
+/// 0=Term, 1=And, 2=Or, 3=Not, 4=Phrase.
+fn write_tsquery_body(out: &mut Vec<u8>, ast: &TsQueryAst) {
+    match ast {
+        TsQueryAst::Term { word, weight_mask } => {
+            out.push(0);
+            let len = u16::try_from(word.len()).expect("tsquery term ≤ 64 KiB");
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(word.as_bytes());
+            out.push(*weight_mask);
+        }
+        TsQueryAst::And(a, b) => {
+            out.push(1);
+            write_tsquery_body(out, a);
+            write_tsquery_body(out, b);
+        }
+        TsQueryAst::Or(a, b) => {
+            out.push(2);
+            write_tsquery_body(out, a);
+            write_tsquery_body(out, b);
+        }
+        TsQueryAst::Not(x) => {
+            out.push(3);
+            write_tsquery_body(out, x);
+        }
+        TsQueryAst::Phrase { left, right, distance } => {
+            out.push(4);
+            out.extend_from_slice(&distance.to_le_bytes());
+            write_tsquery_body(out, left);
+            write_tsquery_body(out, right);
+        }
+    }
+}
+
+/// v7.12.0: byte length that `write_tsquery_body` would emit.
+fn tsquery_encoded_len(ast: &TsQueryAst) -> usize {
+    match ast {
+        TsQueryAst::Term { word, .. } => 1 + 2 + word.len() + 1,
+        TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
+            1 + tsquery_encoded_len(a) + tsquery_encoded_len(b)
+        }
+        TsQueryAst::Not(x) => 1 + tsquery_encoded_len(x),
+        TsQueryAst::Phrase { left, right, .. } => {
+            1 + 2 + tsquery_encoded_len(left) + tsquery_encoded_len(right)
         }
     }
 }
@@ -5466,6 +5633,71 @@ impl<'a> Cursor<'a> {
                 }
                 Ok(Value::BigIntArray(items))
             }
+            // v7.12.0: tsvector dense body — [u16 lex_count]
+            // [per lex: u16 word_len + utf-8 word + u16 pos_count
+            // + (u16 LE * pos_count) + u8 weight].
+            DataType::TsVector => Ok(Value::TsVector(self.read_tsvector_body()?)),
+            DataType::TsQuery => Ok(Value::TsQuery(self.read_tsquery_body()?)),
+        }
+    }
+
+    /// v7.12.0 — read a tsvector body emitted by `write_tsvector_body`.
+    fn read_tsvector_body(&mut self) -> Result<Vec<TsLexeme>, StorageError> {
+        let count = self.read_u16()? as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let word = self.read_str()?;
+            let pos_count = self.read_u16()? as usize;
+            let mut positions = Vec::with_capacity(pos_count);
+            for _ in 0..pos_count {
+                positions.push(self.read_u16()?);
+            }
+            let weight = self.read_u8()?;
+            out.push(TsLexeme {
+                word,
+                positions,
+                weight,
+            });
+        }
+        Ok(out)
+    }
+
+    /// v7.12.0 — read a tsquery body emitted by `write_tsquery_body`.
+    fn read_tsquery_body(&mut self) -> Result<TsQueryAst, StorageError> {
+        let tag = self.read_u8()?;
+        match tag {
+            0 => {
+                let word = self.read_str()?;
+                let weight_mask = self.read_u8()?;
+                Ok(TsQueryAst::Term { word, weight_mask })
+            }
+            1 => {
+                let a = self.read_tsquery_body()?;
+                let b = self.read_tsquery_body()?;
+                Ok(TsQueryAst::And(Box::new(a), Box::new(b)))
+            }
+            2 => {
+                let a = self.read_tsquery_body()?;
+                let b = self.read_tsquery_body()?;
+                Ok(TsQueryAst::Or(Box::new(a), Box::new(b)))
+            }
+            3 => {
+                let x = self.read_tsquery_body()?;
+                Ok(TsQueryAst::Not(Box::new(x)))
+            }
+            4 => {
+                let distance = self.read_u16()?;
+                let left = self.read_tsquery_body()?;
+                let right = self.read_tsquery_body()?;
+                Ok(TsQueryAst::Phrase {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    distance,
+                })
+            }
+            other => Err(StorageError::Corrupt(format!(
+                "tsquery: unknown node tag {other}"
+            ))),
         }
     }
 
@@ -5575,6 +5807,11 @@ impl<'a> Cursor<'a> {
                 }
                 Ok(Value::BigIntArray(items))
             }
+            // v7.12.0: tag 18 — tsvector. Body matches the dense
+            // form (`read_tsvector_body`).
+            18 => Ok(Value::TsVector(self.read_tsvector_body()?)),
+            // v7.12.0: tag 19 — tsquery.
+            19 => Ok(Value::TsQuery(self.read_tsquery_body()?)),
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }

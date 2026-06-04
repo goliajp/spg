@@ -669,6 +669,8 @@ fn render_data_type(ty: DataType) -> String {
         DataType::TextArray => "TEXT[]".into(),
         DataType::IntArray => "INT[]".into(),
         DataType::BigIntArray => "BIGINT[]".into(),
+        DataType::TsVector => "TSVECTOR".into(),
+        DataType::TsQuery => "TSQUERY".into(),
     }
 }
 
@@ -9396,6 +9398,8 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::TextArray => DataType::TextArray,
         ColumnTypeName::IntArray => DataType::IntArray,
         ColumnTypeName::BigIntArray => DataType::BigIntArray,
+        ColumnTypeName::TsVector => DataType::TsVector,
+        ColumnTypeName::TsQuery => DataType::TsQuery,
     }
 }
 
