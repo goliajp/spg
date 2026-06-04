@@ -588,6 +588,12 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // (~4 elements × element size).
                 DataType::IntArray => 16,
                 DataType::BigIntArray => 32,
+                // v7.12.0 — tsvector averages ~80 lexemes × ~8B
+                // each per the v7.12 design risk register R2.
+                DataType::TsVector => 640,
+                // tsquery rarely persists as a column (usually a
+                // literal); rough sizing matches a small AST.
+                DataType::TsQuery => 64,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

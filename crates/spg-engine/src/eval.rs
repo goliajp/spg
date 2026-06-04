@@ -15,12 +15,13 @@
 //! v0.4 deliberately does *not* implement: function calls, string
 //! concatenation, IS NULL / IS NOT NULL, BETWEEN, IN, etc. Those come later.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use spg_sql::ast::{BinOp, CastTarget, ColumnName, Expr, Literal, UnOp};
-use spg_storage::{ColumnSchema, DataType, Row, Value};
+use spg_storage::{ColumnSchema, DataType, Row, TsLexeme, TsQueryAst, Value};
 
 /// Resolution context for evaluating a single row. `table_alias` is the alias
 /// (or table name) callers should accept as the qualifier on a column ref —
@@ -1540,6 +1541,32 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
         // IntArray as appropriate.
         CastTarget::IntArray => cast_to_int_array(v),
         CastTarget::BigIntArray => cast_to_bigint_array(v),
+        // v7.12.0 — `::tsvector` / `::tsquery`. Decodes PG external
+        // form when input is Text; passes through unchanged when the
+        // input is already the target type. Other inputs are a type
+        // mismatch. Lexer / Porter stemmer arrive in v7.12.1; the
+        // external-form cast at v7.12.0 is the path pg_dump and
+        // direct-literal callers use.
+        CastTarget::TsVector => match v {
+            Value::TsVector(items) => Ok(Value::TsVector(items)),
+            Value::Text(s) => decode_tsvector_external(&s).map(Value::TsVector),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::tsvector only accepts TEXT / tsvector inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
+        CastTarget::TsQuery => match v {
+            Value::TsQuery(ast) => Ok(Value::TsQuery(ast)),
+            Value::Text(s) => decode_tsquery_external(&s).map(Value::TsQuery),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::tsquery only accepts TEXT / tsquery inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
     }
 }
 
@@ -1866,6 +1893,15 @@ fn value_to_text(v: &Value) -> String {
         Value::Timestamp(t) => format_timestamp(*t),
         Value::Interval { months, micros } => format_interval(*months, *micros),
         Value::Null => "NULL".into(),
+        // v7.10.4 — BYTEA renders as PG hex form.
+        Value::Bytes(b) => format_bytea_hex(b),
+        // v7.10.9 — TEXT[] / INT[] / BIGINT[] render PG external form.
+        Value::TextArray(items) => format_text_array(items),
+        Value::IntArray(items) => format_int_array(items),
+        Value::BigIntArray(items) => format_bigint_array(items),
+        // v7.12.0 — tsvector / tsquery render PG external form.
+        Value::TsVector(lexs) => format_tsvector(lexs),
+        Value::TsQuery(ast) => format_tsquery(ast),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }
@@ -2167,6 +2203,446 @@ pub fn format_bigint_array(items: &[Option<i64>]) -> String {
     }
     out.push('}');
     out
+}
+
+/// v7.12.0 — render a `tsvector` in PG's external form:
+/// `'lex':1,2A 'word':3` (single-quoted lexemes, optional
+/// `:positions`, optional weight letter `A/B/C/D` per position).
+/// Lexemes already arrive sorted + deduped from the engine. Used
+/// by the wire layer (OID 3614) and by SELECT-text output.
+pub fn format_tsvector(lexs: &[TsLexeme]) -> String {
+    let mut out = String::with_capacity(lexs.len() * 12);
+    for (i, l) in lexs.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push('\'');
+        for c in l.word.chars() {
+            if c == '\'' {
+                out.push('\'');
+            }
+            out.push(c);
+        }
+        out.push('\'');
+        if !l.positions.is_empty() {
+            for (pi, p) in l.positions.iter().enumerate() {
+                out.push(if pi == 0 { ':' } else { ',' });
+                out.push_str(&p.to_string());
+            }
+            // v7.12.0 — weight is per-lexeme (the v7.12 design
+            // collapses PG's per-position weight into one letter).
+            // Emit once after the last position; default `D`
+            // (weight=0) stays implicit.
+            match l.weight {
+                3 => out.push('A'),
+                2 => out.push('B'),
+                1 => out.push('C'),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// v7.12.0 — render a `tsquery` in PG's external form. Operator
+/// precedence: `!` > `&` > `|`. Phrase distance shown as `<N>`.
+pub fn format_tsquery(ast: &TsQueryAst) -> String {
+    fn go(ast: &TsQueryAst, parent_prec: u8, out: &mut String) {
+        // 0 = top, 1 = OR, 2 = AND, 3 = NOT/Phrase, 4 = atom.
+        let (own_prec, write_self): (u8, &dyn Fn(&mut String)) = match ast {
+            TsQueryAst::Or(_, _) => (1, &|_| {}),
+            TsQueryAst::And(_, _) | TsQueryAst::Phrase { .. } => (2, &|_| {}),
+            TsQueryAst::Not(_) => (3, &|_| {}),
+            TsQueryAst::Term { .. } => (4, &|_| {}),
+        };
+        let need_parens = own_prec < parent_prec;
+        if need_parens {
+            out.push('(');
+        }
+        match ast {
+            TsQueryAst::Term { word, .. } => {
+                out.push('\'');
+                for c in word.chars() {
+                    if c == '\'' {
+                        out.push('\'');
+                    }
+                    out.push(c);
+                }
+                out.push('\'');
+            }
+            TsQueryAst::And(a, b) => {
+                go(a, own_prec, out);
+                out.push_str(" & ");
+                go(b, own_prec, out);
+            }
+            TsQueryAst::Or(a, b) => {
+                go(a, own_prec, out);
+                out.push_str(" | ");
+                go(b, own_prec, out);
+            }
+            TsQueryAst::Not(x) => {
+                out.push('!');
+                go(x, own_prec, out);
+            }
+            TsQueryAst::Phrase { left, right, distance } => {
+                go(left, own_prec, out);
+                out.push_str(&alloc::format!(" <{distance}> "));
+                go(right, own_prec, out);
+            }
+        }
+        write_self(out);
+        if need_parens {
+            out.push(')');
+        }
+    }
+    let mut out = String::new();
+    go(ast, 0, &mut out);
+    out
+}
+
+/// v7.12.0 — decode PG external form `'word':1,2A 'other':3` into
+/// a `Vec<TsLexeme>`. Lexemes are sorted ascending by `word` (with
+/// duplicates merged on positions) so the output matches the
+/// engine invariant. Empty input yields an empty vector.
+///
+/// v7.12.0 only ships the cast-literal entry. Full `to_tsvector`
+/// (Unicode word-split + Porter stemming + stopwords) lands in
+/// v7.12.1.
+pub fn decode_tsvector_external(s: &str) -> Result<Vec<TsLexeme>, EvalError> {
+    let mut out: Vec<TsLexeme> = Vec::new();
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Quoted form `'word'` (with embedded `''` for a literal
+        // single quote, mirroring PG).
+        let word = if bytes[i] == b'\'' {
+            i += 1;
+            let mut w = String::new();
+            loop {
+                if i >= bytes.len() {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "tsvector literal: unterminated quoted lexeme".into(),
+                    });
+                }
+                let b = bytes[i];
+                if b == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        w.push('\'');
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    w.push(b as char);
+                    i += 1;
+                }
+            }
+            w
+        } else {
+            // Bare form — read until whitespace, ':' or end.
+            let start = i;
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && bytes[i] != b':'
+            {
+                i += 1;
+            }
+            core::str::from_utf8(&bytes[start..i])
+                .map_err(|_| EvalError::TypeMismatch {
+                    detail: "tsvector literal: non-UTF-8 lexeme".into(),
+                })?
+                .to_string()
+        };
+        if word.is_empty() {
+            return Err(EvalError::TypeMismatch {
+                detail: "tsvector literal: empty lexeme".into(),
+            });
+        }
+        // Optional `:pos[,pos][,pos]`. Each position is u16; each
+        // may carry a trailing weight letter A/B/C/D.
+        let mut positions: Vec<u16> = Vec::new();
+        let mut weight: u8 = 0;
+        if i < bytes.len() && bytes[i] == b':' {
+            i += 1;
+            loop {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if start == i {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "tsvector literal: expected digit after ':'".into(),
+                    });
+                }
+                let num: u16 = core::str::from_utf8(&bytes[start..i])
+                    .expect("ascii digits")
+                    .parse()
+                    .map_err(|_| EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "tsvector literal: position {} overflows u16",
+                            core::str::from_utf8(&bytes[start..i]).unwrap_or("?")
+                        ),
+                    })?;
+                positions.push(num);
+                if i < bytes.len() {
+                    let w = bytes[i];
+                    if matches!(w, b'A' | b'B' | b'C' | b'D') {
+                        weight = match w {
+                            b'A' => 3,
+                            b'B' => 2,
+                            b'C' => 1,
+                            _ => 0,
+                        };
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() && bytes[i] == b',' {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        // Merge into the output vector — sorted insert by word,
+        // duplicate words merge positions.
+        match out.binary_search_by(|l| l.word.as_str().cmp(word.as_str())) {
+            Ok(idx) => {
+                for p in positions {
+                    if !out[idx].positions.contains(&p) {
+                        out[idx].positions.push(p);
+                    }
+                }
+                out[idx].positions.sort_unstable();
+                if weight != 0 {
+                    out[idx].weight = weight;
+                }
+            }
+            Err(idx) => {
+                out.insert(
+                    idx,
+                    TsLexeme {
+                        word,
+                        positions,
+                        weight,
+                    },
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// v7.12.0 — decode PG external form `'foo' & 'bar' | !'baz'`
+/// into a `TsQueryAst`. v7.12.0 supports the canonical
+/// `to_tsquery` surface: single-quoted lexemes, `&` / `|` / `!`,
+/// parens, and phrase `<N>`. Bare lexemes are accepted too. Full
+/// `plainto_tsquery` / `websearch_to_tsquery` arrive in v7.12.1.
+pub fn decode_tsquery_external(s: &str) -> Result<TsQueryAst, EvalError> {
+    let mut p = TsQueryParser {
+        bytes: s.as_bytes(),
+        pos: 0,
+    };
+    p.skip_ws();
+    if p.pos >= p.bytes.len() {
+        return Err(EvalError::TypeMismatch {
+            detail: "tsquery literal: empty".into(),
+        });
+    }
+    let ast = p.parse_or()?;
+    p.skip_ws();
+    if p.pos < p.bytes.len() {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "tsquery literal: trailing garbage at offset {}",
+                p.pos
+            ),
+        });
+    }
+    Ok(ast)
+}
+
+struct TsQueryParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> TsQueryParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+    fn parse_or(&mut self) -> Result<TsQueryAst, EvalError> {
+        let mut lhs = self.parse_and()?;
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'|') {
+                return Ok(lhs);
+            }
+            self.pos += 1;
+            let rhs = self.parse_and()?;
+            lhs = TsQueryAst::Or(Box::new(lhs), Box::new(rhs));
+        }
+    }
+    fn parse_and(&mut self) -> Result<TsQueryAst, EvalError> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'&') => {
+                    self.pos += 1;
+                    let rhs = self.parse_unary()?;
+                    lhs = TsQueryAst::And(Box::new(lhs), Box::new(rhs));
+                }
+                Some(b'<') => {
+                    // Phrase distance `<N>`.
+                    self.pos += 1;
+                    let start = self.pos;
+                    while self.pos < self.bytes.len()
+                        && self.bytes[self.pos].is_ascii_digit()
+                    {
+                        self.pos += 1;
+                    }
+                    if start == self.pos || self.peek() != Some(b'>') {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "tsquery literal: malformed <N> phrase operator".into(),
+                        });
+                    }
+                    let n: u16 = core::str::from_utf8(&self.bytes[start..self.pos])
+                        .expect("ascii digits")
+                        .parse()
+                        .map_err(|_| EvalError::TypeMismatch {
+                            detail: "tsquery literal: phrase distance overflows u16".into(),
+                        })?;
+                    self.pos += 1; // consume '>'
+                    let rhs = self.parse_unary()?;
+                    lhs = TsQueryAst::Phrase {
+                        left: Box::new(lhs),
+                        right: Box::new(rhs),
+                        distance: n,
+                    };
+                }
+                _ => return Ok(lhs),
+            }
+        }
+    }
+    fn parse_unary(&mut self) -> Result<TsQueryAst, EvalError> {
+        self.skip_ws();
+        if self.peek() == Some(b'!') {
+            self.pos += 1;
+            let inner = self.parse_unary()?;
+            return Ok(TsQueryAst::Not(Box::new(inner)));
+        }
+        self.parse_atom()
+    }
+    fn parse_atom(&mut self) -> Result<TsQueryAst, EvalError> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'(') => {
+                self.pos += 1;
+                let inner = self.parse_or()?;
+                self.skip_ws();
+                if self.peek() != Some(b')') {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "tsquery literal: missing ')'".into(),
+                    });
+                }
+                self.pos += 1;
+                Ok(inner)
+            }
+            Some(b'\'') => {
+                self.pos += 1;
+                let mut w = String::new();
+                loop {
+                    match self.peek() {
+                        None => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: "tsquery literal: unterminated quoted lexeme".into(),
+                            });
+                        }
+                        Some(b'\'') => {
+                            if self.bytes.get(self.pos + 1) == Some(&b'\'') {
+                                w.push('\'');
+                                self.pos += 2;
+                            } else {
+                                self.pos += 1;
+                                break;
+                            }
+                        }
+                        Some(b) => {
+                            w.push(b as char);
+                            self.pos += 1;
+                        }
+                    }
+                }
+                // Optional `:WEIGHT_MASK` (digit-mask) — v7.12.0
+                // accepts but always stores 0 (any).
+                self.skip_weight_suffix();
+                Ok(TsQueryAst::Term {
+                    word: w,
+                    weight_mask: 0,
+                })
+            }
+            Some(b) if b.is_ascii_alphanumeric() || b == b'_' => {
+                let start = self.pos;
+                while self.pos < self.bytes.len() {
+                    let c = self.bytes[self.pos];
+                    if c.is_ascii_alphanumeric() || c == b'_' {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let w = core::str::from_utf8(&self.bytes[start..self.pos])
+                    .map_err(|_| EvalError::TypeMismatch {
+                        detail: "tsquery literal: non-UTF-8 lexeme".into(),
+                    })?
+                    .to_string();
+                self.skip_weight_suffix();
+                Ok(TsQueryAst::Term {
+                    word: w,
+                    weight_mask: 0,
+                })
+            }
+            Some(b) => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "tsquery literal: unexpected byte {:?} at offset {}",
+                    b as char,
+                    self.pos
+                ),
+            }),
+            None => Err(EvalError::TypeMismatch {
+                detail: "tsquery literal: expected term".into(),
+            }),
+        }
+    }
+    fn skip_weight_suffix(&mut self) {
+        if self.peek() != Some(b':') {
+            return;
+        }
+        self.pos += 1;
+        while let Some(b) = self.peek() {
+            if matches!(b, b'A' | b'B' | b'C' | b'D' | b'a' | b'b' | b'c' | b'd' | b'*')
+                || b.is_ascii_digit()
+            {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// v7.10.4 — render a BYTEA payload in PG's hex output format

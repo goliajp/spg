@@ -511,6 +511,13 @@ pub enum ColumnTypeName {
     /// v7.11.13 `BIGINT[]` — single-dimension i64 array. PG wire
     /// OID 1016.
     BigIntArray,
+    /// v7.12.0 `tsvector` — PG full-text search lexeme set. PG
+    /// wire OID 3614. Literal: `'foo:1 bar:2'::tsvector` (PG
+    /// external form). G-CRIT-3.
+    TsVector,
+    /// v7.12.0 `tsquery` — PG full-text search parse tree. PG
+    /// wire OID 3615.
+    TsQuery,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -535,6 +542,8 @@ impl fmt::Display for ColumnTypeName {
             Self::TextArray => f.write_str("TEXT[]"),
             Self::IntArray => f.write_str("INT[]"),
             Self::BigIntArray => f.write_str("BIGINT[]"),
+            Self::TsVector => f.write_str("TSVECTOR"),
+            Self::TsQuery => f.write_str("TSQUERY"),
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
@@ -1024,6 +1033,11 @@ pub enum CastTarget {
     /// integer-shaped.
     IntArray,
     BigIntArray,
+    /// v7.12.0 — `::tsvector` / `::tsquery`. Decodes the PG
+    /// external form text representation. Used by pg_dump output
+    /// and by `WHERE col @@ 'term'::tsquery` literal patterns.
+    TsVector,
+    TsQuery,
 }
 
 impl fmt::Display for CastTarget {
@@ -1046,6 +1060,8 @@ impl fmt::Display for CastTarget {
             Self::TextArray => "TEXT[]",
             Self::IntArray => "INT[]",
             Self::BigIntArray => "BIGINT[]",
+            Self::TsVector => "tsvector",
+            Self::TsQuery => "tsquery",
         })
     }
 }

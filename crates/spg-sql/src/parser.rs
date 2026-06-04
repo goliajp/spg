@@ -1878,6 +1878,12 @@ impl Parser {
             // resolver. Literal forms are handled at coerce_value
             // time so the lexer stays untouched.
             "bytea" | "bytes" => ColumnTypeName::Bytes,
+            // v7.12.0 — PG full-text search types. mailrs G-CRIT-3.
+            // The actual `to_tsvector` / `@@` / `ts_rank` surface
+            // arrives in v7.12.1+; the type itself loads here so
+            // mailrs's `scripts/init-schema.sql` runs unmodified.
+            "tsvector" => ColumnTypeName::TsVector,
+            "tsquery" => ColumnTypeName::TsQuery,
             other => {
                 return Err(ParseError {
                     message: format!("unsupported column type {other:?}"),
@@ -2754,6 +2760,11 @@ impl Parser {
                         "jsonb" => CastTarget::Jsonb,
                         "regtype" => CastTarget::RegType,
                         "regclass" => CastTarget::RegClass,
+                        // v7.12.0 — `::tsvector` / `::tsquery`.
+                        // Engine decodes the LHS text via the PG
+                        // external form parser.
+                        "tsvector" => CastTarget::TsVector,
+                        "tsquery" => CastTarget::TsQuery,
                         other => {
                             return Err(ParseError {
                                 message: format!("unsupported cast target `::{other}`"),

@@ -157,6 +157,9 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
                 CastTarget::TextArray => DataType::TextArray,
                 CastTarget::IntArray => DataType::IntArray,
                 CastTarget::BigIntArray => DataType::BigIntArray,
+                // v7.12.0 — `::tsvector` / `::tsquery`.
+                CastTarget::TsVector => DataType::TsVector,
+                CastTarget::TsQuery => DataType::TsQuery,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),
