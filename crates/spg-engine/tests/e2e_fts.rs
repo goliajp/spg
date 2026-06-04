@@ -218,6 +218,183 @@ fn set_pg_catalog_qualified_config_accepted() {
     assert_eq!(lexs[0].word, "run");
 }
 
+// --- v7.12.2: @@ match operator + ts_rank ---
+
+fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
+    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    match r {
+        spg_engine::QueryResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn ts_match_simple_lexeme_present() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT to_tsvector('english', 'the quick brown fox') @@ \
+         to_tsquery('english', 'fox')",
+    );
+    assert!(matches!(v, Value::Bool(true)), "got {v:?}");
+}
+
+#[test]
+fn ts_match_lexeme_absent_false() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT to_tsvector('english', 'the quick brown fox') @@ \
+         to_tsquery('english', 'badger')",
+    );
+    assert!(matches!(v, Value::Bool(false)), "got {v:?}");
+}
+
+#[test]
+fn ts_match_null_propagates() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT NULL::tsvector @@ to_tsquery('english', 'fox')",
+    );
+    assert!(matches!(v, Value::Null), "got {v:?}");
+}
+
+#[test]
+fn ts_match_reverse_ordering_also_parses() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT to_tsquery('english', 'fox') @@ \
+         to_tsvector('english', 'fox jumps over')",
+    );
+    assert!(matches!(v, Value::Bool(true)), "got {v:?}");
+}
+
+#[test]
+fn ts_match_and_or_not_3vl() {
+    let mut e = eng();
+    let vec = "to_tsvector('english', 'cats run fast')";
+    let cases = [
+        ("'cat & fast'", true),
+        ("'cat & badger'", false),
+        ("'cat | badger'", true),
+        ("'!cat'", false),
+        ("'!badger'", true),
+    ];
+    for (q, expected) in cases {
+        let v = first_value(
+            &mut e,
+            &format!("SELECT {vec} @@ to_tsquery('english', {q})"),
+        );
+        assert!(
+            matches!(v, Value::Bool(b) if b == expected),
+            "{q} → expected {expected}, got {v:?}"
+        );
+    }
+}
+
+#[test]
+fn ts_match_filters_rows_in_table() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, body TEXT NOT NULL)");
+    ok(&mut e, "INSERT INTO m VALUES (1, 'the quick brown fox')");
+    ok(&mut e, "INSERT INTO m VALUES (2, 'lazy cats sleep')");
+    ok(&mut e, "INSERT INTO m VALUES (3, 'foxes hunt rabbits')");
+    let r = rows(
+        &mut e,
+        "SELECT id FROM m WHERE to_tsvector('english', body) @@ to_tsquery('english', 'fox')",
+    );
+    let ids: Vec<i32> = r
+        .into_iter()
+        .map(|row| match &row.values[0] {
+            Value::Int(n) => *n,
+            other => panic!("expected int id, got {other:?}"),
+        })
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![1, 3]);
+}
+
+#[test]
+fn ts_rank_returns_positive_float_when_matched() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT ts_rank(to_tsvector('english', 'the quick brown fox'), \
+                         to_tsquery('english', 'fox & quick'))",
+    );
+    match v {
+        Value::Float(x) => assert!(x > 0.0, "expected positive rank, got {x}"),
+        other => panic!("expected float, got {other:?}"),
+    }
+}
+
+#[test]
+fn ts_rank_zero_when_no_match() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT ts_rank(to_tsvector('english', 'the quick brown fox'), \
+                         to_tsquery('english', 'badger'))",
+    );
+    match v {
+        Value::Float(x) => assert_eq!(x, 0.0),
+        other => panic!("expected float, got {other:?}"),
+    }
+}
+
+#[test]
+fn ts_rank_cd_returns_positive_when_matched() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT ts_rank_cd(to_tsvector('english', 'quick brown fox jumps'), \
+                            to_tsquery('english', 'fox & quick'))",
+    );
+    match v {
+        Value::Float(x) => assert!(x > 0.0, "expected positive rank, got {x}"),
+        other => panic!("expected float, got {other:?}"),
+    }
+}
+
+#[test]
+fn ts_rank_orders_select_by_relevance() {
+    // mailrs's exact query shape: ORDER BY ts_rank(search_vector, q) DESC.
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, body TEXT NOT NULL)");
+    ok(&mut e, "INSERT INTO m VALUES (1, 'fox')");
+    ok(&mut e, "INSERT INTO m VALUES (2, 'fox quick fox brown fox')");
+    ok(&mut e, "INSERT INTO m VALUES (3, 'fox jumps')");
+    let r = rows(
+        &mut e,
+        "SELECT id FROM m \
+         WHERE to_tsvector('english', body) @@ to_tsquery('english', 'fox') \
+         ORDER BY ts_rank(to_tsvector('english', body), to_tsquery('english', 'fox')) DESC \
+         LIMIT 3",
+    );
+    let ids: Vec<i32> = r
+        .into_iter()
+        .map(|row| match &row.values[0] {
+            Value::Int(n) => *n,
+            other => panic!("expected int id, got {other:?}"),
+        })
+        .collect();
+    // Row 2 has 3 occurrences of 'fox' → top.
+    assert_eq!(ids[0], 2, "row 2 (3× fox) should rank first; got {ids:?}");
+}
+
+#[test]
+fn ts_rank_null_input_returns_null() {
+    let mut e = eng();
+    let v = first_value(
+        &mut e,
+        "SELECT ts_rank(NULL::tsvector, to_tsquery('english', 'fox'))",
+    );
+    assert!(matches!(v, Value::Null), "got {v:?}");
+}
+
 // --- v7.12.0 carry-forward: cast literal round trip ---
 
 #[test]

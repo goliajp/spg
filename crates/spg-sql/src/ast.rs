@@ -1164,6 +1164,10 @@ pub enum BinOp {
     /// when every key/value in `sub_json` is structurally present in
     /// the left side. Matches PG semantics (top-level + recursive).
     JsonContains,
+    /// v7.12.2 `tsvector @@ tsquery` — FTS match. Returns BOOL;
+    /// 3VL on NULL. Symmetric: PG also accepts `tsquery @@
+    /// tsvector` and engine eval normalises either ordering.
+    TsMatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1853,6 +1857,7 @@ impl fmt::Display for BinOp {
             Self::JsonGetPath => "#>",
             Self::JsonGetPathText => "#>>",
             Self::JsonContains => "@>",
+            Self::TsMatch => "@@",
         })
     }
 }

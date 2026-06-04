@@ -83,6 +83,10 @@ pub enum Token {
     /// every key/value in `sub` is present in `j` with structural
     /// containment for objects + arrays.
     JsonContains,
+    /// v7.12.2 `@@` — tsvector / tsquery match. Either ordering
+    /// (`vec @@ q` or `q @@ vec`) parses; engine eval normalises
+    /// before matching.
+    TsMatch,
     L2Distance,
     /// pgvector inner-product operator `<#>` (returns negative dot product
     /// so smaller still means more similar — same semantics as pgvector).
@@ -301,9 +305,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 }
             }
             // v6.4.5: `@>` JSON containment.
+            // v7.12.2: `@@` tsvector / tsquery match.
             b'@' => {
                 if peek_eq(bytes, i + 1, b'>') {
                     out.push(Token::JsonContains);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'@') {
+                    out.push(Token::TsMatch);
                     i += 2;
                 } else {
                     return Err(LexError {

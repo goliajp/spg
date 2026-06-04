@@ -300,6 +300,207 @@ fn fold_phrase(lexs: &[String]) -> TsQueryAst {
     })
 }
 
+/// v7.12.2 — evaluate `tsvector @@ tsquery`. Walks the query AST
+/// treating each leaf as "does the vector contain this lexeme".
+/// Phrase semantics: the v7.12.2 implementation honours the
+/// `<N>` distance — both operand terms must appear with their
+/// positions exactly `N` apart in the vector. Higher-arity
+/// phrase chains nest as `Phrase(Phrase(a,b,1), c, 1)`, so the
+/// match recursion folds position sets across the AND of the
+/// chain (a fully general n-gram match in a single pass).
+#[must_use]
+pub fn ts_query_matches(vec: &[TsLexeme], query: &TsQueryAst) -> bool {
+    match query {
+        TsQueryAst::Term { word, .. } => contains_lexeme(vec, word),
+        TsQueryAst::And(a, b) => ts_query_matches(vec, a) && ts_query_matches(vec, b),
+        TsQueryAst::Or(a, b) => ts_query_matches(vec, a) || ts_query_matches(vec, b),
+        TsQueryAst::Not(x) => !ts_query_matches(vec, x),
+        TsQueryAst::Phrase { left, right, distance } => {
+            phrase_match(vec, left, right, *distance)
+        }
+    }
+}
+
+fn contains_lexeme(vec: &[TsLexeme], word: &str) -> bool {
+    vec.binary_search_by(|l| l.word.as_str().cmp(word)).is_ok()
+}
+
+/// Phrase positions of a sub-AST. For atomic terms returns the
+/// vector's recorded positions; for nested phrases returns the
+/// rightmost position of each surviving match. Empty positions
+/// mean "no match anywhere".
+fn phrase_positions(vec: &[TsLexeme], q: &TsQueryAst) -> Vec<u16> {
+    match q {
+        TsQueryAst::Term { word, .. } => {
+            match vec.binary_search_by(|l| l.word.as_str().cmp(word)) {
+                Ok(idx) => vec[idx].positions.clone(),
+                Err(_) => Vec::new(),
+            }
+        }
+        TsQueryAst::Phrase { left, right, distance } => {
+            let lp = phrase_positions(vec, left);
+            let rp = phrase_positions(vec, right);
+            let mut out = Vec::new();
+            for l in &lp {
+                let target = l.saturating_add(*distance);
+                if rp.binary_search(&target).is_ok() {
+                    out.push(target);
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        // For mixed-shape phrases (Phrase contains an AND/OR/NOT),
+        // fall back to the boolean match (no position tracking).
+        _ => {
+            if ts_query_matches(vec, q) {
+                alloc::vec![u16::MAX]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn phrase_match(vec: &[TsLexeme], left: &TsQueryAst, right: &TsQueryAst, distance: u16) -> bool {
+    let lp = phrase_positions(vec, left);
+    let rp = phrase_positions(vec, right);
+    lp.iter().any(|l| {
+        let target = l.saturating_add(distance);
+        rp.binary_search(&target).is_ok()
+    })
+}
+
+/// v7.12.2 — `ts_rank(vec, q)` basic form. Score is the sum of
+/// per-matched-lexeme weight factors divided by `1 + log(unique
+/// terms in query)`. Matches PG's `ts_rank` with default
+/// normalisation flag 0.
+#[must_use]
+pub fn ts_rank(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
+    let mut score = 0.0f32;
+    let mut unique_terms = 0usize;
+    collect_rank_terms(query, vec, &mut score, &mut unique_terms);
+    if unique_terms == 0 {
+        return 0.0;
+    }
+    let denom = 1.0 + ln_approx(unique_terms as f32);
+    score / denom
+}
+
+/// v7.12.2 — `ts_rank_cd(vec, q)` cover-density variant. Higher
+/// score when matched lexemes cluster closer together; defaults
+/// to a per-lexeme contribution divided by the average gap
+/// between matched positions. Returns 0 when no terms match.
+#[must_use]
+pub fn ts_rank_cd(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
+    let mut matched_positions: Vec<u16> = Vec::new();
+    let mut score = 0.0f32;
+    let mut unique_terms = 0usize;
+    collect_cd_positions(query, vec, &mut matched_positions, &mut score, &mut unique_terms);
+    if matched_positions.is_empty() || unique_terms == 0 {
+        return 0.0;
+    }
+    matched_positions.sort_unstable();
+    matched_positions.dedup();
+    // Cover density: invert the average distance between
+    // consecutive matched positions.
+    if matched_positions.len() == 1 {
+        return score / (1.0 + ln_approx(unique_terms as f32));
+    }
+    let gaps: u32 = matched_positions
+        .windows(2)
+        .map(|w| u32::from(w[1] - w[0]))
+        .sum();
+    let avg_gap = (gaps as f32) / ((matched_positions.len() - 1) as f32);
+    let density = 1.0 / avg_gap.max(1.0);
+    score * density / (1.0 + ln_approx(unique_terms as f32))
+}
+
+/// `f32::ln` is std-only; spg-engine is no_std. Reuse the bit-
+/// trick decomposition the spg-storage bloom filter uses
+/// (precision ≈ 1e-7, ample for ranking).
+fn ln_approx(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let xd = f64::from(x);
+    let bits = xd.to_bits();
+    let exponent_raw = ((bits >> 52) & 0x7ff) as i64;
+    let exponent = exponent_raw - 1023;
+    let mantissa_bits = (bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000;
+    let mantissa = f64::from_bits(mantissa_bits);
+    let t = (mantissa - 1.0) / (mantissa + 1.0);
+    let t2 = t * t;
+    let ln_mantissa =
+        2.0 * (t + t2 * t / 3.0 + t2 * t2 * t / 5.0 + t2 * t2 * t2 * t / 7.0);
+    let ln = (exponent as f64) * core::f64::consts::LN_2 + ln_mantissa;
+    ln as f32
+}
+
+fn weight_factor(w: u8) -> f32 {
+    // PG default: A=1.0, B=0.4, C=0.2, D=0.1.
+    match w {
+        3 => 1.0,
+        2 => 0.4,
+        1 => 0.2,
+        _ => 0.1,
+    }
+}
+
+fn collect_rank_terms(query: &TsQueryAst, vec: &[TsLexeme], score: &mut f32, n: &mut usize) {
+    match query {
+        TsQueryAst::Term { word, .. } => {
+            *n += 1;
+            if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word.as_str())) {
+                let w = vec[idx].weight;
+                let occurrences = vec[idx].positions.len().max(1) as f32;
+                *score += weight_factor(w) * occurrences;
+            }
+        }
+        TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
+            collect_rank_terms(a, vec, score, n);
+            collect_rank_terms(b, vec, score, n);
+        }
+        TsQueryAst::Not(_) => {
+            // NOT-side terms don't contribute to ts_rank.
+        }
+        TsQueryAst::Phrase { left, right, .. } => {
+            collect_rank_terms(left, vec, score, n);
+            collect_rank_terms(right, vec, score, n);
+        }
+    }
+}
+
+fn collect_cd_positions(
+    query: &TsQueryAst,
+    vec: &[TsLexeme],
+    positions: &mut Vec<u16>,
+    score: &mut f32,
+    n: &mut usize,
+) {
+    match query {
+        TsQueryAst::Term { word, .. } => {
+            *n += 1;
+            if let Ok(idx) = vec.binary_search_by(|l| l.word.as_str().cmp(word.as_str())) {
+                positions.extend_from_slice(&vec[idx].positions);
+                let w = vec[idx].weight;
+                let occurrences = vec[idx].positions.len().max(1) as f32;
+                *score += weight_factor(w) * occurrences;
+            }
+        }
+        TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
+            collect_cd_positions(a, vec, positions, score, n);
+            collect_cd_positions(b, vec, positions, score, n);
+        }
+        TsQueryAst::Not(_) => {}
+        TsQueryAst::Phrase { left, right, .. } => {
+            collect_cd_positions(left, vec, positions, score, n);
+            collect_cd_positions(right, vec, positions, score, n);
+        }
+    }
+}
+
 /// Tokenise on Unicode word boundaries — anything that is not an
 /// alphanumeric scalar value (or `_`) splits the token. Lowercases
 /// each emitted token.

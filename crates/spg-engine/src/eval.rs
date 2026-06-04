@@ -960,10 +960,95 @@ fn apply_function(
         "phraseto_tsquery" => fts_phraseto_tsquery(args, ctx),
         "websearch_to_tsquery" => fts_websearch_to_tsquery(args, ctx),
         "to_tsquery" => fts_to_tsquery(args, ctx),
+        // v7.12.2 — ranking functions. mailrs's fallback search
+        // query ORDERs BY ts_rank(search_vector, q) DESC.
+        "ts_rank" => fts_ts_rank(args),
+        "ts_rank_cd" => fts_ts_rank_cd(args),
         other => Err(EvalError::TypeMismatch {
             detail: format!("unknown function `{other}`"),
         }),
     }
+}
+
+/// v7.12.2 — `ts_rank([weights,] vec, query [, norm])`. v7.12.2
+/// supports the canonical `(vec, query)` two-arg form mailrs uses;
+/// optional weight-array / normalisation arguments error with an
+/// "unsupported" message rather than silently changing semantics.
+fn fts_ts_rank(args: &[Value]) -> Result<Value, EvalError> {
+    let (vec, query) = parse_rank_args("ts_rank", args)?;
+    match (vec, query) {
+        (None, _) | (_, None) => Ok(Value::Null),
+        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank(&v, &q)))),
+    }
+}
+
+fn fts_ts_rank_cd(args: &[Value]) -> Result<Value, EvalError> {
+    let (vec, query) = parse_rank_args("ts_rank_cd", args)?;
+    match (vec, query) {
+        (None, _) | (_, None) => Ok(Value::Null),
+        (Some(v), Some(q)) => Ok(Value::Float(f64::from(crate::fts::ts_rank_cd(&v, &q)))),
+    }
+}
+
+fn parse_rank_args(
+    name: &str,
+    args: &[Value],
+) -> Result<(Option<Vec<spg_storage::TsLexeme>>, Option<spg_storage::TsQueryAst>), EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "{name}() takes 2 args in v7.12.2 (weights array + normalisation flag are v7.12.x carve-out), got {}",
+                args.len()
+            ),
+        });
+    }
+    let vec = match &args[0] {
+        Value::Null => None,
+        Value::TsVector(v) => Some(v.clone()),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "{name}() first arg must be tsvector, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let query = match &args[1] {
+        Value::Null => None,
+        Value::TsQuery(q) => Some(q.clone()),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "{name}() second arg must be tsquery, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    Ok((vec, query))
+}
+
+/// v7.12.2 — `tsvector @@ tsquery` match operator. Either
+/// ordering accepted (PG semantics). NULL on either side → NULL.
+/// Anything that isn't tsvector/tsquery on either side is a type
+/// mismatch. Returns BOOL.
+fn ts_match(l: Value, r: Value) -> Result<Value, EvalError> {
+    let (vec, query) = match (l, r) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::TsVector(v), Value::TsQuery(q)) => (v, q),
+        (Value::TsQuery(q), Value::TsVector(v)) => (v, q),
+        (l, r) => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "@@ requires (tsvector, tsquery), got ({:?}, {:?})",
+                    l.data_type(),
+                    r.data_type()
+                ),
+            });
+        }
+    };
+    Ok(Value::Bool(crate::fts::ts_query_matches(&vec, &query)))
 }
 
 /// v7.12.1 — `to_tsvector([config,] text)`. With one arg the
@@ -3098,6 +3183,9 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
         BinOp::JsonGetPathText => crate::json::path_walk(&l, &r, true),
         BinOp::JsonContains => crate::json::contains(&l, &r),
+        // v7.12.2 — `@@` match. NULL on either side → NULL; PG
+        // accepts both orderings so we normalise.
+        BinOp::TsMatch => ts_match(l, r),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
@@ -3902,6 +3990,7 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::JsonGetPath
         | BinOp::JsonGetPathText
         | BinOp::JsonContains
+        | BinOp::TsMatch
         | BinOp::IsDistinctFrom
         | BinOp::IsNotDistinctFrom => {
             unreachable!("compare() only called with comparison ops")
