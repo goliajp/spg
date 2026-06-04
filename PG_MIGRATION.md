@@ -163,10 +163,13 @@ implemented; further breakdown follows the table.
 | `JSONB` | ✅ v7.9.0 | Same storage as JSON; PG-wire OID 3802 for sqlx-style clients |
 | `SERIAL` / `BIGSERIAL` | ✅ v7.9.6 | Aliased to `INT/BIGINT NOT NULL AUTO_INCREMENT` |
 | `UUID` | ❌ | Store as `TEXT(36)` |
-| `BYTEA` | ❌ | Store as base64 `TEXT` (or wait on native BYTES type) |
+| `BYTEA` | ✅ v7.10.4 | Native bytes; PG-wire OID 17, `\xDEADBEEF` hex literal in/out, `length()` / `octet_length()` (v7.10.4), `\|\|` / `substring` / `position` (v7.11.2) |
 | `VECTOR(N)` | ✅ | pgvector-flavoured; HNSW + SQ8/HALF encodings |
 | `tsvector` + GIN | ❌ | Use Meilisearch / external full-text search |
-| Array columns (`TEXT[]`, `INT[]`) | ❌ | Store as CSV `TEXT` or JSON array |
+| `TEXT[]` | ✅ v7.10.9 | PG-wire OID 1009; external form `{a,b,NULL}` round-trips, `ARRAY[…]` literal, subscript, `ANY` / `ALL`, `array_length` / `array_position` / `unnest` / `\|\|` (v7.11.1) |
+| `INT[]` / `BIGINT[]` | ✅ v7.11.2 | PG-wire OIDs 1007 / 1016; full op parity with `TEXT[]` — typed `unnest`, mixed-width `\|\|` widens to `BIGINT[]` |
+| `SMALLINT[]` / `NUMERIC[]` / `BOOLEAN[]` / `FLOAT[]` | ❌ | Store as `INT[]` / `BIGINT[]` / `TEXT[]` until v7.12 |
+| Multi-dimensional arrays | ❌ | Single-dim only; `array_length(_, dim>1)` returns NULL |
 
 ### Data manipulation (DML)
 
@@ -213,6 +216,8 @@ implemented; further breakdown follows the table.
 | `COALESCE` / `NULLIF` / `GREATEST` / `LEAST` | ✅ | |
 | Aggregates: `count` / `sum` / `avg` / `min` / `max` / `count(DISTINCT)` | ✅ | |
 | Aggregates: `string_agg` / `array_agg` | ⚠️ | `string_agg` ✅; `array_agg` returns text concat |
+| `unnest(arr)` at FROM position | ✅ v7.11.1 | TEXT[] / INT[] / BIGINT[]; uncorrelated only (no LATERAL / JOIN-position) |
+| `substring(x, start [, len])` / `position(needle, hay)` | ✅ v7.11.2 | TEXT + BYTEA; function-call form (PG-spec `FROM … FOR …` / `IN …` syntax deferred) |
 
 ### Vector / kNN (pgvector-compatible)
 
@@ -361,8 +366,11 @@ v8 / v9 plan. If you need any of them, **stay on PG**.
    complete; `TIMESTAMPTZ` is not — store + parse UTC.
 3. **`UUID` columns**. No native UUID type — store as
    `TEXT(36)`. Comparison + index seek still work.
-4. **`bytea`**. No `BYTEA` type yet — store as base64-encoded
-   `TEXT`.
+4. **`bytea`**. ✅ Native since v7.10.4. Wire form is PG hex
+   text (`\x` prefix); inserts accept either hex or octal escape.
+   Scalar ops: `\|\|`, `substring`, `position`, `length` /
+   `octet_length` (all v7.11.2). No inline `'\x..'::BYTEA` cast
+   yet — go through a `BYTEA` column.
 5. **Case-folding identifiers**. PG lower-folds unquoted
    identifiers; SPG preserves case. If your app sends
    `"SELECT * FROM Users"`, define the table as `Users` not

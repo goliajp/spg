@@ -1731,6 +1731,106 @@ CHANGELOG entry's "Known limitations" section.
 8. **BRIN summary RECOMPACT on DELETE.** v6.7 marks affected
    pages "loose" rather than recomputing min/max in-place.
 
+### Native types (v7.10 / v7.11 series)
+
+The v7.10 / v7.11 series fills the PG-type gap that left mailrs
+and other PG-port apps stringifying values that should have been
+first-class. Each addition is wire-frozen here.
+
+**v7.10.4 — `BYTEA`.**
+- `DataType::Bytes` + `Value::Bytes(Vec<u8>)`.
+- Column type: `<col> BYTEA NOT NULL`.
+- Wire OID 17. Text-mode encoding is PG hex (`\x` + lowercase
+  hex pairs). Octal-escape and hex literals both decode on the
+  INSERT path.
+- Functions: `length(b)` / `octet_length(b)` (v7.10.4).
+
+**v7.10.9 — `TEXT[]`.**
+- `DataType::TextArray` + `Value::TextArray(Vec<Option<String>>)`.
+- Wire OID 1009. Text-mode encoding is PG external array form
+  `{a,b,NULL}` with double-quote + backslash escapes for
+  elements containing whitespace, commas, quotes, or braces.
+- Column type: `<col> TEXT[]`.
+- `ARRAY[…]` literal constructs TextArray when any element is
+  text or non-integer.
+- Row codec: `[u32 count][per element: u8 null + (when non-null)
+  u32 len + UTF-8 bytes]`.
+
+**v7.11.0 — read fan-out (snapshot reads).**
+- `Engine::clone_snapshot() -> CatalogSnapshot` is frozen Send +
+  Sync; subsequent writes are NOT visible. Refresh on demand.
+- `Engine::execute_readonly_on_snapshot(&snap, sql)` — DDL / DML
+  return `EngineError::WriteRequired`.
+- `spg-embedded-tokio::AsyncDatabase::read_handle().await ->
+  AsyncReadHandle`; `AsyncReadHandle::{query, refresh}` use
+  `spawn_blocking`. The read path never re-acquires the writer
+  lock.
+
+**v7.11.1 — array operators (TEXT[]).**
+- `arr[i]` 1-based subscript; out-of-range / `i ≤ 0` → NULL.
+- `x = ANY(arr)` / `x op ALL(arr)` with PG 3VL.
+- `array_length(arr, dim)` — count for dim 1; NULL for other
+  dims (single-dim only).
+- `array_position(arr, val)` — 1-based first-match; NULL if
+  absent; NULL elements never match.
+- `unnest(arr)` at FROM position. Uncorrelated only; composes
+  with WHERE / ORDER BY / LIMIT.
+- `||` array concat (three overloads: `arr || arr`,
+  `arr || elem`, `elem || arr`).
+
+**v7.11.2 — `INT[]` / `BIGINT[]` + BYTEA scalar ops.**
+- `DataType::IntArray` (tag 20) + `Value::IntArray(Vec<Option<i32>>)`.
+- `DataType::BigIntArray` (tag 21) + `Value::BigIntArray(Vec<Option<i64>>)`.
+- Wire OIDs 1007 (`_int4`) / 1016 (`_int8`); same text-mode
+  external form as `TEXT[]`.
+- Row codec: `[u16 count][per element: u8 null + (when non-null)
+  i32/i64 LE]`.
+- Casts: `::INT[]` / `::BIGINT[]` decode external form,
+  IntArray↔BigIntArray cross-cast (widening + narrowing).
+- `ARRAY[…]` literal type inference: all-int → IntArray; any
+  i64 → BigIntArray; any text or non-int → TextArray.
+- Full op parity with `TEXT[]`: subscript returns `Int` /
+  `BigInt`; ANY / ALL; `array_length` / `array_position`;
+  `unnest` emits typed `Int` / `BigInt` rows (column inherits
+  element type instead of forcing `Text`); `||` overloads
+  including `IntArray || BigIntArray` widening to `BigIntArray`.
+- BYTEA scalar ops:
+  - `bytea || bytea` byte concat.
+  - `substring(text|bytea, start [, length])` — PG 1-based;
+    out-of-range → empty result.
+  - `position(needle, haystack)` — TEXT (char index) or BYTEA
+    (byte index); 1-based; 0 if absent; empty needle → 1.
+- Catalog `FILE_VERSION` bumps 18 → 19. v18 catalogs continue
+  to load (TextArray / Bytes paths are unchanged).
+
+**New crate (v7.10.0): `spg-embedded-tokio`.**
+- Wraps `Database` in `tokio::sync::Mutex` + dispatches engine
+  calls through `tokio::task::spawn_blocking`.
+- Frozen surface: `AsyncDatabase::open_in_memory()`,
+  `::execute(sql).await`, `::query(sql).await`,
+  `::read_handle().await` (v7.11.0).
+
+#### Out of v7.10 / v7.11 (carved out — explicit STABILITY entries)
+
+1. **`SMALLINT[]` / `NUMERIC[]` / `BOOLEAN[]` / `FLOAT[]`.**
+   Only `INT[]` / `BIGINT[]` / `TEXT[]` / `BYTEA` are first-class.
+   Workaround: widen at the application layer (smallint → int,
+   bool → text, numeric → text).
+2. **Multi-dimensional arrays.** Single-dim only;
+   `array_length(_, dim>1)` returns NULL.
+3. **Binary array wire format.** Drivers requesting binary
+   format get text mode (matches the legacy v6.1.1 behaviour).
+4. **`::BYTEA` inline cast.** v7.10.4 BYTEA goes through column
+   typing on INSERT; the inline `'\x..'::BYTEA` cast surface is
+   a v7.12 parser change.
+5. **PG-spec syntax for `position(needle IN haystack)` /
+   `substring(x FROM y FOR z)`.** Function-call form covers the
+   semantics; the special syntax requires parser changes.
+6. **LATERAL / JOIN-position `unnest`.** Uncorrelated FROM-position
+   only.
+7. **Array subscript with slice (`arr[1:3]`).** Single-index
+   subscript only.
+
 ---
 
 ## Not frozen (free to change in any release)
