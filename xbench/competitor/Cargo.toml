@@ -15,10 +15,10 @@ publish      = false
 # out unsafe_code for spg-crypto; this crate inherits the default deny.
 
 [dependencies]
-spg-engine  = { path = "../../crates/spg-engine" }
-spg-storage = { path = "../../crates/spg-storage" }
-spg-wire    = { path = "../../crates/spg-wire" }
-spg-sql     = { path = "../../crates/spg-sql" }
+spg-engine  = { path = "../../crates/spg-engine",  version = "7.11" }
+spg-storage = { path = "../../crates/spg-storage", version = "7.11" }
+spg-wire    = { path = "../../crates/spg-wire",    version = "7.11" }
+spg-sql     = { path = "../../crates/spg-sql",     version = "7.11" }
 sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
     "mysql",
