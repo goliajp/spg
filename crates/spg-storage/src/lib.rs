@@ -489,6 +489,22 @@ pub struct Index {
     /// index (the legacy shape). Persisted alongside
     /// `partial_predicate` on the v12 catalog snapshot.
     pub expression: Option<String>,
+    /// v7.9.29 — `CREATE UNIQUE INDEX …`. When true the engine
+    /// rejects INSERTs whose key already appears in this index
+    /// (combined with `partial_predicate` when present — only
+    /// rows matching the predicate enter the uniqueness check).
+    /// Catalog FILE_VERSION 16+; older snapshots deserialise
+    /// with `false`. mailrs K1.
+    pub is_unique: bool,
+    /// v7.9.29 — extra (non-leading) column positions for
+    /// multi-column indexes (`CREATE INDEX … (a, b, c)`). The
+    /// planner today still only uses the leading
+    /// `column_position` for index seeks, but UNIQUE INDEX
+    /// enforcement walks the full tuple so partial-unique
+    /// invariants like CalDAV `(calendar_id, uid,
+    /// recurrence_id)` are enforced correctly. Catalog
+    /// FILE_VERSION 16+; older snapshots deserialise empty.
+    pub extra_column_positions: Vec<usize>,
 }
 
 /// Default neighbor degree (M) for the NSW graph. Picked at construction
@@ -714,6 +730,8 @@ impl Index {
             included_columns: Vec::new(),
             partial_predicate: None,
             expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
         }
     }
 
@@ -725,6 +743,8 @@ impl Index {
             included_columns: Vec::new(),
             partial_predicate: None,
             expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
         }
     }
 
@@ -739,6 +759,8 @@ impl Index {
             included_columns: Vec::new(),
             partial_predicate: None,
             expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
         }
     }
 
@@ -1237,6 +1259,8 @@ impl Table {
             included_columns: Vec::new(),
             partial_predicate: None,
             expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
         });
         Ok(())
     }
@@ -1645,6 +1669,8 @@ impl Table {
                 included_columns: Vec::new(),
                 partial_predicate: None,
                 expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
             });
             return Ok(());
         }
@@ -3891,7 +3917,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 15;
+const FILE_VERSION: u8 = 16;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4035,6 +4061,23 @@ impl Catalog {
                         out.push(1);
                         write_str(&mut out, expr);
                     }
+                }
+                // v7.9.29 — is_unique appendix (FILE_VERSION 16+).
+                // Single byte 0/1. v15-and-below readers stop before
+                // this byte; v16 readers always consume it. mailrs K1.
+                out.push(u8::from(idx.is_unique));
+                // v7.9.29 — extra_column_positions appendix.
+                // Layout: [u16 count][count × u16 column_position].
+                write_u16(
+                    &mut out,
+                    u16::try_from(idx.extra_column_positions.len())
+                        .expect("≤ 65k extra cols / index"),
+                );
+                for cp in &idx.extra_column_positions {
+                    write_u16(
+                        &mut out,
+                        u16::try_from(*cp).expect("≤ 65k columns/table"),
+                    );
                 }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
@@ -4458,6 +4501,42 @@ fn deserialize_indices(
                     return Err(StorageError::Corrupt(format!(
                         "expression tag: unknown byte {other}"
                     )));
+                }
+            }
+            // v7.9.29 — is_unique appendix (FILE_VERSION 16+).
+            // v15-and-below catalogs stop before this byte. mailrs K1.
+            if version >= 16 {
+                match cur.read_u8()? {
+                    0 => {}
+                    1 => {
+                        if let Some(last) = t.indices.last_mut() {
+                            last.is_unique = true;
+                        }
+                    }
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "is_unique tag: unknown byte {other}"
+                        )));
+                    }
+                }
+                // v7.9.29 — extra_column_positions appendix.
+                let n = cur.read_u16()? as usize;
+                if n > 0 {
+                    let mut extras: Vec<usize> = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let cp = cur.read_u16()? as usize;
+                        if cp >= t.schema.columns.len() {
+                            return Err(StorageError::Corrupt(format!(
+                                "extra column position {cp} out of range \
+                                 ({} schema columns)",
+                                t.schema.columns.len()
+                            )));
+                        }
+                        extras.push(cp);
+                    }
+                    if let Some(last) = t.indices.last_mut() {
+                        last.extra_column_positions = extras;
+                    }
                 }
             }
         }

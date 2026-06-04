@@ -3003,6 +3003,48 @@ impl Engine {
                 idx.expression = Some(canonical);
             }
         }
+        // v7.9.29 — persist `is_unique` flag on the storage Index.
+        // Combined with `partial_predicate`, INSERT enforcement
+        // checks that no other row whose predicate evaluates true
+        // shares the same indexed key. Parser already rejected
+        // `UNIQUE` on HNSW / BRIN, so plain BTree here.
+        // For multi-column UNIQUE INDEX the extras matter (the
+        // full tuple is the uniqueness key), so resolve them to
+        // column positions and persist on the index too.
+        if stmt.is_unique {
+            let mut extra_positions: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+            for col_name in &stmt.extra_columns {
+                let pos = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "UNIQUE INDEX {:?}: extra column {col_name:?} not in table {:?}",
+                            stmt.name, stmt.table
+                        ))
+                    })?;
+                extra_positions.push(pos);
+            }
+            if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
+                idx.is_unique = true;
+                idx.extra_column_positions = extra_positions;
+            }
+            // At index-creation time, check the existing rows for
+            // pre-existing duplicates that would have violated the
+            // new constraint — otherwise CREATE UNIQUE INDEX would
+            // silently leave duplicates in place.
+            let snapshot_indices = table.indices().to_vec();
+            let snapshot_rows: alloc::vec::Vec<spg_storage::Row> =
+                table.rows().iter().cloned().collect();
+            let snapshot_schema = table.schema().clone();
+            let idx_ref = snapshot_indices
+                .iter()
+                .find(|i| i.name == stmt.name)
+                .expect("just-added index");
+            check_existing_unique_violation(idx_ref, &snapshot_schema, &snapshot_rows)?;
+        }
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.
         self.plan_cache.evict_referencing(&table_name);
@@ -3298,6 +3340,17 @@ impl Engine {
             self.active_catalog(),
             &stmt.table,
             &uniqueness,
+            &all_values,
+        )?;
+        // v7.9.29 — CREATE UNIQUE INDEX [WHERE pred] enforcement.
+        // Independent of table-level UniquenessConstraint (which
+        // can't carry a predicate). Walks the table's indexes;
+        // for each `is_unique` index, only rows whose
+        // partial_predicate evaluates truthy are checked for
+        // collision. mailrs K1.
+        enforce_unique_index_inserts(
+            self.active_catalog(),
+            &stmt.table,
             &all_values,
         )?;
         // v7.9.8 / v7.9.9 — ON CONFLICT handling.
@@ -7959,6 +8012,190 @@ fn enforce_uniqueness_inserts(
                     "{kind} violation on {child_table:?} columns {col_names:?}: \
                      row #{batch_idx} duplicates an existing key"
                 )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.9.29 — `true` iff `v` counts as a truthy SQL value for a
+/// WHERE-style predicate. NULL → false (three-valued logic
+/// collapses to "skip this row" for index inclusion). Numeric
+/// non-zero, BIGINT non-zero, TINYINT non-zero, BOOLEAN true → true.
+/// Everything else (strings, vectors, JSON, …) is not a valid
+/// predicate result and surfaces as `false` so a malformed
+/// predicate degrades to "row not in index" rather than panicking.
+fn predicate_truthy(v: &spg_storage::Value) -> bool {
+    use spg_storage::Value as V;
+    match v {
+        V::Bool(b) => *b,
+        V::Int(n) => *n != 0,
+        V::BigInt(n) => *n != 0,
+        V::SmallInt(n) => *n != 0,
+        _ => false,
+    }
+}
+
+/// v7.9.29 — at CREATE UNIQUE INDEX time, scan the table's
+/// committed rows for pre-existing duplicates. If any pair of rows
+/// matches the predicate AND has the same index key, refuse to
+/// create the index so the user fixes the data before retrying.
+fn check_existing_unique_violation(
+    idx: &spg_storage::Index,
+    schema: &spg_storage::TableSchema,
+    rows: &[spg_storage::Row],
+) -> Result<(), EngineError> {
+    let predicate_expr = match idx.partial_predicate.as_deref() {
+        Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "stored partial predicate {s:?} failed to re-parse: {e:?}"
+            ))
+        })?),
+        None => None,
+    };
+    let ctx = eval::EvalContext::new(&schema.columns, None);
+    let key_positions = unique_key_positions(idx);
+    let mut seen: alloc::vec::Vec<alloc::vec::Vec<spg_storage::Value>> = alloc::vec::Vec::new();
+    for row in rows {
+        if let Some(expr) = &predicate_expr {
+            let v = eval::eval_expr(expr, row, &ctx).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "evaluating UNIQUE INDEX predicate against existing row: {e:?}"
+                ))
+            })?;
+            if !predicate_truthy(&v) {
+                continue;
+            }
+        }
+        let key: alloc::vec::Vec<spg_storage::Value> = key_positions
+            .iter()
+            .map(|&p| {
+                row.values
+                    .get(p)
+                    .cloned()
+                    .unwrap_or(spg_storage::Value::Null)
+            })
+            .collect();
+        if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+            continue;
+        }
+        if seen.iter().any(|other| *other == key) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "CREATE UNIQUE INDEX {:?}: existing rows already violate the constraint",
+                idx.name
+            )));
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
+/// v7.9.29 — full key tuple for a UNIQUE INDEX (leading +
+/// extra positions). For single-column indexes this is just
+/// `[column_position]`.
+fn unique_key_positions(idx: &spg_storage::Index) -> alloc::vec::Vec<usize> {
+    let mut out = alloc::vec::Vec::with_capacity(1 + idx.extra_column_positions.len());
+    out.push(idx.column_position);
+    out.extend_from_slice(&idx.extra_column_positions);
+    out
+}
+
+/// v7.9.29 — at INSERT time, walk every `is_unique` index on the
+/// target table. For each, eval the index's optional predicate
+/// against (a) the candidate row and (b) every committed row plus
+/// earlier batch rows; only rows where the predicate is truthy
+/// participate. A duplicate key among predicate-matching rows is a
+/// uniqueness violation. NULL keys lift the row out of the check
+/// (matching PG's "UNIQUE allows multiple NULLs" semantics).
+fn enforce_unique_index_inserts(
+    catalog: &Catalog,
+    table_name: &str,
+    rows: &[alloc::vec::Vec<spg_storage::Value>],
+) -> Result<(), EngineError> {
+    let table = catalog.get(table_name).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: table_name.into(),
+        })
+    })?;
+    let schema = table.schema();
+    let ctx = eval::EvalContext::new(&schema.columns, None);
+    for idx in table.indices() {
+        if !idx.is_unique {
+            continue;
+        }
+        // Re-parse the predicate once per index per batch.
+        let predicate_expr = match idx.partial_predicate.as_deref() {
+            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} predicate {s:?} failed to re-parse: {e:?}",
+                    idx.name
+                ))
+            })?),
+            None => None,
+        };
+        let key_positions = unique_key_positions(idx);
+        let key_of = |values: &[spg_storage::Value]| -> alloc::vec::Vec<spg_storage::Value> {
+            key_positions
+                .iter()
+                .map(|&p| {
+                    values
+                        .get(p)
+                        .cloned()
+                        .unwrap_or(spg_storage::Value::Null)
+                })
+                .collect()
+        };
+        // Helper: does `values` participate in this index? (predicate
+        // truthy when present.) Wraps `values` into a transient Row
+        // because eval_expr requires &Row.
+        let participates = |values: &[spg_storage::Value]| -> Result<bool, EngineError> {
+            let Some(expr) = &predicate_expr else {
+                return Ok(true);
+            };
+            let tmp_row = spg_storage::Row {
+                values: values.to_vec(),
+            };
+            let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} predicate eval: {e:?}",
+                    idx.name
+                ))
+            })?;
+            Ok(predicate_truthy(&v))
+        };
+        for (batch_idx, row_values) in rows.iter().enumerate() {
+            if !participates(row_values)? {
+                continue;
+            }
+            let key = key_of(row_values);
+            if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+                continue;
+            }
+            // Committed-table collision.
+            for prow in table.rows() {
+                if !participates(&prow.values)? {
+                    continue;
+                }
+                if key_of(&prow.values) == key {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "UNIQUE INDEX {:?} violation on {table_name:?}: \
+                         row #{batch_idx} duplicates an existing key",
+                        idx.name
+                    )));
+                }
+            }
+            // Within-batch collision: earlier rows in the same INSERT.
+            for earlier in &rows[..batch_idx] {
+                if !participates(earlier)? {
+                    continue;
+                }
+                if key_of(earlier) == key {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "UNIQUE INDEX {:?} violation on {table_name:?}: \
+                         row #{batch_idx} duplicates an earlier row in the same batch",
+                        idx.name
+                    )));
+                }
             }
         }
     }
