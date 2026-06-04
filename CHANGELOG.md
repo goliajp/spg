@@ -67,8 +67,42 @@ Sub-versions:
   v7.10.7  Epic 1 — wire OID 17 (text mode; binary follows in v7.11)
   v7.10.8  Epic 1 ship rollup — tag v7.10.1 + crates.io + docker
 
-Epic 2 (TEXT[] arrays) follows in v7.10.9-15. The full v7.10
-sub-version index lives in `.claude/internal-docs/V7_10_DESIGN.md`.
+**Epic 2 — `TEXT[]` arrays (this release).** PG wire OID 1009.
+Single-dimension TEXT array with optional NULL elements. Labels,
+tags, address-on-message — the common shapes mailrs uses.
+
+What lands:
+
+  * `TEXT[]` column type at CREATE TABLE.
+  * `ARRAY['a', 'b', NULL]` constructor literal at INSERT / SELECT.
+  * `'{a,b,NULL}'::TEXT[]` PG external form cast (decoded by the
+    engine, with `\\`/`\"` escapes inside double-quoted elements).
+  * `x = ANY(arr)` / `x <> ALL(arr)` with PG three-valued NULL
+    semantics.
+  * `arr[i]` PG 1-based subscript; NULL on out-of-range / NULL
+    target / NULL index.
+  * PG wire OID 1009; text-mode encoder emits `{a,b,NULL}` so any
+    PG client renders the column correctly.
+
+Storage. `DataType::TextArray` (tag 19) + `Value::TextArray(Vec<
+Option<String>>)`. Row codec: `[u16 count][per element: u8 null +
+(when non-null) u16 len + utf-8]`. Catalog FILE_VERSION 17 → 18;
+v17 catalogs continue to load.
+
+Non-goals (v7.10): non-TEXT element types (`INT[]`, `BIGINT[]`),
+multi-dimensional arrays, array binary wire format. These land in
+v7.11+ if usage data justifies them.
+
+Sub-versions:
+
+  v7.10.9  Epic 2 — storage TextArray DataType + Value + codec (FILE_VERSION 18)
+  v7.10.10 Epic 2 — parser TEXT[] column type + ARRAY[...] literal
+  v7.10.11 Epic 2 — parser '{...}'::TEXT[] PG shorthand cast
+  v7.10.12 Epic 2 — engine ANY/ALL + arr[i] subscript
+  v7.10.13 Epic 2 — wire OID 1009 + text-mode encoder
+  v7.10.14 Epic 2 ship rollup — tag v7.10.2 + crates.io + docker
+
+The full v7.10 sub-version index lives in `.claude/internal-docs/V7_10_DESIGN.md`.
 
 ---
 

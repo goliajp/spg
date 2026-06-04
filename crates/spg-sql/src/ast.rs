@@ -498,6 +498,12 @@ pub enum ColumnTypeName {
     ///   - PG hex form: `'\xDEADBEEF'`
     ///   - Escape form: `'foo\\000bar'` (backslash octal triples)
     Bytes,
+    /// v7.10.10 `TEXT[]` — single-dimension TEXT array. PG wire
+    /// OID 1009. Literal forms accepted by the parser:
+    ///   - `ARRAY['a', 'b', NULL]`
+    ///   - `'{a,b,NULL}'::TEXT[]` (engine decodes the external
+    ///     form at coerce time)
+    TextArray,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -519,6 +525,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Json => f.write_str("JSON"),
             Self::Jsonb => f.write_str("JSONB"),
             Self::Bytes => f.write_str("BYTEA"),
+            Self::TextArray => f.write_str("TEXT[]"),
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
@@ -866,6 +873,31 @@ pub enum Expr {
         field: ExtractField,
         source: Box<Expr>,
     },
+    /// v7.10.10 — `ARRAY[expr, expr, …]` array constructor. Each
+    /// element is evaluated independently; NULLs are allowed.
+    /// v7.10 supports only single-dimension TEXT[] semantically;
+    /// non-text elements coerce at engine evaluation time when
+    /// the surrounding context (column type / cast) makes the
+    /// target clear.
+    Array(Vec<Expr>),
+    /// v7.10.10 — array subscript `arr[i]`. PG 1-based; the
+    /// engine returns NULL for out-of-range indices.
+    ArraySubscript {
+        target: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// v7.10.12 — `expr op ANY(arr)` and `expr op ALL(arr)`. The
+    /// operator is the comparison binary op (Eq / Ne / Lt / …);
+    /// the engine desugars: `ANY` returns true if any element
+    /// satisfies; `ALL` returns true only if every element does.
+    /// NULL handling follows PG's three-valued logic.
+    AnyAll {
+        expr: Box<Expr>,
+        op: BinOp,
+        array: Box<Expr>,
+        /// `true` = ANY, `false` = ALL.
+        is_any: bool,
+    },
 }
 
 /// v6.4.2 — null treatment on `LAG` / `LEAD` / `FIRST_VALUE` /
@@ -966,6 +998,9 @@ pub enum CastTarget {
     /// hint to use `SHOW TABLES` or `spg_table_ddl`. mailrs F3b.
     RegType,
     RegClass,
+    /// v7.10.11 — `::TEXT[]`. Engine decodes the LHS Text into
+    /// the PG external array form `{a,b,NULL}`.
+    TextArray,
 }
 
 impl fmt::Display for CastTarget {
@@ -985,6 +1020,7 @@ impl fmt::Display for CastTarget {
             Self::RegClass => "regclass",
             Self::Date => "date",
             Self::Timestamp => "timestamp",
+            Self::TextArray => "TEXT[]",
         })
     }
 }
@@ -1631,6 +1667,26 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "({expr} IN ({subquery}))")
                 }
+            }
+            Self::Array(items) => {
+                f.write_str("ARRAY[")?;
+                for (i, e) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                f.write_str("]")
+            }
+            Self::ArraySubscript { target, index } => write!(f, "({target}[{index}])"),
+            Self::AnyAll {
+                expr,
+                op,
+                array,
+                is_any,
+            } => {
+                let kw = if *is_any { "ANY" } else { "ALL" };
+                write!(f, "({expr} {op} {kw}({array}))")
             }
         }
     }

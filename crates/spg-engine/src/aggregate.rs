@@ -78,6 +78,16 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         | Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_) => false,
+        // v7.10.10 — recurse into array constructor / subscript /
+        // ANY/ALL children. Aggregates inside `ARRAY[SUM(x)]` are
+        // valid PG and must be detected here.
+        Expr::Array(items) => items.iter().any(contains_aggregate),
+        Expr::ArraySubscript { target, index } => {
+            contains_aggregate(target) || contains_aggregate(index)
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            contains_aggregate(expr) || contains_aggregate(array)
+        }
     }
 }
 
@@ -347,6 +357,21 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
         | Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_) => {}
+        // v7.10.10 — recurse into array constructor children +
+        // subscript / ANY/ALL operands.
+        Expr::Array(items) => {
+            for elem in items {
+                collect_aggregates(elem, out);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            collect_aggregates(target, out);
+            collect_aggregates(index, out);
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            collect_aggregates(expr, out);
+            collect_aggregates(array, out);
+        }
     }
 }
 
@@ -540,6 +565,28 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         | Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_) => e.clone(),
+        // v7.10.10 — recurse children for array nodes.
+        Expr::Array(items) => Expr::Array(
+            items
+                .iter()
+                .map(|elem| rewrite_expr(elem, group_exprs, aggs))
+                .collect(),
+        ),
+        Expr::ArraySubscript { target, index } => Expr::ArraySubscript {
+            target: Box::new(rewrite_expr(target, group_exprs, aggs)),
+            index: Box::new(rewrite_expr(index, group_exprs, aggs)),
+        },
+        Expr::AnyAll {
+            expr,
+            op,
+            array,
+            is_any,
+        } => Expr::AnyAll {
+            expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
+            op: *op,
+            array: Box::new(rewrite_expr(array, group_exprs, aggs)),
+            is_any: *is_any,
+        },
     }
 }
 

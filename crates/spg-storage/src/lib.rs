@@ -143,6 +143,15 @@ pub enum DataType {
     /// the target column is BYTEA — TEXT columns leave the
     /// backslash sequence verbatim).
     Bytes,
+    /// v7.10.9: `TEXT[]` — single-dimension TEXT array. Elements
+    /// may be NULL (PG semantics). PG wire OID 1009. Literal
+    /// forms: `ARRAY['a', 'b', NULL]` and the PG external form
+    /// `'{a,b,NULL}'::TEXT[]`. Engine implements `= ANY(arr)`,
+    /// `<> ALL(arr)`, and 1-based indexing `arr[i]`. Catalog
+    /// FILE_VERSION 18+; older snapshots reject this DataType
+    /// (forward-only by design — TEXT[] columns aren't readable
+    /// on a pre-v7.10 binary).
+    TextArray,
 }
 
 impl fmt::Display for DataType {
@@ -175,6 +184,7 @@ impl fmt::Display for DataType {
             Self::Json => f.write_str("JSON"),
             Self::Jsonb => f.write_str("JSONB"),
             Self::Bytes => f.write_str("BYTEA"),
+            Self::TextArray => f.write_str("TEXT[]"),
         }
     }
 }
@@ -232,6 +242,12 @@ pub enum Value {
     /// literals (`'\xDEADBEEF'`) and escape literals at the
     /// coercion boundary.
     Bytes(Vec<u8>),
+    /// v7.10.9 `TEXT[]` — single-dimension TEXT array with
+    /// optional NULL elements. Equality is element-wise. PG's
+    /// NULL-element comparison semantics: NULL ≠ NULL inside
+    /// arrays under `=`, so `[NULL] != [NULL]` (the engine
+    /// honours this).
+    TextArray(Vec<Option<String>>),
     Null,
 }
 
@@ -272,6 +288,7 @@ impl Value {
             Self::Interval { .. } => Some(DataType::Interval),
             Self::Json(_) => Some(DataType::Json),
             Self::Bytes(_) => Some(DataType::Bytes),
+            Self::TextArray(_) => Some(DataType::TextArray),
             Self::Null => None,
         }
     }
@@ -470,7 +487,8 @@ impl IndexKey {
             | Value::Numeric { .. }
             | Value::Interval { .. }
             | Value::Json(_)
-            | Value::Bytes(_) => None,
+            | Value::Bytes(_)
+            | Value::TextArray(_) => None,
         }
     }
 }
@@ -3934,7 +3952,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 17;
+const FILE_VERSION: u8 = 18;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4705,6 +4723,9 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Jsonb => out.push(16),
         // v7.10.4: tag 18 for `BYTEA`. Body = [u16 len][bytes].
         DataType::Bytes => out.push(18),
+        // v7.10.9: tag 19 for `TEXT[]`. Body = [u16 count][per
+        // element: u8 null + (if non-null) u16 len + utf-8].
+        DataType::TextArray => out.push(19),
     }
 }
 
@@ -4753,6 +4774,8 @@ impl Cursor<'_> {
             17 => Ok(DataType::Timestamptz),
             // v7.10.4: tag 18 for `BYTEA`. Catalog FILE_VERSION 17+.
             18 => Ok(DataType::Bytes),
+            // v7.10.9: tag 19 for `TEXT[]`. Catalog FILE_VERSION 18+.
+            19 => Ok(DataType::TextArray),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -4817,6 +4840,18 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         // carve-out (kept aligned with TEXT for now so the catalog
         // snapshot stays simple).
         Value::Bytes(b) => 2 + b.len(),
+        // v7.10.9: TEXT[] on-disk shape — [u16 count][per element:
+        // u8 null flag + (when non-null) u16 len + utf-8 bytes].
+        Value::TextArray(items) => {
+            let mut n = 2; // count prefix
+            for item in items {
+                n += 1; // null flag
+                if let Some(s) = item {
+                    n += 2 + s.len();
+                }
+            }
+            n
+        }
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -4974,6 +5009,23 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(b);
         }
+        // v7.10.9: TEXT[] dense body — [u16 count][per element:
+        // u8 null flag + (when non-null) u16 len + utf-8 bytes].
+        (Value::TextArray(items), DataType::TextArray) => {
+            let count = u16::try_from(items.len()).expect("TEXT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(s) => {
+                        out.push(0);
+                        let len = u16::try_from(s.len()).expect("TEXT[] element ≤ 64 KiB");
+                        out.extend_from_slice(&len.to_le_bytes());
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
+        }
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -5077,6 +5129,24 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             let len = u16::try_from(b.len()).expect("BYTEA value ≤ 64 KiB");
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(b);
+        }
+        // v7.10.9: TEXT[] — [u8 tag=15][u16 count][per elem: u8
+        // null + (if non-null) u16 len + utf-8 bytes].
+        Value::TextArray(items) => {
+            out.push(15);
+            let count = u16::try_from(items.len()).expect("TEXT[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(s) => {
+                        out.push(0);
+                        let len = u16::try_from(s.len()).expect("TEXT[] element ≤ 64 KiB");
+                        out.extend_from_slice(&len.to_le_bytes());
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
         }
     }
 }
@@ -5274,6 +5344,23 @@ impl<'a> Cursor<'a> {
                 let bytes = self.take(len)?.to_vec();
                 Ok(Value::Bytes(bytes))
             }
+            // v7.10.9: TEXT[] dense body.
+            DataType::TextArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<String>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_str()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "TEXT[] null flag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::TextArray(items))
+            }
         }
     }
 
@@ -5331,6 +5418,24 @@ impl<'a> Cursor<'a> {
                 let len = self.read_u16()? as usize;
                 let bytes = self.take(len)?.to_vec();
                 Ok(Value::Bytes(bytes))
+            }
+            // v7.10.9: tag 15 — TEXT[]. [u16 count][per elem: u8
+            // null + (when non-null) u16 len + utf-8 bytes].
+            15 => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<String>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_str()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "TEXT[] null flag in value tag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::TextArray(items))
             }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }

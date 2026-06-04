@@ -1788,7 +1788,7 @@ impl Parser {
         // them as if user-supplied (rejecting duplicates).
         let mut implied_auto_increment = false;
         let mut implied_not_null = false;
-        let ty = match ty_ident.as_str() {
+        let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
                 implied_auto_increment = true;
@@ -1862,6 +1862,26 @@ impl Parser {
         // without changing semantics. Drop it silently.
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unsigned")) {
             self.advance();
+        }
+        // v7.10.10 — postfix `[]` widens TEXT → TEXT[]. PG accepts
+        // `TYPE[]` after any base type; v7.10 only models TEXT[]
+        // so we reject other base types here. mailrs uses TEXT[]
+        // for labels / addresses / message-on-thread.
+        if matches!(self.peek(), Token::LBracket) {
+            self.advance();
+            if !matches!(self.peek(), Token::RBracket) {
+                return Err(self.err(alloc::format!(
+                    "TEXT[] takes no dimension; got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if !matches!(ty, ColumnTypeName::Text) {
+                return Err(self.err(alloc::format!(
+                    "v7.10 only supports TEXT[]; got {ty:?}[]"
+                )));
+            }
+            ty = ColumnTypeName::TextArray;
         }
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -2458,6 +2478,41 @@ impl Parser {
                 break;
             }
             self.advance();
+            // v7.10.12 — `x <op> ANY(arr)` / `x <op> ALL(arr)`.
+            // ANY is a bare ident; ALL is a reserved Token. Both
+            // require an immediate `(` to disambiguate from
+            // identifier columns named `any` / `all`.
+            let any_kind = match self.peek() {
+                Token::All if matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) => {
+                    Some(false)
+                }
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if (s.eq_ignore_ascii_case("any") || s.eq_ignore_ascii_case("all"))
+                        && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
+                {
+                    Some(s.eq_ignore_ascii_case("any"))
+                }
+                _ => None,
+            };
+            if let Some(is_any) = any_kind {
+                self.advance(); // ident
+                self.advance(); // (
+                let arr = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' after ANY/ALL argument, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                lhs = Expr::AnyAll {
+                    expr: Box::new(lhs),
+                    op,
+                    array: Box::new(arr),
+                    is_any,
+                };
+                continue;
+            }
             let rhs = self.parse_expr(prec + 1)?;
             lhs = Expr::Binary {
                 lhs: Box::new(lhs),
@@ -2546,6 +2601,33 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exists") => {
                 self.parse_exists_atom(false)
             }
+            // v7.10.10 — `ARRAY[expr, expr, …]` constructor. ARRAY
+            // is not a reserved token; we match by case-insensitive
+            // ident. The opening `[` must follow immediately.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("array") && matches!(self.peek(), Token::LBracket) =>
+            {
+                self.advance(); // consume `[`
+                let mut items: Vec<Expr> = Vec::new();
+                if !matches!(self.peek(), Token::RBracket) {
+                    loop {
+                        items.push(self.parse_expr(0)?);
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RBracket => break,
+                            other => {
+                                return Err(self.err(alloc::format!(
+                                    "expected ',' or ']' in ARRAY literal, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                self.advance(); // consume `]`
+                Ok(Expr::Array(items))
+            }
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
@@ -2571,7 +2653,18 @@ impl Parser {
                         "int" | "integer" | "int4" => CastTarget::Int,
                         "bigint" | "int8" => CastTarget::BigInt,
                         "float" | "double" | "real" => CastTarget::Float,
-                        "text" => CastTarget::Text,
+                        "text" => {
+                            // v7.10.11 — `::TEXT[]` widens to TextArray.
+                            if matches!(self.peek(), Token::LBracket)
+                                && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+                            {
+                                self.advance();
+                                self.advance();
+                                CastTarget::TextArray
+                            } else {
+                                CastTarget::Text
+                            }
+                        }
                         "bool" | "boolean" => CastTarget::Bool,
                         "vector" => CastTarget::Vector,
                         "date" => CastTarget::Date,
@@ -2682,6 +2775,25 @@ impl Parser {
                     expr: Box::new(expr),
                     pattern: Box::new(pattern),
                     negated,
+                };
+                continue;
+            }
+            // v7.10.12 — `arr[i]` subscript. PG 1-based; engine
+            // returns NULL for out-of-range. Multiple subscripts
+            // chain: `a[i][j]` parses left-to-right.
+            if matches!(self.peek(), Token::LBracket) {
+                self.advance();
+                let index = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RBracket) {
+                    return Err(self.err(alloc::format!(
+                        "expected ']' after array index, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                expr = Expr::ArraySubscript {
+                    target: Box::new(expr),
+                    index: Box::new(index),
                 };
                 continue;
             }

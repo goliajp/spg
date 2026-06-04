@@ -4156,7 +4156,11 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // elsewhere via `pg_type_oid`; the WireType collapses
         // to the catch-all Text path so the existing encoder
         // emits the hex-formatted body.
-        | DataType::Bytes => WireType::Text,
+        | DataType::Bytes
+        // v7.10.9 — TEXT[] collapses to Text on the wire as the
+        // PG external array form `{a,b,NULL}`. OID 1009 is set
+        // via `pg_type_oid`. Binary array format lands in v7.11.
+        | DataType::TextArray => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
@@ -4209,6 +4213,9 @@ fn value_to_wire(v: &Value) -> WireValue {
         // codec — for now binary fetches surface as the hex text
         // and clients decode normally.
         Value::Bytes(b) => WireValue::Text(spg_engine::eval::format_bytea_hex(b)),
+        // v7.10.9 — TEXT[] goes on the wire as PG external array
+        // form (`{a,b,NULL}`). RowDescription advertises OID 1009.
+        Value::TextArray(items) => WireValue::Text(spg_engine::eval::format_text_array(items)),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => WireValue::Text(format!("{v:?}")),
     }

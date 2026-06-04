@@ -154,6 +154,7 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
                 // but for describe we still claim Text so prepare
                 // doesn't fail.
                 CastTarget::RegType | CastTarget::RegClass => DataType::Text,
+                CastTarget::TextArray => DataType::TextArray,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),
@@ -281,6 +282,19 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_select(subquery, f);
         }
         Expr::Extract { source, .. } => walk_expr(source, f),
+        Expr::Array(items) => {
+            for elem in items {
+                walk_expr(elem, f);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            walk_expr(target, f);
+            walk_expr(index, f);
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            walk_expr(expr, f);
+            walk_expr(array, f);
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => {}
     }
 }
