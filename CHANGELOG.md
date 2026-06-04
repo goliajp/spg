@@ -8,6 +8,78 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.11.3] — 2026-06-04 (PG-customer parity patch — mailrs D-cutover)
+
+Patch release closing four PG idioms mailrs flagged as still
+broken in their D-cutover gap analysis. Two of the four were
+historically introduced as missing parser features but had
+later been resolved; this release fills the runtime side that
+made them appear broken end-to-end. The other two are
+genuinely new parser surfaces. Plus one planner fix that lifts
+multi-column / AND-composite WHERE clauses out of the
+"full-scan + filter" fast-path penalty box.
+
+What lands:
+
+  * **`NOW()` / `CURRENT_TIMESTAMP` / `CURRENT_DATE` in
+    `spg-embedded`** — the clock-call rewrite layer
+    (`Engine::with_clock`) was wired in `spg-server` since v6.x
+    but `Database::open_in_memory()` / `Database::open_path()`
+    constructed the engine without a clock provider. SQL like
+    `WHERE created_at > NOW() - INTERVAL '30 days'` now works
+    in every entry point (server, embedded, embedded-tokio).
+
+  * **`USING ivfflat` accepted as a synonym for `hnsw`** — PG
+    customers shouldn't pick their on-disk index method based on
+    which one SPG happens to implement first. The parser
+    accepts both spellings; the runtime vector op (`<->` /
+    `<#>` / `<=>`) at query time still picks the metric.
+
+  * **`CREATE INDEX … WITH (k = v, ...)` storage params** — PG
+    schemas using pgvector emit `WITH (lists = 20)` for
+    ivfflat or `WITH (m = 16, ef_construction = 64)` for hnsw.
+    Accepted and discarded; SPG's HNSW tunes itself via env
+    vars today, so the WITH clause is informational.
+
+  * **Multi-column / PK index picker under AND-composite
+    WHERE** — `try_index_seek` now recurses through top-level
+    `AND` so `WHERE id = 1 AND created_at > $1` hits the
+    leading-column index instead of degrading to a full scan
+    plus post-filter. EXPLAIN annotates the chosen plan
+    accordingly. The caller already re-applies the full WHERE
+    to every returned row, so dropping the residual conjuncts
+    at seek time stays semantically correct.
+
+  * **New regression test
+    `crates/spg-engine/tests/e2e_pg_customer_parity.rs`** —
+    every PG idiom mailrs raised in D-cutover (the 7
+    critical-priority + 1 nice-to-have items) is now a single
+    test. Closed gaps assert; the one still-open v7.12 epic
+    (tsvector / GIN / `@@` / FTS triggers) is `#[ignore]`-marked
+    with a TODO pointer.
+
+Catalog FILE_VERSION unchanged (still 19 from v7.11.2). 4-corpus
+sqllogictest: 100% (148 / 17 / 144 / 63). Workspace test suites
+all green.
+
+Carve-out for v7.12: full PG full-text search — `tsvector` /
+`tsquery` types, `to_tsvector` / `plainto_tsquery` / `ts_rank`,
+the `@@` match operator, true GIN inverted index, and a
+row-level `CREATE TRIGGER` system so PG's standard
+`AFTER INSERT/UPDATE … UPDATE search_vector` idiom works
+without application changes. Tracked in
+`.claude/internal-docs/V7_12_DESIGN.md` (to be drafted).
+
+Sub-versions:
+
+  v7.11.11-17  Epic 3 — INT[] / BIGINT[] + BYTEA scalar ops
+               (see [7.11] above)
+  v7.11.18     PG-customer parity patch — clock injection,
+               ivfflat alias, WITH (…) drain, multi-column
+               index picker AND recursion, regression suite
+
+---
+
 ## [7.11] — 2026-06-04 (read fan-out + v7.11 series open)
 
 Opens the v7.11 series. Three epics planned: read concurrency

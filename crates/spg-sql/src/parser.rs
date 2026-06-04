@@ -1561,6 +1561,14 @@ impl Parser {
                 // planner cost only for the queries that would have
                 // used the specialised AM.
                 "gin" | "gist" | "spgist" | "hash" => IndexMethod::BTree,
+                // v7.11.3 — pgvector ships both `ivfflat` and
+                // `hnsw`. Customers shouldn't have to choose
+                // their on-disk index method based on what SPG
+                // implements; accept `ivfflat` as a synonym for
+                // `hnsw` so PG schemas using either method drop
+                // in. The vector distance op (`<->` / `<#>` /
+                // `<=>`) at query time still picks the metric.
+                "ivfflat" => IndexMethod::Hnsw,
                 other => {
                     return Err(self.err(alloc::format!(
                         "unknown index method {other:?}; supported: hnsw, btree, brin (gin/gist/spgist/hash accepted as BTree fallback)"
@@ -1688,6 +1696,47 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // v7.11.3 — accept and discard PG `WITH (k = v, ...)` index
+        // storage parameters. pgvector emits `WITH (lists = N)` for
+        // ivfflat and `WITH (m = N, ef_construction = M)` for hnsw;
+        // SPG's HNSW picks its own parameters today (tunable via
+        // env vars), so the WITH clause is informational and dropped.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(format!(
+                    "expected '(' after WITH in CREATE INDEX, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            loop {
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                // Drain `key = value` or bare `key` tokens.
+                let _ = self.advance(); // key
+                if matches!(self.peek(), Token::Eq) {
+                    self.advance();
+                    let _ = self.advance(); // value (int / string / ident)
+                }
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in WITH (…) clause, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
         // v6.8.1 — optional `WHERE <expr>` partial-index predicate.
         let partial_predicate = if matches!(self.peek(), Token::Where) {
             self.advance();
