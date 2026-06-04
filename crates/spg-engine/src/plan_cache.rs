@@ -285,6 +285,19 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Extract { source, .. } => collect_expr(source, out),
+        Expr::Array(items) => {
+            for elem in items {
+                collect_expr(elem, out);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            collect_expr(target, out);
+            collect_expr(index, out);
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            collect_expr(expr, out);
+            collect_expr(array, out);
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => {}
     }
 }

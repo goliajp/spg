@@ -160,6 +160,150 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
         Expr::WindowFunction { .. } => Err(EvalError::TypeMismatch {
             detail: "window function reached row eval — engine rewrite bug".into(),
         }),
+        // v7.10.10 — `ARRAY[expr, expr, …]` constructor. Build a
+        // `Value::TextArray` where each NULL maps to `None` and
+        // each Text element maps to `Some(...)`. Non-TEXT
+        // elements get coerced via `to_string()` here so the
+        // user can write `ARRAY[1, 2, 3]` against a TEXT[]
+        // column (PG also accepts this in many positions).
+        Expr::Array(items) => {
+            let mut out: Vec<Option<String>> = Vec::with_capacity(items.len());
+            for elem in items {
+                match eval_expr(elem, row, ctx)? {
+                    Value::Null => out.push(None),
+                    Value::Text(s) => out.push(Some(s)),
+                    other => out.push(Some(value_to_text_for_array(&other))),
+                }
+            }
+            Ok(Value::TextArray(out))
+        }
+        // v7.10.12 — `arr[i]` PG-style 1-based indexing.
+        // Out-of-range indices (including i ≤ 0) return NULL.
+        Expr::ArraySubscript { target, index } => {
+            let target_v = eval_expr(target, row, ctx)?;
+            let idx_v = eval_expr(index, row, ctx)?;
+            if matches!(target_v, Value::Null) || matches!(idx_v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Value::TextArray(items) = target_v else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "subscript target must be an array, got {:?}",
+                        target_v.data_type()
+                    ),
+                });
+            };
+            let i: i64 = match idx_v {
+                Value::Int(n) => i64::from(n),
+                Value::BigInt(n) => n,
+                Value::SmallInt(n) => i64::from(n),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("array subscript must be integer, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            if i < 1 {
+                return Ok(Value::Null);
+            }
+            let pos = (i - 1) as usize;
+            match items.get(pos) {
+                Some(Some(s)) => Ok(Value::Text(s.clone())),
+                Some(None) | None => Ok(Value::Null),
+            }
+        }
+        // v7.10.12 — `x op ANY(arr)` / `x op ALL(arr)`. PG
+        // 3VL: ANY → true if any element compares-true; NULL if
+        // no true but some NULL; false otherwise. ALL: false if
+        // any compares-false; NULL if no false but some NULL;
+        // true otherwise.
+        Expr::AnyAll {
+            expr,
+            op,
+            array,
+            is_any,
+        } => {
+            let lhs = eval_expr(expr, row, ctx)?;
+            let arr = eval_expr(array, row, ctx)?;
+            if matches!(arr, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Value::TextArray(items) = arr else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "ANY/ALL right-hand side must be an array, got {:?}",
+                        arr.data_type()
+                    ),
+                });
+            };
+            let mut saw_null = matches!(lhs, Value::Null);
+            let mut saw_match = false;
+            let mut saw_mismatch = false;
+            for elem in items {
+                let elem_v = match elem {
+                    Some(s) => Value::Text(s),
+                    None => {
+                        saw_null = true;
+                        continue;
+                    }
+                };
+                if matches!(lhs, Value::Null) {
+                    saw_null = true;
+                    continue;
+                }
+                match apply_binary(*op, lhs.clone(), elem_v) {
+                    Ok(Value::Bool(true)) => saw_match = true,
+                    Ok(Value::Bool(false)) => saw_mismatch = true,
+                    Ok(Value::Null) => saw_null = true,
+                    Ok(other) => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "ANY/ALL comparison didn't return Bool: {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let result = if *is_any {
+                if saw_match {
+                    Value::Bool(true)
+                } else if saw_null {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                }
+            } else if saw_mismatch {
+                Value::Bool(false)
+            } else if saw_null {
+                Value::Null
+            } else {
+                Value::Bool(true)
+            };
+            Ok(result)
+        }
+    }
+}
+
+/// v7.10.10 — best-effort text rendering for non-TEXT array
+/// elements (numbers, bools, etc.). The PG rule is that
+/// `ARRAY[1, 2]` is `int[]`, but SPG's v7.10 only models TEXT[],
+/// so we widen by stringifying. NUMERIC formatting goes through
+/// the existing canonical helpers to stay consistent with
+/// `format_numeric` / `format_date` etc.
+fn value_to_text_for_array(v: &Value) -> String {
+    match v {
+        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Value::Float(x) => format!("{x}"),
+        Value::Date(d) => format_date(*d),
+        Value::Timestamp(t) => format_timestamp(*t),
+        Value::Numeric { scaled, scale } => format_numeric(*scaled, *scale),
+        _ => format!("{v:?}"),
     }
 }
 
@@ -1006,7 +1150,89 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                  (no pg_catalog); use SHOW TABLES / spg_table_ddl instead"
                     .into(),
         }),
+        // v7.10.11 — `::TEXT[]`. Decode PG external array form
+        // when input is Text; pass through unchanged when it is
+        // already TextArray. Anything else is a type mismatch.
+        CastTarget::TextArray => match v {
+            Value::TextArray(items) => Ok(Value::TextArray(items)),
+            Value::Text(s) => decode_text_array_external(&s).map(Value::TextArray),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::TEXT[] only accepts TEXT / TEXT[] inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
     }
+}
+
+/// v7.10.11 — same decoder as `decode_text_array_literal` in
+/// `lib.rs`, but lives here so the eval-time cast path stays
+/// inside `spg-engine::eval`. Kept in lock-step with the engine
+/// `coerce_value` decoder by tests.
+fn decode_text_array_external(s: &str) -> Result<Vec<Option<String>>, EvalError> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or_else(|| EvalError::TypeMismatch {
+            detail: alloc::format!("TEXT[] literal {s:?} must be enclosed in '{{...}}'"),
+        })?;
+    let mut out: Vec<Option<String>> = Vec::new();
+    if inner.trim().is_empty() {
+        return Ok(out);
+    }
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i <= bytes.len() {
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            let mut buf = String::new();
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    buf.push(bytes[i + 1] as char);
+                    i += 2;
+                } else {
+                    buf.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "unterminated quoted element in TEXT[] literal".into(),
+                });
+            }
+            i += 1;
+            out.push(Some(buf));
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b',' {
+                i += 1;
+            }
+            let raw = inner[start..i].trim();
+            if raw.eq_ignore_ascii_case("NULL") {
+                out.push(None);
+            } else {
+                out.push(Some(raw.to_string()));
+            }
+        }
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b',' {
+            return Err(EvalError::TypeMismatch {
+                detail: "expected ',' between TEXT[] elements".into(),
+            });
+        }
+        i += 1;
+    }
+    Ok(out)
 }
 
 fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
@@ -1351,6 +1577,43 @@ const fn days_in_month(y: i32, m: u32) -> u32 {
         // first, but be defensive) get the 30-day fallback.
         _ => 30,
     }
+}
+
+/// v7.10.9 — render a TEXT[] in PG's external array form
+/// (`{a,b,NULL}`). Elements containing whitespace, commas,
+/// quotes, or braces get double-quoted with `\\` / `\"` escapes.
+/// NULL elements use the literal token `NULL`. Public so the
+/// wire layer can produce the canonical text-mode encoding.
+pub fn format_text_array(items: &[Option<String>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 8);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(s) => {
+                let needs_quote = s.is_empty()
+                    || s.eq_ignore_ascii_case("NULL")
+                    || s.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ' | '\t'));
+                if needs_quote {
+                    out.push('"');
+                    for c in s.chars() {
+                        if c == '"' || c == '\\' {
+                            out.push('\\');
+                        }
+                        out.push(c);
+                    }
+                    out.push('"');
+                } else {
+                    out.push_str(s);
+                }
+            }
+        }
+    }
+    out.push('}');
+    out
 }
 
 /// v7.10.4 — render a BYTEA payload in PG's hex output format

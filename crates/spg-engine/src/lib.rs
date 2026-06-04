@@ -651,6 +651,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Jsonb => "JSONB".into(),
         DataType::Timestamptz => "TIMESTAMPTZ".into(),
         DataType::Bytes => "BYTEA".into(),
+        DataType::TextArray => "TEXT[]".into(),
     }
 }
 
@@ -5290,6 +5291,20 @@ impl Engine {
             | Expr::Literal(_)
             | Expr::Placeholder(_)
             | Expr::Column(_) => {}
+            // v7.10.10 — recurse children.
+            Expr::Array(items) => {
+                for elem in items {
+                    self.resolve_expr_subqueries(elem, cancel)?;
+                }
+            }
+            Expr::ArraySubscript { target, index } => {
+                self.resolve_expr_subqueries(target, cancel)?;
+                self.resolve_expr_subqueries(index, cancel)?;
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                self.resolve_expr_subqueries(expr, cancel)?;
+                self.resolve_expr_subqueries(array, cancel)?;
+            }
         }
         Ok(())
     }
@@ -5437,6 +5452,20 @@ impl Engine {
                 self.resolve_correlated_in_expr(source, row, ctx, cancel, memo.as_deref_mut())?;
             }
             Expr::WindowFunction { .. } | Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
+            // v7.10.10 — recurse children.
+            Expr::Array(items) => {
+                for elem in items {
+                    self.resolve_correlated_in_expr(elem, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+            }
+            Expr::ArraySubscript { target, index } => {
+                self.resolve_correlated_in_expr(target, row, ctx, cancel, memo.as_deref_mut())?;
+                self.resolve_correlated_in_expr(index, row, ctx, cancel, memo.as_deref_mut())?;
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
+                self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
+            }
         }
         Ok(())
     }
@@ -5620,6 +5649,13 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
                 || order_by.iter().any(|(o, _)| expr_refers_to(o, target))
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
+        Expr::Array(items) => items.iter().any(|e| expr_refers_to(e, target)),
+        Expr::ArraySubscript { target: t, index } => {
+            expr_refers_to(t, target) || expr_refers_to(index, target)
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_refers_to(expr, target) || expr_refers_to(array, target)
+        }
     }
 }
 
@@ -6090,6 +6126,19 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
             substitute_in_select(subquery, row, ctx, outer_alias);
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
+        Expr::Array(items) => {
+            for elem in items {
+                substitute_in_expr(elem, row, ctx, outer_alias);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            substitute_in_expr(target, row, ctx, outer_alias);
+            substitute_in_expr(index, row, ctx, outer_alias);
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            substitute_in_expr(expr, row, ctx, outer_alias);
+            substitute_in_expr(array, row, ctx, outer_alias);
+        }
     }
 }
 
@@ -6132,6 +6181,13 @@ fn expr_has_window(e: &Expr) -> bool {
         | Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_) => false,
+        Expr::Array(items) => items.iter().any(expr_has_window),
+        Expr::ArraySubscript { target, index } => {
+            expr_has_window(target) || expr_has_window(index)
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_has_window(expr) || expr_has_window(array)
+        }
     }
 }
 
@@ -6858,6 +6914,13 @@ fn expr_has_subquery(e: &Expr) -> bool {
                 || order_by.iter().any(|(e, _)| expr_has_subquery(e))
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
+        Expr::Array(items) => items.iter().any(expr_has_subquery),
+        Expr::ArraySubscript { target, index } => {
+            expr_has_subquery(target) || expr_has_subquery(index)
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_has_subquery(expr) || expr_has_subquery(array)
+        }
     }
 }
 
@@ -7062,6 +7125,19 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
         Expr::Literal(_) | Expr::Column(_) => {}
         // Already handled above.
         Expr::Placeholder(_) => unreachable!("Placeholder handled at top of fn"),
+        Expr::Array(items) => {
+            for elem in items {
+                substitute_expr(elem, params)?;
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            substitute_expr(target, params)?;
+            substitute_expr(index, params)?;
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            substitute_expr(expr, params)?;
+            substitute_expr(array, params)?;
+        }
     }
     Ok(())
 }
@@ -7339,6 +7415,19 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             }
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
+        Expr::Array(items) => {
+            for elem in items {
+                rewrite_expr_clock(elem, now);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            rewrite_expr_clock(target, now);
+            rewrite_expr_clock(index, now);
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            rewrite_expr_clock(expr, now);
+            rewrite_expr_clock(array, now);
+        }
     }
 }
 
@@ -8935,6 +9024,115 @@ fn hex_nibble(b: u8) -> Result<u8, &'static str> {
     }
 }
 
+/// v7.10.11 — decode a PG TEXT[] external array form
+/// (`{a,b,NULL}` with optional double-quoted elements). The
+/// engine takes a leading/trailing `{`/`}` and splits at commas.
+/// Quoted elements (`"hello, world"`) preserve embedded commas;
+/// `\\` and `\"` decode to literal backslash / quote. Plain
+/// unquoted `NULL` (case-insensitive) maps to `None`.
+fn decode_text_array_literal(
+    s: &str,
+) -> Result<alloc::vec::Vec<Option<alloc::string::String>>, &'static str> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or("TEXT[] literal must be enclosed in '{...}'")?;
+    let mut out: alloc::vec::Vec<Option<alloc::string::String>> = alloc::vec::Vec::new();
+    if inner.trim().is_empty() {
+        return Ok(out);
+    }
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i <= bytes.len() {
+        // Skip leading whitespace.
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        // Quoted element.
+        if i < bytes.len() && bytes[i] == b'"' {
+            i += 1; // open quote
+            let mut buf = alloc::string::String::new();
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    buf.push(bytes[i + 1] as char);
+                    i += 2;
+                } else {
+                    buf.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() {
+                return Err("unterminated quoted element");
+            }
+            i += 1; // close quote
+            out.push(Some(buf));
+        } else {
+            // Unquoted element — read until next comma or end.
+            let start = i;
+            while i < bytes.len() && bytes[i] != b',' {
+                i += 1;
+            }
+            let raw = inner[start..i].trim();
+            if raw.eq_ignore_ascii_case("NULL") {
+                out.push(None);
+            } else {
+                out.push(Some(alloc::string::ToString::to_string(raw)));
+            }
+        }
+        // Skip whitespace, expect comma or end.
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b',' {
+            return Err("expected ',' between TEXT[] elements");
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// v7.10.11 — encode a TEXT[] back into the PG external array
+/// form. NULL elements become the literal `NULL`; elements
+/// containing commas, quotes, backslashes, or braces are
+/// double-quoted with `\\` / `\"` escapes.
+fn encode_text_array(items: &[Option<alloc::string::String>]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(2 + items.len() * 8);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(s) => {
+                let needs_quote = s.is_empty()
+                    || s.eq_ignore_ascii_case("NULL")
+                    || s.chars().any(|c| {
+                        matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ' | '\t')
+                    });
+                if needs_quote {
+                    out.push('"');
+                    for c in s.chars() {
+                        if c == '"' || c == '\\' {
+                            out.push('\\');
+                        }
+                        out.push(c);
+                    }
+                    out.push('"');
+                } else {
+                    out.push_str(s);
+                }
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// v7.10.4 — encode BYTEA bytes in PG hex output format
 /// (`\x` prefix, lowercase hex pairs). Used by Text-side
 /// round-trip + the wire layer's text-mode encoder.
@@ -8983,6 +9181,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Json => DataType::Json,
         ColumnTypeName::Jsonb => DataType::Jsonb,
         ColumnTypeName::Bytes => DataType::Bytes,
+        ColumnTypeName::TextArray => DataType::TextArray,
     }
 }
 
@@ -9013,6 +9212,23 @@ fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
                 "unary minus over non-literal expression: {other:?}"
             ))),
         },
+        // v7.10.10 — `ARRAY[lit, lit, …]` constructor accepted at
+        // INSERT-time. Each element must reduce to a Value through
+        // `literal_expr_to_value`; NULL elements become `None`.
+        // Casts (e.g. `ARRAY[]::TEXT[]`) flow through the outer
+        // Cast arm before reaching here.
+        Expr::Array(items) => {
+            let mut out: alloc::vec::Vec<Option<alloc::string::String>> =
+                alloc::vec::Vec::with_capacity(items.len());
+            for elem in items {
+                match literal_expr_to_value(elem)? {
+                    Value::Null => out.push(None),
+                    Value::Text(s) => out.push(Some(s)),
+                    other => out.push(Some(alloc::format!("{other:?}"))),
+                }
+            }
+            Ok(Value::TextArray(out))
+        }
         other => Err(EngineError::Unsupported(alloc::format!(
             "non-literal INSERT value expression: {other:?}"
         ))),
@@ -9124,6 +9340,26 @@ fn coerce_value(
             // output (lowercase, `\x` prefix). Important when a
             // SELECT pulls a bytea cell through a Text column path.
             (Value::Bytes(b), DataType::Text) => Some(Value::Text(encode_bytea_hex(&b))),
+            // v7.10.11 — Text → TEXT[]. Decode PG's external array
+            // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
+            // is the literal `NULL`; everything else is a quoted or
+            // unquoted text element. mailrs `'{label1,label2}'::TEXT[]`.
+            (Value::Text(s), DataType::TextArray) => {
+                let arr = decode_text_array_literal(&s).map_err(|e| {
+                    EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot parse {s:?} as TEXT[] for column `{col_name}`: {e}"
+                        ),
+                    })
+                })?;
+                Some(Value::TextArray(arr))
+            }
+            // v7.10.11 — TEXT[] → Text round-trip uses PG's
+            // external array form (`{a,b,NULL}`). Lets a SELECT
+            // pull an array column through any Text-side codepath.
+            (Value::TextArray(items), DataType::Text) => {
+                Some(Value::Text(encode_text_array(&items)))
+            }
             (Value::Text(s), DataType::Timestamp | DataType::Timestamptz) => {
                 let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
                     EngineError::Eval(EvalError::TypeMismatch {
