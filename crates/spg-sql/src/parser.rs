@@ -1856,10 +1856,19 @@ impl Parser {
                 )));
             }
             self.advance();
-            if !matches!(ty, ColumnTypeName::Text) {
-                return Err(self.err(alloc::format!("v7.10 only supports TEXT[]; got {ty:?}[]")));
-            }
-            ty = ColumnTypeName::TextArray;
+            // v7.11.13 — widened to INT[] and BIGINT[] in addition
+            // to TEXT[]. Other base types (BOOL[], NUMERIC[], etc.)
+            // still error here.
+            ty = match ty {
+                ColumnTypeName::Text => ColumnTypeName::TextArray,
+                ColumnTypeName::Int => ColumnTypeName::IntArray,
+                ColumnTypeName::BigInt => ColumnTypeName::BigIntArray,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "v7.11 supports TEXT[] / INT[] / BIGINT[] only; got {other:?}[]"
+                    )));
+                }
+            };
         }
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -2651,8 +2660,28 @@ impl Parser {
                 // mailrs follow-up H3a + H3b.
                 let target = match self.advance() {
                     Token::Ident(s) => match s.to_ascii_lowercase().as_str() {
-                        "int" | "integer" | "int4" => CastTarget::Int,
-                        "bigint" | "int8" => CastTarget::BigInt,
+                        "int" | "integer" | "int4" => {
+                            if matches!(self.peek(), Token::LBracket)
+                                && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+                            {
+                                self.advance();
+                                self.advance();
+                                CastTarget::IntArray
+                            } else {
+                                CastTarget::Int
+                            }
+                        }
+                        "bigint" | "int8" => {
+                            if matches!(self.peek(), Token::LBracket)
+                                && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+                            {
+                                self.advance();
+                                self.advance();
+                                CastTarget::BigIntArray
+                            } else {
+                                CastTarget::BigInt
+                            }
+                        }
                         "float" | "double" | "real" => CastTarget::Float,
                         "text" => {
                             // v7.10.11 — `::TEXT[]` widens to TextArray.

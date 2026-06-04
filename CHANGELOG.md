@@ -83,7 +83,58 @@ Sub-versions:
   v7.11.9  13 e2e tests
   v7.11.10 Epic 2 ship rollup — tag v7.11.1 + crates.io + docker
 
-Epic 3 (INT[] / BIGINT[] + BYTEA scalar ops) follows.
+**Epic 3 — INT[] / BIGINT[] + BYTEA scalar ops (this release).**
+v7.10.9 only modelled TEXT[]; everything else stringified, so a
+plain `INT[]` column from the PG ecosystem either error-typed or
+silently went through TextArray. Closes that gap with two new
+PG-typed array variants and the BYTEA scalar ops mailrs needs
+for binary email body manipulation.
+
+What lands:
+
+  * `INT[]` / `BIGINT[]` column types: parser accepts the
+    postfix `[]` form (`INT[]` / `BIGINT[]`), PG type OIDs 1007
+    (`_int4`) and 1016 (`_int8`) advertised on RowDescription.
+  * `Value::IntArray(Vec<Option<i32>>)` /
+    `Value::BigIntArray(Vec<Option<i64>>)` storage variants.
+    Row codec: `[u16 count][per element: u8 null flag +
+    (when non-null) i32/i64 LE]`. Catalog FILE_VERSION 18→19;
+    v18 catalogs still load (TextArray + Bytes unchanged).
+  * `::INT[]` / `::BIGINT[]` casts: PG external form decode
+    (`{1,2,3}`), Text→i32/i64 widening per element,
+    IntArray↔BigIntArray cross-cast (widening + narrowing).
+  * Wire output: `format_int_array` / `format_bigint_array`
+    emit `{1,2,NULL}` external form. RowDescription advertises
+    OID 1007 / 1016; binary array format remains deferred.
+  * `ARRAY[…]` literal type inference: all integers → IntArray,
+    mixed with BigInt → BigIntArray, any Text element → TextArray
+    (with stringified numerics as the safe default).
+  * Runtime ops parity with TEXT[]: subscript (`arr[i]` returns
+    Int / BigInt), `ANY` / `ALL`, `array_length`,
+    `array_position`, `unnest` (synthesises typed column),
+    `||` concat (array-array and array-scalar, with mixed
+    Int/BigInt widening to BigIntArray).
+
+  * BYTEA scalar ops: `||` byte concatenation,
+    `substring(bytea, start [, length])` (PG 1-based,
+    out-of-range → empty), `position(needle, haystack)` for
+    BYTEA *and* TEXT (1-based; 0 on absent; empty needle → 1).
+    Function-call form only — the PG-spec syntax
+    `position(needle IN haystack)` / `substring(x FROM y FOR z)`
+    is deferred. `substring` / `position` also work on TEXT.
+
+25 e2e tests across `tests/e2e_int_array.rs` (15) and
+`tests/e2e_bytea_ops.rs` (10). 4-corpus sqllogictest stays 100%.
+
+Sub-versions:
+
+  v7.11.11 INT[] / BIGINT[] storage + parser + cast
+  v7.11.12 IntArray / BigIntArray runtime ops + unnest + ||
+  v7.11.13 Wire output (OIDs 1007 / 1016 + format helpers)
+  v7.11.14 BYTEA scalar ops (|| / substring / position)
+  v7.11.15 e2e test bundle (25 tests)
+  v7.11.16 Epic 3 ship rollup — tag v7.11.2 + crates.io + docker
+  v7.11.17 (workspace bump only — every crate co-ships)
 
 ---
 
