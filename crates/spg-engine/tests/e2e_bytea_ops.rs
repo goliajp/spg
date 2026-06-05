@@ -24,10 +24,7 @@ fn select_value(eng: &mut Engine, sql: &str) -> Value {
 
 fn setup(eng: &mut Engine, left: &str, right: &str) {
     ok(eng, "CREATE TABLE t (a BYTEA NOT NULL, b BYTEA NOT NULL)");
-    ok(
-        eng,
-        &format!("INSERT INTO t VALUES ('{left}', '{right}')"),
-    );
+    ok(eng, &format!("INSERT INTO t VALUES ('{left}', '{right}')"));
 }
 
 #[test]

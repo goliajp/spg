@@ -9526,7 +9526,8 @@ fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
         // → TextArray. Cast targets (`ARRAY[]::INT[]`) flow through
         // the outer Cast arm before reaching here and re-coerce.
         Expr::Array(items) => {
-            let mut materialised: alloc::vec::Vec<Value> = alloc::vec::Vec::with_capacity(items.len());
+            let mut materialised: alloc::vec::Vec<Value> =
+                alloc::vec::Vec::with_capacity(items.len());
             for elem in items {
                 materialised.push(literal_expr_to_value(elem)?);
             }

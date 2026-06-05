@@ -14,11 +14,14 @@ fn eng() -> Engine {
 }
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn first_value(e: &mut Engine, sql: &str) -> Value {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows
             .into_iter()
@@ -34,7 +37,10 @@ fn first_value(e: &mut Engine, sql: &str) -> Value {
 #[test]
 fn to_tsvector_simple_keeps_words_unstemmed() {
     let mut e = eng();
-    let v = first_value(&mut e, "SELECT to_tsvector('simple', 'The Quick brown Foxes')");
+    let v = first_value(
+        &mut e,
+        "SELECT to_tsvector('simple', 'The Quick brown Foxes')",
+    );
     let lexs = match v {
         Value::TsVector(l) => l,
         other => panic!("expected tsvector, got {other:?}"),
@@ -90,7 +96,10 @@ fn to_tsvector_round_trips_through_cast_literal() {
     // `to_tsvector()` builder itself is exercised by the other
     // SELECT tests in this file.
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)",
+    );
     ok(
         &mut e,
         "INSERT INTO m VALUES (1, '''cat'':2 ''run'':1'::tsvector)",
@@ -205,7 +214,10 @@ fn set_default_config_drives_implicit_to_tsvector_config() {
 #[test]
 fn set_pg_catalog_qualified_config_accepted() {
     let mut e = eng();
-    ok(&mut e, "SET default_text_search_config = 'pg_catalog.english'");
+    ok(
+        &mut e,
+        "SET default_text_search_config = 'pg_catalog.english'",
+    );
     // `to_tsvector('pg_catalog.english', ...)` two-arg form too.
     let v = first_value(
         &mut e,
@@ -221,7 +233,9 @@ fn set_pg_catalog_qualified_config_accepted() {
 // --- v7.12.2: @@ match operator + ts_rank ---
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows,
         other => panic!("expected rows, got {other:?}"),
@@ -297,7 +311,10 @@ fn ts_match_and_or_not_3vl() {
 #[test]
 fn ts_match_filters_rows_in_table() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, body TEXT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE m (id INT NOT NULL, body TEXT NOT NULL)",
+    );
     ok(&mut e, "INSERT INTO m VALUES (1, 'the quick brown fox')");
     ok(&mut e, "INSERT INTO m VALUES (2, 'lazy cats sleep')");
     ok(&mut e, "INSERT INTO m VALUES (3, 'foxes hunt rabbits')");
@@ -363,9 +380,15 @@ fn ts_rank_cd_returns_positive_when_matched() {
 fn ts_rank_orders_select_by_relevance() {
     // mailrs's exact query shape: ORDER BY ts_rank(search_vector, q) DESC.
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, body TEXT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE m (id INT NOT NULL, body TEXT NOT NULL)",
+    );
     ok(&mut e, "INSERT INTO m VALUES (1, 'fox')");
-    ok(&mut e, "INSERT INTO m VALUES (2, 'fox quick fox brown fox')");
+    ok(
+        &mut e,
+        "INSERT INTO m VALUES (2, 'fox quick fox brown fox')",
+    );
     ok(&mut e, "INSERT INTO m VALUES (3, 'fox jumps')");
     let r = rows(
         &mut e,

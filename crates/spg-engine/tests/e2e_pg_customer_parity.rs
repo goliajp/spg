@@ -23,11 +23,14 @@ fn eng() -> Engine {
 }
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn first_value(e: &mut Engine, sql: &str) -> Value {
-    let r = e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    let r = e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows
             .into_iter()
@@ -73,7 +76,10 @@ fn limit_placeholder_parses() {
 #[test]
 fn now_minus_interval_30_days() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, created_at TIMESTAMP NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE m (id INT NOT NULL, created_at TIMESTAMP NOT NULL)",
+    );
     ok(&mut e, "INSERT INTO m VALUES (1, '2026-01-01 00:00:00')");
     let _ = first_value(
         &mut e,
@@ -84,7 +90,10 @@ fn now_minus_interval_30_days() {
 #[test]
 fn current_timestamp_minus_interval() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, ts TIMESTAMP NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE m (id INT NOT NULL, ts TIMESTAMP NOT NULL)",
+    );
     ok(&mut e, "INSERT INTO m VALUES (1, '2026-01-01 00:00:00')");
     let _ = first_value(
         &mut e,
@@ -105,7 +114,10 @@ fn bare_interval_literal_evaluates() {
     let v = first_value(&mut e, "SELECT INTERVAL '30 days'");
     assert!(matches!(
         v,
-        Value::Interval { months: 0, micros: 2_592_000_000_000 }
+        Value::Interval {
+            months: 0,
+            micros: 2_592_000_000_000
+        }
     ));
 }
 
@@ -113,7 +125,10 @@ fn bare_interval_literal_evaluates() {
 #[test]
 fn ivfflat_index_accepted() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE emb (id INT NOT NULL, v VECTOR(8) NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE emb (id INT NOT NULL, v VECTOR(8) NOT NULL)",
+    );
     ok(
         &mut e,
         "CREATE INDEX idx_emb ON emb USING ivfflat (v) WITH (lists = 20)",
@@ -123,7 +138,10 @@ fn ivfflat_index_accepted() {
 #[test]
 fn hnsw_with_storage_params_accepted() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE emb (id INT NOT NULL, v VECTOR(8) NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE emb (id INT NOT NULL, v VECTOR(8) NOT NULL)",
+    );
     ok(
         &mut e,
         "CREATE INDEX idx_emb ON emb USING hnsw (v) WITH (m = 16, ef_construction = 64)",
@@ -198,7 +216,10 @@ fn pk_index_picker_used_with_and_predicate() {
 #[test]
 fn hnsw_with_vector_cosine_ops_opclass() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE emb (id INT NOT NULL, v VECTOR(8) NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE emb (id INT NOT NULL, v VECTOR(8) NOT NULL)",
+    );
     ok(
         &mut e,
         "CREATE INDEX idx_emb ON emb USING hnsw (v vector_cosine_ops)",
@@ -210,7 +231,10 @@ fn hnsw_with_vector_cosine_ops_opclass() {
 #[test]
 fn tsvector_column_type_accepted() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)",
+    );
     // tsquery column too — both types should parse cleanly.
     ok(
         &mut e,
@@ -223,7 +247,10 @@ fn tsvector_column_type_accepted() {
 #[test]
 fn tsvector_cast_literal_round_trip() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE m (id INT NOT NULL, v tsvector NOT NULL)",
+    );
     ok(
         &mut e,
         "INSERT INTO m VALUES (1, 'cat:1 fat:2 rat:3,5A'::tsvector)",
@@ -240,7 +267,10 @@ fn tsvector_cast_literal_round_trip() {
 #[test]
 fn tsquery_cast_literal_round_trip() {
     let mut e = eng();
-    ok(&mut e, "CREATE TABLE q (id INT NOT NULL, query tsquery NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE q (id INT NOT NULL, query tsquery NOT NULL)",
+    );
     ok(
         &mut e,
         "INSERT INTO q VALUES (1, 'cat & dog | !fish'::tsquery)",

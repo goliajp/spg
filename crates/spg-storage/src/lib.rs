@@ -233,7 +233,10 @@ pub enum TsQueryAst {
     /// Single lexeme term. The `weight_mask` is the PG-style
     /// bitmask of accepted weights (`A=1<<3`, `B=1<<2`, `C=1<<1`,
     /// `D=1<<0`); `0` = any weight. v7.12.0 always sets it to 0.
-    Term { word: String, weight_mask: u8 },
+    Term {
+        word: String,
+        weight_mask: u8,
+    },
     And(Box<TsQueryAst>, Box<TsQueryAst>),
     Or(Box<TsQueryAst>, Box<TsQueryAst>),
     Not(Box<TsQueryAst>),
@@ -4929,8 +4932,18 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         }
         // v7.11.12: INT[] / BIGINT[] — [u16 count][per element:
         // u8 null + (when non-null) fixed-width LE].
-        Value::IntArray(items) => 2 + items.iter().map(|x| if x.is_some() { 5 } else { 1 }).sum::<usize>(),
-        Value::BigIntArray(items) => 2 + items.iter().map(|x| if x.is_some() { 9 } else { 1 }).sum::<usize>(),
+        Value::IntArray(items) => {
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 5 } else { 1 })
+                .sum::<usize>()
+        }
+        Value::BigIntArray(items) => {
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 9 } else { 1 })
+                .sum::<usize>()
+        }
         // v7.12.0: tsvector dense body — [u16 lexeme_count][per
         // lex: u16 word_len + utf-8 word + u16 pos_count + (u16
         // LE * pos_count) + u8 weight].
@@ -5366,7 +5379,11 @@ fn write_tsquery_body(out: &mut Vec<u8>, ast: &TsQueryAst) {
             out.push(3);
             write_tsquery_body(out, x);
         }
-        TsQueryAst::Phrase { left, right, distance } => {
+        TsQueryAst::Phrase {
+            left,
+            right,
+            distance,
+        } => {
             out.push(4);
             out.extend_from_slice(&distance.to_le_bytes());
             write_tsquery_body(out, left);
