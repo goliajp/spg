@@ -8,6 +8,93 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.12.7] — 2026-06-06 (G-CRIT-3 epic — full PG FTS + PL/pgSQL trigger surface)
+
+Series ship rollup for the v7.12 G-CRIT-3 epic. Closes the
+remaining mailrs D-cutover blocker (full-text search +
+trigger-maintained `tsvector` columns) and ships a usable
+PL/pgSQL trigger function surface that other PG customers
+typically rely on too.
+
+The series shipped in seven sub-versions; this rollup tag is
+the publish + docker target. Sub-version detail:
+
+  v7.12.0  tsvector / tsquery types + wire OIDs 3614 / 3615 +
+           pg_dump-shape `::tsvector` / `::tsquery` cast literals
+  v7.12.1  FTS lexer (`to_tsvector` with Porter stemmer +
+           Simple), four query constructors (`plainto_tsquery`,
+           `phraseto_tsquery`, `to_tsquery`,
+           `websearch_to_tsquery`), `SET default_text_search_config`
+  v7.12.2  `@@` match operator + `ts_rank` / `ts_rank_cd`
+  v7.12.3  Real GIN inverted index for `tsvector @@ tsquery`
+           (replaces the v7.9.26b BTree fallback). Planner
+           recognises `Term` / `And` / `Or` patterns and uses
+           posting-list intersection / union to narrow
+           candidates; `Not` / `Phrase` fall through to full
+           scan. Catalog FILE_VERSION 21
+  v7.12.4  `CREATE [OR REPLACE] FUNCTION ... RETURNS TRIGGER
+           LANGUAGE plpgsql AS $$ ... $$` +
+           `CREATE [OR REPLACE] TRIGGER ... { BEFORE | AFTER }
+           { INSERT | UPDATE | DELETE | ... }
+           ON tbl FOR EACH ROW EXECUTE FUNCTION fn()`.
+           BEFORE+AFTER INSERT row-write hooks. Minimal
+           PL/pgSQL: `NEW.col := <expr>;` (BEFORE only),
+           `RETURN NEW`/`OLD`/`NULL`. Catalog FILE_VERSION 22
+  v7.12.5  UPDATE + DELETE row-write hooks. Same trigger
+           interpreter; the engine wires BEFORE/AFTER into the
+           UPDATE plan-then-apply pass and the DELETE
+           filter-then-delete pass. BEFORE UPDATE sees
+           NEW=candidate + OLD=pre-update; BEFORE DELETE can
+           cancel individual rows; AFTER variants run read-only
+           post-write
+  v7.12.6  PL/pgSQL control flow + diagnostics: `DECLARE var
+           TYPE [:= init];`, `IF cond THEN ... ELSIF cond
+           THEN ... ELSE ... END IF;`,
+           `RAISE { NOTICE | WARNING | INFO | LOG | DEBUG }`
+           and `RAISE EXCEPTION` (aborts trigger with formatted
+           message). Local variables shadow column refs (PG
+           semantics). Earlier DECLAREs in scope for later
+           init exprs
+  v7.12.7  Embedded SQL inside trigger bodies — `INSERT INTO
+           audit VALUES (NEW.id, ...)` and family. NEW / OLD /
+           DECLARE-local references are substituted into the
+           statement's Expr tree at trigger-fire time; the
+           engine queues the resolved statement and drains the
+           queue after the firing DML's main work completes.
+           Recursion bounded at 16 deep (clear error on
+           trigger cycles). Plus this rollup: workspace bump,
+           CHANGELOG, crates.io publish, docker tag
+
+mailrs migration: this rollup closes G-CRIT-3 from the
+D-cutover parity gap doc. With v7.12.7 deployed mailrs's
+`scripts/init-schema.sql` runs unchanged — the
+`messages.search_vector tsvector` column, the
+`CREATE INDEX … USING GIN (search_vector)` index, and the
+`AFTER INSERT OR UPDATE ON messages` row-level trigger that
+maintains `search_vector` from `subject || sender || clean_text`
+all execute end-to-end. Fallback search via the
+`@@` UNION branch and `ts_rank` ordering (which mailrs
+unwound in D-pre #1) works without any mailrs-side change.
+A separate ack note (`.claude/notes/mailrs-ack-v7.12.7-fts-epic.md`)
+walks the mailrs side through what to revert.
+
+Sub-version commit count: 8 (v7.12.0–v7.12.6 + this rollup).
+Catalog FILE_VERSION on tag: 22 (rises by 1 each time the
+catalog appendix grows; v21 catalogs continue to load).
+
+Beyond the G-CRIT-3 epic the v7.12.x line carries one
+cumulative trade-off worth flagging: trigger-emitted embedded
+SQL deferred to post-DML drain (rather than PG's inline
+execution between row writes). The trade-off was the path-of-
+least-resistance to avoid dropping + reacquiring the row-
+write mut borrow inside the trigger interpreter. Functionally
+equivalent for the audit-log / sync-to-related-table / cascade
+patterns; the rare case it matters is a BEFORE trigger whose
+embedded SQL reads its own pre-INSERT row. Documented in
+`crates/spg-engine/src/triggers.rs` for future tightening.
+
+---
+
 ## [7.11.3] — 2026-06-04 (PG-customer parity patch — mailrs D-cutover)
 
 Patch release closing four PG idioms mailrs flagged as still

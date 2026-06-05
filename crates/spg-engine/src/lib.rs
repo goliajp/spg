@@ -619,7 +619,20 @@ pub struct Engine {
     /// All other names are accepted + recorded so PG-dump output
     /// loads, but have no behavioural effect.
     session_params: BTreeMap<String, String>,
+    /// v7.12.7 — depth counter for trigger-emitted embedded SQL.
+    /// Each time the engine executes a `DeferredEmbeddedStmt` it
+    /// increments this; the recursive `execute_stmt_with_cancel`
+    /// inside that path checks against [`MAX_TRIGGER_RECURSION`]
+    /// to bound runaway cascades (trigger A's UPDATE on table B
+    /// fires trigger B which UPDATEs table A which fires trigger
+    /// A again…). Reset to 0 once the original DML returns.
+    trigger_recursion_depth: u32,
 }
+
+/// v7.12.7 — hard cap on nested trigger-emitted embedded SQL
+/// fires. 16 deep is well past anything a normal trigger graph
+/// uses while still preventing infinite-loop wedging.
+const MAX_TRIGGER_RECURSION: u32 = 16;
 
 /// v6.5.6 — callback signature for slow-query log emission. Called
 /// with `(sql, elapsed_us)` once per successful execute that crosses
@@ -741,6 +754,7 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            trigger_recursion_depth: 0,
         }
     }
 
@@ -820,6 +834,7 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            trigger_recursion_depth: 0,
         }
     }
 
@@ -879,6 +894,7 @@ impl Engine {
                     slow_query_threshold_us: None,
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
+                    trigger_recursion_depth: 0,
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1176,6 +1192,37 @@ impl Engine {
             })
             .filter_map(|t| cat.functions().get(&t.function).cloned())
             .collect()
+    }
+
+    /// v7.12.7 — drain the trigger-emitted embedded SQL queue.
+    /// Called by the INSERT / UPDATE / DELETE executors after
+    /// their main row-write loop returns. Each statement runs
+    /// inside the same cancel scope as the firing DML and bumps
+    /// the recursion counter; nested embedded SQL beyond
+    /// [`MAX_TRIGGER_RECURSION`] errors with a clear message so
+    /// a trigger-graph cycle surfaces as a query failure instead
+    /// of stack-blowing the engine.
+    fn execute_deferred_trigger_stmts(
+        &mut self,
+        deferred: Vec<triggers::DeferredEmbeddedStmt>,
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        for d in deferred {
+            if self.trigger_recursion_depth >= MAX_TRIGGER_RECURSION {
+                return Err(EngineError::Storage(StorageError::Corrupt(alloc::format!(
+                    "trigger embedded SQL recursion depth {} exceeded (trigger function \
+                     {:?} would push past the {} cap — check for trigger cycles)",
+                    self.trigger_recursion_depth,
+                    d.function,
+                    MAX_TRIGGER_RECURSION,
+                ))));
+            }
+            self.trigger_recursion_depth += 1;
+            let res = self.execute_stmt_with_cancel(d.stmt, cancel);
+            self.trigger_recursion_depth -= 1;
+            res?;
+        }
+        Ok(())
     }
 
     fn active_catalog_mut(&mut self) -> &mut Catalog {
@@ -2672,12 +2719,14 @@ impl Engine {
         // RETURNING snapshot reflects what actually got written
         // (triggers may rewrite cells, including a cancellation).
         let mut applied_after_before: Vec<(usize, Row, Row)> = Vec::with_capacity(planned.len());
+        // v7.12.7 — embedded SQL queue.
+        let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
         for (pos, new_vals) in &planned {
             let old_row = table.rows()[*pos].clone();
             let mut new_row = Row::new(new_vals.clone());
             let mut skip = false;
             for fd in &before_update_triggers {
-                let outcome = triggers::fire_row_trigger(
+                let (outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     Some(new_row.clone()),
                     Some(&old_row),
@@ -2688,6 +2737,7 @@ impl Engine {
                     false,
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                deferred_embedded.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => new_row = r,
                     triggers::TriggerOutcome::Skip => {
@@ -2717,7 +2767,7 @@ impl Engine {
         for (pos, new_row, old_row) in applied_after_before {
             table.update_row(pos, new_row.values.clone())?;
             for fd in &after_update_triggers {
-                triggers::fire_row_trigger(
+                let (_outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     Some(new_row.clone()),
                     Some(&old_row),
@@ -2728,9 +2778,12 @@ impl Engine {
                     true,
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                deferred_embedded.extend(deferred);
             }
         }
         let _ = table;
+        // v7.12.7 — drain trigger-emitted embedded SQL for this UPDATE.
+        self.execute_deferred_trigger_stmts(deferred_embedded, cancel)?;
         // v6.2.1 — auto-analyze modified-row tracking for UPDATE.
         if !self.in_transaction() && affected > 0 {
             self.statistics
@@ -2848,6 +2901,8 @@ impl Engine {
         // filter must run BEFORE the FK cascade plan so cascaded
         // child rows track the trigger's skip-decision on the
         // parent.
+        // v7.12.7 — embedded SQL queue.
+        let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
         if !before_delete_triggers.is_empty() {
             let mut filtered_positions: Vec<usize> = Vec::with_capacity(positions.len());
             let mut filtered_old_rows: Vec<Vec<Value>> = Vec::with_capacity(to_delete_rows.len());
@@ -2855,7 +2910,7 @@ impl Engine {
                 let old_row = Row::new(old_vals.clone());
                 let mut cancel_this = false;
                 for fd in &before_delete_triggers {
-                    let outcome = triggers::fire_row_trigger(
+                    let (outcome, deferred) = triggers::fire_row_trigger(
                         fd,
                         None,
                         Some(&old_row),
@@ -2868,6 +2923,7 @@ impl Engine {
                     .map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
                     })?;
+                    deferred_embedded.extend(deferred);
                     if matches!(outcome, triggers::TriggerOutcome::Skip) {
                         cancel_this = true;
                         break;
@@ -2915,7 +2971,7 @@ impl Engine {
             for old_vals in &to_delete_rows {
                 let old_row = Row::new(old_vals.clone());
                 for fd in &after_delete_triggers {
-                    triggers::fire_row_trigger(
+                    let (_outcome, deferred) = triggers::fire_row_trigger(
                         fd,
                         None,
                         Some(&old_row),
@@ -2928,9 +2984,12 @@ impl Engine {
                     .map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
                     })?;
+                    deferred_embedded.extend(deferred);
                 }
             }
         }
+        // v7.12.7 — drain trigger-emitted embedded SQL for this DELETE.
+        self.execute_deferred_trigger_stmts(deferred_embedded, cancel)?;
         // v6.2.1 — auto-analyze modified-row tracking for DELETE.
         if !self.in_transaction() && affected > 0 {
             self.statistics
@@ -3906,6 +3965,10 @@ impl Engine {
         // INSERT and per UPDATE branch so DO UPDATE pushes the new
         // post-update state, not the incoming-only values.
         let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+        // v7.12.7 — collect embedded SQL emitted by any trigger
+        // fire across the row loop; engine drains the queue after
+        // the table mut borrow drops.
+        let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
         'rowloop: for values in all_values {
             let mut row = Row::new(values);
             // v7.12.4 — BEFORE INSERT row-level triggers. Each
@@ -3913,7 +3976,7 @@ impl Engine {
             // `search_vector := to_tsvector(...)`) and may return
             // NULL to skip the row entirely.
             for fd in &before_insert_triggers {
-                let outcome = triggers::fire_row_trigger(
+                let (outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     Some(row.clone()),
                     None,
@@ -3924,6 +3987,7 @@ impl Engine {
                     false,
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                deferred_embedded.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => row = r,
                     triggers::TriggerOutcome::Skip => continue 'rowloop,
@@ -3941,7 +4005,7 @@ impl Engine {
             // write. Return value is ignored (PG semantics); we
             // surface any error from the body up to the caller.
             for fd in &after_insert_triggers {
-                triggers::fire_row_trigger(
+                let (_outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     Some(inserted.clone()),
                     None,
@@ -3952,6 +4016,7 @@ impl Engine {
                     true,
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                deferred_embedded.extend(deferred);
             }
         }
         // v7.9.9 — apply ON CONFLICT DO UPDATE rewrites collected
@@ -3965,11 +4030,17 @@ impl Engine {
             affected += 1;
         }
         let _ = skipped_count;
+        // v7.12.7 — drop the table mut borrow and drain any
+        // trigger-emitted embedded SQL queued during this INSERT.
+        // The borrow has to release first because each deferred
+        // stmt may UPDATE / INSERT / DELETE the same (or another)
+        // table — including, in principle, this one.
+        let _ = table;
+        self.execute_deferred_trigger_stmts(deferred_embedded, CancelToken::none())?;
         // v7.9.4/v7.9.9 — RETURNING streams the rows that ended
         // up in the table after this statement (insert or
         // post-update on conflict).
         if let Some(items) = &stmt.returning {
-            let _ = table;
             return self.build_returning_rows(&stmt.table, items, returning_rows);
         }
         // v6.2.1 — auto-analyze: track per-table modified-row
