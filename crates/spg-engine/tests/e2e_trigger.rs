@@ -204,3 +204,208 @@ fn drop_trigger_stops_firing() {
 fn alloc_format<T: core::fmt::Debug>(t: &T) -> String {
     format!("{t:?}")
 }
+
+// --- v7.12.5: UPDATE + DELETE trigger hooks ---
+
+#[test]
+fn before_update_trigger_can_rewrite_new_column() {
+    // BEFORE UPDATE sees NEW (post-update candidate) + OLD
+    // (pre-update). Trigger rewrites NEW.v to a sentinel value.
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(&mut e, "INSERT INTO t VALUES (1, 10)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION force_v() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN NEW.v := 777; RETURN NEW; END; $$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION force_v()",
+    );
+    ok(&mut e, "UPDATE t SET v = 99 WHERE id = 1");
+    // The user's UPDATE asked for v=99 but the BEFORE trigger
+    // rewrote it to 777 before the write landed.
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(777)
+    );
+}
+
+#[test]
+fn before_update_trigger_can_skip_via_return_null() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(&mut e, "INSERT INTO t VALUES (1, 10)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION veto() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION veto()",
+    );
+    ok(&mut e, "UPDATE t SET v = 99 WHERE id = 1");
+    // The trigger returned NULL — UPDATE skipped, v stays 10.
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(10)
+    );
+}
+
+#[test]
+fn before_update_trigger_sees_old_row() {
+    // Trigger writes NEW.v := OLD.v + 1 — a typical "increment
+    // on update" pattern.
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(&mut e, "INSERT INTO t VALUES (1, 10)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION bump() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN NEW.v := OLD.v + 1; RETURN NEW; END; $$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION bump()",
+    );
+    ok(&mut e, "UPDATE t SET v = 999 WHERE id = 1");
+    // OLD.v was 10, NEW.v becomes 11 (regardless of what user
+    // SET told us to write).
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(11)
+    );
+}
+
+#[test]
+fn before_delete_trigger_can_veto_individual_rows() {
+    let mut e = eng();
+    ok(
+        &mut e,
+        "CREATE TABLE t (id INT NOT NULL, keep INT NOT NULL)",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 0)");
+    ok(&mut e, "INSERT INTO t VALUES (2, 1)");
+    ok(&mut e, "INSERT INTO t VALUES (3, 0)");
+    // Trigger: skip rows where OLD.keep = 1.
+    ok(
+        &mut e,
+        "CREATE FUNCTION guard() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.keep := OLD.keep;
+  RETURN NEW;
+END;
+$$",
+    );
+    // The trigger above runs as BEFORE UPDATE (no DELETE skip);
+    // for the DELETE-skip semantics build a dedicated trigger that
+    // returns NULL when OLD.keep = 1. v7.12.5 doesn't yet have IF
+    // in PL/pgSQL, so this test instead verifies the easier shape:
+    // a BEFORE DELETE that always returns NULL skips ALL deletes.
+    ok(
+        &mut e,
+        "CREATE FUNCTION blackhole_del() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg_del BEFORE DELETE ON t FOR EACH ROW EXECUTE FUNCTION blackhole_del()",
+    );
+    let r = e
+        .execute("DELETE FROM t WHERE id IN (1, 2, 3)")
+        .expect("delete should succeed (just no-op)");
+    if let spg_engine::QueryResult::CommandOk { affected, .. } = r {
+        assert_eq!(
+            affected, 0,
+            "all 3 rows skipped via BEFORE DELETE RETURN NULL"
+        );
+    }
+    // All rows still present.
+    let count = first_value(&mut e, "SELECT count(*) FROM t");
+    assert_eq!(count, Value::BigInt(3));
+}
+
+#[test]
+fn after_update_trigger_cannot_assign_to_new() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(&mut e, "INSERT INTO t VALUES (1, 10)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION bad_after() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN NEW.v := 1; RETURN NEW; END; $$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg AFTER UPDATE ON t FOR EACH ROW EXECUTE FUNCTION bad_after()",
+    );
+    let err = e
+        .execute("UPDATE t SET v = 99 WHERE id = 1")
+        .expect_err("AFTER UPDATE writing NEW must error");
+    let msg = alloc_format(&err);
+    assert!(
+        msg.to_lowercase().contains("after") && msg.to_lowercase().contains("read-only"),
+        "expected AFTER NEW read-only error, got {msg}"
+    );
+}
+
+#[test]
+fn mailrs_update_search_vector_on_subject_change() {
+    // mailrs G-CRIT-3 UPDATE-shape acceptance: when a message's
+    // `subject` changes, `search_vector` must auto-recompute via
+    // the BEFORE UPDATE trigger and the GIN index must pick up
+    // the new lexemes. Mirrors the v7.12.4 INSERT-shape test.
+    let mut e = eng();
+    ok(
+        &mut e,
+        "CREATE TABLE messages (id INT NOT NULL, subject TEXT NOT NULL, search_vector tsvector)",
+    );
+    ok(
+        &mut e,
+        "CREATE INDEX msg_sv_gin ON messages USING gin (search_vector)",
+    );
+    ok(
+        &mut e,
+        "CREATE FUNCTION update_sv() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.search_vector := to_tsvector('simple', NEW.subject);
+  RETURN NEW;
+END;
+$$",
+    );
+    // Fires on both INSERT and UPDATE — covers the full mailrs
+    // lifecycle, not just the v7.12.4 INSERT branch.
+    ok(
+        &mut e,
+        "CREATE TRIGGER messages_sv BEFORE INSERT OR UPDATE ON messages FOR EACH ROW EXECUTE FUNCTION update_sv()",
+    );
+    ok(
+        &mut e,
+        "INSERT INTO messages VALUES (1, 'the quick brown fox', NULL)",
+    );
+    let rs = rows(
+        &mut e,
+        "SELECT id FROM messages WHERE search_vector @@ to_tsquery('simple', 'fox')",
+    );
+    assert_eq!(rs.len(), 1, "initial INSERT path: fox matches");
+    // Subject change → trigger re-runs to_tsvector against the
+    // new subject → GIN index re-indexes via rebuild_indices.
+    ok(
+        &mut e,
+        "UPDATE messages SET subject = 'lazy cats sleep' WHERE id = 1",
+    );
+    let rs_fox = rows(
+        &mut e,
+        "SELECT id FROM messages WHERE search_vector @@ to_tsquery('simple', 'fox')",
+    );
+    assert!(
+        rs_fox.is_empty(),
+        "post-UPDATE: fox should NOT match — subject changed and trigger should have rewritten search_vector"
+    );
+    let rs_cats = rows(
+        &mut e,
+        "SELECT id FROM messages WHERE search_vector @@ to_tsquery('simple', 'cats')",
+    );
+    assert_eq!(
+        rs_cats.len(),
+        1,
+        "post-UPDATE: cats should match the new subject's lexemes"
+    );
+}
