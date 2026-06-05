@@ -327,6 +327,14 @@ pub enum IndexMethod {
     /// envelope's sidecar. Created via the standard
     /// `CREATE INDEX … USING brin (col)` syntax.
     Brin,
+    /// v7.12.3 — `USING gin` — inverted index over a `tsvector`
+    /// column. Posting lists map `lexeme word` → row locators; the
+    /// planner uses them to narrow `WHERE col @@ tsquery` to the
+    /// candidate rows whose vectors contain a matching term, then
+    /// re-evaluates the full `@@` semantics on each candidate.
+    /// Replaces the v7.9.26b `USING gin` → BTree fallback that
+    /// silently degraded to a full scan at query time.
+    Gin,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1332,6 +1340,7 @@ impl fmt::Display for CreateIndexStatement {
         match self.method {
             IndexMethod::Hnsw => f.write_str("USING hnsw ")?,
             IndexMethod::Brin => f.write_str("USING brin ")?,
+            IndexMethod::Gin => f.write_str("USING gin ")?,
             IndexMethod::BTree => {}
         }
         if let Some(expr) = &self.expression {

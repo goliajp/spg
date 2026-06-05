@@ -3087,6 +3087,40 @@ impl Engine {
                 }
                 table.add_brin_index(stmt.name.clone(), &stmt.column)?;
             }
+            // v7.12.3 — GIN inverted index. Real posting-list-backed
+            // GIN when the indexed column is `tsvector`; falls back
+            // to a BTree on the leading column for any other column
+            // type so v7.9.26b's `pg_dump` compatibility (GIN on
+            // JSONB etc. silently loading as BTree) is preserved.
+            // Operators see the real GIN only where it matters; old
+            // schemas keep loading.
+            IndexMethod::Gin => {
+                if !included_positions.is_empty() {
+                    return Err(EngineError::Unsupported(
+                        "INCLUDE columns are not supported on GIN indexes".into(),
+                    ));
+                }
+                let col_pos = table
+                    .schema()
+                    .column_position(&stmt.column)
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::ColumnNotFound {
+                            column: stmt.column.clone(),
+                        })
+                    })?;
+                if table.schema().columns[col_pos].ty == spg_storage::DataType::TsVector {
+                    table
+                        .add_gin_index(stmt.name.clone(), &stmt.column)
+                        .map_err(EngineError::Storage)?;
+                } else {
+                    // v7.9.26b BTree fallback — the catalog still
+                    // gets an index entry on the leading column so
+                    // pg_dump scripts that name GIN on JSONB / etc.
+                    // load clean; query-time gain stays opt-in for
+                    // tsvector callers.
+                    table.add_index(stmt.name.clone(), &stmt.column)?;
+                }
+            }
         }
         if !included_positions.is_empty()
             && let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name)
@@ -3102,7 +3136,10 @@ impl Engine {
         // predicate" pass is STABILITY carve-out).
         if let Some(pred_expr) = &stmt.partial_predicate {
             let canonical = pred_expr.to_string();
-            if matches!(stmt.method, IndexMethod::Hnsw | IndexMethod::Brin) {
+            if matches!(
+                stmt.method,
+                IndexMethod::Hnsw | IndexMethod::Brin | IndexMethod::Gin
+            ) {
                 return Err(EngineError::Unsupported(
                     "WHERE predicates are not supported on HNSW or BRIN indexes".into(),
                 ));
@@ -3119,7 +3156,10 @@ impl Engine {
         // round-trip + future planner work. Carved-out in
         // STABILITY § "Out of v6.8".
         if let Some(key_expr) = &stmt.expression {
-            if matches!(stmt.method, IndexMethod::Hnsw | IndexMethod::Brin) {
+            if matches!(
+                stmt.method,
+                IndexMethod::Hnsw | IndexMethod::Brin | IndexMethod::Gin
+            ) {
                 return Err(EngineError::Unsupported(
                     "Expression keys are not supported on HNSW or BRIN indexes".into(),
                 ));
@@ -4143,10 +4183,17 @@ impl Engine {
         // full scan over the hot tier (cold-tier rows are only reached
         // via index seek in v5.1 — full table scans against cold-tier
         // data ship in v5.2 with the freezer's per-segment scan API).
-        let indexed_rows: Option<Vec<Cow<'_, Row>>> = stmt
-            .where_
-            .as_ref()
-            .and_then(|w| try_index_seek(w, schema_cols, self.active_catalog(), table, alias));
+        let indexed_rows: Option<Vec<Cow<'_, Row>>> = stmt.where_.as_ref().and_then(|w| {
+            // BTree / col=literal seek first — covers the v7.11.3 multi-
+            // column AND case and the leading-column equality lookup.
+            try_index_seek(w, schema_cols, self.active_catalog(), table, alias).or_else(|| {
+                // v7.12.3 — GIN-accelerated `WHERE col @@ tsquery`
+                // when the column has a `USING gin` index. Returns an
+                // over-approximate candidate set; the WHERE re-eval
+                // loop below verifies the full `@@` predicate per row.
+                try_gin_seek(w, schema_cols, self.active_catalog(), table, alias, &ctx)
+            })
+        });
 
         // Aggregate path: filter rows first, then hand off to the
         // aggregate executor which does its own projection + ORDER BY.
@@ -4738,6 +4785,187 @@ fn try_index_seek<'a>(
         }
     }
     Some(out)
+}
+
+/// v7.12.3 — GIN-accelerated candidate seek for `WHERE col @@ <ts_query>`.
+///
+/// Recurses through top-level `AND` like [`try_index_seek`] so a
+/// composite predicate `WHERE search_vector @@ q AND id > $1` still
+/// hits the GIN index on `search_vector` — the caller re-applies the
+/// full WHERE expression to each returned candidate, so dropping the
+/// `id > $1` residual here stays semantically correct.
+///
+/// Returns `None` when:
+///   - no leaf is a `col @@ <rhs>` shape on a GIN-indexed column;
+///   - the RHS can't be const-evaluated to a `Value::TsQuery`
+///     (typically because it references row columns);
+///   - the resolved `TsQuery` uses query shapes the MVP doesn't
+///     accelerate (`Not`, `Phrase` — those fall through to full scan).
+///
+/// On `Some(rows)` the caller iterates only `rows` and re-evaluates
+/// the full `@@` predicate per row, so an over-approximate candidate
+/// set is safe.
+fn try_gin_seek<'a>(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    catalog: &'a Catalog,
+    table: &'a Table,
+    table_alias: &str,
+    ctx: &eval::EvalContext<'_>,
+) -> Option<Vec<Cow<'a, Row>>> {
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::And,
+        rhs,
+    } = where_expr
+    {
+        if let Some(rows) = try_gin_seek(lhs, schema_cols, catalog, table, table_alias, ctx) {
+            return Some(rows);
+        }
+        return try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx);
+    }
+    let Expr::Binary {
+        lhs,
+        op: BinOp::TsMatch,
+        rhs,
+    } = where_expr
+    else {
+        return None;
+    };
+    // Either side can be the column; pgvector idiom (`vec @@ q`)
+    // hits the first arm, FROM-clause-derived (`plainto_tsquery($1)
+    // q ... WHERE search_vector @@ q`) the same. CROSS JOIN derived
+    // tables resolve `q` to a Column too.
+    let (col_pos, query) = resolve_gin_col_query(lhs, rhs, schema_cols, table_alias, ctx)
+        .or_else(|| resolve_gin_col_query(rhs, lhs, schema_cols, table_alias, ctx))?;
+    let idx = table
+        .indices()
+        .iter()
+        .find(|i| i.column_position == col_pos && i.is_gin())?;
+    let candidates = gin_query_candidates(idx, &query)?;
+    let _ = catalog; // cold-tier row resolution unused in MVP; see below.
+    let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(candidates.len());
+    for loc in candidates {
+        match loc {
+            spg_storage::RowLocator::Hot(i) => {
+                if let Some(row) = table.rows().get(i) {
+                    out.push(Cow::Borrowed(row));
+                }
+            }
+            // GIN cold-tier rows in the MVP: skipped, matching the
+            // full-scan `@@` path which itself only iterates
+            // `table.rows()` (hot tier). When v7.13+ adds cold-tier
+            // scan-time materialisation for `@@`, the parallel
+            // resolution lands here; until then both paths see the
+            // same hot-only candidate set so correctness is preserved.
+            spg_storage::RowLocator::Cold { .. } => {}
+        }
+    }
+    Some(out)
+}
+
+/// v7.12.3 — extract `(column_position, TsQueryAst)` when one side of
+/// the binary is a column reference to a GIN-indexed tsvector column
+/// and the other side const-evaluates to a `Value::TsQuery`. Returns
+/// `None` if the column reference is for the wrong table alias, or if
+/// the RHS expression depends on row data.
+fn resolve_gin_col_query(
+    col_side: &Expr,
+    query_side: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+    ctx: &eval::EvalContext<'_>,
+) -> Option<(usize, spg_storage::TsQueryAst)> {
+    let Expr::Column(c) = col_side else {
+        return None;
+    };
+    if let Some(q) = &c.qualifier
+        && q != table_alias
+    {
+        return None;
+    }
+    let pos = schema_cols.iter().position(|s| s.name == c.name)?;
+    // Const-evaluate the query side with an empty row — fails fast
+    // (with a `ColumnNotFound` / similar) if the expression actually
+    // depends on row data, which is exactly the bail signal we want.
+    let empty_row = Row::new(Vec::new());
+    let v = eval::eval_expr(query_side, &empty_row, ctx).ok()?;
+    let Value::TsQuery(q) = v else { return None };
+    Some((pos, q))
+}
+
+/// v7.12.3 — walk a `TsQueryAst` against an [`IndexKind::Gin`] index
+/// to produce a candidate row-locator set. Returns `None` for query
+/// shapes the MVP doesn't accelerate (`Not` / `Phrase` — both bail to
+/// full scan since their semantics need either complementation across
+/// the whole row set or positional verification beyond what the
+/// posting list carries).
+///
+/// Candidate sets are over-approximate — the caller re-applies the
+/// full `@@` predicate per row, so reporting "row was in some
+/// posting list" without verifying positions / weights stays correct.
+fn gin_query_candidates(
+    idx: &spg_storage::Index,
+    query: &spg_storage::TsQueryAst,
+) -> Option<Vec<spg_storage::RowLocator>> {
+    use spg_storage::TsQueryAst;
+    match query {
+        TsQueryAst::Term { word, .. } => {
+            let mut v: Vec<spg_storage::RowLocator> = idx.gin_lookup_word(word).to_vec();
+            v.sort_by_key(locator_sort_key);
+            v.dedup_by_key(|l| locator_sort_key(l));
+            Some(v)
+        }
+        TsQueryAst::And(l, r) => {
+            let mut left = gin_query_candidates(idx, l)?;
+            let mut right = gin_query_candidates(idx, r)?;
+            left.sort_by_key(locator_sort_key);
+            right.sort_by_key(locator_sort_key);
+            // Sorted-merge intersection.
+            let mut out: Vec<spg_storage::RowLocator> = Vec::new();
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < left.len() && j < right.len() {
+                let lk = locator_sort_key(&left[i]);
+                let rk = locator_sort_key(&right[j]);
+                match lk.cmp(&rk) {
+                    core::cmp::Ordering::Less => i += 1,
+                    core::cmp::Ordering::Greater => j += 1,
+                    core::cmp::Ordering::Equal => {
+                        out.push(left[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            Some(out)
+        }
+        TsQueryAst::Or(l, r) => {
+            let mut out = gin_query_candidates(idx, l)?;
+            out.extend(gin_query_candidates(idx, r)?);
+            out.sort_by_key(locator_sort_key);
+            out.dedup_by_key(|l| locator_sort_key(l));
+            Some(out)
+        }
+        // Not / Phrase bail to full scan in the MVP. Not needs
+        // complementation against the whole row set (not represented
+        // in the posting-list view); Phrase needs positional
+        // verification beyond what `word → rows` carries.
+        TsQueryAst::Not(_) | TsQueryAst::Phrase { .. } => None,
+    }
+}
+
+/// v7.12.3 — total ordering on `RowLocator` for sort/dedup purposes
+/// inside the GIN intersection / union loops. Hot rows order by their
+/// row index; Cold rows order after all Hot rows, then by
+/// `(segment_id, the cold sub-key)`.
+fn locator_sort_key(l: &spg_storage::RowLocator) -> (u8, u64, u64) {
+    match *l {
+        spg_storage::RowLocator::Hot(i) => (0, i as u64, 0),
+        spg_storage::RowLocator::Cold {
+            segment_id,
+            page_offset,
+        } => (1, u64::from(segment_id), u64::from(page_offset)),
+    }
 }
 
 /// v5.2.3: extract `(column_position, IndexKey)` when `where_expr`
