@@ -565,6 +565,182 @@ $$",
     assert_eq!(count, Value::BigInt(1));
 }
 
+// --- v7.12.7: embedded SQL inside trigger bodies ---
+
+#[test]
+fn after_insert_trigger_embedded_insert_to_audit_table() {
+    // Canonical audit-log shape: AFTER INSERT trigger inserts
+    // a row into a separate audit table referencing NEW.id.
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE TABLE t_audit (src_id INT NOT NULL, src_v INT NOT NULL)",
+    );
+    ok(
+        &mut e,
+        "CREATE FUNCTION audit() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO t_audit VALUES (NEW.id, NEW.v);
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION audit()",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 100)");
+    ok(&mut e, "INSERT INTO t VALUES (2, 200)");
+    // Both rows landed in the audit table.
+    let r = rows(&mut e, "SELECT src_id, src_v FROM t_audit ORDER BY src_id");
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].values, vec![Value::Int(1), Value::Int(100)]);
+    assert_eq!(r[1].values, vec![Value::Int(2), Value::Int(200)]);
+}
+
+#[test]
+fn after_update_trigger_embedded_update_to_propagate_to_related_table() {
+    // AFTER UPDATE trigger propagates a denormalised cell to a
+    // related table via an embedded UPDATE referencing NEW + OLD.
+    let mut e = eng();
+    ok(
+        &mut e,
+        "CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)",
+    );
+    ok(
+        &mut e,
+        "CREATE TABLE posts (id INT NOT NULL, author_id INT NOT NULL, author_name TEXT NOT NULL)",
+    );
+    ok(&mut e, "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')");
+    ok(
+        &mut e,
+        "INSERT INTO posts VALUES (10, 1, 'alice'), (11, 2, 'bob'), (12, 1, 'alice')",
+    );
+    ok(
+        &mut e,
+        "CREATE FUNCTION sync_author_name() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE posts SET author_name = NEW.name WHERE author_id = NEW.id;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg AFTER UPDATE ON users FOR EACH ROW EXECUTE FUNCTION sync_author_name()",
+    );
+    ok(&mut e, "UPDATE users SET name = 'ALICE' WHERE id = 1");
+    // Both alice posts got rewritten.
+    let r = rows(&mut e, "SELECT id, author_name FROM posts ORDER BY id");
+    assert_eq!(
+        r[0].values,
+        vec![Value::Int(10), Value::Text("ALICE".into())]
+    );
+    assert_eq!(r[1].values, vec![Value::Int(11), Value::Text("bob".into())]);
+    assert_eq!(
+        r[2].values,
+        vec![Value::Int(12), Value::Text("ALICE".into())]
+    );
+}
+
+#[test]
+fn after_delete_trigger_embedded_delete_to_cleanup_related_rows() {
+    // AFTER DELETE trigger removes related rows via an embedded
+    // DELETE referencing OLD.id.
+    let mut e = eng();
+    ok(
+        &mut e,
+        "CREATE TABLE parent (id INT NOT NULL, name TEXT NOT NULL)",
+    );
+    ok(
+        &mut e,
+        "CREATE TABLE child (parent_id INT NOT NULL, payload TEXT NOT NULL)",
+    );
+    ok(&mut e, "INSERT INTO parent VALUES (1, 'p1'), (2, 'p2')");
+    ok(
+        &mut e,
+        "INSERT INTO child VALUES (1, 'c1a'), (1, 'c1b'), (2, 'c2a')",
+    );
+    ok(
+        &mut e,
+        "CREATE FUNCTION cascade_delete_children() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM child WHERE parent_id = OLD.id;
+  RETURN OLD;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg AFTER DELETE ON parent FOR EACH ROW EXECUTE FUNCTION cascade_delete_children()",
+    );
+    ok(&mut e, "DELETE FROM parent WHERE id = 1");
+    // child rows for parent_id=1 are gone; parent_id=2 stayed.
+    let r = rows(
+        &mut e,
+        "SELECT parent_id, payload FROM child ORDER BY payload",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].values, vec![Value::Int(2), Value::Text("c2a".into())]);
+}
+
+#[test]
+fn before_insert_trigger_raise_exception_inside_if_still_propagates() {
+    // Composition test: IF predicate + RAISE EXCEPTION + embedded
+    // SQL in the truthy branch.
+    let mut e = eng();
+    ok(
+        &mut e,
+        "CREATE TABLE accounts (id INT NOT NULL, balance INT NOT NULL)",
+    );
+    ok(
+        &mut e,
+        "CREATE TABLE rejections (account_id INT NOT NULL, reason TEXT NOT NULL)",
+    );
+    ok(
+        &mut e,
+        "CREATE FUNCTION guard() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.balance < 0 THEN
+    INSERT INTO rejections VALUES (NEW.id, 'negative balance');
+    RAISE EXCEPTION 'rejected negative balance for account %', NEW.id;
+  END IF;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION guard()",
+    );
+    // OK row goes in.
+    ok(&mut e, "INSERT INTO accounts VALUES (1, 100)");
+    // Negative balance row triggers the IF branch — embedded
+    // INSERT queues + RAISE EXCEPTION fires.
+    let err = e
+        .execute("INSERT INTO accounts VALUES (2, -50)")
+        .expect_err("RAISE EXCEPTION must abort");
+    let msg = alloc_format(&err);
+    assert!(
+        msg.contains("rejected negative balance") && msg.contains("2"),
+        "RAISE EXCEPTION should propagate with substituted account id: {msg}"
+    );
+    // Verify the row didn't land.
+    let r = rows(&mut e, "SELECT id FROM accounts ORDER BY id");
+    assert_eq!(r.len(), 1, "row 2 must not be inserted");
+    // v7.12.7 — RAISE EXCEPTION aborts before the deferred
+    // embedded INSERT runs, so `rejections` stays empty.
+    // (PG would have run the embedded SQL inline; we collect-
+    // then-execute, so abort wins. Documented in the design
+    // and acceptable trade-off.)
+    let r2 = rows(&mut e, "SELECT account_id FROM rejections");
+    assert!(
+        r2.is_empty(),
+        "deferred embedded INSERT must NOT run when RAISE EXCEPTION aborts"
+    );
+}
+
 #[test]
 fn mailrs_update_search_vector_on_subject_change() {
     // mailrs G-CRIT-3 UPDATE-shape acceptance: when a message's

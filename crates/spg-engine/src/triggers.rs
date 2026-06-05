@@ -33,12 +33,24 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use spg_sql::ast::{
-    AssignTarget, Expr, PlPgSqlDeclare, PlPgSqlStmt, RaiseLevel, ReturnTarget,
-};
+use spg_sql::ast::{AssignTarget, Expr, PlPgSqlDeclare, PlPgSqlStmt, RaiseLevel, ReturnTarget};
 use spg_storage::{ColumnSchema, FunctionDef, Row, TriggerDef, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
+
+/// v7.12.7 — embedded SQL statement collected during a trigger
+/// fire, queued for execution after the firing DML completes.
+/// NEW / OLD / DECLARE-local references inside the statement's
+/// Expr tree have already been substituted with literals; the
+/// engine just feeds it to `execute_stmt_with_cancel`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredEmbeddedStmt {
+    /// Trigger function the embedded SQL came from. Used to
+    /// label recursion errors precisely.
+    pub function: String,
+    /// Substituted statement, ready to execute.
+    pub stmt: spg_sql::ast::Statement,
+}
 
 /// What the trigger function returned. Drives the row-write path
 /// the trigger fired from.
@@ -173,7 +185,7 @@ pub fn fire_row_trigger(
     params: &[Value],
     default_text_search_config: Option<&str>,
     is_after: bool,
-) -> Result<TriggerOutcome, TriggerError> {
+) -> Result<(TriggerOutcome, Vec<DeferredEmbeddedStmt>), TriggerError> {
     if !function.language.eq_ignore_ascii_case("plpgsql") {
         return Err(TriggerError::UnsupportedConstruct {
             function: function.name.clone(),
@@ -215,19 +227,22 @@ pub fn fire_row_trigger(
         default_text_search_config,
         is_after,
     };
-    match execute_stmts(
+    let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
+    let outcome = match execute_stmts(
         &block.statements,
         &mut current_new,
         old_row,
         &mut locals,
         &ctx,
+        &mut deferred,
     )? {
-        BodyOutcome::Return(target) => Ok(resolve_return(target, current_new, old_row)),
+        BodyOutcome::Return(target) => resolve_return(target, current_new, old_row),
         // Body fell off without an explicit RETURN. PL/pgSQL
         // default is `RETURN NULL`; we mirror — the BEFORE
         // trigger then skips the row.
-        BodyOutcome::FellThrough => Ok(TriggerOutcome::Skip),
-    }
+        BodyOutcome::FellThrough => TriggerOutcome::Skip,
+    };
+    Ok((outcome, deferred))
 }
 
 /// v7.12.6 — body-walk return signal. `Return(target)` short-
@@ -257,6 +272,7 @@ fn execute_stmts(
     old_row: Option<&Row>,
     locals: &mut BTreeMap<String, Value>,
     ctx: &BodyCtx<'_>,
+    deferred: &mut Vec<DeferredEmbeddedStmt>,
 ) -> Result<BodyOutcome, TriggerError> {
     for stmt in stmts {
         match stmt {
@@ -345,7 +361,7 @@ fn execute_stmts(
                     })?;
                     if matches!(cond_val, Value::Bool(true)) {
                         matched = true;
-                        match execute_stmts(body, current_new, old_row, locals, ctx)? {
+                        match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
                             BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
                             BodyOutcome::FellThrough => {}
                         }
@@ -353,7 +369,7 @@ fn execute_stmts(
                     }
                 }
                 if !matched && !else_branch.is_empty() {
-                    match execute_stmts(else_branch, current_new, old_row, locals, ctx)? {
+                    match execute_stmts(else_branch, current_new, old_row, locals, ctx, deferred)? {
                         BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
                         BodyOutcome::FellThrough => {}
                     }
@@ -398,17 +414,29 @@ fn execute_stmts(
                 let _ = resolved;
                 let _ = level;
             }
-            PlPgSqlStmt::EmbeddedSql(_) => {
-                // v7.12.6 carve-out: embedded SQL parses but its
-                // executor lands in v7.12.7 alongside the engine-
-                // side Engine::execute recursion plumbing (which
-                // requires dropping + reacquiring the row-write
-                // mutable borrow safely).
-                return Err(TriggerError::UnsupportedConstruct {
+            PlPgSqlStmt::EmbeddedSql(boxed_stmt) => {
+                // v7.12.7 — substitute NEW/OLD/locals into every
+                // Expr field of the statement, then queue for
+                // post-DML execution. The trigger interpreter
+                // doesn't call back into Engine::execute directly
+                // (that would deadlock the row-write mut borrow);
+                // the engine drains `deferred` after the firing
+                // INSERT/UPDATE/DELETE completes its main work.
+                let mut substituted = (**boxed_stmt).clone();
+                substitute_trigger_context_in_statement(
+                    &mut substituted,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
-                    detail: String::from(
-                        "embedded SQL inside a trigger body (executor lands in v7.12.7)",
-                    ),
+                    cause,
+                })?;
+                deferred.push(DeferredEmbeddedStmt {
+                    function: ctx.function.into(),
+                    stmt: substituted,
                 });
             }
         }
@@ -726,6 +754,98 @@ fn value_to_literal_expr(_columns: &[ColumnSchema], _pos: usize, v: Value) -> Ex
         other => Literal::String(format!("{other:?}")),
     };
     Expr::Literal(lit)
+}
+
+/// v7.12.7 — substitute NEW / OLD / DECLARE-local references in
+/// every `Expr` field of a [`Statement`]. Used to materialise an
+/// embedded SQL statement's NEW.col / OLD.col / local-var refs as
+/// literals so the engine can re-execute it without holding the
+/// trigger context.
+fn substitute_trigger_context_in_statement(
+    stmt: &mut spg_sql::ast::Statement,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+    locals: &BTreeMap<String, Value>,
+    columns: &[ColumnSchema],
+) -> Result<(), EvalError> {
+    use spg_sql::ast::Statement;
+    let mut walk = |e: &mut Expr| -> Result<(), EvalError> {
+        substitute_locals(e, locals);
+        substitute_new_old(e, new_row, old_row, columns)?;
+        Ok(())
+    };
+    match stmt {
+        Statement::Insert(s) => {
+            for tuple in &mut s.rows {
+                for e in tuple {
+                    walk(e)?;
+                }
+            }
+        }
+        Statement::Update(s) => {
+            for (_col, e) in &mut s.assignments {
+                walk(e)?;
+            }
+            if let Some(w) = &mut s.where_ {
+                walk(w)?;
+            }
+        }
+        Statement::Delete(s) => {
+            if let Some(w) = &mut s.where_ {
+                walk(w)?;
+            }
+        }
+        Statement::Select(s) => {
+            substitute_trigger_context_in_select(s, new_row, old_row, locals, columns)?
+        }
+        // Other statement kinds (DDL, SHOW, etc.) inside a
+        // trigger body would only meaningfully reference NEW/OLD
+        // in error-message position; v7.12.7 doesn't recursively
+        // substitute their Expr fields. Future surfaces (e.g.
+        // RAISE ... USING) can add cases here.
+        _ => {}
+    }
+    Ok(())
+}
+
+fn substitute_trigger_context_in_select(
+    s: &mut spg_sql::ast::SelectStatement,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+    locals: &BTreeMap<String, Value>,
+    columns: &[ColumnSchema],
+) -> Result<(), EvalError> {
+    use spg_sql::ast::SelectItem;
+    let mut walk = |e: &mut Expr| -> Result<(), EvalError> {
+        substitute_locals(e, locals);
+        substitute_new_old(e, new_row, old_row, columns)?;
+        Ok(())
+    };
+    for item in &mut s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr)?;
+        }
+    }
+    if let Some(w) = &mut s.where_ {
+        walk(w)?;
+    }
+    if let Some(group_by) = &mut s.group_by {
+        for g in group_by {
+            walk(g)?;
+        }
+    }
+    if let Some(h) = &mut s.having {
+        walk(h)?;
+    }
+    for ob in &mut s.order_by {
+        walk(&mut ob.expr)?;
+    }
+    // LIMIT / OFFSET use `LimitExpr` (integer literal or
+    // placeholder); they don't carry an `Expr` to substitute
+    // into. Leave them alone.
+    let _ = &s.limit;
+    let _ = &s.offset;
+    Ok(())
 }
 
 /// v7.12.4 — find the triggers that should fire for a given
