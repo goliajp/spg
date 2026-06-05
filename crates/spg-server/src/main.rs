@@ -4221,9 +4221,7 @@ fn value_to_wire(v: &Value) -> WireValue {
         // v7.11.14 — INT[] / BIGINT[] external form `{1,2,NULL}`.
         // RowDescription advertises OIDs 1007 / 1016.
         Value::IntArray(items) => WireValue::Text(spg_engine::eval::format_int_array(items)),
-        Value::BigIntArray(items) => {
-            WireValue::Text(spg_engine::eval::format_bigint_array(items))
-        }
+        Value::BigIntArray(items) => WireValue::Text(spg_engine::eval::format_bigint_array(items)),
         // v7.12.0 — tsvector / tsquery on the wire as PG external
         // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
         Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),

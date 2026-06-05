@@ -106,10 +106,7 @@ fn int_array_position() {
 #[test]
 fn int_array_unnest_emits_ints() {
     let mut eng = Engine::new();
-    let rows = select_rows(
-        &mut eng,
-        "SELECT * FROM unnest(ARRAY[10, 20, 30]) AS u",
-    );
+    let rows = select_rows(&mut eng, "SELECT * FROM unnest(ARRAY[10, 20, 30]) AS u");
     assert_eq!(rows.len(), 3);
     assert!(matches!(rows[0][0], Value::Int(10)));
     assert!(matches!(rows[1][0], Value::Int(20)));
@@ -119,10 +116,7 @@ fn int_array_unnest_emits_ints() {
 #[test]
 fn int_array_concat_array_to_array() {
     let mut eng = Engine::new();
-    let v = select_value(
-        &mut eng,
-        "SELECT ARRAY[1, 2] || ARRAY[3, 4]",
-    );
+    let v = select_value(&mut eng, "SELECT ARRAY[1, 2] || ARRAY[3, 4]");
     assert!(
         matches!(v, Value::IntArray(ref a) if a.as_slice() == [Some(1), Some(2), Some(3), Some(4)])
     );

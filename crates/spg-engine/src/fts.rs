@@ -38,9 +38,7 @@ impl TsConfig {
     /// for any other name so the caller can produce a clear
     /// "config not implemented" error listing what is supported.
     pub fn from_name(name: &str) -> Option<Self> {
-        let bare = name
-            .strip_prefix("pg_catalog.")
-            .unwrap_or(name);
+        let bare = name.strip_prefix("pg_catalog.").unwrap_or(name);
         match bare.to_ascii_lowercase().as_str() {
             "simple" => Some(Self::Simple),
             "english" => Some(Self::English),
@@ -157,9 +155,7 @@ pub fn websearch_to_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
             }
             WebToken::NotTerm(s) => {
                 if !s.is_empty() {
-                    let node = TsQueryAst::Not(alloc::boxed::Box::new(fold_and(
-                        &split_words(s),
-                    )));
+                    let node = TsQueryAst::Not(alloc::boxed::Box::new(fold_and(&split_words(s))));
                     or_groups.last_mut().unwrap().push(node);
                 }
             }
@@ -180,10 +176,7 @@ pub fn websearch_to_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
                 let mut it = g.into_iter();
                 let first = it.next().unwrap();
                 Some(it.fold(first, |acc, n| {
-                    TsQueryAst::And(
-                        alloc::boxed::Box::new(acc),
-                        alloc::boxed::Box::new(n),
-                    )
+                    TsQueryAst::And(alloc::boxed::Box::new(acc), alloc::boxed::Box::new(n))
                 }))
             }
         })
@@ -315,9 +308,11 @@ pub fn ts_query_matches(vec: &[TsLexeme], query: &TsQueryAst) -> bool {
         TsQueryAst::And(a, b) => ts_query_matches(vec, a) && ts_query_matches(vec, b),
         TsQueryAst::Or(a, b) => ts_query_matches(vec, a) || ts_query_matches(vec, b),
         TsQueryAst::Not(x) => !ts_query_matches(vec, x),
-        TsQueryAst::Phrase { left, right, distance } => {
-            phrase_match(vec, left, right, *distance)
-        }
+        TsQueryAst::Phrase {
+            left,
+            right,
+            distance,
+        } => phrase_match(vec, left, right, *distance),
     }
 }
 
@@ -337,7 +332,11 @@ fn phrase_positions(vec: &[TsLexeme], q: &TsQueryAst) -> Vec<u16> {
                 Err(_) => Vec::new(),
             }
         }
-        TsQueryAst::Phrase { left, right, distance } => {
+        TsQueryAst::Phrase {
+            left,
+            right,
+            distance,
+        } => {
             let lp = phrase_positions(vec, left);
             let rp = phrase_positions(vec, right);
             let mut out = Vec::new();
@@ -397,7 +396,13 @@ pub fn ts_rank_cd(vec: &[TsLexeme], query: &TsQueryAst) -> f32 {
     let mut matched_positions: Vec<u16> = Vec::new();
     let mut score = 0.0f32;
     let mut unique_terms = 0usize;
-    collect_cd_positions(query, vec, &mut matched_positions, &mut score, &mut unique_terms);
+    collect_cd_positions(
+        query,
+        vec,
+        &mut matched_positions,
+        &mut score,
+        &mut unique_terms,
+    );
     if matched_positions.is_empty() || unique_terms == 0 {
         return 0.0;
     }
@@ -432,8 +437,7 @@ fn ln_approx(x: f32) -> f32 {
     let mantissa = f64::from_bits(mantissa_bits);
     let t = (mantissa - 1.0) / (mantissa + 1.0);
     let t2 = t * t;
-    let ln_mantissa =
-        2.0 * (t + t2 * t / 3.0 + t2 * t2 * t / 5.0 + t2 * t2 * t2 * t / 7.0);
+    let ln_mantissa = 2.0 * (t + t2 * t / 3.0 + t2 * t2 * t / 5.0 + t2 * t2 * t2 * t / 7.0);
     let ln = (exponent as f64) * core::f64::consts::LN_2 + ln_mantissa;
     ln as f32
 }
@@ -936,11 +940,7 @@ fn step5a(b: &mut Vec<u8>) {
 }
 
 fn step5b(b: &mut Vec<u8>) {
-    if b.len() >= 2
-        && b[b.len() - 1] == b'l'
-        && b[b.len() - 2] == b'l'
-        && measure(b) > 1
-    {
+    if b.len() >= 2 && b[b.len() - 1] == b'l' && b[b.len() - 2] == b'l' && measure(b) > 1 {
         b.pop();
     }
 }
@@ -964,7 +964,10 @@ mod tests {
 
     #[test]
     fn english_drops_stopwords_and_stems() {
-        let v = to_tsvector(TsConfig::English, "The quick brown foxes are jumping over the lazy dogs");
+        let v = to_tsvector(
+            TsConfig::English,
+            "The quick brown foxes are jumping over the lazy dogs",
+        );
         let words: Vec<&str> = v.iter().map(|l| l.word.as_str()).collect();
         // Stopwords removed: the, are, over
         // Stems: quick → quick, brown → brown, foxes → fox,

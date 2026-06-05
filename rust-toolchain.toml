@@ -1,2 +1,11 @@
+# Pinned to a specific stable so rustfmt / clippy rules can't drift
+# between contributor machines or under us in CI. Bumping is a deliberate
+# act — open a feature branch, raise the pin, run `cargo fmt --all` +
+# `cargo clippy --workspace --all-targets -- -D warnings`, and address
+# any new lints in the same change.
+#
+# Last bump: 2026-06-05 — rustc 1.96.0 / rustfmt 1.9.0 / clippy 0.1.96.
 [toolchain]
-channel = "stable"
+channel    = "1.96.0"
+profile    = "minimal"
+components = ["rustfmt", "clippy"]

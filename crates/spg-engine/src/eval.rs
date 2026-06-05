@@ -307,18 +307,11 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                 return Ok(Value::Null);
             }
             let elems: Vec<Option<Value>> = match arr {
-                Value::TextArray(items) => items
-                    .into_iter()
-                    .map(|o| o.map(Value::Text))
-                    .collect(),
-                Value::IntArray(items) => items
-                    .into_iter()
-                    .map(|o| o.map(Value::Int))
-                    .collect(),
-                Value::BigIntArray(items) => items
-                    .into_iter()
-                    .map(|o| o.map(Value::BigInt))
-                    .collect(),
+                Value::TextArray(items) => items.into_iter().map(|o| o.map(Value::Text)).collect(),
+                Value::IntArray(items) => items.into_iter().map(|o| o.map(Value::Int)).collect(),
+                Value::BigIntArray(items) => {
+                    items.into_iter().map(|o| o.map(Value::BigInt)).collect()
+                }
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
@@ -529,11 +522,7 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
 
 /// Dispatch on lowercased function name. v1.4 implements only a handful of
 /// scalar functions; aggregates land in v1.5 alongside GROUP BY.
-fn apply_function(
-    name: &str,
-    args: &[Value],
-    ctx: &EvalContext<'_>,
-) -> Result<Value, EvalError> {
+fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
     match name.to_ascii_lowercase().as_str() {
         "length" => {
             if args.len() != 1 {
@@ -656,9 +645,7 @@ fn apply_function(
                         if let Some(s) = item
                             && s == needle
                         {
-                            return Ok(Value::Int(
-                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
-                            ));
+                            return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
                         }
                     }
                     Ok(Value::Null)
@@ -679,9 +666,7 @@ fn apply_function(
                         if let Some(n) = item
                             && i64::from(*n) == needle
                         {
-                            return Ok(Value::Int(
-                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
-                            ));
+                            return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
                         }
                     }
                     Ok(Value::Null)
@@ -702,22 +687,21 @@ fn apply_function(
                         if let Some(n) = item
                             && *n == needle
                         {
-                            return Ok(Value::Int(
-                                i32::try_from(idx + 1).unwrap_or(i32::MAX),
-                            ));
+                            return Ok(Value::Int(i32::try_from(idx + 1).unwrap_or(i32::MAX)));
                         }
                     }
                     Ok(Value::Null)
                 }
-                (arr @ (Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_)), other) => {
-                    Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "array_position() needle type {:?} doesn't match array {:?}",
-                            other.data_type(),
-                            arr.data_type()
-                        ),
-                    })
-                }
+                (
+                    arr @ (Value::TextArray(_) | Value::IntArray(_) | Value::BigIntArray(_)),
+                    other,
+                ) => Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "array_position() needle type {:?} doesn't match array {:?}",
+                        other.data_type(),
+                        arr.data_type()
+                    ),
+                }),
                 (other, _) => Err(EvalError::TypeMismatch {
                     detail: format!(
                         "array_position() first arg must be an array, got {:?}",
@@ -859,9 +843,7 @@ fn apply_function(
                     }
                     for i in 0..=h_chars.len() - n_chars.len() {
                         if h_chars[i..i + n_chars.len()] == n_chars[..] {
-                            return Ok(Value::Int(
-                                i32::try_from(i + 1).unwrap_or(i32::MAX),
-                            ));
+                            return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
                         }
                     }
                     Ok(Value::Int(0))
@@ -875,9 +857,7 @@ fn apply_function(
                     }
                     for i in 0..=haystack.len() - needle.len() {
                         if &haystack[i..i + needle.len()] == needle.as_slice() {
-                            return Ok(Value::Int(
-                                i32::try_from(i + 1).unwrap_or(i32::MAX),
-                            ));
+                            return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
                         }
                     }
                     Ok(Value::Int(0))
@@ -993,7 +973,13 @@ fn fts_ts_rank_cd(args: &[Value]) -> Result<Value, EvalError> {
 fn parse_rank_args(
     name: &str,
     args: &[Value],
-) -> Result<(Option<Vec<spg_storage::TsLexeme>>, Option<spg_storage::TsQueryAst>), EvalError> {
+) -> Result<
+    (
+        Option<Vec<spg_storage::TsLexeme>>,
+        Option<spg_storage::TsQueryAst>,
+    ),
+    EvalError,
+> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!(
@@ -1802,9 +1788,7 @@ fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {
                         Ok(x) => out.push(Some(x)),
                         Err(_) => {
                             return Err(EvalError::TypeMismatch {
-                                detail: alloc::format!(
-                                    "::INT[] element {n} overflows i32"
-                                ),
+                                detail: alloc::format!("::INT[] element {n} overflows i32"),
                             });
                         }
                     },
@@ -1831,10 +1815,7 @@ fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {
             Ok(Value::IntArray(out))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "::INT[] does not accept {:?}",
-                other.data_type()
-            ),
+            detail: alloc::format!("::INT[] does not accept {:?}", other.data_type()),
         }),
     }
 }
@@ -1843,10 +1824,7 @@ fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::BigIntArray(items) => Ok(Value::BigIntArray(items)),
         Value::IntArray(items) => Ok(Value::BigIntArray(
-            items
-                .into_iter()
-                .map(|x| x.map(i64::from))
-                .collect(),
+            items.into_iter().map(|x| x.map(i64::from)).collect(),
         )),
         Value::Text(s) => decode_bigint_array_external(&s).map(Value::BigIntArray),
         Value::TextArray(items) => {
@@ -1867,10 +1845,7 @@ fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
             Ok(Value::BigIntArray(out))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "::BIGINT[] does not accept {:?}",
-                other.data_type()
-            ),
+            detail: alloc::format!("::BIGINT[] does not accept {:?}", other.data_type()),
         }),
     }
 }
@@ -1893,9 +1868,11 @@ fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
             if p.eq_ignore_ascii_case("NULL") {
                 Ok(None)
             } else {
-                p.parse::<i32>().map(Some).map_err(|_| EvalError::TypeMismatch {
-                    detail: alloc::format!("INT[] element {p:?} is not an i32"),
-                })
+                p.parse::<i32>()
+                    .map(Some)
+                    .map_err(|_| EvalError::TypeMismatch {
+                        detail: alloc::format!("INT[] element {p:?} is not an i32"),
+                    })
             }
         })
         .collect()
@@ -1919,9 +1896,11 @@ fn decode_bigint_array_external(s: &str) -> Result<Vec<Option<i64>>, EvalError> 
             if p.eq_ignore_ascii_case("NULL") {
                 Ok(None)
             } else {
-                p.parse::<i64>().map(Some).map_err(|_| EvalError::TypeMismatch {
-                    detail: alloc::format!("BIGINT[] element {p:?} is not an i64"),
-                })
+                p.parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| EvalError::TypeMismatch {
+                        detail: alloc::format!("BIGINT[] element {p:?} is not an i64"),
+                    })
             }
         })
         .collect()
@@ -2504,7 +2483,11 @@ pub fn format_tsquery(ast: &TsQueryAst) -> String {
                 out.push('!');
                 go(x, own_prec, out);
             }
-            TsQueryAst::Phrase { left, right, distance } => {
+            TsQueryAst::Phrase {
+                left,
+                right,
+                distance,
+            } => {
                 go(left, own_prec, out);
                 out.push_str(&alloc::format!(" <{distance}> "));
                 go(right, own_prec, out);
@@ -2568,10 +2551,7 @@ pub fn decode_tsvector_external(s: &str) -> Result<Vec<TsLexeme>, EvalError> {
         } else {
             // Bare form — read until whitespace, ':' or end.
             let start = i;
-            while i < bytes.len()
-                && !bytes[i].is_ascii_whitespace()
-                && bytes[i] != b':'
-            {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b':' {
                 i += 1;
             }
             core::str::from_utf8(&bytes[start..i])
@@ -2681,10 +2661,7 @@ pub fn decode_tsquery_external(s: &str) -> Result<TsQueryAst, EvalError> {
     p.skip_ws();
     if p.pos < p.bytes.len() {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "tsquery literal: trailing garbage at offset {}",
-                p.pos
-            ),
+            detail: alloc::format!("tsquery literal: trailing garbage at offset {}", p.pos),
         });
     }
     Ok(ast)
@@ -2730,9 +2707,7 @@ impl<'a> TsQueryParser<'a> {
                     // Phrase distance `<N>`.
                     self.pos += 1;
                     let start = self.pos;
-                    while self.pos < self.bytes.len()
-                        && self.bytes[self.pos].is_ascii_digit()
-                    {
+                    while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                         self.pos += 1;
                     }
                     if start == self.pos || self.peek() != Some(b'>') {
@@ -2854,8 +2829,10 @@ impl<'a> TsQueryParser<'a> {
         }
         self.pos += 1;
         while let Some(b) = self.peek() {
-            if matches!(b, b'A' | b'B' | b'C' | b'D' | b'a' | b'b' | b'c' | b'd' | b'*')
-                || b.is_ascii_digit()
+            if matches!(
+                b,
+                b'A' | b'B' | b'C' | b'D' | b'a' | b'b' | b'c' | b'd' | b'*'
+            ) || b.is_ascii_digit()
             {
                 self.pos += 1;
             } else {
