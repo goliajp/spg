@@ -25,10 +25,10 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
-    # rust-toolchain.toml pins the channel; rustup auto-installs rustfmt
-    # + clippy components on first cargo invocation.
     steps:
       - uses: actions/checkout@v4
+      - name: Install rustfmt
+        run: rustup component add rustfmt
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -37,6 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install clippy
+        run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
