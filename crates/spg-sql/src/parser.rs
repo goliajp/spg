@@ -23,9 +23,9 @@ use crate::ast::{
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin, FunctionArg,
     FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
-    JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlStmt, PublicationScope,
-    ReturnTarget, SelectItem, SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach,
-    TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
+    JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
+    PublicationScope, RaiseLevel, ReturnTarget, SelectItem, SelectStatement, Statement, TableRef,
+    TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -974,10 +974,22 @@ impl Parser {
     }
 
     /// v7.12.4 — `BEGIN stmt; stmt; … END[;]` PL/pgSQL block.
+    /// v7.12.6 — optional `DECLARE var TYPE [:= init];` prelude
+    /// before `BEGIN`, and IF / RAISE / embedded SQL statements
+    /// inside the body.
     /// Called by [`parse_plpgsql_body`] after the body's tokens
-    /// have been lexed into this temporary parser. The body's
-    /// outer `$$` markers have already been stripped.
+    /// have been lexed into this temporary parser.
     pub(crate) fn parse_plpgsql_block(&mut self) -> Result<PlPgSqlBlock, ParseError> {
+        // v7.12.6 — optional DECLARE prelude.
+        let declarations = if matches!(
+            self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("declare")
+        ) {
+            self.advance();
+            self.parse_plpgsql_declare_block()?
+        } else {
+            Vec::new()
+        };
         // BEGIN keyword (PL/pgSQL — distinct from the SQL
         // `BEGIN` transaction-start, but we can reuse the
         // reserved Token::Begin since the body is a separate
@@ -989,40 +1001,99 @@ impl Parser {
             )));
         }
         self.advance();
+        let statements = self.parse_plpgsql_stmt_list_until_end()?;
+        Ok(PlPgSqlBlock {
+            declarations,
+            statements,
+        })
+    }
+
+    /// v7.12.6 — parse the `DECLARE ... [var TYPE [:= init];]+`
+    /// prelude. Caller has already consumed `DECLARE`. We stop
+    /// reading entries when we hit `BEGIN`.
+    fn parse_plpgsql_declare_block(&mut self) -> Result<Vec<PlPgSqlDeclare>, ParseError> {
+        let mut out: Vec<PlPgSqlDeclare> = Vec::new();
+        loop {
+            if matches!(self.peek(), Token::Begin) {
+                return Ok(out);
+            }
+            let name = self.expect_ident_like()?;
+            let ty_token = self.expect_ident_like()?;
+            let ty = match map_type_ident_to_column_type_name(&ty_token) {
+                Some(t) => FunctionArgType::Typed(t),
+                None => FunctionArgType::Raw(ty_token),
+            };
+            let default = match self.peek() {
+                Token::ColonEq => {
+                    self.advance();
+                    Some(self.parse_expr(0)?)
+                }
+                Token::Eq => {
+                    // PL/pgSQL also accepts `=` for the
+                    // DECLARE default (PG treats them the same
+                    // in this position).
+                    self.advance();
+                    Some(self.parse_expr(0)?)
+                }
+                _ => None,
+            };
+            // Mandatory `;` between declarations.
+            if !matches!(self.peek(), Token::Semicolon) {
+                return Err(self.err(alloc::format!(
+                    "expected ; after DECLARE entry for {name:?}, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            out.push(PlPgSqlDeclare { name, ty, default });
+        }
+    }
+
+    /// v7.12.6 — parse PL/pgSQL statements up to (and consuming)
+    /// the terminating `END;` (or `END IF;` etc — handled by the
+    /// per-construct sub-parsers). Used by both the outer block
+    /// and the IF/ELSE branch bodies.
+    fn parse_plpgsql_stmt_list_until_end(&mut self) -> Result<Vec<PlPgSqlStmt>, ParseError> {
         let mut statements: Vec<PlPgSqlStmt> = Vec::new();
         loop {
             // Allow trailing semicolons + END.
             while matches!(self.peek(), Token::Semicolon) {
                 self.advance();
             }
-            // END terminates the block.
-            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end"))
-            {
-                self.advance();
-                // Optional trailing semicolon.
-                if matches!(self.peek(), Token::Semicolon) {
-                    self.advance();
-                }
-                break;
+            // END / ELSE / ELSIF — handled by the caller.
+            if matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("end")
+                        || s.eq_ignore_ascii_case("else")
+                        || s.eq_ignore_ascii_case("elsif")
+                        || s.eq_ignore_ascii_case("elseif")
+            ) {
+                return Ok(statements);
             }
-            // Otherwise: one statement, then expect `;` or END.
+            // Otherwise: one statement, then expect `;` or
+            // a block-terminator keyword.
             let stmt = self.parse_plpgsql_stmt()?;
             statements.push(stmt);
             match self.peek() {
                 Token::Semicolon => {
                     self.advance();
                 }
-                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end") => {
-                    // Final statement without trailing `;`.
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("end")
+                        || s.eq_ignore_ascii_case("else")
+                        || s.eq_ignore_ascii_case("elsif")
+                        || s.eq_ignore_ascii_case("elseif") =>
+                {
+                    // Final statement of the block without `;`.
                 }
                 other => {
                     return Err(self.err(alloc::format!(
-                        "expected ; or END after plpgsql statement, got {other:?}"
+                        "expected ; or END/ELSE/ELSIF after plpgsql statement, got {other:?}"
                     )));
                 }
             }
         }
-        Ok(PlPgSqlBlock { statements })
     }
 
     fn parse_plpgsql_stmt(&mut self) -> Result<PlPgSqlStmt, ParseError> {
@@ -1031,6 +1102,30 @@ impl Parser {
         {
             self.advance();
             return self.parse_plpgsql_return();
+        }
+        // v7.12.6 — IF block.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("if"))
+        {
+            self.advance();
+            return self.parse_plpgsql_if();
+        }
+        // v7.12.6 — RAISE.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("raise"))
+        {
+            self.advance();
+            return self.parse_plpgsql_raise();
+        }
+        // v7.12.6 — embedded SQL statements. INSERT/UPDATE/DELETE/
+        // SELECT can appear directly inside a trigger body; we
+        // recurse into the regular Statement parser, which will
+        // stop at the trailing `;` (which our caller then
+        // consumes).
+        if matches!(self.peek(), Token::Insert)
+            || matches!(self.peek(), Token::Select)
+            || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") || s.eq_ignore_ascii_case("delete"))
+        {
+            let stmt = self.parse_one_statement()?;
+            return Ok(PlPgSqlStmt::EmbeddedSql(Box::new(stmt)));
         }
         // Otherwise: assignment. `NEW.col` / `OLD.col` / `var`
         // followed by `:=` and an expression.
@@ -1059,6 +1154,103 @@ impl Parser {
         }
         let value = self.parse_expr(0)?;
         Ok(PlPgSqlStmt::Assign { target, value })
+    }
+
+    /// v7.12.6 — `IF cond THEN body [ELSIF cond THEN body]*
+    /// [ELSE body] END IF`. `IF` keyword already consumed.
+    fn parse_plpgsql_if(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+        let mut branches: Vec<(Expr, Vec<PlPgSqlStmt>)> = Vec::new();
+        let mut else_branch: Vec<PlPgSqlStmt> = Vec::new();
+        loop {
+            // <expr> THEN
+            let cond = self.parse_expr(0)?;
+            let then_kw = self.expect_ident_like()?;
+            if !then_kw.eq_ignore_ascii_case("then") {
+                return Err(self.err(alloc::format!(
+                    "expected THEN after IF/ELSIF condition, got {then_kw:?}"
+                )));
+            }
+            let body = self.parse_plpgsql_stmt_list_until_end()?;
+            branches.push((cond, body));
+            // Look at terminator: ELSIF/ELSEIF, ELSE, or END IF.
+            match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("elsif") || s.eq_ignore_ascii_case("elseif") =>
+                {
+                    self.advance();
+                    continue;
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("else") => {
+                    self.advance();
+                    else_branch = self.parse_plpgsql_stmt_list_until_end()?;
+                    break;
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end") => {
+                    break;
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected ELSIF / ELSE / END after IF branch body, got {other:?}"
+                    )));
+                }
+            }
+        }
+        // Expect `END IF` (the END keyword is the one we're
+        // looking at right now).
+        let end_kw = self.expect_ident_like()?;
+        if !end_kw.eq_ignore_ascii_case("end") {
+            return Err(self.err(alloc::format!("expected END IF, got {end_kw:?}")));
+        }
+        let if_kw = self.expect_ident_like()?;
+        if !if_kw.eq_ignore_ascii_case("if") {
+            return Err(self.err(alloc::format!("expected END IF, got END {if_kw:?}")));
+        }
+        Ok(PlPgSqlStmt::If {
+            branches,
+            else_branch,
+        })
+    }
+
+    /// v7.12.6 — `RAISE { NOTICE | WARNING | INFO | LOG | DEBUG
+    /// | EXCEPTION } '<message>' [, args]*`. The `RAISE` keyword
+    /// is already consumed.
+    fn parse_plpgsql_raise(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+        let lvl_ident = self.expect_ident_like()?;
+        let level = match lvl_ident.to_ascii_lowercase().as_str() {
+            "notice" => RaiseLevel::Notice,
+            "warning" => RaiseLevel::Warning,
+            "info" => RaiseLevel::Info,
+            "log" => RaiseLevel::Log,
+            "debug" => RaiseLevel::Debug,
+            "exception" => RaiseLevel::Exception,
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected RAISE level (NOTICE/WARNING/INFO/LOG/DEBUG/EXCEPTION), got {other:?}"
+                )));
+            }
+        };
+        // Message: required for v7.12.6. PG accepts a bare
+        // RAISE-rethrow form (no message), reserved for future
+        // RAISE-no-args support.
+        let Token::String(msg) = self.peek() else {
+            return Err(self.err(alloc::format!(
+                "expected RAISE message string, got {:?}",
+                self.peek()
+            )));
+        };
+        let message = msg.clone();
+        self.advance();
+        // Optional comma-separated args (PG `%` format substitution).
+        let mut args: Vec<Expr> = Vec::new();
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            args.push(self.parse_expr(0)?);
+        }
+        Ok(PlPgSqlStmt::Raise {
+            level,
+            message,
+            args,
+        })
     }
 
     fn parse_plpgsql_assign_target(&mut self) -> Result<AssignTarget, ParseError> {

@@ -346,6 +346,225 @@ fn after_update_trigger_cannot_assign_to_new() {
     );
 }
 
+// --- v7.12.6: IF / ELSIF / ELSE control flow ---
+
+#[test]
+fn before_insert_trigger_if_then_rewrites_only_when_condition_true() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    // If v == 10 → rewrite to 999. Otherwise pass-through.
+    ok(
+        &mut e,
+        "CREATE FUNCTION gated() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.v = 10 THEN
+    NEW.v := 999;
+  END IF;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION gated()",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 10)");
+    ok(&mut e, "INSERT INTO t VALUES (2, 11)");
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(999),
+        "row matching IF predicate gets rewritten"
+    );
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 2"),
+        Value::Int(11),
+        "row not matching IF predicate passes through"
+    );
+}
+
+#[test]
+fn before_insert_trigger_if_elsif_else_chain() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION grade() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.v < 60 THEN
+    NEW.v := 0;
+  ELSIF NEW.v < 90 THEN
+    NEW.v := 50;
+  ELSE
+    NEW.v := 100;
+  END IF;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION grade()",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 50)");
+    ok(&mut e, "INSERT INTO t VALUES (2, 75)");
+    ok(&mut e, "INSERT INTO t VALUES (3, 95)");
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(0)
+    );
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 2"),
+        Value::Int(50)
+    );
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 3"),
+        Value::Int(100)
+    );
+}
+
+#[test]
+fn before_insert_trigger_if_can_short_circuit_via_return_null() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION pos_only() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.v < 0 THEN
+    RETURN NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION pos_only()",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 5)");
+    ok(&mut e, "INSERT INTO t VALUES (2, -3)");
+    let count = first_value(&mut e, "SELECT count(*) FROM t");
+    assert_eq!(count, Value::BigInt(1));
+}
+
+// --- v7.12.6: DECLARE local variables ---
+
+#[test]
+fn before_insert_trigger_declare_and_use_local_var() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION doubled() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  scaled INT := NEW.v * 2;
+BEGIN
+  NEW.v := scaled;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION doubled()",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 7)");
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(14)
+    );
+}
+
+#[test]
+fn before_insert_trigger_declare_chain_and_assign() {
+    // Earlier DECLAREs are in scope for later DECLAREs.
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION chained() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  a INT := NEW.v + 1;
+  b INT := a * 10;
+BEGIN
+  NEW.v := b;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION chained()",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 4)");
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(50)
+    );
+}
+
+// --- v7.12.6: RAISE NOTICE / EXCEPTION ---
+
+#[test]
+fn before_insert_trigger_raise_notice_does_not_block_write() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION log_it() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE NOTICE 'inserting row %', NEW.id;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_it()",
+    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 42)");
+    assert_eq!(
+        first_value(&mut e, "SELECT v FROM t WHERE id = 1"),
+        Value::Int(42)
+    );
+}
+
+#[test]
+fn before_insert_trigger_raise_exception_blocks_write_and_propagates_message() {
+    let mut e = eng();
+    ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
+    ok(
+        &mut e,
+        "CREATE FUNCTION reject_neg() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.v < 0 THEN
+    RAISE EXCEPTION 'negative value % rejected', NEW.v;
+  END IF;
+  RETURN NEW;
+END;
+$$",
+    );
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION reject_neg()",
+    );
+    // Positive value goes in.
+    ok(&mut e, "INSERT INTO t VALUES (1, 5)");
+    // Negative value triggers RAISE EXCEPTION → propagates as
+    // engine error.
+    let err = e
+        .execute("INSERT INTO t VALUES (2, -10)")
+        .expect_err("RAISE EXCEPTION must abort the insert");
+    let msg = alloc_format(&err);
+    assert!(
+        msg.contains("negative value") && msg.contains("-10"),
+        "RAISE EXCEPTION message + arg substitution should propagate: {msg}"
+    );
+    // Row 2 didn't land.
+    let count = first_value(&mut e, "SELECT count(*) FROM t");
+    assert_eq!(count, Value::BigInt(1));
+}
+
 #[test]
 fn mailrs_update_search_vector_on_subject_change() {
     // mailrs G-CRIT-3 UPDATE-shape acceptance: when a message's

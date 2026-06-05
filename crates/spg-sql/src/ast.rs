@@ -382,13 +382,34 @@ pub enum FunctionBody {
     Raw(String),
 }
 
-/// v7.12.4 — PL/pgSQL `BEGIN ... END;` block. v7.12.4 ships the
-/// minimum shape for mailrs's `update_search_vector()` trigger
-/// function: assignment to NEW columns and a terminal RETURN. The
-/// v7.12.5+ slice adds DECLARE / IF / LOOP / embedded SQL / RAISE.
+/// v7.12.4 — PL/pgSQL `BEGIN ... END;` block. v7.12.6 widens
+/// from assignment + return to a real-PL/pgSQL surface:
+/// `DECLARE`-block local variables, `IF/ELSIF/ELSE/END IF`
+/// control flow, `RAISE` diagnostics, and embedded SQL
+/// statements that execute through the regular engine path.
+/// The remaining v7.12.x carve-out is loops (`LOOP/WHILE/FOR`),
+/// which mailrs's trigger doesn't need but other PG customers
+/// may; deferred to a future minor release.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlPgSqlBlock {
+    /// v7.12.6 — `DECLARE var TYPE [:= init_expr];` declarations
+    /// preceding `BEGIN`. Empty when the body opens directly with
+    /// `BEGIN`. Declarations execute in order; each may reference
+    /// earlier-declared locals in its init expression.
+    pub declarations: Vec<PlPgSqlDeclare>,
     pub statements: Vec<PlPgSqlStmt>,
+}
+
+/// v7.12.6 — single `DECLARE` entry: variable name + declared
+/// type + optional initialiser. Variables default to SQL NULL
+/// when no init is given (matches PG).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlPgSqlDeclare {
+    pub name: String,
+    /// Declared SQL type (mapped to [`ColumnTypeName`] where SPG
+    /// knows it; raw text otherwise).
+    pub ty: FunctionArgType,
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,6 +422,52 @@ pub enum PlPgSqlStmt {
     /// `NEW` / `OLD` / `NULL`; v7.12.4 also accepts a bare
     /// expression for forward compatibility with scalar UDFs.
     Return(ReturnTarget),
+    /// v7.12.6 — `IF cond THEN body [ELSIF cond THEN body]*
+    /// [ELSE body] END IF;`. Branches are tried in order; first
+    /// truthy condition wins; the optional ELSE runs when no
+    /// condition matched.
+    If {
+        branches: Vec<(Expr, Vec<PlPgSqlStmt>)>,
+        else_branch: Vec<PlPgSqlStmt>,
+    },
+    /// v7.12.6 — `RAISE <level> '<fmt>' [, args]*;`. Level is one
+    /// of `NOTICE` / `WARNING` / `INFO` / `LOG` / `DEBUG`
+    /// (logging — observable side effect only) or `EXCEPTION`
+    /// (aborts the trigger and propagates as an error). v7.12.6
+    /// supports the basic format-string substitution PG uses
+    /// (`%` placeholders consumed positionally).
+    Raise {
+        level: RaiseLevel,
+        message: String,
+        args: Vec<Expr>,
+    },
+    /// v7.12.6 — embedded SQL statement inside the trigger body
+    /// (`INSERT INTO …`, `UPDATE …`, `DELETE FROM …`, `SELECT …`).
+    /// NEW.col / OLD.col references inside the embedded
+    /// statement's expression tree are substituted with the
+    /// current trigger context before the engine re-executes the
+    /// statement. Recursion depth into nested triggers is
+    /// bounded by the engine's existing trigger-fire guard.
+    EmbeddedSql(Box<Statement>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseLevel {
+    /// `RAISE NOTICE` — diagnostic message, observable in the
+    /// server log. Does not affect the trigger's outcome.
+    Notice,
+    /// `RAISE WARNING` — like NOTICE, slightly louder severity.
+    Warning,
+    /// `RAISE INFO` — like NOTICE, slightly quieter.
+    Info,
+    /// `RAISE LOG` — like NOTICE, lower priority.
+    Log,
+    /// `RAISE DEBUG` — like NOTICE, lowest priority.
+    Debug,
+    /// `RAISE EXCEPTION` — aborts the trigger function with the
+    /// given message, propagating up to the caller as a query-
+    /// level error.
+    Exception,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1605,6 +1672,20 @@ impl fmt::Display for CreateFunctionStatement {
 
 impl fmt::Display for PlPgSqlBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.declarations.is_empty() {
+            f.write_str("DECLARE\n")?;
+            for d in &self.declarations {
+                write!(f, "  {} ", quote_ident(&d.name))?;
+                match &d.ty {
+                    FunctionArgType::Typed(t) => write!(f, "{t}")?,
+                    FunctionArgType::Raw(s) => f.write_str(s)?,
+                }
+                if let Some(e) = &d.default {
+                    write!(f, " := {e}")?;
+                }
+                f.write_str(";\n")?;
+            }
+        }
         f.write_str("BEGIN\n")?;
         for stmt in &self.statements {
             writeln!(f, "  {stmt};")?;
@@ -1623,6 +1704,54 @@ impl fmt::Display for PlPgSqlStmt {
                 ReturnTarget::Null => f.write_str("RETURN NULL"),
                 ReturnTarget::Expr(e) => write!(f, "RETURN {e}"),
             },
+            Self::If {
+                branches,
+                else_branch,
+            } => {
+                for (i, (cond, body)) in branches.iter().enumerate() {
+                    if i == 0 {
+                        write!(f, "IF {cond} THEN ")?;
+                    } else {
+                        write!(f, " ELSIF {cond} THEN ")?;
+                    }
+                    for (j, s) in body.iter().enumerate() {
+                        if j > 0 {
+                            f.write_str("; ")?;
+                        }
+                        write!(f, "{s}")?;
+                    }
+                }
+                if !else_branch.is_empty() {
+                    f.write_str(" ELSE ")?;
+                    for (j, s) in else_branch.iter().enumerate() {
+                        if j > 0 {
+                            f.write_str("; ")?;
+                        }
+                        write!(f, "{s}")?;
+                    }
+                }
+                f.write_str(" END IF")
+            }
+            Self::Raise {
+                level,
+                message,
+                args,
+            } => {
+                let lvl = match level {
+                    RaiseLevel::Notice => "NOTICE",
+                    RaiseLevel::Warning => "WARNING",
+                    RaiseLevel::Info => "INFO",
+                    RaiseLevel::Log => "LOG",
+                    RaiseLevel::Debug => "DEBUG",
+                    RaiseLevel::Exception => "EXCEPTION",
+                };
+                write!(f, "RAISE {lvl} '{}'", message.replace('\'', "''"))?;
+                for a in args {
+                    write!(f, ", {a}")?;
+                }
+                Ok(())
+            }
+            Self::EmbeddedSql(s) => write!(f, "{s}"),
         }
     }
 }

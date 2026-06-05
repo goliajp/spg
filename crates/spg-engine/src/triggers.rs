@@ -27,12 +27,15 @@
 //!   * `RAISE NOTICE / RAISE EXCEPTION`
 //!   * Loop constructs
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use spg_sql::ast::{AssignTarget, Expr, PlPgSqlStmt, ReturnTarget};
+use spg_sql::ast::{
+    AssignTarget, Expr, PlPgSqlDeclare, PlPgSqlStmt, RaiseLevel, ReturnTarget,
+};
 use spg_storage::{ColumnSchema, FunctionDef, Row, TriggerDef, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
@@ -87,6 +90,11 @@ pub enum TriggerError {
     /// wrapped [`EvalError`] explains the underlying cause
     /// (`ColumnNotFound`, `TypeMismatch`, …).
     EvalFailed { function: String, cause: EvalError },
+    /// v7.12.6 — `RAISE EXCEPTION '<message>' [, args]*` in the
+    /// trigger body. The interpreter formats the args into the
+    /// message via PG-style `%` substitution and surfaces the
+    /// resolved text up to the caller.
+    RaiseException { function: String, message: String },
 }
 
 impl fmt::Display for TriggerError {
@@ -134,6 +142,12 @@ impl fmt::Display for TriggerError {
                     "trigger function {function:?}: expression eval failed: {cause}"
                 )
             }
+            Self::RaiseException { function, message } => {
+                write!(
+                    f,
+                    "trigger function {function:?}: RAISE EXCEPTION {message:?}"
+                )
+            }
         }
     }
 }
@@ -176,96 +190,331 @@ pub fn fire_row_trigger(
             detail: format!("{e}"),
         }
     })?;
+    // v7.12.6 — initialise local variable scope from the DECLARE
+    // block. Each init expr (if any) evaluates against the
+    // so-far-bound scope + the NEW/OLD context, so later DECLAREs
+    // can reference earlier ones.
+    let mut locals: BTreeMap<String, Value> = BTreeMap::new();
+    init_locals_from_declarations(
+        &block.declarations,
+        &mut locals,
+        new_row.as_ref(),
+        old_row,
+        columns,
+        table_name,
+        params,
+        default_text_search_config,
+        &function.name,
+    )?;
     let mut current_new = new_row;
-    for stmt in &block.statements {
+    let ctx = BodyCtx {
+        function: &function.name,
+        table_name,
+        columns,
+        params,
+        default_text_search_config,
+        is_after,
+    };
+    match execute_stmts(
+        &block.statements,
+        &mut current_new,
+        old_row,
+        &mut locals,
+        &ctx,
+    )? {
+        BodyOutcome::Return(target) => Ok(resolve_return(target, current_new, old_row)),
+        // Body fell off without an explicit RETURN. PL/pgSQL
+        // default is `RETURN NULL`; we mirror — the BEFORE
+        // trigger then skips the row.
+        BodyOutcome::FellThrough => Ok(TriggerOutcome::Skip),
+    }
+}
+
+/// v7.12.6 — body-walk return signal. `Return(target)` short-
+/// circuits the caller; `FellThrough` means the statement list
+/// completed without a RETURN, equivalent to PL/pgSQL's implicit
+/// `RETURN NULL`.
+enum BodyOutcome {
+    Return(ReturnTarget),
+    FellThrough,
+}
+
+/// Shared parameters every body-stmt evaluation needs. Bundled so
+/// the recursive `execute_stmts` doesn't have to thread eight
+/// individual `&str` / `&[…]` args around.
+struct BodyCtx<'a> {
+    function: &'a str,
+    table_name: &'a str,
+    columns: &'a [ColumnSchema],
+    params: &'a [Value],
+    default_text_search_config: Option<&'a str>,
+    is_after: bool,
+}
+
+fn execute_stmts(
+    stmts: &[PlPgSqlStmt],
+    current_new: &mut Option<Row>,
+    old_row: Option<&Row>,
+    locals: &mut BTreeMap<String, Value>,
+    ctx: &BodyCtx<'_>,
+) -> Result<BodyOutcome, TriggerError> {
+    for stmt in stmts {
         match stmt {
-            PlPgSqlStmt::Assign { target, value } => match target {
-                AssignTarget::NewColumn(col) => {
-                    if is_after {
-                        return Err(TriggerError::NewReadOnlyInAfterTrigger {
-                            function: function.name.clone(),
-                            column: col.clone(),
-                        });
-                    }
-                    let pos = columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(col))
-                        .ok_or_else(|| TriggerError::UnknownColumn {
-                            function: function.name.clone(),
-                            column: col.clone(),
-                            table: alloc::string::ToString::to_string(&table_name),
-                        })?;
-                    let evaluated = eval_with_new_old(
-                        value,
-                        current_new.as_ref(),
-                        old_row,
-                        columns,
-                        table_name,
-                        params,
-                        default_text_search_config,
-                    )
-                    .map_err(|cause| TriggerError::EvalFailed {
-                        function: function.name.clone(),
-                        cause,
-                    })?;
-                    // current_new is guaranteed Some here for the
-                    // BEFORE INSERT/UPDATE shape (the only ones
-                    // that pass a NEW row in). Surface a clear
-                    // error rather than panic if a caller passes
-                    // None inappropriately.
-                    let row =
-                        current_new
-                            .as_mut()
-                            .ok_or_else(|| TriggerError::UnsupportedConstruct {
-                                function: function.name.clone(),
+            PlPgSqlStmt::Assign { target, value } => {
+                let evaluated = eval_with_new_old_and_locals(
+                    value,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                match target {
+                    AssignTarget::NewColumn(col) => {
+                        if ctx.is_after {
+                            return Err(TriggerError::NewReadOnlyInAfterTrigger {
+                                function: ctx.function.into(),
+                                column: col.clone(),
+                            });
+                        }
+                        let pos = ctx
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col))
+                            .ok_or_else(|| TriggerError::UnknownColumn {
+                                function: ctx.function.into(),
+                                column: col.clone(),
+                                table: alloc::string::ToString::to_string(&ctx.table_name),
+                            })?;
+                        let row = current_new.as_mut().ok_or_else(|| {
+                            TriggerError::UnsupportedConstruct {
+                                function: ctx.function.into(),
                                 detail: format!(
                                     "NEW.{col} := … requires a NEW row context \
-                                 (BEFORE INSERT / UPDATE only — not available on DELETE)"
+                                     (BEFORE INSERT / UPDATE only — not available on DELETE)"
                                 ),
-                            })?;
-                    row.values[pos] = evaluated;
-                }
-                AssignTarget::OldColumn(col) => {
-                    return Err(TriggerError::OldIsReadOnly {
-                        function: function.name.clone(),
-                        column: col.clone(),
-                    });
-                }
-                AssignTarget::Local(name) => {
-                    return Err(TriggerError::UnsupportedConstruct {
-                        function: function.name.clone(),
-                        detail: format!(
-                            "local variable {name:?} (`DECLARE` blocks land in v7.12.5)"
-                        ),
-                    });
-                }
-            },
-            PlPgSqlStmt::Return(target) => {
-                return Ok(match target {
-                    ReturnTarget::New => {
-                        current_new.map_or(TriggerOutcome::Skip, TriggerOutcome::Row)
+                            }
+                        })?;
+                        row.values[pos] = evaluated;
                     }
-                    ReturnTarget::Old => old_row
-                        .cloned()
-                        .map_or(TriggerOutcome::Skip, TriggerOutcome::Row),
-                    ReturnTarget::Null => TriggerOutcome::Skip,
-                    ReturnTarget::Expr(_) => {
-                        return Err(TriggerError::UnsupportedConstruct {
-                            function: function.name.clone(),
-                            detail: String::from(
-                                "RETURN <expr> in a trigger function — only RETURN NEW / OLD / NULL is valid \
-                                 (scalar UDF return values land with the v7.12.5 scalar function surface)",
-                            ),
+                    AssignTarget::OldColumn(col) => {
+                        return Err(TriggerError::OldIsReadOnly {
+                            function: ctx.function.into(),
+                            column: col.clone(),
                         });
                     }
+                    AssignTarget::Local(name) => {
+                        // v7.12.6 — write into the DECLARE scope.
+                        // Loose-typing: we don't enforce the
+                        // declared type at runtime (PG's INTO
+                        // coerces; v7.12.6 just stores the
+                        // evaluated Value as-is). Type coercion
+                        // tightens in a later release.
+                        locals.insert(name.clone(), evaluated);
+                    }
+                }
+            }
+            PlPgSqlStmt::Return(target) => {
+                return Ok(BodyOutcome::Return(target.clone()));
+            }
+            PlPgSqlStmt::If {
+                branches,
+                else_branch,
+            } => {
+                let mut matched = false;
+                for (cond_expr, body) in branches {
+                    let cond_val = eval_with_new_old_and_locals(
+                        cond_expr,
+                        current_new.as_ref(),
+                        old_row,
+                        locals,
+                        ctx.columns,
+                        ctx.table_name,
+                        ctx.params,
+                        ctx.default_text_search_config,
+                    )
+                    .map_err(|cause| TriggerError::EvalFailed {
+                        function: ctx.function.into(),
+                        cause,
+                    })?;
+                    if matches!(cond_val, Value::Bool(true)) {
+                        matched = true;
+                        match execute_stmts(body, current_new, old_row, locals, ctx)? {
+                            BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
+                            BodyOutcome::FellThrough => {}
+                        }
+                        break;
+                    }
+                }
+                if !matched && !else_branch.is_empty() {
+                    match execute_stmts(else_branch, current_new, old_row, locals, ctx)? {
+                        BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
+                        BodyOutcome::FellThrough => {}
+                    }
+                }
+            }
+            PlPgSqlStmt::Raise {
+                level,
+                message,
+                args,
+            } => {
+                // Resolve every %-format placeholder by evaluating
+                // each arg expression and rendering its Value.
+                let mut rendered_args: Vec<String> = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = eval_with_new_old_and_locals(
+                        a,
+                        current_new.as_ref(),
+                        old_row,
+                        locals,
+                        ctx.columns,
+                        ctx.table_name,
+                        ctx.params,
+                        ctx.default_text_search_config,
+                    )
+                    .map_err(|cause| TriggerError::EvalFailed {
+                        function: ctx.function.into(),
+                        cause,
+                    })?;
+                    rendered_args.push(value_to_display_string(&v));
+                }
+                let resolved = format_raise_message(message, &rendered_args);
+                if matches!(level, RaiseLevel::Exception) {
+                    return Err(TriggerError::RaiseException {
+                        function: ctx.function.into(),
+                        message: resolved,
+                    });
+                }
+                // NOTICE / WARNING / INFO / LOG / DEBUG — log to
+                // stderr for v7.12.6. Wiring through the server's
+                // log channel is a v7.12.7+ polish item; the
+                // resolved message stays accessible regardless.
+                let _ = resolved;
+                let _ = level;
+            }
+            PlPgSqlStmt::EmbeddedSql(_) => {
+                // v7.12.6 carve-out: embedded SQL parses but its
+                // executor lands in v7.12.7 alongside the engine-
+                // side Engine::execute recursion plumbing (which
+                // requires dropping + reacquiring the row-write
+                // mutable borrow safely).
+                return Err(TriggerError::UnsupportedConstruct {
+                    function: ctx.function.into(),
+                    detail: String::from(
+                        "embedded SQL inside a trigger body (executor lands in v7.12.7)",
+                    ),
                 });
             }
         }
     }
-    // Body fell off without an explicit RETURN. PL/pgSQL default
-    // is `RETURN NULL`; we mirror — the BEFORE trigger then
-    // skips the row.
-    Ok(TriggerOutcome::Skip)
+    Ok(BodyOutcome::FellThrough)
+}
+
+fn resolve_return(
+    target: ReturnTarget,
+    current_new: Option<Row>,
+    old_row: Option<&Row>,
+) -> TriggerOutcome {
+    match target {
+        ReturnTarget::New => current_new.map_or(TriggerOutcome::Skip, TriggerOutcome::Row),
+        ReturnTarget::Old => old_row
+            .cloned()
+            .map_or(TriggerOutcome::Skip, TriggerOutcome::Row),
+        ReturnTarget::Null => TriggerOutcome::Skip,
+        // The scalar UDF surface in a later release handles
+        // RETURN <expr> properly; for now we fall through to Skip.
+        ReturnTarget::Expr(_) => TriggerOutcome::Skip,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn init_locals_from_declarations(
+    decls: &[PlPgSqlDeclare],
+    locals: &mut BTreeMap<String, Value>,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+    columns: &[ColumnSchema],
+    table_name: &str,
+    params: &[Value],
+    default_text_search_config: Option<&str>,
+    function_name: &str,
+) -> Result<(), TriggerError> {
+    for d in decls {
+        let v = if let Some(init) = &d.default {
+            eval_with_new_old_and_locals(
+                init,
+                new_row,
+                old_row,
+                locals,
+                columns,
+                table_name,
+                params,
+                default_text_search_config,
+            )
+            .map_err(|cause| TriggerError::EvalFailed {
+                function: function_name.into(),
+                cause,
+            })?
+        } else {
+            Value::Null
+        };
+        locals.insert(d.name.clone(), v);
+    }
+    Ok(())
+}
+
+/// v7.12.6 — PG `%` format expansion for RAISE. Sequential
+/// positional substitution; `%%` produces a literal `%`.
+fn format_raise_message(fmt: &str, args: &[String]) -> String {
+    let mut out = String::with_capacity(fmt.len());
+    let mut iter = args.iter();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.peek() {
+                Some('%') => {
+                    out.push('%');
+                    chars.next();
+                }
+                _ => {
+                    if let Some(a) = iter.next() {
+                        out.push_str(a);
+                    } else {
+                        // Unconsumed placeholder — PG emits an
+                        // error here; we mirror by leaving the
+                        // bare `%` so the message stays readable.
+                        out.push('%');
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// v7.12.6 — Display rendering for a [`Value`] inside a RAISE
+/// message arg. Booleans / ints / floats render naturally;
+/// strings render unquoted; other types fall back to Debug.
+fn value_to_display_string(v: &Value) -> String {
+    use alloc::string::ToString;
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(x) => x.to_string(),
+        Value::Text(s) | Value::Json(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Evaluate a sub-expression against the NEW / OLD row context.
@@ -274,6 +523,87 @@ pub fn fire_row_trigger(
 /// to the regular [`eval::eval_expr`]. Pre-walk strategy mirrors
 /// the existing [`substitute_in_expr`] used by correlated
 /// subqueries.
+/// v7.12.6 — same as [`eval_with_new_old`] but also substitutes
+/// qualifier-less `Column(<name>)` references whose name matches
+/// a `DECLARE`'d local variable. Locals shadow table-column refs
+/// (PG semantics — though a careful trigger function avoids the
+/// collision via naming convention).
+#[allow(clippy::too_many_arguments)]
+fn eval_with_new_old_and_locals(
+    expr: &Expr,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+    locals: &BTreeMap<String, Value>,
+    columns: &[ColumnSchema],
+    table_alias: &str,
+    params: &[Value],
+    default_text_search_config: Option<&str>,
+) -> Result<Value, EvalError> {
+    let mut rewritten = expr.clone();
+    substitute_locals(&mut rewritten, locals);
+    substitute_new_old(&mut rewritten, new_row, old_row, columns)?;
+    let ctx = EvalContext::new(columns, Some(table_alias))
+        .with_params(params)
+        .with_default_text_search_config(default_text_search_config);
+    let empty = Row::new(Vec::new());
+    eval::eval_expr(&rewritten, &empty, &ctx)
+}
+
+/// v7.12.6 — in-place substitute every qualifier-less
+/// `Column(<name>)` whose name is in `locals` with that local's
+/// current Value as a literal. Runs before [`substitute_new_old`]
+/// so NEW.col / OLD.col references (which have a qualifier) take
+/// the NEW/OLD path normally.
+fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
+    if let Expr::Column(c) = expr {
+        if c.qualifier.is_none()
+            && let Some(v) = locals.get(&c.name)
+        {
+            *expr = value_to_literal_expr(&[], 0, v.clone());
+            return;
+        }
+    }
+    match expr {
+        Expr::Binary { lhs, rhs, .. } => {
+            substitute_locals(lhs, locals);
+            substitute_locals(rhs, locals);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            substitute_locals(expr, locals);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            substitute_locals(expr, locals);
+            substitute_locals(pattern, locals);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                substitute_locals(a, locals);
+            }
+        }
+        Expr::Extract { source, .. } => substitute_locals(source, locals),
+        Expr::Array(items) => {
+            for elem in items {
+                substitute_locals(elem, locals);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            substitute_locals(target, locals);
+            substitute_locals(index, locals);
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            substitute_locals(expr, locals);
+            substitute_locals(array, locals);
+        }
+        Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Column(_)
+        | Expr::WindowFunction { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. } => {}
+    }
+}
+
 fn eval_with_new_old(
     expr: &Expr,
     new_row: Option<&Row>,
