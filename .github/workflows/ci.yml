@@ -1,10 +1,21 @@
 name: CI
 
+# git-flow trigger map. Heavy gates (prod_ready, slo_smoke, perf_gate,
+# release-build) gate by branch via `if:` so feature/bugfix pushes get
+# fast feedback while release/hotfix + integration lines (develop, master)
+# run the full battery. See .claude/git-flow.md for the mapping table.
 on:
   push:
-    branches: [main, master]
+    branches:
+      - master
+      - main
+      - develop
+      - 'release/**'
+      - 'hotfix/**'
+      - 'feature/**'
+      - 'bugfix/**'
   pull_request:
-    branches: [main, master]
+    branches: [master, main, develop]
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,10 +25,10 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    # rust-toolchain.toml pins the channel; rustup auto-installs rustfmt
+    # + clippy components on first cargo invocation.
     steps:
       - uses: actions/checkout@v4
-      - name: Install rustfmt
-        run: rustup component add rustfmt
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -26,8 +37,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install clippy
-        run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -48,19 +57,28 @@ jobs:
   prod_ready:
     name: prod_ready gate
     runs-on: ubuntu-latest
-    # The prod_ready test asserts every [machine] row in
-    # PROD_READY.md is backed by a row_X_Y_* test in
-    # crates/spg-server/tests/prod_ready.rs. Failure here means
-    # PROD_READY.md is over-claiming.
+    # The prod_ready test asserts every [machine] row in PROD_READY.md
+    # is backed by a row_X_Y_* test in crates/spg-server/tests/prod_ready.rs.
+    # Failure here means PROD_READY.md is over-claiming.
     #
     # v7.11.x — PROD_READY.md / DEPLOYMENT.md / RUNBOOK.md /
-    # PERFORMANCE.md moved into `.claude/internal-docs/` (gitignored
-    # by project convention) so they're not present at workspace
-    # root for the prod_ready harness to read. Restoring this gate
-    # needs a follow-up that either moves the docs back to root or
-    # rewrites the harness to look elsewhere; mark soft-fail until
-    # then to keep the rest of CI honest.
+    # PERFORMANCE.md moved into `.claude/internal-docs/` (gitignored by
+    # project convention) so they're not present at workspace root for
+    # the prod_ready harness to read. Restoring this gate needs a
+    # follow-up that either moves the docs back to root or rewrites the
+    # harness to soft-skip on missing files; mark soft-fail until then
+    # to keep the rest of CI honest.
     continue-on-error: true
+    # Skipped on plain feature/bugfix pushes — runs on every PR (so the
+    # gate fires before merge to develop/master) and on any push to
+    # integration / release lines.
+    if: |
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/master' ||
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/develop' ||
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -70,15 +88,53 @@ jobs:
   slo_smoke:
     name: SLO smoke
     runs-on: ubuntu-latest
-    # v4.32 — the fast SLO gate from PERFORMANCE.md §SLO. Runs
-    # in < 5 s on a normal runner. SLO ceilings are intentionally
-    # loose (~2-3× v4.27 baseline) so shared-runner noise doesn't
-    # false-alarm.
+    # v4.32 — the fast SLO gate from PERFORMANCE.md §SLO. Runs in < 5 s
+    # on a normal runner. SLO ceilings are intentionally loose
+    # (~2-3× v4.27 baseline) so shared-runner noise doesn't false-alarm.
+    #
+    # Same gate policy as prod_ready: PRs + integration/release pushes only.
+    if: |
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/master' ||
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/develop' ||
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --release --test slo_smoke
         run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
+
+  perf_gate:
+    name: perf_gate (release)
+    runs-on: ubuntu-latest
+    # Every stone crate's `tests/perf_gate.rs` is wrapped in
+    # `#![cfg(not(debug_assertions))]`, so the workspace-wide debug
+    # `test` job above produces empty perf_gate binaries. This job is
+    # the real gate — release build, one crate at a time so a single
+    # failure points at exactly which gate regressed.
+    #
+    # Same gate policy as prod_ready / slo_smoke: PRs + integration /
+    # release lines. Skipped on plain feature/bugfix pushes.
+    if: |
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/master' ||
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/develop' ||
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/hotfix/')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --release perf_gate × stone crates
+        run: |
+          set -euo pipefail
+          for crate in spg-audit spg-crypto spg-engine spg-sql spg-storage spg-wire spgctl; do
+            echo "::group::perf_gate ${crate}"
+            cargo test --release -p "${crate}" --test perf_gate --locked -- --test-threads=1 --nocapture
+            echo "::endgroup::"
+          done
 
   audit:
     name: cargo-audit
@@ -92,8 +148,8 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
-    # v4.31: license allowlist + duplicate-version check via
-    # cargo-deny. Config in deny.toml.
+    # v4.31: license allowlist + duplicate-version check via cargo-deny.
+    # Config in deny.toml.
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -105,9 +161,9 @@ jobs:
     # string / common API key format committed in the diff.
     #
     # v7.11.x — gitleaks-action@v2 now requires a paid license for
-    # GitHub organisations. Until we either purchase one or migrate
-    # to a different scanner (trufflehog is the usual swap), allow
-    # this job to soft-fail so it doesn't gate the rest of CI.
+    # GitHub organisations. Until we either purchase one or migrate to
+    # a different scanner (trufflehog is the usual swap), allow this
+    # job to soft-fail so it doesn't gate the rest of CI.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -119,16 +175,29 @@ jobs:
   release-build:
     name: release build (sanity)
     runs-on: ubuntu-latest
-    # Catches optimization-only bugs and confirms the production
-    # binary still links cleanly — runs only on main-branch pushes
-    # to keep PR CI fast.
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    # Catches optimization-only bugs and confirms the production binary
+    # still links cleanly. Runs on anything that will land on master:
+    # master/main push, release/** + hotfix/** push, and PRs targeting
+    # master/main. Skipped on feature/develop to keep their CI quick.
+    if: |
+      (github.event_name == 'push' && (
+        github.ref == 'refs/heads/master' ||
+        github.ref == 'refs/heads/main' ||
+        startsWith(github.ref, 'refs/heads/release/') ||
+        startsWith(github.ref, 'refs/heads/hotfix/')
+      )) ||
+      (github.event_name == 'pull_request' && (
+        github.base_ref == 'master' || github.base_ref == 'main'
+      ))
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release -p spg-server
         run: cargo build --release -p spg-server --locked
       - name: Upload spg-server binary
+        # Only upload on master/main pushes — release/hotfix branches
+        # produce the same binary but it's the master tag that we keep.
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
         uses: actions/upload-artifact@v4
         with:
           name: spg-server-linux-amd64
