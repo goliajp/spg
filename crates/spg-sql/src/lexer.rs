@@ -96,6 +96,13 @@ pub enum Token {
     /// PG-style cast `expr::type` — single token because we want it to bind
     /// at postfix precedence.
     DoubleColon,
+    /// v7.12.4 — PL/pgSQL assignment operator `:=`.
+    /// Outside PL/pgSQL bodies this token has no SQL-side meaning.
+    ColonEq,
+    /// v7.12.4 — bare `:` separator. Used inside `tsvector` external-form
+    /// literals (`'cat:1 dog:2'::tsvector`) and as the fallback path for
+    /// the PL/pgSQL assignment lexer.
+    Colon,
     /// Standard SQL string concatenation `||`.
     Concat,
     /// `IS` keyword — postfix `IS NULL` / `IS NOT NULL` predicates.
@@ -354,6 +361,18 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             b':' if peek_eq(bytes, i + 1, b':') => {
                 out.push(Token::DoubleColon);
                 i += 2;
+            }
+            b':' if peek_eq(bytes, i + 1, b'=') => {
+                // v7.12.4 — PL/pgSQL assignment operator `:=`.
+                out.push(Token::ColonEq);
+                i += 2;
+            }
+            b':' => {
+                // v7.12.4 — bare `:`. Used inside `tsvector` external-form
+                // literals which the cast parser consumes in-token, and as a
+                // separator the PL/pgSQL assignment lexer can recover from.
+                out.push(Token::Colon);
+                i += 1;
             }
             b'|' if peek_eq(bytes, i + 1, b'|') => {
                 out.push(Token::Concat);
@@ -1128,8 +1147,20 @@ mod tests {
     }
 
     #[test]
-    fn lone_single_colon_is_unknown_char() {
-        let err = tokenize(":x").unwrap_err();
-        assert!(matches!(err.kind, LexErrorKind::UnknownChar(':')));
+    fn lone_single_colon_lexes_as_colon_token() {
+        // v7.12.4 — single `:` is now a token (PL/pgSQL surface
+        // + tsvector external-form literal both need it). The
+        // pre-v7.12.4 "single colon = unknown char" behaviour
+        // was incidental.
+        let toks = tokenize(":x").expect("colon now lexes");
+        assert_eq!(toks[0], Token::Colon);
+    }
+
+    #[test]
+    fn colon_eq_lexes_as_assignment() {
+        // v7.12.4 — PL/pgSQL assignment operator.
+        let toks = tokenize("x := 1").expect("colon-eq lexes");
+        // Tokens: Ident("x"), ColonEq, NumberLiteral
+        assert!(matches!(toks[1], Token::ColonEq));
     }
 }

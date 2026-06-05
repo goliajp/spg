@@ -13,3 +13,8 @@ extern crate alloc;
 pub mod ast;
 pub mod lexer;
 pub mod parser;
+
+/// v7.12.4 — convenience re-export of the PL/pgSQL body parser.
+/// Used by the engine-side trigger executor to lazy-re-parse the
+/// function body that the catalog stores as raw source text.
+pub use parser::parse_function_body;

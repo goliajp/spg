@@ -144,6 +144,32 @@ pub enum Statement {
     /// v7.12.1 — `RESET <name>` / `RESET ALL`. Restores parameter
     /// to its default. No-op for parameters SPG does not track.
     ResetParameter(Option<String>),
+    /// v7.12.4 — `CREATE [OR REPLACE] FUNCTION name(args) RETURNS
+    /// <type> [LANGUAGE <lang>] AS $$ body $$ [LANGUAGE <lang>]`.
+    /// v7.12.4 ships `plpgsql` for `RETURNS TRIGGER` bodies (the
+    /// CREATE TRIGGER + AFTER/BEFORE row-level pipeline). Other
+    /// languages parse but error at exec time with a clear
+    /// unsupported message.
+    CreateFunction(CreateFunctionStatement),
+    /// v7.12.4 — `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER}
+    /// {INSERT|UPDATE|DELETE} [OR ...] ON tbl FOR EACH ROW
+    /// EXECUTE {FUNCTION|PROCEDURE} fn_name()`. STATEMENT-level
+    /// triggers and column-list / WHEN clauses are out of scope
+    /// for v7.12.4.
+    CreateTrigger(CreateTriggerStatement),
+    /// v7.12.4 — `DROP TRIGGER [IF EXISTS] name ON tbl`. Silent
+    /// no-op when missing if `IF EXISTS` is set.
+    DropTrigger {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
+    /// v7.12.4 — `DROP FUNCTION [IF EXISTS] name`. Same shape as
+    /// DROP TRIGGER but global (no table scope).
+    DropFunction {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 /// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
@@ -259,6 +285,202 @@ pub struct CreateUserStatement {
     /// typo lands as a runtime error with a clear message rather than
     /// a parse failure.
     pub role: String,
+}
+
+/// v7.12.4 — `CREATE [OR REPLACE] FUNCTION`. v7.12.4 ships
+/// `RETURNS TRIGGER LANGUAGE plpgsql` as the primary use case
+/// (the row-level trigger body the CREATE TRIGGER below references).
+/// Non-trigger user-defined functions parse but error at execution
+/// time with a clear unsupported message; that surface lands in
+/// v7.12.5+.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateFunctionStatement {
+    pub name: String,
+    /// `OR REPLACE` was present; an existing function with the
+    /// same name is overwritten instead of erroring.
+    pub or_replace: bool,
+    /// `(arg1 type1, ...)` — v7.12.4 only accepts the empty arg
+    /// list `()` (sufficient for trigger functions). Other shapes
+    /// parse and store the args but the executor refuses to call
+    /// them.
+    pub args: Vec<FunctionArg>,
+    /// `RETURNS <type>` — `trigger` is the supported shape for
+    /// v7.12.4; arbitrary return types parse to
+    /// [`FunctionReturn::Other`].
+    pub returns: FunctionReturn,
+    /// `LANGUAGE <lang>` clause. PG accepts the clause on either
+    /// side of `AS $$...$$`; the parser canonicalises to one slot.
+    /// `plpgsql` and `sql` are the two interesting values.
+    pub language: String,
+    /// `AS $$ ... $$` body. v7.12.4 parses PL/pgSQL bodies into
+    /// a structured AST; non-trigger / non-plpgsql bodies stay as
+    /// the raw source text so the v7.12.5+ executor can pick them
+    /// up without a parser rev.
+    pub body: FunctionBody,
+}
+
+/// v7.12.4 — one positional argument to a `CREATE FUNCTION`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionArg {
+    /// `IN` / `OUT` / `INOUT` mode. v7.12.4 only accepts `IN`
+    /// (the default); `OUT` / `INOUT` parse but the executor
+    /// refuses them.
+    pub mode: FunctionArgMode,
+    /// Optional arg name. Trigger functions traditionally don't
+    /// name their args (they read NEW/OLD instead), so `None` is
+    /// the common case.
+    pub name: Option<String>,
+    /// Declared type, normalised to the SPG `DataType` mapping
+    /// where one exists. Unknown / extension types parse as a
+    /// raw string under [`FunctionArgType::Raw`].
+    pub ty: FunctionArgType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionArgMode {
+    In,
+    Out,
+    InOut,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionArgType {
+    Typed(ColumnTypeName),
+    /// Unknown / extension types — kept as the parser-side raw
+    /// identifier so error messages can name them precisely.
+    Raw(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionReturn {
+    /// `RETURNS TRIGGER` — the row-level trigger function shape.
+    /// v7.12.4 ships exactly this for execution.
+    Trigger,
+    /// `RETURNS VOID`. Parses; executor rejects in v7.12.4 unless
+    /// the function is unused (since v7.12.4 doesn't ship scalar
+    /// function invocation).
+    Void,
+    /// `RETURNS <type>` for any concrete data type. Reserved for
+    /// v7.12.5+'s scalar UDF surface.
+    Type(ColumnTypeName),
+    /// `RETURNS <ident>` for types SPG doesn't know — extension
+    /// types, RETURNS SETOF rows, RETURNS TABLE(...), etc.
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionBody {
+    /// v7.12.4 — parsed PL/pgSQL `BEGIN … END` block. The
+    /// trigger-function executor walks this directly without
+    /// re-parsing.
+    PlPgSql(PlPgSqlBlock),
+    /// Raw source text — parser couldn't (or didn't try to)
+    /// structure-parse the body. Used for `LANGUAGE sql`
+    /// functions and any PL/pgSQL body that contains v7.12.5+
+    /// features the v7.12.4 parser doesn't yet recognise. The
+    /// executor returns an unsupported error when invoked.
+    Raw(String),
+}
+
+/// v7.12.4 — PL/pgSQL `BEGIN ... END;` block. v7.12.4 ships the
+/// minimum shape for mailrs's `update_search_vector()` trigger
+/// function: assignment to NEW columns and a terminal RETURN. The
+/// v7.12.5+ slice adds DECLARE / IF / LOOP / embedded SQL / RAISE.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlPgSqlBlock {
+    pub statements: Vec<PlPgSqlStmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlPgSqlStmt {
+    /// `NEW.col := expr;` or `OLD.col := expr;`. OLD is parsed
+    /// for clarity in error reporting (PG also forbids it) — the
+    /// executor errors with a clear "OLD is read-only" message.
+    Assign { target: AssignTarget, value: Expr },
+    /// `RETURN <target>;` — trigger functions canonically return
+    /// `NEW` / `OLD` / `NULL`; v7.12.4 also accepts a bare
+    /// expression for forward compatibility with scalar UDFs.
+    Return(ReturnTarget),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignTarget {
+    NewColumn(String),
+    OldColumn(String),
+    /// Reserved for v7.12.5 DECLARE'd local variables.
+    Local(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReturnTarget {
+    /// `RETURN NEW;` — for BEFORE triggers, this is the row that
+    /// actually gets written (possibly with NEW.col mutations
+    /// applied). For AFTER triggers, the return value is ignored.
+    New,
+    /// `RETURN OLD;` — pass-through. For BEFORE DELETE this lets
+    /// the delete proceed; for BEFORE UPDATE / INSERT it's
+    /// equivalent to dropping the write.
+    Old,
+    /// `RETURN NULL;` — for BEFORE triggers, skips the write
+    /// entirely. For AFTER, the return value is ignored.
+    Null,
+    /// `RETURN <expr>;` — non-row return shape; reserved for the
+    /// scalar UDF surface in v7.12.5+. Executor errors when used
+    /// inside a trigger function.
+    Expr(Expr),
+}
+
+/// v7.12.4 — `CREATE [OR REPLACE] TRIGGER`. Always row-level
+/// (`FOR EACH ROW`) in v7.12.4 — statement-level triggers parse
+/// but the executor refuses them. `WHEN (cond)` clauses are out
+/// of scope; the trigger function can short-circuit on a leading
+/// IF inside its body once v7.12.5 lands IF.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerStatement {
+    pub name: String,
+    pub or_replace: bool,
+    pub timing: TriggerTiming,
+    /// At least one event; `INSERT OR UPDATE OR DELETE` parses to
+    /// three entries in order.
+    pub events: Vec<TriggerEvent>,
+    pub table: String,
+    /// `FOR EACH ROW` vs `FOR EACH STATEMENT`. v7.12.4 ships
+    /// only `Row`; `Statement` parses but the executor refuses.
+    pub for_each: TriggerForEach,
+    /// Name of the function to invoke. v7.12.4 requires the
+    /// function to be `CREATE FUNCTION`'d earlier; forward
+    /// references (PG accepts) are deferred to v7.12.5.
+    pub function: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    /// Fires before the row is written; the trigger function's
+    /// return value (NEW or NULL) decides the row content and
+    /// whether the write proceeds at all.
+    Before,
+    /// Fires after the row is written; the return value is
+    /// ignored.
+    After,
+    /// `INSTEAD OF` is PG-VIEW-trigger-only and out of scope for
+    /// v7.12.4 (SPG has no updatable-view surface).
+    InsteadOf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+    /// `TRUNCATE` event parses; SPG has no TRUNCATE statement
+    /// so the trigger never fires.
+    Truncate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerForEach {
+    Row,
+    Statement,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1317,7 +1539,135 @@ impl fmt::Display for Statement {
             }
             Self::ResetParameter(None) => f.write_str("RESET ALL"),
             Self::ResetParameter(Some(name)) => write!(f, "RESET {name}"),
+            Self::CreateFunction(s) => s.fmt(f),
+            Self::CreateTrigger(s) => s.fmt(f),
+            Self::DropTrigger {
+                name,
+                table,
+                if_exists,
+            } => {
+                f.write_str("DROP TRIGGER ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                write!(f, "{} ON {}", quote_ident(name), quote_ident(table))
+            }
+            Self::DropFunction { name, if_exists } => {
+                f.write_str("DROP FUNCTION ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                write!(f, "{}", quote_ident(name))
+            }
         }
+    }
+}
+
+impl fmt::Display for CreateFunctionStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.or_replace {
+            f.write_str("OR REPLACE ")?;
+        }
+        write!(f, "FUNCTION {}(", quote_ident(&self.name))?;
+        for (i, arg) in self.args.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match arg.mode {
+                FunctionArgMode::In => {}
+                FunctionArgMode::Out => f.write_str("OUT ")?,
+                FunctionArgMode::InOut => f.write_str("INOUT ")?,
+            }
+            if let Some(name) = &arg.name {
+                write!(f, "{} ", quote_ident(name))?;
+            }
+            match &arg.ty {
+                FunctionArgType::Typed(t) => write!(f, "{t}")?,
+                FunctionArgType::Raw(s) => f.write_str(s)?,
+            }
+        }
+        f.write_str(") RETURNS ")?;
+        match &self.returns {
+            FunctionReturn::Trigger => f.write_str("TRIGGER")?,
+            FunctionReturn::Void => f.write_str("VOID")?,
+            FunctionReturn::Type(t) => write!(f, "{t}")?,
+            FunctionReturn::Other(s) => f.write_str(s)?,
+        }
+        write!(f, " LANGUAGE {} AS $$", self.language)?;
+        match &self.body {
+            FunctionBody::PlPgSql(b) => write!(f, "\n{b}\n")?,
+            FunctionBody::Raw(s) => f.write_str(s)?,
+        }
+        f.write_str("$$")
+    }
+}
+
+impl fmt::Display for PlPgSqlBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BEGIN\n")?;
+        for stmt in &self.statements {
+            writeln!(f, "  {stmt};")?;
+        }
+        f.write_str("END")
+    }
+}
+
+impl fmt::Display for PlPgSqlStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Assign { target, value } => write!(f, "{target} := {value}"),
+            Self::Return(t) => match t {
+                ReturnTarget::New => f.write_str("RETURN NEW"),
+                ReturnTarget::Old => f.write_str("RETURN OLD"),
+                ReturnTarget::Null => f.write_str("RETURN NULL"),
+                ReturnTarget::Expr(e) => write!(f, "RETURN {e}"),
+            },
+        }
+    }
+}
+
+impl fmt::Display for AssignTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NewColumn(c) => write!(f, "NEW.{}", quote_ident(c)),
+            Self::OldColumn(c) => write!(f, "OLD.{}", quote_ident(c)),
+            Self::Local(n) => f.write_str(n),
+        }
+    }
+}
+
+impl fmt::Display for CreateTriggerStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.or_replace {
+            f.write_str("OR REPLACE ")?;
+        }
+        write!(f, "TRIGGER {} ", quote_ident(&self.name))?;
+        match self.timing {
+            TriggerTiming::Before => f.write_str("BEFORE")?,
+            TriggerTiming::After => f.write_str("AFTER")?,
+            TriggerTiming::InsteadOf => f.write_str("INSTEAD OF")?,
+        }
+        for (i, e) in self.events.iter().enumerate() {
+            if i == 0 {
+                f.write_str(" ")?;
+            } else {
+                f.write_str(" OR ")?;
+            }
+            match e {
+                TriggerEvent::Insert => f.write_str("INSERT")?,
+                TriggerEvent::Update => f.write_str("UPDATE")?,
+                TriggerEvent::Delete => f.write_str("DELETE")?,
+                TriggerEvent::Truncate => f.write_str("TRUNCATE")?,
+            }
+        }
+        write!(f, " ON {} FOR EACH ", quote_ident(&self.table))?;
+        match self.for_each {
+            TriggerForEach::Row => f.write_str("ROW")?,
+            TriggerForEach::Statement => f.write_str("STATEMENT")?,
+        }
+        write!(f, " EXECUTE FUNCTION {}()", quote_ident(&self.function))
     }
 }
 
