@@ -18,11 +18,14 @@ use core::fmt;
 use core::mem;
 
 use crate::ast::{
-    BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName, CreateIndexStatement,
-    CreatePublicationStatement, CreateSubscriptionStatement, CreateTableStatement, Expr,
-    ExtractField, FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin,
-    IndexMethod, InsertStatement, JoinKind, Literal, NullTreatment, OrderBy, PublicationScope,
-    SelectItem, SelectStatement, Statement, TableRef, UnOp, UnionKind, VecEncoding, WindowFrame,
+    AssignTarget, BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName,
+    CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
+    CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
+    FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin, FunctionArg,
+    FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
+    JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlStmt, PublicationScope,
+    ReturnTarget, SelectItem, SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach,
+    TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -334,8 +337,56 @@ impl Parser {
                         let name = self.expect_ident_or_string()?;
                         Ok(Statement::DropUser(name))
                     }
+                    // v7.12.4 — DROP TRIGGER [IF EXISTS] name ON table.
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("trigger") => {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let name = self.expect_ident_like()?;
+                        // ON <table>
+                        if !matches!(self.peek(), Token::On) {
+                            return Err(self.err(alloc::format!(
+                                "expected ON <table> after DROP TRIGGER {name:?}, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let table = self.expect_ident_like()?;
+                        Ok(Statement::DropTrigger {
+                            name,
+                            table,
+                            if_exists,
+                        })
+                    }
+                    // v7.12.4 — DROP FUNCTION [IF EXISTS] name [(args)].
+                    // v7.12.4 ignores any optional arg-list (signature-
+                    // based overload disambiguation lands in v7.12.5+).
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("function") => {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let name = self.expect_ident_like()?;
+                        // Optional `()` — consume + discard.
+                        if matches!(self.peek(), Token::LParen) {
+                            self.advance();
+                            // Skip until matching RParen, accepting any tokens (typed args we don't model yet).
+                            let mut depth = 1usize;
+                            while depth > 0 {
+                                match self.peek() {
+                                    Token::LParen => depth += 1,
+                                    Token::RParen => depth -= 1,
+                                    Token::Eof => {
+                                        return Err(self.err(alloc::format!(
+                                            "unterminated arg list in DROP FUNCTION {name:?}"
+                                        )));
+                                    }
+                                    _ => {}
+                                }
+                                self.advance();
+                            }
+                        }
+                        Ok(Statement::DropFunction { name, if_exists })
+                    }
                     other => Err(self.err(format!(
-                        "expected USER / PUBLICATION / SUBSCRIPTION after DROP, got {other:?}"
+                        "expected USER / PUBLICATION / SUBSCRIPTION / TRIGGER / FUNCTION after DROP, got {other:?}"
                     ))),
                 }
             }
@@ -519,9 +570,65 @@ impl Parser {
                 self.advance();
                 self.parse_create_extension_after_keyword()
             }
+            // v7.12.4 — `CREATE [OR REPLACE] FUNCTION …` and
+            // `CREATE [OR REPLACE] TRIGGER …`. `OR REPLACE` is
+            // optional; absorb it here and forward to the
+            // per-kind parsers with the flag. OR is a reserved
+            // keyword token.
+            Token::Or => {
+                self.advance();
+                let next = self.peek();
+                let (Token::Ident(s2) | Token::QuotedIdent(s2)) = next else {
+                    return Err(self.err(alloc::format!(
+                        "expected REPLACE after CREATE OR, got {next:?}"
+                    )));
+                };
+                if !s2.eq_ignore_ascii_case("replace") {
+                    return Err(self.err(alloc::format!(
+                        "expected REPLACE after CREATE OR, got {s2:?}"
+                    )));
+                }
+                self.advance();
+                self.parse_create_function_or_trigger_after_or_replace(true)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("function") => {
+                self.advance();
+                self.parse_create_function_after_keyword(false)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("trigger") => {
+                self.advance();
+                self.parse_create_trigger_after_keyword(false)
+            }
             other => Err(self.err(format!(
-                "expected TABLE / INDEX / USER / EXTENSION / PUBLICATION / SUBSCRIPTION after CREATE, got {other:?}"
+                "expected TABLE / INDEX / USER / EXTENSION / PUBLICATION / SUBSCRIPTION / FUNCTION / TRIGGER [OR REPLACE …] after CREATE, got {other:?}"
             ))),
+        }
+    }
+
+    /// v7.12.4 — `CREATE OR REPLACE` already consumed; the next
+    /// keyword decides whether we parse a function or trigger
+    /// body. PG accepts other `OR REPLACE`-able objects (VIEW,
+    /// PROCEDURE) — those land in later releases.
+    fn parse_create_function_or_trigger_after_or_replace(
+        &mut self,
+        or_replace: bool,
+    ) -> Result<Statement, ParseError> {
+        let tok = self.peek();
+        let (Token::Ident(s) | Token::QuotedIdent(s)) = tok else {
+            return Err(self.err(alloc::format!(
+                "expected FUNCTION / TRIGGER after CREATE OR REPLACE, got {tok:?}"
+            )));
+        };
+        if s.eq_ignore_ascii_case("function") {
+            self.advance();
+            self.parse_create_function_after_keyword(or_replace)
+        } else if s.eq_ignore_ascii_case("trigger") {
+            self.advance();
+            self.parse_create_trigger_after_keyword(or_replace)
+        } else {
+            Err(self.err(alloc::format!(
+                "expected FUNCTION / TRIGGER after CREATE OR REPLACE, got {s:?}"
+            )))
         }
     }
 
@@ -565,6 +672,467 @@ impl Parser {
             }
         }
         Ok(Statement::CreateExtension(name))
+    }
+
+    /// v7.12.4 — body of `CREATE [OR REPLACE] FUNCTION`. The
+    /// `[OR REPLACE]` flag (and the `FUNCTION` keyword) have
+    /// already been consumed by the caller. Grammar accepted:
+    ///
+    ///   name `(` arg-list `)`
+    ///   `RETURNS` return-type
+    ///   [ `LANGUAGE` ident ]
+    ///   `AS` $$ body $$
+    ///   [ `LANGUAGE` ident ]
+    ///
+    /// Either `LANGUAGE` position is allowed; PG accepts both.
+    fn parse_create_function_after_keyword(
+        &mut self,
+        or_replace: bool,
+    ) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        // Argument list. v7.12.4 commonly sees the empty `()`
+        // (trigger functions); typed args parse and round-trip
+        // but the executor only invokes nullary functions.
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after function name {name:?}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let args = self.parse_function_arg_list()?;
+        // RETURNS clause.
+        let tok = self.peek();
+        let (Token::Ident(s) | Token::QuotedIdent(s)) = tok else {
+            return Err(self.err(alloc::format!(
+                "expected RETURNS after function arg list, got {tok:?}"
+            )));
+        };
+        if !s.eq_ignore_ascii_case("returns") {
+            return Err(self.err(alloc::format!(
+                "expected RETURNS after function arg list, got {s:?}"
+            )));
+        }
+        self.advance();
+        let returns = self.parse_function_return()?;
+        // Optional LANGUAGE clause (PG also accepts after AS — we'll
+        // re-check after the body too).
+        let mut language: Option<String> = self.parse_optional_language()?;
+        // `AS` followed by a $$-quoted body (lexer already
+        // collapses both `$$…$$` and `$tag$…$tag$` to a single
+        // Token::String). AS is a reserved keyword (Token::As).
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS before function body, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let body_text = match self.peek() {
+            Token::String(s) => {
+                let body = s.clone();
+                self.advance();
+                body
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected $$-quoted function body after AS, got {other:?}"
+                )));
+            }
+        };
+        // Trailing optional LANGUAGE clause (the other PG position).
+        if language.is_none() {
+            language = self.parse_optional_language()?;
+        }
+        let language = language.unwrap_or_else(|| String::from("sql"));
+        // PL/pgSQL bodies get structure-parsed. Other languages
+        // (or PL/pgSQL bodies the v7.12.4 parser doesn't yet
+        // recognise) round-trip as Raw text — the executor errors
+        // when invoked with a clear unsupported message.
+        let body = if language.eq_ignore_ascii_case("plpgsql") {
+            match parse_plpgsql_body(&body_text) {
+                Ok(block) => FunctionBody::PlPgSql(block),
+                // Best-effort: if the body parser doesn't yet
+                // support a construct used inside, fall back to
+                // raw — keeps `CREATE FUNCTION` itself working
+                // (catalogue accepts), executor errors on
+                // invocation only.
+                Err(_) => FunctionBody::Raw(body_text),
+            }
+        } else {
+            FunctionBody::Raw(body_text)
+        };
+        Ok(Statement::CreateFunction(CreateFunctionStatement {
+            name,
+            or_replace,
+            args,
+            returns,
+            language,
+            body,
+        }))
+    }
+
+    /// Closing `)`-terminated argument list. v7.12.4 commonly
+    /// sees the empty `()`; typed args round-trip but the
+    /// executor (yet) doesn't invoke them.
+    fn parse_function_arg_list(&mut self) -> Result<Vec<FunctionArg>, ParseError> {
+        let mut args: Vec<FunctionArg> = Vec::new();
+        if matches!(self.peek(), Token::RParen) {
+            self.advance();
+            return Ok(args);
+        }
+        loop {
+            // Optional `IN` / `OUT` / `INOUT` mode keyword. IN is
+            // a reserved token; OUT / INOUT are bare idents.
+            let mode = if matches!(self.peek(), Token::In) {
+                self.advance();
+                FunctionArgMode::In
+            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("out"))
+            {
+                self.advance();
+                FunctionArgMode::Out
+            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("inout"))
+            {
+                self.advance();
+                FunctionArgMode::InOut
+            } else {
+                FunctionArgMode::In
+            };
+            // Optional name. The next token is either a name
+            // (followed by a type ident) or the type itself.
+            // Disambiguate by peeking ahead: if the token after
+            // the next ident is also an ident, we treat the
+            // first as the name.
+            let (name, ty_token) = {
+                let first = self.expect_ident_like()?;
+                // Peek next: if it's an ident (i.e. a type
+                // name) the `first` was the arg name.
+                match self.peek() {
+                    Token::Ident(_) | Token::QuotedIdent(_) => {
+                        let ty = self.expect_ident_like()?;
+                        (Some(first), ty)
+                    }
+                    _ => (None, first),
+                }
+            };
+            // Type — try to map to ColumnTypeName, else Raw.
+            let ty = match map_type_ident_to_column_type_name(&ty_token) {
+                Some(t) => FunctionArgType::Typed(t),
+                None => FunctionArgType::Raw(ty_token),
+            };
+            args.push(FunctionArg { mode, name, ty });
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                    continue;
+                }
+                Token::RParen => {
+                    self.advance();
+                    return Ok(args);
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected , or ) in function arg list, got {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn parse_function_return(&mut self) -> Result<FunctionReturn, ParseError> {
+        let ident = self.expect_ident_like()?;
+        if ident.eq_ignore_ascii_case("trigger") {
+            return Ok(FunctionReturn::Trigger);
+        }
+        if ident.eq_ignore_ascii_case("void") {
+            return Ok(FunctionReturn::Void);
+        }
+        match map_type_ident_to_column_type_name(&ident) {
+            Some(t) => Ok(FunctionReturn::Type(t)),
+            None => Ok(FunctionReturn::Other(ident)),
+        }
+    }
+
+    fn parse_optional_language(&mut self) -> Result<Option<String>, ParseError> {
+        match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("language") => {
+                self.advance();
+                let lang = self.expect_ident_like()?;
+                Ok(Some(lang.to_ascii_lowercase()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// v7.12.4 — body of `CREATE [OR REPLACE] TRIGGER`. The
+    /// `[OR REPLACE]` flag and the `TRIGGER` keyword have already
+    /// been consumed.
+    fn parse_create_trigger_after_keyword(
+        &mut self,
+        or_replace: bool,
+    ) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        let timing = {
+            let ident = self.expect_ident_like()?;
+            if ident.eq_ignore_ascii_case("before") {
+                TriggerTiming::Before
+            } else if ident.eq_ignore_ascii_case("after") {
+                TriggerTiming::After
+            } else if ident.eq_ignore_ascii_case("instead") {
+                let next = self.expect_ident_like()?;
+                if !next.eq_ignore_ascii_case("of") {
+                    return Err(self.err(alloc::format!(
+                        "expected OF after INSTEAD in trigger timing, got {next:?}"
+                    )));
+                }
+                TriggerTiming::InsteadOf
+            } else {
+                return Err(self.err(alloc::format!(
+                    "expected BEFORE / AFTER / INSTEAD OF in trigger timing, got {ident:?}"
+                )));
+            }
+        };
+        // Events: INSERT [ OR UPDATE [ OR DELETE [ OR TRUNCATE ] ] ].
+        // OR is a reserved keyword token (Token::Or), not an Ident.
+        let mut events: Vec<TriggerEvent> = Vec::new();
+        events.push(self.parse_trigger_event()?);
+        while matches!(self.peek(), Token::Or) {
+            self.advance();
+            events.push(self.parse_trigger_event()?);
+        }
+        // ON <table>
+        let tok = self.peek();
+        let Token::On = tok else {
+            return Err(self.err(alloc::format!(
+                "expected ON after trigger events, got {tok:?}"
+            )));
+        };
+        self.advance();
+        let table = self.expect_ident_like()?;
+        // FOR EACH ROW / FOR EACH STATEMENT. FOR is a reserved
+        // keyword (Token::For); EACH / ROW / STATEMENT are bare
+        // idents.
+        if !matches!(self.peek(), Token::For) {
+            return Err(self.err(alloc::format!(
+                "expected FOR EACH ROW / STATEMENT, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let for_each = {
+            let e = self.expect_ident_like()?;
+            if !e.eq_ignore_ascii_case("each") {
+                return Err(self.err(alloc::format!("expected EACH after FOR, got {e:?}")));
+            }
+            let unit = self.expect_ident_like()?;
+            if unit.eq_ignore_ascii_case("row") {
+                TriggerForEach::Row
+            } else if unit.eq_ignore_ascii_case("statement") {
+                TriggerForEach::Statement
+            } else {
+                return Err(self.err(alloc::format!(
+                    "expected ROW / STATEMENT after FOR EACH, got {unit:?}"
+                )));
+            }
+        };
+        // EXECUTE FUNCTION/PROCEDURE name(...)
+        let exec = self.expect_ident_like()?;
+        if !exec.eq_ignore_ascii_case("execute") {
+            return Err(self.err(alloc::format!(
+                "expected EXECUTE FUNCTION/PROCEDURE in CREATE TRIGGER, got {exec:?}"
+            )));
+        }
+        let fn_or_proc = self.expect_ident_like()?;
+        if !(fn_or_proc.eq_ignore_ascii_case("function")
+            || fn_or_proc.eq_ignore_ascii_case("procedure"))
+        {
+            return Err(self.err(alloc::format!(
+                "expected FUNCTION / PROCEDURE after EXECUTE, got {fn_or_proc:?}"
+            )));
+        }
+        let function = self.expect_ident_like()?;
+        // Optional empty arg list `()`.
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "v7.12.4 trigger function calls take no args; got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+        }
+        Ok(Statement::CreateTrigger(CreateTriggerStatement {
+            name,
+            or_replace,
+            timing,
+            events,
+            table,
+            for_each,
+            function,
+        }))
+    }
+
+    /// v7.12.4 — `BEGIN stmt; stmt; … END[;]` PL/pgSQL block.
+    /// Called by [`parse_plpgsql_body`] after the body's tokens
+    /// have been lexed into this temporary parser. The body's
+    /// outer `$$` markers have already been stripped.
+    pub(crate) fn parse_plpgsql_block(&mut self) -> Result<PlPgSqlBlock, ParseError> {
+        // BEGIN keyword (PL/pgSQL — distinct from the SQL
+        // `BEGIN` transaction-start, but we can reuse the
+        // reserved Token::Begin since the body is a separate
+        // lex/parse context).
+        if !matches!(self.peek(), Token::Begin) {
+            return Err(self.err(alloc::format!(
+                "expected BEGIN at start of plpgsql block, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut statements: Vec<PlPgSqlStmt> = Vec::new();
+        loop {
+            // Allow trailing semicolons + END.
+            while matches!(self.peek(), Token::Semicolon) {
+                self.advance();
+            }
+            // END terminates the block.
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end"))
+            {
+                self.advance();
+                // Optional trailing semicolon.
+                if matches!(self.peek(), Token::Semicolon) {
+                    self.advance();
+                }
+                break;
+            }
+            // Otherwise: one statement, then expect `;` or END.
+            let stmt = self.parse_plpgsql_stmt()?;
+            statements.push(stmt);
+            match self.peek() {
+                Token::Semicolon => {
+                    self.advance();
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end") => {
+                    // Final statement without trailing `;`.
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected ; or END after plpgsql statement, got {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(PlPgSqlBlock { statements })
+    }
+
+    fn parse_plpgsql_stmt(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+        // RETURN keyword?
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("return"))
+        {
+            self.advance();
+            return self.parse_plpgsql_return();
+        }
+        // Otherwise: assignment. `NEW.col` / `OLD.col` / `var`
+        // followed by `:=` and an expression.
+        let target = self.parse_plpgsql_assign_target()?;
+        // PL/pgSQL assignment uses `:=`. The lexer represents
+        // this as a colon followed by `=`; check both shapes.
+        match self.peek() {
+            Token::ColonEq => {
+                self.advance();
+            }
+            Token::Colon => {
+                self.advance();
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(self.err(alloc::format!(
+                        "expected := after plpgsql assign target, got `:` then {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected := after plpgsql assign target, got {other:?}"
+                )));
+            }
+        }
+        let value = self.parse_expr(0)?;
+        Ok(PlPgSqlStmt::Assign { target, value })
+    }
+
+    fn parse_plpgsql_assign_target(&mut self) -> Result<AssignTarget, ParseError> {
+        let head = self.expect_ident_like()?;
+        if matches!(self.peek(), Token::Dot) {
+            self.advance();
+            let col = self.expect_ident_like()?;
+            if head.eq_ignore_ascii_case("new") {
+                return Ok(AssignTarget::NewColumn(col));
+            }
+            if head.eq_ignore_ascii_case("old") {
+                return Ok(AssignTarget::OldColumn(col));
+            }
+            return Err(self.err(alloc::format!(
+                "v7.12.4 plpgsql assign target must be NEW.<col> / OLD.<col> / <local_var>; \
+                 got {head:?}.<col>"
+            )));
+        }
+        Ok(AssignTarget::Local(head))
+    }
+
+    fn parse_plpgsql_return(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+        // RETURN NEW / OLD / NULL — bare-ident forms.
+        match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("new") => {
+                self.advance();
+                return Ok(PlPgSqlStmt::Return(ReturnTarget::New));
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("old") => {
+                self.advance();
+                return Ok(PlPgSqlStmt::Return(ReturnTarget::Old));
+            }
+            Token::Null => {
+                self.advance();
+                return Ok(PlPgSqlStmt::Return(ReturnTarget::Null));
+            }
+            // Bare `RETURN;` (no value) — treated as `RETURN NULL`
+            // per PL/pgSQL convention.
+            Token::Semicolon => {
+                return Ok(PlPgSqlStmt::Return(ReturnTarget::Null));
+            }
+            _ => {}
+        }
+        // Fall through: parse a full expression.
+        let e = self.parse_expr(0)?;
+        Ok(PlPgSqlStmt::Return(ReturnTarget::Expr(e)))
+    }
+
+    fn parse_trigger_event(&mut self) -> Result<TriggerEvent, ParseError> {
+        // INSERT is a reserved Token; UPDATE / DELETE / TRUNCATE
+        // are ident-shaped (the parser keys off case-insensitive
+        // match — same shape used by the top-level Update / Delete
+        // dispatchers at parse_one_statement).
+        if matches!(self.peek(), Token::Insert) {
+            self.advance();
+            return Ok(TriggerEvent::Insert);
+        }
+        match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
+                self.advance();
+                Ok(TriggerEvent::Update)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete") => {
+                self.advance();
+                Ok(TriggerEvent::Delete)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("truncate") => {
+                self.advance();
+                Ok(TriggerEvent::Truncate)
+            }
+            other => Err(self.err(alloc::format!(
+                "expected INSERT / UPDATE / DELETE / TRUNCATE in trigger event list, got {other:?}"
+            ))),
+        }
     }
 
     /// v6.1.2 → v6.1.3 — `CREATE PUBLICATION <name>` body. Accepts:
@@ -1577,6 +2145,25 @@ impl Parser {
         }
         self.advance(); // IF
         self.advance(); // NOT
+        self.advance(); // EXISTS
+        true
+    }
+
+    /// v7.12.4 — `IF EXISTS` modifier for DROP statements.
+    /// Consumes IF EXISTS as a pair; returns false otherwise
+    /// without consuming any tokens.
+    fn consume_if_exists(&mut self) -> bool {
+        let looks_like_if = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if"));
+        if !looks_like_if {
+            return false;
+        }
+        if !matches!(
+            self.tokens.get(self.pos + 1),
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("exists")
+        ) {
+            return false;
+        }
+        self.advance(); // IF
         self.advance(); // EXISTS
         true
     }
@@ -3746,6 +4333,78 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i64)> {
     Some((months, micros))
 }
 
+/// v7.12.4 — map a bare type-name identifier (the form that
+/// appears in a function arg list or RETURNS clause) to a
+/// [`ColumnTypeName`]. Returns `None` for unknown / extension
+/// types so the caller can preserve them as
+/// [`FunctionArgType::Raw`] / [`FunctionReturn::Other`].
+///
+/// Subset of the full column-type grammar — we deliberately
+/// don't parse parameterised forms (`VARCHAR(n)`, `NUMERIC(p,s)`)
+/// here because function-arg types in v7.12.4 are mostly the
+/// bare form (`text`, `int`, `bytea`, …).
+fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
+    Some(match ident.to_ascii_lowercase().as_str() {
+        "smallint" | "tinyint" => ColumnTypeName::SmallInt,
+        "int" | "integer" | "mediumint" => ColumnTypeName::Int,
+        "bigint" => ColumnTypeName::BigInt,
+        "float" | "double" | "real" => ColumnTypeName::Float,
+        "text" => ColumnTypeName::Text,
+        "bool" | "boolean" => ColumnTypeName::Bool,
+        "date" => ColumnTypeName::Date,
+        "timestamp" | "datetime" => ColumnTypeName::Timestamp,
+        "timestamptz" => ColumnTypeName::Timestamptz,
+        "json" => ColumnTypeName::Json,
+        "jsonb" => ColumnTypeName::Jsonb,
+        "bytea" | "bytes" => ColumnTypeName::Bytes,
+        "tsvector" => ColumnTypeName::TsVector,
+        "tsquery" => ColumnTypeName::TsQuery,
+        _ => return None,
+    })
+}
+
+/// v7.12.4 — parse a PL/pgSQL function body (the bytes between
+/// `$$ ... $$`). Returns the parsed `BEGIN ... END;` block.
+///
+/// v7.12.4 grammar (strict subset — IF / LOOP / DECLARE / RAISE
+/// / embedded SQL land in v7.12.5+):
+///
+/// ```text
+///   body          := [ws] block [ws]
+///   block         := BEGIN stmt ( ; stmt )* [ ; ] END [ ; ]
+///   stmt          := assign | return
+///   assign        := assign_target := expr
+///   assign_target := ( NEW | OLD ) . ident | ident
+///   return        := RETURN ( NEW | OLD | NULL | expr )
+/// ```
+///
+/// `expr` is parsed by recursing into the regular `Parser` — so a
+/// PL/pgSQL `NEW.search_vector := to_tsvector('english',
+/// NEW.subject || ' ' || NEW.sender)` body shape works without
+/// the body parser knowing what `to_tsvector` is.
+///
+/// Errors here cause the caller to fall back to
+/// `FunctionBody::Raw` — keeping the CREATE FUNCTION DDL itself
+/// successful, but the executor will refuse to invoke the
+/// function with an "unparseable body" error.
+/// v7.12.4 — public alias for [`parse_plpgsql_body`] re-exported
+/// from the crate root as `spg_sql::parse_function_body`.
+pub fn parse_function_body(body: &str) -> Result<PlPgSqlBlock, ParseError> {
+    parse_plpgsql_body(body)
+}
+
+fn parse_plpgsql_body(body: &str) -> Result<PlPgSqlBlock, ParseError> {
+    // Use the regular lexer on the body text. The trailing
+    // `END;` may or may not have a semicolon; the lexer treats
+    // both forms identically.
+    let tokens = lexer::tokenize(body).map_err(|e| ParseError {
+        message: alloc::format!("plpgsql body lex error: {e}"),
+        token_pos: 0,
+    })?;
+    let mut parser = Parser::new(tokens);
+    parser.parse_plpgsql_block()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4796,6 +5455,123 @@ mod tests {
             "CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t1",
             "DROP PUBLICATION pub_a",
             "SHOW PUBLICATIONS",
+        ] {
+            let s = parse(sql);
+            let printed = s.to_string();
+            let again = parse_statement(&printed)
+                .unwrap_or_else(|e| panic!("re-parse failed for {printed:?}: {e}"));
+            assert_eq!(s, again, "round-trip mismatch for {sql:?}");
+        }
+    }
+
+    // --- v7.12.4: CREATE FUNCTION + CREATE TRIGGER + PL/pgSQL ---
+
+    #[test]
+    fn create_function_returns_trigger_plpgsql_minimal() {
+        let sql = "CREATE FUNCTION noop() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$";
+        let s = parse(sql);
+        let Statement::CreateFunction(f) = s else {
+            panic!("expected CreateFunction");
+        };
+        assert_eq!(f.name, "noop");
+        assert!(!f.or_replace);
+        assert!(f.args.is_empty());
+        assert!(matches!(f.returns, FunctionReturn::Trigger));
+        assert_eq!(f.language, "plpgsql");
+        let FunctionBody::PlPgSql(block) = f.body else {
+            panic!("expected PlPgSql body");
+        };
+        assert_eq!(block.statements.len(), 1);
+        assert!(matches!(
+            block.statements[0],
+            PlPgSqlStmt::Return(ReturnTarget::New)
+        ));
+    }
+
+    #[test]
+    fn create_function_or_replace_with_assignment() {
+        // mailrs-shape trigger function: NEW.col := to_tsvector(...);
+        // RETURN NEW.
+        let sql = "CREATE OR REPLACE FUNCTION update_sv() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.search_vector := to_tsvector('english', NEW.subject);
+  RETURN NEW;
+END;
+$$";
+        let s = parse(sql);
+        let Statement::CreateFunction(f) = s else {
+            panic!("expected CreateFunction");
+        };
+        assert!(f.or_replace);
+        let FunctionBody::PlPgSql(block) = &f.body else {
+            panic!("expected PlPgSql body");
+        };
+        assert_eq!(block.statements.len(), 2);
+        // First statement: NEW.search_vector := to_tsvector(...)
+        let PlPgSqlStmt::Assign { target, .. } = &block.statements[0] else {
+            panic!("expected Assign as first stmt");
+        };
+        match target {
+            AssignTarget::NewColumn(c) => assert_eq!(c, "search_vector"),
+            other => panic!("expected NEW.col, got {other:?}"),
+        }
+        // Second statement: RETURN NEW
+        assert!(matches!(
+            block.statements[1],
+            PlPgSqlStmt::Return(ReturnTarget::New)
+        ));
+    }
+
+    #[test]
+    fn create_trigger_after_insert_or_update() {
+        let sql = "CREATE TRIGGER tg AFTER INSERT OR UPDATE ON messages FOR EACH ROW EXECUTE FUNCTION update_sv()";
+        let s = parse(sql);
+        let Statement::CreateTrigger(t) = s else {
+            panic!("expected CreateTrigger");
+        };
+        assert_eq!(t.name, "tg");
+        assert_eq!(t.table, "messages");
+        assert_eq!(t.timing, TriggerTiming::After);
+        assert_eq!(t.events, vec![TriggerEvent::Insert, TriggerEvent::Update]);
+        assert_eq!(t.for_each, TriggerForEach::Row);
+        assert_eq!(t.function, "update_sv");
+    }
+
+    #[test]
+    fn create_trigger_before_delete_execute_procedure_alias() {
+        // PG also accepts the legacy `EXECUTE PROCEDURE` spelling.
+        let sql =
+            "CREATE TRIGGER guard BEFORE DELETE ON t FOR EACH ROW EXECUTE PROCEDURE block_delete()";
+        let s = parse(sql);
+        let Statement::CreateTrigger(t) = s else {
+            panic!("expected CreateTrigger");
+        };
+        assert_eq!(t.timing, TriggerTiming::Before);
+        assert_eq!(t.events, vec![TriggerEvent::Delete]);
+    }
+
+    #[test]
+    fn drop_trigger_if_exists_round_trips() {
+        // No parser support for DROP TRIGGER yet — added in v7.12.5
+        // alongside the broader DROP …{IF EXISTS} cleanup. The
+        // AST + Display impls are in place so we round-trip via
+        // construction:
+        let s = Statement::DropTrigger {
+            name: "tg".into(),
+            table: "messages".into(),
+            if_exists: true,
+        };
+        assert_eq!(s.to_string(), "DROP TRIGGER IF EXISTS tg ON messages");
+    }
+
+    #[test]
+    fn trigger_ddl_display_roundtrips_through_parser() {
+        // CREATE TRIGGER + its referenced CREATE FUNCTION must
+        // Display → parse → same AST (modulo PL/pgSQL body
+        // formatting which is parser-canonicalised).
+        for sql in [
+            "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+            "CREATE TRIGGER tg2 BEFORE UPDATE OR DELETE ON t FOR EACH ROW EXECUTE FUNCTION g()",
         ] {
             let s = parse(sql);
             let printed = s.to_string();

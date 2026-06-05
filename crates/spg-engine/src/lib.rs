@@ -19,6 +19,7 @@ pub mod reorder;
 pub mod selectivity;
 pub mod statistics;
 pub mod subscriptions;
+pub mod triggers;
 pub mod users;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
@@ -1151,6 +1152,32 @@ impl Engine {
         }
     }
 
+    /// v7.12.4 — snapshot every row-level trigger on `table` that
+    /// fires for `event` (`"INSERT"` / `"UPDATE"` / `"DELETE"`) at
+    /// the given `timing` (`"BEFORE"` / `"AFTER"`), and clone its
+    /// referenced function definition. Returned as a vec of owned
+    /// `FunctionDef` so the row-write loop can fire them without
+    /// holding a borrow on the catalog (which would conflict with
+    /// the table.insert / update_row / delete mutable borrows).
+    fn snapshot_row_triggers(
+        &self,
+        table: &str,
+        event: &str,
+        timing: &str,
+    ) -> Vec<spg_storage::FunctionDef> {
+        let cat = self.active_catalog();
+        cat.triggers()
+            .iter()
+            .filter(|t| {
+                t.table == table
+                    && t.timing.eq_ignore_ascii_case(timing)
+                    && t.for_each.eq_ignore_ascii_case("row")
+                    && t.events.iter().any(|e| e.eq_ignore_ascii_case(event))
+            })
+            .filter_map(|t| cat.functions().get(&t.function).cloned())
+            .collect()
+    }
+
     fn active_catalog_mut(&mut self) -> &mut Catalog {
         let tx = self.current_tx;
         match tx {
@@ -1467,6 +1494,19 @@ impl Engine {
                     affected: 0,
                     modified_catalog: false,
                 })
+            }
+            // v7.12.4 — CREATE FUNCTION / CREATE TRIGGER / DROP …
+            // for the PL/pgSQL trigger surface. exec_* methods are
+            // defined alongside the existing CREATE handlers below.
+            Statement::CreateFunction(s) => self.exec_create_function(s),
+            Statement::CreateTrigger(s) => self.exec_create_trigger(s),
+            Statement::DropTrigger {
+                name,
+                table,
+                if_exists,
+            } => self.exec_drop_trigger(&name, &table, if_exists),
+            Statement::DropFunction { name, if_exists } => {
+                self.exec_drop_function(&name, if_exists)
             }
             Statement::ResetParameter(target) => {
                 match target {
@@ -2352,6 +2392,121 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: 1,
             modified_catalog: true,
+        })
+    }
+
+    /// v7.12.4 — `CREATE [OR REPLACE] FUNCTION`. Stores the
+    /// function metadata in the catalog. PL/pgSQL bodies are
+    /// already parsed by the SQL parser; we re-canonicalise the
+    /// body to source text for storage (the executor re-parses
+    /// it at trigger fire time — see the trigger fire path).
+    fn exec_create_function(
+        &mut self,
+        s: spg_sql::ast::CreateFunctionStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let args_repr = render_function_args(&s.args);
+        let returns = match &s.returns {
+            spg_sql::ast::FunctionReturn::Trigger => alloc::string::String::from("TRIGGER"),
+            spg_sql::ast::FunctionReturn::Void => alloc::string::String::from("VOID"),
+            spg_sql::ast::FunctionReturn::Type(t) => alloc::format!("{t}"),
+            spg_sql::ast::FunctionReturn::Other(s) => s.clone(),
+        };
+        let body_text = match &s.body {
+            spg_sql::ast::FunctionBody::PlPgSql(b) => alloc::format!("{b}"),
+            spg_sql::ast::FunctionBody::Raw(s) => s.clone(),
+        };
+        let def = spg_storage::FunctionDef {
+            name: s.name.clone(),
+            args_repr,
+            returns,
+            language: s.language.clone(),
+            body: body_text,
+        };
+        self.active_catalog_mut()
+            .create_function(def, s.or_replace)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
+    /// v7.12.4 — `CREATE [OR REPLACE] TRIGGER`. The referenced
+    /// function must already exist in the catalog (forward
+    /// references defer to a later release). Persists the
+    /// trigger metadata for the row-write hooks below to consult.
+    fn exec_create_trigger(
+        &mut self,
+        s: spg_sql::ast::CreateTriggerStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let timing = match s.timing {
+            spg_sql::ast::TriggerTiming::Before => "BEFORE",
+            spg_sql::ast::TriggerTiming::After => "AFTER",
+            spg_sql::ast::TriggerTiming::InsteadOf => "INSTEAD OF",
+        };
+        let events: Vec<alloc::string::String> = s
+            .events
+            .iter()
+            .map(|e| match e {
+                spg_sql::ast::TriggerEvent::Insert => alloc::string::String::from("INSERT"),
+                spg_sql::ast::TriggerEvent::Update => alloc::string::String::from("UPDATE"),
+                spg_sql::ast::TriggerEvent::Delete => alloc::string::String::from("DELETE"),
+                spg_sql::ast::TriggerEvent::Truncate => alloc::string::String::from("TRUNCATE"),
+            })
+            .collect();
+        let for_each = match s.for_each {
+            spg_sql::ast::TriggerForEach::Row => "ROW",
+            spg_sql::ast::TriggerForEach::Statement => "STATEMENT",
+        };
+        let def = spg_storage::TriggerDef {
+            name: s.name.clone(),
+            table: s.table.clone(),
+            timing: alloc::string::String::from(timing),
+            events,
+            for_each: alloc::string::String::from(for_each),
+            function: s.function.clone(),
+        };
+        self.active_catalog_mut()
+            .create_trigger(def, s.or_replace)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
+    fn exec_drop_trigger(
+        &mut self,
+        name: &str,
+        table: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let removed = self.active_catalog_mut().drop_trigger(name, table);
+        if !removed && !if_exists {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("trigger {name:?} on {table:?} does not exist"),
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    fn exec_drop_function(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let removed = self.active_catalog_mut().drop_function(name);
+        if !removed && !if_exists {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("function {name:?} does not exist"),
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
         })
     }
 
@@ -3364,6 +3519,17 @@ impl Engine {
         // borrow on the catalog opens; runtime DEFAULT eval needs
         // it inside the row hot loop.
         let clock = self.clock;
+        // v7.12.4 — snapshot row-level triggers + their referenced
+        // functions before the mut borrow on the catalog opens.
+        // Cloned out so the row hot loop can fire them without
+        // re-borrowing the catalog (which would conflict with
+        // table.insert's mutable borrow).
+        let before_insert_triggers = self.snapshot_row_triggers(&stmt.table, "INSERT", "BEFORE");
+        let after_insert_triggers = self.snapshot_row_triggers(&stmt.table, "INSERT", "AFTER");
+        let trigger_session_cfg: Option<alloc::string::String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -3597,12 +3763,53 @@ impl Engine {
         // INSERT and per UPDATE branch so DO UPDATE pushes the new
         // post-update state, not the incoming-only values.
         let mut returning_rows: Vec<Vec<Value>> = Vec::new();
-        for values in all_values {
-            if stmt.returning.is_some() {
-                returning_rows.push(values.clone());
+        'rowloop: for values in all_values {
+            let mut row = Row::new(values);
+            // v7.12.4 — BEFORE INSERT row-level triggers. Each
+            // trigger may rewrite NEW cells (e.g. populate
+            // `search_vector := to_tsvector(...)`) and may return
+            // NULL to skip the row entirely.
+            for fd in &before_insert_triggers {
+                let outcome = triggers::fire_row_trigger(
+                    fd,
+                    Some(row.clone()),
+                    None,
+                    &stmt.table,
+                    &column_meta,
+                    &[],
+                    trigger_session_cfg.as_deref(),
+                    false,
+                )
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                match outcome {
+                    triggers::TriggerOutcome::Row(r) => row = r,
+                    triggers::TriggerOutcome::Skip => continue 'rowloop,
+                }
             }
-            table.insert(Row::new(values))?;
+            if stmt.returning.is_some() {
+                returning_rows.push(row.values.clone());
+            }
+            // v7.12.4 — clone for the AFTER trigger view; insert
+            // moves the row into the table.
+            let inserted = row.clone();
+            table.insert(row)?;
             affected += 1;
+            // v7.12.4 — AFTER INSERT row-level triggers fire post-
+            // write. Return value is ignored (PG semantics); we
+            // surface any error from the body up to the caller.
+            for fd in &after_insert_triggers {
+                triggers::fire_row_trigger(
+                    fd,
+                    Some(inserted.clone()),
+                    None,
+                    &stmt.table,
+                    &column_meta,
+                    &[],
+                    trigger_session_cfg.as_deref(),
+                    true,
+                )
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            }
         }
         // v7.9.9 — apply ON CONFLICT DO UPDATE rewrites collected
         // in the conflict-resolution pass. update_row handles
@@ -10011,6 +10218,38 @@ fn coerce_value(
         actual,
         position,
     }))
+}
+
+/// v7.12.4 — render a function arg list into the
+/// canonical form the storage layer caches as
+/// [`spg_storage::FunctionDef::args_repr`]. The catalogue uses
+/// this string for both display + as a coarse signature key
+/// for the (deferred) overload resolution v7.12.5+ adds.
+fn render_function_args(args: &[spg_sql::ast::FunctionArg]) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::from("(");
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        match a.mode {
+            spg_sql::ast::FunctionArgMode::In => {}
+            spg_sql::ast::FunctionArgMode::Out => out.push_str("OUT "),
+            spg_sql::ast::FunctionArgMode::InOut => out.push_str("INOUT "),
+        }
+        if let Some(n) = &a.name {
+            out.push_str(n);
+            out.push(' ');
+        }
+        match &a.ty {
+            spg_sql::ast::FunctionArgType::Typed(t) => {
+                let _ = write!(out, "{t}");
+            }
+            spg_sql::ast::FunctionArgType::Raw(s) => out.push_str(s),
+        }
+    }
+    out.push(')');
+    out
 }
 
 #[cfg(test)]

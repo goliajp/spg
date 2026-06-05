@@ -2978,6 +2978,67 @@ pub struct Catalog {
     /// a manifest that no longer lists it, and the file becomes
     /// an orphan eligible for offline cleanup).
     cold_segments: Vec<Option<Arc<OwnedSegment>>>,
+    /// v7.12.4 — user-defined functions (PL/pgSQL + SQL).
+    /// Keyed by function name (PG overloading is out of scope).
+    /// Bodies are stored as the raw source text the parser saw
+    /// between `$$ ... $$`; the engine re-parses on each
+    /// invocation. This keeps `spg-storage` free of `spg-sql`
+    /// dependency — same pattern as partial-index predicates.
+    functions: BTreeMap<String, FunctionDef>,
+    /// v7.12.4 — triggers in insertion order. Multiple triggers
+    /// per table / event fire in this order (matching PG's
+    /// alphabetical-by-default with insertion-stable tie-break
+    /// behaviour — we just keep insertion order for now).
+    triggers: Vec<TriggerDef>,
+}
+
+/// v7.12.4 — catalogued user-defined function. `body` is the raw
+/// source text between `$$ ... $$`; the engine re-parses it on
+/// invocation. This keeps the storage codec stable when the
+/// PL/pgSQL surface grows (no breaking-change risk on the disk
+/// format).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDef {
+    pub name: String,
+    /// Display form of the argument list, e.g.
+    /// `"(name TEXT, ts TIMESTAMP)"`. Empty `"()"` for the trigger
+    /// function shape. Parser-side canonicalised before storage.
+    pub args_repr: String,
+    /// Display form of the return type, e.g. `"TRIGGER"` /
+    /// `"INT"` / `"SETOF text"`. The engine special-cases
+    /// `"TRIGGER"` (case-insensitive) to gate trigger-only
+    /// semantics (NEW/OLD).
+    pub returns: String,
+    /// `LANGUAGE` clause, lowercased. `"plpgsql"` / `"sql"`.
+    pub language: String,
+    /// Source body of the function. PL/pgSQL: includes the
+    /// surrounding `BEGIN ... END;`. SQL: includes the
+    /// statement(s). The engine re-parses on invocation; bad
+    /// bodies surface as a parse error at CALL time, not CREATE.
+    pub body: String,
+}
+
+/// v7.12.4 — catalogued trigger. References its function by
+/// name; the function must exist at TRIGGER creation time
+/// (forward references are deferred to v7.12.5+).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerDef {
+    pub name: String,
+    /// Watched table. Trigger is dropped when the table drops.
+    pub table: String,
+    /// `"BEFORE"` / `"AFTER"` / `"INSTEAD OF"`. Stored as the
+    /// uppercased keyword so deserialised catalogs round-trip
+    /// without canonicalisation surprises.
+    pub timing: String,
+    /// Each entry is one of `"INSERT"` / `"UPDATE"` / `"DELETE"`
+    /// / `"TRUNCATE"`. `INSERT OR UPDATE` parses to two entries.
+    pub events: Vec<String>,
+    /// `"ROW"` / `"STATEMENT"`. v7.12.4 ships `"ROW"` only;
+    /// `"STATEMENT"` parses and persists but the executor
+    /// refuses it at trigger fire time.
+    pub for_each: String,
+    /// Name of the PL/pgSQL function to invoke.
+    pub function: String,
 }
 
 impl Catalog {
@@ -2986,7 +3047,98 @@ impl Catalog {
             tables: Vec::new(),
             by_name: BTreeMap::new(),
             cold_segments: Vec::new(),
+            functions: BTreeMap::new(),
+            triggers: Vec::new(),
         }
+    }
+
+    /// v7.12.4 — read-only view of catalogued user-defined
+    /// functions. Engine callers go through here to look up the
+    /// function body before re-parsing it for invocation.
+    pub const fn functions(&self) -> &BTreeMap<String, FunctionDef> {
+        &self.functions
+    }
+
+    /// v7.12.4 — register a new user-defined function. With
+    /// `or_replace = false`, errors if the name is taken. The
+    /// engine validates the body before passing it here.
+    pub fn create_function(
+        &mut self,
+        def: FunctionDef,
+        or_replace: bool,
+    ) -> Result<(), StorageError> {
+        if !or_replace && self.functions.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "function {:?} already exists (drop or use CREATE OR REPLACE)",
+                def.name
+            )));
+        }
+        self.functions.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.12.4 — remove a user-defined function by name. Returns
+    /// `true` if a function was removed, `false` if none matched.
+    /// Caller decides whether to surface `if_exists` semantics.
+    pub fn drop_function(&mut self, name: &str) -> bool {
+        self.functions.remove(name).is_some()
+    }
+
+    /// v7.12.4 — read-only slice of all catalogued triggers.
+    /// Engine row-write paths filter this by (table, event,
+    /// timing) and fire matches in slice order.
+    pub fn triggers(&self) -> &[TriggerDef] {
+        &self.triggers
+    }
+
+    /// v7.12.4 — register a new trigger. With `or_replace = false`,
+    /// errors when a trigger with the same name already exists on
+    /// the same table (PG scoping rule — trigger names are
+    /// per-table, not global). Trigger function must already
+    /// exist in the catalog at registration time.
+    pub fn create_trigger(
+        &mut self,
+        def: TriggerDef,
+        or_replace: bool,
+    ) -> Result<(), StorageError> {
+        if !self.by_name.contains_key(&def.table) {
+            return Err(StorageError::TableNotFound {
+                name: def.table.clone(),
+            });
+        }
+        if !self.functions.contains_key(&def.function) {
+            return Err(StorageError::Corrupt(format!(
+                "trigger {:?} references unknown function {:?}",
+                def.name, def.function
+            )));
+        }
+        let dup = self
+            .triggers
+            .iter()
+            .position(|t| t.name == def.name && t.table == def.table);
+        match (dup, or_replace) {
+            (Some(_), false) => Err(StorageError::Corrupt(format!(
+                "trigger {:?} already exists on table {:?}",
+                def.name, def.table
+            ))),
+            (Some(i), true) => {
+                self.triggers[i] = def;
+                Ok(())
+            }
+            (None, _) => {
+                self.triggers.push(def);
+                Ok(())
+            }
+        }
+    }
+
+    /// v7.12.4 — remove a trigger by `(name, table)`. Returns
+    /// `true` if one was removed.
+    pub fn drop_trigger(&mut self, name: &str, table: &str) -> bool {
+        let before = self.triggers.len();
+        self.triggers
+            .retain(|t| !(t.name == name && t.table == table));
+        before != self.triggers.len()
     }
 
     pub fn create_table(&mut self, schema: TableSchema) -> Result<(), StorageError> {
@@ -4246,7 +4398,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 21;
+const FILE_VERSION: u8 = 22;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4526,6 +4678,47 @@ impl Catalog {
                 write_str(&mut out, expr);
             }
         }
+        // v7.12.4 — catalog-wide appendix: user-defined functions
+        // then triggers. FILE_VERSION 22+ only. v21 and earlier
+        // readers stop after the last table; v22 readers always
+        // consume two `u32` counts (possibly zero).
+        //
+        // Function entry layout:
+        //   [str name] [str args_repr] [str returns]
+        //   [str language] [str body]
+        // Trigger entry layout:
+        //   [str name] [str table] [str timing]
+        //   [u16 event_count] (event_count × str)
+        //   [str for_each] [str function]
+        write_u32(
+            &mut out,
+            u32::try_from(self.functions.len()).expect("≤ 4G functions"),
+        );
+        for fd in self.functions.values() {
+            write_str(&mut out, &fd.name);
+            write_str(&mut out, &fd.args_repr);
+            write_str(&mut out, &fd.returns);
+            write_str(&mut out, &fd.language);
+            write_str_long(&mut out, &fd.body);
+        }
+        write_u32(
+            &mut out,
+            u32::try_from(self.triggers.len()).expect("≤ 4G triggers"),
+        );
+        for td in &self.triggers {
+            write_str(&mut out, &td.name);
+            write_str(&mut out, &td.table);
+            write_str(&mut out, &td.timing);
+            write_u16(
+                &mut out,
+                u16::try_from(td.events.len()).expect("≤ 65k events / trigger"),
+            );
+            for ev in &td.events {
+                write_str(&mut out, ev);
+            }
+            write_str(&mut out, &td.for_each);
+            write_str(&mut out, &td.function);
+        }
         out
     }
 
@@ -4549,6 +4742,50 @@ impl Catalog {
         let mut cat = Self::new();
         for _ in 0..table_count {
             deserialize_table(&mut cur, &mut cat, version)?;
+        }
+        // v7.12.4 — catalog-wide function + trigger appendix.
+        // FILE_VERSION 22+ only; v21 and earlier catalogs stop
+        // after the last table.
+        if version >= 22 {
+            let fn_count = cur.read_u32()? as usize;
+            for _ in 0..fn_count {
+                let name = cur.read_str()?;
+                let args_repr = cur.read_str()?;
+                let returns = cur.read_str()?;
+                let language = cur.read_str()?;
+                let body = cur.read_str_long()?;
+                cat.functions.insert(
+                    name.clone(),
+                    FunctionDef {
+                        name,
+                        args_repr,
+                        returns,
+                        language,
+                        body,
+                    },
+                );
+            }
+            let trg_count = cur.read_u32()? as usize;
+            for _ in 0..trg_count {
+                let name = cur.read_str()?;
+                let table = cur.read_str()?;
+                let timing = cur.read_str()?;
+                let ev_count = cur.read_u16()? as usize;
+                let mut events = Vec::with_capacity(ev_count);
+                for _ in 0..ev_count {
+                    events.push(cur.read_str()?);
+                }
+                let for_each = cur.read_str()?;
+                let function = cur.read_str()?;
+                cat.triggers.push(TriggerDef {
+                    name,
+                    table,
+                    timing,
+                    events,
+                    for_each,
+                    function,
+                });
+            }
         }
         if cur.pos < buf.len() {
             return Err(StorageError::Corrupt(format!(
@@ -5693,6 +5930,16 @@ fn write_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// v7.12.4 — long-string variant: `[u32 LE len][bytes]`. For
+/// payloads that can plausibly exceed 64 KiB (notably PL/pgSQL
+/// function bodies). Identifiers + short text continue to use
+/// the u16 [`write_str`] codec.
+fn write_str_long(out: &mut Vec<u8>, s: &str) {
+    let len = u32::try_from(s.len()).expect("function body fits in u32");
+    write_u32(out, len);
+    out.extend_from_slice(s.as_bytes());
+}
+
 /// Serialise an [`IndexKey`] using the v9 tagged codec. `read_index_key`
 /// is the inverse. v8 catalogs never wrote index keys (`BTree` entries were
 /// rebuilt from `Table::rows`), so this codec is v9+ only.
@@ -5782,6 +6029,17 @@ impl<'a> Cursor<'a> {
         core::str::from_utf8(bytes)
             .map(String::from)
             .map_err(|_| StorageError::Corrupt("invalid UTF-8 in identifier or text".into()))
+    }
+
+    /// v7.12.4 — long-string variant for payloads written via
+    /// [`write_str_long`] (u32-length prefix). Used for PL/pgSQL
+    /// function bodies which can plausibly exceed 64 KiB.
+    fn read_str_long(&mut self) -> Result<String, StorageError> {
+        let len = self.read_u32()? as usize;
+        let bytes = self.take(len)?;
+        core::str::from_utf8(bytes)
+            .map(String::from)
+            .map_err(|_| StorageError::Corrupt("invalid UTF-8 in long-string payload".into()))
     }
 
     /// Parse an [`IndexKey`] emitted by `write_index_key` (v9 tagged
