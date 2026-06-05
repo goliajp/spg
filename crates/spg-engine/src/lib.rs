@@ -2521,6 +2521,16 @@ impl Engine {
         stmt: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.12.5 — snapshot BEFORE/AFTER UPDATE row triggers + the
+        // session FTS config before the table mut-borrow opens (the
+        // INSERT path uses the same pattern). Empty vecs are the
+        // common "no triggers on this table" fast path.
+        let before_update_triggers = self.snapshot_row_triggers(&stmt.table, "UPDATE", "BEFORE");
+        let after_update_triggers = self.snapshot_row_triggers(&stmt.table, "UPDATE", "AFTER");
+        let trigger_session_cfg: Option<String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
         // v5.2.3: if the WHERE is a PK equality and matches a cold-
         // tier row, promote it back to the hot tier *before* the
         // hot-row walk. The promote pushes the row to the end of
@@ -2619,7 +2629,9 @@ impl Engine {
             .map(|(pos, new_vals)| (*pos, table.rows()[*pos].values.clone(), new_vals.clone()))
             .collect();
         let self_fks = table.schema().foreign_keys.clone();
-        let affected = planned.len();
+        // v7.12.5 — `affected` is computed post-BEFORE-trigger
+        // below (triggers may RETURN NULL to skip individual
+        // rows). The pre-trigger len shape is no longer accurate.
         // Release mutable borrow on `table` for the FK passes.
         let _ = table;
         // v7.6.6 — Stage 2a: outbound FK check. For every row whose
@@ -2650,14 +2662,73 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
-        // v7.9.4 — snapshot post-update values for RETURNING.
+        // v7.12.5 — fire BEFORE/AFTER UPDATE row-level triggers
+        // around the apply loop. BEFORE sees NEW=candidate +
+        // OLD=current; may rewrite NEW or RETURN NULL to skip.
+        // AFTER sees NEW=post-write + OLD=pre-write (both read-
+        // only).
+        //
+        // Filter `planned` through the BEFORE pass first so the
+        // RETURNING snapshot reflects what actually got written
+        // (triggers may rewrite cells, including a cancellation).
+        let mut applied_after_before: Vec<(usize, Row, Row)> = Vec::with_capacity(planned.len());
+        for (pos, new_vals) in &planned {
+            let old_row = table.rows()[*pos].clone();
+            let mut new_row = Row::new(new_vals.clone());
+            let mut skip = false;
+            for fd in &before_update_triggers {
+                let outcome = triggers::fire_row_trigger(
+                    fd,
+                    Some(new_row.clone()),
+                    Some(&old_row),
+                    &stmt.table,
+                    &schema_cols,
+                    &[],
+                    trigger_session_cfg.as_deref(),
+                    false,
+                )
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                match outcome {
+                    triggers::TriggerOutcome::Row(r) => new_row = r,
+                    triggers::TriggerOutcome::Skip => {
+                        skip = true;
+                        break;
+                    }
+                }
+            }
+            if !skip {
+                applied_after_before.push((*pos, new_row, old_row));
+            }
+        }
+        // v7.9.4 — snapshot post-update values for RETURNING (post-
+        // BEFORE-trigger because triggers can rewrite cells).
         let updated_for_returning: Vec<Vec<Value>> = if stmt.returning.is_some() {
-            planned.iter().map(|(_pos, vals)| vals.clone()).collect()
+            applied_after_before
+                .iter()
+                .map(|(_pos, new_row, _old)| new_row.values.clone())
+                .collect()
         } else {
             Vec::new()
         };
-        for (pos, vals) in planned {
-            table.update_row(pos, vals)?;
+        let affected = applied_after_before.len();
+        // Apply, then fire AFTER triggers per row. AFTER runs read-
+        // only against the freshly-written row; v7.12.4-shape
+        // assignment errors with a clear message.
+        for (pos, new_row, old_row) in applied_after_before {
+            table.update_row(pos, new_row.values.clone())?;
+            for fd in &after_update_triggers {
+                triggers::fire_row_trigger(
+                    fd,
+                    Some(new_row.clone()),
+                    Some(&old_row),
+                    &stmt.table,
+                    &schema_cols,
+                    &[],
+                    trigger_session_cfg.as_deref(),
+                    true,
+                )
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            }
         }
         let _ = table;
         // v6.2.1 — auto-analyze modified-row tracking for UPDATE.
@@ -2683,6 +2754,15 @@ impl Engine {
         stmt: &spg_sql::ast::DeleteStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.12.5 — snapshot BEFORE/AFTER DELETE row triggers + the
+        // session FTS config before the mut borrow (same shape as
+        // INSERT / UPDATE).
+        let before_delete_triggers = self.snapshot_row_triggers(&stmt.table, "DELETE", "BEFORE");
+        let after_delete_triggers = self.snapshot_row_triggers(&stmt.table, "DELETE", "AFTER");
+        let trigger_session_cfg: Option<String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
         // v5.2.3: PK-targeted DELETE → first retire any cold-tier
         // locator for the key. The cold row body stays in the
         // segment (becoming shadowed garbage that a future
@@ -2762,6 +2842,45 @@ impl Engine {
         // cascade plan that stage 3 applies after the primary delete.
         // SET NULL / SET DEFAULT remain Unsupported until v7.6.5.
         let _ = table;
+        // v7.12.5 — BEFORE DELETE row-level triggers. Each fires
+        // with NEW=None / OLD=pre-delete row; RETURN OLD (or NEW)
+        // = proceed, RETURN NULL = skip the row entirely. The
+        // filter must run BEFORE the FK cascade plan so cascaded
+        // child rows track the trigger's skip-decision on the
+        // parent.
+        if !before_delete_triggers.is_empty() {
+            let mut filtered_positions: Vec<usize> = Vec::with_capacity(positions.len());
+            let mut filtered_old_rows: Vec<Vec<Value>> = Vec::with_capacity(to_delete_rows.len());
+            for (pos, old_vals) in positions.iter().zip(to_delete_rows.iter()) {
+                let old_row = Row::new(old_vals.clone());
+                let mut cancel_this = false;
+                for fd in &before_delete_triggers {
+                    let outcome = triggers::fire_row_trigger(
+                        fd,
+                        None,
+                        Some(&old_row),
+                        &stmt.table,
+                        &schema_cols,
+                        &[],
+                        trigger_session_cfg.as_deref(),
+                        false,
+                    )
+                    .map_err(|e| {
+                        EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
+                    })?;
+                    if matches!(outcome, triggers::TriggerOutcome::Skip) {
+                        cancel_this = true;
+                        break;
+                    }
+                }
+                if !cancel_this {
+                    filtered_positions.push(*pos);
+                    filtered_old_rows.push(old_vals.clone());
+                }
+            }
+            positions = filtered_positions;
+            to_delete_rows = filtered_old_rows;
+        }
         let cascade_plan = plan_fk_parent_deletions(
             self.active_catalog(),
             &stmt.table,
@@ -2788,6 +2907,30 @@ impl Engine {
             })?;
         let affected = table.delete_rows(&positions) + cold_shadow_count;
         let _ = table;
+        // v7.12.5 — AFTER DELETE row-level triggers fire post-write
+        // with NEW=None / OLD=pre-delete row (each from the
+        // already-snapshotted to_delete_rows). Return value is
+        // ignored (matches PG AFTER semantics).
+        if !after_delete_triggers.is_empty() {
+            for old_vals in &to_delete_rows {
+                let old_row = Row::new(old_vals.clone());
+                for fd in &after_delete_triggers {
+                    triggers::fire_row_trigger(
+                        fd,
+                        None,
+                        Some(&old_row),
+                        &stmt.table,
+                        &schema_cols,
+                        &[],
+                        trigger_session_cfg.as_deref(),
+                        true,
+                    )
+                    .map_err(|e| {
+                        EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
+                    })?;
+                }
+            }
+        }
         // v6.2.1 — auto-analyze modified-row tracking for DELETE.
         if !self.in_transaction() && affected > 0 {
             self.statistics

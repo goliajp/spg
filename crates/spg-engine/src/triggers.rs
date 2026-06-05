@@ -146,10 +146,10 @@ impl fmt::Display for TriggerError {
 /// returned [`TriggerOutcome`] just carries the (possibly
 /// untouched) NEW row for symmetry.
 #[allow(clippy::too_many_arguments)] // the table_name / columns / params /
-                                     // ts-config trio are independent; folding
-                                     // them into a struct just shuffles the
-                                     // boilerplate to the call sites without
-                                     // material gain.
+// ts-config trio are independent; folding
+// them into a struct just shuffles the
+// boilerplate to the call sites without
+// material gain.
 pub fn fire_row_trigger(
     function: &FunctionDef,
     new_row: Option<Row>,
