@@ -435,3 +435,181 @@ fn cast_literal_tsvector_still_works() {
     assert!(lexs.iter().any(|l| l.word == "bar"));
     let _: &TsLexeme = &lexs[0]; // type re-export check
 }
+
+// --- v7.12.3: GIN inverted index acceleration of `@@` ---
+
+/// Helper for the GIN tests below: build a `messages(id, sv tsvector)`
+/// table with a `USING gin (sv)` index and three rows whose lexeme
+/// sets overlap on `fox`. Mirrors the mailrs `messages.search_vector`
+/// shape without the trigger (which lands separately in v7.12.4+).
+fn gin_messages_eng() -> Engine {
+    let mut e = eng();
+    ok(
+        &mut e,
+        "CREATE TABLE messages (id INT NOT NULL, sv tsvector NOT NULL)",
+    );
+    ok(&mut e, "CREATE INDEX msg_sv_gin ON messages USING gin (sv)");
+    // Three rows: 1 has fox+quick+brown, 2 has lazy+cats, 3 has
+    // foxes+rabbits — so `fox` matches {1}, `quick` matches {1},
+    // `cats` matches {2}, `fox | cats` matches {1, 2}, `fox & cats`
+    // matches {} (correctly, intersection is empty).
+    // INSERT can't yet take function-call values (separate AST work);
+    // construct the tsvector via the `::tsvector` cast literal form
+    // pg_dump uses, with simple-config lexeme sets:
+    //   row 1: brown:3 fox:4 quick:2 the:1
+    //   row 2: cats:2 lazy:1 sleep:3
+    //   row 3: foxes:1 hunt:2 rabbits:3
+    ok(
+        &mut e,
+        "INSERT INTO messages VALUES \
+         (1, '''brown'':3 ''fox'':4 ''quick'':2 ''the'':1'::tsvector), \
+         (2, '''cats'':2 ''lazy'':1 ''sleep'':3'::tsvector), \
+         (3, '''foxes'':1 ''hunt'':2 ''rabbits'':3'::tsvector)",
+    );
+    e
+}
+
+fn collect_ids(rs: Vec<spg_storage::Row>) -> Vec<i32> {
+    let mut out: Vec<i32> = rs
+        .into_iter()
+        .map(|r| match r.values[0] {
+            Value::Int(n) => n,
+            ref other => panic!("expected int id, got {other:?}"),
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+#[test]
+fn gin_create_index_on_tsvector_loads() {
+    // CREATE INDEX ... USING gin succeeds on a tsvector column. v7.9.26b
+    // would have silently degraded to BTree; v7.12.3 keeps it as a real
+    // GIN index. (Smoke check that the engine validation accepted the
+    // column type and rebuilt posting lists from existing rows.)
+    let _e = gin_messages_eng();
+}
+
+#[test]
+fn gin_on_non_tsvector_silently_falls_back_to_btree() {
+    // v7.12.3 keeps v7.9.26b's pg_dump compatibility: GIN on a
+    // non-tsvector column (TEXT / JSONB / etc.) loads as a BTree
+    // on the leading column rather than erroring. Real GIN
+    // posting-list acceleration only kicks in for tsvector columns.
+    let mut e = eng();
+    ok(
+        &mut e,
+        "CREATE TABLE t (id INT NOT NULL, body TEXT NOT NULL)",
+    );
+    ok(&mut e, "CREATE INDEX t_body_gin ON t USING gin (body)");
+}
+
+#[test]
+fn gin_term_lookup_matches_only_rows_containing_word() {
+    let mut e = gin_messages_eng();
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', 'fox')",
+    ));
+    // `fox` only — `foxes` is a different lexeme under `simple` config.
+    assert_eq!(ids, vec![1]);
+}
+
+#[test]
+fn gin_and_query_intersects_posting_lists() {
+    let mut e = gin_messages_eng();
+    // Intersection of {1} and {1} is {1}.
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', 'fox & quick')",
+    ));
+    assert_eq!(ids, vec![1]);
+    // Intersection of {1} and {2} (`fox` ∩ `cats`) is empty.
+    let none = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', 'fox & cats')",
+    ));
+    assert!(
+        none.is_empty(),
+        "fox & cats should match no rows, got {none:?}"
+    );
+}
+
+#[test]
+fn gin_or_query_unions_posting_lists() {
+    let mut e = gin_messages_eng();
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', 'fox | cats')",
+    ));
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[test]
+fn gin_survives_insert_after_index_create() {
+    // GIN must maintain incremental posting lists on INSERT.
+    let mut e = gin_messages_eng();
+    ok(
+        &mut e,
+        "INSERT INTO messages VALUES \
+         (4, '''another'':1 ''fox'':2 ''sighting'':3'::tsvector)",
+    );
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', 'fox')",
+    ));
+    assert_eq!(ids, vec![1, 4]);
+}
+
+#[test]
+fn gin_survives_delete_via_rebuild_indices() {
+    let mut e = gin_messages_eng();
+    ok(&mut e, "DELETE FROM messages WHERE id = 1");
+    // After DELETE, posting list for `fox` should be empty.
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', 'fox')",
+    ));
+    assert!(
+        ids.is_empty(),
+        "fox should match nothing after row 1 deleted, got {ids:?}"
+    );
+    // `lazy` still matches row 2.
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', 'lazy')",
+    ));
+    assert_eq!(ids, vec![2]);
+}
+
+#[test]
+fn gin_query_with_not_falls_through_to_full_scan() {
+    // Not-queries aren't accelerated in v7.12.3 (would need
+    // complementation against the full row set). The full-scan
+    // path still evaluates `@@` correctly per row.
+    let mut e = gin_messages_eng();
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ to_tsquery('simple', '!fox')",
+    ));
+    // Everything that doesn't contain `fox`: rows 2 and 3 (3 has
+    // `foxes`, not `fox` under `simple` config).
+    assert_eq!(ids, vec![2, 3]);
+}
+
+/// Picks up the mailrs fallback-search shape:
+/// `... FROM messages WHERE search_vector @@ plainto_tsquery($1)`
+/// — except using a literal text in place of $1 since this engine-
+/// level test doesn't bind params. Verifies the GIN path co-exists
+/// with `plainto_tsquery` (which builds an `And` of terms).
+#[test]
+fn gin_accelerates_plainto_tsquery_and_chain() {
+    let mut e = gin_messages_eng();
+    // `plainto_tsquery('quick fox')` builds `quick & fox` — both
+    // appear only in row 1.
+    let ids = collect_ids(rows(
+        &mut e,
+        "SELECT id FROM messages WHERE sv @@ plainto_tsquery('simple', 'quick fox')",
+    ));
+    assert_eq!(ids, vec![1]);
+}

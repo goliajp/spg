@@ -1638,15 +1638,20 @@ impl Parser {
                 "hnsw" => IndexMethod::Hnsw,
                 "btree" => IndexMethod::BTree,
                 "brin" => IndexMethod::Brin,
-                // v7.9.26b — PG `pg_dump` emits `USING gin` /
-                // `USING gist` / `USING spgist` / `USING hash` for
-                // their built-in index AMs. SPG doesn't have a
-                // matching implementation; degrade to BTree on the
+                // v7.12.3 — real GIN inverted index over `tsvector`.
+                // v7.9.26b's `USING gin` → BTree silent fallback is
+                // gone; the engine validates that the indexed column
+                // is `tsvector` at CREATE INDEX time.
+                "gin" => IndexMethod::Gin,
+                // v7.9.26b — PG `pg_dump` emits `USING gist` /
+                // `USING spgist` / `USING hash` for their built-in
+                // AMs that SPG doesn't have a matching
+                // implementation for; degrade to BTree on the
                 // leading column so the schema loads + the index
                 // catalogue stays consistent. Operator pays the
                 // planner cost only for the queries that would have
                 // used the specialised AM.
-                "gin" | "gist" | "spgist" | "hash" => IndexMethod::BTree,
+                "gist" | "spgist" | "hash" => IndexMethod::BTree,
                 // v7.11.3 — pgvector ships both `ivfflat` and
                 // `hnsw`. Customers shouldn't have to choose
                 // their on-disk index method based on what SPG
@@ -1657,7 +1662,7 @@ impl Parser {
                 "ivfflat" => IndexMethod::Hnsw,
                 other => {
                     return Err(self.err(alloc::format!(
-                        "unknown index method {other:?}; supported: hnsw, btree, brin (gin/gist/spgist/hash accepted as BTree fallback)"
+                        "unknown index method {other:?}; supported: hnsw, btree, brin, gin (gist/spgist/hash accepted as BTree fallback)"
                     )));
                 }
             }

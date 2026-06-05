@@ -747,6 +747,22 @@ pub enum IndexKind {
         /// predicates against the BRIN-indexed column.
         column_type: DataType,
     },
+    /// v7.12.3 — GIN inverted index over a `tsvector` column.
+    ///
+    /// Storage shape: `lexeme word → Vec<RowLocator>`. The posting
+    /// list per word is appended in row-order, so range scans are
+    /// O(matching rows) once the per-word lookup is done. Multi-
+    /// term queries intersect / union posting lists.
+    ///
+    /// `IndexKey::from_value(TsVector)` returns `None` — GIN doesn't
+    /// participate in `try_index_seek` (which is BTree-equality-keyed).
+    /// The engine consults this index through `try_gin_lookup` on
+    /// `WHERE col @@ tsquery` predicates instead.
+    ///
+    /// Backed by a `PersistentBTreeMap` so `Catalog::clone` (the
+    /// per-write snapshot) stays O(1) — same structural-sharing
+    /// invariant as BTree.
+    Gin(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
 }
 
 /// Multi-layer HNSW graph (v2.13). Each node is assigned a `top_level`;
@@ -882,9 +898,26 @@ impl Index {
         }
     }
 
+    /// v7.12.3 — GIN inverted-index constructor. Empty posting-list
+    /// map; caller (typically [`Table::add_gin_index`] or
+    /// [`Table::restore_gin_index`]) populates it from existing rows
+    /// or from a deserialised snapshot.
+    fn new_gin(name: String, column_position: usize) -> Self {
+        Self {
+            name,
+            column_position,
+            kind: IndexKind::Gin(PersistentBTreeMap::new()),
+            included_columns: Vec::new(),
+            partial_predicate: None,
+            expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
+        }
+    }
+
     /// Look up the locators stored under `key` (B-tree only). Returns
-    /// an empty slice when the key is absent or the index is an NSW
-    /// graph — callers can treat both cases uniformly.
+    /// an empty slice when the key is absent or the index isn't a
+    /// BTree — callers can treat both cases uniformly.
     ///
     /// v5.1: return type widened from `&[usize]` to `&[RowLocator]`.
     /// Pre-v5.2 callers can read the slice and `.as_hot().unwrap()`
@@ -893,8 +926,19 @@ impl Index {
     pub fn lookup_eq(&self, key: &IndexKey) -> &[RowLocator] {
         match &self.kind {
             IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
-            // BRIN/Nsw have no key→locator map; lookup is a no-op.
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } => &[][..],
+            // BRIN / NSW / GIN have no IndexKey-keyed map; lookup is a no-op.
+            // GIN uses [`Index::gin_lookup_word`] instead.
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => &[][..],
+        }
+    }
+
+    /// v7.12.3 — GIN posting-list lookup. Returns the row locators
+    /// whose `tsvector` cell contains `word`. Empty when the word is
+    /// absent from the index or this isn't a GIN index.
+    pub fn gin_lookup_word(&self, word: &str) -> &[RowLocator] {
+        match &self.kind {
+            IndexKind::Gin(m) => m.get(&String::from(word)).map_or(&[][..], Vec::as_slice),
+            IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => &[][..],
         }
     }
 
@@ -903,7 +947,7 @@ impl Index {
     pub const fn nsw(&self) -> Option<&NswGraph> {
         match &self.kind {
             IndexKind::Nsw(g) => Some(g),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } => None,
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => None,
         }
     }
 
@@ -913,6 +957,13 @@ impl Index {
     /// on range predicates.
     pub const fn is_brin(&self) -> bool {
         matches!(self.kind, IndexKind::Brin { .. })
+    }
+
+    /// v7.12.3 — true when this index is a GIN inverted index.
+    /// Used by the planner to opt into posting-list acceleration on
+    /// `WHERE col @@ tsquery` predicates.
+    pub const fn is_gin(&self) -> bool {
+        matches!(self.kind, IndexKind::Gin(_))
     }
 }
 
@@ -1185,17 +1236,35 @@ impl Table {
         // For NSW we defer the graph update to *after* the row is pushed
         // so the kNN search can see it in `self.rows`.
         for idx in &mut self.indices {
-            if let IndexKind::BTree(map) = &mut idx.kind
-                && let Some(key) = IndexKey::from_value(&row.values[idx.column_position])
-            {
-                // v4.40: PersistentBTreeMap has no in-place entry-or-default.
-                // Clone-then-insert keeps the same semantics — for typical
-                // unique-key schemas the Vec is 1-element so the clone is
-                // O(1). For dup-heavy columns it's O(M) per insert, traded
-                // for the structural-sharing win at clone time.
-                let mut entries = map.get(&key).cloned().unwrap_or_default();
-                entries.push(RowLocator::Hot(new_row_idx));
-                map.insert_mut(key, entries);
+            match &mut idx.kind {
+                IndexKind::BTree(map) => {
+                    if let Some(key) = IndexKey::from_value(&row.values[idx.column_position]) {
+                        // v4.40: PersistentBTreeMap has no in-place entry-or-default.
+                        // Clone-then-insert keeps the same semantics — for typical
+                        // unique-key schemas the Vec is 1-element so the clone is
+                        // O(1). For dup-heavy columns it's O(M) per insert, traded
+                        // for the structural-sharing win at clone time.
+                        let mut entries = map.get(&key).cloned().unwrap_or_default();
+                        entries.push(RowLocator::Hot(new_row_idx));
+                        map.insert_mut(key, entries);
+                    }
+                }
+                IndexKind::Gin(map) => {
+                    // v7.12.3 — extend posting list per lexeme word.
+                    // NULL or non-TsVector cell → no-op (cell carries
+                    // no lexemes to index).
+                    if let Value::TsVector(lexemes) = &row.values[idx.column_position] {
+                        for lex in lexemes {
+                            let mut entries = map.get(&lex.word).cloned().unwrap_or_default();
+                            entries.push(RowLocator::Hot(new_row_idx));
+                            map.insert_mut(lex.word.clone(), entries);
+                        }
+                    }
+                }
+                // NSW handled below after the row push (so the new row
+                // is visible to the kNN-graph connect step). BRIN
+                // carries no per-row state.
+                IndexKind::Nsw(_) | IndexKind::Brin { .. } => {}
             }
         }
         // v5.2.1: maintain incremental hot-tier byte counter. Computed
@@ -1294,7 +1363,7 @@ impl Table {
         let col_pos = self.indices[idx_pos].column_position;
         let m = match &self.indices[idx_pos].kind {
             IndexKind::Nsw(g) => g.m,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } => {
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
                 return Err(StorageError::Unsupported(format!(
                     "ALTER INDEX REBUILD on non-NSW index {name:?} — only NSW indexes can rebuild"
                 )));
@@ -1425,6 +1494,66 @@ impl Table {
         Ok(())
     }
 
+    /// v7.12.3 — Build a new GIN inverted index over a `tsvector`
+    /// column. Populates posting lists from existing rows. Errors
+    /// if the column doesn't exist, isn't `TsVector`, or the index
+    /// name is taken.
+    pub fn add_gin_index(&mut self, name: String, column_name: &str) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        if self.schema.columns[column_position].ty != DataType::TsVector {
+            return Err(StorageError::Corrupt(format!(
+                "GIN index {name:?} requires a tsvector column; \
+                 {column_name:?} is {:?}",
+                self.schema.columns[column_position].ty
+            )));
+        }
+        let mut idx = Index::new_gin(name, column_position);
+        if let IndexKind::Gin(map) = &mut idx.kind {
+            for (i, row) in self.rows.iter().enumerate() {
+                if let Value::TsVector(lexemes) = &row.values[column_position] {
+                    for lex in lexemes {
+                        let mut entries = map.get(&lex.word).cloned().unwrap_or_default();
+                        entries.push(RowLocator::Hot(i));
+                        map.insert_mut(lex.word.clone(), entries);
+                    }
+                }
+            }
+        }
+        self.indices.push(idx);
+        Ok(())
+    }
+
+    /// v7.12.3 — Restore a GIN index from a deserialised snapshot.
+    /// Mirrors [`Self::restore_btree_index`] but takes the GIN's
+    /// `word → Vec<RowLocator>` posting-list map (already populated
+    /// from the catalog stream) instead of an `IndexKey` map.
+    pub fn restore_gin_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        let mut idx = Index::new_gin(name, column_position);
+        idx.kind = IndexKind::Gin(map);
+        self.indices.push(idx);
+        Ok(())
+    }
+
     /// v5.1: register cold-tier locators on a `BTree` index. Used
     /// after [`Catalog::load_segment_bytes`] to wire every cold-
     /// tier row's PK back to its segment so
@@ -1456,7 +1585,7 @@ impl Table {
             .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
         let map = match &mut idx.kind {
             IndexKind::BTree(map) => map,
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "index {index_name:?} is not BTree; cold locators apply only to BTree indices"
                 )));
@@ -1467,6 +1596,41 @@ impl Table {
             let mut entries = map.get(&key).cloned().unwrap_or_default();
             entries.push(locator);
             map.insert_mut(key, entries);
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// v7.12.3 — GIN-side parallel to [`Self::register_cold_locators`].
+    /// Re-attaches `word → cold RowLocator` posting-list entries after
+    /// the from-rows rebuild loop. Errors when the index doesn't
+    /// exist or isn't a GIN.
+    pub fn register_gin_cold_locators<I>(
+        &mut self,
+        index_name: &str,
+        locators: I,
+    ) -> Result<usize, StorageError>
+    where
+        I: IntoIterator<Item = (String, RowLocator)>,
+    {
+        let idx = self
+            .indices
+            .iter_mut()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
+        let map = match &mut idx.kind {
+            IndexKind::Gin(map) => map,
+            IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
+                return Err(StorageError::Corrupt(format!(
+                    "register_gin_cold_locators: index {index_name:?} is not GIN"
+                )));
+            }
+        };
+        let mut count = 0usize;
+        for (word, locator) in locators {
+            let mut entries = map.get(&word).cloned().unwrap_or_default();
+            entries.push(locator);
+            map.insert_mut(word, entries);
             count += 1;
         }
         Ok(count)
@@ -1497,7 +1661,7 @@ impl Table {
             })?;
         let map = match &mut idx.kind {
             IndexKind::BTree(map) => map,
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "remove_cold_locators_for_key: index {index_name:?} is not BTree; \
                      cold locators apply only to BTree indices"
@@ -1678,20 +1842,50 @@ impl Table {
                         Some((idx.name.clone(), cold))
                     }
                 }
-                // BRIN / NSW carry no key→locator map.
-                IndexKind::Nsw(_) | IndexKind::Brin { .. } => None,
+                // BRIN / NSW carry no key→locator map. GIN handles
+                // its own cold preservation below in `preserved_gin_cold`.
+                IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => None,
+            })
+            .collect();
+
+        // v7.12.3 — same cold-preservation pattern for GIN's
+        // `word → Vec<RowLocator>` posting lists. Parallel to the
+        // BTree pass above (different key type so a separate vec is
+        // cleaner than a generic merge).
+        let preserved_gin_cold: Vec<(String, Vec<(String, RowLocator)>)> = self
+            .indices
+            .iter()
+            .filter_map(|idx| match &idx.kind {
+                IndexKind::Gin(map) => {
+                    let cold: Vec<(String, RowLocator)> = map
+                        .iter()
+                        .flat_map(|(w, locs)| {
+                            locs.iter()
+                                .filter(|l| l.is_cold())
+                                .copied()
+                                .map(move |l| (w.clone(), l))
+                        })
+                        .collect();
+                    if cold.is_empty() {
+                        None
+                    } else {
+                        Some((idx.name.clone(), cold))
+                    }
+                }
+                IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => None,
             })
             .collect();
 
         // v6.7.1 — descriptor needs to capture index kind so the
-        // rebuild loop can resurrect BTree / NSW / BRIN exactly as
-        // they were. (NSW carries m; BRIN carries the column type
-        // snapshot; BTree needs no extra payload.)
+        // rebuild loop can resurrect BTree / NSW / BRIN / GIN exactly
+        // as they were. (NSW carries m; BRIN carries the column type
+        // snapshot; BTree / GIN need no extra payload.)
         #[derive(Clone)]
         enum RebuildKind {
             BTree,
             Nsw(usize),
             Brin(DataType),
+            Gin,
         }
         let descriptors: Vec<(String, usize, RebuildKind)> = self
             .indices
@@ -1701,6 +1895,7 @@ impl Table {
                     IndexKind::Nsw(g) => RebuildKind::Nsw(g.m),
                     IndexKind::Brin { column_type } => RebuildKind::Brin(*column_type),
                     IndexKind::BTree(_) => RebuildKind::BTree,
+                    IndexKind::Gin(_) => RebuildKind::Gin,
                 };
                 (idx.name.clone(), idx.column_position, kind)
             })
@@ -1736,6 +1931,22 @@ impl Table {
                     }
                     self.indices.push(idx);
                 }
+                RebuildKind::Gin => {
+                    let mut idx = Index::new_gin(name, column_position);
+                    if let IndexKind::Gin(map) = &mut idx.kind {
+                        for (i, row) in self.rows.iter().enumerate() {
+                            if let Value::TsVector(lexemes) = &row.values[column_position] {
+                                for lex in lexemes {
+                                    let mut entries =
+                                        map.get(&lex.word).cloned().unwrap_or_default();
+                                    entries.push(RowLocator::Hot(i));
+                                    map.insert_mut(lex.word.clone(), entries);
+                                }
+                            }
+                        }
+                    }
+                    self.indices.push(idx);
+                }
             }
         }
 
@@ -1748,6 +1959,10 @@ impl Table {
             // between snapshot and rebuild, which can't happen
             // because the rebuild restores the same descriptor set.
             let _ = self.register_cold_locators(&idx_name, locators);
+        }
+        // v7.12.3 — same for GIN posting-list cold locators.
+        for (idx_name, locators) in preserved_gin_cold {
+            let _ = self.register_gin_cold_locators(&idx_name, locators);
         }
     }
 
@@ -1867,7 +2082,7 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     ensure_node_slot(table, idx_pos, new_row_idx, level);
     let (entry, entry_level, m) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level, g.m),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } => {
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
             unreachable!("nsw_insert_at on a non-NSW index")
         }
     };
@@ -1983,7 +2198,9 @@ fn greedy_layer_walk(
 ) -> (usize, f32) {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) | IndexKind::Brin { .. } => return (current, current_d),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            return (current, current_d);
+        }
     };
     let col_pos = table.indices[idx_pos].column_position;
     loop {
@@ -2034,7 +2251,7 @@ fn layer_beam_search(
 ) -> Vec<(f32, usize)> {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) | IndexKind::Brin { .. } => return Vec::new(),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => return Vec::new(),
     };
     let col_pos = table.indices[idx_pos].column_position;
     let d0 = if matches!(metric, NswMetric::L2) {
@@ -2215,7 +2432,7 @@ fn connect_at_layer(
     let col_pos = table.indices[idx_pos].column_position;
     let cap = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g.cap_for_layer(layer),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } => return,
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => return,
     };
     // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
     // each) rather than usize (8 B on 64-bit). Boundary casts here
@@ -2255,7 +2472,7 @@ fn connect_at_layer(
         //    insert path so connectivity stays consistent.
         let needs_trim = match &table.indices[idx_pos].kind {
             IndexKind::Nsw(g) => g.layers[layer as usize][peer].len() > cap,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } => false,
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => false,
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
@@ -2263,7 +2480,7 @@ fn connect_at_layer(
                     .iter()
                     .map(|&n| n as usize)
                     .collect(),
-                IndexKind::BTree(_) | IndexKind::Brin { .. } => continue,
+                IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
             // heuristic receives candidates closest-first. `cell_l2_sq`
@@ -2400,7 +2617,7 @@ fn nsw_search(
 ) -> Vec<(f32, usize)> {
     let (entry, entry_level) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } => return Vec::new(),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => return Vec::new(),
     };
     let Some(entry) = entry else {
         return Vec::new();
@@ -3598,7 +3815,7 @@ impl Catalog {
             })?;
         let map = match &idx.kind {
             IndexKind::BTree(m) => m,
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "compact_cold_segments: index {index_name:?} is not BTree; \
                      compaction applies only to BTree cold-tier indices"
@@ -4029,7 +4246,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 20;
+const FILE_VERSION: u8 = 21;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4137,6 +4354,31 @@ impl Catalog {
                         // cold segments, not the catalog.
                         out.push(2);
                         write_data_type(&mut out, *column_type);
+                    }
+                    IndexKind::Gin(map) => {
+                        // v7.12.3 — tag byte 3 = GIN. Payload mirrors
+                        // the BTree encoding but with String (lexeme
+                        // word) keys instead of IndexKey. Tag-prefixed
+                        // RowLocator codec so freezer-produced Cold
+                        // locators survive snapshot round-trip.
+                        // FILE_VERSION 21+; v20 catalogs never wrote a
+                        // GIN index (the AM degraded to BTree fallback
+                        // pre-v7.12.3), so no migration shim is needed.
+                        out.push(3);
+                        write_u32(
+                            &mut out,
+                            u32::try_from(map.len()).expect("≤ 4G GIN posting lists"),
+                        );
+                        for (word, locators) in map {
+                            write_str(&mut out, word);
+                            write_u32(
+                                &mut out,
+                                u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
+                            );
+                            for loc in locators {
+                                loc.write_le(&mut out);
+                            }
+                        }
                     }
                 }
                 // v6.8.0 — included_columns appendix per index.
@@ -4540,6 +4782,14 @@ fn deserialize_indices(
                 let column_type = cur.read_data_type()?;
                 t.restore_brin_index(idx_name, &column_name, column_type)?;
             }
+            3 => {
+                // v7.12.3 — GIN tag. Payload mirrors the BTree
+                // encoding but with String (lexeme word) keys.
+                // Only emitted by FILE_VERSION 21+ writers — v20
+                // and earlier degraded `USING gin` to BTree.
+                let map = read_gin_map(cur)?;
+                t.restore_gin_index(idx_name, &column_name, map)?;
+            }
             other => {
                 return Err(StorageError::Corrupt(format!(
                     "unknown index kind tag: {other}"
@@ -4659,6 +4909,31 @@ fn read_btree_map(
             locators.push(loc);
         }
         map.insert_mut(key, locators);
+    }
+    Ok(map)
+}
+
+/// v7.12.3 — parse a `Gin` index payload. Mirrors [`read_btree_map`]
+/// but with `String` (lexeme word) keys instead of `IndexKey`.
+/// FILE_VERSION 21+ only.
+fn read_gin_map(
+    cur: &mut Cursor<'_>,
+) -> Result<PersistentBTreeMap<String, Vec<RowLocator>>, StorageError> {
+    let entry_count = cur.read_u32()? as usize;
+    let mut map = PersistentBTreeMap::new();
+    for _ in 0..entry_count {
+        let word = cur.read_str()?;
+        let locator_count = cur.read_u32()? as usize;
+        let mut locators = Vec::with_capacity(locator_count);
+        for _ in 0..locator_count {
+            let tail = &cur.buf[cur.pos..];
+            let (loc, consumed) = RowLocator::read_le(tail).map_err(|e| {
+                StorageError::Corrupt(format!("row_locator decode at offset {}: {e}", cur.pos))
+            })?;
+            cur.pos += consumed;
+            locators.push(loc);
+        }
+        map.insert_mut(word, locators);
     }
     Ok(map)
 }
@@ -6262,7 +6537,9 @@ mod tests {
             .unwrap();
         let g = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } => panic!("expected NSW"),
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+                panic!("expected NSW")
+            }
         };
         // Non-trivial graph: one level slot per row, and the geometric level
         // distribution puts some nodes above layer 0.
@@ -6622,13 +6899,17 @@ mod tests {
             .unwrap();
         let original = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } => panic!("expected NSW"),
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+                panic!("expected NSW")
+            }
         };
         let bytes = cat.serialize();
         let restored = Catalog::deserialize(&bytes).expect("deserialize");
         let restored_graph = match &restored.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } => panic!("expected NSW"),
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+                panic!("expected NSW")
+            }
         };
         assert_eq!(restored_graph.m, original.m);
         assert_eq!(restored_graph.m_max_0, original.m_max_0);
@@ -7359,11 +7640,15 @@ mod tests {
                         write_u16(&mut out, u16::try_from(g.m).unwrap());
                         write_nsw_graph(&mut out, g);
                     }
-                    // v8 had no BRIN; this test-only writer can't
-                    // serialise BRIN into the legacy format.
+                    // v8 had no BRIN / GIN; this test-only writer
+                    // can't serialise either into the legacy format.
                     IndexKind::Brin { .. } => panic!(
                         "v8 catalog writer cannot serialise BRIN — \
                          tests with BRIN indices must use the current writer"
+                    ),
+                    IndexKind::Gin(_) => panic!(
+                        "v8 catalog writer cannot serialise GIN — \
+                         tests with GIN indices must use the current writer"
                     ),
                 }
             }
