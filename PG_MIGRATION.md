@@ -254,7 +254,7 @@ implemented; further breakdown follows the table.
 | `TEXT` / `VARCHAR(n)` / `CHAR(n)` | ✅ | |
 | `DATE` | ✅ | Days since epoch |
 | `TIMESTAMP` | ✅ | Microseconds since epoch |
-| `TIMESTAMPTZ` | ✅ v7.9.2 | Internally UTC `TIMESTAMP`; PG-wire OID 1184 |
+| `TIMESTAMPTZ` | ✅ v7.9.2 → v7.15.0 offset literals | Storage = i64 µs UTC. v7.15.0: accepts `'YYYY-MM-DD HH:MM:SS[.fff]±OO[:MM]'` / `…Z` / `… UTC` (pg_dump-shape) and round-trips with a `+00` suffix so `SELECT` output re-INSERTs verbatim. PG-wire OID 1184 |
 | `INTERVAL` | ⚠️ | Runtime literals only, no column storage |
 | `JSON` | ✅ | Text-backed; PG-wire OID 114 |
 | `JSONB` | ✅ v7.9.0 | Same storage as JSON; PG-wire OID 3802 for sqlx-style clients |

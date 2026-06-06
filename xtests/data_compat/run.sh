@@ -45,6 +45,13 @@ trap cleanup EXIT
 start_server() {
     if [[ "$VERSION" == "local-build" ]]; then
         (cd "$ROOT" && cargo build --release --bin spg-server -q)
+        # Kill any stale spg-server still listening on $PORT —
+        # leftover from an interrupted prior run that the trap
+        # didn't catch (e.g. user ctrl-C'd between fixtures).
+        if lsof -ti :$PORT >/dev/null 2>&1; then
+            lsof -ti :$PORT | xargs kill -9 2>/dev/null || true
+            sleep 0.3
+        fi
         SPG_PG_ADDR=0.0.0.0:$PORT \
             POSTGRES_DB=app POSTGRES_USER=u POSTGRES_PASSWORD=p \
         "$ROOT/target/release/spg-server" 127.0.0.1:0 >/tmp/spg-data.log 2>&1 &

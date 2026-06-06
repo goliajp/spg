@@ -8,6 +8,139 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.15.0] — 2026-06-06 (RENAME COLUMN + real pg_trgm + MySQL inline KEY + COPY FROM STDIN + TIMESTAMPTZ offsets)
+
+Five-item round. The first four ship the docket (RENAME COLUMN,
+trigram-index acceleration, MySQL inline secondary KEY, COPY
+FROM STDIN with column-list); the fifth lands the mailrs
+round-8 cutover blocker plus the gate that would have caught it.
+
+### Looking ahead → v7.15.x
+
+- pgwire BINARY format for TIMESTAMPTZ on the OID-1184 wire so
+  drivers that read i64 microseconds directly (jdbc, .NET,
+  diesel binary mode) avoid the text round-trip.
+- COPY FROM STDIN per-row column list: today the COPY data
+  builds INSERTs against the table's full column list, so a
+  pg_dump `COPY t (a, c) FROM stdin` with rows shorter than the
+  full column count would mis-align (none of the corpora hit
+  this — pg_dump always emits every column when dumping a
+  table).
+- spg-embedded prepare/bind API + `spg-sqlx` adapter crate (the
+  E1/E2 gaps from the mailrs spg-embedded gap evaluation).
+
+### Five things shipped
+
+1. **`ALTER TABLE … RENAME [COLUMN] old TO new`** is now a real
+   subaction. mailrs guarded RENAME under `DO $$` to keep round-
+   7/8 unblocked; v7.15.0 lifts the guard for general dump-
+   import customers. Schema column renames cascade into stored
+   predicate sources: CHECK predicates, partial-index
+   predicates, runtime DEFAULT expressions, and triggers'
+   `UPDATE OF` column lists all get rewritten via parse →
+   Expr walker → Display round-trip. Function and trigger
+   bodies are NOT auto-rewritten (matches PG plpgsql: name-
+   referencing bodies invalidate at call time, not rename
+   time).
+
+2. **Real `gin_trgm_ops` over TEXT/VARCHAR**. Pre-v7.15 SPG
+   parsed `CREATE INDEX … USING gin (col gin_trgm_ops)` but
+   discarded the opclass — the index degraded silently to a
+   BTree, so `LIKE '%pattern%'` queries full-scanned even with
+   the index "in place". v7.15.0 builds a real trigram-shingle
+   GIN backed by `IndexKind::GinTrgm(PersistentBTreeMap)`,
+   persisted via tag-4 index payload in catalog `FILE_VERSION`
+   24+. INSERT / UPDATE / DELETE maintain trigram posting lists
+   incrementally; LIKE / ILIKE `'<pat>'` queries on a trigram-
+   indexed column hit `try_trgm_seek` first — the pattern is
+   decomposed into a trigram set, the posting lists are
+   intersected, and the LIKE re-evaluates per candidate row.
+   New built-ins `similarity(a, b)` (Jaccard) and `show_trgm(t)`
+   (TEXT[]) match PG `pg_trgm`. PG customers migrating with
+   trigram-accelerated search no longer notice "fast on PG,
+   slow on SPG" on their first query.
+
+3. **MySQL inline plain `KEY name (cols)` builds a real BTree**.
+   Pre-v7.15 `UNIQUE KEY` installed; plain `KEY` parse-accepted
+   and dropped. mysqldump emits `KEY idx_posts_author
+   (author_id)` for routine secondary indexes; v7.15.0 builds
+   the BTree on the leading column under the user-supplied name
+   so ORM equality lookups hit the index instead of scanning.
+
+4. **`COPY FROM STDIN [(col, col, …)]` via pgwire**. pg_dump's
+   default output (no `--schema-only`) emits the column-list
+   form for every table with rows. Pre-v7.15's parse_copy_intent
+   split on whitespace and mistook `(col1,` for the FROM
+   direction word, so every `pg_dump` → `psql -f` flow with
+   data went through the regular SQL path and got rejected as
+   a parse error. v7.15.0 walks the prefix manually, skipping
+   the parenthesised column list, and strips the optional
+   `<schema>.` qualifier the same way the SPG SQL parser already
+   does. New dump-compat fixture `pg/minimal-with-data` covers
+   the full `pg_dump` → `psql -f` flow end-to-end.
+
+5. **TIMESTAMPTZ offset literals + canonical-form round-trip**
+   (mailrs round-8 cutover blocker). Pre-v7.15 SPG accepted
+   `TIMESTAMPTZ` DDL but rejected `'2023-10-27 12:00:00+00'` at
+   INSERT — `parse_timestamp_literal` required exactly
+   `HH:MM:SS` after the date. mailrs's prod dump (563 MB / 5.7M
+   lines) hit 3,592 TIMESTAMPTZ errors and dropped 4 high-
+   volume tables (messages / contacts / email_analysis /
+   attachment_content) to 0 rows. v7.15.0:
+   - `parse_time_of_day_micros` now scans for a TZ suffix
+     (`+OO[:MM]` / `-OO[:MM]` / `+OOMM` / `-OOMM` / `Z` / `UTC`
+     / ` UTC`) and subtracts the offset so storage stays the
+     canonical i64 microseconds UTC the engine already used.
+   - `format_timestamptz` appends `+00` so `SELECT` on a
+     TIMESTAMPTZ column round-trips to a literal pg_dump would
+     re-INSERT verbatim.
+   - **New gate #4** — `xtests/data_compat/` — pipes pg_dump-
+     shape COPY blocks (TIMESTAMPTZ with `+00`, `+09`, `-05`,
+     `+05:30`, ` UTC`, `Z`, sub-second; BYTEA hex; JSONB; TEXT[];
+     COPY-escape edge cases — 13 rows total) through pgwire and
+     asserts `SELECT count(*)` post-load matches exactly per
+     table. mailrs round-8 explicitly recommended this gate —
+     the per-statement error count alone was missing silent data
+     drops (a COPY block whose rows fail at engine eval time
+     still increments only one psql ERROR even when 100% of
+     rows dropped).
+
+### Result
+
+| Gate | v7.14.0 | v7.15.0 |
+|---|---|---|
+| workspace tests (`cargo test --workspace --locked`) | baseline | unchanged (12 pre-existing e2e_trigger fails — out of scope this round) |
+| sqllogictest 4-corpus | 373/373 | **432/432** (+59 covering RENAME COLUMN, trigram, MySQL inline KEY, TIMESTAMPTZ offsets) |
+| mailrs ZERO-CHANGE CUTOVER | 42/42 schema | **42/42 schema** + TIMESTAMPTZ data INSERT works |
+| dump-compat (schema-only) | 9/9 PASS | **10/10 PASS** (+ `pg/minimal-with-data` full-data fixture) |
+| data-compat (NEW gate #4) | n/a | **1/1 PASS** — 13 rows including TIMESTAMPTZ offset shapes |
+
+### Catalog version
+
+`FILE_VERSION` 23 → 24. v24 introduces index tag 4 = trigram-
+GIN (`gin_trgm_ops`); same `String → Vec<RowLocator>` payload
+shape as the existing tsvector-GIN (tag 3). v23 catalogs
+deserialise unchanged — no migration shim needed.
+
+### Three gates → four gates
+
+mailrs round-8 surfaced that the existing three-gate protocol
+missed real data round-trip. The new four-gate protocol:
+
+1. `cargo test --workspace --locked` — catches Cargo.lock drift
+2. `cargo run -p sqllogictest --release --locked` — catches
+   grammar regressions
+3. `xtests/dump_compat/run.sh` — catches pg_dump / mysqldump
+   schema-shape regressions (and now the COPY data path via the
+   `minimal-with-data` fixture)
+4. `xtests/data_compat/run.sh` — explicit row-count assertion
+   after a pg_dump-shape data load
+   — plus `.claude/scripts/validate-spg-zero-change.sh` for the
+   mailrs end-to-end check.
+
+`feedback-three-release-gates` memory note → updated to
+`feedback-four-release-gates` after the v7.15.0 ship lands.
+
 ## [7.14.0] — 2026-06-06 (pg_dump / mysqldump / mariadb-dump zero-change import)
 
 Polish round. The product positioning shifts from "mailrs zero-
