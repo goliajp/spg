@@ -8,6 +8,35 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.13.1] — 2026-06-06 (test corpus catch-up — ALTER TABLE ADD COLUMN no longer "unsupported")
+
+Test-only hotfix on top of v7.13.0. Zero runtime / wire /
+file-format change — the spg-engine / spg-server / etc binaries
+are byte-identical between v7.13.0 and v7.13.1. No need to
+upgrade the `goliakk/spg:7.13.0` docker image or the v7.13.0
+crates.io artifacts.
+
+The v7.13.0 release ran `cargo test --workspace --locked`
+(green) but didn't re-run the 4-corpus sqllogictest runner
+(`cargo run -p sqllogictest --release`). The runner caught one
+case `pg_regress` had been asserting since v4.x:
+
+  statement error
+  ALTER TABLE t ADD COLUMN extra INT
+
+That assertion was correct for the v4.x cold backlog era but
+v7.13.0 G1 made the statement succeed. The corpus case now
+reads `statement ok` (matches PG semantics), with a
+`v7.13.0 — supported (mailrs round-5 G1)` annotation. 4-corpus
+total stays at 372/372 = 100% after the fix.
+
+Lesson baked into the next release-prep gate:
+`cargo run -p sqllogictest --release` must run **alongside**
+`cargo test --workspace --locked` before any v7.x release-finish.
+Both green or no release.
+
+---
+
 ## [7.13.0] — 2026-06-06 (zero-change docker compose cutover for mailrs)
 
 Closes mailrs migration round 5. Goal stated by mailrs in their
