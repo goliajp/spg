@@ -2783,7 +2783,7 @@ const fn pg_type_len(ty: DataType) -> i16 {
     }
 }
 
-fn value_to_pg_text(v: &Value, _ty: Option<DataType>) -> Option<String> {
+fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
     Some(match v {
         Value::Null => return None,
         Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
@@ -2792,6 +2792,13 @@ fn value_to_pg_text(v: &Value, _ty: Option<DataType>) -> Option<String> {
         Value::BigInt(n) => n.to_string(),
         Value::Float(f) => format!("{f}"),
         Value::Text(s) | Value::Json(s) => s.clone(),
+        // v7.15.0 — TIMESTAMPTZ vs plain TIMESTAMP at render
+        // time. mailrs round-8 acceptance: SELECT on TIMESTAMPTZ
+        // must round-trip to a literal pg_dump would emit (i.e.
+        // include the `+00` UTC offset).
+        Value::Timestamp(micros) if matches!(ty, Some(DataType::Timestamptz)) => {
+            spg_engine::eval::format_timestamptz(*micros)
+        }
         Value::Timestamp(micros) => format_timestamp(*micros),
         Value::Date(days) => format_date(*days),
         Value::Interval { months, micros } => format!("P{months}M{micros}U"),

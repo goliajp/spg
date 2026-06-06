@@ -4115,15 +4115,23 @@ fn emit_result(
                 spg_wire::FRAME_HEADER_LEN + rd.payload.len() + rows.len() * 64 + 16,
             );
             encode(&rd, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
+            // v7.15.0 — column types thread through the wire path
+            // so TIMESTAMPTZ can render with PG-canonical `+00`
+            // offset, distinguishing it from plain TIMESTAMP.
+            // Both are stored as i64 microseconds UTC; the type
+            // tag is the only thing that says "include offset".
+            let col_types: Vec<DataType> =
+                columns.iter().map(|c| c.ty).collect();
             if rows.len() <= 1 {
                 for row in rows {
-                    let wire = row_to_wire(&row);
+                    let wire = row_to_wire_with_types(&row, &col_types);
                     let frame =
                         build_data_row(&wire).map_err(|e| std::io::Error::other(e.to_string()))?;
                     encode(&frame, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
             } else {
-                let wire_rows: Vec<Vec<WireValue>> = rows.iter().map(row_to_wire).collect();
+                let wire_rows: Vec<Vec<WireValue>> =
+                    rows.iter().map(|r| row_to_wire_with_types(r, &col_types)).collect();
                 for chunk in wire_rows.chunks(BATCH_ROWS_PER_FRAME) {
                     let frame = build_data_row_batch(chunk)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -4199,6 +4207,28 @@ const fn data_type_to_wire(t: DataType) -> WireType {
 
 fn row_to_wire(r: &Row) -> Vec<WireValue> {
     r.values.iter().map(value_to_wire).collect()
+}
+
+/// v7.15.0 — column-type-aware wire conversion. Used wherever a
+/// SELECT result needs to distinguish TIMESTAMP from TIMESTAMPTZ
+/// at render time (canonical PG output includes `+00` for
+/// TIMESTAMPTZ). Both share the i64 microseconds UTC on-disk
+/// shape; the type-tag is what flips the renderer.
+fn row_to_wire_with_types(r: &Row, col_types: &[DataType]) -> Vec<WireValue> {
+    r.values
+        .iter()
+        .zip(col_types.iter())
+        .map(|(v, ty)| value_to_wire_typed(v, *ty))
+        .collect()
+}
+
+fn value_to_wire_typed(v: &Value, ty: DataType) -> WireValue {
+    match (v, ty) {
+        (Value::Timestamp(t), DataType::Timestamptz) => {
+            WireValue::Text(spg_engine::eval::format_timestamptz(*t))
+        }
+        _ => value_to_wire(v),
+    }
 }
 
 fn value_to_wire(v: &Value) -> WireValue {
