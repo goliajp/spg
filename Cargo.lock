@@ -1352,6 +1352,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "spg-sqlx"
+version = "7.15.0"
+dependencies = [
+ "chrono",
+ "either",
+ "futures-core",
+ "futures-util",
+ "log",
+ "serde_json",
+ "spg-embedded",
+ "spg-embedded-tokio",
+ "sqlx",
+ "sqlx-core",
+ "tokio",
+]
+
+[[package]]
 name = "spg-sqlx-pgwire"
 version = "7.15.0"
 dependencies = [

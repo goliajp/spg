@@ -1488,7 +1488,21 @@ impl Engine {
         params: &[Value],
     ) -> Result<QueryResult, EngineError> {
         substitute_placeholders(&mut stmt, params)?;
-        self.execute_stmt_with_cancel(stmt, CancelToken::none())
+        // v7.16.0 — set `current_tx` for the duration of the
+        // dispatch so the `exec_*` helpers see the right TX
+        // slot (matches what `execute_in_with_cancel` does for
+        // simple-query). Pre-v7.16 the simple-query path
+        // worked because every public entry point routed
+        // through `execute_in_with_cancel`; the prepared path
+        // skipped the wrap and so its INSERTs/UPDATEs landed
+        // in the no-tx default slot, silently invisible to a
+        // BEGIN/COMMIT-bracketed flow. Caught by spg-sqlx's
+        // first transaction-visibility test.
+        let saved = self.current_tx;
+        self.current_tx = Some(IMPLICIT_TX);
+        let result = self.execute_stmt_with_cancel(stmt, CancelToken::none());
+        self.current_tx = saved;
+        result
     }
 
     fn execute_inner_with_cancel(
