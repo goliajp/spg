@@ -1,6 +1,6 @@
 # SPG data-compat report (gate #4 — pg_dump data round-trip)
 
-Generated 2026-06-06T13:22:33Z against SPG `local-build`.
+Generated 2026-06-06T13:27:13Z against SPG `7.15.0`.
 
 | Fixture | Status | Errors | Row counts (got/expected) |
 |---|---|---|---|
