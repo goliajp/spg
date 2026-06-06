@@ -1770,11 +1770,35 @@ impl Parser {
     /// v6.7.2 — `ALTER TABLE <name> SET hot_tier_bytes = <n>`. The
     /// only `SET` form currently supported; future v6.7.x can add
     /// more SET subjects without changing the dispatch shape.
+    /// v7.13.2 — mailrs round-6 S1: accepts comma-separated
+    /// subactions. Single-subaction shape stays a 1-element vec.
     fn parse_alter_table_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let table_name = self.expect_ident_like()?;
-        // v7.6.8 — dispatch on the next keyword: SET / ADD / DROP.
-        // SET kept identical to v6.7.x. ADD / DROP CONSTRAINT routes
-        // to FK installation / removal.
+        let mut targets: Vec<crate::ast::AlterTableTarget> = Vec::new();
+        loop {
+            let subaction = self.parse_alter_table_subaction()?;
+            // ADD COLUMN with inline REFERENCES emits both an
+            // AddColumn and an AddForeignKey subaction; the
+            // helper returns 1 or 2 items.
+            targets.extend(subaction);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
+            name: table_name,
+            targets,
+        }))
+    }
+
+    /// Parse one ALTER TABLE subaction. Returns a Vec because
+    /// inline `REFERENCES` on `ADD COLUMN` produces both an
+    /// AddColumn and an AddForeignKey entry (mailrs round-6 S3).
+    fn parse_alter_table_subaction(
+        &mut self,
+    ) -> Result<Vec<crate::ast::AlterTableTarget>, ParseError> {
         match self.peek() {
             Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
                 self.advance();
@@ -1792,18 +1816,10 @@ impl Parser {
                 }
                 self.advance();
                 let n = self.expect_u64_literal()?;
-                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
-                    name: table_name,
-                    target: crate::ast::AlterTableTarget::SetHotTierBytes(n),
-                }))
+                Ok(alloc::vec![crate::ast::AlterTableTarget::SetHotTierBytes(n)])
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
-                // v7.13.0 — dispatch on the next token. `CONSTRAINT` /
-                // `FOREIGN` route to the FK arm (existing v7.6.8
-                // behaviour). `COLUMN` and any bare identifier that
-                // isn't one of those keywords route to ADD COLUMN.
-                // mailrs round-5 G1.
                 let is_fk = matches!(
                     self.peek(),
                     Token::Ident(s) if s.eq_ignore_ascii_case("constraint")
@@ -1811,18 +1827,11 @@ impl Parser {
                 );
                 if is_fk {
                     let fk = self.parse_table_level_fk()?;
-                    return Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
-                        name: table_name,
-                        target: crate::ast::AlterTableTarget::AddForeignKey(fk),
-                    }));
+                    return Ok(alloc::vec![crate::ast::AlterTableTarget::AddForeignKey(fk)]);
                 }
-                // Optional `COLUMN` keyword (PG accepts either form;
-                // ADD COLUMN is the canonical spelling).
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
                     self.advance();
                 }
-                // Optional `IF NOT EXISTS` — skipped silently when the
-                // column already exists at engine time.
                 let mut if_not_exists = false;
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
                     self.advance();
@@ -1842,14 +1851,22 @@ impl Parser {
                     self.advance();
                     if_not_exists = true;
                 }
-                let column = self.parse_column_def()?;
-                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
-                    name: table_name,
-                    target: crate::ast::AlterTableTarget::AddColumn {
-                        column,
-                        if_not_exists,
-                    },
-                }))
+                // v7.13.2 — mailrs round-6 S3: `ADD COLUMN col TYPE
+                // REFERENCES other(col) [ON DELETE …]`. parse_column_def
+                // returns ColumnDef + an optional inline FK.
+                let (column, col_level_fk) = self.parse_column_def_with_fk()?;
+                let col_name = column.name.clone();
+                let mut out = alloc::vec![crate::ast::AlterTableTarget::AddColumn {
+                    column,
+                    if_not_exists,
+                }];
+                if let Some(mut fk) = col_level_fk {
+                    if fk.columns.is_empty() {
+                        fk.columns.push(col_name);
+                    }
+                    out.push(crate::ast::AlterTableTarget::AddForeignKey(fk));
+                }
+                Ok(out)
             }
             Token::Drop => {
                 self.advance();
@@ -1861,22 +1878,37 @@ impl Parser {
                         )));
                     }
                 }
+                // v7.13.2 — mailrs round-6 S7: optional `IF EXISTS`.
+                let mut if_exists = false;
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
+                    let n1 = self.tokens.get(self.pos + 1);
+                    if matches!(n1, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("exists")) {
+                        self.advance();
+                        self.advance();
+                        if_exists = true;
+                    }
+                }
                 let cname = self.expect_ident_like()?;
-                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
-                    name: table_name,
-                    target: crate::ast::AlterTableTarget::DropForeignKey(cname),
-                }))
+                // Tolerate trailing `CASCADE` / `RESTRICT` (mailrs uses
+                // neither but PG emits them and we accept silently).
+                if matches!(
+                    self.peek(),
+                    Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                        || s.eq_ignore_ascii_case("restrict")
+                ) {
+                    self.advance();
+                }
+                Ok(alloc::vec![crate::ast::AlterTableTarget::DropForeignKey {
+                    name: cname,
+                    if_exists,
+                }])
             }
-            // v7.13.0 — `ALTER TABLE t ALTER COLUMN <c> TYPE <ty>
-            // [USING <expr>]` (mailrs round-5 G8).
             Token::Ident(s) if s.eq_ignore_ascii_case("alter") => {
                 self.advance();
-                // Optional `COLUMN` keyword (PG-canonical).
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
                     self.advance();
                 }
                 let col_name = self.expect_ident_like()?;
-                // Required `TYPE` keyword.
                 match self.peek() {
                     Token::Ident(s) if s.eq_ignore_ascii_case("type") => {
                         self.advance();
@@ -1895,14 +1927,11 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
-                    name: table_name,
-                    target: crate::ast::AlterTableTarget::AlterColumnType {
-                        column: col_name,
-                        new_type,
-                        using,
-                    },
-                }))
+                Ok(alloc::vec![crate::ast::AlterTableTarget::AlterColumnType {
+                    column: col_name,
+                    new_type,
+                    using,
+                }])
             }
             other => Err(self.err(alloc::format!(
                 "expected SET / ADD / DROP / ALTER in ALTER TABLE, got {other:?}"
@@ -3268,6 +3297,20 @@ impl Parser {
         if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
             return Ok(VecEncoding::F32);
         }
+        // v7.13.2 — mailrs round-6 S6: `USING` after a vector type
+        // overlaps with `ALTER COLUMN TYPE … USING <expr>`. Only
+        // consume the token when the very next token is a known
+        // vector-encoding keyword (SQ8 / HALF). Otherwise leave
+        // `USING` for the caller — it's the rewrite-expression form.
+        let n1 = self.tokens.get(self.pos + 1);
+        let next_is_encoding = matches!(
+            n1,
+            Some(Token::Ident(s))
+                if s.eq_ignore_ascii_case("sq8") || s.eq_ignore_ascii_case("half")
+        );
+        if !next_is_encoding {
+            return Ok(VecEncoding::F32);
+        }
         self.advance();
         let enc_ident = match self.advance() {
             Token::Ident(s) => s,
@@ -3588,13 +3631,14 @@ impl Parser {
                 )));
             }
             self.advance();
-            let alias_ident = self.parse_optional_alias();
+            let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(expr)),
+                unnest_column_aliases,
             });
         }
         let name = self.expect_ident_like()?;
@@ -3644,7 +3688,42 @@ impl Parser {
             alias,
             as_of_segment,
             unnest_expr: None,
+            unnest_column_aliases: Vec::new(),
         })
+    }
+
+    /// v7.13.2 — mailrs round-6 S5. Like `parse_optional_alias`
+    /// but also accepts `AS alias(col [, col, …])` — the
+    /// PG-standard table-function column-list form. The column
+    /// list is only honoured when paired with `UNNEST(...)` in
+    /// the parent; other call sites currently discard it.
+    fn parse_optional_alias_with_columns(&mut self) -> (Option<String>, Vec<String>) {
+        let alias = self.parse_optional_alias();
+        if alias.is_none() {
+            return (None, Vec::new());
+        }
+        let mut cols: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                match self.peek().clone() {
+                    Token::Ident(s) | Token::QuotedIdent(s) => {
+                        self.advance();
+                        cols.push(s);
+                    }
+                    _ => break,
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if matches!(self.peek(), Token::RParen) {
+                self.advance();
+            }
+        }
+        (alias, cols)
     }
 
     /// FROM-clause: a primary table reference plus zero-or-more joined
