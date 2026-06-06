@@ -52,12 +52,32 @@ fn create_index_without_where_has_no_predicate() {
 }
 
 #[test]
-fn create_index_where_rejected_on_hnsw() {
+fn create_index_where_accepted_on_hnsw() {
+    // v7.13.2 — partial-index predicates are persisted on
+    // HNSW/GIN/BRIN the same way they already were on BTree.
+    // HNSW carries the caveat that the predicate isn't applied
+    // at build time (would need per-row eval inside the NSW
+    // construction loop), so the index oversamples; query-time
+    // WHERE re-eval still filters correctly. This test used to
+    // assert rejection (pre-v7.13.2 behavior); v7.15.0 corrects
+    // it to assert the documented "accept + persist" behavior.
     let mut e = Engine::new();
     e.execute("CREATE TABLE emb (id INT NOT NULL, v VECTOR(4) NOT NULL, active INT NOT NULL)")
         .unwrap();
-    let r = e.execute("CREATE INDEX emb_idx ON emb USING hnsw (v) WHERE active = 1");
-    assert!(r.is_err(), "WHERE on HNSW must error");
+    e.execute("CREATE INDEX emb_idx ON emb USING hnsw (v) WHERE active = 1")
+        .expect("WHERE on HNSW is accepted post-v7.13.2");
+    let idx = e
+        .catalog()
+        .get("emb")
+        .unwrap()
+        .indices()
+        .iter()
+        .find(|i| i.name == "emb_idx")
+        .unwrap();
+    assert!(
+        idx.partial_predicate.is_some(),
+        "partial predicate must persist on HNSW"
+    );
 }
 
 #[test]

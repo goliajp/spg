@@ -18,6 +18,7 @@ pub mod persistent_btree;
 pub mod quantize;
 pub mod row_locator;
 pub mod segment;
+pub mod trgm;
 
 pub use self::bloom::{BloomError, BloomFilter};
 pub use self::row_locator::{RowLocator, RowLocatorError};
@@ -779,6 +780,17 @@ pub enum IndexKind {
     /// per-write snapshot) stays O(1) — same structural-sharing
     /// invariant as BTree.
     Gin(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    /// v7.15.0 — `USING gin (col gin_trgm_ops)` over a `TEXT`
+    /// column. Posting lists map `trigram` (PG-compatible 3-byte
+    /// shingle on the lower-cased + space-padded input) to row
+    /// locators. The planner uses this index to accelerate
+    /// `WHERE col LIKE '…'` / `ILIKE '…'` / `similarity(col, q) >
+    /// t` — every literal run of length ≥ 1 in the pattern
+    /// produces a trigram set, the engine intersects the posting
+    /// lists, and the LIKE / similarity predicate is re-evaluated
+    /// per candidate row to filter the over-approximation.
+    /// Persisted via tag-4 index payload in `FILE_VERSION` 24+.
+    GinTrgm(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
 }
 
 /// Multi-layer HNSW graph (v2.13). Each node is assigned a `top_level`;
@@ -931,6 +943,23 @@ impl Index {
         }
     }
 
+    /// v7.15.0 — `gin_trgm_ops`-flavoured GIN constructor. Same
+    /// shape as `new_gin` but the posting-list keys are 3-byte
+    /// trigram shingles (`pg_trgm`-compatible) and the column
+    /// type is `TEXT` / `VARCHAR` (not `TSVECTOR`).
+    fn new_gin_trgm(name: String, column_position: usize) -> Self {
+        Self {
+            name,
+            column_position,
+            kind: IndexKind::GinTrgm(PersistentBTreeMap::new()),
+            included_columns: Vec::new(),
+            partial_predicate: None,
+            expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
+        }
+    }
+
     /// Look up the locators stored under `key` (B-tree only). Returns
     /// an empty slice when the key is absent or the index isn't a
     /// BTree — callers can treat both cases uniformly.
@@ -942,9 +971,13 @@ impl Index {
     pub fn lookup_eq(&self, key: &IndexKey) -> &[RowLocator] {
         match &self.kind {
             IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
-            // BRIN / NSW / GIN have no IndexKey-keyed map; lookup is a no-op.
-            // GIN uses [`Index::gin_lookup_word`] instead.
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => &[][..],
+            // BRIN / NSW / GIN / trigram-GIN have no IndexKey-keyed
+            // map; lookup is a no-op. GIN uses
+            // [`Index::gin_lookup_word`] instead.
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => &[][..],
         }
     }
 
@@ -954,7 +987,24 @@ impl Index {
     pub fn gin_lookup_word(&self, word: &str) -> &[RowLocator] {
         match &self.kind {
             IndexKind::Gin(m) => m.get(&String::from(word)).map_or(&[][..], Vec::as_slice),
-            IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => &[][..],
+            IndexKind::BTree(_)
+            | IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::GinTrgm(_) => &[][..],
+        }
+    }
+
+    /// v7.15.0 — trigram-GIN posting-list lookup. Returns the row
+    /// locators whose indexed `TEXT` cell contains the trigram
+    /// `tri`. Empty when the trigram is absent or this isn't a
+    /// trigram-GIN index.
+    pub fn gin_trgm_lookup(&self, tri: &str) -> &[RowLocator] {
+        match &self.kind {
+            IndexKind::GinTrgm(m) => m.get(&String::from(tri)).map_or(&[][..], Vec::as_slice),
+            IndexKind::BTree(_)
+            | IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_) => &[][..],
         }
     }
 
@@ -963,7 +1013,10 @@ impl Index {
     pub const fn nsw(&self) -> Option<&NswGraph> {
         match &self.kind {
             IndexKind::Nsw(g) => Some(g),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => None,
+            IndexKind::BTree(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => None,
         }
     }
 
@@ -973,6 +1026,13 @@ impl Index {
     /// on range predicates.
     pub const fn is_brin(&self) -> bool {
         matches!(self.kind, IndexKind::Brin { .. })
+    }
+
+    /// v7.15.0 — true when this index is a trigram GIN
+    /// (`gin_trgm_ops`-flavoured). Used by the LIKE planner to
+    /// opt into trigram acceleration.
+    pub const fn is_gin_trgm(&self) -> bool {
+        matches!(self.kind, IndexKind::GinTrgm(_))
     }
 
     /// v7.12.3 — true when this index is a GIN inverted index.
@@ -1277,6 +1337,18 @@ impl Table {
                         }
                     }
                 }
+                IndexKind::GinTrgm(map) => {
+                    // v7.15.0 — trigram GIN. Shingle the TEXT cell
+                    // into PG-compatible 3-byte trigrams and extend
+                    // each trigram's posting list.
+                    if let Value::Text(s) = &row.values[idx.column_position] {
+                        for tri in trgm::extract_trigrams(s) {
+                            let mut entries = map.get(&tri).cloned().unwrap_or_default();
+                            entries.push(RowLocator::Hot(new_row_idx));
+                            map.insert_mut(tri, entries);
+                        }
+                    }
+                }
                 // NSW handled below after the row push (so the new row
                 // is visible to the kNN-graph connect step). BRIN
                 // carries no per-row state.
@@ -1379,7 +1451,10 @@ impl Table {
         let col_pos = self.indices[idx_pos].column_position;
         let m = match &self.indices[idx_pos].kind {
             IndexKind::Nsw(g) => g.m,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            IndexKind::BTree(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => {
                 return Err(StorageError::Unsupported(format!(
                     "ALTER INDEX REBUILD on non-NSW index {name:?} — only NSW indexes can rebuild"
                 )));
@@ -1570,6 +1645,71 @@ impl Table {
         Ok(())
     }
 
+    /// v7.15.0 — `gin_trgm_ops` GIN over a TEXT column. Walks
+    /// every row, shingles the cell into PG-compatible trigrams,
+    /// and builds the posting-list map. NULL / non-TEXT cells
+    /// contribute nothing (no trigrams).
+    pub fn add_gin_trgm_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        if !matches!(
+            self.schema.columns[column_position].ty,
+            DataType::Text | DataType::Varchar(_)
+        ) {
+            return Err(StorageError::Corrupt(format!(
+                "trigram-GIN index {name:?} requires a TEXT/VARCHAR column; \
+                 {column_name:?} is {:?}",
+                self.schema.columns[column_position].ty
+            )));
+        }
+        let mut idx = Index::new_gin_trgm(name, column_position);
+        if let IndexKind::GinTrgm(map) = &mut idx.kind {
+            for (i, row) in self.rows.iter().enumerate() {
+                if let Value::Text(s) = &row.values[column_position] {
+                    for tri in trgm::extract_trigrams(s) {
+                        let mut entries = map.get(&tri).cloned().unwrap_or_default();
+                        entries.push(RowLocator::Hot(i));
+                        map.insert_mut(tri, entries);
+                    }
+                }
+            }
+        }
+        self.indices.push(idx);
+        Ok(())
+    }
+
+    /// v7.15.0 — restore a trigram-GIN from its catalog snapshot
+    /// payload. Mirrors [`Self::restore_gin_index`].
+    pub fn restore_gin_trgm_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        let mut idx = Index::new_gin_trgm(name, column_position);
+        idx.kind = IndexKind::GinTrgm(map);
+        self.indices.push(idx);
+        Ok(())
+    }
+
     /// v5.1: register cold-tier locators on a `BTree` index. Used
     /// after [`Catalog::load_segment_bytes`] to wire every cold-
     /// tier row's PK back to its segment so
@@ -1601,7 +1741,10 @@ impl Table {
             .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
         let map = match &mut idx.kind {
             IndexKind::BTree(map) => map,
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "index {index_name:?} is not BTree; cold locators apply only to BTree indices"
                 )));
@@ -1620,7 +1763,9 @@ impl Table {
     /// v7.12.3 — GIN-side parallel to [`Self::register_cold_locators`].
     /// Re-attaches `word → cold RowLocator` posting-list entries after
     /// the from-rows rebuild loop. Errors when the index doesn't
-    /// exist or isn't a GIN.
+    /// exist or isn't a GIN. Both tsvector-GIN and trigram-GIN
+    /// variants share posting-list shape (`String → Vec<RowLocator>`),
+    /// so this helper accepts either.
     pub fn register_gin_cold_locators<I>(
         &mut self,
         index_name: &str,
@@ -1635,7 +1780,7 @@ impl Table {
             .find(|i| i.name == index_name)
             .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
         let map = match &mut idx.kind {
-            IndexKind::Gin(map) => map,
+            IndexKind::Gin(map) | IndexKind::GinTrgm(map) => map,
             IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
                 return Err(StorageError::Corrupt(format!(
                     "register_gin_cold_locators: index {index_name:?} is not GIN"
@@ -1677,7 +1822,10 @@ impl Table {
             })?;
         let map = match &mut idx.kind {
             IndexKind::BTree(map) => map,
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "remove_cold_locators_for_key: index {index_name:?} is not BTree; \
                      cold locators apply only to BTree indices"
@@ -1975,19 +2123,25 @@ impl Table {
                 }
                 // BRIN / NSW carry no key→locator map. GIN handles
                 // its own cold preservation below in `preserved_gin_cold`.
-                IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => None,
+                IndexKind::Nsw(_)
+                | IndexKind::Brin { .. }
+                | IndexKind::Gin(_)
+                | IndexKind::GinTrgm(_) => None,
             })
             .collect();
 
         // v7.12.3 — same cold-preservation pattern for GIN's
         // `word → Vec<RowLocator>` posting lists. Parallel to the
         // BTree pass above (different key type so a separate vec is
-        // cleaner than a generic merge).
+        // cleaner than a generic merge). v7.15.0: trigram-GIN
+        // (`gin_trgm_ops`) shares the same posting-list shape, so
+        // one pass handles both — the `RebuildKind` carries the
+        // kind tag to drive resurrection.
         let preserved_gin_cold: Vec<(String, Vec<(String, RowLocator)>)> = self
             .indices
             .iter()
             .filter_map(|idx| match &idx.kind {
-                IndexKind::Gin(map) => {
+                IndexKind::Gin(map) | IndexKind::GinTrgm(map) => {
                     let cold: Vec<(String, RowLocator)> = map
                         .iter()
                         .flat_map(|(w, locs)| {
@@ -2017,6 +2171,7 @@ impl Table {
             Nsw(usize),
             Brin(DataType),
             Gin,
+            GinTrgm,
         }
         let descriptors: Vec<(String, usize, RebuildKind)> = self
             .indices
@@ -2027,6 +2182,7 @@ impl Table {
                     IndexKind::Brin { column_type } => RebuildKind::Brin(*column_type),
                     IndexKind::BTree(_) => RebuildKind::BTree,
                     IndexKind::Gin(_) => RebuildKind::Gin,
+                    IndexKind::GinTrgm(_) => RebuildKind::GinTrgm,
                 };
                 (idx.name.clone(), idx.column_position, kind)
             })
@@ -2072,6 +2228,22 @@ impl Table {
                                         map.get(&lex.word).cloned().unwrap_or_default();
                                     entries.push(RowLocator::Hot(i));
                                     map.insert_mut(lex.word.clone(), entries);
+                                }
+                            }
+                        }
+                    }
+                    self.indices.push(idx);
+                }
+                RebuildKind::GinTrgm => {
+                    let mut idx = Index::new_gin_trgm(name, column_position);
+                    if let IndexKind::GinTrgm(map) = &mut idx.kind {
+                        for (i, row) in self.rows.iter().enumerate() {
+                            if let Value::Text(s) = &row.values[column_position] {
+                                for tri in trgm::extract_trigrams(s) {
+                                    let mut entries =
+                                        map.get(&tri).cloned().unwrap_or_default();
+                                    entries.push(RowLocator::Hot(i));
+                                    map.insert_mut(tri, entries);
                                 }
                             }
                         }
@@ -2213,7 +2385,7 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     ensure_node_slot(table, idx_pos, new_row_idx, level);
     let (entry, entry_level, m) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level, g.m),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
             unreachable!("nsw_insert_at on a non-NSW index")
         }
     };
@@ -2329,7 +2501,7 @@ fn greedy_layer_walk(
 ) -> (usize, f32) {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
             return (current, current_d);
         }
     };
@@ -2382,7 +2554,7 @@ fn layer_beam_search(
 ) -> Vec<(f32, usize)> {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => return Vec::new(),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => return Vec::new(),
     };
     let col_pos = table.indices[idx_pos].column_position;
     let d0 = if matches!(metric, NswMetric::L2) {
@@ -2563,7 +2735,7 @@ fn connect_at_layer(
     let col_pos = table.indices[idx_pos].column_position;
     let cap = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g.cap_for_layer(layer),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => return,
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => return,
     };
     // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
     // each) rather than usize (8 B on 64-bit). Boundary casts here
@@ -2603,7 +2775,7 @@ fn connect_at_layer(
         //    insert path so connectivity stays consistent.
         let needs_trim = match &table.indices[idx_pos].kind {
             IndexKind::Nsw(g) => g.layers[layer as usize][peer].len() > cap,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => false,
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => false,
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
@@ -2611,7 +2783,7 @@ fn connect_at_layer(
                     .iter()
                     .map(|&n| n as usize)
                     .collect(),
-                IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => continue,
+                IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
             // heuristic receives candidates closest-first. `cell_l2_sq`
@@ -2748,7 +2920,7 @@ fn nsw_search(
 ) -> Vec<(f32, usize)> {
     let (entry, entry_level) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => return Vec::new(),
+        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => return Vec::new(),
     };
     let Some(entry) = entry else {
         return Vec::new();
@@ -4146,7 +4318,7 @@ impl Catalog {
             })?;
         let map = match &idx.kind {
             IndexKind::BTree(m) => m,
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "compact_cold_segments: index {index_name:?} is not BTree; \
                      compaction applies only to BTree cold-tier indices"
@@ -4589,7 +4761,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     semantics.
 /// v22 catalogs deserialise with empty `checks` and every UC
 /// at `nulls_not_distinct = false`.
-const FILE_VERSION: u8 = 23;
+/// v24 introduces:
+///   * Index kind tag 4 = trigram-GIN (`gin_trgm_ops`-flavoured
+///     `USING gin` over a TEXT/VARCHAR column). Payload shape is
+///     identical to tag-3 GIN (String → Vec<RowLocator>); the
+///     keys are PG-compatible 3-byte trigram shingles instead of
+///     tsvector lexemes. v23 catalogs deserialise unchanged — no
+///     v23 writer ever emitted tag 4.
+const FILE_VERSION: u8 = 24;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4717,6 +4896,34 @@ impl Catalog {
                             write_u32(
                                 &mut out,
                                 u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
+                            );
+                            for loc in locators {
+                                loc.write_le(&mut out);
+                            }
+                        }
+                    }
+                    IndexKind::GinTrgm(map) => {
+                        // v7.15.0 — tag byte 4 = GinTrgm
+                        // (`gin_trgm_ops` GIN over a TEXT column).
+                        // Payload shape is identical to tag-3 GIN —
+                        // `String → Vec<RowLocator>` posting lists.
+                        // The String keys are 3-byte trigrams instead
+                        // of tsvector lexemes; the deserializer
+                        // dispatches on the tag, not the key shape.
+                        // FILE_VERSION 24+; v23 catalogs never wrote
+                        // a trigram-GIN.
+                        out.push(4);
+                        write_u32(
+                            &mut out,
+                            u32::try_from(map.len())
+                                .expect("≤ 4G trigram-GIN posting lists"),
+                        );
+                        for (tri, locators) in map {
+                            write_str(&mut out, tri);
+                            write_u32(
+                                &mut out,
+                                u32::try_from(locators.len())
+                                    .expect("≤ 4G locators/posting list"),
                             );
                             for loc in locators {
                                 loc.write_le(&mut out);
@@ -5278,6 +5485,19 @@ fn deserialize_indices(
                 // and earlier degraded `USING gin` to BTree.
                 let map = read_gin_map(cur)?;
                 t.restore_gin_index(idx_name, &column_name, map)?;
+            }
+            4 => {
+                // v7.15.0 — trigram-GIN tag (`gin_trgm_ops`).
+                // Same payload shape as tag 3 (String → posting
+                // list); only emitted by FILE_VERSION 24+ writers.
+                if version < 24 {
+                    return Err(StorageError::Corrupt(format!(
+                        "trigram-GIN index tag 4 found in catalog FILE_VERSION {version}; \
+                         FILE_VERSION 24+ required (v7.15.0 introduced this tag)"
+                    )));
+                }
+                let map = read_gin_map(cur)?;
+                t.restore_gin_trgm_index(idx_name, &column_name, map)?;
             }
             other => {
                 return Err(StorageError::Corrupt(format!(
@@ -7047,7 +7267,7 @@ mod tests {
             .unwrap();
         let g = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
                 panic!("expected NSW")
             }
         };
@@ -7409,7 +7629,7 @@ mod tests {
             .unwrap();
         let original = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
                 panic!("expected NSW")
             }
         };
@@ -7417,7 +7637,7 @@ mod tests {
         let restored = Catalog::deserialize(&bytes).expect("deserialize");
         let restored_graph = match &restored.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) => {
+            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
                 panic!("expected NSW")
             }
         };
@@ -8159,6 +8379,10 @@ mod tests {
                     IndexKind::Gin(_) => panic!(
                         "v8 catalog writer cannot serialise GIN — \
                          tests with GIN indices must use the current writer"
+                    ),
+                    IndexKind::GinTrgm(_) => panic!(
+                        "v8 catalog writer cannot serialise trigram-GIN — \
+                         tests with trgm indices must use the current writer"
                     ),
                 }
             }

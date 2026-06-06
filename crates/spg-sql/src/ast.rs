@@ -700,6 +700,14 @@ pub struct CreateIndexStatement {
     /// and PG's canonical way to express conditional uniqueness.
     /// mailrs K1.
     pub is_unique: bool,
+    /// v7.15.0 — operator class on the leading column, when the
+    /// CREATE INDEX named one (`(col vector_cosine_ops)` shape).
+    /// Lower-cased. Most opclasses are still informational; the
+    /// engine routes on `gin_trgm_ops` specifically to build a
+    /// trigram-shingle GIN over a TEXT column, and otherwise
+    /// keeps the current "accepted and discarded" behaviour for
+    /// pg_dump compatibility.
+    pub opclass: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2024,7 +2032,15 @@ impl fmt::Display for CreateIndexStatement {
         if let Some(expr) = &self.expression {
             write!(f, "({})", expr)?;
         } else if self.extra_columns.is_empty() {
-            write!(f, "({})", quote_ident(&self.column))?;
+            // v7.15.0 — preserve operator class on round-trip
+            // (`(col opclass)`) so WAL replay reconstructs the
+            // engine-routing intent (e.g. `gin_trgm_ops` →
+            // trigram-GIN build path).
+            if let Some(op) = &self.opclass {
+                write!(f, "({} {})", quote_ident(&self.column), op)?;
+            } else {
+                write!(f, "({})", quote_ident(&self.column))?;
+            }
         } else {
             // v7.9.14 — multi-column key. Emit each column quoted
             // so the round-tripped form re-parses to identical AST.
