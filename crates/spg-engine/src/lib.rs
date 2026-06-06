@@ -9564,6 +9564,18 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Numeric { scaled, scale } => Literal::String(eval::format_numeric(scaled, scale)),
         Value::Date(d) => Literal::String(eval::format_date(d)),
         Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
+        // v7.16.0 — BYTEA round-trip for the spg-sqlx Bind path.
+        // PG-canonical text rep is `\x` + lowercase hex; the
+        // engine's coerce_value already accepts that on the
+        // text → bytea direction.
+        Value::Bytes(b) => Literal::String(eval::format_bytea_hex(&b)),
+        // v7.16.0 — array round-trip for the spg-sqlx Bind
+        // path. Render as PG external form `{a,b,c}`; the
+        // engine's text → array coerce (just below in
+        // coerce_value) accepts it on the matching column type.
+        Value::TextArray(items) => Literal::String(eval::format_text_array(&items)),
+        Value::IntArray(items) => Literal::String(eval::format_int_array(&items)),
+        Value::BigIntArray(items) => Literal::String(eval::format_bigint_array(&items)),
         Value::Interval { months, micros } => Literal::Interval {
             months,
             micros,
@@ -11783,6 +11795,63 @@ fn coerce_value(
                 })
             })?;
             Some(Value::TextArray(arr))
+        }
+        // v7.16.0 — Text → IntArray / BigIntArray for the
+        // spg-sqlx Bind path. Decode the PG external form
+        // `{1,2,3}` as a TEXT array first, then parse each
+        // element as int. Same shape as the TextArray decode
+        // above with an element-wise narrow.
+        (Value::Text(s), DataType::IntArray) => {
+            let arr = decode_text_array_literal(&s).map_err(|e| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as INT[] for column `{col_name}`: {e}"
+                    ),
+                })
+            })?;
+            let mut out: Vec<Option<i32>> = Vec::with_capacity(arr.len());
+            for elem in arr {
+                match elem {
+                    None => out.push(None),
+                    Some(t) => {
+                        let n: i32 = t.parse().map_err(|_| {
+                            EngineError::Eval(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "cannot parse {t:?} as INT element for `{col_name}`"
+                                ),
+                            })
+                        })?;
+                        out.push(Some(n));
+                    }
+                }
+            }
+            Some(Value::IntArray(out))
+        }
+        (Value::Text(s), DataType::BigIntArray) => {
+            let arr = decode_text_array_literal(&s).map_err(|e| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as BIGINT[] for column `{col_name}`: {e}"
+                    ),
+                })
+            })?;
+            let mut out: Vec<Option<i64>> = Vec::with_capacity(arr.len());
+            for elem in arr {
+                match elem {
+                    None => out.push(None),
+                    Some(t) => {
+                        let n: i64 = t.parse().map_err(|_| {
+                            EngineError::Eval(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "cannot parse {t:?} as BIGINT element for `{col_name}`"
+                                ),
+                            })
+                        })?;
+                        out.push(Some(n));
+                    }
+                }
+            }
+            Some(Value::BigIntArray(out))
         }
         // v7.10.11 — TEXT[] → Text round-trip uses PG's
         // external array form (`{a,b,NULL}`). Lets a SELECT

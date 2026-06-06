@@ -58,6 +58,36 @@ impl SpgTypeInfo {
     pub const fn kind(&self) -> Kind {
         self.kind
     }
+
+    /// v7.16.0 — translate from the engine's [`DataType`] to
+    /// the adapter's typed `Kind`. Used by the fetch path to
+    /// build column metadata for `SpgRow`. Any DataType the
+    /// adapter hasn't bridged yet maps to `Kind::Null` —
+    /// downstream Decode calls then fail with a clear
+    /// "cannot decode" message identifying the column type.
+    #[must_use]
+    pub fn from_data_type(ty: spg_embedded::DataType) -> Self {
+        use spg_embedded::DataType;
+        let kind = match ty {
+            DataType::Int => Kind::Int,
+            DataType::BigInt => Kind::BigInt,
+            DataType::SmallInt => Kind::SmallInt,
+            DataType::Bool => Kind::Bool,
+            DataType::Text => Kind::Text,
+            DataType::Bytes => Kind::Bytes,
+            DataType::Float => Kind::Float,
+            DataType::Date => Kind::Date,
+            DataType::Timestamp => Kind::Timestamp,
+            DataType::Timestamptz => Kind::Timestamptz,
+            DataType::Json => Kind::Json,
+            // v7.16.0 — DataType is #[non_exhaustive]; any
+            // variant we haven't bridged yet decodes to Null
+            // (so Decode impls see "compatible? no" instead of
+            // a panic).
+            _ => Kind::Null,
+        };
+        Self { kind }
+    }
 }
 
 impl TypeInfo for SpgTypeInfo {

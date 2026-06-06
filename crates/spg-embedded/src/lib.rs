@@ -77,7 +77,7 @@
 //! `no_std` boundary clean.
 
 pub use spg_engine::{Engine, EngineError, ParsedStatement, QueryResult};
-pub use spg_storage::Value;
+pub use spg_storage::{ColumnSchema, DataType, Value};
 
 /// v7.16.0 — handle for a parsed-and-planned SQL statement.
 /// Hand off to [`Database::execute_prepared`] / [`Database::query_prepared`]
@@ -675,6 +675,50 @@ impl Database {
             // variant is not a SELECT row stream, treat as Unsupported.
             _ => Err(EngineError::Unsupported(
                 "query() expects a SELECT — use execute() for DML/DDL".into(),
+            )),
+        }
+    }
+
+    /// v7.16.0 — column-aware variant of [`Self::query`].
+    /// Returns the column schema vec alongside the rows so
+    /// adapters (the spg-sqlx Row impl most notably) can drive
+    /// name + type-based column lookups. Errors on non-Rows
+    /// results identically to `query`.
+    pub fn query_with_columns(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+        match self.engine.execute(sql)? {
+            QueryResult::Rows { columns, rows } => {
+                Ok((columns, rows.into_iter().map(|r| r.values).collect()))
+            }
+            QueryResult::CommandOk { .. } => Err(EngineError::Unsupported(
+                "query_with_columns() expects a SELECT — use execute() for DML/DDL".into(),
+            )),
+            _ => Err(EngineError::Unsupported(
+                "query_with_columns() expects a SELECT — use execute() for DML/DDL".into(),
+            )),
+        }
+    }
+
+    /// v7.16.0 — column-aware variant of
+    /// [`Self::query_prepared`]. Same shape as
+    /// `query_with_columns` but driven from a prepared
+    /// statement + bound params.
+    pub fn query_prepared_with_columns(
+        &mut self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<(Vec<spg_storage::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+        match self.engine.execute_prepared(stmt.stmt.clone(), params)? {
+            QueryResult::Rows { columns, rows } => {
+                Ok((columns, rows.into_iter().map(|r| r.values).collect()))
+            }
+            QueryResult::CommandOk { .. } => Err(EngineError::Unsupported(
+                "query_prepared_with_columns() expects a SELECT — use execute_prepared() for DML/DDL".into(),
+            )),
+            _ => Err(EngineError::Unsupported(
+                "query_prepared_with_columns() expects a SELECT — use execute_prepared() for DML/DDL".into(),
             )),
         }
     }

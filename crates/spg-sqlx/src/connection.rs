@@ -8,20 +8,26 @@
 //! `min_connections` / `max_connections` knobs just control
 //! how many cheap clones the pool keeps around.
 
+use std::sync::Arc;
+
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use sqlx_core::connection::Connection;
 use sqlx_core::error::Error;
 use sqlx_core::executor::Executor;
 use sqlx_core::transaction::Transaction;
+use sqlx_core::HashMap;
 
 use spg_embedded::QueryResult as EngineQueryResult;
 use spg_embedded_tokio::AsyncDatabase;
 
+use crate::column::SpgColumn;
 use crate::database::Spg;
 use crate::error::engine_to_sqlx;
 use crate::options::SpgConnectOptions;
 use crate::query_result::SpgQueryResult;
+use crate::row::SpgRow;
+use crate::type_info::SpgTypeInfo;
 
 /// One sqlx connection backed by an in-process SPG.
 #[derive(Debug, Clone)]
@@ -120,7 +126,7 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
         'c: 'e,
         E: 'q + sqlx_core::executor::Execute<'q, Self::Database>,
     {
-        use futures_util::stream;
+        use futures_util::stream::{self, StreamExt};
         let sql = query.sql().to_string();
         let arguments = match query.take_arguments() {
             Ok(args) => args,
@@ -129,24 +135,37 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
             }
         };
         let inner = self.inner.clone();
-        Box::pin(stream::once(async move {
-            let result = run_query(&inner, &sql, arguments).await?;
-            Ok(either::Either::Left(result))
+        let outcome_fut = async move { run_one(&inner, &sql, arguments).await };
+        Box::pin(stream::once(outcome_fut).flat_map(|outcome| {
+            let items: Vec<Result<either::Either<SpgQueryResult, SpgRow>, Error>> = match outcome {
+                Ok(Outcome::Affected(qr)) => vec![Ok(either::Either::Left(qr))],
+                Ok(Outcome::Rows(rows)) => rows
+                    .into_iter()
+                    .map(|r| Ok(either::Either::Right(r)))
+                    .collect(),
+                Err(e) => vec![Err(e)],
+            };
+            stream::iter(items)
         }))
     }
 
     fn fetch_optional<'e, 'q: 'e, E>(
         self,
-        _query: E,
+        mut query: E,
     ) -> BoxFuture<'e, Result<Option<crate::SpgRow>, Error>>
     where
         'c: 'e,
         E: 'q + sqlx_core::executor::Execute<'q, Self::Database>,
     {
+        let sql = query.sql().to_string();
+        let arguments = query.take_arguments();
+        let inner = self.inner.clone();
         Box::pin(async move {
-            Err(Error::Protocol(
-                "SELECT decode path is v7.16.x — use sqlx::query().execute() for now".into(),
-            ))
+            let args = arguments.map_err(Error::Encode)?;
+            match run_one(&inner, &sql, args).await? {
+                Outcome::Rows(mut rows) => Ok(rows.drain(..).next()),
+                Outcome::Affected(_) => Ok(None),
+            }
         })
     }
 
@@ -192,13 +211,29 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
     }
 }
 
-async fn run_query(
+/// Outcome of a single dispatch — either rows-affected (DML / DDL)
+/// or a row stream (SELECT). The fetch helpers below convert this
+/// to sqlx's `Either<QueryResult, Row>` stream shape.
+enum Outcome {
+    /// DML / DDL statement returning a rows-affected counter.
+    Affected(SpgQueryResult),
+    /// SELECT result — every row already converted to an
+    /// [`SpgRow`].
+    Rows(Vec<SpgRow>),
+}
+
+async fn run_one(
     db: &AsyncDatabase,
     sql: &str,
     arguments: Option<crate::SpgArguments<'_>>,
-) -> Result<SpgQueryResult, Error> {
+) -> Result<Outcome, Error> {
+    // Single-dispatch: hit the engine once and inspect the
+    // returned QueryResult shape. The prepared path picks up
+    // the bind-final SQL via execute_prepared; the bare path
+    // reuses execute(). Both surface column metadata for SELECT
+    // via the engine's QueryResult::Rows variant directly so we
+    // never double-run a statement.
     let result: EngineQueryResult = if let Some(args) = arguments {
-        // Prepared path — bind the engine values.
         let stmt = db.prepare(sql).await.map_err(engine_to_sqlx)?;
         db.execute_prepared(&stmt, args.into_engine_values())
             .await
@@ -206,10 +241,45 @@ async fn run_query(
     } else {
         db.execute(sql).await.map_err(engine_to_sqlx)?
     };
-    let affected: u64 = match result {
-        EngineQueryResult::CommandOk { affected, .. } => u64::try_from(affected).unwrap_or(0),
+    match result {
+        EngineQueryResult::Rows { columns, rows } => {
+            let row_values: Vec<Vec<spg_embedded::Value>> =
+                rows.into_iter().map(|r| r.values).collect();
+            Ok(Outcome::Rows(build_rows(&columns, row_values)))
+        }
+        EngineQueryResult::CommandOk { affected, .. } => Ok(Outcome::Affected(
+            SpgQueryResult::new(u64::try_from(affected).unwrap_or(0)),
+        )),
+        _ => Ok(Outcome::Affected(SpgQueryResult::default())),
+    }
+}
+
+fn affected_from(qr: &EngineQueryResult) -> u64 {
+    match qr {
+        EngineQueryResult::CommandOk { affected, .. } => u64::try_from(*affected).unwrap_or(0),
         EngineQueryResult::Rows { rows, .. } => u64::try_from(rows.len()).unwrap_or(0),
         _ => 0,
-    };
-    Ok(SpgQueryResult::new(affected))
+    }
+}
+
+fn build_rows(
+    cols: &[spg_embedded::ColumnSchema],
+    rows: Vec<Vec<spg_embedded::Value>>,
+) -> Vec<SpgRow> {
+    let columns: Arc<Vec<SpgColumn>> = Arc::new(
+        cols.iter()
+            .enumerate()
+            .map(|(i, c)| {
+                SpgColumn::new(i, c.name.clone(), SpgTypeInfo::from_data_type(c.ty))
+            })
+            .collect(),
+    );
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    for (i, c) in cols.iter().enumerate() {
+        by_name.insert(c.name.clone(), i);
+    }
+    let by_name = Arc::new(by_name);
+    rows.into_iter()
+        .map(|values| SpgRow::new(Arc::clone(&columns), Arc::clone(&by_name), values))
+        .collect()
 }

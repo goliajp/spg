@@ -24,7 +24,7 @@ sqlx-core = { version = "0.8", default-features = false }
 # Type bridges. chrono + serde_json + uuid match the type set mailrs
 # uses against sqlx::Postgres today; surfacing them behind feature
 # flags so consumers pay only for what they reach.
-chrono     = { version = "0.4", default-features = false, optional = true }
+chrono     = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 serde_json = { version = "1",   optional = true }
 # Standard async machinery.
 futures-core = "0.3"
@@ -34,8 +34,10 @@ log         = "0.4"
 tokio       = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-tokio  = { version = "1", features = ["rt-multi-thread", "macros"] }
-sqlx   = { version = "0.8", default-features = false, features = ["runtime-tokio"] }
+tokio        = { version = "1", features = ["rt-multi-thread", "macros"] }
+sqlx         = { version = "0.8", default-features = false, features = ["runtime-tokio"] }
+chrono       = { version = "0.4", features = ["clock", "std"] }
+serde_json   = "1"
 
 [features]
 default = ["chrono", "json"]
