@@ -8,6 +8,47 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.12.8] — 2026-06-06 (docs + CI chore patch — no runtime change)
+
+Doc-and-CI patch on top of v7.12.7. Zero runtime change — the
+spg-engine / spg-server / etc binaries are byte-identical
+between v7.12.7 and v7.12.8. No need to upgrade
+`goliakk/spg:7.12.7` or the v7.12.7 crates.io artifacts; this
+tag is for the doc + CI surface only.
+
+What this tag carries that v7.12.7 didn't:
+
+- **`PG_MIGRATION.md` refreshed for the v7.12.7 ship surface.**
+  Was stuck at v7.3 ship-time and listed `tsvector` / `CREATE
+  TRIGGER` / `CREATE FUNCTION` / `INSERT … ON CONFLICT …` /
+  `RETURNING` as ❌ / ⚠️ — every one of those has shipped.
+  Customers reading the doc were getting wrong "use Meilisearch
+  / talk to your app team about a workaround" answers. New
+  §Full-text search (13 rows) and §PL/pgSQL triggers (14 rows)
+  sections cover the v7.12.0–7 surface; A7 §What we won't add
+  picks up its third narrowing note (FK in v7.5, ON CONFLICT
+  in v7.9, CREATE TRIGGER + CREATE FUNCTION in v7.12).
+- **`prod_ready` CI gate restored.** Was
+  `continue-on-error: true` since v7.11.x when the source docs
+  moved into `.claude/internal-docs/`. The harness has had a
+  graceful skip-on-missing path for a while (45 / 45 on master
+  CI), so the soft-fail is dead weight masking real
+  regressions. Dropped.
+- **Secret scanning: gitleaks → trufflehog.**
+  `gitleaks/gitleaks-action@v2` added an org-license gate in
+  2026 (the reason it was also `continue-on-error: true`).
+  trufflehog is free for OSS / org use and `--only-verified`
+  mode probes credentials against the issuing service before
+  reporting — sharper signal-to-noise than gitleaks's pattern
+  match. Prod-ready row 3.7 follows
+  (`row_3_7_gitleaks_in_ci` → `row_3_7_secret_scan_in_ci`).
+
+Sub-version commit count: 3 chore commits (no feature work).
+No catalog FILE_VERSION change. No crates.io re-publish, no
+docker rebuild — the binaries are unchanged.
+
+---
+
 ## [7.12.7] — 2026-06-06 (G-CRIT-3 epic — full PG FTS + PL/pgSQL trigger surface)
 
 Series ship rollup for the v7.12 G-CRIT-3 epic. Closes the
