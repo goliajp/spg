@@ -997,6 +997,74 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // implicit BIGSERIAL counter.
         "nextval" | "currval" | "lastval" => Ok(Value::Null),
         "setval" => Ok(args.first().cloned().unwrap_or(Value::Null)),
+        // v7.15.0 — pg_trgm: similarity, show_trgm. Match PG
+        // semantics: similarity returns Jaccard of trigram sets;
+        // show_trgm returns the trigram set as TEXT[]. NULL on
+        // any NULL arg.
+        "similarity" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("similarity() takes 2 args, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let a = match &args[0] {
+                Value::Text(s) => s.as_str(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "similarity() needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let b = match &args[1] {
+                Value::Text(s) => s.as_str(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "similarity() needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // PG returns REAL (f32) — we use Float (f64) and let
+            // coerce_value narrow on assignment to a REAL column.
+            Ok(Value::Float(spg_storage::trgm::similarity(a, b)))
+        }
+        "show_trgm" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("show_trgm() takes 1 arg, got {}", args.len()),
+                });
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let s = match &args[0] {
+                Value::Text(s) => s.as_str(),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "show_trgm() needs text, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // PG returns the trigram set sorted lexicographically.
+            // `extract_trigrams` already returns a BTreeSet so the
+            // order is canonical.
+            let trigrams: Vec<Option<String>> = spg_storage::trgm::extract_trigrams(s)
+                .into_iter()
+                .map(Some)
+                .collect();
+            Ok(Value::TextArray(trigrams))
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("unknown function `{other}`"),
         }),

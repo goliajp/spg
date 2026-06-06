@@ -3998,7 +3998,26 @@ impl Engine {
                             column: stmt.column.clone(),
                         })
                     })?;
-                if table.schema().columns[col_pos].ty == spg_storage::DataType::TsVector {
+                let col_ty = table.schema().columns[col_pos].ty;
+                // v7.15.0 — `gin_trgm_ops` on a TEXT/VARCHAR
+                // column dispatches to the real trigram-shingle
+                // GIN build (LIKE / similarity acceleration).
+                // Other GIN opclasses fall through to the regular
+                // tsvector-vs-BTree split below.
+                let is_trgm = stmt
+                    .opclass
+                    .as_deref()
+                    .is_some_and(|op| op.eq_ignore_ascii_case("gin_trgm_ops"));
+                if is_trgm
+                    && matches!(
+                        col_ty,
+                        spg_storage::DataType::Text | spg_storage::DataType::Varchar(_)
+                    )
+                {
+                    table
+                        .add_gin_trgm_index(stmt.name.clone(), &stmt.column)
+                        .map_err(EngineError::Storage)?;
+                } else if col_ty == spg_storage::DataType::TsVector {
                     table
                         .add_gin_index(stmt.name.clone(), &stmt.column)
                         .map_err(EngineError::Storage)?;
@@ -5365,13 +5384,23 @@ impl Engine {
         let indexed_rows: Option<Vec<Cow<'_, Row>>> = stmt.where_.as_ref().and_then(|w| {
             // BTree / col=literal seek first — covers the v7.11.3 multi-
             // column AND case and the leading-column equality lookup.
-            try_index_seek(w, schema_cols, self.active_catalog(), table, alias).or_else(|| {
-                // v7.12.3 — GIN-accelerated `WHERE col @@ tsquery`
-                // when the column has a `USING gin` index. Returns an
-                // over-approximate candidate set; the WHERE re-eval
-                // loop below verifies the full `@@` predicate per row.
-                try_gin_seek(w, schema_cols, self.active_catalog(), table, alias, &ctx)
-            })
+            try_index_seek(w, schema_cols, self.active_catalog(), table, alias)
+                .or_else(|| {
+                    // v7.12.3 — GIN-accelerated `WHERE col @@
+                    // tsquery` when the column has a `USING gin`
+                    // index. Returns an over-approximate candidate
+                    // set; the WHERE re-eval loop below verifies
+                    // the full `@@` predicate per row.
+                    try_gin_seek(w, schema_cols, self.active_catalog(), table, alias, &ctx)
+                })
+                .or_else(|| {
+                    // v7.15.0 — trigram-GIN-accelerated
+                    // `WHERE col LIKE / ILIKE '<pat>'` when the
+                    // column has a `gin_trgm_ops` GIN index.
+                    // Over-approximate candidate set; the WHERE
+                    // re-eval verifies the LIKE per row.
+                    try_trgm_seek(w, schema_cols, table, alias)
+                })
         });
 
         // Aggregate path: filter rows first, then hand off to the
@@ -6115,6 +6144,120 @@ fn try_gin_seek<'a>(
             // same hot-only candidate set so correctness is preserved.
             spg_storage::RowLocator::Cold { .. } => {}
         }
+    }
+    Some(out)
+}
+
+/// v7.15.0 — trigram-GIN-accelerated candidate seek for
+/// `WHERE col LIKE '<pat>'` and `WHERE col ILIKE '<pat>'` when
+/// the column has a `gin_trgm_ops` GIN index.
+///
+/// Walks top-level `AND` so multi-predicate WHEREs (`col LIKE
+/// 'foo%' AND id > 1`) still hit the trigram index; the caller
+/// re-evaluates the full WHERE per candidate row, so dropping
+/// non-LIKE conjuncts here stays semantically correct.
+///
+/// Returns `None` when:
+///   - no leaf is `col LIKE/ILIKE <literal>` on a trigram-GIN-
+///     indexed column;
+///   - the pattern's literal runs are too short to constrain
+///     (pattern decomposes into `< 3`-char runs, e.g. `%ab%`);
+///   - the pattern doesn't const-evaluate to a TEXT.
+fn try_trgm_seek<'a>(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &'a Table,
+    table_alias: &str,
+) -> Option<Vec<Cow<'a, Row>>> {
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::And,
+        rhs,
+    } = where_expr
+    {
+        if let Some(rows) = try_trgm_seek(lhs, schema_cols, table, table_alias) {
+            return Some(rows);
+        }
+        return try_trgm_seek(rhs, schema_cols, table, table_alias);
+    }
+    // LIKE node is what carries the column reference + pattern.
+    // ILIKE is the same AST node — PG's LIKE/ILIKE both lower
+    // through `Expr::Like { expr, pattern, negated }`. The trigram
+    // index posting-list keys are already lower-cased and
+    // case-folded, so we only need the pattern's literal runs.
+    let Expr::Like {
+        expr, pattern, ..
+    } = where_expr
+    else {
+        return None;
+    };
+    // Column side.
+    let Expr::Column(c) = expr.as_ref() else {
+        return None;
+    };
+    if let Some(q) = &c.qualifier
+        && q != table_alias
+    {
+        return None;
+    }
+    let col_pos = schema_cols
+        .iter()
+        .position(|s| s.name.eq_ignore_ascii_case(&c.name))?;
+    // Index must exist on that column AND be a trigram-GIN.
+    let idx = table
+        .indices()
+        .iter()
+        .find(|i| i.column_position == col_pos && i.is_gin_trgm())?;
+    // Pattern side must be a literal TEXT — anything else (column
+    // ref, function call, parameter that hasn't been bound yet)
+    // falls through to full scan.
+    let Expr::Literal(spg_sql::ast::Literal::String(pat)) = pattern.as_ref() else {
+        return None;
+    };
+    let trigrams = spg_storage::trgm::trigrams_from_like_pattern(pat)?;
+    // Intersect every trigram's posting list. Empty intersection
+    // → empty candidate set (caller short-circuits its row loop).
+    let mut iter = trigrams.iter();
+    let first = iter.next()?;
+    let mut acc: Vec<spg_storage::RowLocator> = {
+        let mut v = idx.gin_trgm_lookup(first).to_vec();
+        v.sort_by_key(locator_sort_key);
+        v.dedup_by_key(|l| locator_sort_key(l));
+        v
+    };
+    for tri in iter {
+        let mut next: Vec<spg_storage::RowLocator> = idx.gin_trgm_lookup(tri).to_vec();
+        next.sort_by_key(locator_sort_key);
+        next.dedup_by_key(|l| locator_sort_key(l));
+        // Sorted-merge intersection.
+        let mut merged: Vec<spg_storage::RowLocator> = Vec::with_capacity(acc.len().min(next.len()));
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < acc.len() && j < next.len() {
+            let lk = locator_sort_key(&acc[i]);
+            let rk = locator_sort_key(&next[j]);
+            match lk.cmp(&rk) {
+                core::cmp::Ordering::Less => i += 1,
+                core::cmp::Ordering::Greater => j += 1,
+                core::cmp::Ordering::Equal => {
+                    merged.push(acc[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        acc = merged;
+        if acc.is_empty() {
+            break;
+        }
+    }
+    let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(acc.len());
+    for loc in acc {
+        if let spg_storage::RowLocator::Hot(i) = loc
+            && let Some(row) = table.rows().get(i)
+        {
+            out.push(Cow::Borrowed(row));
+        }
+        // Cold-tier rows: skipped in MVP (same as try_gin_seek).
     }
     Some(out)
 }

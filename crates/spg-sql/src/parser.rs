@@ -3532,6 +3532,7 @@ impl Parser {
         // (`advance()` uses `mem::replace` to nil out the current
         // slot, so we can't save+rewind cleanly — peek-ahead via
         // direct index avoids the mutation.)
+        let mut opclass: Option<String> = None;
         let (column, expression): (String, Option<Expr>) = match self.peek().clone() {
             // Single column with `)` immediately after — fast path.
             // v7.9.29 — also: bare column followed by `,` (the
@@ -3550,11 +3551,13 @@ impl Parser {
             }
             // v7.9.22 — single column followed by a pgvector
             // opclass ident: `(col vector_cosine_ops)`. mailrs G5.
-            // SPG's HNSW currently picks its distance metric from
-            // the query's operator (`<->` / `<#>` / `<=>`), so the
-            // opclass is informational — accepted and discarded.
-            // Recognised opclasses: vector_cosine_ops, vector_l2_ops,
-            // vector_ip_ops, halfvec_*_ops, sq8_*_ops.
+            // v7.15.0 — capture the opclass instead of discarding
+            // it so the engine can dispatch (e.g. `gin_trgm_ops`
+            // → real trigram-shingle GIN over a TEXT column).
+            // Vector/HNSW opclasses still take their distance
+            // metric from the query operator (`<->` / `<#>` /
+            // `<=>`), so for those callers the opclass stays
+            // informational.
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     self.tokens.get(self.pos + 1),
@@ -3563,7 +3566,12 @@ impl Parser {
                 ) =>
             {
                 self.advance(); // column name
-                self.advance(); // opclass ident — drop
+                // Capture the opclass token, lower-cased for
+                // case-insensitive engine dispatch.
+                let op_tok = self.advance();
+                if let Token::Ident(op) | Token::QuotedIdent(op) = op_tok {
+                    opclass = Some(op.to_ascii_lowercase());
+                }
                 (s, None)
             }
             Token::Ident(_) | Token::QuotedIdent(_) => {
@@ -3704,6 +3712,7 @@ impl Parser {
             extra_columns: extra_columns.clone(),
             expression,
             is_unique,
+            opclass,
         }))
     }
 

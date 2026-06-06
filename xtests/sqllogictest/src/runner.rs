@@ -220,6 +220,13 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
         Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
         Value::Json(s) => s.clone(),
+        // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side
+        // canonical text form so fixtures can assert on
+        // array-returning functions (`show_trgm`, `string_to_array`,
+        // …) instead of debug-format strings.
+        Value::TextArray(items) => spg_engine::eval::format_text_array(items),
+        Value::IntArray(items) => spg_engine::eval::format_int_array(items),
+        Value::BigIntArray(items) => spg_engine::eval::format_bigint_array(items),
         // v7.5.0 — Value is #[non_exhaustive]; Debug-form fallback
         // for any future variant.
         _ => format!("{v:?}"),
