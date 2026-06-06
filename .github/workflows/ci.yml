@@ -163,25 +163,29 @@ jobs:
     # v4.32 originally used gitleaks/gitleaks-action@v2 for secret
     # scanning. gitleaks v2 added an org-license gate in 2026 that
     # would have us paying per-month; v7.12.8 swaps to trufflehog
-    # which stays free for OSS / org use.
+    # which stays free for OSS / org use. v7.12.9 hotfix narrows
+    # the trigger config — passing `base: default_branch + head:
+    # HEAD` on a push-to-master event tells trufflehog the diff is
+    # master..master (empty) and the action errors out with "BASE
+    # and HEAD commits are the same".
     #
-    # Scope: scan the commit range introduced by this push / PR
-    # (`--since-commit` from the base) for any high-entropy string
-    # or recognised credential format (AWS keys, GH PATs, JWTs,
-    # Stripe / Twilio / etc). `--only-verified` cuts false-
-    # positives — trufflehog actually probes the candidate string
-    # against the issuing service's auth endpoint before reporting,
-    # so what fires here is a credential that *currently works*.
+    # Fix: drop the explicit base/head, omit `path` (so the action
+    # picks its event-aware default). The action then:
+    #   - on push, scans the commits introduced by the push range
+    #   - on pull_request, scans the PR's diff vs the base ref
+    #   - on workflow_dispatch / schedule, scans the whole tree
+    #
+    # `--results=verified,unknown` keeps the signal high — only
+    # credentials the action could actually probe against an
+    # issuing service (verified) plus genuinely-novel matches
+    # the action's analyzers don't recognise (unknown).
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - name: trufflehog scan
         uses: trufflesecurity/trufflehog@main
         with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          extra_args: --only-verified
+          extra_args: --results=verified,unknown
 
   release-build:
     name: release build (sanity)
