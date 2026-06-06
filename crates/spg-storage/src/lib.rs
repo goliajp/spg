@@ -31,7 +31,7 @@ pub use self::segment::{
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -1722,6 +1722,32 @@ impl Table {
         self.rows = new_rows;
     }
 
+    /// v7.15.0 — replace the partial-index predicate source on
+    /// the index at slot `idx`. Used by `ALTER TABLE … RENAME
+    /// COLUMN` after the engine rewrites column-identifier
+    /// references in the predicate source text. Pure metadata
+    /// edit; index rows are unaffected (they're keyed by
+    /// column position, not predicate text).
+    pub fn set_partial_predicate(&mut self, idx: usize, pred: Option<String>) {
+        debug_assert!(idx < self.indices.len());
+        self.indices[idx].partial_predicate = pred;
+    }
+
+    /// v7.15.0 — rename the column at `col_pos` to `new_name`.
+    /// The on-disk row encoding is positional, so no row rewrite
+    /// is needed; only the schema's column name changes. Indices,
+    /// UCs, FKs all key off column positions and are unaffected.
+    /// Source-text references that hold the column name (CHECK
+    /// predicates, partial-index predicates, runtime DEFAULT
+    /// expressions, trigger `UPDATE OF` lists) are rewritten by
+    /// the engine before this helper is called — the storage
+    /// layer doesn't depend on `spg-sql` and so can't re-parse the
+    /// predicate sources itself.
+    pub fn rename_column(&mut self, col_pos: usize, new_name: &str) {
+        debug_assert!(col_pos < self.schema.columns.len());
+        self.schema.columns[col_pos].name = new_name.to_string();
+    }
+
     /// v7.13.3 — drop the column at `col_pos`. Removes the entry
     /// from the schema, the value from every row, any index that
     /// references the column (pure drop, not shift), and shifts
@@ -3201,6 +3227,14 @@ impl Catalog {
     /// timing) and fire matches in slice order.
     pub fn triggers(&self) -> &[TriggerDef] {
         &self.triggers
+    }
+
+    /// v7.15.0 — mutable handle to the trigger slice for
+    /// `ALTER TABLE … RENAME COLUMN`, which rewrites every
+    /// `update_columns` entry that referenced the renamed
+    /// column.
+    pub fn triggers_mut(&mut self) -> &mut Vec<TriggerDef> {
+        &mut self.triggers
     }
 
     /// v7.12.4 — register a new trigger. With `or_replace = false`,

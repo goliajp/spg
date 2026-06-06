@@ -3764,6 +3764,102 @@ impl Engine {
                 // row + schema + index shift atomically.
                 table.drop_column(col_pos);
             }
+            spg_sql::ast::AlterTableTarget::RenameColumn { old, new } => {
+                // v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO
+                // new`. Rename the column in the schema; rewrite
+                // every stored source string on this table that
+                // references it as a (potentially-qualified)
+                // column identifier: CHECK predicates, partial-
+                // index predicates, runtime DEFAULT expressions.
+                // Then walk catalog triggers on this table and
+                // patch any `UPDATE OF` column list. Function and
+                // trigger bodies are NOT auto-rewritten — that
+                // surface is dynamic SQL territory; users update
+                // those separately (matches PG plpgsql behavior:
+                // a column rename invalidates name-referencing
+                // plpgsql at call time, not rename time).
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.into(),
+                    })
+                })?;
+                let col_pos = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&old))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "ALTER TABLE RENAME COLUMN: column {old:?} not found on {:?}",
+                            s.name
+                        ))
+                    })?;
+                // Reject same-name (case-insensitive) collision.
+                if table
+                    .schema()
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| i != col_pos && c.name.eq_ignore_ascii_case(&new))
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE RENAME COLUMN: column {new:?} already exists on {:?}",
+                        s.name
+                    )));
+                }
+                // Schema rename first — even idempotent same-name
+                // rename (`ALTER TABLE t RENAME a TO a`) needs to
+                // be a no-op, not an error.
+                if old.eq_ignore_ascii_case(&new) {
+                    return Ok(());
+                }
+                table.rename_column(col_pos, &new);
+                // Rewrite per-column runtime_default sources on
+                // every column of this table — a DEFAULT expression
+                // on column X may reference column Y by name (rare,
+                // but legal in PG when the value is supplied via a
+                // function that takes the row).
+                let n_cols = table.schema().columns.len();
+                for i in 0..n_cols {
+                    let rt = table.schema().columns[i].runtime_default.clone();
+                    if let Some(src) = rt {
+                        let rewritten = rewrite_column_in_source(&src, &old, &new)?;
+                        table.schema_mut().columns[i].runtime_default = Some(rewritten);
+                    }
+                }
+                // Rewrite table-level CHECK predicates.
+                let checks = table.schema().checks.clone();
+                let mut new_checks = Vec::with_capacity(checks.len());
+                for chk in checks {
+                    new_checks.push(rewrite_column_in_source(&chk, &old, &new)?);
+                }
+                table.schema_mut().checks = new_checks;
+                // Rewrite per-index partial_predicate sources.
+                let n_idx = table.indices().len();
+                for i in 0..n_idx {
+                    let pred = table.indices()[i].partial_predicate.clone();
+                    if let Some(src) = pred {
+                        let rewritten = rewrite_column_in_source(&src, &old, &new)?;
+                        // SAFETY: indices_mut would be cleanest, but
+                        // partial_predicate is the only mutable field
+                        // here; reach in via the public mut accessor.
+                        table.set_partial_predicate(i, Some(rewritten));
+                    }
+                }
+                // Walk catalog triggers; patch `update_columns` on
+                // triggers attached to this table.
+                let table_name = s.name.to_string();
+                for trig in self.active_catalog_mut().triggers_mut() {
+                    if !trig.table.eq_ignore_ascii_case(&table_name) {
+                        continue;
+                    }
+                    for c in &mut trig.update_columns {
+                        if c.eq_ignore_ascii_case(&old) {
+                            *c = new.clone();
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -8807,6 +8903,118 @@ fn format_numeric(scaled: i128, scale: u8) -> String {
 /// `params.len()`. Out-of-range happens when the Bind didn't
 /// supply enough values; pgwire surfaces this as a protocol error
 /// to the client.
+/// v7.15.0 — rewrite every (potentially-qualified) column
+/// identifier matching `old` to `new` in a stored SQL source
+/// string. Used by `ALTER TABLE … RENAME COLUMN` to patch
+/// CHECK predicate sources, partial-index predicate sources,
+/// and runtime DEFAULT expression sources before they get
+/// re-parsed on the next INSERT/UPDATE.
+///
+/// Round-trips through the parser, so the rewritten output is
+/// the canonical Display form (matches what the engine stores
+/// for fresh predicates). If the source doesn't parse, surfaces
+/// the parse error — the invariant that stored predicates are
+/// in canonical Display form means a parse failure here is a
+/// real bug, not a user mistake to swallow.
+fn rewrite_column_in_source(
+    src: &str,
+    old: &str,
+    new: &str,
+) -> Result<alloc::string::String, EngineError> {
+    let mut expr = spg_sql::parser::parse_expression(src).map_err(|e| {
+        EngineError::Unsupported(alloc::format!(
+            "ALTER TABLE RENAME COLUMN: stored predicate source {src:?} \
+             failed to parse for rewrite ({e})"
+        ))
+    })?;
+    rewrite_column_in_expr(&mut expr, old, new);
+    Ok(alloc::format!("{expr}"))
+}
+
+/// v7.15.0 — Expr walker that swaps `Expr::Column { name: old, .. }`
+/// for `Expr::Column { name: new, .. }`. Qualifier is preserved
+/// (e.g. `t.old` → `t.new`); a foreign-table qualifier still
+/// gets rewritten because the AST has no way to tell us this
+/// predicate is on table T versus table T2 — predicate sources
+/// in SPG are always scoped to the owning table, so any
+/// qualifier present is either redundant or wrong.
+fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
+    match e {
+        Expr::Column(c) => {
+            if c.name.eq_ignore_ascii_case(old) {
+                c.name = new.to_string();
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_column_in_expr(lhs, old, new);
+            rewrite_column_in_expr(rhs, old, new);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_column_in_expr(expr, old, new);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                rewrite_column_in_expr(a, old, new);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            rewrite_column_in_expr(expr, old, new);
+            rewrite_column_in_expr(pattern, old, new);
+        }
+        Expr::Extract { source, .. } => rewrite_column_in_expr(source, old, new),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                rewrite_column_in_expr(a, old, new);
+            }
+            for p in partition_by {
+                rewrite_column_in_expr(p, old, new);
+            }
+            for (o, _) in order_by {
+                rewrite_column_in_expr(o, old, new);
+            }
+        }
+        Expr::Array(items) => {
+            for elem in items {
+                rewrite_column_in_expr(elem, old, new);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            rewrite_column_in_expr(target, old, new);
+            rewrite_column_in_expr(index, old, new);
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            rewrite_column_in_expr(expr, old, new);
+            rewrite_column_in_expr(array, old, new);
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                rewrite_column_in_expr(o, old, new);
+            }
+            for (w, t) in branches {
+                rewrite_column_in_expr(w, old, new);
+                rewrite_column_in_expr(t, old, new);
+            }
+            if let Some(e) = else_branch {
+                rewrite_column_in_expr(e, old, new);
+            }
+        }
+        // Stored predicate sources never contain subqueries —
+        // CHECK / partial-index / runtime_default are all scalar.
+        // If a future feature changes that, recurse here.
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+        Expr::Literal(_) | Expr::Placeholder(_) => {}
+    }
+}
+
 fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result<(), EngineError> {
     match stmt {
         Statement::Select(s) => substitute_select(s, params)?,
