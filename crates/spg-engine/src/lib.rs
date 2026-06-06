@@ -2691,6 +2691,16 @@ impl Engine {
                 .collect();
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &self_fks, &new_rows)?;
         }
+        // v7.13.0 — CHECK constraint enforcement on UPDATE
+        // (mailrs round-5 G3). Predicates evaluated against the
+        // candidate post-UPDATE row; false rejects the UPDATE.
+        {
+            let new_rows: Vec<Vec<Value>> = planned
+                .iter()
+                .map(|(_pos, new_vals)| new_vals.clone())
+                .collect();
+            enforce_check_constraints(self.active_catalog(), &stmt.table, &new_rows)?;
+        }
         // v7.6.6 — Stage 2b: inbound FK check. For every row that
         // changed value in a column that *some other table* uses as
         // a FK parent column, react per `on_update` action.
@@ -3324,6 +3334,64 @@ impl Engine {
                     )));
                 }
             }
+            spg_sql::ast::AlterTableTarget::AddColumn {
+                column,
+                if_not_exists,
+            } => {
+                // v7.13.0 — mailrs round-5 G1. Append-only column add
+                // with back-fill of the DEFAULT (or NULL) into every
+                // existing row. Column positions don't shift, so we
+                // skip index rebuild.
+                let clock = self.clock;
+                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.clone(),
+                    })
+                })?;
+                if table
+                    .schema()
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+                {
+                    if if_not_exists {
+                        return Ok(QueryResult::CommandOk {
+                            affected: 0,
+                            modified_catalog: !self.in_transaction(),
+                        });
+                    }
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE ADD COLUMN: column {:?} already exists on {:?}",
+                        column.name,
+                        s.name
+                    )));
+                }
+                let col_name = column.name.clone();
+                let nullable = column.nullable;
+                let has_default =
+                    column.default.is_some() || column.auto_increment;
+                let col_schema = column_def_to_schema(column)?;
+                let row_count = table.row_count();
+                // Compute the back-fill value. Literal / runtime DEFAULT
+                // funnels through the same resolver that INSERT uses
+                // (v7.9.21 `resolve_column_default_free`). NULL when
+                // the column is nullable and has no DEFAULT. NOT NULL
+                // without DEFAULT errors when the table has existing
+                // rows — same as PG.
+                let fill_value: Value = if has_default
+                    || col_schema.runtime_default.is_some()
+                {
+                    resolve_column_default_free(&col_schema, clock)?
+                } else if nullable || row_count == 0 {
+                    Value::Null
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE ADD COLUMN {col_name:?}: NOT NULL column requires DEFAULT \
+                         when the table has existing rows"
+                    )));
+                };
+                table.add_column(col_schema, fill_value);
+            }
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
@@ -3641,12 +3709,23 @@ impl Engine {
         // UniquenessConstraints (column name → position) so the
         // INSERT enforcement helper sees positions directly.
         let mut uc_storage: Vec<spg_storage::UniquenessConstraint> = Vec::new();
+        let mut check_exprs: Vec<String> = Vec::new();
         for tc in &stmt.table_constraints {
-            let (is_pk, names) = match tc {
+            let (is_pk, names, nnd) = match tc {
                 spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
-                    (true, columns.clone())
+                    (true, columns.clone(), false)
                 }
-                spg_sql::ast::TableConstraint::Unique { columns, .. } => (false, columns.clone()),
+                spg_sql::ast::TableConstraint::Unique {
+                    columns,
+                    nulls_not_distinct,
+                    ..
+                } => (false, columns.clone(), *nulls_not_distinct),
+                spg_sql::ast::TableConstraint::Check { expr, .. } => {
+                    // v7.13.0 — collect CHECK predicate sources;
+                    // they get attached to the schema below.
+                    check_exprs.push(alloc::format!("{expr}"));
+                    continue;
+                }
             };
             let mut positions = Vec::with_capacity(names.len());
             for n in &names {
@@ -3664,9 +3743,11 @@ impl Engine {
             uc_storage.push(spg_storage::UniquenessConstraint {
                 is_primary_key: is_pk,
                 columns: positions,
+                nulls_not_distinct: nnd,
             });
         }
         schema.uniqueness_constraints = uc_storage.clone();
+        schema.checks = check_exprs;
         self.active_catalog_mut().create_table(schema)?;
         // v7.9.13 — implicit BTree per inline PK column +
         // v7.9.19 — implicit BTree on the leading column of every
@@ -3689,6 +3770,7 @@ impl Engine {
             let (is_pk, names) = match tc {
                 spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => (true, columns),
                 spg_sql::ast::TableConstraint::Unique { columns, .. } => (false, columns),
+                spg_sql::ast::TableConstraint::Check { .. } => continue,
             };
             let leading = &names[0];
             // Skip if a same-column BTree already exists (e.g.
@@ -3861,6 +3943,8 @@ impl Engine {
         if !fks.is_empty() {
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
         }
+        // v7.13.0 — CHECK constraint enforcement (mailrs round-5 G3).
+        enforce_check_constraints(self.active_catalog(), &stmt.table, &all_values)?;
         // v7.9.19 — composite UNIQUE / PRIMARY KEY enforcement.
         enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
         // v7.9.29 — CREATE UNIQUE INDEX [WHERE pred] enforcement.
@@ -8989,7 +9073,11 @@ fn enforce_uniqueness_inserts(
         for (batch_idx, row_values) in rows.iter().enumerate() {
             let key: Vec<&Value> = uc.columns.iter().map(|&i| &row_values[i]).collect();
             let has_null = key.iter().any(|v| matches!(v, Value::Null));
-            if has_null {
+            // v7.13.0 — `NULLS NOT DISTINCT` (mailrs round-5 G10,
+            // PG 15+): two rows whose constrained columns are all
+            // NULL collide. SQL-standard `NULLS DISTINCT` lets any
+            // NULL skip the check.
+            if has_null && !uc.nulls_not_distinct {
                 continue;
             }
             // Table-side collision: scan existing rows.
@@ -9200,6 +9288,56 @@ fn enforce_unique_index_inserts(
                         idx.name
                     )));
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.13.0 — evaluate every CHECK predicate on the schema against
+/// each candidate row. Mirrors PG semantics: a `false` result
+/// rejects the mutation; a NULL result *passes* (CHECK rejects
+/// only on definite-false, not on unknown). mailrs round-5 G3.
+fn enforce_check_constraints(
+    catalog: &Catalog,
+    table_name: &str,
+    rows: &[alloc::vec::Vec<spg_storage::Value>],
+) -> Result<(), EngineError> {
+    let table = catalog.get(table_name).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: table_name.into(),
+        })
+    })?;
+    let schema = table.schema();
+    if schema.checks.is_empty() {
+        return Ok(());
+    }
+    let ctx = eval::EvalContext::new(&schema.columns, None);
+    let mut parsed: alloc::vec::Vec<(usize, Expr)> = alloc::vec::Vec::new();
+    for (i, src) in schema.checks.iter().enumerate() {
+        let expr = spg_sql::parser::parse_expression(src).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "CHECK constraint #{i} on {table_name:?} ({src:?}) failed to re-parse: {e:?}"
+            ))
+        })?;
+        parsed.push((i, expr));
+    }
+    for (batch_idx, row_values) in rows.iter().enumerate() {
+        let tmp_row = spg_storage::Row {
+            values: row_values.clone(),
+        };
+        for (i, expr) in &parsed {
+            let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "CHECK constraint #{i} on {table_name:?} eval at row #{batch_idx}: {e:?}"
+                ))
+            })?;
+            // PG: NULL passes (CHECK rejects on definite-false only).
+            if matches!(v, spg_storage::Value::Bool(false)) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CHECK constraint violation on {table_name:?} (row #{batch_idx}): {:?}",
+                    schema.checks[*i]
+                )));
             }
         }
     }

@@ -1728,12 +1728,56 @@ impl Parser {
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
-                // Optional `CONSTRAINT <name>` prefix, then the same
-                // FK clause shape as table-level CREATE TABLE FK.
-                let fk = self.parse_table_level_fk()?;
+                // v7.13.0 — dispatch on the next token. `CONSTRAINT` /
+                // `FOREIGN` route to the FK arm (existing v7.6.8
+                // behaviour). `COLUMN` and any bare identifier that
+                // isn't one of those keywords route to ADD COLUMN.
+                // mailrs round-5 G1.
+                let is_fk = matches!(
+                    self.peek(),
+                    Token::Ident(s) if s.eq_ignore_ascii_case("constraint")
+                        || s.eq_ignore_ascii_case("foreign")
+                );
+                if is_fk {
+                    let fk = self.parse_table_level_fk()?;
+                    return Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
+                        name: table_name,
+                        target: crate::ast::AlterTableTarget::AddForeignKey(fk),
+                    }));
+                }
+                // Optional `COLUMN` keyword (PG accepts either form;
+                // ADD COLUMN is the canonical spelling).
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
+                    self.advance();
+                }
+                // Optional `IF NOT EXISTS` — skipped silently when the
+                // column already exists at engine time.
+                let mut if_not_exists = false;
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
+                    self.advance();
+                    if !matches!(self.peek(), Token::Not) {
+                        return Err(self.err(alloc::format!(
+                            "expected NOT after IF in ALTER TABLE ADD COLUMN, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exists")) {
+                        return Err(self.err(alloc::format!(
+                            "expected EXISTS after IF NOT in ALTER TABLE ADD COLUMN, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if_not_exists = true;
+                }
+                let column = self.parse_column_def()?;
                 Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
                     name: table_name,
-                    target: crate::ast::AlterTableTarget::AddForeignKey(fk),
+                    target: crate::ast::AlterTableTarget::AddColumn {
+                        column,
+                        if_not_exists,
+                    },
                 }))
             }
             Token::Drop => {
@@ -1984,10 +2028,29 @@ impl Parser {
                 table_constraints.push(self.parse_table_level_primary_key()?);
             } else if self.peek_table_level_unique_start() {
                 table_constraints.push(self.parse_table_level_unique()?);
+            } else if self.peek_table_level_check_start() {
+                // v7.13.0 — table-level CHECK (mailrs round-5 G3).
+                table_constraints.push(self.parse_table_level_check()?);
             } else if self.peek_constraint_or_fk_start() {
                 foreign_keys.push(self.parse_table_level_fk()?);
             } else {
                 let (col, col_level_fk) = self.parse_column_def_with_fk()?;
+                // v7.13.0 — fold inline UNIQUE / CHECK column
+                // constraints into table-level entries so the
+                // engine path stays uniform.
+                if col.is_unique {
+                    table_constraints.push(crate::ast::TableConstraint::Unique {
+                        name: None,
+                        columns: alloc::vec![col.name.clone()],
+                        nulls_not_distinct: false,
+                    });
+                }
+                if let Some(check_expr) = col.check.clone() {
+                    table_constraints.push(crate::ast::TableConstraint::Check {
+                        name: None,
+                        expr: check_expr,
+                    });
+                }
                 columns.push(col);
                 if let Some(fk) = col_level_fk {
                     foreign_keys.push(fk);
@@ -2035,12 +2098,39 @@ impl Parser {
     }
 
     /// v7.9.18 — true when the next tokens are `UNIQUE (…)`.
+    /// v7.13.0 — also matches `UNIQUE NULLS [NOT] DISTINCT (…)`
+    /// (mailrs round-5 G10).
     fn peek_table_level_unique_start(&self) -> bool {
         let cur = self.peek();
-        let nxt = self.tokens.get(self.pos + 1);
         let is_unique = matches!(cur, Token::Ident(s) if s.eq_ignore_ascii_case("unique"));
-        let is_lparen = matches!(nxt, Some(Token::LParen));
-        is_unique && is_lparen
+        if !is_unique {
+            return false;
+        }
+        let n1 = self.tokens.get(self.pos + 1);
+        // Plain `UNIQUE (…)`.
+        if matches!(n1, Some(Token::LParen)) {
+            return true;
+        }
+        // `UNIQUE NULLS [NOT] DISTINCT (…)`.
+        let is_nulls = matches!(n1, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("nulls"));
+        if !is_nulls {
+            return false;
+        }
+        let n2 = self.tokens.get(self.pos + 2);
+        let n3 = self.tokens.get(self.pos + 3);
+        let n4 = self.tokens.get(self.pos + 4);
+        // `UNIQUE NULLS DISTINCT (…)` — 4 tokens before `(`.
+        if matches!(n2, Some(Token::Distinct)) && matches!(n3, Some(Token::LParen)) {
+            return true;
+        }
+        // `UNIQUE NULLS NOT DISTINCT (…)` — 5 tokens before `(`.
+        if matches!(n2, Some(Token::Not))
+            && matches!(n3, Some(Token::Distinct))
+            && matches!(n4, Some(Token::LParen))
+        {
+            return true;
+        }
+        false
     }
 
     fn parse_table_level_primary_key(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
@@ -2055,11 +2145,59 @@ impl Parser {
 
     fn parse_table_level_unique(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
         self.advance(); // UNIQUE
+        // v7.13.0 — optional `NULLS NOT DISTINCT` modifier
+        // (mailrs round-5 G10, PG 15+ surface). Default behaviour
+        // is `NULLS DISTINCT` per the SQL standard.
+        let mut nulls_not_distinct = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("nulls")) {
+            let n1 = self.tokens.get(self.pos + 1);
+            let n2 = self.tokens.get(self.pos + 2);
+            let is_not = matches!(n1, Some(Token::Not));
+            let is_distinct = matches!(n2, Some(Token::Distinct));
+            if is_not && is_distinct {
+                self.advance(); // NULLS
+                self.advance(); // NOT
+                self.advance(); // DISTINCT
+                nulls_not_distinct = true;
+            } else if matches!(n1, Some(Token::Distinct)) {
+                self.advance(); // NULLS
+                self.advance(); // DISTINCT
+            }
+        }
         let columns = self.parse_paren_ident_list("UNIQUE")?;
         Ok(crate::ast::TableConstraint::Unique {
             name: None,
             columns,
+            nulls_not_distinct,
         })
+    }
+
+    /// v7.13.0 — table-level `CHECK (<expr>)` constraint
+    /// (mailrs round-5 G3). Consumes `CHECK` then a parenthesised
+    /// expression.
+    fn parse_table_level_check(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
+        self.advance(); // CHECK
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after CHECK, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let expr = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close CHECK predicate, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(crate::ast::TableConstraint::Check { name: None, expr })
+    }
+
+    /// v7.13.0 — `true` when the next token is `CHECK` (a bare ident).
+    fn peek_table_level_check_start(&self) -> bool {
+        matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("check"))
     }
 
     fn parse_paren_ident_list(&mut self, ctx: &str) -> Result<Vec<String>, ParseError> {
@@ -2803,6 +2941,8 @@ impl Parser {
         let mut nullability_seen = implied_not_null;
         let mut auto_increment = implied_auto_increment;
         let mut is_primary_key = false;
+        let mut is_unique = false;
+        let mut check: Option<Expr> = None;
         loop {
             if matches!(self.peek(), Token::Default) {
                 if default.is_some() {
@@ -2875,6 +3015,52 @@ impl Parser {
                 nullability_seen = true;
                 continue;
             }
+            // v7.13.0 — inline `UNIQUE` column constraint
+            // (mailrs round-5 G2). Fold into a single-column
+            // table-level UNIQUE at CREATE TABLE post-process time.
+            if let Token::Ident(s) = self.peek()
+                && s.eq_ignore_ascii_case("unique")
+            {
+                if is_unique {
+                    return Err(self.err("UNIQUE specified twice".into()));
+                }
+                self.advance();
+                is_unique = true;
+                continue;
+            }
+            // v7.13.0 — inline `CHECK (<expr>)` column constraint
+            // (mailrs round-5 G3). PG semantics: column-level
+            // CHECK is equivalent to a table-level CHECK. Multiple
+            // inline CHECKs on the same column AND together.
+            if let Token::Ident(s) = self.peek()
+                && s.eq_ignore_ascii_case("check")
+            {
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after CHECK in column def, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let pred = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' to close CHECK predicate, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                check = Some(match check.take() {
+                    Some(prev) => Expr::Binary {
+                        op: BinOp::And,
+                        lhs: Box::new(prev),
+                        rhs: Box::new(pred),
+                    },
+                    None => pred,
+                });
+                continue;
+            }
             break;
         }
         Ok(ColumnDef {
@@ -2884,6 +3070,8 @@ impl Parser {
             default,
             auto_increment,
             is_primary_key,
+            is_unique,
+            check,
         })
     }
 

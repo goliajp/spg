@@ -446,6 +446,15 @@ pub struct TableSchema {
     /// by the leading column. Persisted in catalog FILE_VERSION
     /// 15+. Older catalogs (≤ 14) deserialise with an empty vec.
     pub uniqueness_constraints: Vec<UniquenessConstraint>,
+    /// v7.13.0 — `CHECK (<expr>)` predicates declared on this
+    /// table. Both column-level inline `CHECK (…)` and
+    /// table-level `CHECK (…)` fold into this list. Each entry
+    /// is the AST Expr's `Display` form, re-parsed on every
+    /// INSERT/UPDATE and evaluated against the candidate row.
+    /// A false / NULL result rejects the mutation (PG semantics).
+    /// Persisted in catalog FILE_VERSION 23+. Older catalogs
+    /// deserialise with an empty vec.
+    pub checks: Vec<String>,
 }
 
 /// v7.9.19 — composite UNIQUE / PRIMARY KEY constraint persisted
@@ -463,6 +472,13 @@ pub struct UniquenessConstraint {
     /// single-column UNIQUE this is exactly one position; the
     /// BTree index alone enforces it.
     pub columns: Vec<usize>,
+    /// v7.13.0 — `UNIQUE NULLS NOT DISTINCT` modifier
+    /// (mailrs round-5 G10; PG 15+ surface). When `true`, two
+    /// rows whose constrained columns are all NULL collide on
+    /// the constraint. Default (`false`) is the SQL-standard
+    /// `NULLS DISTINCT` behaviour where any NULL passes.
+    /// Persisted in catalog FILE_VERSION 23+.
+    pub nulls_not_distinct: bool,
 }
 
 /// v7.6.1 — Storage-layer mirror of `spg_sql::ast::ForeignKeyConstraint`.
@@ -1687,6 +1703,23 @@ impl Table {
         // recoverable when the future compaction job lands.
         map.insert_mut(key.clone(), kept);
         Ok(removed)
+    }
+
+    /// v7.13.0 — append a new column to the schema and back-fill
+    /// every existing row with `fill_value`. Used by the engine's
+    /// `ALTER TABLE t ADD COLUMN …` handler (mailrs round-5 G1).
+    /// Indices on existing columns keep working — column positions
+    /// don't shift since the new column lands at the end — so no
+    /// index rebuild is needed.
+    pub fn add_column(&mut self, col: ColumnSchema, fill_value: Value) {
+        self.schema.columns.push(col);
+        let mut new_rows: PersistentVec<Row> = PersistentVec::new();
+        for row in self.rows.iter() {
+            let mut values = row.values.clone();
+            values.push(fill_value.clone());
+            new_rows.push_mut(Row::new(values));
+        }
+        self.rows = new_rows;
     }
 
     /// v4.4: delete the rows at the given positions in one pass.
@@ -4321,6 +4354,7 @@ impl TableSchema {
             hot_tier_bytes: None,
             foreign_keys: Vec::new(),
             uniqueness_constraints: Vec::new(),
+            checks: Vec::new(),
         }
     }
 }
@@ -4398,7 +4432,18 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// `included_columns = Vec::new()` for every index — same
 /// "older readers, append-only extension" pattern as the v6.7.2
 /// hot_tier_bytes byte.
-const FILE_VERSION: u8 = 22;
+/// v7.13.0 — bumped from 22 to 23. mailrs round-5 G3 / G10.
+/// Per-table appendix gains two new sections:
+///   * `checks: Vec<String>` — CHECK predicate sources (Display
+///     form of the AST Expr); re-parsed on INSERT/UPDATE to
+///     enforce against candidate rows. Same persistence pattern
+///     as `Index::partial_predicate`.
+///   * Per `UniquenessConstraint`: trailing `nulls_not_distinct:
+///     u8` flag for PG 15+ `UNIQUE NULLS NOT DISTINCT (cols)`
+///     semantics.
+/// v22 catalogs deserialise with empty `checks` and every UC
+/// at `nulls_not_distinct = false`.
+const FILE_VERSION: u8 = 23;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4656,6 +4701,11 @@ impl Catalog {
                 for &p in &uc.columns {
                     write_u16(&mut out, u16::try_from(p).expect("≤ 65k columns/table"));
                 }
+                // v7.13.0 — `nulls_not_distinct` flag
+                // (FILE_VERSION 23+). Always written by writers at
+                // version 23+; deserialise gates on `version >= 23`
+                // so v22-and-below catalogs round-trip cleanly.
+                out.push(u8::from(uc.nulls_not_distinct));
             }
             // v7.9.21 — runtime_default appendix per table.
             // Layout: [u16 count] then for each:
@@ -4676,6 +4726,19 @@ impl Catalog {
             for (pos, expr) in rt_defaults {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, expr);
+            }
+            // v7.13.0 — CHECK constraint appendix per table.
+            // Layout: [u16 count] then `count` Display-form
+            // expression strings. Re-parsed on every INSERT/UPDATE
+            // by the engine. FILE_VERSION 23+ only; v22 readers
+            // never reach this block because the writer also moves
+            // to v23 in lock-step.
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.checks.len()).expect("≤ 65k CHECK constraints/table"),
+            );
+            for c in &t.schema.checks {
+                write_str(&mut out, c.as_str());
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
@@ -4922,9 +4985,18 @@ fn deserialize_table(
             for _ in 0..arity {
                 cols.push(cur.read_u16()? as usize);
             }
+            // v7.13.0 — trailing `nulls_not_distinct` flag
+            // (FILE_VERSION 23+). v22 and below skip — flag
+            // defaults to false (= NULLS DISTINCT).
+            let nulls_not_distinct = if version >= 23 {
+                cur.read_u8()? != 0
+            } else {
+                false
+            };
             ucs.push(UniquenessConstraint {
                 is_primary_key: is_pk,
                 columns: cols,
+                nulls_not_distinct,
             });
         }
         t.schema_mut().uniqueness_constraints = ucs;
@@ -4937,6 +5009,16 @@ fn deserialize_table(
                 col.runtime_default = Some(expr);
             }
         }
+    }
+    // v7.13.0 — CHECK constraints appendix (FILE_VERSION 23+).
+    // v22 and below leave the vec empty.
+    if version >= 23 {
+        let check_count = cur.read_u16()? as usize;
+        let mut checks = Vec::with_capacity(check_count);
+        for _ in 0..check_count {
+            checks.push(cur.read_str()?);
+        }
+        t.schema_mut().checks = checks;
     }
     let _ = table_name;
     Ok(())

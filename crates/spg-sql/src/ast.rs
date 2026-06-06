@@ -262,6 +262,15 @@ pub enum AlterTableTarget {
     /// constraint by user-supplied name; raises if no FK with that
     /// name exists on the table.
     DropForeignKey(String),
+    /// v7.13.0 — `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] <col>
+    /// <type> [DEFAULT <expr>] [NOT NULL]`. mailrs round-5 G1
+    /// (20 migrate-*.sql hits). Engine appends the column to the
+    /// schema and back-fills every existing row with the DEFAULT
+    /// (or NULL when no DEFAULT and the column is nullable).
+    AddColumn {
+        column: ColumnDef,
+        if_not_exists: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -666,6 +675,20 @@ pub enum TableConstraint {
     Unique {
         name: Option<String>,
         columns: Vec<String>,
+        /// v7.13.0 — `NULLS NOT DISTINCT` modifier (mailrs round-5
+        /// G10). PG 15+ flips the NULL handling so any number of
+        /// NULL rows collide on the constraint. Default is
+        /// `false` (NULLS DISTINCT, standard SQL behaviour).
+        nulls_not_distinct: bool,
+    },
+    /// v7.13.0 — `CHECK (<expr>)` table-level constraint
+    /// (mailrs round-5 G3). Column-level inline CHECKs fold into
+    /// this same variant at parse time. Engine evaluates the
+    /// predicate against each INSERT/UPDATE candidate row; a
+    /// false / NULL result rejects the mutation.
+    Check {
+        name: Option<String>,
+        expr: Expr,
     },
 }
 
@@ -688,6 +711,17 @@ pub struct ColumnDef {
     /// column at CREATE TABLE time, satisfying the parent-side
     /// index requirement for any FOREIGN KEY pointing at it.
     pub is_primary_key: bool,
+    /// v7.13.0 — inline `UNIQUE` column constraint
+    /// (mailrs round-5 G2). The CREATE TABLE handler folds this
+    /// into a single-column `TableConstraint::Unique` so the
+    /// engine path stays uniform with table-level UNIQUE.
+    pub is_unique: bool,
+    /// v7.13.0 — inline `CHECK (<expr>)` column constraint
+    /// (mailrs round-5 G3). Stored alongside the column so the
+    /// CREATE TABLE handler can fold these into table-level
+    /// CHECK constraints. Multiple inline CHECKs on the same
+    /// column are concatenated with AND at the table level.
+    pub check: Option<Expr>,
 }
 
 /// v7.6.0 — A single FOREIGN KEY constraint. Both column-level
@@ -1561,6 +1595,29 @@ impl fmt::Display for Statement {
                     AlterTableTarget::DropForeignKey(name) => {
                         write!(f, "DROP CONSTRAINT {}", quote_ident(name))
                     }
+                    AlterTableTarget::AddColumn {
+                        column,
+                        if_not_exists,
+                    } => {
+                        f.write_str("ADD COLUMN ")?;
+                        if *if_not_exists {
+                            f.write_str("IF NOT EXISTS ")?;
+                        }
+                        write!(f, "{} {}", quote_ident(&column.name), column.ty)?;
+                        if !column.nullable {
+                            f.write_str(" NOT NULL")?;
+                        }
+                        if let Some(d) = &column.default {
+                            write!(f, " DEFAULT {d}")?;
+                        }
+                        if column.auto_increment {
+                            f.write_str(" AUTO_INCREMENT")?;
+                        }
+                        if column.is_primary_key {
+                            f.write_str(" PRIMARY KEY")?;
+                        }
+                        Ok(())
+                    }
                 }
             }
             Self::CreatePublication(p) => {
@@ -1874,7 +1931,62 @@ impl fmt::Display for CreateTableStatement {
             f.write_str(", ")?;
             write!(f, "{fk}")?;
         }
+        // v7.13.0 — render table-level constraints (PRIMARY KEY /
+        // UNIQUE / CHECK) so WAL replay reconstructs them. Inline
+        // column-level UNIQUE / CHECK get lifted to this list at
+        // parse time, so emitting only here avoids double-counting.
+        for tc in &self.table_constraints {
+            f.write_str(", ")?;
+            write!(f, "{tc}")?;
+        }
         f.write_str(")")
+    }
+}
+
+impl fmt::Display for TableConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PrimaryKey { name, columns } => {
+                if let Some(n) = name {
+                    write!(f, "CONSTRAINT {} ", quote_ident(n))?;
+                }
+                f.write_str("PRIMARY KEY (")?;
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&quote_ident(c))?;
+                }
+                f.write_str(")")
+            }
+            Self::Unique {
+                name,
+                columns,
+                nulls_not_distinct,
+            } => {
+                if let Some(n) = name {
+                    write!(f, "CONSTRAINT {} ", quote_ident(n))?;
+                }
+                f.write_str("UNIQUE ")?;
+                if *nulls_not_distinct {
+                    f.write_str("NULLS NOT DISTINCT ")?;
+                }
+                f.write_str("(")?;
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&quote_ident(c))?;
+                }
+                f.write_str(")")
+            }
+            Self::Check { name, expr } => {
+                if let Some(n) = name {
+                    write!(f, "CONSTRAINT {} ", quote_ident(n))?;
+                }
+                write!(f, "CHECK ({expr})")
+            }
+        }
     }
 }
 
