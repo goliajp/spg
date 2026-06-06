@@ -15,6 +15,14 @@ keywords     = ["spg", "database", "server", "sql", "postgres"]
 name = "spg-server"
 path = "src/main.rs"
 
+# v7.13.0 (C5, mailrs round-5) — pg_isready-compatible health
+# probe. Thin TCP-connect on the PG-wire port; exits 0 if the
+# server accepts connections, 2 otherwise (matching PG's
+# pg_isready return codes).
+[[bin]]
+name = "pg_isready"
+path = "src/bin/pg_isready.rs"
+
 [dependencies]
 spg-wire     = { workspace = true }
 # v6.1.1: pgwire's Extended Query path stores the parsed AST in

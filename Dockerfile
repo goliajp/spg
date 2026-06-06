@@ -71,10 +71,11 @@ RUN case "$TARGETPLATFORM" in \
     esac \
  && rustup target add "$TARGET" \
  && cargo build --release --target "$TARGET" \
-        --bin spg-server --bin spg \
+        --bin spg-server --bin spg --bin pg_isready \
  && mkdir -p /out \
  && cp "target/$TARGET/release/spg-server" /out/ \
- && cp "target/$TARGET/release/spg"        /out/
+ && cp "target/$TARGET/release/spg"        /out/ \
+ && cp "target/$TARGET/release/pg_isready" /out/
 
 # ----------------------------------------------------------------------
 # Runtime stage. distroless/cc-debian12 ships glibc + libstdc++ +
@@ -91,12 +92,19 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /out/spg-server /usr/local/bin/spg-server
 COPY --from=builder /out/spg        /usr/local/bin/spg
+# v7.13.0 (C5, mailrs round-5) — pg_isready-compatible health
+# probe. Drops in next to the canonical PG binary name so
+# docker-compose `healthcheck: test: ["CMD", "pg_isready", …]`
+# blocks transparently.
+COPY --from=builder /out/pg_isready /usr/local/bin/pg_isready
 
 # Operator contract:
+# - PG-wire on 5432 (default) — drop-in for Postgres clients.
 # - Native wire on 5544 (default).
 # - Persistent state under /data: catalog snapshot, WAL,
 #   manifest, cold segments. Volume-mount it.
 # - All other knobs via env vars; see DEPLOYMENT.md.
+EXPOSE 5432
 EXPOSE 5544
 VOLUME ["/data"]
 WORKDIR /data
@@ -108,5 +116,10 @@ USER nonroot:nonroot
 # Sensible defaults for a containerised deployment:
 #   - bind on every interface inside the container, port 5544
 #   - place catalog snapshot + WAL under /data
+#   - v7.13.0 (C1, mailrs round-5): PG-wire enabled by default
+#     on 0.0.0.0:5432 so docker-compose stacks can drop the SPG
+#     image into a service slot that previously ran postgres
+#     without changing client URLs.
+ENV SPG_PG_ADDR=0.0.0.0:5432
 ENTRYPOINT ["/usr/local/bin/spg-server"]
 CMD ["0.0.0.0:5544", "/data/spg.db", "-", "/data/wal.log"]
