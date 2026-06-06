@@ -1,5 +1,6 @@
-# DML coverage: v4.4 added UPDATE / DELETE. DROP TABLE / ALTER TABLE
-# remain unsupported (v4.x cold backlog).
+# DML coverage: v4.4 added UPDATE / DELETE. DROP TABLE remains
+# unsupported (v4.x cold backlog). v7.13.0 unblocks
+# `ALTER TABLE … ADD COLUMN`.
 
 statement ok
 CREATE TABLE t (id INT NOT NULL, name TEXT)
@@ -35,5 +36,6 @@ z
 statement error
 DROP TABLE t
 
-statement error
+# v7.13.0 — ALTER TABLE ADD COLUMN is supported (mailrs round-5 G1).
+statement ok
 ALTER TABLE t ADD COLUMN extra INT
