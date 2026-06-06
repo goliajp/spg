@@ -8,6 +8,47 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.12.11] — 2026-06-06 (docs patch — PG-customer migration pathway)
+
+Doc-only patch on top of v7.12.10. Zero runtime / wire / file-
+format change — the spg-engine / spg-server / etc binaries are
+byte-identical between v7.12.7 and v7.12.11. No need to
+upgrade the `goliakk/spg:7.12.7` docker image or the v7.12.7
+crates.io artifacts.
+
+Goal: a PG customer landing on the GitHub README + clicking
+through to PG_MIGRATION.md can decide "is SPG a drop-in for
+my schema" in two minutes of reading, without parsing a
+release-history archaeology trail across v7.9 → v7.12.
+
+What lands:
+
+- **README** retitled `v7.12 (current)` (was `v7.11`). The
+  carve-out paragraph removed `tsvector + GIN` (shipped
+  v7.12.0–3), `CREATE TRIGGER` + PL/pgSQL (shipped v7.12.4–7),
+  and `ON CONFLICT` upsert (shipped v7.9.8–10). Highlights
+  list gained top-level bullets for the v7.12 PG FTS + trigger
+  surface and the v7.9 ON CONFLICT + RETURNING surface so the
+  feature set is current.
+- **PG_MIGRATION.md** gains a §Quick start "if your schema
+  uses X, drop it in" at the top — the 60-second read PG
+  customers want. Lists every v7.x ✅ surface plus the
+  small-change list and the remaining carve-outs. The full
+  reference matrix below stays unchanged; the header
+  rebadges `v7.12.7 ship-time` → `v7.12.10 ship-time`.
+- **STABILITY.md** SemVer-policy section reframed from the
+  "v4.x" framing it'd been stuck in for years. Now reads
+  "across v4.x → v7.x, no MAJOR has been needed"; v8.0 is
+  the first breaking-change window. The v7.12 epic + the
+  v7.12.8–11 patch cluster appear as MINOR + PATCH
+  worked-examples so the bump policy isn't abstract.
+
+Sub-version commit count: 1 feature commit + 1 release-prep
+commit. No catalog FILE_VERSION change. No crates / docker
+re-publish — runtime is byte-identical to v7.12.7.
+
+---
+
 ## [7.12.10] — 2026-06-06 (CI hotfix — Cargo.lock sync, never-skipped pre-finish gate)
 
 Second hotfix off master in 10 minutes. v7.12.9 bumped
