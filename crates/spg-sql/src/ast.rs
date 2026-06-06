@@ -271,6 +271,16 @@ pub enum AlterTableTarget {
         column: ColumnDef,
         if_not_exists: bool,
     },
+    /// v7.13.0 — `ALTER TABLE t ALTER COLUMN <col> TYPE <ty>
+    /// [USING <expr>]` (mailrs round-5 G8). Engine rewrites every
+    /// existing row's column value by evaluating the optional
+    /// USING expression (default `col::<ty>`) and re-coercing
+    /// against the new column type.
+    AlterColumnType {
+        column: String,
+        new_type: ColumnTypeName,
+        using: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -527,6 +537,15 @@ pub struct CreateTriggerStatement {
     /// function to be `CREATE FUNCTION`'d earlier; forward
     /// references (PG accepts) are deferred to v7.12.5.
     pub function: String,
+    /// v7.13.0 — `UPDATE OF col, col, …` column-list filter
+    /// (mailrs round-5 G7). Non-empty only when the events list
+    /// contains UPDATE and the user wrote the column-list filter.
+    /// PG fires the trigger only when at least one of these
+    /// columns appears in the SET clause; SPG conservatively
+    /// fires on any UPDATE matching the listed columns or
+    /// rewriting them at the row level. Empty vec = no filter
+    /// (fire on every UPDATE).
+    pub update_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,8 +968,15 @@ pub struct InsertStatement {
     /// fills the rest with NULL (must be nullable).
     pub columns: Option<Vec<String>>,
     /// One or more `(expr, expr, ...)` tuples — the multi-row VALUES form.
-    /// v1.3+ accepts `INSERT INTO t VALUES (a), (b)`.
+    /// v1.3+ accepts `INSERT INTO t VALUES (a), (b)`. Empty when
+    /// `select_source` is `Some` (the engine builds rows from the
+    /// inner SELECT result set instead).
     pub rows: Vec<Vec<Expr>>,
+    /// v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
+    /// round-5 G4). When present, `rows` is empty and the engine
+    /// materialises the SELECT result, coerces each output tuple to
+    /// the target column types, and inserts as a single batch.
+    pub select_source: Option<Box<SelectStatement>>,
     /// v7.9.7 — `ON CONFLICT (cols) DO { NOTHING | UPDATE SET … }`
     /// upsert clause. None = legacy INSERT (conflict raises a
     /// DuplicateKey error). mailrs migration blocker #2.
@@ -1280,6 +1306,19 @@ pub enum Expr {
         array: Box<Expr>,
         /// `true` = ANY, `false` = ALL.
         is_any: bool,
+    },
+    /// v7.13.0 — `CASE WHEN <cond> THEN <val> ... ELSE <val> END`
+    /// (searched form, `operand` is None) and
+    /// `CASE <expr> WHEN <val> THEN <val> ... END` (simple form,
+    /// `operand` is the lead expression compared against each
+    /// branch's match). Each `(when_expr, then_expr)` branch
+    /// stays as written; engine short-circuits on the first match.
+    /// `else_branch` is `None` when no ELSE; evaluates to NULL.
+    /// mailrs round-5 G9.
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        else_branch: Option<Box<Expr>>,
     },
 }
 
@@ -1618,6 +1657,21 @@ impl fmt::Display for Statement {
                         }
                         Ok(())
                     }
+                    AlterTableTarget::AlterColumnType {
+                        column,
+                        new_type,
+                        using,
+                    } => {
+                        write!(
+                            f,
+                            "ALTER COLUMN {} TYPE {new_type}",
+                            quote_ident(column)
+                        )?;
+                        if let Some(u) = using {
+                            write!(f, " USING {u}")?;
+                        }
+                        Ok(())
+                    }
                 }
             }
             Self::CreatePublication(p) => {
@@ -1843,7 +1897,18 @@ impl fmt::Display for CreateTriggerStatement {
             }
             match e {
                 TriggerEvent::Insert => f.write_str("INSERT")?,
-                TriggerEvent::Update => f.write_str("UPDATE")?,
+                TriggerEvent::Update => {
+                    f.write_str("UPDATE")?;
+                    if !self.update_columns.is_empty() {
+                        f.write_str(" OF ")?;
+                        for (j, col) in self.update_columns.iter().enumerate() {
+                            if j > 0 {
+                                f.write_str(", ")?;
+                            }
+                            f.write_str(&quote_ident(col))?;
+                        }
+                    }
+                }
                 TriggerEvent::Delete => f.write_str("DELETE")?,
                 TriggerEvent::Truncate => f.write_str("TRUNCATE")?,
             }
@@ -2067,19 +2132,25 @@ impl fmt::Display for InsertStatement {
             }
             f.write_str(")")?;
         }
-        f.write_str(" VALUES ")?;
-        for (ri, row) in self.rows.iter().enumerate() {
-            if ri > 0 {
-                f.write_str(", ")?;
-            }
-            f.write_str("(")?;
-            for (i, v) in row.iter().enumerate() {
-                if i > 0 {
+        // v7.13.0 — INSERT…SELECT renders as `... SELECT …`,
+        // skipping the VALUES list (mailrs round-5 G4).
+        if let Some(sel) = &self.select_source {
+            write!(f, " {sel}")?;
+        } else {
+            f.write_str(" VALUES ")?;
+            for (ri, row) in self.rows.iter().enumerate() {
+                if ri > 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "{v}")?;
+                f.write_str("(")?;
+                for (i, v) in row.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(")")?;
             }
-            f.write_str(")")?;
         }
         Ok(())
     }
@@ -2367,6 +2438,23 @@ impl fmt::Display for Expr {
             } => {
                 let kw = if *is_any { "ANY" } else { "ALL" };
                 write!(f, "({expr} {op} {kw}({array}))")
+            }
+            Self::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                f.write_str("CASE")?;
+                if let Some(op) = operand {
+                    write!(f, " {op}")?;
+                }
+                for (w, t) in branches {
+                    write!(f, " WHEN {w} THEN {t}")?;
+                }
+                if let Some(e) = else_branch {
+                    write!(f, " ELSE {e}")?;
+                }
+                f.write_str(" END")
             }
         }
     }

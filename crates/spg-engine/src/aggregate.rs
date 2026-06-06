@@ -86,6 +86,19 @@ pub fn contains_aggregate(e: &Expr) -> bool {
             contains_aggregate(target) || contains_aggregate(index)
         }
         Expr::AnyAll { expr, array, .. } => contains_aggregate(expr) || contains_aggregate(array),
+        // v7.13.0 — CASE WHEN … END. Recurse into operand,
+        // every (WHEN, THEN) pair, and the ELSE branch.
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || branches
+                    .iter()
+                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
+                || else_branch.as_deref().is_some_and(contains_aggregate)
+        }
     }
 }
 
@@ -370,6 +383,22 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(expr, out);
             collect_aggregates(array, out);
         }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                collect_aggregates(o, out);
+            }
+            for (w, t) in branches {
+                collect_aggregates(w, out);
+                collect_aggregates(t, out);
+            }
+            if let Some(e) = else_branch {
+                collect_aggregates(e, out);
+            }
+        }
     }
 }
 
@@ -584,6 +613,27 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             op: *op,
             array: Box::new(rewrite_expr(array, group_exprs, aggs)),
             is_any: *is_any,
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => Expr::Case {
+            operand: operand
+                .as_deref()
+                .map(|o| Box::new(rewrite_expr(o, group_exprs, aggs))),
+            branches: branches
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        rewrite_expr(w, group_exprs, aggs),
+                        rewrite_expr(t, group_exprs, aggs),
+                    )
+                })
+                .collect(),
+            else_branch: else_branch
+                .as_deref()
+                .map(|e| Box::new(rewrite_expr(e, group_exprs, aggs))),
         },
     }
 }

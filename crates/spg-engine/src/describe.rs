@@ -308,6 +308,22 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_expr(expr, f);
             walk_expr(array, f);
         }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                walk_expr(o, f);
+            }
+            for (w, t) in branches {
+                walk_expr(w, f);
+                walk_expr(t, f);
+            }
+            if let Some(e) = else_branch {
+                walk_expr(e, f);
+            }
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => {}
     }
 }
