@@ -3303,11 +3303,38 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::AlterTableStatement,
     ) -> Result<QueryResult, EngineError> {
-        match s.target {
+        // v7.13.2 — mailrs round-6 S1: apply each subaction in order.
+        // On first error the statement aborts; subactions already
+        // applied stay (no transactional rollback in v7.13 — wrap in
+        // BEGIN/COMMIT if atomicity matters).
+        let table_name = s.name.clone();
+        for target in s.targets {
+            self.exec_alter_table_subaction(&table_name, target)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    fn exec_alter_table_subaction(
+        &mut self,
+        table_name_outer: &str,
+        target: spg_sql::ast::AlterTableTarget,
+    ) -> Result<(), EngineError> {
+        // Inner helper retains the s.name closure shape; alias to `s`
+        // for minimal diff against the v7.13.0 body.
+        struct S<'a> {
+            name: &'a str,
+        }
+        let s = S {
+            name: table_name_outer,
+        };
+        match target {
             spg_sql::ast::AlterTableTarget::SetHotTierBytes(n) => {
-                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
                     EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.clone(),
+                        name: s.name.into(),
                     })
                 })?;
                 table.schema_mut().hot_tier_bytes = Some(n);
@@ -3319,17 +3346,17 @@ impl Engine {
                 // satisfies the new constraint. Then install it.
                 let cols_snapshot = self
                     .active_catalog()
-                    .get(&s.name)
+                    .get(s.name)
                     .ok_or_else(|| {
                         EngineError::Storage(StorageError::TableNotFound {
-                            name: s.name.clone(),
+                            name: s.name.into(),
                         })
                     })?
                     .schema()
                     .columns
                     .clone();
                 let storage_fk =
-                    resolve_foreign_key(&s.name, &cols_snapshot, fk, self.active_catalog())?;
+                    resolve_foreign_key(s.name, &cols_snapshot, fk, self.active_catalog())?;
                 // Verify existing rows. Treat them as a virtual
                 // INSERT batch — reusing the v7.6.2 enforce helper.
                 let existing_rows: Vec<Vec<Value>> = self
@@ -3342,14 +3369,14 @@ impl Engine {
                     .collect();
                 enforce_fk_inserts(
                     self.active_catalog(),
-                    &s.name,
+                    s.name,
                     core::slice::from_ref(&storage_fk),
                     &existing_rows,
                 )?;
                 // Reject duplicate constraint name.
                 let table = self
                     .active_catalog_mut()
-                    .get_mut(&s.name)
+                    .get_mut(s.name)
                     .expect("checked above");
                 if let Some(name) = &storage_fk.name
                     && table
@@ -3364,21 +3391,22 @@ impl Engine {
                 }
                 table.schema_mut().foreign_keys.push(storage_fk);
             }
-            spg_sql::ast::AlterTableTarget::DropForeignKey(name) => {
-                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+            spg_sql::ast::AlterTableTarget::DropForeignKey { name, if_exists } => {
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
                     EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.clone(),
+                        name: s.name.into(),
                     })
                 })?;
                 let fks = &mut table.schema_mut().foreign_keys;
                 let before = fks.len();
                 fks.retain(|f| f.name.as_ref() != Some(&name));
-                if fks.len() == before {
+                if fks.len() == before && !if_exists {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "ALTER TABLE DROP CONSTRAINT: no FK named {name:?} on {:?}",
                         s.name
                     )));
                 }
+                // v7.13.2 mailrs round-6 S7: IF EXISTS silences the miss.
             }
             spg_sql::ast::AlterTableTarget::AddColumn {
                 column,
@@ -3389,9 +3417,9 @@ impl Engine {
                 // existing row. Column positions don't shift, so we
                 // skip index rebuild.
                 let clock = self.clock;
-                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
                     EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.clone(),
+                        name: s.name.into(),
                     })
                 })?;
                 if table
@@ -3401,10 +3429,7 @@ impl Engine {
                     .any(|c| c.name.eq_ignore_ascii_case(&column.name))
                 {
                     if if_not_exists {
-                        return Ok(QueryResult::CommandOk {
-                            affected: 0,
-                            modified_catalog: !self.in_transaction(),
-                        });
+                        return Ok(());
                     }
                     return Err(EngineError::Unsupported(alloc::format!(
                         "ALTER TABLE ADD COLUMN: column {:?} already exists on {:?}",
@@ -3449,9 +3474,9 @@ impl Engine {
                 // the existing value) and re-coerce to the new
                 // type. Indices on the column get rebuilt.
                 let new_data_type = column_type_to_data_type(new_type);
-                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
                     EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.clone(),
+                        name: s.name.into(),
                     })
                 })?;
                 let col_pos = table
@@ -3494,10 +3519,7 @@ impl Engine {
                 }
             }
         }
-        Ok(QueryResult::CommandOk {
-            affected: 0,
-            modified_catalog: !self.in_transaction(),
-        })
+        Ok(())
     }
 
     fn exec_alter_index(
@@ -3662,14 +3684,17 @@ impl Engine {
         // predicate" pass is STABILITY carve-out).
         if let Some(pred_expr) = &stmt.partial_predicate {
             let canonical = pred_expr.to_string();
-            if matches!(
-                stmt.method,
-                IndexMethod::Hnsw | IndexMethod::Brin | IndexMethod::Gin
-            ) {
-                return Err(EngineError::Unsupported(
-                    "WHERE predicates are not supported on HNSW or BRIN indexes".into(),
-                ));
-            }
+            // v7.13.2 — mailrs round-6 S2. PG's `pg_trgm` uses
+            // `CREATE INDEX … USING gin(col gin_trgm_ops) WHERE …`
+            // routinely to slim trigram indexes. SPG now persists
+            // the predicate for GIN / BRIN / HNSW the same way it
+            // already does for BTree — same v6.8.1 "over-maintain
+            // is safe; planner-side partial routing is STABILITY
+            // carve-out" semantics. HNSW carries an additional
+            // caveat: the predicate isn't applied at index build
+            // time (would require per-row eval inside the NSW
+            // construction loop), so the index oversamples; query
+            // time the WHERE clause still filters correctly.
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.partial_predicate = Some(canonical);
             }
@@ -4663,7 +4688,17 @@ impl Engine {
             .alias
             .clone()
             .unwrap_or_else(|| "unnest".to_string());
-        let col_schema = ColumnSchema::new(alias.clone(), elem_dtype, true);
+        // v7.13.2 — mailrs round-6 S5. Honour PG-standard
+        // `UNNEST(arr) AS p(col_name)` column-list aliasing: the
+        // first entry overrides the projected column's name.
+        // Without the column list, fall back to the table alias
+        // (pre-v7.13.2 behaviour).
+        let col_name = primary
+            .unnest_column_aliases
+            .first()
+            .cloned()
+            .unwrap_or_else(|| alias.clone());
+        let col_schema = ColumnSchema::new(col_name, elem_dtype, true);
         let schema_cols = alloc::vec![col_schema.clone()];
         let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
         // Apply WHERE.
@@ -4969,53 +5004,130 @@ impl Engine {
     /// rows. No index seek. Aggregates and DISTINCT still work because
     /// the executor delegates projection through the same shared paths.
     #[allow(clippy::too_many_lines)]
+    /// v7.13.2 — mailrs round-6 S5. Resolve a TableRef into an
+    /// owned (rows, schema) pair. Catalog tables clone their hot
+    /// rows + schema; UNNEST table refs evaluate their array
+    /// expression once and synthesise a single-column row set
+    /// using the same dispatch as `exec_select_unnest`. Used by
+    /// the joined-select path so UNNEST can appear in any FROM
+    /// position, not just as the primary.
+    fn materialise_table_ref(
+        &self,
+        tref: &TableRef,
+    ) -> Result<(Vec<Row>, Vec<ColumnSchema>), EngineError> {
+        if let Some(expr) = tref.unnest_expr.as_deref() {
+            let empty_schema: Vec<ColumnSchema> = Vec::new();
+            let ctx = EvalContext::new(&empty_schema, None);
+            let dummy_row = Row::new(Vec::new());
+            let (elem_dtype, rows) =
+                match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
+                    Value::Null => (DataType::Text, Vec::new()),
+                    Value::TextArray(items) => (
+                        DataType::Text,
+                        items
+                            .into_iter()
+                            .map(|item| {
+                                Row::new(alloc::vec![match item {
+                                    Some(s) => Value::Text(s),
+                                    None => Value::Null,
+                                }])
+                            })
+                            .collect(),
+                    ),
+                    Value::IntArray(items) => (
+                        DataType::Int,
+                        items
+                            .into_iter()
+                            .map(|item| {
+                                Row::new(alloc::vec![match item {
+                                    Some(n) => Value::Int(n),
+                                    None => Value::Null,
+                                }])
+                            })
+                            .collect(),
+                    ),
+                    Value::BigIntArray(items) => (
+                        DataType::BigInt,
+                        items
+                            .into_iter()
+                            .map(|item| {
+                                Row::new(alloc::vec![match item {
+                                    Some(n) => Value::BigInt(n),
+                                    None => Value::Null,
+                                }])
+                            })
+                            .collect(),
+                    ),
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "unnest() expects an array argument, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                };
+            let alias = tref.alias.clone().unwrap_or_else(|| "unnest".to_string());
+            let col_name = tref
+                .unnest_column_aliases
+                .first()
+                .cloned()
+                .unwrap_or(alias);
+            return Ok((rows, alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)]));
+        }
+        let table = self
+            .active_catalog()
+            .get(&tref.name)
+            .ok_or_else(|| StorageError::TableNotFound {
+                name: tref.name.clone(),
+            })?;
+        let rows: Vec<Row> = table.rows().iter().cloned().collect();
+        let cols = table.schema().columns.clone();
+        Ok((rows, cols))
+    }
+
     fn exec_joined_select(
         &self,
         stmt: &SelectStatement,
         from: &FromClause,
     ) -> Result<QueryResult, EngineError> {
-        // Resolve every table reference up front so we surface
-        // TableNotFound before we start the cartesian work.
-        let primary_table = self
-            .active_catalog()
-            .get(&from.primary.name)
-            .ok_or_else(|| StorageError::TableNotFound {
-                name: from.primary.name.clone(),
-            })?;
+        // v7.13.2 — mailrs round-6 S5. UNNEST peers materialise
+        // into virtual (rows, schema) sources alongside catalog
+        // tables, so `FROM t, UNNEST(arr) AS p(col)` works in
+        // any join-list position. The lookup helper handles both
+        // shapes uniformly.
+        let (primary_rows, primary_cols) = self.materialise_table_ref(&from.primary)?;
         let primary_alias = from
             .primary
             .alias
             .as_deref()
             .unwrap_or(from.primary.name.as_str())
             .to_string();
-        let mut joined_tables: Vec<(&Table, String, JoinKind, Option<&Expr>)> = Vec::new();
+        // Owned (rows, schema) per peer — borrows from the catalog
+        // would not survive UNNEST-side materialisation.
+        let mut joined: Vec<(Vec<Row>, Vec<ColumnSchema>, String, JoinKind, Option<&Expr>)> =
+            Vec::new();
         for j in &from.joins {
-            let t = self.active_catalog().get(&j.table.name).ok_or_else(|| {
-                StorageError::TableNotFound {
-                    name: j.table.name.clone(),
-                }
-            })?;
+            let (rows, cols) = self.materialise_table_ref(&j.table)?;
             let a = j
                 .table
                 .alias
                 .as_deref()
                 .unwrap_or(j.table.name.as_str())
                 .to_string();
-            joined_tables.push((t, a, j.kind, j.on.as_ref()));
+            joined.push((rows, cols, a, j.kind, j.on.as_ref()));
         }
 
         // Build the combined schema: composite "alias.col" names so the
         // qualified-column resolver can find anything by exact match.
         let mut combined_schema: Vec<ColumnSchema> = Vec::new();
-        for col in &primary_table.schema().columns {
+        for col in &primary_cols {
             combined_schema.push(ColumnSchema::new(
                 alloc::format!("{primary_alias}.{}", col.name),
                 col.ty,
                 col.nullable,
             ));
         }
-        for (t, a, _, _) in &joined_tables {
-            for col in &t.schema().columns {
+        for (_, cols, a, _, _) in &joined {
+            for col in cols {
                 combined_schema.push(ColumnSchema::new(
                     alloc::format!("{a}.{}", col.name),
                     col.ty,
@@ -5025,16 +5137,15 @@ impl Engine {
         }
         let ctx = EvalContext::new(&combined_schema, None);
 
-        // Nested-loop join. Starting set: every primary row, padded with
-        // (no joined columns yet).
-        let mut working: Vec<Row> = primary_table.rows().iter().cloned().collect();
-        let mut produced_len = primary_table.schema().columns.len();
-        for (t, _, kind, on) in &joined_tables {
-            let right_arity = t.schema().columns.len();
+        // Nested-loop join.
+        let mut working: Vec<Row> = primary_rows;
+        let mut produced_len = primary_cols.len();
+        for (rrows, rcols, _, kind, on) in &joined {
+            let right_arity = rcols.len();
             let mut next: Vec<Row> = Vec::new();
             for left in &working {
                 let mut left_matched = false;
-                for right in t.rows() {
+                for right in rrows {
                     let mut combined_vals = left.values.clone();
                     combined_vals.extend(right.values.iter().cloned());
                     // Pad combined to the eventual full width so the
@@ -9167,6 +9278,18 @@ fn resolve_on_conflict_columns(
         })
     })?;
     if target.is_empty() {
+        // v7.13.2 — mailrs round-6 S5 follow-up. Composite UNIQUE
+        // constraints carry a multi-column tuple; the prior code
+        // path picked only the leading column of the first BTree
+        // index, which caused `ON CONFLICT DO NOTHING` to dedup
+        // by leading column alone (3 rows with same group_id but
+        // different permission collapsed to 1). PG semantics use
+        // the full tuple. Prefer a UniquenessConstraint's full
+        // column list when one exists; fall back to the leading
+        // BTree column for legacy single-column UNIQUE.
+        if let Some(uc) = table.schema().uniqueness_constraints.first() {
+            return Ok(uc.columns.clone());
+        }
         let pos = table
             .indices()
             .iter()

@@ -8,6 +8,92 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.13.2] — 2026-06-06 (mailrs round-6 derived-shape coverage — 7 surfaces closed)
+
+mailrs ran the v7.13.0 image end-to-end (round-6 ack:
+`.claude/notes/mailrs-migration-feedback-followup-d-validate-6.md`).
+Image side (C1–C7) verified perfect drop-in. SQL cold-start went
+14/42 → **32/42** migrations passing, +128%. The remaining 10
+failures clustered on 7 derived shapes of round-5 categories
+that v7.13.0 ack treated as closed but only closed the base form
+of. v7.13.2 covers all 7.
+
+The "客户 0 改动" (zero customer change) rule stands: mailrs's
+`scripts/init-schema.sql` + 42 `migrate-*.sql` apply zero-error
+against the v7.13.2 image, no mailrs-side edit, no schema
+reshape.
+
+### Round-6 surfaces closed
+
+- **S1 — multi-column `ALTER TABLE … ADD COLUMN, ADD COLUMN, …`**
+  (3 mailrs hits — `migrate-031/032/035`). `AlterTableStatement`
+  now carries `targets: Vec<AlterTableTarget>`; the parser accepts
+  comma-separated subactions (ADD COLUMN / DROP CONSTRAINT /
+  ALTER COLUMN TYPE / ADD CONSTRAINT FOREIGN KEY / SET
+  hot_tier_bytes in any order). Engine applies subactions
+  sequentially; first error aborts the statement (PG-flavoured
+  atomicity needs an explicit BEGIN/COMMIT in v7.13).
+- **S2 — `gin_trgm_ops` partial index WHERE** (2 hits —
+  `migrate-007/012`). GIN / BRIN / HNSW indexes now accept the
+  `partial_predicate` (stored the same way BTree partial indexes
+  do since v6.8.1). Maintenance is conservative: predicate is not
+  applied at NSW build time (oversamples the index); query-side
+  WHERE still filters correctly.
+- **S3 — inline `REFERENCES` on `ALTER TABLE ADD COLUMN`** (1
+  hit — `migrate-014`). `ADD COLUMN col TYPE REFERENCES
+  other(col) [ON DELETE …]` now parses; the parser splits into
+  an `AddColumn` subaction + an `AddForeignKey` subaction so the
+  catalog ends up with both the column and the FK.
+- **S4 — inline `REFERENCES` in `CREATE TABLE` column def**.
+  Verified that `parse_column_def_with_fk` already handled this
+  shape; the round-6 doc miscategorised the cascade from S1.
+- **S5 — `FROM tbl, UNNEST(ARRAY[…]) AS alias(col)`** (1 hit —
+  `migrate-013`). UNNEST table function valid in any FROM
+  position (not just primary). New `materialise_table_ref`
+  helper synthesises an in-memory single-column row set per
+  unnest peer; `parse_optional_alias_with_columns` honours the
+  PG-standard `AS alias(col)` column-list aliasing so `p.perm`
+  resolves correctly. v7.13.0 G4 INSERT…SELECT works unchanged
+  with the new FROM shape.
+- **S6 — `ALTER COLUMN TYPE vector(N) USING NULL`** (1 hit —
+  `migrate-025`). Vector encoding parser (`USING SQ8` /
+  `USING HALF`) now peeks one token past `USING` and only
+  consumes when the next token is a known encoding ident;
+  otherwise leaves `USING` for the ALTER COLUMN TYPE rewrite-
+  expression path. PG semantics for `USING NULL` (clear the
+  column during type change) now work as written.
+- **S7 — `ALTER TABLE … DROP CONSTRAINT IF EXISTS [name]
+  [CASCADE]`** (1 hit — `migrate-033`). New `if_exists` flag on
+  the `DropForeignKey` variant; CASCADE / RESTRICT trailers
+  accepted silently for pg_dump compatibility.
+
+### Bonus correctness fix
+
+- `ON CONFLICT DO NOTHING / DO UPDATE` without an explicit
+  target tuple was picking the first single-column BTree index,
+  which made composite UNIQUE constraints (`UNIQUE(a, b)`) dedup
+  on the leading column alone (3 rows with same `a` collapsed
+  to 1 even when `b` differed). v7.13.2 prefers the first
+  `UniquenessConstraint`'s full column list when one exists;
+  single-column UNIQUE keeps the legacy path. mailrs's RBAC
+  bootstrap (`INSERT … UNNEST([10 permission strings]) …
+  ON CONFLICT DO NOTHING`) was the trigger — without this fix,
+  only 1 of 10 permissions would land.
+
+### Validation
+
+- `cargo test --workspace --locked` → 0 failures
+- `cargo run -p sqllogictest --release` → 372/372 = 100%
+- 10 new e2e tests in `tests/e2e_round6_surfaces.rs` cover each
+  surface end-to-end against the exact mailrs SQL shape.
+
+Catalog FILE_VERSION stays at 23 (no new persistent fields).
+Display round-trips via the new `fmt_alter_target` helper so
+WAL replay reconstructs multi-subaction ALTER TABLE statements
+identically.
+
+---
+
 ## [7.13.1] — 2026-06-06 (test corpus catch-up — ALTER TABLE ADD COLUMN no longer "unsupported")
 
 Test-only hotfix on top of v7.13.0. Zero runtime / wire /

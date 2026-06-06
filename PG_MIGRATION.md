@@ -217,9 +217,12 @@ implemented; further breakdown follows the table.
 | `EXPLAIN (SUGGEST) …` (v6.8.3) | ✅ | PG would use `pg_qualstats`/`hypopg` — SPG is built-in |
 | `ALTER TABLE t SET hot_tier_bytes = X` | ✅ | SPG-specific cold-tier knob |
 | `ALTER TABLE t ADD COLUMN` | ✅ v7.13.0 | `[IF NOT EXISTS]`, `DEFAULT`, `NOT NULL` (errors if non-empty + NOT NULL + no DEFAULT — same as PG); back-fills every row |
+| `ALTER TABLE t ADD COLUMN col TYPE REFERENCES other(c) [ON DELETE …]` | ✅ v7.13.2 | inline REFERENCES on ADD COLUMN; parser splits into column add + FK install |
+| Multi-subaction `ALTER TABLE t … , … , …` | ✅ v7.13.2 | comma-separated ADD COLUMN / ALTER COLUMN TYPE / DROP CONSTRAINT / ADD CONSTRAINT FK; applied in source order |
 | `ALTER TABLE t DROP COLUMN` | ❌ | Re-CREATE with the desired layout + `INSERT INTO new SELECT …` |
 | `ALTER TABLE t RENAME COLUMN` | ❌ | Re-CREATE as above |
-| `ALTER TABLE t ALTER COLUMN c TYPE T [USING expr]` | ✅ v7.13.0 | `USING` expression evaluated per row; falls back to direct cast |
+| `ALTER TABLE t ALTER COLUMN c TYPE T [USING expr]` | ✅ v7.13.0 | `USING` expression evaluated per row; falls back to direct cast; `USING NULL` clears (v7.13.2 disambiguation) |
+| `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name [CASCADE]` | ✅ v7.13.2 | `IF EXISTS` makes drop idempotent; CASCADE/RESTRICT accepted silently |
 | `ALTER INDEX … REBUILD` | ✅ | NSW / BRIN rebuild lands; B-tree no-op |
 | `CREATE SCHEMA foo; foo.bar` | ❌ | Single-namespace catalog; rename-to-prefix as workaround |
 | `CREATE TYPE` / domains / composite types | ❌ | A7 — out of scope |
@@ -230,6 +233,8 @@ implemented; further breakdown follows the table.
 | `CREATE TRIGGER` | ✅ v7.12.4 | BEFORE/AFTER row-level triggers on INSERT/UPDATE/DELETE; see [§PL/pgSQL triggers](#plpgsql-triggers) below |
 | `CREATE TRIGGER … BEFORE UPDATE OF col, col, … ON tbl` | ✅ v7.13.0 | Column-list filter — trigger fires only when at least one listed column actually differs between OLD and NEW |
 | Trigram opclasses (`gin_trgm_ops` / `gist_trgm_ops`) | ⚠️ v7.13.0 | Opclass token accepted in `USING gin (col gin_trgm_ops)`; `pg_trgm` operators / `LIKE` acceleration not wired — index still degrades to a full scan for trigram-style queries |
+| GIN partial index `WHERE pred` | ✅ v7.13.2 | predicate stored on GIN/BRIN/HNSW indexes the same way BTree partial predicates persist since v6.8.1; query-side WHERE still applies |
+| `FROM tbl, UNNEST(<arr>) AS alias(col)` | ✅ v7.13.2 | UNNEST in any FROM position (cross-join); PG-standard `AS alias(col_name)` column-list aliasing |
 | PG btree opclasses (`text_pattern_ops` etc) | ✅ v7.13.0 | Token accepted; doesn't change BTree comparator (SPG already orders text bytewise) |
 | `CREATE FUNCTION ... LANGUAGE plpgsql` (trigger functions) | ✅ v7.12.4 | DECLARE / IF / RAISE / embedded SQL — full subset used by mailrs's `update_search_vector`; see [§PL/pgSQL triggers](#plpgsql-triggers) below |
 | `CREATE FUNCTION` (scalar UDF, non-trigger) | ⚠️ | DDL parses, body is stored, but invocation surface ships in v7.13+. Use built-in functions for v7.12.x. |

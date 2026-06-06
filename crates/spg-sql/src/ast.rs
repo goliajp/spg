@@ -245,7 +245,12 @@ pub enum AlterIndexTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlterTableStatement {
     pub name: String,
-    pub target: AlterTableTarget,
+    /// v7.13.2 — mailrs round-6 S1. One or more subactions
+    /// separated by commas in the source SQL. PG-semantic apply
+    /// is sequential; engine bails on first error (no
+    /// transactional rollback of completed subactions in v7.13).
+    /// Single-subaction shape stays a 1-element vec.
+    pub targets: Vec<AlterTableTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,10 +263,13 @@ pub enum AlterTableTarget {
     /// Engine validates existing rows against the new constraint
     /// before installing it.
     AddForeignKey(ForeignKeyConstraint),
-    /// v7.6.8 — `ALTER TABLE t DROP CONSTRAINT name`. Removes the
-    /// constraint by user-supplied name; raises if no FK with that
-    /// name exists on the table.
-    DropForeignKey(String),
+    /// v7.6.8 — `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name`.
+    /// `if_exists` (v7.13.2 mailrs round-6 S7) makes the drop a
+    /// no-op when no FK with that name exists; otherwise raises.
+    DropForeignKey {
+        name: String,
+        if_exists: bool,
+    },
     /// v7.13.0 — `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] <col>
     /// <type> [DEFAULT <expr>] [NOT NULL]`. mailrs round-5 G1
     /// (20 migrate-*.sql hits). Engine appends the column to the
@@ -1157,10 +1165,17 @@ pub struct TableRef {
     /// `"unnest"` when no `AS` is given) and the engine builds a
     /// synthetic single-column table by evaluating the expression
     /// once at SELECT entry. Each TEXT[] element becomes one row;
-    /// NULL elements become NULL cells. v7.11 supports
-    /// uncorrelated UNNEST only (the expr cannot reference outer
-    /// columns) and only as the FROM primary (no JOINs).
+    /// NULL elements become NULL cells. v7.11 supported
+    /// uncorrelated UNNEST only as the FROM primary; v7.13.2
+    /// (mailrs round-6 S5) widens to UNNEST in any FROM-list
+    /// position (cross-join with regular tables).
     pub unnest_expr: Option<Box<Expr>>,
+    /// v7.13.2 — mailrs round-6 S5. PG-standard
+    /// `UNNEST(<arr>) AS alias(col_name)` column-list aliasing:
+    /// when non-empty, the first entry overrides the projected
+    /// column name for the unnested column. Empty = fall back to
+    /// the table alias (pre-v7.13.2 behaviour).
+    pub unnest_column_aliases: Vec<String>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -1626,53 +1641,13 @@ impl fmt::Display for Statement {
             }
             Self::AlterTable(a) => {
                 write!(f, "ALTER TABLE {} ", quote_ident(&a.name))?;
-                match &a.target {
-                    AlterTableTarget::SetHotTierBytes(n) => {
-                        write!(f, "SET hot_tier_bytes = {n}")
+                for (i, t) in a.targets.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
                     }
-                    AlterTableTarget::AddForeignKey(fk) => write!(f, "ADD {fk}"),
-                    AlterTableTarget::DropForeignKey(name) => {
-                        write!(f, "DROP CONSTRAINT {}", quote_ident(name))
-                    }
-                    AlterTableTarget::AddColumn {
-                        column,
-                        if_not_exists,
-                    } => {
-                        f.write_str("ADD COLUMN ")?;
-                        if *if_not_exists {
-                            f.write_str("IF NOT EXISTS ")?;
-                        }
-                        write!(f, "{} {}", quote_ident(&column.name), column.ty)?;
-                        if !column.nullable {
-                            f.write_str(" NOT NULL")?;
-                        }
-                        if let Some(d) = &column.default {
-                            write!(f, " DEFAULT {d}")?;
-                        }
-                        if column.auto_increment {
-                            f.write_str(" AUTO_INCREMENT")?;
-                        }
-                        if column.is_primary_key {
-                            f.write_str(" PRIMARY KEY")?;
-                        }
-                        Ok(())
-                    }
-                    AlterTableTarget::AlterColumnType {
-                        column,
-                        new_type,
-                        using,
-                    } => {
-                        write!(
-                            f,
-                            "ALTER COLUMN {} TYPE {new_type}",
-                            quote_ident(column)
-                        )?;
-                        if let Some(u) = using {
-                            write!(f, " USING {u}")?;
-                        }
-                        Ok(())
-                    }
+                    fmt_alter_target(f, t)?;
                 }
+                Ok(())
             }
             Self::CreatePublication(p) => {
                 write!(f, "CREATE PUBLICATION {}", quote_ident(&p.name))?;
@@ -2005,6 +1980,56 @@ impl fmt::Display for CreateTableStatement {
             write!(f, "{tc}")?;
         }
         f.write_str(")")
+    }
+}
+
+fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Result {
+    match t {
+        AlterTableTarget::SetHotTierBytes(n) => {
+            write!(f, "SET hot_tier_bytes = {n}")
+        }
+        AlterTableTarget::AddForeignKey(fk) => write!(f, "ADD {fk}"),
+        AlterTableTarget::DropForeignKey { name, if_exists } => {
+            f.write_str("DROP CONSTRAINT ")?;
+            if *if_exists {
+                f.write_str("IF EXISTS ")?;
+            }
+            write!(f, "{}", quote_ident(name))
+        }
+        AlterTableTarget::AddColumn {
+            column,
+            if_not_exists,
+        } => {
+            f.write_str("ADD COLUMN ")?;
+            if *if_not_exists {
+                f.write_str("IF NOT EXISTS ")?;
+            }
+            write!(f, "{} {}", quote_ident(&column.name), column.ty)?;
+            if !column.nullable {
+                f.write_str(" NOT NULL")?;
+            }
+            if let Some(d) = &column.default {
+                write!(f, " DEFAULT {d}")?;
+            }
+            if column.auto_increment {
+                f.write_str(" AUTO_INCREMENT")?;
+            }
+            if column.is_primary_key {
+                f.write_str(" PRIMARY KEY")?;
+            }
+            Ok(())
+        }
+        AlterTableTarget::AlterColumnType {
+            column,
+            new_type,
+            using,
+        } => {
+            write!(f, "ALTER COLUMN {} TYPE {new_type}", quote_ident(column))?;
+            if let Some(u) = using {
+                write!(f, " USING {u}")?;
+            }
+            Ok(())
+        }
     }
 }
 
