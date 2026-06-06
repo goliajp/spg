@@ -8,6 +8,131 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.16.0] — 2026-06-06 (spg-embedded prepare/bind + spg-sqlx adapter — mailrs in-process path)
+
+The "mailrs cuts the SPG container from prod docker-compose"
+release. Closes gap-eval E2 (in-process prepare/bind API) and
+E1 (sqlx 0.8 adapter) so mailrs can swap `sqlx::PgPool` for
+`SpgPool` with one type rename and keep its 600 existing
+`sqlx::query` / `sqlx::query_as` / `pool.begin` call sites
+unchanged. The kevy `kevy_embedded::Store` precedent for SPG.
+
+### What shipped
+
+1. **spg-embedded prepare/bind**. The engine has had
+   `prepare_cached` + `execute_prepared` + Expr::Placeholder
+   since v6.1.1 / v6.3.0 to back pgwire's extended-query
+   protocol; v7.16.0 surfaces them on the in-process API.
+   New `Database::prepare(sql) → Statement` returns a Clone
+   handle that subsequent `execute_prepared(&Statement,
+   &[Value])` / `query_prepared(&Statement, &[Value])` calls
+   re-bind without re-parsing. The WAL persistence path
+   renders the bind-final AST back to canonical SQL so replay
+   sees a simple-query-shaped statement and never needs the
+   original prepared handle to still be alive.
+   `spg-embedded-tokio` mirrors the API as `AsyncStatement`,
+   shared via `Arc` so the handle is `Clone + Send` across
+   concurrent binds.
+
+2. **spg-sqlx adapter** (new crate). Full `sqlx::Database`
+   driver with all 11 associated types implemented. Wraps
+   `AsyncDatabase`; pool connections share one in-process
+   engine via a `tokio::sync::OnceCell` on `SpgConnectOptions`
+   so `pool.begin()` and `pool.acquire()` reach the same
+   engine and tx visibility works. `SpgPool::connect_in_memory()`
+   / `connect_path(p)` mirror `PgPool::connect()` shape.
+   Encode/Decode/Type for the 11-type mailrs union: i16, i32,
+   i64, f64, f32, bool, String, Vec<u8>, chrono::DateTime<Utc>
+   (TIMESTAMPTZ), chrono::NaiveDateTime / NaiveDate (TIMESTAMP /
+   DATE), serde_json::Value (JSON / JSONB), Vec<i32> / Vec<i64>
+   / Vec<String> (INT[] / BIGINT[] / TEXT[]). Transactions via
+   the engine's BEGIN/COMMIT/ROLLBACK. 16 tests cover
+   end-to-end: `sqlx::query("...").bind(...).execute(&pool)`,
+   `fetch_one` / `fetch_optional` / `fetch_all`, transaction
+   commit/rollback visibility, per-type insert+select
+   round-trip.
+
+### Engine bugs caught + fixed by spg-sqlx dogfood
+
+The adapter is the FIRST consumer that mixes prepared
+statements with manual `BEGIN`/`COMMIT` and Bind-time
+non-scalar values, so it surfaced two real engine bugs
+pre-v7.16 callers never hit:
+
+1. `Engine::execute_prepared` skipped the `current_tx` wrap
+   that `execute_in_with_cancel` does for simple-query. Every
+   prepared INSERT/UPDATE/DELETE inside a manual transaction
+   landed in the no-tx default slot — invisible to in-tx
+   SELECT and dropped on COMMIT. Pre-v7.16 nobody noticed
+   because the only prepared-stmt caller was pgwire, which
+   routes the whole client tx through simple-query.
+2. `value_to_literal` rendered `Value::Bytes` / `Value::IntArray` /
+   `Value::BigIntArray` / `Value::TextArray` via the
+   Debug-format wildcard, producing literal text like
+   `"Bytes([0, 1, 2])"` in the executed SQL. Pgwire's Bind
+   serialised those types differently so it never tripped.
+   v7.16.0 adds explicit value_to_literal arms + the matching
+   `coerce_value` Text → IntArray / BigIntArray paths so
+   Bind-side round-trip is symmetric with pgwire.
+
+### What's NOT in v7.16.0 (lands incrementally in v7.16.x)
+
+- `sqlx::query!()` compile-time validation macros. The macros
+  call into a `describe()` impl on the connection which v7.16
+  stubs with a "use offline mode" error. mailrs's existing
+  `.sqlx/` offline cache (generated against PG) works for the
+  read side without runtime changes; full describe lands in
+  v7.17 alongside an explicit type-inference pass on the
+  engine's planner.
+- TCP fallback for the `spg://addr:port` URL scheme. The
+  adapter always opens an in-process Database today.
+- tsvector / VECTOR(N) type bridges — niche from mailrs's
+  cement; the adapter's `SpgArgumentValue` accepts any
+  `EngineValue` so users can reach for the embedded escape
+  hatch when needed.
+- Numeric type bridge.
+
+### Result (all 4 gates green)
+
+| Gate | v7.15.0 | v7.16.0 |
+|---|---|---|
+| workspace tests (`cargo test --workspace --locked`) | 12 pre-existing e2e_trigger fails | unchanged (still pre-existing) |
+| sqllogictest 4-corpus | 432/432 | 432/432 |
+| mailrs ZERO-CHANGE CUTOVER | 42/42 schema + TIMESTAMPTZ data | unchanged |
+| dump-compat (schema + with-data) | 10/10 PASS | 10/10 PASS |
+| data-compat (NEW v7.15.0 gate #4) | 1/1 PASS | 1/1 PASS |
+| spg-sqlx (NEW) | n/a | **16/16 PASS** (3 smoke + 5 fetch + 7 types + 1 doc) |
+| spg-embedded prepare/bind (NEW) | n/a | **6/6 PASS** sync + **3/3 PASS** async |
+
+### Migration suggestion for mailrs
+
+```rust
+// Before
+let pool: sqlx::PgPool = sqlx::PgPool::connect(&url).await?;
+
+// After (one line)
+use spg_sqlx::{SpgPool, SpgPoolExt};
+let pool: SpgPool = SpgPool::connect_path("/data/mailrs.db").await?;
+
+// Every existing call site:
+sqlx::query("SELECT ...").bind(...).fetch_one(&pool).await?;  // works
+sqlx::query_as::<_, Msg>("SELECT ...").fetch_one(&pool).await?;  // works
+pool.begin().await?;  // works
+```
+
+The first thing to verify on the mailrs side is the existing
+`cargo test -p mailrs-mailbox --test smoke` against
+`SpgPool::connect_in_memory()` — that's the dogfood loop the
+gap-eval E1 acceptance criteria called out.
+
+### Looking ahead → v7.17
+
+- `sqlx::query!()` compile-time macros via the engine's
+  `describe()` impl + planner type-inference pass on
+  placeholder slots.
+- spg-sqlx Numeric / tsvector / VECTOR(N) bridges.
+- spg-server pgwire-mode `spg://addr:port` URL.
+
 ## [7.15.0] — 2026-06-06 (RENAME COLUMN + real pg_trgm + MySQL inline KEY + COPY FROM STDIN + TIMESTAMPTZ offsets)
 
 Five-item round. The first four ship the docket (RENAME COLUMN,
