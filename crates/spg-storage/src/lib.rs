@@ -1722,6 +1722,78 @@ impl Table {
         self.rows = new_rows;
     }
 
+    /// v7.13.3 — drop the column at `col_pos`. Removes the entry
+    /// from the schema, the value from every row, any index that
+    /// references the column (pure drop, not shift), and shifts
+    /// every remaining index/UC/FK column position that pointed
+    /// past `col_pos` down by one. Used by `ALTER TABLE t DROP
+    /// COLUMN <c>` (mailrs round-7 S8). FK dependents on this
+    /// column must already have been removed by the caller (CASCADE
+    /// path); the helper assumes only same-column index removal is
+    /// needed.
+    pub fn drop_column(&mut self, col_pos: usize) {
+        debug_assert!(col_pos < self.schema.columns.len());
+        // Strip the column from the schema.
+        self.schema.columns.remove(col_pos);
+        // Rewrite every row to omit the cell at col_pos.
+        let mut new_rows: PersistentVec<Row> = PersistentVec::new();
+        for row in self.rows.iter() {
+            let mut values = row.values.clone();
+            if col_pos < values.len() {
+                values.remove(col_pos);
+            }
+            new_rows.push_mut(Row::new(values));
+        }
+        self.rows = new_rows;
+        // Drop indices on the column outright; shift the rest.
+        self.indices.retain(|idx| idx.column_position != col_pos);
+        for idx in &mut self.indices {
+            if idx.column_position > col_pos {
+                idx.column_position -= 1;
+            }
+            // Same shift for any included-columns reference.
+            for inc in &mut idx.included_columns {
+                if *inc as usize > col_pos {
+                    *inc -= 1;
+                }
+            }
+        }
+        // Shift uniqueness-constraint column positions (and drop
+        // entries that lose all columns, though that shouldn't
+        // happen in practice — caller has already CASCADE-removed
+        // FKs and there's no general CASCADE for UCs).
+        let mut surviving_ucs: Vec<UniquenessConstraint> = Vec::new();
+        for mut uc in core::mem::take(&mut self.schema.uniqueness_constraints) {
+            uc.columns.retain(|&c| c != col_pos);
+            if uc.columns.is_empty() {
+                continue;
+            }
+            for c in &mut uc.columns {
+                if *c > col_pos {
+                    *c -= 1;
+                }
+            }
+            surviving_ucs.push(uc);
+        }
+        self.schema.uniqueness_constraints = surviving_ucs;
+        // Shift FK local_columns (parent-pointing column positions
+        // are off-table and untouched).
+        for fk in &mut self.schema.foreign_keys {
+            for c in &mut fk.local_columns {
+                if *c > col_pos {
+                    *c -= 1;
+                }
+            }
+        }
+        // Rebuild remaining indices' payload — the column-position
+        // shift means existing IndexKey entries are still keyed by
+        // the same column data but the position numbers changed;
+        // existing key→locator maps stay valid because they're
+        // keyed by Value not position. The rebuild is conservative
+        // — same pattern delete_rows uses post-mutation.
+        self.rebuild_indices();
+    }
+
     /// v4.4: delete the rows at the given positions in one pass.
     /// `positions` must be unique; ordering doesn't matter. Indices
     /// are rebuilt from scratch (cheaper than tracking incremental
