@@ -126,7 +126,13 @@ fn syntax_error_returns_error_response() {
     let mut stream = connect_to(&addrs.native);
     stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
-    send_query(&mut stream, "DROP TABLE foo"); // not in parser scope yet
+    // v7.16.1 — pick a SQL fragment the parser actually
+    // rejects. The original test used `DROP TABLE foo` but
+    // v7.14.0 added DROP TABLE support, so `foo` now lands as
+    // a storage "table not found" error instead of a parse
+    // error. A malformed keyword sequence still hits the
+    // parse path.
+    send_query(&mut stream, "SELECT FROM WHERE");
     let f = read_frame(&mut stream);
     assert_eq!(f.op, Op::ErrorResponse);
     let msg = parse_error_response(&f).unwrap();

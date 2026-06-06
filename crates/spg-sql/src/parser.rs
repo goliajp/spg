@@ -1602,7 +1602,27 @@ impl Parser {
     }
 
     fn parse_plpgsql_assign_target(&mut self) -> Result<AssignTarget, ParseError> {
-        let head = self.expect_ident_like()?;
+        // v7.16.1 — read the head token DIRECTLY rather than
+        // via `expect_ident_like`. The v7.14.0 schema-qualifier
+        // strip (`public.t` → `t`) inside `expect_ident_like`
+        // greedily consumes any `ident . ident` pair, which
+        // silently turned every `NEW.col := …` /
+        // `OLD.col := …` plpgsql assignment into a Local("col")
+        // assignment — the head "new"/"old" was eaten as if it
+        // were a schema name and the Dot was consumed too, so
+        // this function's own `peek() == Token::Dot` check
+        // below never fired. Every BEFORE trigger that rewrote
+        // a NEW cell was a silent no-op for two major releases
+        // (v7.14.0 + v7.15.0) until the e2e_trigger workspace-
+        // gate failures were investigated as v7.16.1 backlog.
+        let head = match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s,
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected NEW / OLD / <local_var> as plpgsql assign target, got {other:?}"
+                )));
+            }
+        };
         if matches!(self.peek(), Token::Dot) {
             self.advance();
             let col = self.expect_ident_like()?;
@@ -1613,7 +1633,7 @@ impl Parser {
                 return Ok(AssignTarget::OldColumn(col));
             }
             return Err(self.err(alloc::format!(
-                "v7.12.4 plpgsql assign target must be NEW.<col> / OLD.<col> / <local_var>; \
+                "plpgsql assign target must be NEW.<col> / OLD.<col> / <local_var>; \
                  got {head:?}.<col>"
             )));
         }
@@ -2460,8 +2480,48 @@ impl Parser {
                     new,
                 }])
             }
+            // v7.16.1 — `ALTER TABLE t { ENABLE | DISABLE } TRIGGER
+            // { ALL | <name> }`. pg_dump --disable-triggers wraps
+            // every data block with these. Real disable semantics —
+            // not no-op — because reload correctness assumes the
+            // triggers don't fire (rows already carry their
+            // computed values from prod).
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("enable") || s.eq_ignore_ascii_case("disable") =>
+            {
+                let enabled = s.eq_ignore_ascii_case("enable");
+                self.advance();
+                // PG also accepts ENABLE/DISABLE { REPLICA | ALWAYS }
+                // TRIGGER … and ENABLE/DISABLE RULE / ROW LEVEL
+                // SECURITY. v7.16.1 only matches TRIGGER (mailrs's
+                // pg_dump output) — anything else falls through to
+                // the catch-all error below.
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("trigger")) {
+                    return Err(self.err(alloc::format!(
+                        "expected TRIGGER after {}, got {:?}",
+                        if enabled { "ENABLE" } else { "DISABLE" },
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                // `ALL` lexes as Token::All (reserved); also
+                // accept Token::Ident("all") for symmetry.
+                let which = if matches!(self.peek(), Token::All)
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("all"))
+                {
+                    self.advance();
+                    crate::ast::TriggerSelector::All
+                } else {
+                    let name = self.expect_ident_like()?;
+                    crate::ast::TriggerSelector::Named(name)
+                };
+                Ok(alloc::vec![crate::ast::AlterTableTarget::SetTriggerEnabled {
+                    which,
+                    enabled,
+                }])
+            }
             other => Err(self.err(alloc::format!(
-                "expected SET / ADD / DROP / ALTER / RENAME in ALTER TABLE, got {other:?}"
+                "expected SET / ADD / DROP / ALTER / RENAME / ENABLE / DISABLE in ALTER TABLE, got {other:?}"
             ))),
         }
     }
@@ -6264,8 +6324,22 @@ mod tests {
 
     #[test]
     fn empty_input_errors() {
-        let err = parse_statement("").unwrap_err();
-        assert!(err.message.contains("SELECT"));
+        // v7.14.0 — pg_dump preambles emit several comment-only
+        // / blank-line statements that collapse to Statement::
+        // Empty rather than a parse error. The old "SELECT in
+        // message" assertion is stale; verify the new contract:
+        // empty / whitespace / comment-only input parses to
+        // Statement::Empty.
+        assert!(matches!(
+            parse_statement("").unwrap(),
+            Statement::Empty
+        ));
+        assert!(matches!(
+            parse_statement("  \n\t ").unwrap(),
+            Statement::Empty
+        ));
+        // Sanity: malformed-but-non-empty still errors.
+        assert!(parse_statement("SELECT FROM WHERE").is_err());
     }
 
     #[test]
@@ -6361,10 +6435,21 @@ mod tests {
 
     #[test]
     fn create_table_vector_using_unknown_errors() {
+        // v7.16.1 — the inline `USING <encoding>` shape on
+        // CREATE TABLE column defs was withdrawn before
+        // v7.14.0 in favour of `CREATE INDEX … USING hnsw
+        // (col vector_<metric>_ops)`; the parser now rejects
+        // USING at column-list position with a clearer
+        // "expected ',' or ')'" message. Test asserts the
+        // current rejection, not the old "unknown vector
+        // encoding" string.
         let err = parse_statement("CREATE TABLE t (v VECTOR(8) USING PQ8)").unwrap_err();
         assert!(
-            err.message.contains("unknown vector encoding"),
-            "got: {}",
+            err.message.contains("USING")
+                || err.message.contains("using")
+                || err.message.contains("')'")
+                || err.message.contains("','"),
+            "expected USING/column-list rejection, got: {}",
             err.message
         );
     }

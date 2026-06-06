@@ -3349,6 +3349,15 @@ pub struct TriggerDef {
     /// catalog FILE_VERSION 23+; older catalogs deserialise with
     /// an empty vec.
     pub update_columns: Vec<String>,
+    /// v7.16.1 — whether the trigger fires when its watched
+    /// event occurs. Toggled by `ALTER TABLE … { ENABLE |
+    /// DISABLE } TRIGGER …`; pg_dump --disable-triggers wraps
+    /// every data block with a DISABLE/ENABLE pair so the
+    /// rows already-computed in prod don't get re-rewritten.
+    /// Defaults to `true` at CREATE TRIGGER time. Stored in
+    /// catalog FILE_VERSION 25+; older catalogs deserialise
+    /// with `enabled = true`.
+    pub enabled: bool,
 }
 
 impl Catalog {
@@ -4768,7 +4777,12 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     keys are PG-compatible 3-byte trigram shingles instead of
 ///     tsvector lexemes. v23 catalogs deserialise unchanged — no
 ///     v23 writer ever emitted tag 4.
-const FILE_VERSION: u8 = 24;
+/// v25 introduces:
+///   * Per `TriggerDef`: trailing `enabled: u8` flag (mailrs
+///     round-9 A.2.b — `ALTER TABLE … { ENABLE | DISABLE }
+///     TRIGGER …`). v24 catalogs deserialise with every trigger
+///     `enabled = true`, matching pre-v7.16.1 behaviour.
+const FILE_VERSION: u8 = 25;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5144,6 +5158,8 @@ impl Catalog {
             for c in &td.update_columns {
                 write_str(&mut out, c);
             }
+            // v7.16.1 — TriggerDef.enabled (FILE_VERSION 25+).
+            out.push(u8::from(td.enabled));
         }
         out
     }
@@ -5216,6 +5232,14 @@ impl Catalog {
                 } else {
                     Vec::new()
                 };
+                // v7.16.1 — TriggerDef.enabled (FILE_VERSION 25+).
+                // v24-and-below catalogs deserialise with `true`
+                // — pre-v7.16.1 every trigger always fired.
+                let enabled = if version >= 25 {
+                    cur.read_u8()? != 0
+                } else {
+                    true
+                };
                 cat.triggers.push(TriggerDef {
                     name,
                     table,
@@ -5224,6 +5248,7 @@ impl Catalog {
                     for_each,
                     function,
                     update_columns,
+                    enabled,
                 });
             }
         }

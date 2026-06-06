@@ -355,6 +355,36 @@ pub enum AlterTableTarget {
     /// column referenced by a function body update the function
     /// body separately.
     RenameColumn { old: String, new: String },
+    /// v7.16.1 — `ALTER TABLE t { ENABLE | DISABLE } TRIGGER
+    /// { ALL | <name> }`. Toggles whether row-level triggers
+    /// fire on subsequent INSERT/UPDATE/DELETE on the table.
+    /// `pg_dump --disable-triggers` emits a DISABLE wrapper +
+    /// ENABLE epilogue around every table's data block so the
+    /// rows already-computed in prod don't get re-rewritten
+    /// (and so trigger-driven side effects like
+    /// audit/queueing don't re-fire during a bulk reload).
+    /// `which == TriggerSelector::All` toggles every trigger
+    /// on the table; `Named(name)` toggles one trigger. The
+    /// engine persists the disabled state on `TriggerDef.enabled`
+    /// (catalog FILE_VERSION 25+) and the row-write paths skip
+    /// the trigger when `!enabled`.
+    SetTriggerEnabled {
+        which: TriggerSelector,
+        enabled: bool,
+    },
+}
+
+/// v7.16.1 — target of `ALTER TABLE … { ENABLE | DISABLE }
+/// TRIGGER …`. PG also accepts `USER`, `REPLICA`, `ALWAYS`
+/// modifiers; v7.16.1 ships the two shapes pg_dump actually
+/// emits (`ALL` + per-name) — the rest parse-accept as `Named`
+/// shouldn't surface from a dump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerSelector {
+    /// Every trigger on the table.
+    All,
+    /// A specific trigger by name.
+    Named(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2185,6 +2215,13 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
                 quote_ident(old),
                 quote_ident(new)
             )
+        }
+        AlterTableTarget::SetTriggerEnabled { which, enabled } => {
+            f.write_str(if *enabled { "ENABLE TRIGGER " } else { "DISABLE TRIGGER " })?;
+            match which {
+                TriggerSelector::All => f.write_str("ALL"),
+                TriggerSelector::Named(n) => f.write_str(&quote_ident(n)),
+            }
         }
     }
 }
