@@ -42,6 +42,15 @@ pub enum Token {
     // Identifiers
     Ident(String),       // ASCII case-folded
     QuotedIdent(String), // original case, "" → "
+    /// v7.14.0 — MySQL session / user variable reference
+    /// (`@VAR` / `@@VAR`). The wrapped string is the verbatim
+    /// source form (including the `@` / `@@` prefix). Used by
+    /// mysqldump preamble (`SET @OLD_FOREIGN_KEY_CHECKS =
+    /// @@FOREIGN_KEY_CHECKS, …`); SPG accepts the token and
+    /// the SET parser treats the assignment as a no-op apart
+    /// from any second LHS that targets a real session
+    /// parameter (e.g. `FOREIGN_KEY_CHECKS=0`).
+    SessionVar(String),
 
     // Literals
     Integer(i64),
@@ -218,6 +227,28 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             b'/' if peek_eq(bytes, i + 1, b'*') => {
                 let start = i;
+                // v7.14.0 — MySQL versioned conditional comment
+                // `/*!NNNNN <body> */`. The body is real SQL that
+                // MySQL/MariaDB executes when the runtime version
+                // matches the 5-digit code; PG strips the whole
+                // thing as a block comment. SPG sides with MySQL
+                // semantics for dump compatibility: skip the
+                // `/*!NNNNN ` prefix and continue lexing the body
+                // as ordinary tokens. The closing `*/` is later
+                // matched + skipped by the symmetric arm below.
+                if peek_eq(bytes, i + 2, b'!') {
+                    let mut j = i + 3;
+                    // skip the optional 5-digit version code +
+                    // following single whitespace
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
                 i += 2;
                 let mut closed = false;
                 while i + 1 < bytes.len() {
@@ -234,6 +265,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                         pos: start,
                     });
                 }
+            }
+            // v7.14.0 — bare `*/` (closing of the v7.14 MySQL
+            // versioned-comment opener that didn't consume the
+            // closer). We treat it as an inline comment terminator
+            // and skip 2 bytes.
+            b'*' if peek_eq(bytes, i + 1, b'/') => {
+                i += 2;
             }
             b'\'' => {
                 let (tok, consumed) = lex_quoted(input, i, b'\'', false)?;
@@ -313,18 +351,41 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             // v6.4.5: `@>` JSON containment.
             // v7.12.2: `@@` tsvector / tsquery match.
+            // v7.14.0: `@@NAME` MySQL session variable ref +
+            //          `@NAME` user variable ref. mysqldump preamble
+            //          uses both heavily (`SET @OLD_FOREIGN_KEY_CHECKS
+            //          = @@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0`).
+            //          We lex both as a single SessionVar token so
+            //          the parser can accept and ignore them.
             b'@' => {
                 if peek_eq(bytes, i + 1, b'>') {
                     out.push(Token::JsonContains);
                     i += 2;
-                } else if peek_eq(bytes, i + 1, b'@') {
+                } else if peek_eq(bytes, i + 1, b'@')
+                    && !is_session_var_ident_start(bytes.get(i + 2).copied())
+                {
+                    // `@@` not followed by an ident-start byte is
+                    // the tsquery `@@` operator.
                     out.push(Token::TsMatch);
                     i += 2;
                 } else {
-                    return Err(LexError {
-                        kind: LexErrorKind::UnknownChar('@'),
-                        pos: i,
-                    });
+                    // `@VAR` / `@@VAR` — MySQL user / session
+                    // variable reference. Consume the ident-shaped
+                    // tail and emit as Token::SessionVar so the
+                    // SET parser can accept-and-ignore.
+                    let prefix_end = if peek_eq(bytes, i + 1, b'@') { i + 2 } else { i + 1 };
+                    let mut end = prefix_end;
+                    while end < bytes.len() && is_session_var_ident_continue(bytes[end]) {
+                        end += 1;
+                    }
+                    if end == prefix_end {
+                        return Err(LexError {
+                            kind: LexErrorKind::UnknownChar('@'),
+                            pos: i,
+                        });
+                    }
+                    out.push(Token::SessionVar(input[i..end].to_string()));
+                    i = end;
                 }
             }
             b'*' => single(&mut out, Token::Star, &mut i),
@@ -482,6 +543,22 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 
 fn peek_eq(bytes: &[u8], i: usize, target: u8) -> bool {
     bytes.get(i) == Some(&target)
+}
+
+/// v7.14.0 — recognise the first byte of a MySQL session/user
+/// variable name (after `@` or `@@`). PG-strict idents are ASCII
+/// letter or underscore; MySQL also allows leading digits inside
+/// quoted names but unquoted vars match the same shape.
+fn is_session_var_ident_start(b: Option<u8>) -> bool {
+    matches!(b, Some(c) if c.is_ascii_alphabetic() || c == b'_')
+}
+
+/// Continuation byte for a `@VAR`/`@@VAR` ident (after the first
+/// alphabet/underscore byte). Letters, digits, underscore, dot
+/// (MySQL allows session-scope qualifiers like
+/// `@@global.sql_mode`) and `$` (some MySQL versions accept it).
+fn is_session_var_ident_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$'
 }
 
 /// v7.9.27 — find the start index of the next occurrence of `tag`

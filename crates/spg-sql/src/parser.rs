@@ -29,6 +29,37 @@ use crate::ast::{
 };
 use crate::lexer::{self, LexError, Token};
 
+/// v7.14.0 — true when the leading keyword of a top-level
+/// statement is one of the dump-emitted DDL forms SPG accepts
+/// as a no-op (no behavioural effect on the single-schema /
+/// single-database model). These statements are consumed up to
+/// the next `;` / EOF and returned as `Statement::Empty`.
+fn is_dump_noise_statement(lc: &str) -> bool {
+    matches!(
+        lc,
+        // Object comments / privileges / ownership — none of
+        // these change schema semantics on SPG.
+        "comment"
+            | "grant"
+            | "revoke"
+            // MySQL bulk-load brackets.
+            | "lock"
+            | "unlock"
+            // MySQL OPTIMIZE / ANALYZE TABLE / CHECK TABLE
+            // diagnostics that pg_dump-style tools also emit
+            // post-restore.
+            | "optimize"
+            | "check"
+            | "use"
+            // PG psql backslash meta-commands that newer
+            // pg_dump versions emit unescaped (\restrict /
+            // \unrestrict). Real psql intercepts these; SPG's
+            // PG-wire sees them as raw text.
+            | "\\restrict"
+            | "\\unrestrict"
+    )
+}
+
 /// v7.9.22 — recognise pgvector / SPG vector-index opclass names
 /// in CREATE INDEX. SPG's HNSW already routes by query operator;
 /// the opclass is accepted for `pg_dump` compatibility (mailrs
@@ -159,18 +190,80 @@ impl Parser {
         }
     }
 
-    fn expect_ident_like(&mut self) -> Result<String, ParseError> {
-        match self.advance() {
-            Token::Ident(s) | Token::QuotedIdent(s) => Ok(s),
-            other => Err(ParseError {
-                message: format!("expected identifier, got {other:?}"),
-                token_pos: self.pos.saturating_sub(1),
-            }),
+    /// v7.14.0 — swallow every token up to (but not including) the
+    /// next semicolon / EOF. Used by the dump-noise dispatcher
+    /// to consume `COMMENT ON …`, `GRANT …`, `LOCK TABLES …`,
+    /// etc. without modeling each grammar.
+    fn consume_until_statement_boundary(&mut self) {
+        loop {
+            match self.peek() {
+                Token::Semicolon | Token::Eof => return,
+                _ => self.advance(),
+            };
         }
+    }
+
+    fn expect_ident_like(&mut self) -> Result<String, ParseError> {
+        let first = match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s,
+            other => {
+                return Err(ParseError {
+                    message: format!("expected identifier, got {other:?}"),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
+        };
+        // v7.14.0 — strip optional `<schema>.` prefix. PG dumps
+        // qualify every name with `public.` (and pg_catalog.* for
+        // functions); SPG is single-schema so we discard the
+        // prefix and return only the trailing ident. Same shape
+        // also handles MySQL `db.tbl` cross-database refs (SPG
+        // ignores the db part).
+        if matches!(self.peek(), Token::Dot) {
+            self.advance();
+            match self.advance() {
+                Token::Ident(s) | Token::QuotedIdent(s) => return Ok(s),
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "expected identifier after '{first}.', got {other:?}"
+                        ),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            }
+        }
+        Ok(first)
     }
 
     #[allow(clippy::too_many_lines)]
     fn parse_one_statement(&mut self) -> Result<Statement, ParseError> {
+        // v7.14.0 — empty / comment-only / semicolon-only input
+        // (after the lexer strips line + block + MySQL
+        // conditional comments) lands as Statement::Empty.
+        // pg_dump and mysqldump emit several wrappers that
+        // collapse to nothing after stripping (`/*!40101 SET …
+        // */;`, blank lines between statements); the engine
+        // returns CommandOk no-op so the dump loads cleanly.
+        if matches!(self.peek(), Token::Eof | Token::Semicolon) {
+            return Ok(Statement::Empty);
+        }
+        // v7.14.0 — pg_dump / mysqldump "noise" statements:
+        // catalog / metadata DDL that has no behavioural effect
+        // on SPG's single-schema, single-database, single-user
+        // model. Consume the whole statement up to the next
+        // semicolon / EOF and return Empty. This is broader than
+        // the per-keyword DROP / SET / COMMENT arms but lets the
+        // long tail of `LOCK TABLES`, `UNLOCK TABLES`, `GRANT`,
+        // `REVOKE`, `ALTER OWNER TO`, `\restrict`, `\unrestrict`,
+        // `BEGIN; COMMIT;` wrappers, etc. all pass through.
+        if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek() {
+            let lc = s.to_ascii_lowercase();
+            if is_dump_noise_statement(&lc) {
+                self.consume_until_statement_boundary();
+                return Ok(Statement::Empty);
+            }
+        }
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
             // v7.9.27 — `DO $$ … $$ [LANGUAGE plpgsql]`. PG-only;
@@ -405,8 +498,90 @@ impl Parser {
                         }
                         Ok(Statement::DropFunction { name, if_exists })
                     }
+                    // v7.14.0 — DROP TABLE [IF EXISTS] name [, name…]
+                    // [CASCADE|RESTRICT]. pg_dump and mysqldump both
+                    // emit DROP TABLE IF EXISTS at the head of every
+                    // CREATE TABLE block so re-importing a dump
+                    // overwrites prior state. SPG accepts and removes
+                    // matching tables; CASCADE/RESTRICT trailers
+                    // accepted silently.
+                    Token::Table => {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names: Vec<String> = Vec::new();
+                        loop {
+                            names.push(self.expect_ident_like()?);
+                            if matches!(self.peek(), Token::Comma) {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropTable { names, if_exists })
+                    }
+                    // v7.14.0 — DROP INDEX [IF EXISTS] name
+                    // [CASCADE|RESTRICT]. PG / mysqldump emit this
+                    // for partial-index renames and pgvector
+                    // migrations. SPG removes the matching index;
+                    // IF EXISTS makes the drop idempotent.
+                    Token::Index => {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let name = self.expect_ident_like()?;
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropIndex { name, if_exists })
+                    }
+                    // v7.14.0 — DROP SCHEMA [IF EXISTS] name
+                    // [CASCADE|RESTRICT]. SPG is single-database;
+                    // schemas are accepted as no-ops (any name
+                    // resolves to the single catalog).
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("schema") => {
+                        self.advance();
+                        let _ = self.consume_if_exists();
+                        let _ = self.expect_ident_like()?;
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::Empty)
+                    }
+                    // v7.14.0 — DROP SEQUENCE [IF EXISTS] name
+                    // [CASCADE|RESTRICT]. SPG has no separate
+                    // sequence object — SERIAL/BIGSERIAL is column-
+                    // local AUTO_INCREMENT — so DROP SEQUENCE
+                    // resolves as a no-op.
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
+                        self.advance();
+                        let _ = self.consume_if_exists();
+                        let _ = self.expect_ident_like()?;
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::Empty)
+                    }
                     other => Err(self.err(format!(
-                        "expected USER / PUBLICATION / SUBSCRIPTION / TRIGGER / FUNCTION after DROP, got {other:?}"
+                        "expected TABLE / INDEX / SCHEMA / SEQUENCE / USER / PUBLICATION / \
+                         SUBSCRIPTION / TRIGGER / FUNCTION after DROP, got {other:?}"
                     ))),
                 }
             }
@@ -498,28 +673,101 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("set") => {
                 self.advance();
                 // PG allows `SET LOCAL` / `SET SESSION` qualifiers
-                // — accept and ignore.
-                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("local") || s.eq_ignore_ascii_case("session"))
+                // — accept and ignore. MySQL adds `SET GLOBAL` too
+                // (and the alias `SET @@global.name = …` which the
+                // SessionVar path handles).
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("local") || s.eq_ignore_ascii_case("session") || s.eq_ignore_ascii_case("global"))
                 {
                     self.advance();
                 }
-                let name = self.parse_set_param_name()?;
-                // Accept either `=` or the bare `TO` keyword.
-                match self.peek() {
-                    Token::Eq => {
+                // v7.14.0 — MySQL `SET NAMES <charset> [COLLATE
+                // <collation>]` — change the connection client
+                // charset. SPG stores UTF-8 always and orders
+                // bytewise; accept as a no-op.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("names"))
+                {
+                    self.advance();
+                    // Charset ident-or-string.
+                    if matches!(
+                        self.peek(),
+                        Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                    ) {
                         self.advance();
                     }
-                    Token::To => {
+                    // Optional `COLLATE <name>`.
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate"))
+                    {
                         self.advance();
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                        ) {
+                            self.advance();
+                        }
                     }
-                    other => {
-                        return Err(self.err(format!(
-                            "expected `=` or TO after SET {name}, got {other:?}"
-                        )));
-                    }
+                    return Ok(Statement::Empty);
                 }
-                let value = self.parse_set_value()?;
-                Ok(Statement::SetParameter { name, value })
+                // v7.14.0 — MySQL `SET CHARACTER SET <charset>`
+                // alias — same accept-as-no-op as SET NAMES.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("character"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("set"))
+                {
+                    self.advance(); // CHARACTER
+                    self.advance(); // SET
+                    if matches!(
+                        self.peek(),
+                        Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                    ) {
+                        self.advance();
+                    }
+                    return Ok(Statement::Empty);
+                }
+                // v7.14.0 — multi-assignment form
+                // `SET a = 1, b = 2, …`. Single-assignment is the
+                // 1-element case. Each LHS may be a regular ident
+                // or a SessionVar (`@VAR` / `@@VAR`).
+                let mut pairs: Vec<(String, crate::ast::SetValue)> = Vec::new();
+                loop {
+                    let lhs = match self.peek().clone() {
+                        Token::SessionVar(s) => {
+                            self.advance();
+                            s
+                        }
+                        Token::Ident(_) | Token::QuotedIdent(_) => self.parse_set_param_name()?,
+                        other => {
+                            return Err(self.err(format!(
+                                "expected parameter name after SET, got {other:?}"
+                            )));
+                        }
+                    };
+                    // Accept either `=` or the bare `TO` keyword.
+                    match self.peek() {
+                        Token::Eq => {
+                            self.advance();
+                        }
+                        Token::To => {
+                            self.advance();
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "expected `=` or TO after SET {lhs}, got {other:?}"
+                            )));
+                        }
+                    }
+                    let value = self.parse_set_value()?;
+                    pairs.push((lhs, value));
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                if pairs.len() == 1 {
+                    let (name, value) = pairs.into_iter().next().unwrap();
+                    Ok(Statement::SetParameter { name, value })
+                } else {
+                    Ok(Statement::SetParameterList(pairs))
+                }
             }
             // v7.12.1 — `RESET <name>` / `RESET ALL`.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("reset") => {
@@ -619,8 +867,37 @@ impl Parser {
                 self.advance();
                 self.parse_create_trigger_after_keyword(false)
             }
+            // v7.14.0 — pg_dump / mysqldump emit
+            // `CREATE SEQUENCE / SCHEMA / VIEW / MATERIALIZED VIEW
+            // / TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
+            // SPG is single-schema / single-database; these have
+            // no behavioural effect, so consume + return Empty.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "sequence"
+                        | "schema"
+                        | "view"
+                        | "materialized"
+                        | "type"
+                        | "domain"
+                        | "database"
+                        | "role"
+                        | "policy"
+                        | "operator"
+                        | "cast"
+                        | "rule"
+                        | "aggregate"
+                        | "language"
+                        | "collation"
+                        | "conversion"
+                ) =>
+            {
+                self.consume_until_statement_boundary();
+                return Ok(Statement::Empty);
+            }
             other => Err(self.err(format!(
-                "expected TABLE / INDEX / USER / EXTENSION / PUBLICATION / SUBSCRIPTION / FUNCTION / TRIGGER [OR REPLACE …] after CREATE, got {other:?}"
+                "expected TABLE / INDEX / USER / EXTENSION / PUBLICATION / SUBSCRIPTION / FUNCTION / TRIGGER / SEQUENCE / SCHEMA / VIEW / TYPE / DOMAIN [OR REPLACE …] after CREATE, got {other:?}"
             ))),
         }
     }
@@ -1535,6 +1812,23 @@ impl Parser {
             }
             Token::Integer(n) => Ok(crate::ast::SetValue::Number(n.to_string())),
             Token::Float(f) => Ok(crate::ast::SetValue::Number(f.to_string())),
+            // v7.14.0 — MySQL session/user variable RHS
+            // (e.g. `SET OLD_FOREIGN_KEY_CHECKS = @@FOREIGN_KEY_CHECKS`).
+            // Wrap as Ident so the SET handler can record it; the
+            // engine treats `@VAR` / `@@VAR` values as opaque
+            // strings.
+            Token::SessionVar(s) => Ok(crate::ast::SetValue::Ident(s)),
+            // v7.14.0 — `SET sql_mode = 'NO_AUTO_VALUE_ON_ZERO,STRICT_TRANS_TABLES'`
+            // is the common MySQL preamble shape. Allow a `+` or
+            // `-` prefix on negative numerics for parity with PG
+            // (some param defaults are negative).
+            Token::Minus => match self.advance() {
+                Token::Integer(n) => Ok(crate::ast::SetValue::Number(alloc::format!("-{n}"))),
+                Token::Float(f) => Ok(crate::ast::SetValue::Number(alloc::format!("-{f}"))),
+                other => Err(self.err(format!(
+                    "expected numeric after `-` in SET value, got {other:?}"
+                ))),
+            },
             other => Err(self.err(format!(
                 "expected literal, identifier, or DEFAULT after `=` in SET, got {other:?}"
             ))),
@@ -1699,17 +1993,60 @@ impl Parser {
     /// ```
     fn parse_alter_after_keyword(&mut self) -> Result<Statement, ParseError> {
         // ALTER INDEX <name> ... | ALTER TABLE <name> SET hot_tier_bytes = <n>
+        // v7.14.0 — `ALTER TABLE ONLY` modifier (PG partition-
+        // exclusion) is accepted by stripping the `ONLY` keyword
+        // before the table parse.
+        // v7.14.0 — `ALTER SEQUENCE / ALTER VIEW / ALTER OWNER`
+        // and the long PG-dump tail are accepted as no-ops.
         match self.advance() {
             Token::Index => {}
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("index") => {}
             // v6.7.2 — ALTER TABLE t SET hot_tier_bytes = X
-            Token::Table => return self.parse_alter_table_after_keyword(),
-            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("table") => {
+            // v7.14.0 — ALTER TABLE ONLY t … strip the `ONLY`.
+            Token::Table => {
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("only")) {
+                    self.advance();
+                }
                 return self.parse_alter_table_after_keyword();
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("table") => {
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("only")) {
+                    self.advance();
+                }
+                return self.parse_alter_table_after_keyword();
+            }
+            // v7.14.0 — ALTER SEQUENCE / ALTER VIEW / ALTER
+            // FUNCTION / ALTER TYPE / ALTER DOMAIN / ALTER
+            // DATABASE / ALTER USER / ALTER ROLE / ALTER SCHEMA
+            // / ALTER OWNER / ALTER DEFAULT PRIVILEGES — accept
+            // as no-op so pg_dump's tail loads.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "sequence"
+                        | "view"
+                        | "function"
+                        | "type"
+                        | "domain"
+                        | "database"
+                        | "role"
+                        | "schema"
+                        | "owner"
+                        | "default"
+                        | "extension"
+                        | "materialized"
+                        | "policy"
+                        | "publication"
+                        | "subscription"
+                ) =>
+            {
+                self.consume_until_statement_boundary();
+                return Ok(Statement::Empty);
             }
             other => {
                 return Err(self.err(format!(
-                    "expected INDEX or TABLE after ALTER, got {other:?}"
+                    "expected INDEX / TABLE / SEQUENCE / VIEW / FUNCTION / TYPE / OWNER / etc \
+                     after ALTER, got {other:?}"
                 )));
             }
         }
@@ -1820,6 +2157,81 @@ impl Parser {
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
+                // v7.14.0 — ADD CONSTRAINT <name> { FOREIGN KEY |
+                // PRIMARY KEY | UNIQUE | CHECK }. pg_dump emits
+                // PRIMARY KEY this way; mysqldump emits both.
+                // Peek-only dispatch (no advance) — `advance()`
+                // destructively replaces consumed tokens with Eof,
+                // so saved-pos restore would land on Eofs.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint"))
+                {
+                    // The next-but-one ident is the constraint
+                    // name; the one after THAT is the kind.
+                    let kind_pos = self.pos + 2;
+                    let kind = self.tokens.get(kind_pos).cloned();
+                    if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("foreign"))
+                    {
+                        let fk = self.parse_table_level_fk()?;
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddForeignKey(fk)
+                        ]);
+                    }
+                    if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("primary"))
+                    {
+                        self.advance(); // CONSTRAINT
+                        let _name = self.expect_ident_like()?;
+                        self.advance(); // PRIMARY
+                        self.expect_keyword_ident("key")?;
+                        let cols = self.parse_paren_ident_list("PRIMARY KEY")?;
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(
+                                crate::ast::TableConstraint::PrimaryKey {
+                                    name: None,
+                                    columns: cols,
+                                }
+                            )
+                        ]);
+                    }
+                    if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("unique"))
+                    {
+                        self.advance(); // CONSTRAINT
+                        let _name = self.expect_ident_like()?;
+                        self.advance(); // UNIQUE
+                        let cols = self.parse_paren_ident_list("UNIQUE")?;
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(
+                                crate::ast::TableConstraint::Unique {
+                                    name: None,
+                                    columns: cols,
+                                    nulls_not_distinct: false,
+                                }
+                            )
+                        ]);
+                    }
+                    if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("check"))
+                    {
+                        self.advance(); // CONSTRAINT
+                        let _name = self.expect_ident_like()?;
+                        self.advance(); // CHECK
+                        if !matches!(self.peek(), Token::LParen) {
+                            return Err(self.err(alloc::format!(
+                                "expected '(' after CHECK, got {:?}", self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let expr = self.parse_expr(0)?;
+                        if matches!(self.peek(), Token::RParen) {
+                            self.advance();
+                        }
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(
+                                crate::ast::TableConstraint::Check { name: None, expr }
+                            )
+                        ]);
+                    }
+                    // Unknown kind — fall through to FK path which
+                    // produces a descriptive parse error.
+                }
                 let is_fk = matches!(
                     self.peek(),
                     Token::Ident(s) if s.eq_ignore_ascii_case("constraint")
@@ -1828,6 +2240,37 @@ impl Parser {
                 if is_fk {
                     let fk = self.parse_table_level_fk()?;
                     return Ok(alloc::vec![crate::ast::AlterTableTarget::AddForeignKey(fk)]);
+                }
+                // v7.14.0 — bare ADD PRIMARY KEY / UNIQUE / CHECK
+                // (no CONSTRAINT prefix) — same dispatch.
+                match self.peek().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("primary") => {
+                        self.advance();
+                        self.expect_keyword_ident("key")?;
+                        let cols = self.parse_paren_ident_list("PRIMARY KEY")?;
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(
+                                crate::ast::TableConstraint::PrimaryKey {
+                                    name: None,
+                                    columns: cols,
+                                }
+                            )
+                        ]);
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("unique") => {
+                        self.advance();
+                        let cols = self.parse_paren_ident_list("UNIQUE")?;
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(
+                                crate::ast::TableConstraint::Unique {
+                                    name: None,
+                                    columns: cols,
+                                    nulls_not_distinct: false,
+                                }
+                            )
+                        ]);
+                    }
+                    _ => {}
                 }
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
                     self.advance();
@@ -1940,9 +2383,29 @@ impl Parser {
                     Token::Ident(s) if s.eq_ignore_ascii_case("type") => {
                         self.advance();
                     }
+                    // v7.14.0 — pg_dump emits BIGSERIAL via
+                    // `ALTER TABLE … ALTER COLUMN id SET DEFAULT
+                    // nextval('seq')` (the sequence is created
+                    // separately). SPG's BIGSERIAL already uses
+                    // AUTO_INCREMENT; accept SET DEFAULT / DROP
+                    // DEFAULT / SET NOT NULL / DROP NOT NULL as
+                    // engine no-ops by consuming the tail.
+                    Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
+                        // ALTER COLUMN col SET DEFAULT … / SET NOT
+                        // NULL — accept as a no-op on SPG (BIGSERIAL
+                        // already auto-increments; nullability change
+                        // would need row scan — deferred).
+                        self.consume_until_statement_boundary();
+                        return Ok(Vec::new());
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("drop") => {
+                        // ALTER COLUMN col DROP DEFAULT / DROP NOT NULL.
+                        self.consume_until_statement_boundary();
+                        return Ok(Vec::new());
+                    }
                     other => {
                         return Err(self.err(alloc::format!(
-                            "expected TYPE after ALTER COLUMN <name>, got {other:?}"
+                            "expected TYPE / SET / DROP after ALTER COLUMN <name>, got {other:?}"
                         )));
                     }
                 }
@@ -2195,6 +2658,15 @@ impl Parser {
             } else if self.peek_table_level_check_start() {
                 // v7.13.0 — table-level CHECK (mailrs round-5 G3).
                 table_constraints.push(self.parse_table_level_check()?);
+            } else if self.peek_mysql_inline_key_start() {
+                // v7.14.0 — mysqldump emits inline `KEY name (cols)`,
+                // `INDEX name (cols)`, `UNIQUE KEY name (cols)`,
+                // `FULLTEXT KEY name (cols)`, `SPATIAL KEY name (cols)`
+                // inside the column list. Skip name + paren list;
+                // for UNIQUE KEY, register as a UC.
+                if let Some(uc) = self.parse_mysql_inline_key()? {
+                    table_constraints.push(uc);
+                }
             } else if self.peek_constraint_or_fk_start() {
                 foreign_keys.push(self.parse_table_level_fk()?);
             } else {
@@ -2238,6 +2710,13 @@ impl Parser {
         if columns.is_empty() {
             return Err(self.err("CREATE TABLE requires at least one column".into()));
         }
+        // v7.14.0 — consume MySQL/MariaDB table options after the
+        // closing `)`. mysqldump emits things like
+        // `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        // AUTO_INCREMENT=42 ROW_FORMAT=DYNAMIC COMMENT='blog posts'`.
+        // SPG accepts all forms as no-ops (each option is
+        // `<ident> [=] <ident-or-string>` separated by whitespace).
+        self.consume_mysql_table_options();
         Ok(Statement::CreateTable(CreateTableStatement {
             name,
             columns,
@@ -2245,6 +2724,257 @@ impl Parser {
             foreign_keys,
             table_constraints,
         }))
+    }
+
+    /// v7.14.0 — true when the next tokens look like an inline
+    /// MySQL index declaration: KEY / INDEX / UNIQUE KEY /
+    /// UNIQUE INDEX / FULLTEXT [KEY|INDEX] / SPATIAL [KEY|INDEX]
+    /// — each followed by an optional name + `(...)`. Critical:
+    /// a column NAMED `key` / `index` (PG accepts as ident) must
+    /// NOT be mistaken for the KEY constraint shape. We disambig
+    /// by requiring the keyword to be followed by either `(` or
+    /// `<ident> (`.
+    fn peek_mysql_inline_key_start(&self) -> bool {
+        let cur = self.peek();
+        // Shapes:
+        //   KEY (cols)
+        //   KEY name (cols)
+        //   INDEX (cols)
+        //   INDEX name (cols)
+        //   UNIQUE KEY [name] (cols)
+        //   UNIQUE INDEX [name] (cols)
+        //   FULLTEXT [KEY|INDEX] [name] (cols)
+        //   SPATIAL [KEY|INDEX] [name] (cols)
+        let after_keyword_followed_by_paren_or_ident_paren = |skip: usize| -> bool {
+            // tokens at skip = the position AFTER the index-form
+            // keywords (KEY/INDEX) have been consumed.
+            match self.tokens.get(skip) {
+                Some(Token::LParen) => true,
+                Some(Token::Ident(_) | Token::QuotedIdent(_)) => {
+                    matches!(self.tokens.get(skip + 1), Some(Token::LParen))
+                }
+                _ => false,
+            }
+        };
+        match cur {
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("key") || s.eq_ignore_ascii_case("index") =>
+            {
+                after_keyword_followed_by_paren_or_ident_paren(self.pos + 1)
+            }
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("fulltext") || s.eq_ignore_ascii_case("spatial") =>
+            {
+                let nxt = self.tokens.get(self.pos + 1);
+                let after_after = if matches!(
+                    nxt,
+                    Some(Token::Ident(t))
+                        if t.eq_ignore_ascii_case("key") || t.eq_ignore_ascii_case("index")
+                ) {
+                    self.pos + 2
+                } else {
+                    self.pos + 1
+                };
+                after_keyword_followed_by_paren_or_ident_paren(after_after)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("unique") => {
+                let nxt = self.tokens.get(self.pos + 1);
+                if !matches!(
+                    nxt,
+                    Some(Token::Ident(t))
+                        if t.eq_ignore_ascii_case("key") || t.eq_ignore_ascii_case("index")
+                ) {
+                    return false;
+                }
+                after_keyword_followed_by_paren_or_ident_paren(self.pos + 2)
+            }
+            _ => false,
+        }
+    }
+
+    /// v7.14.0 — parse the MySQL inline KEY/INDEX form. Returns
+    /// Some(TableConstraint::Unique) for UNIQUE KEY (so SPG
+    /// enforces uniqueness on INSERT); returns None for plain
+    /// KEY/INDEX/FULLTEXT/SPATIAL (accepted but doesn't create
+    /// an index in v7.14 — only the surface is unblocked).
+    fn parse_mysql_inline_key(
+        &mut self,
+    ) -> Result<Option<crate::ast::TableConstraint>, ParseError> {
+        // Detect UNIQUE prefix.
+        let is_unique = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unique"))
+        {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        // Consume FULLTEXT / SPATIAL prefix (silent).
+        if matches!(
+            self.peek(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("fulltext") || s.eq_ignore_ascii_case("spatial")
+        ) {
+            self.advance();
+        }
+        // KEY / INDEX keyword.
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("key") || s.eq_ignore_ascii_case("index") => {
+                self.advance();
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected KEY/INDEX in inline index declaration, got {other:?}"
+                )));
+            }
+        }
+        // Optional index name (an ident before the `(`).
+        if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_))
+            && !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen) | None)
+        {
+            // Identifier IS the name when followed by `(`; otherwise
+            // it's part of a USING clause we don't model.
+        }
+        if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::LParen)
+                    | Some(Token::Ident(_))
+                    | Some(Token::QuotedIdent(_))
+            )
+        {
+            // Skip name if it precedes the `(`.
+            if matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
+                self.advance();
+            }
+        }
+        // Optional `USING BTREE` / `USING HASH` (MySQL).
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+            self.advance();
+            if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
+                self.advance();
+            }
+        }
+        // Required column list `(col [, col]*)`.
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' in inline KEY/INDEX, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut cols: Vec<String> = Vec::new();
+        loop {
+            match self.peek().clone() {
+                Token::Ident(s) | Token::QuotedIdent(s) => {
+                    self.advance();
+                    cols.push(s);
+                }
+                _ => break,
+            }
+            // Skip optional `(length)` per-column prefix.
+            if matches!(self.peek(), Token::LParen) {
+                let mut depth = 1usize;
+                self.advance();
+                while depth > 0 {
+                    match self.peek() {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        Token::Eof => break,
+                        _ => {}
+                    }
+                    self.advance();
+                }
+            }
+            // Skip optional ASC / DESC.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("asc") || s.eq_ignore_ascii_case("desc"))
+                || matches!(self.peek(), Token::Asc | Token::Desc)
+            {
+                self.advance();
+            }
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if matches!(self.peek(), Token::RParen) {
+            self.advance();
+        }
+        // Trailing options on the inline index — comment / etc.
+        // Skip until comma or `)`.
+        while !matches!(self.peek(), Token::Comma | Token::RParen | Token::Eof) {
+            self.advance();
+        }
+        if is_unique && !cols.is_empty() {
+            Ok(Some(crate::ast::TableConstraint::Unique {
+                name: None,
+                columns: cols,
+                nulls_not_distinct: false,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// v7.14.0 — consume MySQL/MariaDB table-options tail after
+    /// the closing `)`: ENGINE=..., DEFAULT CHARSET=...,
+    /// COLLATE=..., AUTO_INCREMENT=N, ROW_FORMAT=..., COMMENT='...'
+    /// (in any order, separated by whitespace).
+    fn consume_mysql_table_options(&mut self) {
+        loop {
+            // Heuristic: a table option is an ident (or `DEFAULT`
+            // reserved keyword) followed by `=` and an
+            // ident / string / integer.
+            let name_lc = match self.peek().clone() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                Token::Default => alloc::string::String::from("default"),
+                _ => break,
+            };
+            let known = matches!(
+                name_lc.as_str(),
+                "engine"
+                    | "default"
+                    | "charset"
+                    | "collate"
+                    | "auto_increment"
+                    | "row_format"
+                    | "comment"
+                    | "pack_keys"
+                    | "stats_persistent"
+                    | "stats_auto_recalc"
+                    | "stats_sample_pages"
+                    | "key_block_size"
+                    | "tablespace"
+                    | "min_rows"
+                    | "max_rows"
+                    | "checksum"
+                    | "delay_key_write"
+                    | "insert_method"
+                    | "data"
+                    | "index"
+                    | "encryption"
+                    | "compression"
+            );
+            if !known {
+                break;
+            }
+            self.advance(); // option name
+            // `DEFAULT` optional prefix is followed by `CHARSET` /
+            // `COLLATE`; consume the next ident too.
+            if name_lc == "default" {
+                if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
+                    self.advance();
+                }
+            }
+            if matches!(self.peek(), Token::Eq) {
+                self.advance();
+            }
+            match self.peek() {
+                Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_) | Token::Integer(_) => {
+                    self.advance();
+                }
+                _ => {}
+            }
+        }
     }
 
     /// v7.9.18 — true when the next tokens are `PRIMARY KEY (…)`.
@@ -3016,10 +3746,22 @@ impl Parser {
             // since SPG doesn't have a dedicated i8. MEDIUMINT (MySQL
             // 24-bit) → INT. UNSIGNED modifiers are consumed below
             // without semantic effect.
-            "smallint" | "tinyint" => ColumnTypeName::SmallInt,
-            // INTEGER is MySQL's spelling for INT; MEDIUMINT widens up.
-            "int" | "integer" | "mediumint" => ColumnTypeName::Int,
-            "bigint" => ColumnTypeName::BigInt,
+            "smallint" | "tinyint" => {
+                // v7.14.0 — MySQL display-width on integers
+                // (`TINYINT(1)`, `INT(11)`, `BIGINT(20)`). The
+                // parenthesised number is purely cosmetic — it
+                // doesn't change storage. Accept + discard.
+                self.consume_optional_paren_size();
+                ColumnTypeName::SmallInt
+            }
+            "int" | "integer" | "mediumint" => {
+                self.consume_optional_paren_size();
+                ColumnTypeName::Int
+            }
+            "bigint" => {
+                self.consume_optional_paren_size();
+                ColumnTypeName::BigInt
+            }
             // DOUBLE / REAL are 64-bit IEEE — same as our FLOAT.
             // v7.13.0 — `DOUBLE PRECISION` (PG canonical spelling)
             // (mailrs round-5 G6). Consume the optional `PRECISION`
@@ -3050,7 +3792,36 @@ impl Parser {
             "date" => ColumnTypeName::Date,
             // MySQL's `DATETIME` is the same domain as standard
             // `TIMESTAMP` — accept both spellings.
-            "timestamp" | "datetime" => ColumnTypeName::Timestamp,
+            "timestamp" | "datetime" => {
+                // v7.14.0 — PG canonical `TIMESTAMP WITH TIME ZONE`
+                // / `TIMESTAMP WITHOUT TIME ZONE`. pg_dump emits
+                // the full form. SPG canonicalises:
+                //   - WITH TIME ZONE    → Timestamptz
+                //   - WITHOUT TIME ZONE → Timestamp
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("time"))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("zone"))
+                {
+                    self.advance(); // WITH
+                    self.advance(); // TIME
+                    self.advance(); // ZONE
+                    ColumnTypeName::Timestamptz
+                } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("without"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("time"))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("zone"))
+                {
+                    self.advance(); // WITHOUT
+                    self.advance(); // TIME
+                    self.advance(); // ZONE
+                    ColumnTypeName::Timestamp
+                } else {
+                    // Optional `(precision)` parenthesised modifier
+                    // (PG fractional seconds precision). SPG stores
+                    // µs always; accept + discard.
+                    self.consume_optional_paren_size();
+                    ColumnTypeName::Timestamp
+                }
+            }
             // v7.9.2 — `TIMESTAMPTZ` and full PG spelling
             // `TIMESTAMP WITH TIME ZONE`. Same storage as TIMESTAMP;
             // only PG-wire OID differs.
@@ -3086,6 +3857,33 @@ impl Parser {
         // without changing semantics. Drop it silently.
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unsigned")) {
             self.advance();
+        }
+        // v7.14.0 — mysqldump emits `<type> CHARACTER SET <name>` and
+        // `<type> COLLATE <name>` post-fixes on text columns. SPG
+        // stores text as UTF-8 always and orders bytewise; charset /
+        // collate are accepted as no-ops so PG / MySQL / MariaDB
+        // dumps load without parser noise.
+        loop {
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("character"))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("set"))
+            {
+                self.advance(); // CHARACTER
+                self.advance(); // SET
+                if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_))
+                {
+                    self.advance();
+                }
+                continue;
+            }
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate")) {
+                self.advance(); // COLLATE
+                if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_))
+                {
+                    self.advance();
+                }
+                continue;
+            }
+            break;
         }
         // v7.10.10 — postfix `[]` widens TEXT → TEXT[]. PG accepts
         // `TYPE[]` after any base type; v7.10 only models TEXT[]
@@ -3153,6 +3951,22 @@ impl Parser {
                 }
                 self.advance();
                 nullable = false;
+                nullability_seen = true;
+                continue;
+            }
+            // v7.14.0 — MySQL accepts a bare `NULL` as an explicit
+            // "this column is nullable" marker (the default in
+            // standard SQL anyway). mysqldump emits it routinely
+            // (`col TYPE NULL DEFAULT NULL` for nullable
+            // timestamps etc). Accept + no-op.
+            if matches!(self.peek(), Token::Null) {
+                if nullability_seen && !nullable {
+                    return Err(self.err(
+                        "column declared NOT NULL then NULL — pick one".into(),
+                    ));
+                }
+                self.advance();
+                nullable = true;
                 nullability_seen = true;
                 continue;
             }
@@ -3355,6 +4169,27 @@ impl Parser {
             other => Err(self.err(format!(
                 "unknown vector encoding {other:?}; supported: SQ8, HALF"
             ))),
+        }
+    }
+
+    /// v7.14.0 — consume an optional MySQL display-width
+    /// parenthesised number after an integer type, returning
+    /// nothing. `TINYINT(1)` etc.
+    fn consume_optional_paren_size(&mut self) {
+        if !matches!(self.peek(), Token::LParen) {
+            return;
+        }
+        self.advance();
+        // Skip until matching RParen (allow nested or any tokens).
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.peek() {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Eof => return,
+                _ => {}
+            }
+            self.advance();
         }
     }
 
@@ -4811,6 +5646,14 @@ impl Parser {
         if matches!(self.peek(), Token::Dot) {
             self.advance();
             let name = self.expect_ident_like()?;
+            // v7.14.0 — schema-qualified function call
+            // `<schema>.<fn>(args)`. PG dumps emit
+            // `pg_catalog.set_config(...)` in the preamble. SPG
+            // is single-namespace: drop the schema prefix and
+            // route the dispatch on the bare function name.
+            if matches!(self.peek(), Token::LParen) {
+                return self.finish_ident_atom(name);
+            }
             return Ok(Expr::Column(ColumnName {
                 qualifier: Some(first),
                 name,

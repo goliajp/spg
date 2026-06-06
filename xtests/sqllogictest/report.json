@@ -52,13 +52,13 @@
         { "file": "02_int_types.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 144, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 145, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "02_insert_shapes.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "03_dml_v2_unsupported.test", "pass": 9, "fail": 0, "skip": 0,
+        { "file": "03_dml_v2_unsupported.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "04_pg_types.test", "pass": 24, "fail": 0, "skip": 0,
           "fail_reasons": [] },

@@ -1,6 +1,7 @@
-# DML coverage: v4.4 added UPDATE / DELETE. DROP TABLE remains
-# unsupported (v4.x cold backlog). v7.13.0 unblocks
-# `ALTER TABLE … ADD COLUMN`.
+# DML coverage history: v4.4 added UPDATE / DELETE; v7.13.0
+# unblocked `ALTER TABLE … ADD COLUMN`; v7.14.0 added
+# `DROP TABLE [IF EXISTS]` so pg_dump / mysqldump reloads
+# work without splitting scripts.
 
 statement ok
 CREATE TABLE t (id INT NOT NULL, name TEXT)
@@ -33,9 +34,13 @@ SELECT id, name FROM t
 2
 z
 
-statement error
-DROP TABLE t
-
 # v7.13.0 — ALTER TABLE ADD COLUMN is supported (mailrs round-5 G1).
 statement ok
 ALTER TABLE t ADD COLUMN extra INT
+
+# v7.14.0 — DROP TABLE [IF EXISTS] is supported.
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE IF EXISTS t

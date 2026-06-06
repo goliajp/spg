@@ -976,6 +976,27 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // query ORDERs BY ts_rank(search_vector, q) DESC.
         "ts_rank" => fts_ts_rank(args),
         "ts_rank_cd" => fts_ts_rank_cd(args),
+        // v7.14.0 — PG dump preamble emits
+        // `SELECT pg_catalog.set_config('search_path', '', false);`
+        // and friends. SPG is single-schema; accept-as-no-op
+        // returning either the new value or NULL.
+        "set_config" => Ok(args.get(1).cloned().unwrap_or(Value::Null)),
+        "current_setting" => Ok(Value::Text(String::new())),
+        // PG `pg_catalog.*` discovery / cast helpers commonly
+        // emitted by ORMs probing the server. Accept-as-no-op
+        // with sensible defaults so the dump preamble doesn't
+        // fail. `pg_get_serial_sequence` returns NULL (no
+        // sequence — SPG has AUTO_INCREMENT instead).
+        "pg_get_serial_sequence" | "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
+        "version" => Ok(Value::Text("PostgreSQL 16 (SPG-compat)".into())),
+        // pg_dump emits `nextval('seq')` after creating a
+        // sequence; SPG has no separate sequence object (the
+        // owning column carries AUTO_INCREMENT). Return NULL
+        // (PG would return the sequence value) — the value isn't
+        // used at restore time because the column has its own
+        // implicit BIGSERIAL counter.
+        "nextval" | "currval" | "lastval" => Ok(Value::Null),
+        "setval" => Ok(args.first().cloned().unwrap_or(Value::Null)),
         other => Err(EvalError::TypeMismatch {
             detail: format!("unknown function `{other}`"),
         }),
