@@ -2237,6 +2237,21 @@ pub fn format_date(days: i32) -> String {
 /// Render a `Timestamp` (microseconds since epoch) as
 /// `YYYY-MM-DD HH:MM:SS[.fff...]`. Trailing-zero fractional digits are
 /// dropped; a whole-second value has no fractional part.
+/// v7.15.0 — PG-canonical TIMESTAMPTZ wire format. Storage is
+/// the same i64 microseconds UTC as TIMESTAMP, but the canonical
+/// PG text output appends the session's UTC-offset suffix (`+00`
+/// for the default UTC session, the form pg_dump emits). Mailrs
+/// round-8 acceptance criterion: `SELECT col FROM tstz` should
+/// round-trip to a literal that re-INSERTs without semantic
+/// drift.
+pub fn format_timestamptz(micros: i64) -> String {
+    let base = format_timestamp(micros);
+    let mut s = String::with_capacity(base.len() + 3);
+    s.push_str(&base);
+    s.push_str("+00");
+    s
+}
+
 pub fn format_timestamp(micros: i64) -> String {
     const MICROS_PER_DAY: i64 = 86_400_000_000;
     // Split into day + intra-day part with proper floor division so
@@ -2327,17 +2342,58 @@ pub fn parse_timestamp_literal(s: &str) -> Option<i64> {
         None => (trimmed, None),
     };
     let days = parse_date_literal(date_part)?;
-    let day_micros = match time_part {
-        None => 0,
+    let (day_micros, tz_offset_micros) = match time_part {
+        None => (0, 0),
         Some(t) => parse_time_of_day_micros(t)?,
     };
-    Some(i64::from(days) * 86_400_000_000 + day_micros)
+    // PG semantics: a TIMESTAMPTZ literal with an explicit offset
+    // is normalised to UTC for storage. `'12:00:00+09'` means
+    // 12:00:00 in a UTC+09 zone → 03:00:00 UTC → subtract the
+    // positive offset (or add the negative one). Storage is i64
+    // microseconds UTC for both TIMESTAMP and TIMESTAMPTZ (see
+    // spg-storage::DataType::Timestamptz docs); the wire-level
+    // round-trip then re-applies the session timezone on the
+    // SELECT side when format_timestamp is asked for a TZ-aware
+    // render.
+    Some(i64::from(days) * 86_400_000_000 + day_micros - tz_offset_micros)
 }
 
-fn parse_time_of_day_micros(t: &str) -> Option<i64> {
-    let (time, frac_str) = match t.split_once('.') {
+/// v7.15.0 — Parse `HH:MM:SS[.frac][<tz>]` and return
+/// `(day_micros, tz_offset_micros)` where `day_micros` is the
+/// local-clock seconds-of-day in microseconds and
+/// `tz_offset_micros` is the UTC offset (positive = east of
+/// UTC, negative = west). Caller subtracts the offset to
+/// normalise to UTC. PG's recognised TZ shapes after the
+/// seconds (or frac) part:
+///   * `+OO[:MM]` / `-OO[:MM]` — numeric offset
+///   * `+OOMM` / `-OOMM` (no colon, less common but legal)
+///   * ` UTC` / `UTC` / `Z` — explicit zero offset
+/// Anything else after the seconds = parse failure (the caller
+/// surfaces as "cannot parse … as TIMESTAMP").
+fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
+    let t = t.trim();
+    // Detect & strip optional TZ suffix. Anchor on the first
+    // `+` / `-` AFTER position 8 (so the leading sign on a
+    // negative offset can't be mistaken for an `HH:MM:SS-OO`
+    // boundary if the time itself is somehow malformed).
+    // ` UTC` and trailing `Z` also count as zero-offset TZ tags.
+    let (core, tz_micros) = if let Some(rest) = t.strip_suffix('Z') {
+        (rest, 0i64)
+    } else if let Some(rest) = t
+        .strip_suffix(" UTC")
+        .or_else(|| t.strip_suffix("UTC"))
+    {
+        (rest, 0i64)
+    } else if let Some((idx, sign_byte)) = find_offset_sign(t) {
+        let suffix = &t[idx..];
+        let micros = parse_tz_offset_suffix(suffix, sign_byte == b'+')?;
+        (&t[..idx], micros)
+    } else {
+        (t, 0i64)
+    };
+    let (time, frac_str) = match core.split_once('.') {
         Some((a, b)) => (a, Some(b)),
-        None => (t, None),
+        None => (core, None),
     };
     let bytes = time.as_bytes();
     if bytes.len() != 8 || bytes[2] != b':' || bytes[5] != b':' {
@@ -2364,7 +2420,62 @@ fn parse_time_of_day_micros(t: &str) -> Option<i64> {
             padded.parse().ok()?
         }
     };
-    Some(((hh * 3600 + mm * 60 + ss) * 1_000_000) + frac_micros)
+    Some((
+        ((hh * 3600 + mm * 60 + ss) * 1_000_000) + frac_micros,
+        tz_micros,
+    ))
+}
+
+/// Find the index of the TZ-offset sign byte (`+` or `-`) that
+/// terminates an `HH:MM:SS[.fff]` time string, or `None` when
+/// the time carries no numeric TZ suffix. Anchors past the first
+/// 8 bytes (`HH:MM:SS`) so the seconds/minutes colons don't
+/// confuse the scan.
+fn find_offset_sign(t: &str) -> Option<(usize, u8)> {
+    let bytes = t.as_bytes();
+    // Start past `HH:MM:SS` (8 bytes).
+    if bytes.len() < 9 {
+        return None;
+    }
+    for i in 8..bytes.len() {
+        match bytes[i] {
+            b'+' | b'-' => return Some((i, bytes[i])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse `+OO`, `+OO:MM`, `+OOMM`, `-OO`, `-OO:MM`, `-OOMM` into
+/// a UTC-offset microsecond delta. `is_positive` reflects the
+/// already-stripped sign.
+fn parse_tz_offset_suffix(suffix: &str, is_positive: bool) -> Option<i64> {
+    // suffix starts with `+` or `-`; strip it.
+    let body = &suffix[1..];
+    let (hh, mm): (i64, i64) = if let Some((h, m)) = body.split_once(':') {
+        (h.parse().ok()?, m.parse().ok()?)
+    } else {
+        match body.len() {
+            2 => (body.parse().ok()?, 0),
+            3 => {
+                // PG's "+0530" form lacks the colon; but a 3-char
+                // body is `OOM` which is ambiguous (`+053` ?). PG
+                // doesn't emit that; reject.
+                return None;
+            }
+            4 => {
+                let h: i64 = body[0..2].parse().ok()?;
+                let m: i64 = body[2..4].parse().ok()?;
+                (h, m)
+            }
+            _ => return None,
+        }
+    };
+    if !(0..=18).contains(&hh) || !(0..60).contains(&mm) {
+        return None;
+    }
+    let abs = (hh * 3600 + mm * 60) * 1_000_000;
+    Some(if is_positive { abs } else { -abs })
 }
 
 /// Render an `Interval { months, micros }` in a PG-ish shape. The output
