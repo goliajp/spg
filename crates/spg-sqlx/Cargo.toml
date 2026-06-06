@@ -1,0 +1,47 @@
+[package]
+name         = "spg-sqlx"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "sqlx 0.8 Database driver for spg-embedded — let in-process callers use sqlx::query / query_as / pool.begin against an in-process SPG without a TCP listener. Backs mailrs's drop-in PgPool → SpgPool swap (gap-eval E1)."
+
+[lib]
+name = "spg_sqlx"
+
+[dependencies]
+# Workspace SPG deps. spg-embedded carries the in-process Database;
+# spg-embedded-tokio adds the async wrapper. spg-engine is pulled
+# transitively through spg-embedded.
+spg-embedded       = { workspace = true }
+spg-embedded-tokio = { workspace = true }
+# sqlx-core ONLY — we implement Database against sqlx-core's traits;
+# we don't ship our own runtime or macro layer. Users add sqlx
+# itself for the query!() macro + runtime selection.
+sqlx-core = { version = "0.8", default-features = false }
+# Type bridges. chrono + serde_json + uuid match the type set mailrs
+# uses against sqlx::Postgres today; surfacing them behind feature
+# flags so consumers pay only for what they reach.
+chrono     = { version = "0.4", default-features = false, optional = true }
+serde_json = { version = "1",   optional = true }
+# Standard async machinery.
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+either      = "1"
+log         = "0.4"
+tokio       = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio  = { version = "1", features = ["rt-multi-thread", "macros"] }
+sqlx   = { version = "0.8", default-features = false, features = ["runtime-tokio"] }
+
+[features]
+default = ["chrono", "json"]
+# `chrono` — Encode/Decode for chrono::DateTime<Utc> against
+# SPG's TIMESTAMPTZ (post-v7.15.0 offset literal round-trip).
+chrono  = ["dep:chrono"]
+# `json` — Encode/Decode for serde_json::Value against
+# SPG's JSON / JSONB columns.
+json    = ["dep:serde_json"]

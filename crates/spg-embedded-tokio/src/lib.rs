@@ -65,6 +65,17 @@ pub struct AsyncStatement {
     inner: Arc<crate::Statement>,
 }
 
+/// v7.16.0 — adapter escape hatch: hand back the inner
+/// `Arc<Statement>`. Used by the `spg-sqlx` crate to plug the
+/// engine-side prepared handle into sqlx's `Statement<'q>` trait
+/// without going through another clone. Not intended for
+/// application code.
+#[doc(hidden)]
+#[must_use]
+pub fn async_statement_inner(stmt: &AsyncStatement) -> Arc<crate::Statement> {
+    Arc::clone(&stmt.inner)
+}
+
 impl AsyncDatabase {
     /// In-memory database. No WAL, no catalog snapshot on disk.
     /// `Clone` shares the engine; drop the last clone to release.
