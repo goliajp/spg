@@ -1194,6 +1194,33 @@ impl Engine {
             .collect()
     }
 
+    /// v7.13.0 — UPDATE-side snapshot that pairs each trigger's
+    /// function with its `UPDATE OF cols` filter (mailrs round-5
+    /// G7). Empty filter Vec means "fire unconditionally", matching
+    /// the v7.12 behaviour.
+    fn snapshot_update_row_triggers(
+        &self,
+        table: &str,
+        timing: &str,
+    ) -> Vec<(spg_storage::FunctionDef, Vec<String>)> {
+        let cat = self.active_catalog();
+        cat.triggers()
+            .iter()
+            .filter(|t| {
+                t.table == table
+                    && t.timing.eq_ignore_ascii_case(timing)
+                    && t.for_each.eq_ignore_ascii_case("row")
+                    && t.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
+            })
+            .filter_map(|t| {
+                cat.functions()
+                    .get(&t.function)
+                    .cloned()
+                    .map(|fd| (fd, t.update_columns.clone()))
+            })
+            .collect()
+    }
+
     /// v7.12.7 — drain the trigger-emitted embedded SQL queue.
     /// Called by the INSERT / UPDATE / DELETE executors after
     /// their main row-write loop returns. Each statement runs
@@ -2512,6 +2539,7 @@ impl Engine {
             events,
             for_each: alloc::string::String::from(for_each),
             function: s.function.clone(),
+            update_columns: s.update_columns.clone(),
         };
         self.active_catalog_mut()
             .create_trigger(def, s.or_replace)
@@ -2572,8 +2600,12 @@ impl Engine {
         // session FTS config before the table mut-borrow opens (the
         // INSERT path uses the same pattern). Empty vecs are the
         // common "no triggers on this table" fast path.
-        let before_update_triggers = self.snapshot_row_triggers(&stmt.table, "UPDATE", "BEFORE");
-        let after_update_triggers = self.snapshot_row_triggers(&stmt.table, "UPDATE", "AFTER");
+        // v7.13.0 — UPDATE triggers carry an optional `UPDATE OF
+        // cols` filter. The filter is paired with each function so
+        // the per-row fire loop can skip when no listed column
+        // actually differs between OLD and NEW.
+        let before_update_triggers = self.snapshot_update_row_triggers(&stmt.table, "BEFORE");
+        let after_update_triggers = self.snapshot_update_row_triggers(&stmt.table, "AFTER");
         let trigger_session_cfg: Option<String> = self
             .session_params
             .get("default_text_search_config")
@@ -2735,7 +2767,16 @@ impl Engine {
             let old_row = table.rows()[*pos].clone();
             let mut new_row = Row::new(new_vals.clone());
             let mut skip = false;
-            for fd in &before_update_triggers {
+            for (fd, filter) in &before_update_triggers {
+                // v7.13.0 — `UPDATE OF cols` filter (mailrs round-5
+                // G7). Skip this trigger when the filter is set and
+                // no listed column actually differs between OLD and
+                // NEW for this row.
+                if !filter.is_empty()
+                    && !any_column_changed(filter, &schema_cols, &old_row, &new_row)
+                {
+                    continue;
+                }
                 let (outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     Some(new_row.clone()),
@@ -2776,7 +2817,12 @@ impl Engine {
         // assignment errors with a clear message.
         for (pos, new_row, old_row) in applied_after_before {
             table.update_row(pos, new_row.values.clone())?;
-            for fd in &after_update_triggers {
+            for (fd, filter) in &after_update_triggers {
+                if !filter.is_empty()
+                    && !any_column_changed(filter, &schema_cols, &old_row, &new_row)
+                {
+                    continue;
+                }
                 let (_outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     Some(new_row.clone()),
@@ -3392,6 +3438,61 @@ impl Engine {
                 };
                 table.add_column(col_schema, fill_value);
             }
+            spg_sql::ast::AlterTableTarget::AlterColumnType {
+                column,
+                new_type,
+                using,
+            } => {
+                // v7.13.0 — mailrs round-5 G8. Re-evaluate each
+                // row's column value (either through the USING
+                // expression if supplied, or as a direct CAST of
+                // the existing value) and re-coerce to the new
+                // type. Indices on the column get rebuilt.
+                let new_data_type = column_type_to_data_type(new_type);
+                let table = self.active_catalog_mut().get_mut(&s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.clone(),
+                    })
+                })?;
+                let col_pos = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&column))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "ALTER COLUMN TYPE: column {column:?} not found on {:?}",
+                            s.name
+                        ))
+                    })?;
+                let schema_cols = table.schema().columns.clone();
+                let ctx = eval::EvalContext::new(&schema_cols, None);
+                let mut new_values: alloc::vec::Vec<Value> =
+                    alloc::vec::Vec::with_capacity(table.row_count());
+                for row in table.rows().iter() {
+                    let raw = match &using {
+                        Some(expr) => eval::eval_expr(expr, row, &ctx).map_err(|e| {
+                            EngineError::Unsupported(alloc::format!(
+                                "ALTER COLUMN TYPE: USING expression failed: {e:?}"
+                            ))
+                        })?,
+                        None => row.values.get(col_pos).cloned().unwrap_or(Value::Null),
+                    };
+                    let coerced = coerce_value(raw, new_data_type, &column, col_pos)?;
+                    new_values.push(coerced);
+                }
+                table.schema_mut().columns[col_pos].ty = new_data_type;
+                for (i, v) in new_values.into_iter().enumerate() {
+                    let mut row_values = table
+                        .rows()
+                        .get(i)
+                        .expect("bounds-checked above")
+                        .values
+                        .clone();
+                    row_values[col_pos] = v;
+                    table.update_row(i, row_values)?;
+                }
+            }
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
@@ -3799,6 +3900,38 @@ impl Engine {
     }
 
     fn exec_insert(&mut self, stmt: InsertStatement) -> Result<QueryResult, EngineError> {
+        // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
+        // round-5 G4). Execute the inner SELECT first, then route
+        // back through the regular VALUES code path with the
+        // materialised rows.
+        if let Some(select) = stmt.select_source.clone() {
+            let select_result = self.exec_select_cancel(&select, CancelToken::none())?;
+            let rows = match select_result {
+                QueryResult::Rows { rows, .. } => rows,
+                other => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "INSERT … SELECT: inner statement produced {other:?} instead of a row set"
+                    )));
+                }
+            };
+            let mut materialised: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut tuple: Vec<Expr> = Vec::with_capacity(row.values.len());
+                for v in row.values {
+                    tuple.push(value_to_literal_expr_permissive(v)?);
+                }
+                materialised.push(tuple);
+            }
+            let recurse = InsertStatement {
+                table: stmt.table,
+                columns: stmt.columns,
+                rows: materialised,
+                select_source: None,
+                on_conflict: stmt.on_conflict,
+                returning: stmt.returning,
+            };
+            return self.exec_insert(recurse);
+        }
         // v7.9.21 — snapshot the clock fn pointer before the mut
         // borrow on the catalog opens; runtime DEFAULT eval needs
         // it inside the row hot loop.
@@ -6327,6 +6460,22 @@ impl Engine {
                 self.resolve_expr_subqueries(expr, cancel)?;
                 self.resolve_expr_subqueries(array, cancel)?;
             }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    self.resolve_expr_subqueries(o, cancel)?;
+                }
+                for (w, t) in branches {
+                    self.resolve_expr_subqueries(w, cancel)?;
+                    self.resolve_expr_subqueries(t, cancel)?;
+                }
+                if let Some(e) = else_branch {
+                    self.resolve_expr_subqueries(e, cancel)?;
+                }
+            }
         }
         Ok(())
     }
@@ -6490,6 +6639,22 @@ impl Engine {
             Expr::AnyAll { expr, array, .. } => {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
                 self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    self.resolve_correlated_in_expr(o, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+                for (w, t) in branches {
+                    self.resolve_correlated_in_expr(w, row, ctx, cancel, memo.as_deref_mut())?;
+                    self.resolve_correlated_in_expr(t, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+                if let Some(e) = else_branch {
+                    self.resolve_correlated_in_expr(e, row, ctx, cancel, memo.as_deref_mut())?;
+                }
             }
         }
         Ok(())
@@ -6680,6 +6845,19 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
         }
         Expr::AnyAll { expr, array, .. } => {
             expr_refers_to(expr, target) || expr_refers_to(array, target)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(|o| expr_refers_to(o, target))
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_refers_to(w, target) || expr_refers_to(t, target))
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|e| expr_refers_to(e, target))
         }
     }
 }
@@ -7164,6 +7342,22 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
             substitute_in_expr(expr, row, ctx, outer_alias);
             substitute_in_expr(array, row, ctx, outer_alias);
         }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                substitute_in_expr(o, row, ctx, outer_alias);
+            }
+            for (w, t) in branches {
+                substitute_in_expr(w, row, ctx, outer_alias);
+                substitute_in_expr(t, row, ctx, outer_alias);
+            }
+            if let Some(e) = else_branch {
+                substitute_in_expr(e, row, ctx, outer_alias);
+            }
+        }
     }
 }
 
@@ -7209,6 +7403,17 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::Array(items) => items.iter().any(expr_has_window),
         Expr::ArraySubscript { target, index } => expr_has_window(target) || expr_has_window(index),
         Expr::AnyAll { expr, array, .. } => expr_has_window(expr) || expr_has_window(array),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(expr_has_window)
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_has_window(w) || expr_has_window(t))
+                || else_branch.as_deref().is_some_and(expr_has_window)
+        }
     }
 }
 
@@ -7938,6 +8143,17 @@ fn expr_has_subquery(e: &Expr) -> bool {
             expr_has_subquery(target) || expr_has_subquery(index)
         }
         Expr::AnyAll { expr, array, .. } => expr_has_subquery(expr) || expr_has_subquery(array),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(expr_has_subquery)
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_has_subquery(w) || expr_has_subquery(t))
+                || else_branch.as_deref().is_some_and(expr_has_subquery)
+        }
     }
 }
 
@@ -7964,6 +8180,100 @@ fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         }
     };
     Ok(Expr::Literal(lit))
+}
+
+/// v7.13.0 — wider helper used by `INSERT … SELECT` (mailrs
+/// round-5 G4). Covers the most common `Value` variants. Types
+/// that need lossy textual round-trip (BYTEA, arrays, ts*)
+/// surface as an Unsupported error so the caller can add a cast
+/// in the inner SELECT.
+fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineError> {
+    let lit = match v {
+        Value::Null => Literal::Null,
+        Value::SmallInt(n) => Literal::Integer(i64::from(n)),
+        Value::Int(n) => Literal::Integer(i64::from(n)),
+        Value::BigInt(n) => Literal::Integer(n),
+        Value::Float(x) => Literal::Float(x),
+        Value::Text(s) | Value::Json(s) => Literal::String(s),
+        Value::Bool(b) => Literal::Bool(b),
+        Value::Vector(xs) => Literal::Vector(xs),
+        // Date / Timestamp / Timestamptz / Numeric round-trip
+        // through a TEXT literal that `coerce_value` re-parses
+        // against the target column type.
+        Value::Date(days) => {
+            let micros = (i64::from(days)) * 86_400_000_000;
+            Literal::String(format_timestamp_micros_as_date(micros))
+        }
+        Value::Timestamp(us) => Literal::String(format_timestamp_micros(us)),
+        Value::Numeric { scaled, scale } => {
+            Literal::String(format_numeric(scaled, scale))
+        }
+        other => {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "INSERT … SELECT cannot materialise value of type {:?}; \
+                 add an explicit CAST in the inner SELECT",
+                other.data_type()
+            )));
+        }
+    };
+    Ok(Expr::Literal(lit))
+}
+
+fn format_timestamp_micros(us: i64) -> String {
+    // Same Y/M/D split used by the wire layer; epoch-relative.
+    let days = us.div_euclid(86_400_000_000);
+    let intra_day = us.rem_euclid(86_400_000_000);
+    let date = format_timestamp_micros_as_date(days * 86_400_000_000);
+    let secs = intra_day / 1_000_000;
+    let us_rem = intra_day % 1_000_000;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    if us_rem == 0 {
+        alloc::format!("{date} {h:02}:{m:02}:{s:02}")
+    } else {
+        alloc::format!("{date} {h:02}:{m:02}:{s:02}.{us_rem:06}")
+    }
+}
+
+fn format_timestamp_micros_as_date(us: i64) -> String {
+    // Days since 1970-01-01 → calendar Y-M-D via the proleptic
+    // Gregorian conversion used by spg-engine's date helpers.
+    let days = us.div_euclid(86_400_000_000);
+    // 1970-01-01 = JDN 2440588.
+    let jdn = days + 2_440_588;
+    let (y, mo, d) = jdn_to_ymd(jdn);
+    alloc::format!("{y:04}-{mo:02}-{d:02}")
+}
+
+fn jdn_to_ymd(jdn: i64) -> (i64, u32, u32) {
+    // Fliegel & Van Flandern (1968) — works for all positive JDNs.
+    let l = jdn + 68569;
+    let n = (4 * l) / 146_097;
+    let l = l - (146_097 * n + 3) / 4;
+    let i = (4000 * (l + 1)) / 1_461_001;
+    let l = l - (1461 * i) / 4 + 31;
+    let j = (80 * l) / 2447;
+    let day = (l - (2447 * j) / 80) as u32;
+    let l = j / 11;
+    let month = (j + 2 - 12 * l) as u32;
+    let year = 100 * (n - 49) + i + l;
+    (year, month, day)
+}
+
+fn format_numeric(scaled: i128, scale: u8) -> String {
+    if scale == 0 {
+        return alloc::format!("{scaled}");
+    }
+    let abs = scaled.unsigned_abs();
+    let divisor = 10u128.pow(u32::from(scale));
+    let whole = abs / divisor;
+    let frac = abs % divisor;
+    let sign = if scaled < 0 { "-" } else { "" };
+    alloc::format!(
+        "{sign}{whole}.{frac:0width$}",
+        width = usize::from(scale)
+    )
 }
 
 /// v6.1.1 — walk the prepared `Statement` AST and replace every
@@ -8151,6 +8461,22 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
         Expr::AnyAll { expr, array, .. } => {
             substitute_expr(expr, params)?;
             substitute_expr(array, params)?;
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                substitute_expr(o, params)?;
+            }
+            for (w, t) in branches {
+                substitute_expr(w, params)?;
+                substitute_expr(t, params)?;
+            }
+            if let Some(e) = else_branch {
+                substitute_expr(e, params)?;
+            }
         }
     }
     Ok(())
@@ -8439,6 +8765,22 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         Expr::AnyAll { expr, array, .. } => {
             rewrite_expr_clock(expr, now);
             rewrite_expr_clock(array, now);
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                rewrite_expr_clock(o, now);
+            }
+            for (w, t) in branches {
+                rewrite_expr_clock(w, now);
+                rewrite_expr_clock(t, now);
+            }
+            if let Some(e) = else_branch {
+                rewrite_expr_clock(e, now);
+            }
         }
     }
 }
@@ -9292,6 +9634,35 @@ fn enforce_unique_index_inserts(
         }
     }
     Ok(())
+}
+
+/// v7.13.0 — `UPDATE OF cols` filter helper (mailrs round-5 G7).
+/// Returns `true` when at least one of `filter_cols` has a
+/// different value in `new_row` vs `old_row`. Column lookup is
+/// case-insensitive against `schema_cols`; unknown filter columns
+/// are treated as "not changed" (the trigger therefore won't
+/// fire on them — surfacing a parse-time error would be too
+/// strict for catalog reloads where the schema may have drifted).
+fn any_column_changed(
+    filter_cols: &[String],
+    schema_cols: &[ColumnSchema],
+    old_row: &Row,
+    new_row: &Row,
+) -> bool {
+    for col_name in filter_cols {
+        let Some(pos) = schema_cols
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+        else {
+            continue;
+        };
+        let old_v = old_row.values.get(pos);
+        let new_v = new_row.values.get(pos);
+        if old_v != new_v {
+            return true;
+        }
+    }
+    false
 }
 
 /// v7.13.0 — evaluate every CHECK predicate on the schema against

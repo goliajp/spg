@@ -33,6 +33,9 @@ use crate::lexer::{self, LexError, Token};
 /// in CREATE INDEX. SPG's HNSW already routes by query operator;
 /// the opclass is accepted for `pg_dump` compatibility (mailrs
 /// migration follow-up G5).
+/// v7.13.0 — extended to recognise PG built-in / pg_trgm opclasses
+/// (mailrs round-5 G5). These are tokens-only acceptance — SPG
+/// doesn't change index behaviour based on them.
 fn is_vector_opclass_name(name: &str) -> bool {
     let lc = name.to_ascii_lowercase();
     matches!(
@@ -46,6 +49,23 @@ fn is_vector_opclass_name(name: &str) -> bool {
             | "sq8_cosine_ops"
             | "sq8_l2_ops"
             | "sq8_ip_ops"
+            // pg_trgm — trigram operator class. SPG's GIN index
+            // already uses tsvector tokens; trigram-style LIKE
+            // pattern matching still routes through a sequential
+            // scan, but the opclass name is accepted so PG schemas
+            // load.
+            | "gin_trgm_ops"
+            | "gist_trgm_ops"
+            // PG built-in btree opclasses occasionally appear in
+            // pg_dump output for column types with multiple
+            // sort orders (text_pattern_ops, varchar_pattern_ops,
+            // bpchar_pattern_ops).
+            | "text_pattern_ops"
+            | "varchar_pattern_ops"
+            | "bpchar_pattern_ops"
+            | "int4_ops"
+            | "int8_ops"
+            | "text_ops"
     )
 }
 
@@ -894,11 +914,29 @@ impl Parser {
         };
         // Events: INSERT [ OR UPDATE [ OR DELETE [ OR TRUNCATE ] ] ].
         // OR is a reserved keyword token (Token::Or), not an Ident.
+        // v7.13.0 — after an UPDATE event we may optionally see
+        // `OF col, col, …` (mailrs round-5 G7). Columns are
+        // captured into `update_columns` once across the whole
+        // events list; multiple `UPDATE OF` clauses are rejected.
         let mut events: Vec<TriggerEvent> = Vec::new();
-        events.push(self.parse_trigger_event()?);
+        let mut update_columns: Vec<String> = Vec::new();
+        let (first_ev, first_cols) = self.parse_trigger_event_with_optional_of()?;
+        events.push(first_ev);
+        if !first_cols.is_empty() {
+            update_columns = first_cols;
+        }
         while matches!(self.peek(), Token::Or) {
             self.advance();
-            events.push(self.parse_trigger_event()?);
+            let (ev, cols) = self.parse_trigger_event_with_optional_of()?;
+            events.push(ev);
+            if !cols.is_empty() {
+                if !update_columns.is_empty() {
+                    return Err(self.err(
+                        "CREATE TRIGGER: `UPDATE OF cols` may appear at most once".into(),
+                    ));
+                }
+                update_columns = cols;
+            }
         }
         // ON <table>
         let tok = self.peek();
@@ -970,7 +1008,40 @@ impl Parser {
             table,
             for_each,
             function,
+            update_columns,
         }))
+    }
+
+    /// v7.13.0 — parse one trigger event, then optionally consume
+    /// `OF col, col, …` after `UPDATE` (mailrs round-5 G7). Other
+    /// events (INSERT/DELETE/TRUNCATE) don't accept the OF tail.
+    fn parse_trigger_event_with_optional_of(
+        &mut self,
+    ) -> Result<(TriggerEvent, Vec<String>), ParseError> {
+        let ev = self.parse_trigger_event()?;
+        if !matches!(ev, TriggerEvent::Update) {
+            return Ok((ev, Vec::new()));
+        }
+        // `OF` is a bare ident.
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("of")) {
+            return Ok((ev, Vec::new()));
+        }
+        self.advance(); // OF
+        let mut cols: Vec<String> = Vec::new();
+        loop {
+            cols.push(self.expect_ident_like()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if cols.is_empty() {
+            return Err(self.err(
+                "CREATE TRIGGER: `UPDATE OF` requires at least one column name".into(),
+            ));
+        }
+        Ok((ev, cols))
     }
 
     /// v7.12.4 — `BEGIN stmt; stmt; … END[;]` PL/pgSQL block.
@@ -1796,8 +1867,45 @@ impl Parser {
                     target: crate::ast::AlterTableTarget::DropForeignKey(cname),
                 }))
             }
+            // v7.13.0 — `ALTER TABLE t ALTER COLUMN <c> TYPE <ty>
+            // [USING <expr>]` (mailrs round-5 G8).
+            Token::Ident(s) if s.eq_ignore_ascii_case("alter") => {
+                self.advance();
+                // Optional `COLUMN` keyword (PG-canonical).
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
+                    self.advance();
+                }
+                let col_name = self.expect_ident_like()?;
+                // Required `TYPE` keyword.
+                match self.peek() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("type") => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected TYPE after ALTER COLUMN <name>, got {other:?}"
+                        )));
+                    }
+                }
+                let new_type = self.parse_column_type_name()?;
+                let using = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using"))
+                {
+                    self.advance();
+                    Some(self.parse_expr(0)?)
+                } else {
+                    None
+                };
+                Ok(Statement::AlterTable(crate::ast::AlterTableStatement {
+                    name: table_name,
+                    target: crate::ast::AlterTableTarget::AlterColumnType {
+                        column: col_name,
+                        new_type,
+                        using,
+                    },
+                }))
+            }
             other => Err(self.err(alloc::format!(
-                "expected SET / ADD / DROP in ALTER TABLE, got {other:?}"
+                "expected SET / ADD / DROP / ALTER in ALTER TABLE, got {other:?}"
             ))),
         }
     }
@@ -2804,10 +2912,21 @@ impl Parser {
         Ok((col, Some(fk)))
     }
 
-    fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
-        let name = self.expect_ident_like()?;
-        // Type keyword arrives as a bare Ident (we did not promote type names
-        // to keyword tokens — see lexer rationale).
+    /// v7.13.0 — parse a column type (consuming the type ident and
+    /// any trailing parameters / `[]`), without surrounding column
+    /// constraints. Used by ALTER COLUMN TYPE (mailrs round-5 G8).
+    /// Returns the resolved `ColumnTypeName` plus implied
+    /// `(auto_increment, not_null)` flags from PG SERIAL family
+    /// shorthands — callers that don't expect those (ALTER COLUMN
+    /// TYPE) can discard them.
+    fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
+        let (ty, _, _) = self.parse_type_with_implied_flags()?;
+        Ok(ty)
+    }
+
+    fn parse_type_with_implied_flags(
+        &mut self,
+    ) -> Result<(ColumnTypeName, bool, bool), ParseError> {
         let ty_ident = match self.advance() {
             Token::Ident(s) => s,
             other => {
@@ -2817,12 +2936,6 @@ impl Parser {
                 });
             }
         };
-        // v7.9.6 — PG `SERIAL` / `BIGSERIAL` shorthand for
-        // `INT/BIGINT NOT NULL AUTO_INCREMENT`. PG also defines
-        // SMALLSERIAL → SMALLINT; we accept that too. The implicit
-        // NOT NULL + AUTO_INCREMENT flags get baked in after the
-        // type tag so the rest of the constraint-loop parser sees
-        // them as if user-supplied (rejecting duplicates).
         let mut implied_auto_increment = false;
         let mut implied_not_null = false;
         let mut ty = match ty_ident.as_str() {
@@ -2852,7 +2965,19 @@ impl Parser {
             "int" | "integer" | "mediumint" => ColumnTypeName::Int,
             "bigint" => ColumnTypeName::BigInt,
             // DOUBLE / REAL are 64-bit IEEE — same as our FLOAT.
-            "float" | "double" | "real" => ColumnTypeName::Float,
+            // v7.13.0 — `DOUBLE PRECISION` (PG canonical spelling)
+            // (mailrs round-5 G6). Consume the optional `PRECISION`
+            // tail when the type keyword was `double` / `DOUBLE`.
+            "float" | "double" | "real" => {
+                if ty_ident.eq_ignore_ascii_case("double")
+                    && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("precision"))
+                {
+                    self.advance();
+                }
+                ColumnTypeName::Float
+            }
+            // v7.13.0 — `FLOAT8` (PG short form) maps the same as FLOAT.
+            "float4" | "float8" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
@@ -2933,6 +3058,13 @@ impl Parser {
                 }
             };
         }
+        Ok((ty, implied_auto_increment, implied_not_null))
+    }
+
+    fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
+        let name = self.expect_ident_like()?;
+        let (ty, implied_auto_increment, implied_not_null) =
+            self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
         // each at most once.
@@ -3216,9 +3348,31 @@ impl Parser {
         } else {
             None
         };
+        // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
+        // round-5 G4). Dispatch on VALUES vs SELECT.
+        if matches!(self.peek(), Token::Select) {
+            let select_stmt = match self.parse_select_stmt()? {
+                Statement::Select(s) => s,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected SELECT after INSERT INTO ... target, got {other:?}"
+                    )));
+                }
+            };
+            let on_conflict = self.parse_optional_on_conflict()?;
+            let returning = self.parse_optional_returning()?;
+            return Ok(Statement::Insert(InsertStatement {
+                table,
+                columns,
+                rows: Vec::new(),
+                select_source: Some(Box::new(select_stmt)),
+                on_conflict,
+                returning,
+            }));
+        }
         if !matches!(self.peek(), Token::Values) {
             return Err(self.err(format!(
-                "expected VALUES after table name, got {:?}",
+                "expected VALUES or SELECT after table name, got {:?}",
                 self.peek()
             )));
         }
@@ -3271,6 +3425,7 @@ impl Parser {
             table,
             columns,
             rows,
+            select_source: None,
             on_conflict,
             returning,
         }))
@@ -3724,6 +3879,12 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exists") => {
                 self.parse_exists_atom(false)
             }
+            // v7.13.0 — `CASE [<operand>] WHEN <cond> THEN <val>
+            // [WHEN ...] [ELSE <val>] END` (mailrs round-5 G9).
+            // CASE is a bare ident; we dispatch on lowercase match.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("case") => {
+                self.parse_case_atom()
+            }
             // v7.10.10 — `ARRAY[expr, expr, …]` constructor. ARRAY
             // is not a reserved token; we match by case-insensitive
             // ident. The opening `[` must follow immediately.
@@ -4085,6 +4246,69 @@ impl Parser {
     /// v4.10: parse `EXISTS (SELECT ...)`. Caller (`parse_atom`)
     /// already consumed the leading `EXISTS` ident via
     /// `self.advance()`.
+    /// v7.13.0 — parse the rest of a `CASE … END` expression after
+    /// the leading `CASE` ident has been consumed (mailrs round-5
+    /// G9). Supports both the searched form
+    /// (`CASE WHEN cond THEN val …`) and the simple form
+    /// (`CASE operand WHEN val THEN val …`).
+    fn parse_case_atom(&mut self) -> Result<Expr, ParseError> {
+        // Disambiguate searched vs simple form: if the next token
+        // is `WHEN`, we're in the searched form. Otherwise the
+        // intervening expression is the operand.
+        let operand = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("when")) {
+            None
+        } else {
+            Some(Box::new(self.parse_expr(0)?))
+        };
+        let mut branches: Vec<(Expr, Expr)> = Vec::new();
+        loop {
+            match self.peek() {
+                Token::Ident(s) if s.eq_ignore_ascii_case("when") => {
+                    self.advance();
+                    let cond = self.parse_expr(0)?;
+                    match self.peek() {
+                        Token::Ident(t) if t.eq_ignore_ascii_case("then") => {
+                            self.advance();
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected THEN after CASE WHEN <expr>, got {other:?}"
+                            )));
+                        }
+                    }
+                    let value = self.parse_expr(0)?;
+                    branches.push((cond, value));
+                }
+                _ => break,
+            }
+        }
+        if branches.is_empty() {
+            return Err(self.err("CASE requires at least one WHEN … THEN … branch".into()));
+        }
+        let else_branch = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("else"))
+        {
+            self.advance();
+            Some(Box::new(self.parse_expr(0)?))
+        } else {
+            None
+        };
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("end") => {
+                self.advance();
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected END to close CASE expression, got {other:?}"
+                )));
+            }
+        }
+        Ok(Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        })
+    }
+
     fn parse_exists_atom(&mut self, negated: bool) -> Result<Expr, ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after EXISTS, got {:?}", self.peek())));

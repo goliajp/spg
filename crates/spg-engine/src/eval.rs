@@ -368,6 +368,38 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             };
             Ok(result)
         }
+        // v7.13.0 — CASE WHEN … END (mailrs round-5 G9).
+        // Short-circuit on the first matching branch. Searched form
+        // (operand=None) treats each branch's WHEN as a Bool
+        // predicate. Simple form (operand=Some) compares with =.
+        // ELSE on no match; NULL if no ELSE.
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            let operand_value = match operand {
+                Some(o) => Some(eval_expr(o, row, ctx)?),
+                None => None,
+            };
+            for (when_expr, then_expr) in branches {
+                let when_value = eval_expr(when_expr, row, ctx)?;
+                let matched = match &operand_value {
+                    None => matches!(when_value, Value::Bool(true)),
+                    Some(op_v) => matches!(
+                        apply_binary(spg_sql::ast::BinOp::Eq, op_v.clone(), when_value)?,
+                        Value::Bool(true)
+                    ),
+                };
+                if matched {
+                    return eval_expr(then_expr, row, ctx);
+                }
+            }
+            match else_branch {
+                Some(e) => eval_expr(e, row, ctx),
+                None => Ok(Value::Null),
+            }
+        }
     }
 }
 

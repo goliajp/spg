@@ -303,6 +303,22 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
             collect_expr(expr, out);
             collect_expr(array, out);
         }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                collect_expr(o, out);
+            }
+            for (w, t) in branches {
+                collect_expr(w, out);
+                collect_expr(t, out);
+            }
+            if let Some(e) = else_branch {
+                collect_expr(e, out);
+            }
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => {}
     }
 }

@@ -3072,6 +3072,13 @@ pub struct TriggerDef {
     pub for_each: String,
     /// Name of the PL/pgSQL function to invoke.
     pub function: String,
+    /// v7.13.0 — `UPDATE OF col, col, …` column-list filter
+    /// (mailrs round-5 G7). Non-empty means the trigger fires
+    /// only when at least one of these columns appears in the
+    /// UPDATE's SET list. Empty = no column filter. Stored in
+    /// catalog FILE_VERSION 23+; older catalogs deserialise with
+    /// an empty vec.
+    pub update_columns: Vec<String>,
 }
 
 impl Catalog {
@@ -4781,6 +4788,16 @@ impl Catalog {
             }
             write_str(&mut out, &td.for_each);
             write_str(&mut out, &td.function);
+            // v7.13.0 — `UPDATE OF cols` filter
+            // (FILE_VERSION 23+). v22 readers omit; v23 writers
+            // always emit (possibly zero).
+            write_u16(
+                &mut out,
+                u16::try_from(td.update_columns.len()).expect("≤ 65k cols / trigger"),
+            );
+            for c in &td.update_columns {
+                write_str(&mut out, c);
+            }
         }
         out
     }
@@ -4840,6 +4857,19 @@ impl Catalog {
                 }
                 let for_each = cur.read_str()?;
                 let function = cur.read_str()?;
+                // v7.13.0 — trailing `UPDATE OF cols` filter
+                // (FILE_VERSION 23+ only; v22 catalogs omit and
+                // deserialise with an empty vec).
+                let update_columns = if version >= 23 {
+                    let n = cur.read_u16()? as usize;
+                    let mut cols = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        cols.push(cur.read_str()?);
+                    }
+                    cols
+                } else {
+                    Vec::new()
+                };
                 cat.triggers.push(TriggerDef {
                     name,
                     table,
@@ -4847,6 +4877,7 @@ impl Catalog {
                     events,
                     for_each,
                     function,
+                    update_columns,
                 });
             }
         }

@@ -622,6 +622,22 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
             substitute_locals(expr, locals);
             substitute_locals(array, locals);
         }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                substitute_locals(o, locals);
+            }
+            for (w, t) in branches {
+                substitute_locals(w, locals);
+                substitute_locals(t, locals);
+            }
+            if let Some(e) = else_branch {
+                substitute_locals(e, locals);
+            }
+        }
         Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_)
@@ -719,6 +735,22 @@ fn substitute_new_old(
         Expr::AnyAll { expr, array, .. } => {
             substitute_new_old(expr, new_row, old_row, columns)?;
             substitute_new_old(array, new_row, old_row, columns)?;
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                substitute_new_old(o, new_row, old_row, columns)?;
+            }
+            for (w, t) in branches {
+                substitute_new_old(w, new_row, old_row, columns)?;
+                substitute_new_old(t, new_row, old_row, columns)?;
+            }
+            if let Some(e) = else_branch {
+                substitute_new_old(e, new_row, old_row, columns)?;
+            }
         }
         // Leaves + variants we don't recurse into (sub-queries
         // inside a trigger body would require correlated-query
