@@ -8,6 +8,34 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.12.10] — 2026-06-06 (CI hotfix — Cargo.lock sync, never-skipped pre-finish gate)
+
+Second hotfix off master in 10 minutes. v7.12.9 bumped
+`Cargo.toml` to 7.12.9 but didn't sync `Cargo.lock`, which
+stayed at 7.12.8. Local `cargo test` (without `--locked`)
+silently updates the lockfile so the gate looked green; CI's
+`--locked` mode rejects with "cannot update the lock file
+because --locked was passed". prod_ready gate red on master
+again as a result.
+
+Fix: bump to 7.12.10 + `cargo check --workspace` to write the
+matching lockfile + commit both. Pre-finish gate this time
+adds the explicit `--locked` flag so a future "lockfile drift"
+regression catches at hotfix-prep time:
+
+    cargo test --workspace --locked -- --test-threads=1
+
+Zero runtime change, again. No crates / docker re-publish.
+
+Lessons baked into `.claude/git-flow.md` red lines: any
+version bump on a release/hotfix branch MUST be followed by
+`cargo check --workspace` (regenerates lockfile) AND
+`cargo test --workspace --locked` (verifies it) BEFORE
+`git flow ... finish`. The `--locked` requirement is what
+keeps CI honest, so the same gate has to run locally.
+
+---
+
 ## [7.12.9] — 2026-06-06 (CI hotfix — trufflehog base/head config)
 
 Hotfix off master for a CI regression v7.12.8 introduced. The
