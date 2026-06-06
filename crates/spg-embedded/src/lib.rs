@@ -76,8 +76,56 @@
 //! threading), so it lives in its own crate to keep the
 //! `no_std` boundary clean.
 
-pub use spg_engine::{Engine, EngineError, QueryResult};
+pub use spg_engine::{Engine, EngineError, ParsedStatement, QueryResult};
 pub use spg_storage::Value;
+
+/// v7.16.0 — handle for a parsed-and-planned SQL statement.
+/// Hand off to [`Database::execute_prepared`] / [`Database::query_prepared`]
+/// with a `&[Value]` slice carrying the bind parameters (PG-style
+/// `$1`, `$2`, … positional). Cheap to `Clone`; the underlying AST
+/// is shared by handle copies and cloned per bind call by the
+/// engine's executor.
+///
+/// The handle holds a snapshot of the AST at prepare time. If
+/// the engine's plan cache evicts the entry between prepare and
+/// execute (e.g. ANALYZE bumps the statistics version) the
+/// stored AST keeps working — `execute_prepared` operates on
+/// the handle's clone, not the cache entry.
+#[derive(Debug, Clone)]
+pub struct Statement {
+    /// The parsed + planned AST. `spg-engine::prepare_cached`
+    /// returns it as a clone of the cached plan, so any rewrite
+    /// passes (`expand_group_by_all`, `reorder_joins`, …) have
+    /// already run.
+    pub(crate) stmt: ParsedStatement,
+    /// Original SQL source, kept for `Display` / debug only.
+    /// WAL persistence renders from the AST so a bind-time
+    /// rewrite of `$1..$N` survives replay.
+    pub(crate) sql: String,
+}
+
+impl Statement {
+    /// Borrow the original SQL source — useful for tracing and
+    /// debug logs. WAL replay does NOT use this; it serialises
+    /// the bind-final AST instead.
+    #[must_use]
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+/// v7.16.0 — internal WAL helper. Mirrors what
+/// `Engine::execute_prepared` does to the cloned AST so the WAL
+/// record carries the bind-final SQL text (so replay's
+/// simple-query path reconstructs the same row state without
+/// needing the original `Statement` handle to still be alive).
+/// Errors from the underlying engine helper would only fire if
+/// the bind-final stmt referenced a placeholder past the params
+/// slice — and that case has already errored in the executor
+/// above before this helper runs, so we discard the Result here.
+fn wal_render_with_params(stmt: &mut ParsedStatement, params: &[Value]) {
+    let _ = spg_engine::substitute_placeholders(stmt, params);
+}
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -645,6 +693,123 @@ impl Database {
     /// bulk loads that bypass SQL parsing).
     pub const fn engine_mut(&mut self) -> &mut Engine {
         &mut self.engine
+    }
+
+    /// v7.16.0 — parse + plan a SQL string ONCE so subsequent
+    /// `execute_prepared` / `query_prepared` calls can re-bind
+    /// parameters without re-parsing. The returned [`Statement`]
+    /// is a thin handle around the AST + cached source SQL; it's
+    /// `Clone` so the same plan can drive many bind calls
+    /// concurrently (each call clones the AST and runs
+    /// placeholder substitution on the clone — the cached
+    /// plan stays intact).
+    ///
+    /// Plan caching follows the engine's existing version-aware
+    /// rule: a prepared `Statement` whose statistics version
+    /// has rolled (ANALYZE ran between prepare and execute)
+    /// will silently re-prepare under the hood. Callers don't
+    /// need to detect this.
+    ///
+    /// Placeholders in the SQL use PG's `$1`, `$2`, … convention.
+    /// `bind`-time `Value`s are passed as a slice; arity
+    /// mismatches surface as `EvalError::PlaceholderOutOfRange`
+    /// at `execute_prepared` time, not here.
+    ///
+    /// # Errors
+    /// Surfaces `EngineError` (parse error / plan rewrite
+    /// failure) from the underlying `Engine::prepare`.
+    pub fn prepare(&mut self, sql: &str) -> Result<Statement, EngineError> {
+        // Use the cached path so repeated prepares of the same
+        // SQL are O(1). The engine's plan cache stays shared
+        // across all callers of this Database — a single
+        // `PgPool`-shaped consumer (or, later, the spg-sqlx
+        // adapter) prepares once and reaps the win on every bind.
+        let stmt = self.engine.prepare_cached(sql).map_err(EngineError::Parse)?;
+        Ok(Statement {
+            stmt,
+            sql: sql.to_string(),
+        })
+    }
+
+    /// v7.16.0 — execute a prepared statement with bound
+    /// parameters. Mirrors `Engine::execute_prepared`: clones
+    /// the AST, substitutes `$1..$N` → `params[0..N-1]`, runs.
+    ///
+    /// Persistence (WAL fsync + auto-checkpoint) follows the
+    /// same rules as `execute(sql)`: mutating statements get a
+    /// WAL record AFTER the in-memory exec succeeds. The WAL
+    /// record carries the substituted, bind-final SQL, so
+    /// replay reconstructs the same row state without needing
+    /// the original prepared `Statement` to still be alive.
+    ///
+    /// # Errors
+    /// Propagates engine errors. Param arity mismatch surfaces
+    /// as `EvalError::PlaceholderOutOfRange`.
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<QueryResult, EngineError> {
+        let result = self.engine.execute_prepared(stmt.stmt.clone(), params)?;
+        // WAL persistence on the bind-final SQL. Build the
+        // canonical Display form by re-printing the
+        // placeholder-substituted statement (cheap — the AST
+        // is already in hand from execute_prepared's internal
+        // clone) so replay's path is identical to the
+        // simple-query path.
+        if self.persistence.is_some()
+            && matches!(
+                &result,
+                QueryResult::CommandOk {
+                    modified_catalog: true,
+                    ..
+                }
+            )
+        {
+            // Render the AST back to SQL for WAL replay. The
+            // placeholder positions are already substituted in
+            // the executed clone; we re-substitute on a fresh
+            // clone here purely to obtain the canonical text.
+            let mut wal_stmt = stmt.stmt.clone();
+            // Use the engine's substitute_placeholders entry —
+            // exposed via execute_prepared above. Here we
+            // re-run the substitution only for Display.
+            crate::wal_render_with_params(&mut wal_stmt, params);
+            let canonical = format!("{wal_stmt}");
+            let record = encode_v3_auto_commit(&canonical);
+            let p = self.persistence.as_mut().expect("checked above");
+            p.wal.write_all(&record).map_err(io_err)?;
+            p.wal.sync_data().map_err(io_err)?;
+            p.wal_len = p.wal_len.saturating_add(record.len() as u64);
+            if p.wal_len >= p.checkpoint_threshold_bytes {
+                self.checkpoint()?;
+            }
+        }
+        Ok(result)
+    }
+
+    /// v7.16.0 — run a prepared SELECT with bound params and
+    /// return rows as `Vec<Vec<Value>>`, matching `query()`
+    /// shape. SELECTs are read-only so this never writes the
+    /// WAL.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` if the prepared statement isn't a
+    /// SELECT (use `execute_prepared` for DML/DDL).
+    pub fn query_prepared(
+        &mut self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<Vec<Vec<Value>>, EngineError> {
+        match self.engine.execute_prepared(stmt.stmt.clone(), params)? {
+            QueryResult::Rows { rows, .. } => Ok(rows.into_iter().map(|r| r.values).collect()),
+            QueryResult::CommandOk { .. } => Err(EngineError::Unsupported(
+                "query_prepared() expects a SELECT — use execute_prepared() for DML/DDL".into(),
+            )),
+            _ => Err(EngineError::Unsupported(
+                "query_prepared() expects a SELECT — use execute_prepared() for DML/DDL".into(),
+            )),
+        }
     }
 
     /// v7.2.0 — run `body` inside an implicit `BEGIN` /

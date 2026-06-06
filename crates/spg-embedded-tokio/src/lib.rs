@@ -31,7 +31,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-pub use spg_embedded::{Database, EngineError, QueryResult, Value};
+pub use spg_embedded::{Database, EngineError, ParsedStatement, QueryResult, Statement, Value};
 pub use spg_engine::CatalogSnapshot;
 
 use tokio::sync::Mutex;
@@ -43,6 +43,26 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone)]
 pub struct AsyncDatabase {
     inner: Arc<Mutex<Database>>,
+}
+
+/// v7.16.0 — Tokio-flavoured prepared-statement handle. Wraps
+/// the sync `spg_embedded::Statement` in an `Arc` so the AST is
+/// shared (not cloned) across `execute_prepared` /
+/// `query_prepared` calls, and so the handle is `Clone + Send`
+/// without copying the AST per bind. The engine's per-bind
+/// internal clone still happens — that's where placeholder
+/// substitution lands — but the spg-embedded-tokio surface
+/// avoids the second clone the naive shape would force.
+///
+/// Holding an `AsyncStatement` does NOT pin the database; drop
+/// the last `AsyncDatabase` clone and the handle stops being
+/// useful (the next `execute_prepared` call would still find a
+/// locked `Database` if any other clone is alive, but bind
+/// against a dropped database surfaces as the underlying
+/// `EngineError`).
+#[derive(Debug, Clone)]
+pub struct AsyncStatement {
+    inner: Arc<crate::Statement>,
 }
 
 impl AsyncDatabase {
@@ -102,6 +122,75 @@ impl AsyncDatabase {
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
             guard.query(&sql)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.16.0 — parse + plan a SQL string once. Returns an
+    /// [`AsyncStatement`] handle that subsequent
+    /// `execute_prepared` / `query_prepared` calls can re-bind
+    /// without re-parsing. Cheap to `Clone` — the underlying AST
+    /// sits behind an `Arc`, so the same plan can drive many
+    /// concurrent bind calls.
+    ///
+    /// # Errors
+    /// Propagates `EngineError` from the underlying
+    /// `Database::prepare`.
+    pub async fn prepare(&self, sql: &str) -> Result<AsyncStatement, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.prepare(&sql).map(|stmt| AsyncStatement {
+                inner: Arc::new(stmt),
+            })
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.16.0 — execute a prepared statement with bound params.
+    /// `params` is taken by value because the spawn_blocking
+    /// closure needs a `'static` capture; the cost is one
+    /// `Vec::clone`-equivalent ownership transfer, dwarfed by
+    /// the engine's per-bind work.
+    ///
+    /// # Errors
+    /// Propagates engine errors; arity mismatch surfaces as
+    /// "parameter \$N referenced but only M bound by client".
+    pub async fn execute_prepared(
+        &self,
+        stmt: &AsyncStatement,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let stmt_inner = Arc::clone(&stmt.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.execute_prepared(&stmt_inner, &params)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.16.0 — run a prepared SELECT with bound params and
+    /// return rows as `Vec<Vec<Value>>`. Errors when the prepared
+    /// statement isn't a SELECT.
+    ///
+    /// # Errors
+    /// Propagates `EngineError` from the underlying
+    /// `Database::query_prepared`.
+    pub async fn query_prepared(
+        &self,
+        stmt: &AsyncStatement,
+        params: Vec<Value>,
+    ) -> Result<Vec<Vec<Value>>, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let stmt_inner = Arc::clone(&stmt.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.query_prepared(&stmt_inner, &params)
         })
         .await
         .expect("spawn_blocking join")
