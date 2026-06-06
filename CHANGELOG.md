@@ -8,6 +8,30 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.12.9] — 2026-06-06 (CI hotfix — trufflehog base/head config)
+
+Hotfix off master for a CI regression v7.12.8 introduced. The
+v7.12.8 trufflehog step passed `base:
+github.event.repository.default_branch + head: HEAD`. On a
+push-to-master event that resolves to `master..master`, which
+is an empty diff, and the trufflehog action errors out with
+"BASE and HEAD commits are the same" → exit 1. Net effect:
+master CI red on the secret_scan job even with zero actual
+secrets in the diff.
+
+Fix: drop the explicit base/head args so the action picks its
+event-aware default (push → push-range, pull_request → PR
+diff, workflow_dispatch → whole tree). Also widen
+`extra_args` to `--results=verified,unknown` to keep the
+signal high — verified credentials (action probed the issuer
+endpoint) plus genuinely-novel matches the analyzers don't
+recognise.
+
+Zero runtime change again. No need to upgrade the
+`goliakk/spg:7.12.7` image or the v7.12.7 crates.io artifacts.
+
+---
+
 ## [7.12.8] — 2026-06-06 (docs + CI chore patch — no runtime change)
 
 Doc-and-CI patch on top of v7.12.7. Zero runtime change — the
