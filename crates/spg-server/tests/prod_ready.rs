@@ -168,15 +168,20 @@ fn assert_doc_has_sections(doc_name: &str, required: &[&str]) {
     }
 }
 
-// ---- 3.7 gitleaks ----
+// ---- 3.7 secret scan ----
 
 #[test]
-fn row_3_7_gitleaks_in_ci() {
+fn row_3_7_secret_scan_in_ci() {
+    // v7.12.8 — swapped gitleaks → trufflehog. gitleaks v2 added
+    // an org-license gate; trufflehog is free for OSS / org use
+    // and the `--only-verified` mode actually probes credentials
+    // against their issuing service before reporting, so the
+    // signal-to-noise ratio is better.
     let yml =
         std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml")).expect("ci.yml");
     assert!(
-        yml.contains("gitleaks/gitleaks-action"),
-        "CI must run gitleaks for secret scanning"
+        yml.contains("trufflesecurity/trufflehog"),
+        "CI must run a secret scanner (trufflehog as of v7.12.8)"
     );
 }
 

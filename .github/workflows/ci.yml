@@ -157,23 +157,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  gitleaks:
-    name: gitleaks
+  secret_scan:
+    name: secret scan (trufflehog)
     runs-on: ubuntu-latest
-    # v4.32: secret scanning. Fails the build on any high-entropy
-    # string / common API key format committed in the diff.
+    # v4.32 originally used gitleaks/gitleaks-action@v2 for secret
+    # scanning. gitleaks v2 added an org-license gate in 2026 that
+    # would have us paying per-month; v7.12.8 swaps to trufflehog
+    # which stays free for OSS / org use.
     #
-    # v7.11.x — gitleaks-action@v2 now requires a paid license for
-    # GitHub organisations. Until we either purchase one or migrate to
-    # a different scanner (trufflehog is the usual swap), allow this
-    # job to soft-fail so it doesn't gate the rest of CI.
-    continue-on-error: true
+    # Scope: scan the commit range introduced by this push / PR
+    # (`--since-commit` from the base) for any high-entropy string
+    # or recognised credential format (AWS keys, GH PATs, JWTs,
+    # Stripe / Twilio / etc). `--only-verified` cuts false-
+    # positives — trufflehog actually probes the candidate string
+    # against the issuing service's auth endpoint before reporting,
+    # so what fires here is a credential that *currently works*.
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: trufflehog scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
 
   release-build:
     name: release build (sanity)
