@@ -38,6 +38,10 @@ use spg_sql::ast::{
     SelectStatement, Statement, TableRef, UnOp, UnionKind, VecEncoding as SqlVecEncoding,
     WindowFrame,
 };
+// v7.16.0 — re-export the parsed-statement AST so downstream
+// crates (spg-embedded → spg-sqlx) don't need a direct dep on
+// spg-sql for the prepare/bind handle.
+pub use spg_sql::ast::Statement as ParsedStatement;
 use spg_sql::parser::{self, ParseError};
 use spg_storage::{
     Catalog, ColumnSchema, CompactReport, DataType, IndexKey, IndexKind, Row, StorageError, Table,
@@ -9191,7 +9195,14 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
     }
 }
 
-fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result<(), EngineError> {
+/// v7.16.0 — walks a parsed statement and replaces every
+/// `Expr::Placeholder(N)` with the corresponding `params[N-1]`
+/// re-encoded as an `Expr::Literal`. Used internally by
+/// `Engine::execute_prepared` AND surfaced for the spg-embedded
+/// WAL path (which needs the bind-final AST so replay sees a
+/// simple-query-shaped statement, not a `$1`-shaped one). Errors
+/// when a placeholder references an index past the params slice.
+pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result<(), EngineError> {
     match stmt {
         Statement::Select(s) => substitute_select(s, params)?,
         Statement::Insert(ins) => {
