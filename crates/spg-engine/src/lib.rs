@@ -627,6 +627,16 @@ pub struct Engine {
     /// fires trigger B which UPDATEs table A which fires trigger
     /// A again…). Reset to 0 once the original DML returns.
     trigger_recursion_depth: u32,
+    /// v7.14.0 — when `SET FOREIGN_KEY_CHECKS=0` is in effect
+    /// (mysqldump preamble), the FK existence + arity check at
+    /// CREATE TABLE time is deferred. FKs referencing a
+    /// not-yet-existing parent land in `pending_foreign_keys`
+    /// keyed by child table; `SET FOREIGN_KEY_CHECKS=1` drains
+    /// the queue and resolves each FK against the now-complete
+    /// catalog. Empty by default; the queue is drained on every
+    /// `RESET ALL` too.
+    foreign_key_checks: bool,
+    pending_foreign_keys: Vec<(alloc::string::String, spg_sql::ast::ForeignKeyConstraint)>,
 }
 
 /// v7.12.7 — hard cap on nested trigger-emitted embedded SQL
@@ -755,6 +765,8 @@ impl Engine {
             slow_query_logger: None,
             session_params: BTreeMap::new(),
             trigger_recursion_depth: 0,
+            foreign_key_checks: true,
+            pending_foreign_keys: Vec::new(),
         }
     }
 
@@ -835,6 +847,8 @@ impl Engine {
             slow_query_logger: None,
             session_params: BTreeMap::new(),
             trigger_recursion_depth: 0,
+            foreign_key_checks: true,
+            pending_foreign_keys: Vec::new(),
         }
     }
 
@@ -895,6 +909,8 @@ impl Engine {
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
                     trigger_recursion_depth: 0,
+            foreign_key_checks: true,
+            pending_foreign_keys: Vec::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1520,6 +1536,15 @@ impl Engine {
                 affected: 0,
                 modified_catalog: false,
             }),
+            // v7.14.0 — empty-statement no-op for pg_dump /
+            // mysqldump preamble lines that collapse to nothing
+            // after comment-stripping.
+            Statement::Empty => Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            }),
+            Statement::DropTable { names, if_exists } => self.exec_drop_table(names, if_exists),
+            Statement::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Update(s) => self.exec_update_cancel(&s, cancel),
@@ -1564,6 +1589,20 @@ impl Engine {
             // is a recorded no-op (PG dump compat).
             Statement::SetParameter { name, value } => {
                 self.set_session_param(name, value);
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
+            // v7.14.0 — MySQL multi-assignment SET. Each pair runs
+            // through `set_session_param` so engine-known params
+            // (FOREIGN_KEY_CHECKS, session_replication_role, …) take
+            // effect; unknown pairs (including `@VAR` LHS from the
+            // mysqldump preamble) are recorded then ignored.
+            Statement::SetParameterList(pairs) => {
+                for (name, value) in pairs {
+                    self.set_session_param(name, value);
+                }
                 Ok(QueryResult::CommandOk {
                     affected: 0,
                     modified_catalog: false,
@@ -2223,8 +2262,68 @@ impl Engine {
             spg_sql::ast::SetValue::Number(s) => s,
             spg_sql::ast::SetValue::Default => String::new(),
         };
-        self.session_params
-            .insert(name.to_ascii_lowercase(), normalised);
+        let key = name.to_ascii_lowercase();
+        // v7.14.0 — mysqldump preamble emits
+        // `SET FOREIGN_KEY_CHECKS=0` so it can CREATE TABLE in any
+        // order despite cross-table FK references; the closing
+        // section emits `SET FOREIGN_KEY_CHECKS=1` (or
+        // `=@OLD_FOREIGN_KEY_CHECKS` which resolves to "ON" in our
+        // session-variable-aware path). Match both shapes.
+        // Also accept PG's `session_replication_role = 'replica'`
+        // which suppresses trigger + FK enforcement during a
+        // logical replication apply (pg_dump preserves this for
+        // schema-only mode but it shows up in some restores).
+        let value_off = matches!(
+            normalised.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        );
+        let value_on = matches!(
+            normalised.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true"
+        );
+        if key == "foreign_key_checks"
+            || key == "session_replication_role" && normalised.eq_ignore_ascii_case("replica")
+        {
+            if value_off || key == "session_replication_role" {
+                self.foreign_key_checks = false;
+            } else if value_on
+                || (key == "session_replication_role"
+                    && normalised.eq_ignore_ascii_case("origin"))
+            {
+                self.foreign_key_checks = true;
+                // Drain pending FK queue against the now-complete
+                // catalog. Errors here surface as the SET reply —
+                // caller knows enabling checks revealed orphans.
+                let _ = self.drain_pending_foreign_keys();
+            }
+        }
+        self.session_params.insert(key, normalised);
+    }
+
+    /// v7.14.0 — resolve every queued FK whose installation was
+    /// deferred (`SET FOREIGN_KEY_CHECKS=0` window). Called by
+    /// `set_session_param` when checks flip back on and by the
+    /// drop-import release gate. Each FK is resolved against the
+    /// current catalog; remaining missing-parent errors propagate
+    /// up so the caller knows the import was incomplete.
+    fn drain_pending_foreign_keys(&mut self) -> Result<(), EngineError> {
+        let pending = core::mem::take(&mut self.pending_foreign_keys);
+        for (child, fk) in pending {
+            // Resolve against the current catalog. Skip silently
+            // when the child table itself was dropped between
+            // queue + drain.
+            let cols_snapshot = match self.active_catalog().get(&child) {
+                Some(t) => t.schema().columns.clone(),
+                None => continue,
+            };
+            let storage_fk = resolve_foreign_key(&child, &cols_snapshot, fk, self.active_catalog())?;
+            let table = self
+                .active_catalog_mut()
+                .get_mut(&child)
+                .expect("checked above");
+            table.schema_mut().foreign_keys.push(storage_fk);
+        }
+        Ok(())
     }
 
     /// v7.12.1 — read a session parameter set via `SET`. Used by
@@ -3518,6 +3617,84 @@ impl Engine {
                     table.update_row(i, row_values)?;
                 }
             }
+            spg_sql::ast::AlterTableTarget::AddTableConstraint(tc) => {
+                // v7.14.0 — pg_dump emits PKs as a separate
+                // ALTER TABLE ADD CONSTRAINT post-CREATE-TABLE.
+                // For PRIMARY KEY / UNIQUE, install a UC entry
+                // and the implicit BTree index on the leading
+                // column. CHECK: append predicate to schema.
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.into(),
+                    })
+                })?;
+                let is_pk = matches!(
+                    tc,
+                    spg_sql::ast::TableConstraint::PrimaryKey { .. }
+                );
+                match tc {
+                    spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
+                    | spg_sql::ast::TableConstraint::Unique { columns, .. } => {
+                        let positions: Vec<usize> = columns
+                            .iter()
+                            .map(|c| {
+                                table
+                                    .schema()
+                                    .columns
+                                    .iter()
+                                    .position(|sc| sc.name.eq_ignore_ascii_case(c))
+                                    .ok_or_else(|| {
+                                        EngineError::Unsupported(alloc::format!(
+                                            "ALTER TABLE ADD CONSTRAINT: column {c:?} not found on {:?}",
+                                            s.name
+                                        ))
+                                    })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        // Skip if an equivalent UC is already there
+                        // (idempotent — pg_dump's PK + a prior inline
+                        // PK shouldn't double-install).
+                        let already = table
+                            .schema()
+                            .uniqueness_constraints
+                            .iter()
+                            .any(|u| u.columns == positions);
+                        if !already {
+                            table.schema_mut().uniqueness_constraints.push(
+                                spg_storage::UniquenessConstraint {
+                                    is_primary_key: is_pk,
+                                    columns: positions.clone(),
+                                    nulls_not_distinct: false,
+                                },
+                            );
+                            // PK implies NOT NULL on referenced cols.
+                            if is_pk {
+                                for p in &positions {
+                                    if let Some(c) = table.schema_mut().columns.get_mut(*p) {
+                                        c.nullable = false;
+                                    }
+                                }
+                            }
+                            // Add a BTree index on the leading
+                            // column for INSERT-side enforcement.
+                            let leading = &columns[0];
+                            let already_idx = table.indices().iter().any(|idx| {
+                                matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                                    && table.schema().columns[idx.column_position].name
+                                        == *leading
+                            });
+                            if !already_idx {
+                                let suffix = if is_pk { "pkey" } else { "key" };
+                                let idx_name = alloc::format!("{}_{leading}_{suffix}", s.name);
+                                let _ = table.add_index(idx_name, leading);
+                            }
+                        }
+                    }
+                    spg_sql::ast::TableConstraint::Check { expr, .. } => {
+                        table.schema_mut().checks.push(alloc::format!("{expr}"));
+                    }
+                }
+            }
             spg_sql::ast::AlterTableTarget::DropColumn {
                 column,
                 if_exists,
@@ -3945,6 +4122,40 @@ impl Engine {
         })
     }
 
+    /// v7.14.0 — DROP TABLE handler (pg_dump / mysqldump preamble).
+    fn exec_drop_table(
+        &mut self,
+        names: Vec<String>,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        for name in names {
+            let dropped = self.active_catalog_mut().drop_table(&name);
+            if !dropped && !if_exists {
+                return Err(EngineError::Storage(StorageError::TableNotFound { name }));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.14.0 — DROP INDEX handler.
+    fn exec_drop_index(
+        &mut self,
+        name: String,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let dropped = self.active_catalog_mut().drop_named_index(&name);
+        if !dropped && !if_exists {
+            return Err(EngineError::Storage(StorageError::IndexNotFound { name }));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     fn exec_create_table(
         &mut self,
         stmt: CreateTableStatement,
@@ -4006,6 +4217,21 @@ impl Engine {
         let mut fks: Vec<spg_storage::ForeignKeyConstraint> =
             Vec::with_capacity(stmt.foreign_keys.len());
         for fk in stmt.foreign_keys {
+            // v7.14.0 — when SET FOREIGN_KEY_CHECKS=0 is in effect
+            // (mysqldump preamble + bulk imports), defer FK
+            // resolution if the parent table isn't in the catalog
+            // yet. The FK is queued and resolved when checks flip
+            // back on. Self-references stay in-band (the parent is
+            // the same as the child we're building).
+            let needs_parent = !fk.parent_table.eq_ignore_ascii_case(&table_name);
+            if !self.foreign_key_checks
+                && needs_parent
+                && self.active_catalog().get(&fk.parent_table).is_none()
+            {
+                self.pending_foreign_keys
+                    .push((table_name.clone(), fk));
+                continue;
+            }
             fks.push(resolve_foreign_key(
                 &table_name,
                 &cols,
@@ -11087,6 +11313,21 @@ fn coerce_value(
             })?;
             Some(Value::Date(d))
         }
+        // v7.14.0 — MySQL DEFAULT clauses quote integer / float
+        // / boolean literals (`DEFAULT '0'`, `DEFAULT '1'`,
+        // `DEFAULT '3.14'`, `DEFAULT 'true'`). Coerce the text
+        // form to the column's numeric / bool type at DEFAULT-
+        // installation time so the storage check sees a typed
+        // value. Parse failures fall through to TypeMismatch.
+        (Value::Text(s), DataType::SmallInt) => s.parse::<i16>().ok().map(Value::SmallInt),
+        (Value::Text(s), DataType::Int) => s.parse::<i32>().ok().map(Value::Int),
+        (Value::Text(s), DataType::BigInt) => s.parse::<i64>().ok().map(Value::BigInt),
+        (Value::Text(s), DataType::Float) => s.parse::<f64>().ok().map(Value::Float),
+        (Value::Text(s), DataType::Bool) => match s.to_ascii_lowercase().as_str() {
+            "0" | "false" | "f" | "no" | "off" => Some(Value::Bool(false)),
+            "1" | "true" | "t" | "yes" | "on" => Some(Value::Bool(true)),
+            _ => None,
+        },
         // v4.9: Text ↔ JSON coercion. No structural validation —
         // any text literal is accepted; the responsibility for
         // valid JSON lies with the producer.

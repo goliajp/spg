@@ -3280,6 +3280,39 @@ impl Catalog {
         self.tables.len()
     }
 
+    /// v7.14.0 — remove a table by name. Returns `true` when the
+    /// table existed (and is now gone), `false` when it didn't.
+    /// Used by `DROP TABLE` from pg_dump / mysqldump preambles
+    /// where the dump re-creates schema and starts with
+    /// `DROP TABLE IF EXISTS`.
+    pub fn drop_table(&mut self, name: &str) -> bool {
+        let Some(idx) = self.by_name.remove(name) else {
+            return false;
+        };
+        // swap_remove invalidates the trailing index → rebuild
+        // by_name for affected entries.
+        self.tables.swap_remove(idx);
+        // Re-stamp moved table's index slot in by_name.
+        if idx < self.tables.len() {
+            let moved_name = self.tables[idx].schema.name.clone();
+            self.by_name.insert(moved_name, idx);
+        }
+        true
+    }
+
+    /// v7.14.0 — remove a named index across the catalog.
+    /// Returns `true` when found + dropped.
+    pub fn drop_named_index(&mut self, name: &str) -> bool {
+        for t in &mut self.tables {
+            let before = t.indices.len();
+            t.indices.retain(|i| i.name != name);
+            if t.indices.len() != before {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Borrow-free copy of every table's name in catalog order
     /// (= insertion order, matching the on-disk encoding).
     pub fn table_names(&self) -> Vec<String> {

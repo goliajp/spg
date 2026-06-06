@@ -14,6 +14,29 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
+    /// v7.14.0 — `DROP TABLE [IF EXISTS] name [, name…]
+    /// [CASCADE | RESTRICT]`. Engine removes the matching tables
+    /// (each one) from the catalog; IF EXISTS makes the drop
+    /// idempotent. CASCADE / RESTRICT trailers parsed silently
+    /// (SPG always cascades index drops on table drop).
+    DropTable {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// v7.14.0 — `DROP INDEX [IF EXISTS] name`. Removes the
+    /// matching index across whichever table holds it.
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
+    /// v7.14.0 — empty / comment-only statement. The lexer strips
+    /// `--` line comments and `/* … */` block comments (including
+    /// the MySQL conditional `/*!NNNNN … */` form) before the
+    /// parser ever sees them; a SQL chunk that contains nothing
+    /// else lands here. Engine returns CommandOk no-op so
+    /// pg_dump / mysqldump preambles (`SET NAMES utf8mb4`
+    /// wrapped in conditional comments, etc.) load cleanly.
+    Empty,
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
     /// v7.9.15 — `CREATE EXTENSION [IF NOT EXISTS] <name>
@@ -141,6 +164,16 @@ pub enum Statement {
         name: String,
         value: SetValue,
     },
+    /// v7.14.0 — `SET a = 1, b = 2, …` MySQL-flavoured
+    /// multi-assignment (mysqldump preamble uses
+    /// `SET @OLD_FOREIGN_KEY_CHECKS = @@FOREIGN_KEY_CHECKS,
+    /// FOREIGN_KEY_CHECKS=0`). Engine applies each pair in
+    /// source order. Pairs whose LHS is a MySQL session/user
+    /// variable (`@VAR` / `@@VAR`) are recorded with the raw
+    /// name so the engine can ignore them; pairs whose LHS is
+    /// a recognised engine parameter (e.g. `FOREIGN_KEY_CHECKS`)
+    /// go through the regular `set_session_param` path.
+    SetParameterList(Vec<(String, SetValue)>),
     /// v7.12.1 — `RESET <name>` / `RESET ALL`. Restores parameter
     /// to its default. No-op for parameters SPG does not track.
     ResetParameter(Option<String>),
@@ -302,6 +335,13 @@ pub enum AlterTableTarget {
         if_exists: bool,
         cascade: bool,
     },
+    /// v7.14.0 — `ALTER TABLE t ADD CONSTRAINT name PRIMARY KEY
+    /// (cols)` / `ADD CONSTRAINT name UNIQUE (cols)` / `ADD
+    /// CONSTRAINT name CHECK (expr)` — table-level constraints
+    /// installed post-CREATE-TABLE. pg_dump emits PKs as a
+    /// separate ALTER TABLE statement, so this surface lets the
+    /// dump load straight through.
+    AddTableConstraint(TableConstraint),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1579,6 +1619,27 @@ pub enum UnOp {
 impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Empty => Ok(()),
+            Self::DropTable { names, if_exists } => {
+                f.write_str("DROP TABLE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+            Self::DropIndex { name, if_exists } => {
+                f.write_str("DROP INDEX ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                write!(f, "{}", quote_ident(name))
+            }
             Self::Select(s) => s.fmt(f),
             Self::CreateTable(s) => s.fmt(f),
             Self::CreateIndex(s) => s.fmt(f),
@@ -1702,6 +1763,21 @@ impl fmt::Display for Statement {
                     SetValue::Ident(s) | SetValue::Number(s) => f.write_str(s),
                     SetValue::Default => f.write_str("DEFAULT"),
                 }
+            }
+            Self::SetParameterList(pairs) => {
+                f.write_str("SET ")?;
+                for (i, (name, value)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{name} = ")?;
+                    match value {
+                        SetValue::String(s) => write!(f, "'{}'", s.replace('\'', "''"))?,
+                        SetValue::Ident(s) | SetValue::Number(s) => f.write_str(s)?,
+                        SetValue::Default => f.write_str("DEFAULT")?,
+                    }
+                }
+                Ok(())
             }
             Self::ResetParameter(None) => f.write_str("RESET ALL"),
             Self::ResetParameter(Some(name)) => write!(f, "RESET {name}"),
@@ -2057,6 +2133,9 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
                 f.write_str(" CASCADE")?;
             }
             Ok(())
+        }
+        AlterTableTarget::AddTableConstraint(tc) => {
+            write!(f, "ADD {tc}")
         }
     }
 }
@@ -2732,6 +2811,7 @@ mod tests {
                     alias: None,
                     as_of_segment: None,
                     unnest_expr: None,
+                    unnest_column_aliases: Vec::new(),
                 },
                 joins: vec![],
             }),

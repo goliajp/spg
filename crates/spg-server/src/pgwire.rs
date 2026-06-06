@@ -249,13 +249,42 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 // SPG doesn't act on the value (most are
                 // client-side hints), but `SHOW name` later
                 // returns what was stored.
+                // v7.14.0 — SET dispatch is two-tiered:
+                //   1. Engine-affecting (FOREIGN_KEY_CHECKS,
+                //      session_replication_role, default_text_search_config)
+                //      and multi-assignment SET (mysqldump preamble
+                //      `SET @OLD_FK_CHECKS=@@FK_CHECKS, FK_CHECKS=0`)
+                //      fall through to the engine so the flag
+                //      flips.
+                //   2. All other SETs (search_path / client_encoding /
+                //      timezone / …) stay intercepted to keep the
+                //      engine RWLock contention low.
                 if let Some((name, value)) = parse_set_statement(&sql) {
-                    settings.insert(name.to_ascii_lowercase(), value);
-                    send_command_complete(&mut wbuf, "SET")?;
-                    send_ready_for_query(&mut wbuf, tx_state)?;
-                    stream.write_all(&wbuf)?;
-                    wbuf.clear();
-                    continue;
+                    let name_lc = name.to_ascii_lowercase();
+                    settings.insert(name_lc.clone(), value.clone());
+                    let engine_affecting = matches!(
+                        name_lc.as_str(),
+                        "foreign_key_checks"
+                            | "session_replication_role"
+                            | "default_text_search_config"
+                    );
+                    // Detect multi-assignment from the LHS shape
+                    // (contains '@' anywhere) or comma in the value
+                    // portion (more than one assignment).
+                    let is_multi = name_lc.contains('@')
+                        || value.contains(',')
+                        || sql.to_ascii_lowercase().contains("foreign_key_checks=0")
+                        || sql.to_ascii_lowercase().contains("foreign_key_checks =")
+                        || sql.to_ascii_lowercase().contains("foreign_key_checks  ");
+                    if !engine_affecting && !is_multi {
+                        send_command_complete(&mut wbuf, "SET")?;
+                        send_ready_for_query(&mut wbuf, tx_state)?;
+                        stream.write_all(&wbuf)?;
+                        wbuf.clear();
+                        continue;
+                    }
+                    // engine-affecting or multi-assignment:
+                    // fall through to dispatch so the engine sees it.
                 }
                 // v4.19: SHOW name / SHOW ALL.
                 if let Some(name) = parse_show_statement(&sql) {

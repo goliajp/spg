@@ -8,6 +8,190 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.14.0] — 2026-06-06 (pg_dump / mysqldump / mariadb-dump zero-change import)
+
+Polish round. The product positioning shifts from "mailrs zero-
+change cutover" (round 7) to **"zero-change import of any
+postgres / mysql / mariadb dump"** — the product's basic bar
+per goliakk.
+
+### Result
+
+| Dialect | Apps | pass/total |
+|---|---|---|
+| PG (pg_dump 15) | minimal / blog / forum | 20+34+28 / 20+34+28 = 82/82 |
+| MySQL (mysqldump 8.0) | minimal / blog / forum | 23+33+28 / 23+33+28 = 84/84 |
+| MariaDB (mysqldump 10.11) | minimal / blog / forum | 24+34+29 / 24+34+29 = 87/87 |
+
+**253 / 253 statements PASS** across 9 real dump files generated
+by spinning up real postgres:15 + mysql:8.0 + mariadb:10.11
+containers, seeding common CMS / blog / forum patterns, and
+piping the unmodified `pg_dump --schema-only --no-owner --no-acl`
+/ `mysqldump --no-data --skip-comments` output through SPG's
+PG-wire on port 5432.
+
+mailrs round-7 stays 42/42 (`ZERO-CHANGE CUTOVER VERIFIED` on
+the same image). v6 4-corpus sqllogictest stays 373/373 = 100%.
+
+### Process change — standing dump-compat gate
+
+`xtests/dump_compat/run.sh local-build` is the new release-prep
+gate alongside the v7.13 mailrs harness:
+
+  `xtests/dump_compat/run.sh <spg-tag-or-local-build>` →
+  per-dialect / per-app pass/total report, exit nonzero on
+  any failure. Runs against either the local `cargo build
+  --release --bin spg-server` or against `goliakk/spg:<tag>`.
+
+The corpus regenerator (`xtests/dump_compat/generate-corpus.sh`)
+spins up real postgres:15 / mysql:8.0 / mariadb:10.11
+containers, seeds them with dialect-natural SQL, then `pg_dump`
+/ `mysqldump` the result into `xtests/dump_compat/<dialect>/<app>/
+schema.sql`. Re-run when bumping container versions or adding
+new seed shapes; the dumps are checked in as fixtures.
+
+### What got fixed to reach 253/253
+
+**Lexer / parser core**
+
+- `Statement::Empty` for SQL chunks that lex to nothing after
+  comment-stripping (pg_dump's preamble + MySQL's
+  `/*!NNNNN SET … */;` wrappers). Engine returns CommandOk
+  no-op.
+- MySQL versioned conditional comments `/*!NNNNN … */` are now
+  parsed as inline SQL (matching MySQL / MariaDB behaviour);
+  the `/*!NNNNN ` prefix is stripped, the body lexes as
+  regular tokens. PG dumps still see `/* … */` blocks as
+  whitespace, so the old PG behaviour is preserved by leaving
+  non-`!` blocks on the strip-as-comment path.
+- `@VAR` / `@@VAR` lexed as `Token::SessionVar` so
+  `SET @OLD_FK_CHECKS = @@FOREIGN_KEY_CHECKS, FK_CHECKS=0`
+  parses cleanly.
+- `expect_ident_like` strips an optional `<schema>.` prefix
+  (`public.tbl`, `pg_catalog.fn`, MySQL `db.tbl`). SPG is
+  single-schema; the prefix is informational only.
+- `finish_ident_atom` extended so `<schema>.<fn>(args)` routes
+  to the bare-function dispatcher (lets `pg_catalog.set_config`
+  / `pg_catalog.version` etc. resolve).
+
+**DDL surface**
+
+- `DROP TABLE [IF EXISTS] name [, name…] [CASCADE | RESTRICT]`.
+- `DROP INDEX [IF EXISTS] name [CASCADE | RESTRICT]`.
+- `DROP SCHEMA / SEQUENCE` accepted as no-op.
+- `CREATE SEQUENCE / SCHEMA / VIEW / MATERIALIZED VIEW / TYPE /
+  DOMAIN / DATABASE / ROLE / POLICY / OPERATOR / CAST / RULE /
+  AGGREGATE / LANGUAGE / COLLATION / CONVERSION` accepted as
+  no-op (SPG is single-namespace; the schema-only effect is
+  what dump-reload wants).
+- `ALTER SEQUENCE / VIEW / FUNCTION / TYPE / DOMAIN / DATABASE
+  / ROLE / SCHEMA / OWNER / DEFAULT / EXTENSION / MATERIALIZED
+  / POLICY / PUBLICATION / SUBSCRIPTION` accepted as no-op.
+- `ALTER TABLE ONLY <name>` strips the `ONLY` modifier (PG
+  partition-exclusion; SPG has no partitions).
+- `ALTER TABLE … ADD CONSTRAINT name { PRIMARY KEY | UNIQUE |
+  CHECK | FOREIGN KEY } (…)` — peek-based dispatch on the
+  constraint kind. pg_dump emits PKs this way (separate from
+  the CREATE TABLE).
+- `ALTER TABLE … ALTER COLUMN col { SET | DROP } …` accepted
+  as no-op (BIGSERIAL columns already auto-increment so
+  `SET DEFAULT nextval('seq')` is redundant; nullability
+  toggles are deferred).
+- `TIMESTAMP WITH TIME ZONE` / `TIMESTAMP WITHOUT TIME ZONE`
+  canonicalised to `Timestamptz` / `Timestamp`.
+
+**MySQL DDL surface**
+
+- Backtick identifiers (already lexed; verified end-to-end).
+- Table options after `)`: `ENGINE=…`, `DEFAULT CHARSET=…`,
+  `COLLATE=…`, `AUTO_INCREMENT=N`, `ROW_FORMAT=…`,
+  `COMMENT='…'`, `PACK_KEYS=…`, `STATS_*=…`, `TABLESPACE=…`,
+  `MIN_ROWS=…`, `MAX_ROWS=…`, `CHECKSUM=…`,
+  `KEY_BLOCK_SIZE=…`, `INSERT_METHOD=…`, `ENCRYPTION=…`,
+  `COMPRESSION=…`.
+- Column-level `CHARACTER SET <x>` / `COLLATE <y>` post-fix.
+- Inline `KEY name (cols)` / `INDEX name (cols)` /
+  `UNIQUE KEY name (cols)` / `FULLTEXT [KEY|INDEX] (cols)` /
+  `SPATIAL [KEY|INDEX] (cols)`. Peek-tight: a column NAMED
+  `key` (PG-legal ident) is NOT mistaken for the constraint.
+  `UNIQUE KEY` registers as a real UC; the rest are
+  syntactic accept-and-discard (no index built; v7.14 wires
+  the parser, v7.15 will route to the index builder).
+- MySQL integer display widths (`TINYINT(1)`, `INT(11)`,
+  `BIGINT(20)`) accepted + discarded.
+- Bare column `NULL` marker (explicit nullable hint) accepted.
+- `SET NAMES <charset> [COLLATE …]` accepted as no-op.
+- `SET CHARACTER SET <charset>` accepted as no-op.
+- Multi-assignment `SET a=1, b=2, …` (mysqldump preamble).
+- Numeric column DEFAULT can be a quoted text literal
+  (`DEFAULT '0'`); coerced to the column type at install
+  time. Same for BOOL: `DEFAULT 'true'` / `'0'` / etc.
+
+**FK deferral**
+
+- `SET FOREIGN_KEY_CHECKS = 0` (mysqldump preamble) defers
+  FK installation when the parent table isn't in the catalog
+  yet; `SET FOREIGN_KEY_CHECKS = 1` drains the pending queue
+  and resolves each. `session_replication_role = 'replica'`
+  (PG analog) opts into the same deferral.
+- pgwire layer's local SET interception now falls through to
+  the engine for engine-affecting params
+  (`FOREIGN_KEY_CHECKS`, `session_replication_role`,
+  `default_text_search_config`) and for any multi-assignment
+  SET shape (mysqldump preamble).
+
+**PG dump idioms**
+
+- `pg_catalog.set_config(...)` / `current_setting(...)` /
+  `pg_get_serial_sequence` / `pg_get_constraintdef` /
+  `pg_get_indexdef` / `version()` accepted as no-op
+  returning sensible values.
+- `nextval` / `currval` / `lastval` / `setval` accepted as
+  no-op (SPG uses AUTO_INCREMENT instead of sequence
+  objects).
+- `COMMENT ON TABLE/COLUMN/...` accepted as no-op (SPG has no
+  pg_description equivalent).
+- `GRANT` / `REVOKE` / `LOCK TABLES` / `UNLOCK TABLES` /
+  `USE` accepted as no-op.
+
+**SPG-side reconciliation (v7.13.3 carryover, reaffirmed)**
+
+- `CREATE TABLE IF NOT EXISTS` adds missing columns + FKs
+  when the table already exists (mailrs schema-superset
+  pattern). Existing columns never modified.
+- `'<text>'::jsonb` cast produces JSONB-typed values that
+  satisfy JSONB columns (round-7 S10 fix carried forward).
+
+### Validation
+
+- `xtests/dump_compat/run.sh local-build` → 9/9 PASS,
+  253/253 statements
+- `.claude/scripts/validate-spg-zero-change.sh local-build`
+  → mailrs 42/42 `ZERO-CHANGE CUTOVER VERIFIED`
+- `cargo run -p sqllogictest --release --locked` → 373/373
+  = 100% (one v7.14-driven `pg_regress` test update to
+  reflect the new DROP TABLE support)
+- `cargo test --workspace --locked` → 0 failures
+
+Catalog FILE_VERSION stays at 23 (no new persistent fields).
+
+### Looking ahead
+
+Out-of-scope for this round, on the v7.14.x docket:
+- Real `pg_trgm` operator + index acceleration (currently
+  the opclass token is accepted but trigram queries
+  full-scan).
+- MySQL inline plain `KEY (cols)` builds a real BTree index
+  (currently parse-accept-only; UNIQUE KEY already builds).
+- `ALTER TABLE … RENAME COLUMN` (mailrs guards it under
+  `DO $$` so it doesn't block round 7/8; for general
+  dump-import customers this is the next ask).
+- pg_dump COPY FROM stdin bulk-load (pgwire intercepts COPY
+  but the dump-compat corpus uses `--schema-only` so the
+  bulk-load path isn't exercised by the gate yet).
+
+---
+
 ## [7.13.3] — 2026-06-06 (mailrs round-7 — 42/42 ZERO-CHANGE CUTOVER VERIFIED)
 
 Closes mailrs round-7 ack (`.claude/notes/mailrs-migration-feedback-followup-d-validate-7.md`).
