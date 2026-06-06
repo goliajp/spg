@@ -8,6 +8,105 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.13.0] — 2026-06-06 (zero-change docker compose cutover for mailrs)
+
+Closes mailrs migration round 5. Goal stated by mailrs in their
+round-5 doc: "swap `image: postgres:16` → `image: goliakk/spg`
+in docker-compose, leave init-schema.sql / migrate-*.sql / the
+application code unchanged, and have everything boot." v7.12.x
+had 12 SQL parser gaps and 5 image behaviour gaps blocking that
+swap. v7.13.0 closes all 17.
+
+### SQL parser / engine surface (10 gaps)
+
+- **G1 — `ALTER TABLE t ADD COLUMN`** (20 hits in mailrs's
+  migrate-*.sql). Full PG syntax: `ADD [COLUMN] [IF NOT EXISTS]
+  <col> <type> [DEFAULT <expr>] [NOT NULL] [PRIMARY KEY]`.
+  Engine back-fills every existing row with the DEFAULT (or
+  NULL); NOT NULL with no DEFAULT on a non-empty table errors
+  with PG's message shape.
+- **G2 — inline `UNIQUE`** column constraint. `<col> TYPE NOT
+  NULL UNIQUE` folds to a single-column table-level UNIQUE so
+  the v7.9.19 UC enforcement path catches everything.
+- **G3 — `CHECK` constraints**, both inline column-level and
+  table-level. Persisted as Display-form predicate strings,
+  re-parsed at INSERT / UPDATE and evaluated against the
+  candidate row; false rejects, NULL passes (PG three-valued
+  semantics). New `enforce_check_constraints` helper.
+- **G4 — `INSERT INTO t [(cols)] SELECT … [WHERE …]`**. Inner
+  SELECT runs first; materialised rows route back through the
+  regular VALUES code path so FK / CHECK / UC / RETURNING /
+  ON CONFLICT enforcement stay reused.
+- **G5 — `gin_trgm_ops` and 7 other PG built-in opclass
+  tokens** (`gist_trgm_ops`, `text_pattern_ops`,
+  `varchar_pattern_ops`, `bpchar_pattern_ops`, `int4_ops`,
+  `int8_ops`, `text_ops`). Tokens-only acceptance — SPG
+  doesn't change index behaviour based on them, but PG schemas
+  using `pg_trgm` load without parser-side errors.
+- **G6 — `DOUBLE PRECISION`** (PG canonical spelling) and
+  `FLOAT8` / `FLOAT4` (short forms) accepted as synonyms for
+  FLOAT.
+- **G7 — `CREATE TRIGGER … BEFORE UPDATE OF col, col, … ON
+  tbl`**. Column-list filter — trigger fires only when at
+  least one listed column actually differs between OLD and
+  NEW for the row. Persisted in catalog FILE_VERSION 23+.
+- **G8 — `ALTER TABLE … ALTER COLUMN c TYPE T [USING expr]`**.
+  USING expression evaluated per row; falls back to a direct
+  cast when omitted.
+- **G9 — `CASE WHEN … THEN … ELSE … END`** in any expression
+  position. Both searched form (`CASE WHEN cond THEN …`) and
+  simple form (`CASE operand WHEN val THEN …`). Short-circuits
+  on first match; falls through to ELSE or NULL. Recursion
+  arms added to 14 Expr-walking sites across the engine.
+- **G10 — `UNIQUE NULLS NOT DISTINCT (cols)`** (PG 15+
+  surface). UniquenessConstraint gains `nulls_not_distinct`
+  flag; enforce path treats two all-NULL rows as colliding
+  when the flag is set.
+
+### Image-side changes (5 gaps)
+
+- **C1 — PG-wire on port 5432 by default** in the docker image
+  via `ENV SPG_PG_ADDR=0.0.0.0:5432`. Local cargo / dev
+  binaries keep the pre-v7.13 opt-in behaviour so test suites
+  don't collide on :5432.
+- **C2 — `POSTGRES_DB` env var accepted** at startup. SPG is
+  single-database; the value is logged but has no on-disk
+  effect.
+- **C3 + C4 — `POSTGRES_USER` + `POSTGRES_PASSWORD` env vars
+  wired** through `bootstrap_admin_from_env`. Precedence:
+  `SPG_ADMIN_PASSWORD` > `POSTGRES_PASSWORD`, `SPG_ADMIN_USER`
+  > `POSTGRES_USER` > `"postgres"`.
+- **C5 — `pg_isready` binary** shipped alongside `spg-server`.
+  Honours `-h` / `-p` / `-t` / `-q` / `PGHOST` / `PGPORT`;
+  exit 0 on TCP accept, 2 on miss. docker-compose
+  `healthcheck: test: ["CMD", "pg_isready", …]` works
+  unmodified.
+
+### Catalog format
+
+FILE_VERSION 22 → 23. Per-table appendix gains a
+`checks: Vec<String>` section (G3) plus a trailing
+`nulls_not_distinct` byte per UC (G10). Trigger appendix gains
+a trailing `update_columns` array (G7). v22 catalogs
+deserialise transparently with empty checks / no NND flag /
+empty update_columns.
+
+### PG_MIGRATION.md honesty pass
+
+Round 5 also flagged matrix lies in the v7.12.11 doc:
+`ALTER TABLE ADD COLUMN` ✅ with no version note (v7.12 rejected
+it), `DROP COLUMN` ✅ (still rejects), `RENAME COLUMN` ✅ (still
+rejects). Corrected to ✅ v7.13.0, ❌, ❌. New rows added for
+every v7.13 surface (inline UNIQUE, CHECK, INSERT … SELECT,
+UPDATE … CASE WHEN, ALTER COLUMN TYPE USING,
+CREATE TRIGGER UPDATE OF, opclass tokens).
+
+Sub-version commit count: 3 feature commits + 1 release-prep
+commit. Catalog FILE_VERSION bump 22 → 23 (additive — v22
+catalogs round-trip).
+
+---
+
 ## [7.12.11] — 2026-06-06 (docs patch — PG-customer migration pathway)
 
 Doc-only patch on top of v7.12.10. Zero runtime / wire / file-
