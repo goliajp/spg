@@ -1205,7 +1205,10 @@ impl Engine {
         cat.triggers()
             .iter()
             .filter(|t| {
-                t.table == table
+                // v7.16.1 — skip disabled triggers (mailrs
+                // round-9 A.2.b — pg_dump --disable-triggers).
+                t.enabled
+                    && t.table == table
                     && t.timing.eq_ignore_ascii_case(timing)
                     && t.for_each.eq_ignore_ascii_case("row")
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case(event))
@@ -1227,7 +1230,9 @@ impl Engine {
         cat.triggers()
             .iter()
             .filter(|t| {
-                t.table == table
+                // v7.16.1 — skip disabled triggers.
+                t.enabled
+                    && t.table == table
                     && t.timing.eq_ignore_ascii_case(timing)
                     && t.for_each.eq_ignore_ascii_case("row")
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
@@ -2657,6 +2662,9 @@ impl Engine {
             for_each: alloc::string::String::from(for_each),
             function: s.function.clone(),
             update_columns: s.update_columns.clone(),
+            // v7.16.1 — every trigger is born enabled. Toggled
+            // by ALTER TABLE … { ENABLE | DISABLE } TRIGGER.
+            enabled: true,
         };
         self.active_catalog_mut()
             .create_trigger(def, s.or_replace)
@@ -3799,6 +3807,48 @@ impl Engine {
                 // Drop the column. New helper on Table does the
                 // row + schema + index shift atomically.
                 table.drop_column(col_pos);
+            }
+            spg_sql::ast::AlterTableTarget::SetTriggerEnabled { which, enabled } => {
+                // v7.16.1 — mailrs round-9 A.2.b. pg_dump
+                // --disable-triggers wraps each table's data
+                // block with `ALTER TABLE … DISABLE TRIGGER ALL`
+                // / `… ENABLE TRIGGER ALL`. Toggle the enabled
+                // flag on every matching trigger so the row-
+                // write paths skip them; the catalog snapshot
+                // persists the new state across restarts.
+                let table_name = s.name.to_string();
+                let trigs = self.active_catalog_mut().triggers_mut();
+                let mut touched = false;
+                for t in trigs.iter_mut() {
+                    if !t.table.eq_ignore_ascii_case(&table_name) {
+                        continue;
+                    }
+                    match &which {
+                        spg_sql::ast::TriggerSelector::All => {
+                            t.enabled = enabled;
+                            touched = true;
+                        }
+                        spg_sql::ast::TriggerSelector::Named(name) => {
+                            if t.name.eq_ignore_ascii_case(name) {
+                                t.enabled = enabled;
+                                touched = true;
+                            }
+                        }
+                    }
+                }
+                // PG semantics: `ALL` on a table with no
+                // triggers is a no-op (no error). A `Named`
+                // form pointing at a non-existent trigger
+                // raises in PG; v7.16.1 also raises so we
+                // don't silently lose state.
+                if !touched {
+                    if let spg_sql::ast::TriggerSelector::Named(name) = &which {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "ALTER TABLE {table_name:?} {} TRIGGER {name:?}: no such trigger on table",
+                            if enabled { "ENABLE" } else { "DISABLE" },
+                        )));
+                    }
+                }
             }
             spg_sql::ast::AlterTableTarget::RenameColumn { old, new } => {
                 // v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO
@@ -11857,6 +11907,25 @@ fn coerce_value(
         // external array form (`{a,b,NULL}`). Lets a SELECT
         // pull an array column through any Text-side codepath.
         (Value::TextArray(items), DataType::Text) => Some(Value::Text(encode_text_array(&items))),
+        // v7.16.1 — Text → TSVECTOR auto-coerce for the
+        // INSERT-side wire path (mailrs round-9 A.2.a). PG
+        // implicitly promotes the TEXT literal at INSERT into a
+        // TSVECTOR column; SPG previously rejected with a hard
+        // type mismatch, blocking 23,276 pg_dump rows into
+        // `messages.search_vector`. We route through the same
+        // `decode_tsvector_external` the `::tsvector` cast
+        // already uses, so PG-canonical forms (`'word'`,
+        // `'word:1A,2B'`, multi-lexeme, empty `''`) all parse.
+        (Value::Text(s), DataType::TsVector) => {
+            let lexs = eval::decode_tsvector_external(&s).map_err(|e| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as TSVECTOR for column `{col_name}`: {e}"
+                    ),
+                })
+            })?;
+            Some(Value::TsVector(lexs))
+        }
         (Value::Text(s), DataType::Timestamp | DataType::Timestamptz) => {
             let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
                 EngineError::Eval(EvalError::TypeMismatch {

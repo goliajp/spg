@@ -8,6 +8,138 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.16.1] — 2026-06-07 (mailrs round-9 closures: TSVECTOR wire + DISABLE/ENABLE TRIGGER + trigger NEW.col regression fix)
+
+The "mailrs server + embed cutover paths both unblock" patch.
+Closes mailrs's round-9 A.2.a (TSVECTOR wire) and A.2.b
+(`ALTER TABLE … DISABLE/ENABLE TRIGGER`) — the only two
+remaining items blocking real prod-dump load. Also fixes a
+quiet two-major-release regression that broke every BEFORE
+trigger's `NEW.col := …` rewrite, which mailrs hadn't
+diagnosed yet because their dump-load gate doesn't exercise
+trigger-fire correctness.
+
+### What shipped
+
+1. **TSVECTOR literal auto-coerce on the INSERT wire path**
+   (mailrs round-9 A.2.a). PG implicitly promotes a `TEXT`
+   literal into a TSVECTOR column at INSERT; pre-v7.16.1 SPG
+   rejected with a hard type mismatch, blocking 23,276
+   pg_dump rows into `messages.search_vector` alone. v7.16.1
+   adds a Text → TSVector arm to `coerce_value` that routes
+   through the same `decode_tsvector_external` the
+   `'…'::tsvector` cast already used. Accepts the
+   PG-canonical positioned-and-weighted form
+   (`'''hello'':1A ''world'':2B'`), bare lexemes
+   (`'word1 word2'`), and the empty form (`''`).
+
+2. **`ALTER TABLE … { ENABLE | DISABLE } TRIGGER { ALL | name }`**
+   (mailrs round-9 A.2.b). pg_dump `--disable-triggers` wraps
+   every data block with these so the rows already-computed in
+   prod don't get re-rewritten by server-side triggers (e.g.
+   `mark_search_vector_trg`). v7.16.1 implements **real**
+   disable — not no-op — because reload correctness assumes
+   triggers don't fire. New `TriggerSelector::All / Named`
+   AST variant + `AlterTableTarget::SetTriggerEnabled` engine
+   handler + per-trigger `enabled: bool` persisted via
+   catalog FILE_VERSION 25.
+
+3. **BEFORE-trigger `NEW.col := …` rewrite restored.** A
+   regression in v7.14.0's `expect_ident_like` schema-strip
+   (`public.t` → `t`) silently turned every `NEW.col` /
+   `OLD.col` plpgsql assignment target into a `Local("col")`
+   — the head "new"/"old" got eaten as if it were a schema
+   name, the dot was consumed, and `parse_plpgsql_assign_target`
+   fell through to the local-variable arm. Effect: ALL
+   BEFORE triggers that rewrote a NEW cell were silent no-ops
+   for two major releases (v7.14.0 + v7.15.0 + v7.16.0).
+   mailrs didn't notice because round-7/8/9 dump-zero-change
+   gates only exercise schema apply, not trigger firing
+   correctness — so `messages.search_vector` would have been
+   empty on the cement read path post-cutover. v7.16.1
+   restores by reading the head ident directly instead of
+   going through the schema-strip helper.
+
+4. **mailrs round-9 B.4 clarifications** as `spg-sqlx` module
+   docs: `SpgPool: Send + Sync + 'static` (yes, by
+   construction); single-process write semantics (shared
+   underlying engine through a `OnceCell` on options);
+   cross-process write semantics (NOT serialised; admin tool
+   + server requires stop/restart; cross-process locking is
+   v7.17+); WAL durability under crash (fsynced per
+   `execute()` return; uncommitted tx rolls back on reopen;
+   checkpoint snapshot rewritten atomically via temp + rename).
+
+5. **3 stale workspace-test cleanups**. `e2e_query::syntax_
+   error_returns_error_response` used `DROP TABLE foo` which
+   parses fine post-v7.14.0. `parser::tests::empty_input_errors`
+   expected an error from empty input but v7.14.0 made empty
+   input return `Statement::Empty`. `parser::tests::create_
+   table_vector_using_unknown_errors` expected the old
+   "unknown vector encoding" error string but the error
+   format changed earlier. The first three were silently
+   broken on the workspace gate across several releases.
+
+### Two new regression locks
+
+- `xtests/sqllogictest/corpus/pg_regress/14_disable_trigger_
+  tsvector.test` — 13 records covering every form of
+  TSVECTOR literal acceptance + ENABLE/DISABLE TRIGGER (ALL
+  + named + unknown-name reject) + the NEW.col rewrite
+  positive-case.
+- `xtests/data_compat/fixtures/mailrs-prod-shape/` — gate #4
+  fixture mirroring mailrs's `messages` + `attachments`
+  shape with a server-side `mark_search_vector_trg`,
+  wrapped in `DISABLE TRIGGER ALL` / `ENABLE TRIGGER ALL`
+  around a 5-row COPY of mixed TSVECTOR shapes (positioned,
+  empty, edge-case strings). Asserts 5 messages + 4
+  attachments land after the wrapper-unwrap cycle.
+
+### Catalog version
+
+`FILE_VERSION` 24 → 25. v25 adds a trailing `enabled: u8`
+flag per `TriggerDef`. v24 catalogs deserialise with every
+trigger `enabled = true`, matching pre-v7.16.1 behaviour.
+
+### Result (all 4 gates green)
+
+| Gate | v7.16.0 | v7.16.1 |
+|---|---|---|
+| workspace tests | 12 pre-existing trigger fails + 3 stale | **0 fail** (closes the 12 trigger + 3 stale) |
+| sqllogictest 4-corpus | 432/432 | **455/455** (+23 covering TSVECTOR + DISABLE TRIGGER + trigger fix) |
+| mailrs ZERO-CHANGE CUTOVER | 42/42 | **42/42** (unchanged — schema apply was always green) |
+| dump-compat (schema + with-data) | 10/10 | **10/10** |
+| data-compat (gate #4) | 1/1 | **2/2** (+ mailrs-prod-shape fixture) |
+| spg-sqlx | 16/16 | **16/16** |
+| spg-embedded prepare/bind | 9/9 | **9/9** |
+
+### mailrs round-9 acceptance state
+
+mailrs's round-9 critical-path table (§ Roadmap summary):
+
+| Order | Owner | Item | v7.16.0 → v7.16.1 |
+|---|---|---|---|
+| 1 | SPG | A.2.a TSVECTOR wire fix | ⏳ → ✅ |
+| 2 | SPG | A.2.b `ALTER TABLE DISABLE/ENABLE TRIGGER` | ⏳ → ✅ |
+| 3 | mailrs | apply `migrate-038` on prod PG | mailrs-side, unchanged |
+| 4 | mailrs | run A.4 server acceptance against candidate image | unblocked by 1 + 2 |
+| 5 | mailrs | run B.5 embed acceptance | unblocked by 1 + 2 |
+
+Both server and embed cutover modes are now unblocked at the
+SPG side. mailrs side can run A.4 + B.5 against
+`goliakk/spg:7.16.1`.
+
+### Looking ahead → v7.17
+
+- Compile-time `sqlx::query!()` macros via the engine's
+  `describe()` impl + planner type-inference on placeholder
+  slots.
+- Cross-process locking on `Database::open_path(p)` so two
+  coexisting processes get serialised (file lock or lease;
+  mailrs round-9 B.4 question 1).
+- spg-sqlx Numeric / tsvector / VECTOR(N) bridges — not
+  blocking mailrs but worth shipping for breadth.
+
 ## [7.16.0] — 2026-06-06 (spg-embedded prepare/bind + spg-sqlx adapter — mailrs in-process path)
 
 The "mailrs cuts the SPG container from prod docker-compose"
