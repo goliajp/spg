@@ -2793,7 +2793,15 @@ impl Parser {
                 _ => false,
             }
         };
+        // `INDEX` lexes as Token::Index (reserved), not as
+        // Token::Ident("index"). Both shapes count as a KEY/INDEX
+        // start; the peek helper below handles either.
+        let is_key_or_index_tok = |t: &Token| -> bool {
+            matches!(t, Token::Index)
+                || matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case("key") || s.eq_ignore_ascii_case("index"))
+        };
         match cur {
+            Token::Index => after_keyword_followed_by_paren_or_ident_paren(self.pos + 1),
             Token::Ident(s)
                 if s.eq_ignore_ascii_case("key") || s.eq_ignore_ascii_case("index") =>
             {
@@ -2803,11 +2811,7 @@ impl Parser {
                 if s.eq_ignore_ascii_case("fulltext") || s.eq_ignore_ascii_case("spatial") =>
             {
                 let nxt = self.tokens.get(self.pos + 1);
-                let after_after = if matches!(
-                    nxt,
-                    Some(Token::Ident(t))
-                        if t.eq_ignore_ascii_case("key") || t.eq_ignore_ascii_case("index")
-                ) {
+                let after_after = if nxt.is_some_and(is_key_or_index_tok) {
                     self.pos + 2
                 } else {
                     self.pos + 1
@@ -2816,11 +2820,7 @@ impl Parser {
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("unique") => {
                 let nxt = self.tokens.get(self.pos + 1);
-                if !matches!(
-                    nxt,
-                    Some(Token::Ident(t))
-                        if t.eq_ignore_ascii_case("key") || t.eq_ignore_ascii_case("index")
-                ) {
+                if !nxt.is_some_and(is_key_or_index_tok) {
                     return false;
                 }
                 after_keyword_followed_by_paren_or_ident_paren(self.pos + 2)
@@ -2831,9 +2831,12 @@ impl Parser {
 
     /// v7.14.0 — parse the MySQL inline KEY/INDEX form. Returns
     /// Some(TableConstraint::Unique) for UNIQUE KEY (so SPG
-    /// enforces uniqueness on INSERT); returns None for plain
-    /// KEY/INDEX/FULLTEXT/SPATIAL (accepted but doesn't create
-    /// an index in v7.14 — only the surface is unblocked).
+    /// enforces uniqueness on INSERT). v7.15.0: plain KEY/INDEX
+    /// returns Some(TableConstraint::Index) so the engine builds
+    /// a real BTree index on the leading column (mysqldump
+    /// `KEY idx_posts_author (author_id)` shape).
+    /// FULLTEXT / SPATIAL still return None — accepted-as-no-op
+    /// (the storage layer has no matching AM).
     fn parse_mysql_inline_key(
         &mut self,
     ) -> Result<Option<crate::ast::TableConstraint>, ParseError> {
@@ -2845,15 +2848,25 @@ impl Parser {
         } else {
             false
         };
-        // Consume FULLTEXT / SPATIAL prefix (silent).
-        if matches!(
+        // Consume FULLTEXT / SPATIAL prefix and record it. SPG
+        // has no native FULLTEXT / SPATIAL AM, so we still
+        // accept-as-no-op for those (return None below); plain
+        // KEY/INDEX builds a real BTree.
+        let is_fulltext_or_spatial = if matches!(
             self.peek(),
             Token::Ident(s) if s.eq_ignore_ascii_case("fulltext") || s.eq_ignore_ascii_case("spatial")
         ) {
             self.advance();
-        }
-        // KEY / INDEX keyword.
+            true
+        } else {
+            false
+        };
+        // KEY / INDEX keyword. `INDEX` lexes as Token::Index
+        // (reserved); accept either token shape.
         match self.peek() {
+            Token::Index => {
+                self.advance();
+            }
             Token::Ident(s) if s.eq_ignore_ascii_case("key") || s.eq_ignore_ascii_case("index") => {
                 self.advance();
             }
@@ -2864,23 +2877,15 @@ impl Parser {
             }
         }
         // Optional index name (an ident before the `(`).
+        // v7.15.0 — capture the name when present so the engine
+        // builds the secondary index under the user's chosen
+        // name (matches mysqldump's `KEY idx_x (col)` shape).
+        let mut idx_name: Option<String> = None;
         if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_))
-            && !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen) | None)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
-            // Identifier IS the name when followed by `(`; otherwise
-            // it's part of a USING clause we don't model.
-        }
-        if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_))
-            && matches!(
-                self.tokens.get(self.pos + 1),
-                Some(Token::LParen)
-                    | Some(Token::Ident(_))
-                    | Some(Token::QuotedIdent(_))
-            )
-        {
-            // Skip name if it precedes the `(`.
-            if matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
-                self.advance();
+            if let Token::Ident(s) | Token::QuotedIdent(s) = self.advance() {
+                idx_name = Some(s);
             }
         }
         // Optional `USING BTREE` / `USING HASH` (MySQL).
@@ -2941,14 +2946,30 @@ impl Parser {
         while !matches!(self.peek(), Token::Comma | Token::RParen | Token::Eof) {
             self.advance();
         }
-        if is_unique && !cols.is_empty() {
+        if cols.is_empty() {
+            return Ok(None);
+        }
+        if is_unique {
+            // Carry the captured idx_name on UNIQUE too so future
+            // engine work can name the underlying BTree
+            // accordingly; today the unique-constraint installer
+            // synthesises the name itself, but Display round-trip
+            // benefits from preserving it.
             Ok(Some(crate::ast::TableConstraint::Unique {
-                name: None,
+                name: idx_name,
                 columns: cols,
                 nulls_not_distinct: false,
             }))
-        } else {
+        } else if is_fulltext_or_spatial {
+            // SPG has no FULLTEXT / SPATIAL AM. Accept-as-no-op.
             Ok(None)
+        } else {
+            // v7.15.0 — plain KEY / INDEX builds a real BTree
+            // secondary index.
+            Ok(Some(crate::ast::TableConstraint::Index {
+                name: idx_name,
+                columns: cols,
+            }))
         }
     }
 

@@ -1,0 +1,89 @@
+# v7.15.0 — MySQL inline `KEY name (cols)` now builds a real
+# BTree secondary index. mysqldump's `KEY idx_posts_author
+# (author_id)` shape lands the index with the user-supplied
+# name; ORM queries using `WHERE author_id = ?` get the
+# leading-column equality lookup.
+
+statement ok
+CREATE TABLE posts (
+  id INT NOT NULL,
+  author_id INT NOT NULL,
+  title TEXT,
+  PRIMARY KEY (id),
+  KEY idx_posts_author (author_id)
+)
+
+statement ok
+INSERT INTO posts VALUES (1, 100, 'hello')
+
+statement ok
+INSERT INTO posts VALUES (2, 100, 'world')
+
+statement ok
+INSERT INTO posts VALUES (3, 200, 'goodbye')
+
+# Equality lookup on the indexed secondary column.
+query IT rowsort
+SELECT id, title FROM posts WHERE author_id = 100
+----
+1
+hello
+2
+world
+
+# Plain `INDEX` keyword (mysqldump synonym for KEY) also builds.
+statement ok
+CREATE TABLE comments (
+  id INT NOT NULL,
+  post_id INT NOT NULL,
+  body TEXT,
+  PRIMARY KEY (id),
+  INDEX idx_comments_post (post_id)
+)
+
+statement ok
+INSERT INTO comments VALUES (1, 1, 'first')
+
+statement ok
+INSERT INTO comments VALUES (2, 1, 'second')
+
+statement ok
+INSERT INTO comments VALUES (3, 2, 'third')
+
+query IT rowsort
+SELECT id, body FROM comments WHERE post_id = 1
+----
+1
+first
+2
+second
+
+# Anonymous KEY (no name) — engine synthesises a name.
+statement ok
+CREATE TABLE tags (
+  id INT NOT NULL,
+  slug TEXT,
+  PRIMARY KEY (id),
+  KEY (slug)
+)
+
+statement ok
+INSERT INTO tags VALUES (1, 'rust')
+
+statement ok
+INSERT INTO tags VALUES (2, 'sql')
+
+query IT rowsort
+SELECT id, slug FROM tags WHERE slug = 'rust'
+----
+1
+rust
+
+statement ok
+DROP TABLE posts
+
+statement ok
+DROP TABLE comments
+
+statement ok
+DROP TABLE tags

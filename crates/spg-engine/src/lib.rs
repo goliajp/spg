@@ -3693,6 +3693,24 @@ impl Engine {
                     spg_sql::ast::TableConstraint::Check { expr, .. } => {
                         table.schema_mut().checks.push(alloc::format!("{expr}"));
                     }
+                    spg_sql::ast::TableConstraint::Index { name, columns } => {
+                        // v7.15.0 — ALTER TABLE ADD KEY (cols).
+                        // mysqldump occasionally emits this
+                        // post-CREATE-TABLE shape; build a BTree
+                        // on the leading column using the
+                        // user-supplied or synthesised name.
+                        let leading = &columns[0];
+                        let already_idx = table.indices().iter().any(|idx| {
+                            matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                                && table.schema().columns[idx.column_position].name == *leading
+                        });
+                        if !already_idx {
+                            let idx_name = name
+                                .clone()
+                                .unwrap_or_else(|| alloc::format!("{}_{leading}_idx", s.name));
+                            let _ = table.add_index(idx_name, leading);
+                        }
+                    }
                 }
             }
             spg_sql::ast::AlterTableTarget::DropColumn {
@@ -4377,6 +4395,12 @@ impl Engine {
                     check_exprs.push(alloc::format!("{expr}"));
                     continue;
                 }
+                // v7.15.0 — plain `KEY (cols)` from MySQL inline
+                // is NOT a uniqueness constraint; skip the UC
+                // build path entirely. The BTree index lands in
+                // the post-create loop below alongside the PK/UQ
+                // implicit indexes.
+                spg_sql::ast::TableConstraint::Index { .. } => continue,
             };
             let mut positions = Vec::with_capacity(names.len());
             for n in &names {
@@ -4418,9 +4442,17 @@ impl Engine {
             }
         }
         for (i, tc) in stmt.table_constraints.iter().enumerate() {
-            let (is_pk, names) = match tc {
-                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => (true, columns),
-                spg_sql::ast::TableConstraint::Unique { columns, .. } => (false, columns),
+            // v7.15.0 — plain KEY/INDEX rides this same loop so
+            // the implicit BTree gets built. It carries its own
+            // user-supplied name; PK/UQ still synthesise.
+            let (suffix, names, explicit_name): (&str, &Vec<String>, Option<&String>) = match tc {
+                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
+                    ("pkey", columns, None)
+                }
+                spg_sql::ast::TableConstraint::Unique { columns, .. } => ("key", columns, None),
+                spg_sql::ast::TableConstraint::Index { name, columns } => {
+                    ("idx", columns, name.as_ref())
+                }
                 spg_sql::ast::TableConstraint::Check { .. } => continue,
             };
             let leading = &names[0];
@@ -4433,8 +4465,9 @@ impl Engine {
             if already {
                 continue;
             }
-            let suffix = if is_pk { "pkey" } else { "key" };
-            let idx_name = if names.len() == 1 {
+            let idx_name = if let Some(n) = explicit_name {
+                n.clone()
+            } else if names.len() == 1 {
                 alloc::format!("{table_name}_{leading}_{suffix}")
             } else {
                 alloc::format!("{table_name}_{leading}_{suffix}_{i}")

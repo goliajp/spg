@@ -791,6 +791,18 @@ pub enum TableConstraint {
         name: Option<String>,
         expr: Expr,
     },
+    /// v7.15.0 — MySQL `KEY name (cols)` / `INDEX name (cols)`
+    /// non-unique secondary-index declaration inline in CREATE
+    /// TABLE. Engine builds a BTree index on the leading column
+    /// (composite columns parse but only the leading column is
+    /// honoured at v7.15 — matches the existing
+    /// `CreateIndexStatement::extra_columns` semantics). Useful
+    /// for `mysql/blog`-style schemas that lean on routine
+    /// secondary indexes for ORM lookups.
+    Index {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2219,6 +2231,20 @@ impl fmt::Display for TableConstraint {
                     write!(f, "CONSTRAINT {} ", quote_ident(n))?;
                 }
                 write!(f, "CHECK ({expr})")
+            }
+            Self::Index { name, columns } => {
+                f.write_str("KEY ")?;
+                if let Some(n) = name {
+                    write!(f, "{} ", quote_ident(n))?;
+                }
+                f.write_str("(")?;
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&quote_ident(c))?;
+                }
+                f.write_str(")")
             }
         }
     }
