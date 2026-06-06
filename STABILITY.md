@@ -7,17 +7,24 @@ What's frozen, what's not, how to read a version bump.
 ## SemVer for SPG
 
 - **MAJOR** bump → breaking change. Old clients may not connect;
-  old snapshot/WAL files may need migration. None planned in
-  v4.x.
+  old snapshot/WAL files may need migration. **None has
+  happened across v4.x → v7.x** — the contract has held all
+  the way through. A v8.0 release would be the first formal
+  breaking-change window.
 - **MINOR** bump → backwards-compatible additions. New SQL
   features, new wire opcodes, new env vars. Old behaviors
-  unchanged.
+  unchanged. The whole v7.12 epic (full PG FTS + PL/pgSQL
+  row-level trigger surface + embedded SQL in trigger bodies)
+  shipped as MINOR additions across v7.12.0–7.
 - **PATCH** bump → bug fix or doc-only. Wire / SQL / file formats
-  unchanged.
+  unchanged. The v7.12.8 / .9 / .10 / .11 patch cluster was
+  pure doc + CI hygiene with byte-identical runtime to
+  v7.12.7.
 
-Pre-v1.0 caveat: SPG itself is at v4.x, but treats this as its
-"v1.0 contract" for the surfaces below. A v5.0 release would be
-the first formal breaking-change window.
+Pre-v1.0 caveat: SPG started at v4.x and treats that as its
+"v1.0 contract" for the surfaces below. The same contract
+holds across v5.x / v6.x / v7.x — the whole point of the
+SemVer discipline is that no MAJOR has been needed yet.
 
 ---
 
@@ -25,8 +32,10 @@ the first formal breaking-change window.
 
 These are stable: client code, snapshot files, and operational
 config written against the contract continue to work against any
-future v4.x release. v4.31's CI gates this for the snapshot
-format; the others are gated by per-row `prod_ready` tests.
+future v7.x release (the contract carries forward from v4.x
+without ever having needed a MAJOR break). v4.31's CI gates
+this for the snapshot format; the others are gated by per-row
+`prod_ready` tests.
 
 ### Native wire protocol (port `SPG_ADDR`)
 

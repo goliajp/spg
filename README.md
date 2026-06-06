@@ -94,8 +94,13 @@ cargo fmt --all --check
 
 ## Status
 
-**v7.11** (current). PG-port-ready surface, used in production
-embedded scenarios. Highlights since v1.0:
+**v7.12** (current). PG-port-ready surface, used in production
+embedded scenarios. Drop-in PG replacement for the schemas
+that don't reach for SPG's explicit carve-outs — see
+[`PG_MIGRATION.md`](PG_MIGRATION.md) for the full matrix +
+"if your schema uses X, you can drop it in as-is" quick start.
+
+Highlights since v1.0:
 
 - PG-wire protocol on `SPG_PG_ADDR` — simple + extended query,
   Parse / Bind / Execute / Describe, binary-format Bind params
@@ -110,6 +115,28 @@ embedded scenarios. Highlights since v1.0:
   arrays (v7.10.9 / v7.11.2) with full op surface (subscript,
   ANY / ALL, `array_length` / `array_position` / `unnest` /
   `||`), `substring` / `position` on TEXT + BYTEA.
+- **PG full-text search (v7.12)** — `tsvector` / `tsquery`
+  types, `to_tsvector` with Porter stemmer + Simple configs,
+  the four query constructors (`plainto_tsquery`,
+  `to_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`),
+  `@@` operator, `ts_rank` / `ts_rank_cd`, and a real
+  GIN inverted index. mailrs-shape `messages.search_vector
+  tsvector` schemas drop in unmodified.
+- **PL/pgSQL row triggers (v7.12)** —
+  `CREATE FUNCTION ... LANGUAGE plpgsql AS $$ ... $$` +
+  `CREATE TRIGGER ... { BEFORE | AFTER } { INSERT | UPDATE |
+  DELETE } ... FOR EACH ROW EXECUTE FUNCTION fn()`. Body
+  subset: `DECLARE` / `IF / ELSIF / ELSE / END IF` /
+  `RAISE NOTICE | EXCEPTION` / `RETURN NEW | OLD | NULL` /
+  embedded `INSERT / UPDATE / DELETE` referencing NEW/OLD.
+- `INSERT … ON CONFLICT { DO NOTHING | DO UPDATE SET …
+  EXCLUDED.col } [RETURNING …]` (v7.9), composite-target
+  `ON CONFLICT (a, b)` for CalDAV / CardDAV upsert.
+- `INSERT / UPDATE / DELETE … RETURNING` (v7.9.4) — real
+  DataRow stream, IMAP UID monotonic-alloc / mailrs-shape
+  patterns work as written.
+- Foreign keys (v7.6) — all four `ON DELETE / ON UPDATE`
+  actions, including CASCADE plan-then-apply.
 - Logical replication (v6.1) — publications, subscriptions,
   segment forwarding.
 - WAL compression (v6.6) — LZSS, no-deps hand-rolled, with
@@ -126,12 +153,15 @@ See [`STABILITY.md`](STABILITY.md) for the wire-frozen surface
 matrix and [`CHANGELOG.md`](CHANGELOG.md) for the full minor /
 patch history.
 
-Carved out (not currently in scope): `tsvector` + GIN (use
-external FTS), multi-master / quorum replication, INTERSECT /
-EXCEPT, `ON CONFLICT` upsert, server-side cursor / partial
-Execute, multi-dimensional arrays, SMALLINT[] / NUMERIC[] /
-BOOLEAN[] arrays. See [`PG_MIGRATION.md`](PG_MIGRATION.md) for
-the full migration matrix.
+Carved out (genuinely not in scope, see
+[`PG_MIGRATION.md`](PG_MIGRATION.md) § A7 for why):
+multi-master / quorum replication, multi-writer MVCC,
+INTERSECT / EXCEPT, server-side cursor / partial Execute,
+multi-dimensional arrays, SMALLINT[] / NUMERIC[] / BOOLEAN[]
+arrays, Row-Level Security, `pg_catalog.*` parity. The
+v7.12 epic narrowed the carve-out list significantly — FTS,
+`CREATE TRIGGER`, PL/pgSQL, and `ON CONFLICT` all moved out
+(see CHANGELOG entries v7.9, v7.12.0–7).
 
 ## License
 

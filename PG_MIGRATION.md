@@ -110,7 +110,90 @@ auth is intentionally not wired — operators set
 
 ---
 
-## SQL compatibility matrix (v7.12.7 ship-time)
+## Quick start — "if your schema uses X, drop it in" (v7.12.10 ship-time)
+
+The 60-second read for customers porting from PG. If every
+item your `pg_dump` / `init-schema.sql` reaches for is on the
+✅ list below, the schema runs unchanged on SPG today. The
+full reference matrix follows in the next section.
+
+**Drops in as-is — no rewrite needed**:
+
+- `tsvector` + `tsquery` types, `to_tsvector(config, text)` +
+  the four query constructors (`plainto_tsquery`,
+  `to_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`),
+  `@@` match, `ts_rank` / `ts_rank_cd`, real GIN inverted
+  index (v7.12.0–3)
+- `CREATE FUNCTION fn() RETURNS TRIGGER LANGUAGE plpgsql AS
+  $$ ... $$` + `CREATE TRIGGER ... { BEFORE | AFTER } { INSERT
+  | UPDATE | DELETE } [OR ...] ON tbl FOR EACH ROW EXECUTE
+  FUNCTION fn()` (v7.12.4–7). Body subset: `BEGIN/END`,
+  `DECLARE var TYPE [:= init];`, `NEW.col := <expr>;`
+  (BEFORE only), `IF/ELSIF/ELSE/END IF`,
+  `RAISE { NOTICE | WARNING | INFO | LOG | DEBUG }
+  '<fmt>' [, args]*`, `RAISE EXCEPTION '<fmt>' [, args]*`,
+  `RETURN NEW / OLD / NULL`, embedded `INSERT / UPDATE /
+  DELETE / SELECT` referencing NEW/OLD
+- `INSERT ... ON CONFLICT (col) DO NOTHING` (v7.9.8)
+- `INSERT ... ON CONFLICT (col) DO UPDATE SET col =
+  EXCLUDED.col [, ...] [WHERE ...] [RETURNING ...]` (v7.9.9)
+- `INSERT ... ON CONFLICT (col1, col2)` composite target
+  (v7.9.10)
+- `INSERT / UPDATE / DELETE ... RETURNING col1, col2, ...`
+  (v7.9.4) — real DataRow stream
+- Foreign keys with all four `ON DELETE / ON UPDATE` actions
+  (NO ACTION, RESTRICT, CASCADE, SET NULL / SET DEFAULT) —
+  v7.6
+- `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`,
+  `INTERVAL '30 days'` literals at expression position (v7.11.3)
+- `LIMIT $1` / `LIMIT $n` parameter placeholders (v7.9.24)
+- Multi-column / AND-composite `WHERE` with leading-column
+  index seek + caller-side filter on remaining columns
+  (v7.11.3)
+- `CREATE EXTENSION pg_trgm` (and other extensions) as no-op
+  accepted (v7.9.15); `CREATE INDEX ... USING gin (jsonb_col)`
+  loads as BTree fallback on the leading column (v7.9.26b)
+- `BIGSERIAL` / `SERIAL` / `SMALLSERIAL` PRIMARY KEY inline
+  (v7.9.13)
+- `JSONB` (PG-wire OID 3802), `TEXT[]` / `INT[]` / `BIGINT[]`
+  arrays, `TIMESTAMPTZ`, `BYTEA` (v7.9 / v7.10 / v7.11)
+- pgvector `USING ivfflat` accepted as alias for `USING hnsw`;
+  pgvector opclass `vector_cosine_ops` recognised (v7.11.3)
+
+**Needs a small schema-side change** (the change itself is
+mechanical; the rewrite list under your `pg_dump` output is
+short):
+
+- `RIGHT JOIN` / `FULL OUTER JOIN` → rewrite as `LEFT JOIN`
+- `INTERSECT` / `EXCEPT` → application-level set ops
+- `UUID` column → `TEXT(36)` with the same string format
+- `SMALLINT[]` / `BOOLEAN[]` / `NUMERIC[]` → `INT[]` /
+  `BIGINT[]` / `TEXT[]` (you keep the operator surface
+  identically)
+- `CHECK` constraints → enforce at the application layer or
+  via a BEFORE trigger that runs `RAISE EXCEPTION` (v7.12.6)
+
+**Genuine carve-outs** — if your schema reaches for these,
+you're not on the SPG migration path today. See §A7 below
+for the reasoning:
+
+- Row-Level Security (`RLS`)
+- Multi-writer MVCC (concurrent unrelated writers without
+  app-level partition)
+- `pg_hba.conf`-style auth rules
+- `pg_catalog.*` system catalog parity (use
+  `SHOW TABLES` / `spg_table_ddl` instead)
+- Server-side cursor / partial Execute
+- Multi-dimensional arrays
+
+If your schema mixes drop-ins with one or two carve-outs,
+the typical answer is "run SPG for the drop-in tables + keep
+PG alongside for the carve-out tables" — they can share a
+PG-wire client pool with a per-statement router.
+
+---
+
+## SQL compatibility matrix (v7.12.10 ship-time)
 
 ✅ = works through the 4-corpus regression. ⚠️ = works in
 common shapes; corner cases differ from PG. ❌ = not
