@@ -1,11 +1,12 @@
 # SPG dump-compat report
 
-Generated 2026-06-06T12:41:48Z against SPG `local-build`.
+Generated 2026-06-06T12:51:58Z against SPG `local-build`.
 
 | Dialect | App | Status | Stmts pass/total | First error |
 |---|---|---|---:|---|
 | pg | blog | PASS | 34/34 |  |
 | pg | forum | PASS | 28/28 |  |
+| pg | minimal-with-data | PASS | 21/21 |  |
 | pg | minimal | PASS | 20/20 |  |
 | mysql | blog | PASS | 33/33 |  |
 | mysql | forum | PASS | 28/28 |  |

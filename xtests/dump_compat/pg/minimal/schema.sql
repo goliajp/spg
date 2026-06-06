@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict a4sR9bjyM9bVjzIdp9YablFV920bc9SdYvhr5uiPjaeZabDRxQX593b1Z5H5g9h
+\restrict At2xJZXy7rmicnDEnDaNIWAhxeeEwZgxW8cT9ltvhjAOJ6lb0P9Q5O9gD9C2a2w
 
 -- Dumped from database version 15.18 (Debian 15.18-1.pgdg13+1)
 -- Dumped by pg_dump version 15.18 (Debian 15.18-1.pgdg13+1)
@@ -94,5 +94,5 @@ CREATE INDEX idx_posts_created ON public.posts USING btree (created_at DESC);
 -- PostgreSQL database dump complete
 --
 
-\unrestrict a4sR9bjyM9bVjzIdp9YablFV920bc9SdYvhr5uiPjaeZabDRxQX593b1Z5H5g9h
+\unrestrict At2xJZXy7rmicnDEnDaNIWAhxeeEwZgxW8cT9ltvhjAOJ6lb0P9Q5O9gD9C2a2w
 

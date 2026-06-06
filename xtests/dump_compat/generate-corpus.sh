@@ -172,6 +172,48 @@ dump_pg() {
     echo "wrote $outfile ($(wc -l < "$outfile") lines)"
 }
 
+# v7.15.0 — full pg_dump WITH data (no --schema-only). pg_dump's
+# default emits `COPY t (col, col) FROM stdin;` for every table
+# with rows, so this fixture exercises the pgwire COPY FROM STDIN
+# path that --schema-only had been sidestepping.
+dump_pg_with_data() {
+    local app="$1"
+    local upper=$(echo "$app" | tr a-z A-Z)
+    local seed_var="SEED_${upper}_PG"
+    local seed="${!seed_var}"
+    local data_var="SEED_${upper}_PG_DATA"
+    local data="${!data_var:-}"
+    local outfile="$HERE/pg/${app}-with-data/schema.sql"
+    mkdir -p "$(dirname "$outfile")"
+    local container="dump-corpus-pg-${app}-data"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    docker run -d --name "$container" \
+        -e POSTGRES_USER=u -e POSTGRES_PASSWORD=p -e POSTGRES_DB=app \
+        postgres:15 >/dev/null
+    for i in $(seq 1 30); do
+        if docker exec "$container" pg_isready -U u >/dev/null 2>&1; then break; fi
+        sleep 1
+    done
+    echo "$seed" | docker exec -i -e PGPASSWORD=p "$container" psql -U u -d app -v ON_ERROR_STOP=1 >/dev/null
+    if [[ -n "$data" ]]; then
+        echo "$data" | docker exec -i -e PGPASSWORD=p "$container" psql -U u -d app -v ON_ERROR_STOP=1 >/dev/null
+    fi
+    docker exec "$container" pg_dump -U u -d app --no-owner --no-acl > "$outfile"
+    docker rm -f "$container" >/dev/null
+    echo "wrote $outfile ($(wc -l < "$outfile") lines)"
+}
+
+# Seed data for the with-data dumps. PG-side INSERTs that produce
+# rows for the same schemas the --schema-only seeds define.
+SEED_MINIMAL_PG_DATA=$(cat <<'EOF'
+INSERT INTO posts (title, body, tags) VALUES
+    ('Hello, world', 'first post', ARRAY['intro','hello']),
+    ('Second post', 'body two', ARRAY['follow-up']),
+    ('Tab\thandling', 'COPY round-trip must escape \t \n \\ safely', ARRAY[]::TEXT[]),
+    ('Quotes ''matter''', 'and so do backslashes \\', ARRAY['edge-cases']);
+EOF
+)
+
 dump_mysql() {
     local app="$1"
     local image="$2"   # mysql:8 or mariadb:10.11
@@ -198,11 +240,17 @@ dump_mysql() {
 }
 
 mkdir -p "$HERE"/{pg,mysql,mariadb}/{minimal,blog,forum}
+mkdir -p "$HERE"/pg/minimal-with-data
 
 for app in minimal blog forum; do
     dump_pg "$app"
     dump_mysql "$app" mysql:8.0 mysql
     dump_mysql "$app" mariadb:10.11 mariadb
 done
+
+# v7.15.0 — one full-data fixture exercises the COPY FROM STDIN
+# path. Skipped for MySQL/MariaDB since mysqldump emits INSERT
+# statements by default (not COPY).
+dump_pg_with_data minimal
 
 echo "corpus regenerated"

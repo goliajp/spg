@@ -1681,6 +1681,7 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
 
 // ---- v4.17 COPY FROM STDIN / COPY TO STDOUT ----
 
+#[derive(Debug)]
 enum CopyIntent {
     From(String, CopyOptions),
     To(String),
@@ -1705,20 +1706,94 @@ struct CopyOptions {
     pub format_json: bool,
 }
 
-/// Detects `COPY <table> FROM STDIN [WITH (options)]` and
-/// `COPY <table> TO STDOUT` (case-insensitive). Anything else (e.g.
-/// `COPY ... FROM '/path'`) falls through to the regular engine
-/// path, which will report a parse error — file-based COPY is
-/// intentionally not supported (no filesystem access from the
-/// server in the docker-compose deployment shape).
+/// Detects `COPY <table> [(col1, col2, …)] FROM STDIN [WITH
+/// (options)]` and `COPY <table> [(…)] TO STDOUT`
+/// (case-insensitive). Anything else (e.g. `COPY ... FROM
+/// '/path'`) falls through to the regular engine path, which
+/// will report a parse error — file-based COPY is intentionally
+/// not supported (no filesystem access from the server in the
+/// docker-compose deployment shape).
+///
+/// v7.15.0 — the column-list form `COPY t (a, b, c) FROM STDIN`
+/// is recognised. pg_dump emits this for every table with data
+/// (the default output, not just `--column-inserts`), so without
+/// this we mis-classify any `pg_dump` (no `--schema-only`) →
+/// `psql -f` flow as a normal SQL statement and report a parse
+/// error.
 fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
     let trimmed = sql.trim();
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("copy ")?;
-    let mut it = rest.split_ascii_whitespace();
-    let table = it.next()?.to_string();
-    let dir = it.next()?;
-    let endpoint = it.next()?;
+    // Walk the prefix manually so we can skip an optional
+    // parenthesised column list between the table name and the
+    // FROM/TO keyword. Token splitting on whitespace alone
+    // mistakes `(col1,` for the FROM direction word.
+    let bytes = rest.as_bytes();
+    let mut i = skip_ws_bytes(bytes, 0);
+    // Table name (may be schema-qualified `s.t`, MySQL-style
+    // backtick-quoted, or PG double-quoted). Read until the next
+    // whitespace OR `(`.
+    let table_start = i;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_whitespace() || c == '(' {
+            break;
+        }
+        i += 1;
+    }
+    if i == table_start {
+        return None;
+    }
+    // Strip optional `<schema>.` qualifier — pg_dump emits
+    // `public.posts`. The SPG SQL parser does the same strip; do
+    // the COPY-path equivalent here so the catalog lookup hits
+    // the bare table name.
+    let raw = &rest[table_start..i];
+    let table = match raw.rsplit_once('.') {
+        Some((_, bare)) => bare.to_string(),
+        None => raw.to_string(),
+    };
+    // Skip an optional `(col, col, …)` column list. v7.15.0
+    // doesn't need the column names — the COPY data path
+    // builds INSERTs against the table's full column list (or
+    // a JSON-keyed subset) by default. Recording the column
+    // list per-COPY is a v7.15.x follow-up if mismatched-arity
+    // dumps surface.
+    i = skip_ws_bytes(bytes, i);
+    if bytes.get(i) == Some(&b'(') {
+        let mut depth = 1usize;
+        i += 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        i = skip_ws_bytes(bytes, i);
+    }
+    // dir + endpoint, whitespace-separated.
+    let dir_start = i;
+    while i < bytes.len() && !(bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == dir_start {
+        return None;
+    }
+    let dir = &rest[dir_start..i];
+    i = skip_ws_bytes(bytes, i);
+    let ep_start = i;
+    while i < bytes.len()
+        && !(bytes[i] as char).is_ascii_whitespace()
+        && bytes[i] != b';'
+    {
+        i += 1;
+    }
+    if i == ep_start {
+        return None;
+    }
+    let endpoint = &rest[ep_start..i];
     match (dir, endpoint) {
         ("from", "stdin") => {
             // Look for the WITH (...) tail and parse options.
@@ -1728,6 +1803,13 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
         ("to", "stdout") => Some(CopyIntent::To(table)),
         _ => None,
     }
+}
+
+fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 /// Find a `WITH (...)` chunk in the SQL and decode the options.
@@ -2805,5 +2887,62 @@ fn format_numeric(scaled: i128, scale: u8) -> String {
         format!("-{int_part}.{frac_pad}")
     } else {
         format!("{int_part}.{frac_pad}")
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v7.15.0 — pg_dump's default output emits `COPY t (col, col)
+    /// FROM stdin;` for every table with data. The old whitespace-
+    /// split parser mistook `(col,` for the FROM direction word and
+    /// missed the COPY entirely; the new bytes-walk skips the
+    /// parenthesised column list.
+    #[test]
+    fn parse_copy_with_column_list() {
+        let sql = "COPY posts (id, title, body) FROM stdin;";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::From(table, _)) => assert_eq!(table, "posts"),
+            other => panic!("expected From(posts), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_without_column_list() {
+        let sql = "COPY accounts FROM STDIN";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::From(table, _)) => assert_eq!(table, "accounts"),
+            other => panic!("expected From(accounts), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_to_stdout_with_column_list() {
+        let sql = "COPY t (a, b) TO STDOUT";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::To(table)) => assert_eq!(table, "t"),
+            other => panic!("expected To(t), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_with_with_options() {
+        let sql = "COPY t FROM stdin WITH (format json)";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::From(table, opts)) => {
+                assert_eq!(table, "t");
+                assert!(opts.format_json);
+            }
+            other => panic!("expected From(t) with format_json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_non_copy_returns_none() {
+        assert!(parse_copy_intent("SELECT 1").is_none());
+        // File-based COPY: pgwire intentionally doesn't handle.
+        assert!(parse_copy_intent("COPY t FROM '/etc/passwd'").is_none());
     }
 }
