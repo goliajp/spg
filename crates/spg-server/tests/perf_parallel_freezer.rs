@@ -63,6 +63,7 @@ fn wide_users_schema() -> TableSchema {
         hot_tier_bytes: None,
         foreign_keys: Vec::new(),
         uniqueness_constraints: Vec::new(),
+        checks: Vec::new(),
     }
 }
 
