@@ -44,7 +44,7 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use spg_sqlx::SpgPool;
+//! use spg_sqlx::{SpgPool, SpgPoolExt};
 //!
 //! # async fn _f() -> Result<(), Box<dyn std::error::Error>> {
 //! let pool = SpgPool::connect_in_memory().await?;

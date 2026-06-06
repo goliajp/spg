@@ -31,7 +31,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-pub use spg_embedded::{Database, EngineError, ParsedStatement, QueryResult, Statement, Value};
+pub use spg_embedded::{
+    ColumnSchema, Database, DataType, EngineError, ParsedStatement, QueryResult, Statement, Value,
+};
 pub use spg_engine::CatalogSnapshot;
 
 use tokio::sync::Mutex;
@@ -202,6 +204,50 @@ impl AsyncDatabase {
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
             guard.query_prepared(&stmt_inner, &params)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.16.0 — column-aware variant of `query`. Returns the
+    /// SELECT's column schema vec alongside the rows so adapters
+    /// (the spg-sqlx fetch path most notably) can drive name +
+    /// type-based column lookups.
+    ///
+    /// # Errors
+    /// Same shape as `query` — errors when the SQL isn't a SELECT
+    /// or the engine returns one.
+    pub async fn query_with_columns(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<spg_embedded::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.query_with_columns(&sql)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.16.0 — column-aware variant of `query_prepared`. Same
+    /// shape as `query_with_columns` but driven from a prepared
+    /// AsyncStatement + bound params.
+    ///
+    /// # Errors
+    /// Propagates `EngineError`; errors when the prepared
+    /// statement isn't a SELECT.
+    pub async fn query_prepared_with_columns(
+        &self,
+        stmt: &AsyncStatement,
+        params: Vec<Value>,
+    ) -> Result<(Vec<spg_embedded::ColumnSchema>, Vec<Vec<Value>>), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let stmt_inner = Arc::clone(&stmt.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.query_prepared_with_columns(&stmt_inner, &params)
         })
         .await
         .expect("spawn_blocking join")

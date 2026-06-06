@@ -4,7 +4,13 @@
 //! the first five; the date/time + JSON families land in
 //! follow-up commits.
 
+mod array;
 mod bool;
 mod bytes;
+#[cfg(feature = "chrono")]
+mod chrono;
+mod float;
 mod int;
+#[cfg(feature = "json")]
+mod json;
 mod text;
