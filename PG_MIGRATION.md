@@ -216,15 +216,21 @@ implemented; further breakdown follows the table.
 | `CREATE INDEX … (lower(col))` (expression, v6.8.2) | ✅ | Same caveat as partial |
 | `EXPLAIN (SUGGEST) …` (v6.8.3) | ✅ | PG would use `pg_qualstats`/`hypopg` — SPG is built-in |
 | `ALTER TABLE t SET hot_tier_bytes = X` | ✅ | SPG-specific cold-tier knob |
-| `ALTER TABLE t ADD COLUMN` | ✅ | |
-| `ALTER TABLE t DROP COLUMN` | ✅ | |
-| `ALTER TABLE t RENAME COLUMN` | ✅ | |
+| `ALTER TABLE t ADD COLUMN` | ✅ v7.13.0 | `[IF NOT EXISTS]`, `DEFAULT`, `NOT NULL` (errors if non-empty + NOT NULL + no DEFAULT — same as PG); back-fills every row |
+| `ALTER TABLE t DROP COLUMN` | ❌ | Re-CREATE with the desired layout + `INSERT INTO new SELECT …` |
+| `ALTER TABLE t RENAME COLUMN` | ❌ | Re-CREATE as above |
+| `ALTER TABLE t ALTER COLUMN c TYPE T [USING expr]` | ✅ v7.13.0 | `USING` expression evaluated per row; falls back to direct cast |
 | `ALTER INDEX … REBUILD` | ✅ | NSW / BRIN rebuild lands; B-tree no-op |
 | `CREATE SCHEMA foo; foo.bar` | ❌ | Single-namespace catalog; rename-to-prefix as workaround |
 | `CREATE TYPE` / domains / composite types | ❌ | A7 — out of scope |
 | Foreign keys (`REFERENCES … ON DELETE/UPDATE …`) | ✅ v7.6 | All four `ON DELETE / ON UPDATE` actions (NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT) |
-| `CHECK` constraints | ❌ | A7 — won't do |
+| `CHECK` constraints (column-level + table-level) | ✅ v7.13.0 | Inline `<col> TYPE CHECK (expr)` and `CHECK (expr)` table-level; enforced on INSERT / UPDATE; NULL passes (PG three-valued semantics) |
+| Inline `UNIQUE` column constraint | ✅ v7.13.0 | `<col> TYPE NOT NULL UNIQUE` folds to a single-column UNIQUE; full BTree index + INSERT enforcement |
+| `UNIQUE NULLS NOT DISTINCT (cols)` | ✅ v7.13.0 | PG 15+ surface; two all-NULL rows collide on the constraint |
 | `CREATE TRIGGER` | ✅ v7.12.4 | BEFORE/AFTER row-level triggers on INSERT/UPDATE/DELETE; see [§PL/pgSQL triggers](#plpgsql-triggers) below |
+| `CREATE TRIGGER … BEFORE UPDATE OF col, col, … ON tbl` | ✅ v7.13.0 | Column-list filter — trigger fires only when at least one listed column actually differs between OLD and NEW |
+| Trigram opclasses (`gin_trgm_ops` / `gist_trgm_ops`) | ⚠️ v7.13.0 | Opclass token accepted in `USING gin (col gin_trgm_ops)`; `pg_trgm` operators / `LIKE` acceleration not wired — index still degrades to a full scan for trigram-style queries |
+| PG btree opclasses (`text_pattern_ops` etc) | ✅ v7.13.0 | Token accepted; doesn't change BTree comparator (SPG already orders text bytewise) |
 | `CREATE FUNCTION ... LANGUAGE plpgsql` (trigger functions) | ✅ v7.12.4 | DECLARE / IF / RAISE / embedded SQL — full subset used by mailrs's `update_search_vector`; see [§PL/pgSQL triggers](#plpgsql-triggers) below |
 | `CREATE FUNCTION` (scalar UDF, non-trigger) | ⚠️ | DDL parses, body is stored, but invocation surface ships in v7.13+. Use built-in functions for v7.12.x. |
 | Partition tables (`PARTITION BY`) | ❌ | Cold-tier covers time-series natively |
@@ -269,6 +275,8 @@ implemented; further breakdown follows the table.
 | `INSERT … ON CONFLICT (col) DO NOTHING` | ✅ v7.9.8 | BTree-fast-path conflict resolution + within-batch dedup |
 | `INSERT … ON CONFLICT (col) DO UPDATE SET … EXCLUDED.col` | ✅ v7.9.9 | Includes mixed `tbl.col + EXCLUDED.col` exprs, optional WHERE, and RETURNING over the post-update row |
 | `INSERT … ON CONFLICT (col1, col2)` composite target | ✅ v7.9.10 | For CalDAV / CardDAV upsert patterns |
+| `INSERT INTO t [(cols)] SELECT … FROM …` | ✅ v7.13.0 | Inner SELECT runs first; materialised rows feed the regular INSERT pipeline (FK / CHECK / UC / RETURNING / ON CONFLICT all stay) |
+| `UPDATE t SET col = CASE WHEN cond THEN x ELSE y END` | ✅ v7.13.0 | CASE WHEN in any expression position (UPDATE SET, SELECT projection, WHERE, …) |
 | `TRUNCATE TABLE` | ❌ | Use `DELETE FROM t` |
 | Bulk `COPY FROM STDIN` (PG-wire) | ❌ | Use multi-row INSERT instead |
 

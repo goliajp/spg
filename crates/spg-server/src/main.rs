@@ -1270,6 +1270,11 @@ fn run(
     // v4.3: optional PG-wire compatibility listener. Opt-in via env
     // so a deployment that doesn't need psql / Metabase / DBeaver
     // doesn't pay the extra port + thread.
+    // v7.13.0 (C1, mailrs round-5): the Dockerfile sets
+    // `SPG_PG_ADDR=0.0.0.0:5432` so the official image is a
+    // drop-in PG listener. Local / cargo-test runs keep the
+    // pre-v7.13 opt-in behaviour (no listener unless the env var
+    // is explicitly set).
     if let Ok(pg_addr) = env::var("SPG_PG_ADDR")
         && !pg_addr.is_empty()
     {
@@ -3686,21 +3691,43 @@ fn bootstrap_admin_from_env(engine: &mut Engine, db_path: Option<&Path>) -> std:
     if !engine.users().is_empty() {
         return Ok(());
     }
-    let Ok(pw) = env::var("SPG_ADMIN_PASSWORD") else {
-        return Ok(());
-    };
-    if pw.is_empty() {
-        return Ok(());
+    // v7.13.0 (C2/C3/C4, mailrs round-5): the official PG image
+    // bootstraps via POSTGRES_USER / POSTGRES_PASSWORD /
+    // POSTGRES_DB env vars. SPG is single-database (POSTGRES_DB
+    // has no on-disk effect — every connection sees the same
+    // single catalog) but we accept and log it so docker-compose
+    // files port over verbatim.
+    let pg_user = env::var("POSTGRES_USER").ok().filter(|s| !s.is_empty());
+    let pg_pass = env::var("POSTGRES_PASSWORD").ok().filter(|s| !s.is_empty());
+    if let Some(db) = env::var("POSTGRES_DB").ok().filter(|s| !s.is_empty()) {
+        eprintln!(
+            "spg-server: POSTGRES_DB={db:?} accepted — SPG is single-database, \
+             every connection sees the same catalog"
+        );
     }
-    let user = env::var("SPG_ADMIN_USER")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "admin".to_string());
+    let (pw, user) = match (
+        env::var("SPG_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty()),
+        pg_pass,
+    ) {
+        (Some(spg_pw), _) => {
+            let user = env::var("SPG_ADMIN_USER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or(pg_user)
+                .unwrap_or_else(|| "admin".to_string());
+            (spg_pw, user)
+        }
+        (None, Some(pg_pw)) => {
+            let user = pg_user.unwrap_or_else(|| "postgres".to_string());
+            (pg_pw, user)
+        }
+        (None, None) => return Ok(()),
+    };
     let salt = random_salt()?;
     engine
         .create_user(&user, &pw, Role::Admin, salt)
         .map_err(|e| std::io::Error::other(format!("bootstrap admin {user:?}: {e}")))?;
-    eprintln!("spg-server: bootstrapped admin user {user:?} from SPG_ADMIN_PASSWORD");
+    eprintln!("spg-server: bootstrapped admin user {user:?} from env");
     // Persist immediately so the bootstrap survives without waiting
     // for the first successful DDL/DML to trigger a snapshot.
     if let Some(p) = db_path {
