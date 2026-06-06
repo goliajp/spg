@@ -342,6 +342,19 @@ pub enum AlterTableTarget {
     /// separate ALTER TABLE statement, so this surface lets the
     /// dump load straight through.
     AddTableConstraint(TableConstraint),
+    /// v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO new`.
+    /// Renames the column in the schema and propagates the rename
+    /// to every stored source string that references it as a
+    /// (potentially-qualified) column identifier: CHECK predicates,
+    /// partial-index predicates, runtime DEFAULT expressions, and
+    /// triggers' `UPDATE OF` column lists. Function bodies and
+    /// trigger bodies are NOT auto-rewritten — they're loose
+    /// source text and may contain references SPG can't statically
+    /// resolve to this column (NEW./OLD. + dynamic SQL). Renames
+    /// the column even if dependents exist; users renaming a
+    /// column referenced by a function body update the function
+    /// body separately.
+    RenameColumn { old: String, new: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2136,6 +2149,14 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         }
         AlterTableTarget::AddTableConstraint(tc) => {
             write!(f, "ADD {tc}")
+        }
+        AlterTableTarget::RenameColumn { old, new } => {
+            write!(
+                f,
+                "RENAME COLUMN {} TO {}",
+                quote_ident(old),
+                quote_ident(new)
+            )
         }
     }
 }

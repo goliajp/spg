@@ -2423,8 +2423,45 @@ impl Parser {
                     using,
                 }])
             }
+            // v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO new`.
+            // PG also supports `RENAME TO new_table` for table-name
+            // rename; that surface is deferred (pg_dump never emits
+            // it). If the first post-RENAME ident is `TO`, the user
+            // is asking for table rename — error with a clear
+            // message rather than misparsing `TO` as a column name.
+            Token::Ident(s) if s.eq_ignore_ascii_case("rename") => {
+                self.advance();
+                // `TO` is a reserved keyword token (Token::To), not
+                // Token::Ident("to"); detect both shapes so the
+                // table-rename surface (RENAME TO) produces a clear
+                // error rather than misparsing.
+                if matches!(self.peek(), Token::To)
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("to"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "ALTER TABLE RENAME TO <new_name> (table rename) is not supported; \
+                         use RENAME COLUMN <old> TO <new> instead"
+                    )));
+                }
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
+                    self.advance();
+                }
+                let old = self.expect_ident_like()?;
+                // `TO` is a reserved keyword token; accept both
+                // Token::To and Token::Ident("to") for consistency.
+                if matches!(self.peek(), Token::To) {
+                    self.advance();
+                } else {
+                    self.expect_keyword_ident("to")?;
+                }
+                let new = self.expect_ident_like()?;
+                Ok(alloc::vec![crate::ast::AlterTableTarget::RenameColumn {
+                    old,
+                    new,
+                }])
+            }
             other => Err(self.err(alloc::format!(
-                "expected SET / ADD / DROP / ALTER in ALTER TABLE, got {other:?}"
+                "expected SET / ADD / DROP / ALTER / RENAME in ALTER TABLE, got {other:?}"
             ))),
         }
     }
