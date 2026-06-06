@@ -3518,6 +3518,75 @@ impl Engine {
                     table.update_row(i, row_values)?;
                 }
             }
+            spg_sql::ast::AlterTableTarget::DropColumn {
+                column,
+                if_exists,
+                cascade,
+            } => {
+                // v7.13.3 — mailrs round-7 S8. Remove the column +
+                // every row's value at that position; drop any index
+                // on the column. RESTRICT (default) rejects when an
+                // FK on this table or partial-index predicate
+                // references the column; CASCADE removes those
+                // dependents first.
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.into(),
+                    })
+                })?;
+                let col_pos = match table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&column))
+                {
+                    Some(p) => p,
+                    None => {
+                        if if_exists {
+                            return Ok(());
+                        }
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "ALTER TABLE DROP COLUMN: column {column:?} not found on {:?}",
+                            s.name
+                        )));
+                    }
+                };
+                // Dependent check: FKs whose local columns include
+                // col_pos. CASCADE drops them; otherwise reject.
+                let dependent_fks: Vec<usize> = table
+                    .schema()
+                    .foreign_keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, fk)| {
+                        if fk.local_columns.contains(&col_pos) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !dependent_fks.is_empty() && !cascade {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "ALTER TABLE DROP COLUMN {column:?}: column has FK dependents; \
+                         use DROP COLUMN ... CASCADE to remove them"
+                    )));
+                }
+                // CASCADE the FK removals first.
+                if cascade {
+                    // Drop in reverse so indices stay valid.
+                    let mut sorted = dependent_fks.clone();
+                    sorted.sort();
+                    sorted.reverse();
+                    let fks = &mut table.schema_mut().foreign_keys;
+                    for i in sorted {
+                        fks.remove(i);
+                    }
+                }
+                // Drop the column. New helper on Table does the
+                // row + schema + index shift atomically.
+                table.drop_column(col_pos);
+            }
         }
         Ok(())
     }
@@ -3772,15 +3841,130 @@ impl Engine {
         })
     }
 
+    /// v7.13.3 — mailrs round-7 S9. SPG-specific reconciliation
+    /// for `CREATE TABLE IF NOT EXISTS` when the table already
+    /// exists. Adds missing columns + inline FKs from the new
+    /// definition; existing columns / constraints stay untouched.
+    /// New columns with a `NOT NULL` declaration without a
+    /// `DEFAULT` are reported as a clear error rather than
+    /// silently dropped — this is the "fail loud on real
+    /// incompatibility, fail silent on schema-superset" tradeoff.
+    fn reconcile_table_if_not_exists(
+        &mut self,
+        stmt: CreateTableStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let table_name = stmt.name.clone();
+        let clock = self.clock;
+        let existing_col_names: alloc::collections::BTreeSet<String> = self
+            .active_catalog()
+            .get(&table_name)
+            .expect("checked above")
+            .schema()
+            .columns
+            .iter()
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect();
+        let row_count = self
+            .active_catalog()
+            .get(&table_name)
+            .expect("checked above")
+            .row_count();
+        // Collect missing column defs in source order.
+        let new_columns: alloc::vec::Vec<spg_sql::ast::ColumnDef> = stmt
+            .columns
+            .iter()
+            .filter(|c| !existing_col_names.contains(&c.name.to_ascii_lowercase()))
+            .cloned()
+            .collect();
+        for col_def in new_columns {
+            let col_name = col_def.name.clone();
+            let nullable = col_def.nullable;
+            let has_default = col_def.default.is_some() || col_def.auto_increment;
+            let col_schema = column_def_to_schema(col_def)?;
+            let fill_value: Value = if has_default || col_schema.runtime_default.is_some() {
+                resolve_column_default_free(&col_schema, clock)?
+            } else if nullable || row_count == 0 {
+                Value::Null
+            } else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CREATE TABLE IF NOT EXISTS {table_name:?}: reconciling \
+                     column {col_name:?} requires DEFAULT (existing rows would violate NOT NULL)"
+                )));
+            };
+            let table = self
+                .active_catalog_mut()
+                .get_mut(&table_name)
+                .expect("checked above");
+            table.add_column(col_schema, fill_value);
+        }
+        // Resolve any newly-added inline FKs (column-level
+        // REFERENCES forms) and install. Skip FKs whose local
+        // columns we didn't have in the existing table.
+        let table_cols_now = self
+            .active_catalog()
+            .get(&table_name)
+            .expect("checked above")
+            .schema()
+            .columns
+            .clone();
+        for fk in stmt.foreign_keys {
+            // Only install FKs whose every local column resolves
+            // — older catalogs may have a column the new FK
+            // references but not the column the new FK declares.
+            let all_resolved = fk
+                .columns
+                .iter()
+                .all(|c| table_cols_now.iter().any(|sc| sc.name.eq_ignore_ascii_case(c)));
+            if !all_resolved {
+                continue;
+            }
+            let already_present = {
+                let table = self
+                    .active_catalog()
+                    .get(&table_name)
+                    .expect("checked above");
+                table.schema().foreign_keys.iter().any(|f| {
+                    f.parent_table.eq_ignore_ascii_case(&fk.parent_table)
+                        && f.local_columns.len() == fk.columns.len()
+                })
+            };
+            if already_present {
+                continue;
+            }
+            let storage_fk =
+                resolve_foreign_key(&table_name, &table_cols_now, fk, self.active_catalog())?;
+            let table = self
+                .active_catalog_mut()
+                .get_mut(&table_name)
+                .expect("checked above");
+            table.schema_mut().foreign_keys.push(storage_fk);
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     fn exec_create_table(
         &mut self,
         stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
         if stmt.if_not_exists && self.active_catalog().get(&stmt.name).is_some() {
-            return Ok(QueryResult::CommandOk {
-                affected: 0,
-                modified_catalog: false,
-            });
+            // v7.13.3 — mailrs round-7 S9 reconciliation. PG's
+            // semantics for `CREATE TABLE IF NOT EXISTS` is a
+            // silent no-op when the table exists, even if the new
+            // definition adds columns or constraints. SPG extends
+            // this: any column in the new definition that's
+            // missing from the existing table is added (with
+            // DEFAULT back-fill / NULL); inline FKs likewise.
+            // Existing columns are NOT modified. This makes
+            // mailrs's schema layering (init-schema's `contacts`
+            // sender-tracking table + migrate-023's CardDAV
+            // `contacts` extension) converge correctly without
+            // mailrs-side edits. PG users who want PG-strict
+            // silent-no-op behaviour can use SPG's `--strict-pg`
+            // flag (deferred to v7.14).
+            return self.reconcile_table_if_not_exists(stmt);
         }
         let table_name = stmt.name.clone();
         // v7.9.13 — pluck the names of any columns marked
@@ -10908,6 +11092,14 @@ fn coerce_value(
         // valid JSON lies with the producer.
         (Value::Text(s), DataType::Json | DataType::Jsonb) => Some(Value::Json(s)),
         (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
+        // v7.13.3 — mailrs round-7 S10. SPG's storage represents
+        // both JSON and JSONB on-disk as `Value::Json(String)` —
+        // they share the underlying text payload. The cast
+        // `'<text>'::jsonb` produces a Value::Json that needs to
+        // satisfy a DataType::Jsonb column. Identity coerce in
+        // both directions so JSON ↔ JSONB assignments work at all
+        // INSERT / ALTER COLUMN TYPE / DEFAULT contexts.
+        (Value::Json(s), DataType::Jsonb | DataType::Json) => Some(Value::Json(s)),
         // v7.10.4 — Text → BYTEA. Decode PG-style literal forms:
         //   - Hex:    `\x48656c6c6f`  (case-insensitive hex pairs)
         //   - Escape: `Hello\\000world`  (backslash + octal triples)

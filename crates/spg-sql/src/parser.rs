@@ -1870,15 +1870,31 @@ impl Parser {
             }
             Token::Drop => {
                 self.advance();
-                match self.advance() {
-                    Token::Ident(s) if s.eq_ignore_ascii_case("constraint") => {}
+                // v7.13.3 — dispatch on the next token. mailrs round-7
+                // S8 closed DROP COLUMN; round-6 S7 closed
+                // DROP CONSTRAINT. Both share IF EXISTS / CASCADE /
+                // RESTRICT modifiers.
+                //   DROP CONSTRAINT [IF EXISTS] <name> [CASCADE|RESTRICT]
+                //   DROP [COLUMN] [IF EXISTS] <col> [CASCADE|RESTRICT]
+                let subject = match self.peek() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("constraint") => {
+                        self.advance();
+                        "constraint"
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("column") => {
+                        self.advance();
+                        "column"
+                    }
+                    // PG-canonical bare `DROP <col>` without COLUMN
+                    // keyword is also valid; treat any other ident
+                    // as the column name.
+                    Token::Ident(_) | Token::QuotedIdent(_) => "column",
                     other => {
                         return Err(self.err(alloc::format!(
-                            "expected CONSTRAINT after DROP in ALTER TABLE, got {other:?}"
+                            "expected COLUMN / CONSTRAINT after DROP in ALTER TABLE, got {other:?}"
                         )));
                     }
-                }
-                // v7.13.2 — mailrs round-6 S7: optional `IF EXISTS`.
+                };
                 let mut if_exists = false;
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
                     let n1 = self.tokens.get(self.pos + 1);
@@ -1888,20 +1904,31 @@ impl Parser {
                         if_exists = true;
                     }
                 }
-                let cname = self.expect_ident_like()?;
-                // Tolerate trailing `CASCADE` / `RESTRICT` (mailrs uses
-                // neither but PG emits them and we accept silently).
+                let name = self.expect_ident_like()?;
+                let mut cascade = false;
                 if matches!(
                     self.peek(),
                     Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
                         || s.eq_ignore_ascii_case("restrict")
                 ) {
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("cascade"))
+                    {
+                        cascade = true;
+                    }
                     self.advance();
                 }
-                Ok(alloc::vec![crate::ast::AlterTableTarget::DropForeignKey {
-                    name: cname,
-                    if_exists,
-                }])
+                if subject == "constraint" {
+                    Ok(alloc::vec![crate::ast::AlterTableTarget::DropForeignKey {
+                        name,
+                        if_exists,
+                    }])
+                } else {
+                    Ok(alloc::vec![crate::ast::AlterTableTarget::DropColumn {
+                        column: name,
+                        if_exists,
+                        cascade,
+                    }])
+                }
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("alter") => {
                 self.advance();

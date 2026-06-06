@@ -289,6 +289,19 @@ pub enum AlterTableTarget {
         new_type: ColumnTypeName,
         using: Option<Expr>,
     },
+    /// v7.13.3 — `ALTER TABLE t DROP [COLUMN] [IF EXISTS] <col>
+    /// [CASCADE | RESTRICT]` (mailrs round-7 S8). The column +
+    /// every row's value at that position is removed; any index
+    /// on the column is dropped. `if_exists` makes the drop a
+    /// no-op when the column is missing. `cascade` removes
+    /// dependents (FKs referencing the column, partial indexes
+    /// whose predicate names the column); without it, the engine
+    /// rejects when dependents exist.
+    DropColumn {
+        column: String,
+        if_exists: bool,
+        cascade: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2027,6 +2040,21 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
             write!(f, "ALTER COLUMN {} TYPE {new_type}", quote_ident(column))?;
             if let Some(u) = using {
                 write!(f, " USING {u}")?;
+            }
+            Ok(())
+        }
+        AlterTableTarget::DropColumn {
+            column,
+            if_exists,
+            cascade,
+        } => {
+            f.write_str("DROP COLUMN ")?;
+            if *if_exists {
+                f.write_str("IF EXISTS ")?;
+            }
+            write!(f, "{}", quote_ident(column))?;
+            if *cascade {
+                f.write_str(" CASCADE")?;
             }
             Ok(())
         }

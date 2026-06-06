@@ -219,8 +219,10 @@ implemented; further breakdown follows the table.
 | `ALTER TABLE t ADD COLUMN` | ✅ v7.13.0 | `[IF NOT EXISTS]`, `DEFAULT`, `NOT NULL` (errors if non-empty + NOT NULL + no DEFAULT — same as PG); back-fills every row |
 | `ALTER TABLE t ADD COLUMN col TYPE REFERENCES other(c) [ON DELETE …]` | ✅ v7.13.2 | inline REFERENCES on ADD COLUMN; parser splits into column add + FK install |
 | Multi-subaction `ALTER TABLE t … , … , …` | ✅ v7.13.2 | comma-separated ADD COLUMN / ALTER COLUMN TYPE / DROP CONSTRAINT / ADD CONSTRAINT FK; applied in source order |
-| `ALTER TABLE t DROP COLUMN` | ❌ | Re-CREATE with the desired layout + `INSERT INTO new SELECT …` |
-| `ALTER TABLE t RENAME COLUMN` | ❌ | Re-CREATE as above |
+| `ALTER TABLE t DROP [COLUMN] [IF EXISTS] col [CASCADE\|RESTRICT]` | ✅ v7.13.3 | `IF EXISTS` idempotent; CASCADE drops dependent FKs; RESTRICT (default) errors on dependents |
+| `ALTER TABLE t RENAME COLUMN` | ❌ | Re-CREATE with the desired layout + `INSERT INTO new SELECT …` |
+| `'<text>'::jsonb` cast in DEFAULT / INSERT / UPDATE | ✅ v7.13.3 | produces JSONB-typed value (matches a JSONB column); same for `'<text>'::json` → JSON |
+| `CREATE TABLE IF NOT EXISTS` reconciliation | ✅ v7.13.3 SPG-ext | when table exists, **adds missing columns + FKs from the new definition** (SPG-specific; PG silently no-ops). Existing columns never modified. See note below. |
 | `ALTER TABLE t ALTER COLUMN c TYPE T [USING expr]` | ✅ v7.13.0 | `USING` expression evaluated per row; falls back to direct cast; `USING NULL` clears (v7.13.2 disambiguation) |
 | `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name [CASCADE]` | ✅ v7.13.2 | `IF EXISTS` makes drop idempotent; CASCADE/RESTRICT accepted silently |
 | `ALTER INDEX … REBUILD` | ✅ | NSW / BRIN rebuild lands; B-tree no-op |

@@ -8,6 +8,122 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.13.3] — 2026-06-06 (mailrs round-7 — 42/42 ZERO-CHANGE CUTOVER VERIFIED)
+
+Closes mailrs round-7 ack (`.claude/notes/mailrs-migration-feedback-followup-d-validate-7.md`).
+v7.13.2 brought migrations 38/42; v7.13.3 brings the remaining 4
+(S8/S9/S10 + the migrate-033 cascade S10 closes) to **42/42 PASS**
+against the full mailrs `init-schema.sql + 42 migrate-*.sql` path,
+zero mailrs-side edit.
+
+### Process change
+
+Before this round, SPG-side ack of "all closed" was based on
+synthetic unit tests + spot probes. mailrs has had to file 3
+follow-up rounds to surface PG-customer-visible shapes those
+tests missed. Going forward, the gate is:
+
+  `.claude/scripts/validate-spg-zero-change.sh local-build`
+
+which spawns a real spg-server, pipes mailrs's actual
+init-schema + 42 migrate-*.sql through psql at PG-wire 5432,
+and exits 0 iff the output ends with
+`ZERO-CHANGE CUTOVER VERIFIED`. **No ack pings before that
+exit-zero.** Same gate runs against the docker image post-build
+(`validate-spg-zero-change.sh 7.13.x`).
+
+### Round-7 surfaces closed
+
+- **S8 — `ALTER TABLE … DROP [COLUMN] [IF EXISTS] <col>
+  [CASCADE|RESTRICT]`** (mailrs hit: migrate-013 line 86). New
+  `AlterTableTarget::DropColumn` variant; parser dispatches on
+  the next ident after DROP (CONSTRAINT vs COLUMN vs bare ident).
+  `IF EXISTS` makes the drop idempotent; CASCADE removes
+  dependent FKs; RESTRICT (default) rejects with a clear error
+  when dependents exist. New `Table::drop_column` storage helper
+  removes the column from schema + row payload + indices and
+  shifts every remaining column-position reference (UC columns,
+  FK local_columns, index column_position + included_columns)
+  down by one.
+- **S9 — schema-superset reconciliation on `CREATE TABLE IF NOT
+  EXISTS`** (mailrs hit: migrate-023 line 55). PG's `CREATE
+  TABLE IF NOT EXISTS` is a silent no-op when the table exists;
+  mailrs's schema has two `contacts` tables (one in init-schema
+  for sender tracking, one in migrate-023 for CardDAV) and the
+  PG-strict silent skip leaves the CardDAV-specific columns
+  missing, making downstream `CREATE INDEX … ON contacts(
+  address_book_id)` fail with "column not found". **Real PG
+  exhibits the same failure** (verified against postgres:15);
+  the mailrs-side schema collision is independent of SPG, but
+  the zero-change contract requires SPG to absorb it.
+
+  SPG now extends the semantic: when the table exists, any
+  column in the new definition not already present is added
+  (with DEFAULT back-fill / NULL); inline FKs whose local
+  columns resolve are installed. Existing columns are NEVER
+  modified — type/nullability/default of existing columns stays
+  as the original CREATE TABLE set them. This is documented in
+  PG_MIGRATION.md § "SPG-specific extensions" so PG-customer
+  users aren't surprised by the behaviour difference.
+
+- **S10 — `'<text>'::jsonb` cast produces JSONB, not JSON**
+  (mailrs hit: migrate-031 line 22; cascades into migrate-033).
+  SPG stores both JSON and JSONB values as `Value::Json(String)`
+  on the wire and on-disk (same text payload, the column type
+  on the schema distinguishes them). The cast was producing a
+  `Value::Json` typed value that the type-compat check in
+  `coerce_value` rejected against a `DataType::Jsonb` column.
+  Fix: add identity Json↔Jsonb arms to `coerce_value` so
+  assignments between the two SPG-internal representations
+  match. PG-semantic distinction at the schema level is
+  preserved — `DataType::Json` and `DataType::Jsonb` remain
+  separate types; the cast just lands the right one.
+
+- **migrate-033 cascade** — closes automatically when S10
+  closes. migrate-031's multi-subaction ALTER TABLE runs to
+  completion, landing `recurrence_id` as a real column, and
+  migrate-033's `CREATE UNIQUE INDEX … (calendar_id, uid,
+  recurrence_id) WHERE recurrence_id IS NOT NULL` finds the
+  column and succeeds.
+
+### Acceptance harness
+
+`.claude/scripts/validate-spg-zero-change.sh` is the new
+release-prep gate alongside `cargo test --workspace --locked`
+and `cargo run -p sqllogictest --release`. Two modes:
+
+- `local-build` — fast iteration. Builds `spg-server` from the
+  workspace and pipes mailrs SQL through PG-wire 6021.
+- `<version>` — production-fidelity. Pulls
+  `goliakk/spg:<version>` and runs the same path. Matches the
+  exact bytes mailrs sees when they swap `image:` in compose.
+
+Both modes must exit `ZERO-CHANGE CUTOVER VERIFIED` before any
+mailrs ack ping.
+
+### Round-7 doc takeaway
+
+mailrs's round-7 doc made the process change explicit:
+
+> "We will not re-validate from raw scripts after this — we
+> want SPG's own ack to be reproducible from the script in
+> this doc."
+
+The harness above is the answer. Going forward every ack is
+self-verified before ping.
+
+### Validation
+
+- `.claude/scripts/validate-spg-zero-change.sh local-build`
+  → `ZERO-CHANGE CUTOVER VERIFIED` (18 + 42 SQL files, 0 ERROR)
+- `cargo test --workspace --locked` → 0 failures
+- `cargo run -p sqllogictest --release` → 372/372 = 100%
+- 13 new e2e tests in `tests/e2e_round7_surfaces.rs`
+
+Catalog FILE_VERSION stays at 23 (no new persistent fields).
+
+---
+
 ## [7.13.2] — 2026-06-06 (mailrs round-6 derived-shape coverage — 7 surfaces closed)
 
 mailrs ran the v7.13.0 image end-to-end (round-6 ack:
