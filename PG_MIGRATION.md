@@ -110,7 +110,7 @@ auth is intentionally not wired — operators set
 
 ---
 
-## SQL compatibility matrix (v7.3 ship-time)
+## SQL compatibility matrix (v7.12.7 ship-time)
 
 ✅ = works through the 4-corpus regression. ⚠️ = works in
 common shapes; corner cases differ from PG. ❌ = not
@@ -139,10 +139,11 @@ implemented; further breakdown follows the table.
 | `ALTER INDEX … REBUILD` | ✅ | NSW / BRIN rebuild lands; B-tree no-op |
 | `CREATE SCHEMA foo; foo.bar` | ❌ | Single-namespace catalog; rename-to-prefix as workaround |
 | `CREATE TYPE` / domains / composite types | ❌ | A7 — out of scope |
-| Foreign keys (`REFERENCES … ON DELETE/UPDATE …`) | 🚧 v7.6 | Lands in v7.6; A7 narrowed (see below) |
+| Foreign keys (`REFERENCES … ON DELETE/UPDATE …`) | ✅ v7.6 | All four `ON DELETE / ON UPDATE` actions (NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT) |
 | `CHECK` constraints | ❌ | A7 — won't do |
-| `CREATE TRIGGER` | ❌ | A7 — won't do |
-| `CREATE FUNCTION` / `CREATE PROCEDURE` / PL/pgSQL | ❌ | A7 — won't do |
+| `CREATE TRIGGER` | ✅ v7.12.4 | BEFORE/AFTER row-level triggers on INSERT/UPDATE/DELETE; see [§PL/pgSQL triggers](#plpgsql-triggers) below |
+| `CREATE FUNCTION ... LANGUAGE plpgsql` (trigger functions) | ✅ v7.12.4 | DECLARE / IF / RAISE / embedded SQL — full subset used by mailrs's `update_search_vector`; see [§PL/pgSQL triggers](#plpgsql-triggers) below |
+| `CREATE FUNCTION` (scalar UDF, non-trigger) | ⚠️ | DDL parses, body is stored, but invocation surface ships in v7.13+. Use built-in functions for v7.12.x. |
 | Partition tables (`PARTITION BY`) | ❌ | Cold-tier covers time-series natively |
 | Row-Level Security (`RLS`) | ❌ | A5 — process isolation instead |
 
@@ -165,7 +166,7 @@ implemented; further breakdown follows the table.
 | `UUID` | ❌ | Store as `TEXT(36)` |
 | `BYTEA` | ✅ v7.10.4 | Native bytes; PG-wire OID 17, `\xDEADBEEF` hex literal in/out, `length()` / `octet_length()` (v7.10.4), `\|\|` / `substring` / `position` (v7.11.2) |
 | `VECTOR(N)` | ✅ | pgvector-flavoured; HNSW + SQ8/HALF encodings |
-| `tsvector` + GIN | ❌ | Use Meilisearch / external full-text search |
+| `tsvector` + `tsquery` types | ✅ v7.12.0 | PG-wire OIDs 3614 / 3615; `pg_dump`-shape `::tsvector` / `::tsquery` cast literals round-trip; see [§Full-text search](#full-text-search) below |
 | `TEXT[]` | ✅ v7.10.9 | PG-wire OID 1009; external form `{a,b,NULL}` round-trips, `ARRAY[…]` literal, subscript, `ANY` / `ALL`, `array_length` / `array_position` / `unnest` / `\|\|` (v7.11.1) |
 | `INT[]` / `BIGINT[]` | ✅ v7.11.2 | PG-wire OIDs 1007 / 1016; full op parity with `TEXT[]` — typed `unnest`, mixed-width `\|\|` widens to `BIGINT[]` |
 | `SMALLINT[]` / `NUMERIC[]` / `BOOLEAN[]` / `FLOAT[]` | ❌ | Store as `INT[]` / `BIGINT[]` / `TEXT[]` until v7.12 |
@@ -177,11 +178,14 @@ implemented; further breakdown follows the table.
 |---|---|---|
 | `INSERT INTO t VALUES (…), (…)` | ✅ | Multi-row INSERT |
 | `INSERT INTO t (col, …) VALUES …` | ✅ | Column-list INSERT |
-| `INSERT … RETURNING` | ⚠️ | Parses, returns CommandComplete; row return TBD |
+| `INSERT … RETURNING` | ✅ v7.9.4 | Real DataRow stream — IMAP UID monotonic-alloc / mailrs-shape patterns work |
 | `UPDATE t SET … WHERE …` | ✅ | Single-statement |
-| `UPDATE t SET … WHERE … RETURNING …` | ⚠️ | Same as above |
+| `UPDATE t SET … WHERE … RETURNING …` | ✅ v7.9.4 | Same as INSERT RETURNING |
 | `DELETE FROM t WHERE …` | ✅ | |
-| `INSERT … ON CONFLICT …` (UPSERT) | ❌ | Application-level upsert via `SELECT` + branch |
+| `DELETE … RETURNING` | ✅ v7.9.4 | Returns the pre-delete row state (PG semantics) |
+| `INSERT … ON CONFLICT (col) DO NOTHING` | ✅ v7.9.8 | BTree-fast-path conflict resolution + within-batch dedup |
+| `INSERT … ON CONFLICT (col) DO UPDATE SET … EXCLUDED.col` | ✅ v7.9.9 | Includes mixed `tbl.col + EXCLUDED.col` exprs, optional WHERE, and RETURNING over the post-update row |
+| `INSERT … ON CONFLICT (col1, col2)` composite target | ✅ v7.9.10 | For CalDAV / CardDAV upsert patterns |
 | `TRUNCATE TABLE` | ❌ | Use `DELETE FROM t` |
 | Bulk `COPY FROM STDIN` (PG-wire) | ❌ | Use multi-row INSERT instead |
 
@@ -232,8 +236,57 @@ implemented; further breakdown follows the table.
 | `ORDER BY v <-> [literal] LIMIT k` (kNN) | ✅ | HNSW picked automatically when index present |
 | `USING SQ8` 8-bit quantisation | ✅ | v6.0.1 |
 | `USING HALF` (binary16) | ✅ | v6.0.3 (pgvector keyword) |
-| `ivfflat` index | ❌ | HNSW only |
+| `ivfflat` index | ✅ v7.11.3 | Accepted as a synonym for `hnsw` — both `pg_dump`-shape spellings load |
 | `vector_dims()` / `vector_norm()` | ⚠️ | Some functions present; not the full pgvector function set |
+
+### Full-text search
+
+The full PG FTS stack landed across v7.12.0–7. Schemas using
+`tsvector` + `GIN` + the `@@` query operator + trigger-
+maintained search vectors run unmodified.
+
+| Feature | SPG | Notes |
+|---|---|---|
+| `tsvector` / `tsquery` column types | ✅ v7.12.0 | PG-wire OIDs 3614 / 3615 |
+| `'foo:1 bar:2,3A'::tsvector` cast literal (`pg_dump` shape) | ✅ v7.12.0 | Quoted + bare lexeme syntax, optional `:positions[weight]` suffix; auto sort + dedupe |
+| `'cat & dog \| !fish'::tsquery` cast literal | ✅ v7.12.0 | Pratt parser over `&` `\|` `!` `()` and phrase `<N>` |
+| `to_tsvector(config, text)` / `to_tsvector(text)` | ✅ v7.12.1 | English Porter stemmer + `simple` config; `default_text_search_config` honoured for the 1-arg form |
+| `plainto_tsquery` / `phraseto_tsquery` / `to_tsquery` / `websearch_to_tsquery` | ✅ v7.12.1 | All four query constructors |
+| `SET default_text_search_config = 'english'` | ✅ v7.12.1 | Session-scoped; `'pg_catalog.english'` qualified form also accepted |
+| `@@` match operator (`tsvector @@ tsquery` either order) | ✅ v7.12.2 | NULL on either side returns NULL (3VL) |
+| `ts_rank(vec, query)` / `ts_rank_cd(vec, query)` | ✅ v7.12.2 | Weight × occurrence sum normalised by `1 + ln(unique_terms)`; `cd` adds cover-density factor |
+| `CREATE INDEX … USING GIN (tsvector_col)` | ✅ v7.12.3 | Real posting-list inverted index — replaces the v7.9.26b BTree fallback. `@@` query planner picks it automatically; `Term` / `And` / `Or` accelerated, `Not` / `Phrase` fall through to full scan |
+| `CREATE INDEX … USING GIN (non_tsvector_col)` | ✅ v7.9.26b | Loads as BTree fallback on the leading column so `pg_dump` JSONB-GIN scripts still load |
+| `ts_headline` / `ts_lexize` / other display-side FTS funcs | ❌ | Out of scope for v7.12.x; on the v7.13+ queue if customer-flagged |
+| Spanish / French / German / non-English config | ❌ | `simple` and `english` only in v7.12.x — unsupported configs error with a clear message |
+| Trigram (`pg_trgm` extension) | ❌ | `CREATE EXTENSION pg_trgm` parses as no-op (v7.9.15); the operators / functions don't exist yet |
+
+### PL/pgSQL triggers
+
+The full PL/pgSQL trigger surface landed across v7.12.4–7.
+mailrs's `AFTER INSERT OR UPDATE ON messages` trigger
+maintaining `search_vector` from `subject || sender ||
+clean_text` runs end-to-end.
+
+| Feature | SPG | Notes |
+|---|---|---|
+| `CREATE [OR REPLACE] FUNCTION fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$ … $$` | ✅ v7.12.4 | Persisted in the catalog; body re-parsed on each fire |
+| `CREATE [OR REPLACE] TRIGGER name { BEFORE \| AFTER } { event } [OR { event }]* ON tbl FOR EACH ROW EXECUTE FUNCTION fn()` | ✅ v7.12.4 | All event combinations (INSERT / UPDATE / DELETE); `EXECUTE PROCEDURE` legacy spelling also accepted |
+| `BEGIN ... END;` body | ✅ v7.12.4 | Required outer block |
+| `NEW.col := <expr>;` (BEFORE only) | ✅ v7.12.4 | AFTER triggers attempting NEW.col := … error with a clear "NEW is read-only post-write" message |
+| `RETURN NEW` / `RETURN OLD` / `RETURN NULL` / bare `RETURN;` | ✅ v7.12.4 | NULL skips the row (BEFORE) / no-ops the notification (AFTER) |
+| `OLD.col := <expr>;` | ❌ | PG forbids; we mirror with a clear error |
+| `DECLARE var TYPE [:= init_expr];` | ✅ v7.12.6 | Block before BEGIN; earlier DECLAREs in scope for later init exprs |
+| `IF cond THEN ... [ELSIF cond THEN ...]* [ELSE ...] END IF;` | ✅ v7.12.6 | Arbitrary nesting; bodies are full statement lists |
+| `RAISE { NOTICE \| WARNING \| INFO \| LOG \| DEBUG } '<fmt>' [, args]*;` | ✅ v7.12.6 | PG-style `%` substitution; logged but doesn't affect outcome |
+| `RAISE EXCEPTION '<fmt>' [, args]*;` | ✅ v7.12.6 | Aborts trigger function; propagates as engine-level error rolling back the firing DML |
+| Embedded SQL: `INSERT / UPDATE / DELETE / SELECT` inside trigger body | ✅ v7.12.7 | NEW / OLD / DECLARE-local refs substituted into the statement's Expr tree; recursion bounded at 16 deep |
+| `DROP TRIGGER [IF EXISTS] name ON tbl` | ✅ v7.12.4 | |
+| `DROP FUNCTION [IF EXISTS] fn[()]` | ✅ v7.12.4 | Arg-list disambiguation deferred (no PG-style overloading in v7.12.x) |
+| `LOOP / WHILE / FOR` iteration | ❌ | Carve-out; not on the mailrs critical path |
+| `SELECT … INTO var` binding | ❌ | The SELECT runs (as embedded SQL) but doesn't yet bind the result into a local. Workaround: use a separate UPDATE |
+| `GET DIAGNOSTICS` / `EXIT WHEN` / nested sub-blocks | ❌ | Out of scope for v7.12.x |
+| `BEFORE` trigger embedded SQL with PG's strict inline-between-rows semantics | ⚠️ | Embedded SQL collected during the row-write pass + executed after the firing DML's main work completes. Functionally equivalent for audit / sync / cascade patterns; differs only if the embedded SQL needs to read its own pre-INSERT row |
 
 ### Transactions / sessions
 
@@ -338,16 +391,32 @@ v8 / v9 plan. If you need any of them, **stay on PG**.
 
 > **v7.5 update — A7 narrowed.** Foreign keys were removed from
 > the won't-do list in v7.5. SPG's single-writer model makes FK
-> enforcement cheap (no concurrent-write race conditions, no
-> phantom child rows), and downstream users surfaced FK as a
-> hard requirement. The full `REFERENCES … ON DELETE …` surface
-> ships in v7.6. The remaining A7 items below are still
-> structural non-goals.
+> enforcement cheap, and downstream users surfaced FK as a hard
+> requirement. The full `REFERENCES … ON DELETE …` surface ships
+> in v7.6.
+>
+> **v7.9 update — A7 narrowed again.** `INSERT … ON CONFLICT DO
+> UPDATE` was originally on the won't-do list (PG's complexity
+> there is the concurrent-write race; SPG's single-writer model
+> collapses that to a BTree-seek-then-branch). The mailrs
+> migration evidence (47 use sites) made it worth shipping;
+> landed across v7.9.7–10.
+>
+> **v7.12 update — A7 narrowed again.** `CREATE TRIGGER` +
+> `CREATE FUNCTION ... LANGUAGE plpgsql` were originally on the
+> won't-do list. The mailrs migration drove a full PG FTS
+> stack (G-CRIT-3), and the customer-natural way to maintain a
+> `tsvector` column is an `AFTER INSERT OR UPDATE` row-level
+> trigger. The "side effects break determinism" concern is
+> mitigated by SPG's single-writer model: trigger execution
+> happens inside the row-write loop holding the catalog lock,
+> so determinism is preserved as long as the trigger function
+> is itself deterministic (which is a customer-side property,
+> not an engine one). Shipped across v7.12.4–7. **The
+> remaining A7 items below are still structural non-goals.**
 
 | Won't do | Why | Workaround |
 |---|---|---|
-| `CREATE TRIGGER` | Side effects break the single-writer determinism guarantee that powers group commit + WAL replay | Application-level event hooks via the publication/subscription change feed |
-| `CREATE FUNCTION` / PL/pgSQL | Adds a new VM surface inside the engine; SPG keeps SQL execution purely declarative | Application-level functions |
 | Row-Level Security | Multi-tenant via process isolation (one SPG instance per tenant) | `docker compose` with N services |
 | Multi-writer MVCC | Single-writer is the core architectural choice (powers group commit + zero-cost catalog clone) | Read replicas via logical replication |
 | Multi-master | A3 | Single primary + read replicas |
