@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict At2xJZXy7rmicnDEnDaNIWAhxeeEwZgxW8cT9ltvhjAOJ6lb0P9Q5O9gD9C2a2w
+\restrict KYyYjAhHFEyHIGbwyWVWPdqFONX4LmHKVIKjbOR9QeZqkIopQl6OsQG8u4mwXWN
 
 -- Dumped from database version 15.18 (Debian 15.18-1.pgdg13+1)
 -- Dumped by pg_dump version 15.18 (Debian 15.18-1.pgdg13+1)
@@ -76,6 +76,25 @@ ALTER TABLE ONLY public.posts ALTER COLUMN id SET DEFAULT nextval('public.posts_
 
 
 --
+-- Data for Name: posts; Type: TABLE DATA; Schema: public; Owner: -
+--
+
+COPY public.posts (id, title, body, tags, created_at) FROM stdin;
+1	Hello, world	first post	{intro,hello}	2026-06-06 12:50:59.447392+00
+2	Second post	body two	{follow-up}	2026-06-06 12:50:59.447392+00
+3	Tab\\thandling	COPY round-trip must escape \\t \\n \\\\ safely	{}	2026-06-06 12:50:59.447392+00
+4	Quotes 'matter'	and so do backslashes \\\\	{edge-cases}	2026-06-06 12:50:59.447392+00
+\.
+
+
+--
+-- Name: posts_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
+--
+
+SELECT pg_catalog.setval('public.posts_id_seq', 4, true);
+
+
+--
 -- Name: posts posts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -94,5 +113,5 @@ CREATE INDEX idx_posts_created ON public.posts USING btree (created_at DESC);
 -- PostgreSQL database dump complete
 --
 
-\unrestrict At2xJZXy7rmicnDEnDaNIWAhxeeEwZgxW8cT9ltvhjAOJ6lb0P9Q5O9gD9C2a2w
+\unrestrict KYyYjAhHFEyHIGbwyWVWPdqFONX4LmHKVIKjbOR9QeZqkIopQl6OsQG8u4mwXWN
 
