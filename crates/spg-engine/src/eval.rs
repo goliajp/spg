@@ -1220,6 +1220,44 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // substring helpers. Negative n means "all but last/first
         // |n| chars" — slice from the OPPOSITE side. n=0 → ''.
         // Codepoint-counted. NULL on any arg → NULL.
+        // PG `floor(x)` — largest integer <= x.
+        //   * Negative floats floor TOWARD -infinity, NOT toward 0.
+        //   * Integer types passthrough unchanged.
+        //   * NULL → NULL.
+        "floor" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "floor() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                    Ok(args[0].clone())
+                }
+                Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
+                Value::Numeric { scaled, scale } => {
+                    let factor = pow10_i128(*scale);
+                    let q = scaled.div_euclid(factor);
+                    // div_euclid rounds toward -infinity which is
+                    // exactly the floor semantic — perfect for
+                    // negative values.
+                    Ok(Value::Numeric {
+                        scaled: q * factor,
+                        scale: *scale,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "floor() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "left" => string_left_right(args, true, "left"),
         "right" => string_left_right(args, false, "right"),
         "strpos" => {
@@ -2787,6 +2825,30 @@ fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Val
         return Ok(Value::Text(String::new()));
     }
     Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// no_std-compatible `floor(x)` for f64. SPG's engine is
+/// `#![no_std]` and can't call `f64::floor` directly (libm).
+/// This handles the floor semantic manually:
+///   * NaN / Inf passthrough.
+///   * Values outside i64 range are already integer-precision.
+///   * Negative non-integers floor toward -infinity (the
+///     critical PG-canonical semantic).
+fn f64_floor(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    // f64 representation: any value with |x| > 2^53 is integer
+    // precision (mantissa is 52 bits), so floor is identity.
+    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
+        return x;
+    }
+    let trunc = (x as i64) as f64;
+    if x < 0.0 && x != trunc {
+        trunc - 1.0
+    } else {
+        trunc
+    }
 }
 
 /// PG `lpad` / `rpad` shared implementation. Length is the
