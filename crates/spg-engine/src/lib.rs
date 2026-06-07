@@ -8129,9 +8129,11 @@ fn build_projection(
             }
             SelectItem::Expr { expr, alias } => {
                 // Plain column ref keeps full schema info (real type +
-                // nullability). Compound expressions evaluate fine but have
-                // no static type — surface them as nullable TEXT, which is
-                // what most clients render anyway.
+                // nullability). For compound expressions try the
+                // describe-side function-return-type table first
+                // (e.g. `SELECT now()` → Timestamptz, `SELECT
+                // concat(…)` → Text). Falls back to nullable Text
+                // for shapes the describe path can't resolve.
                 if let Expr::Column(c) = expr {
                     let sch = resolve_projection_column(c, schema_cols, table_alias)?;
                     let output_name = alias.clone().unwrap_or_else(|| c.name.clone());
@@ -8140,6 +8142,14 @@ fn build_projection(
                         output_name,
                         ty: sch.ty,
                         nullable: sch.nullable,
+                    });
+                } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
+                    let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
+                    out.push(ProjectedItem {
+                        expr: expr.clone(),
+                        output_name,
+                        ty: shape.ty,
+                        nullable: shape.nullable,
                     });
                 } else {
                     let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
