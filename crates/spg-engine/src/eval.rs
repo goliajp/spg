@@ -26,7 +26,8 @@ use spg_storage::{ColumnSchema, DataType, Row, TsLexeme, TsQueryAst, Value};
 /// Resolution context for evaluating a single row. `table_alias` is the alias
 /// (or table name) callers should accept as the qualifier on a column ref —
 /// e.g. `FROM users AS u` makes `u.name` valid and rejects `other.name`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[allow(missing_debug_implementations)] // sequence_resolver is a dyn Fn — no Debug
 pub struct EvalContext<'a> {
     pub columns: &'a [ColumnSchema],
     pub table_alias: Option<&'a str>,
@@ -42,6 +43,30 @@ pub struct EvalContext<'a> {
     /// `plainto_tsquery(text)` etc are called without an explicit
     /// config arg. `None` falls through to `simple`.
     pub default_text_search_config: Option<&'a str>,
+    /// v7.17.0 Phase 1.1 — `nextval` / `currval` / `setval`
+    /// resolver. The engine builds this around a `&mut Catalog`
+    /// so apply_function can mutate sequence state without
+    /// eval owning a catalog reference. When `None`, sequence
+    /// functions return an error (read-only contexts).
+    pub sequence_resolver: Option<&'a SequenceResolver<'a>>,
+}
+
+/// v7.17.0 — sequence-mutating callback used by `apply_function`
+/// for `nextval` / `currval` / `setval`. Implemented by the
+/// engine to thread `&mut Catalog` access through an immutable
+/// `&EvalContext`.
+pub type SequenceResolver<'a> = dyn Fn(SequenceOp) -> Result<i64, EvalError> + 'a;
+
+/// v7.17.0 — sequence operation requested by an Expr eval.
+#[derive(Debug, Clone)]
+pub enum SequenceOp {
+    Next(String),
+    Curr(String),
+    Set {
+        name: String,
+        value: i64,
+        is_called: bool,
+    },
 }
 
 impl<'a> EvalContext<'a> {
@@ -51,7 +76,20 @@ impl<'a> EvalContext<'a> {
             table_alias,
             params: &[],
             default_text_search_config: None,
+            sequence_resolver: None,
         }
+    }
+
+    /// v7.17.0 — attach a sequence resolver. The engine wraps a
+    /// `&mut Catalog` in a closure that performs the requested
+    /// SequenceOp.
+    #[must_use]
+    pub const fn with_sequence_resolver(
+        mut self,
+        resolver: &'a SequenceResolver<'a>,
+    ) -> Self {
+        self.sequence_resolver = Some(resolver);
+        self
     }
 
     /// v6.1.1 — attach a parameter buffer for `$N` placeholder
@@ -556,6 +594,113 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
 /// scalar functions; aggregates land in v1.5 alongside GROUP BY.
 fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
     match name.to_ascii_lowercase().as_str() {
+        // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
+        "nextval" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("nextval() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let seq_name = match &args[0] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "nextval() argument must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
+                detail: "nextval() requires a sequence resolver (read-only context)".into(),
+            })?;
+            let v = resolver(SequenceOp::Next(seq_name))?;
+            Ok(Value::BigInt(v))
+        }
+        "currval" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("currval() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let seq_name = match &args[0] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "currval() argument must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
+                detail: "currval() requires a sequence resolver (read-only context)".into(),
+            })?;
+            let v = resolver(SequenceOp::Curr(seq_name))?;
+            Ok(Value::BigInt(v))
+        }
+        "setval" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("setval() takes 2 or 3 args, got {}", args.len()),
+                });
+            }
+            let seq_name = match &args[0] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "setval() name argument must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let value = match &args[1] {
+                Value::SmallInt(n) => i64::from(*n),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "setval() value argument must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let is_called = if args.len() == 3 {
+                match &args[2] {
+                    Value::Bool(b) => *b,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "setval() is_called argument must be BOOL, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            } else {
+                true
+            };
+            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
+                detail: "setval() requires a sequence resolver (read-only context)".into(),
+            })?;
+            let v = resolver(SequenceOp::Set {
+                name: seq_name,
+                value,
+                is_called,
+            })?;
+            Ok(Value::BigInt(v))
+        }
         "length" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -989,14 +1134,11 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // sequence — SPG has AUTO_INCREMENT instead).
         "pg_get_serial_sequence" | "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
         "version" => Ok(Value::Text("PostgreSQL 16 (SPG-compat)".into())),
-        // pg_dump emits `nextval('seq')` after creating a
-        // sequence; SPG has no separate sequence object (the
-        // owning column carries AUTO_INCREMENT). Return NULL
-        // (PG would return the sequence value) — the value isn't
-        // used at restore time because the column has its own
-        // implicit BIGSERIAL counter.
-        "nextval" | "currval" | "lastval" => Ok(Value::Null),
-        "setval" => Ok(args.first().cloned().unwrap_or(Value::Null)),
+        // v7.17.0 — `nextval` / `currval` / `setval` are handled
+        // at the top of this match against the SequenceResolver.
+        // `lastval()` (no-arg session memory) still degrades to
+        // NULL pending a Phase 1.1b session tracker.
+        "lastval" => Ok(Value::Null),
         // v7.15.0 — pg_trgm: similarity, show_trgm. Match PG
         // semantics: similarity returns Jaccard of trigram sets;
         // show_trgm returns the trigram set as TEXT[]. NULL on
