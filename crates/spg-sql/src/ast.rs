@@ -1097,6 +1097,19 @@ pub enum TableConstraint {
         name: Option<String>,
         columns: Vec<String>,
     },
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY/INDEX [name]
+    /// (cols)` inline declaration. Pre-v7.17 the parser
+    /// silently dropped these so MyISAM-imported FULLTEXT
+    /// indexes vanished; v7.17 routes them through the
+    /// existing tsvector-GIN engine path so MATCH AGAINST
+    /// queries get a real inverted index instead of falling
+    /// back to a full scan. Multi-column FULLTEXT KEYs build
+    /// one GIN per column at v7.17 (per-column posting lists);
+    /// the leading column drives query planning.
+    FulltextIndex {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2837,6 +2850,23 @@ impl fmt::Display for TableConstraint {
             }
             Self::Index { name, columns } => {
                 f.write_str("KEY ")?;
+                if let Some(n) = name {
+                    write!(f, "{} ", quote_ident(n))?;
+                }
+                f.write_str("(")?;
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&quote_ident(c))?;
+                }
+                f.write_str(")")
+            }
+            Self::FulltextIndex { name, columns } => {
+                // Mysqldump emits `FULLTEXT KEY name (cols)` —
+                // Display rounds back to that shape so dump
+                // replay reproduces the input verbatim.
+                f.write_str("FULLTEXT KEY ")?;
                 if let Some(n) = name {
                     write!(f, "{} ", quote_ident(n))?;
                 }

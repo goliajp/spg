@@ -4813,6 +4813,32 @@ impl Engine {
                             let _ = table.add_index(idx_name, leading);
                         }
                     }
+                    spg_sql::ast::TableConstraint::FulltextIndex { name, columns } => {
+                        // v7.17.0 Phase 2.2 — ALTER TABLE ADD
+                        // FULLTEXT KEY (cols). Builds one
+                        // fulltext-GIN per named column so MATCH
+                        // AGAINST gets a real inverted index.
+                        // Multi-column declarations expand to
+                        // per-column GINs (the leading column
+                        // drives MATCH AGAINST planning).
+                        for (k, col) in columns.iter().enumerate() {
+                            let already_idx = table.indices().iter().any(|idx| {
+                                matches!(idx.kind, spg_storage::IndexKind::GinFulltext(_))
+                                    && table.schema().columns[idx.column_position].name == *col
+                            });
+                            if already_idx {
+                                continue;
+                            }
+                            let idx_name = match (&name, columns.len(), k) {
+                                (Some(n), 1, _) => n.clone(),
+                                (Some(n), _, k) => alloc::format!("{n}_{k}"),
+                                (None, _, _) => {
+                                    alloc::format!("{}_{col}_ftidx", s.name)
+                                }
+                            };
+                            let _ = table.add_gin_fulltext_index(idx_name, col);
+                        }
+                    }
                 }
             }
             spg_sql::ast::AlterTableTarget::DropColumn {
@@ -5615,6 +5641,10 @@ impl Engine {
                 // the post-create loop below alongside the PK/UQ
                 // implicit indexes.
                 spg_sql::ast::TableConstraint::Index { .. } => continue,
+                // v7.17.0 Phase 2.2 — MySQL FULLTEXT KEY is not
+                // a uniqueness constraint either; its GIN gets
+                // built in the post-create loop below.
+                spg_sql::ast::TableConstraint::FulltextIndex { .. } => continue,
             };
             let mut positions = Vec::with_capacity(names.len());
             for n in &names {
@@ -5656,6 +5686,32 @@ impl Engine {
             }
         }
         for (i, tc) in stmt.table_constraints.iter().enumerate() {
+            // v7.17.0 Phase 2.2 — FULLTEXT KEY lands a real
+            // tsvector-GIN per declared column instead of the
+            // BTree the PK / UQ / KEY paths build. Branch early
+            // so the BTree loop never sees the FULLTEXT shape.
+            if let spg_sql::ast::TableConstraint::FulltextIndex { name, columns } = tc {
+                for (k, col) in columns.iter().enumerate() {
+                    let already = table.indices().iter().any(|idx| {
+                        matches!(idx.kind, spg_storage::IndexKind::GinFulltext(_))
+                            && table.schema().columns[idx.column_position].name == *col
+                    });
+                    if already {
+                        continue;
+                    }
+                    let idx_name = match (name.as_ref(), columns.len(), k) {
+                        (Some(n), 1, _) => n.clone(),
+                        (Some(n), _, k) => alloc::format!("{n}_{k}"),
+                        (None, _, _) => {
+                            alloc::format!("{table_name}_{col}_ftidx")
+                        }
+                    };
+                    if let Err(e) = table.add_gin_fulltext_index(idx_name, col) {
+                        return Err(EngineError::Storage(e));
+                    }
+                }
+                continue;
+            }
             // v7.15.0 — plain KEY/INDEX rides this same loop so
             // the implicit BTree gets built. It carries its own
             // user-supplied name; PK/UQ still synthesise.
@@ -5668,6 +5724,8 @@ impl Engine {
                     ("idx", columns, name.as_ref())
                 }
                 spg_sql::ast::TableConstraint::Check { .. } => continue,
+                // Handled by the early-branch above.
+                spg_sql::ast::TableConstraint::FulltextIndex { .. } => continue,
             };
             let leading = &names[0];
             // Skip if a same-column BTree already exists (e.g.

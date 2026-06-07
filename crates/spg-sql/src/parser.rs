@@ -3917,19 +3917,22 @@ impl Parser {
         } else {
             false
         };
-        // Consume FULLTEXT / SPATIAL prefix and record it. SPG
-        // has no native FULLTEXT / SPATIAL AM, so we still
-        // accept-as-no-op for those (return None below); plain
-        // KEY/INDEX builds a real BTree.
-        let is_fulltext_or_spatial = if matches!(
-            self.peek(),
-            Token::Ident(s) if s.eq_ignore_ascii_case("fulltext") || s.eq_ignore_ascii_case("spatial")
-        ) {
-            self.advance();
-            true
-        } else {
-            false
-        };
+        // Consume FULLTEXT / SPATIAL prefix and record which one
+        // it was. v7.17.0 Phase 2.2 — FULLTEXT routes through a
+        // dedicated TableConstraint variant so the engine can
+        // build a tsvector-GIN; SPATIAL still has no matching
+        // AM, so it falls back to accept-as-no-op.
+        let mut is_fulltext = false;
+        let mut is_spatial = false;
+        if let Token::Ident(s) = self.peek().clone() {
+            if s.eq_ignore_ascii_case("fulltext") {
+                self.advance();
+                is_fulltext = true;
+            } else if s.eq_ignore_ascii_case("spatial") {
+                self.advance();
+                is_spatial = true;
+            }
+        }
         // KEY / INDEX keyword. `INDEX` lexes as Token::Index
         // (reserved); accept either token shape.
         match self.peek() {
@@ -4024,8 +4027,19 @@ impl Parser {
                 columns: cols,
                 nulls_not_distinct: false,
             }))
-        } else if is_fulltext_or_spatial {
-            // SPG has no FULLTEXT / SPATIAL AM. Accept-as-no-op.
+        } else if is_fulltext {
+            // v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` now
+            // routes through `TableConstraint::FulltextIndex`;
+            // the engine builds a tsvector-GIN over each named
+            // column so MATCH AGAINST gets a real inverted
+            // index instead of a silently-dropped declaration.
+            Ok(Some(crate::ast::TableConstraint::FulltextIndex {
+                name: idx_name,
+                columns: cols,
+            }))
+        } else if is_spatial {
+            // SPG has no native SPATIAL AM. Accept-as-no-op
+            // (declaration is parsed, but no index is built).
             Ok(None)
         } else {
             // v7.15.0 — plain KEY / INDEX builds a real BTree
@@ -6055,6 +6069,25 @@ impl Parser {
                 self.advance(); // consume `]`
                 Ok(Expr::Array(items))
             }
+            // v7.17.0 Phase 2.2 — MySQL `MATCH(col, ...) AGAINST
+            // ('term' [IN BOOLEAN MODE | IN NATURAL LANGUAGE MODE])`.
+            // We special-case before the generic ident dispatch so
+            // the AGAINST clause never reaches the function-call
+            // loop (which would mis-read `(cols) AGAINST` as a
+            // call with no trailing modifier). The shape is
+            // rewritten to a Boolean OR over per-column
+            // `to_tsvector('simple', col) @@ plainto_tsquery('simple',
+            // term)` so the existing FTS evaluator handles
+            // semantics — the fulltext-GIN built at CREATE TABLE
+            // time is currently a "real index that survives dump
+            // round-trip"; the planner hook that actually uses
+            // it for posting-list intersection lands in a later
+            // sub-phase (Phase 2.2b) without touching this surface.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("match") && matches!(self.peek(), Token::LParen) =>
+            {
+                self.parse_match_against_atom()
+            }
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
@@ -6551,6 +6584,153 @@ impl Parser {
     /// `EXTRACT(<field> FROM <source>)`. The dispatching `parse_atom`
     /// has already consumed the `EXTRACT` token before calling us —
     /// we pick up at the opening `(`.
+    /// v7.17.0 Phase 2.2 — MySQL `MATCH(col [, col ...]) AGAINST
+    /// (expr [IN BOOLEAN MODE | IN NATURAL LANGUAGE MODE
+    /// [WITH QUERY EXPANSION]])`. Rewritten in-place to a
+    /// per-column OR-fold of
+    /// `to_tsvector('simple', col) @@ plainto_tsquery('simple',
+    /// term)` so the existing FTS evaluator handles semantics.
+    ///
+    /// The mode modifier is accepted-and-ignored at v7.17 — all
+    /// modes map to the same `plainto_tsquery` rewrite. Boolean-
+    /// mode operators (`+foo -bar`) would need their own parser
+    /// (Phase 2.2c); customers who hit them today already get a
+    /// correct lexeme-match against the bare term, only without
+    /// the +/- precedence the customer asked for.
+    fn parse_match_against_atom(&mut self) -> Result<Expr, ParseError> {
+        // Already at `MATCH`-consumed position; the dispatcher
+        // confirmed the next token is `(`.
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after MATCH, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut cols: Vec<Expr> = Vec::new();
+        loop {
+            cols.push(self.parse_expr(0)?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => break,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected ',' or ')' in MATCH column list, got {other:?}"
+                    )));
+                }
+            }
+        }
+        self.advance(); // ')'
+        // Expect AGAINST.
+        match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("against") => {
+                self.advance();
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected AGAINST after MATCH column list, got {other:?}"
+                )));
+            }
+        }
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after AGAINST, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Read AGAINST's argument as a single primary token —
+        // string literal, placeholder, or column-ref ident. We
+        // can't call `parse_expr` / `parse_unary` here because
+        // the postfix chain inside `parse_atom` would greedily
+        // fold a trailing `IN BOOLEAN MODE` as `expr IN (...)`
+        // and fail at "expected '(' after IN". Customers always
+        // write a literal or bound parameter in AGAINST, so this
+        // restriction is non-blocking; the error path explains
+        // the limit if a more complex expression shows up.
+        let term = match self.advance() {
+            Token::String(s) => Expr::Literal(crate::ast::Literal::String(s)),
+            Token::Placeholder(n) => Expr::Placeholder(n),
+            Token::Ident(s) | Token::QuotedIdent(s) => Expr::Column(crate::ast::ColumnName {
+                qualifier: None,
+                name: s,
+            }),
+            other => {
+                return Err(self.err(alloc::format!(
+                    "MATCH ... AGAINST(<term>) expects a string literal, \
+                     bound parameter, or column ref, got {other:?}"
+                )));
+            }
+        };
+        // Optional mode tail — accept-and-ignore at v7.17:
+        //   IN NATURAL LANGUAGE MODE [WITH QUERY EXPANSION]
+        //   IN BOOLEAN MODE
+        //   WITH QUERY EXPANSION
+        loop {
+            match self.peek() {
+                // IN lexes as a reserved Token::In, not an ident,
+                // so it gets its own arm.
+                Token::In => {
+                    self.advance();
+                }
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("natural")
+                        || s.eq_ignore_ascii_case("language")
+                        || s.eq_ignore_ascii_case("boolean")
+                        || s.eq_ignore_ascii_case("mode")
+                        || s.eq_ignore_ascii_case("with")
+                        || s.eq_ignore_ascii_case("query")
+                        || s.eq_ignore_ascii_case("expansion") =>
+                {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close AGAINST, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Build per-column `to_tsvector('simple', col) @@
+        // plainto_tsquery('simple', term)` and OR-fold.
+        let simple_lit = || Expr::Literal(crate::ast::Literal::String(String::from("simple")));
+        let plainto = Expr::FunctionCall {
+            name: String::from("plainto_tsquery"),
+            args: alloc::vec![simple_lit(), term.clone()],
+        };
+        let mut folded: Option<Expr> = None;
+        for col in cols {
+            let to_tsv = Expr::FunctionCall {
+                name: String::from("to_tsvector"),
+                args: alloc::vec![simple_lit(), col],
+            };
+            let leaf = Expr::Binary {
+                lhs: Box::new(to_tsv),
+                op: crate::ast::BinOp::TsMatch,
+                rhs: Box::new(plainto.clone()),
+            };
+            folded = Some(match folded {
+                None => leaf,
+                Some(prev) => Expr::Binary {
+                    lhs: Box::new(prev),
+                    op: crate::ast::BinOp::Or,
+                    rhs: Box::new(leaf),
+                },
+            });
+        }
+        match folded {
+            Some(e) => Ok(e),
+            None => Err(self.err(String::from(
+                "MATCH(...) AGAINST(...) requires at least one column",
+            ))),
+        }
+    }
+
     fn parse_extract_atom(&mut self) -> Result<Expr, ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after EXTRACT, got {:?}", self.peek())));
