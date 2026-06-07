@@ -35,10 +35,7 @@ impl Type<Spg> for Vec<i32> {
 }
 
 impl<'q> Encode<'q, Spg> for Vec<i32> {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         // PG external form `{1,2,3}`.
         let mut s = String::from("{");
         for (i, v) in self.iter().enumerate() {
@@ -60,9 +57,7 @@ impl<'q> Encode<'q, Spg> for Vec<i32> {
 impl<'r> Decode<'r, Spg> for Vec<i32> {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
-            EngineValue::IntArray(items) => {
-                Ok(items.iter().filter_map(|o| o.clone()).collect())
-            }
+            EngineValue::IntArray(items) => Ok(items.iter().filter_map(|o| o.clone()).collect()),
             // BIGINT[] narrows lossily.
             EngineValue::BigIntArray(items) => Ok(items
                 .iter()
@@ -85,10 +80,7 @@ impl Type<Spg> for Vec<i64> {
 }
 
 impl<'q> Encode<'q, Spg> for Vec<i64> {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         let mut s = String::from("{");
         for (i, v) in self.iter().enumerate() {
             if i > 0 {
@@ -109,9 +101,7 @@ impl<'q> Encode<'q, Spg> for Vec<i64> {
 impl<'r> Decode<'r, Spg> for Vec<i64> {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
-            EngineValue::BigIntArray(items) => {
-                Ok(items.iter().filter_map(|o| o.clone()).collect())
-            }
+            EngineValue::BigIntArray(items) => Ok(items.iter().filter_map(|o| o.clone()).collect()),
             EngineValue::IntArray(items) => Ok(items
                 .iter()
                 .filter_map(|o| o.clone().map(i64::from))
@@ -133,10 +123,7 @@ impl Type<Spg> for Vec<String> {
 }
 
 impl<'q> Encode<'q, Spg> for Vec<String> {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         // PG external form `{"a","b","c"}` — quote every element
         // so commas and braces inside payloads survive.
         let mut s = String::from("{");
@@ -166,9 +153,7 @@ impl<'q> Encode<'q, Spg> for Vec<String> {
 impl<'r> Decode<'r, Spg> for Vec<String> {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
-            EngineValue::TextArray(items) => {
-                Ok(items.iter().filter_map(|o| o.clone()).collect())
-            }
+            EngineValue::TextArray(items) => Ok(items.iter().filter_map(|o| o.clone()).collect()),
             other => Err(format!("cannot decode {other:?} as Vec<String>").into()),
         }
     }

@@ -62,13 +62,9 @@ fn do_block_executes_its_body() {
     // failed at the SELECT.
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (a INT NOT NULL)").unwrap();
-    eng.execute(
-        "DO $$ BEGIN ALTER TABLE t ADD COLUMN b INT; UPDATE t SET a = a; END $$",
-    )
-    .unwrap();
-    let r = eng
-        .execute("SELECT b FROM t WHERE a = 0")
+    eng.execute("DO $$ BEGIN ALTER TABLE t ADD COLUMN b INT; UPDATE t SET a = a; END $$")
         .unwrap();
+    let r = eng.execute("SELECT b FROM t WHERE a = 0").unwrap();
     assert!(matches!(r, QueryResult::Rows { .. }), "{r:?}");
 }
 
@@ -80,7 +76,8 @@ fn pg_dump_idempotent_do_block_pattern() {
     // view; the THEN branch fires only if the column genuinely
     // exists. Idempotent on re-run.
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE accounts (id INT NOT NULL)").unwrap();
+    eng.execute("CREATE TABLE accounts (id INT NOT NULL)")
+        .unwrap();
     ok(
         &mut eng,
         "DO $$ \

@@ -1014,10 +1014,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                 Value::Text(s) => s.as_str(),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "similarity() needs text, got {:?}",
-                            other.data_type()
-                        ),
+                        detail: format!("similarity() needs text, got {:?}", other.data_type()),
                     });
                 }
             };
@@ -1025,10 +1022,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                 Value::Text(s) => s.as_str(),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "similarity() needs text, got {:?}",
-                            other.data_type()
-                        ),
+                        detail: format!("similarity() needs text, got {:?}", other.data_type()),
                     });
                 }
             };
@@ -1049,10 +1043,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                 Value::Text(s) => s.as_str(),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "show_trgm() needs text, got {:?}",
-                            other.data_type()
-                        ),
+                        detail: format!("show_trgm() needs text, got {:?}", other.data_type()),
                     });
                 }
             };
@@ -2379,10 +2370,7 @@ fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
     // ` UTC` and trailing `Z` also count as zero-offset TZ tags.
     let (core, tz_micros) = if let Some(rest) = t.strip_suffix('Z') {
         (rest, 0i64)
-    } else if let Some(rest) = t
-        .strip_suffix(" UTC")
-        .or_else(|| t.strip_suffix("UTC"))
-    {
+    } else if let Some(rest) = t.strip_suffix(" UTC").or_else(|| t.strip_suffix("UTC")) {
         (rest, 0i64)
     } else if let Some((idx, sign_byte)) = find_offset_sign(t) {
         let suffix = &t[idx..];

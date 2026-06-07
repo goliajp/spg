@@ -100,8 +100,11 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 /// signals the caller to fall back to a full scan.
 pub fn trigrams_from_like_pattern(pattern: &str) -> Option<BTreeSet<String>> {
     // Split on wildcards, honoring backslash escapes.
-    let mut runs: Vec<(String, bool /* leading-anchored */, bool /* trailing-anchored */)> =
-        Vec::new();
+    let mut runs: Vec<(
+        String,
+        bool, /* leading-anchored */
+        bool, /* trailing-anchored */
+    )> = Vec::new();
     let mut cur = String::new();
     let mut iter = pattern.chars().peekable();
     let mut leading = true;

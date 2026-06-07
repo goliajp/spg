@@ -11,10 +11,8 @@ fn create_index_using_gin_with_trgm_opclass_is_accepted() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE docs (id INT NOT NULL, clean_text TEXT)")
         .unwrap();
-    eng.execute(
-        "CREATE INDEX docs_clean_text_idx ON docs USING gin (clean_text gin_trgm_ops)",
-    )
-    .unwrap();
+    eng.execute("CREATE INDEX docs_clean_text_idx ON docs USING gin (clean_text gin_trgm_ops)")
+        .unwrap();
 }
 
 #[test]
@@ -51,10 +49,8 @@ fn float8_accepted_as_float_synonym() {
 #[test]
 fn case_when_in_update_set_expression() {
     let mut eng = Engine::new();
-    eng.execute(
-        "CREATE TABLE msgs (id INT NOT NULL, message_id TEXT NOT NULL)",
-    )
-    .unwrap();
+    eng.execute("CREATE TABLE msgs (id INT NOT NULL, message_id TEXT NOT NULL)")
+        .unwrap();
     eng.execute("INSERT INTO msgs VALUES (1, ''), (2, 'real-id')")
         .unwrap();
     eng.execute(
@@ -80,9 +76,7 @@ fn case_when_in_select_searched_form() {
     eng.execute("CREATE TABLE t (n INT NOT NULL)").unwrap();
     eng.execute("INSERT INTO t VALUES (1), (5), (10)").unwrap();
     let r = eng
-        .execute(
-            "SELECT CASE WHEN n < 5 THEN 'small' WHEN n < 10 THEN 'mid' ELSE 'big' END FROM t",
-        )
+        .execute("SELECT CASE WHEN n < 5 THEN 'small' WHEN n < 10 THEN 'mid' ELSE 'big' END FROM t")
         .unwrap();
     let rows = match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows,
@@ -122,9 +116,7 @@ fn case_when_simple_form_with_operand() {
     eng.execute("INSERT INTO t VALUES ('A'), ('B'), ('C')")
         .unwrap();
     let r = eng
-        .execute(
-            "SELECT CASE kind WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 0 END FROM t",
-        )
+        .execute("SELECT CASE kind WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 0 END FROM t")
         .unwrap();
     let rows = match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows,

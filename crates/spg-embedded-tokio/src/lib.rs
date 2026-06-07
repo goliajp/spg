@@ -32,7 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use spg_embedded::{
-    ColumnSchema, Database, DataType, EngineError, ParsedStatement, QueryResult, Statement, Value,
+    ColumnSchema, DataType, Database, EngineError, ParsedStatement, QueryResult, Statement, Value,
 };
 pub use spg_engine::CatalogSnapshot;
 

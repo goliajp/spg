@@ -32,7 +32,8 @@ fn alter_table_multi_add_column() {
 #[test]
 fn alter_table_mixed_subactions_apply_in_order() {
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (id INT NOT NULL, x TEXT)").unwrap();
+    eng.execute("CREATE TABLE t (id INT NOT NULL, x TEXT)")
+        .unwrap();
     eng.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
     eng.execute(
         "ALTER TABLE t \
@@ -49,7 +50,8 @@ fn alter_table_mixed_subactions_apply_in_order() {
 #[test]
 fn gin_index_with_where_predicate_is_accepted() {
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE docs (id INT NOT NULL, body TEXT)").unwrap();
+    eng.execute("CREATE TABLE docs (id INT NOT NULL, body TEXT)")
+        .unwrap();
     eng.execute(
         "CREATE INDEX IF NOT EXISTS idx_body_trgm ON docs \
          USING gin(body gin_trgm_ops) \
@@ -65,7 +67,8 @@ fn alter_table_add_column_with_inline_references() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE apps (id INT NOT NULL PRIMARY KEY)")
         .unwrap();
-    eng.execute("CREATE TABLE api_keys (id INT NOT NULL)").unwrap();
+    eng.execute("CREATE TABLE api_keys (id INT NOT NULL)")
+        .unwrap();
     eng.execute(
         "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS app_id INT \
          REFERENCES apps(id) ON DELETE CASCADE",
@@ -111,7 +114,8 @@ fn unnest_cross_join_with_table_and_column_alias() {
          )",
     )
     .unwrap();
-    eng.execute("INSERT INTO groups VALUES (1, 'super', NULL)").unwrap();
+    eng.execute("INSERT INTO groups VALUES (1, 'super', NULL)")
+        .unwrap();
     eng.execute(
         "INSERT INTO group_permissions (group_id, permission) \
          SELECT g.id, p.perm \
@@ -127,7 +131,9 @@ fn unnest_cross_join_with_table_and_column_alias() {
 #[test]
 fn unnest_in_from_primary_position_still_works() {
     let mut eng = Engine::new();
-    let r = eng.execute("SELECT * FROM UNNEST(ARRAY['a','b','c'])").unwrap();
+    let r = eng
+        .execute("SELECT * FROM UNNEST(ARRAY['a','b','c'])")
+        .unwrap();
     match r {
         spg_engine::QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
         _ => panic!("expected rows"),
@@ -139,11 +145,10 @@ fn unnest_in_from_primary_position_still_works() {
 #[test]
 fn alter_column_type_vector_using_null() {
     let mut eng = Engine::new();
-    eng.execute("CREATE TABLE t (id INT NOT NULL, e VECTOR(768))").unwrap();
-    eng.execute(
-        "INSERT INTO t VALUES (1, [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0])",
-    )
-    .ok(); // dim mismatch ok; we only care about ALTER parsing/eval
+    eng.execute("CREATE TABLE t (id INT NOT NULL, e VECTOR(768))")
+        .unwrap();
+    eng.execute("INSERT INTO t VALUES (1, [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0])")
+        .ok(); // dim mismatch ok; we only care about ALTER parsing/eval
     eng.execute("ALTER TABLE t ALTER COLUMN e TYPE VECTOR(1024) USING NULL")
         .unwrap();
 }

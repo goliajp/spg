@@ -1784,10 +1784,7 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
     let dir = &rest[dir_start..i];
     i = skip_ws_bytes(bytes, i);
     let ep_start = i;
-    while i < bytes.len()
-        && !(bytes[i] as char).is_ascii_whitespace()
-        && bytes[i] != b';'
-    {
+    while i < bytes.len() && !(bytes[i] as char).is_ascii_whitespace() && bytes[i] != b';' {
         i += 1;
     }
     if i == ep_start {
@@ -2896,7 +2893,6 @@ fn format_numeric(scaled: i128, scale: u8) -> String {
         format!("{int_part}.{frac_pad}")
     }
 }
-
 
 #[cfg(test)]
 mod tests {

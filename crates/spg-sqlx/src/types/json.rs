@@ -28,10 +28,7 @@ impl Type<Spg> for serde_json::Value {
 }
 
 impl<'q> Encode<'q, Spg> for serde_json::Value {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         let s = serde_json::to_string(self)?;
         buf.push(SpgArgumentValue {
             value: EngineValue::Json(s),

@@ -30,7 +30,8 @@ fn drop_column_basic() {
 #[test]
 fn drop_column_if_exists_idempotent() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, x INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, x INT)")
+        .unwrap();
     e.execute("ALTER TABLE t DROP COLUMN IF EXISTS x").unwrap();
     // Re-drop is a no-op under IF EXISTS.
     e.execute("ALTER TABLE t DROP COLUMN IF EXISTS x").unwrap();
@@ -47,7 +48,8 @@ fn drop_column_without_if_exists_errors_when_missing() {
 #[test]
 fn drop_column_with_fk_dependent_without_cascade_errors() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)").unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
     e.execute("CREATE TABLE c (id INT NOT NULL, pid INT REFERENCES p(id))")
         .unwrap();
     let r = e.execute("ALTER TABLE c DROP COLUMN pid");
@@ -57,7 +59,8 @@ fn drop_column_with_fk_dependent_without_cascade_errors() {
 #[test]
 fn drop_column_with_fk_dependent_cascade_drops_fk_too() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)").unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
     e.execute("CREATE TABLE c (id INT NOT NULL, pid INT REFERENCES p(id))")
         .unwrap();
     e.execute("ALTER TABLE c DROP COLUMN pid CASCADE").unwrap();
@@ -68,7 +71,8 @@ fn drop_column_with_fk_dependent_cascade_drops_fk_too() {
 #[test]
 fn drop_column_bare_drop_without_column_keyword() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, x INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, x INT)")
+        .unwrap();
     e.execute("ALTER TABLE t DROP x").unwrap();
     let table = e.catalog().get("t").unwrap();
     assert_eq!(table.schema().columns.len(), 1);
@@ -79,7 +83,8 @@ fn drop_column_bare_drop_without_column_keyword() {
 #[test]
 fn create_table_if_not_exists_is_noop_on_existing_table() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE contacts (id INT NOT NULL, email TEXT)").unwrap();
+    e.execute("CREATE TABLE contacts (id INT NOT NULL, email TEXT)")
+        .unwrap();
     // Second create with a different shape — PG-strict semantics:
     // table already exists, so this is a no-op. The "added" columns
     // must NOT appear in the existing table.
@@ -92,7 +97,12 @@ fn create_table_if_not_exists_is_noop_on_existing_table() {
     )
     .unwrap();
     let table = e.catalog().get("contacts").unwrap();
-    let names: Vec<&str> = table.schema().columns.iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = table
+        .schema()
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert!(names.contains(&"id"));
     assert!(names.contains(&"email"));
     assert!(!names.contains(&"address_book_id"));
@@ -104,7 +114,8 @@ fn create_table_if_not_exists_does_not_register_inline_fk_on_existing_table() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE address_books (id BIGINT NOT NULL PRIMARY KEY)")
         .unwrap();
-    e.execute("CREATE TABLE contacts (id INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE contacts (id INT NOT NULL)")
+        .unwrap();
     e.execute(
         "CREATE TABLE IF NOT EXISTS contacts (\
            id INT NOT NULL, \
@@ -119,7 +130,8 @@ fn create_table_if_not_exists_does_not_register_inline_fk_on_existing_table() {
 #[test]
 fn create_table_if_not_exists_doesnt_modify_existing_columns() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
     // Try to "redefine" with a different type for `name`.
     e.execute(
@@ -155,11 +167,20 @@ fn create_table_inline_fk_lands_on_column_on_fresh_create() {
     )
     .unwrap();
     let contacts = e.catalog().get("contacts").unwrap();
-    let names: Vec<&str> = contacts.schema().columns.iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = contacts
+        .schema()
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert!(names.contains(&"address_book_id"));
     assert_eq!(contacts.schema().foreign_keys.len(), 1);
-    assert_eq!(contacts.schema().foreign_keys[0].parent_table, "address_books");
-    e.execute("CREATE INDEX idx_book ON contacts(address_book_id)").unwrap();
+    assert_eq!(
+        contacts.schema().foreign_keys[0].parent_table,
+        "address_books"
+    );
+    e.execute("CREATE INDEX idx_book ON contacts(address_book_id)")
+        .unwrap();
 }
 
 // ── S10: '<text>'::jsonb cast produces JSONB ─────────────────────
@@ -196,7 +217,8 @@ fn jsonb_cast_in_insert_value() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE jb (id INT NOT NULL, data JSONB NOT NULL DEFAULT '[]'::jsonb)")
         .unwrap();
-    e.execute("INSERT INTO jb VALUES (1, '[1,2,3]'::jsonb)").unwrap();
+    e.execute("INSERT INTO jb VALUES (1, '[1,2,3]'::jsonb)")
+        .unwrap();
     let table = e.catalog().get("jb").unwrap();
     let row = table.rows().get(0).unwrap();
     assert!(matches!(&row.values[1], spg_storage::Value::Json(s) if s == "[1,2,3]"));

@@ -3706,7 +3706,9 @@ fn bootstrap_admin_from_env(engine: &mut Engine, db_path: Option<&Path>) -> std:
         );
     }
     let (pw, user) = match (
-        env::var("SPG_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty()),
+        env::var("SPG_ADMIN_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty()),
         pg_pass,
     ) {
         (Some(spg_pw), _) => {
@@ -4120,8 +4122,7 @@ fn emit_result(
             // offset, distinguishing it from plain TIMESTAMP.
             // Both are stored as i64 microseconds UTC; the type
             // tag is the only thing that says "include offset".
-            let col_types: Vec<DataType> =
-                columns.iter().map(|c| c.ty).collect();
+            let col_types: Vec<DataType> = columns.iter().map(|c| c.ty).collect();
             if rows.len() <= 1 {
                 for row in rows {
                     let wire = row_to_wire_with_types(&row, &col_types);
@@ -4130,8 +4131,10 @@ fn emit_result(
                     encode(&frame, &mut out).map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
             } else {
-                let wire_rows: Vec<Vec<WireValue>> =
-                    rows.iter().map(|r| row_to_wire_with_types(r, &col_types)).collect();
+                let wire_rows: Vec<Vec<WireValue>> = rows
+                    .iter()
+                    .map(|r| row_to_wire_with_types(r, &col_types))
+                    .collect();
                 for chunk in wire_rows.chunks(BATCH_ROWS_PER_FRAME) {
                     let frame = build_data_row_batch(chunk)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;

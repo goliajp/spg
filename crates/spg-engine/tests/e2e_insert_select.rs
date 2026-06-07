@@ -38,7 +38,8 @@ fn insert_select_with_where_filters_rows() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE src (id INT NOT NULL)").unwrap();
     eng.execute("CREATE TABLE dst (id INT NOT NULL)").unwrap();
-    eng.execute("INSERT INTO src VALUES (1), (2), (3), (4)").unwrap();
+    eng.execute("INSERT INTO src VALUES (1), (2), (3), (4)")
+        .unwrap();
     eng.execute("INSERT INTO dst SELECT id FROM src WHERE id > 2")
         .unwrap();
     let dst = eng.catalog().get("dst").expect("table present");

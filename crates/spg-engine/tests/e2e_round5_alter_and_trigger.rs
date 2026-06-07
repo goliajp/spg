@@ -35,7 +35,8 @@ fn update_of_filter_skips_trigger_when_other_columns_change() {
     eng.execute("CREATE TABLE msgs (id INT NOT NULL, subject TEXT, sender TEXT)")
         .unwrap();
     eng.execute("CREATE TABLE audit (n INT NOT NULL)").unwrap();
-    eng.execute("INSERT INTO msgs VALUES (1, 'sub', 'a@x')").unwrap();
+    eng.execute("INSERT INTO msgs VALUES (1, 'sub', 'a@x')")
+        .unwrap();
     eng.execute(
         "CREATE OR REPLACE FUNCTION audit_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$\n\
          BEGIN INSERT INTO audit VALUES (1); RETURN NEW; END\n\
@@ -51,12 +52,20 @@ fn update_of_filter_skips_trigger_when_other_columns_change() {
     eng.execute("UPDATE msgs SET sender = 'b@x' WHERE id = 1")
         .unwrap();
     let audit = eng.catalog().get("audit").expect("table present");
-    assert_eq!(audit.rows().len(), 0, "trigger fired despite UPDATE OF filter");
+    assert_eq!(
+        audit.rows().len(),
+        0,
+        "trigger fired despite UPDATE OF filter"
+    );
     // Now update subject — trigger should fire.
     eng.execute("UPDATE msgs SET subject = 'sub2' WHERE id = 1")
         .unwrap();
     let audit = eng.catalog().get("audit").expect("table present");
-    assert_eq!(audit.rows().len(), 1, "trigger should fire when subject changes");
+    assert_eq!(
+        audit.rows().len(),
+        1,
+        "trigger should fire when subject changes"
+    );
 }
 
 #[test]
@@ -88,7 +97,8 @@ fn alter_column_type_widens_int_to_bigint() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     eng.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
-    eng.execute("ALTER TABLE t ALTER COLUMN id TYPE BIGINT").unwrap();
+    eng.execute("ALTER TABLE t ALTER COLUMN id TYPE BIGINT")
+        .unwrap();
     let table = eng.catalog().get("t").expect("table present");
     assert_eq!(table.schema().columns[0].ty, spg_storage::DataType::BigInt);
     for row in table.rows() {

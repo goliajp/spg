@@ -62,9 +62,7 @@ fn prepare_then_bind_dml() {
     db.execute("CREATE TABLE items (id INT NOT NULL, qty INT NOT NULL)")
         .unwrap();
 
-    let insert = db
-        .prepare("INSERT INTO items VALUES ($1, $2)")
-        .unwrap();
+    let insert = db.prepare("INSERT INTO items VALUES ($1, $2)").unwrap();
     db.execute_prepared(&insert, &[Value::Int(1), Value::Int(10)])
         .unwrap();
     db.execute_prepared(&insert, &[Value::Int(2), Value::Int(20)])
@@ -106,9 +104,7 @@ fn prepare_multi_param_mixed_types() {
     let select = db
         .prepare("SELECT id, name, active FROM events WHERE active = $1")
         .unwrap();
-    let rows = db
-        .query_prepared(&select, &[Value::Bool(true)])
-        .unwrap();
+    let rows = db.query_prepared(&select, &[Value::Bool(true)]).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], Value::Int(1));
     assert_eq!(rows[0][1], Value::Text("signin".into()));

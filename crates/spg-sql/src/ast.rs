@@ -306,10 +306,7 @@ pub enum AlterTableTarget {
     /// v7.6.8 — `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name`.
     /// `if_exists` (v7.13.2 mailrs round-6 S7) makes the drop a
     /// no-op when no FK with that name exists; otherwise raises.
-    DropForeignKey {
-        name: String,
-        if_exists: bool,
-    },
+    DropForeignKey { name: String, if_exists: bool },
     /// v7.13.0 — `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] <col>
     /// <type> [DEFAULT <expr>] [NOT NULL]`. mailrs round-5 G1
     /// (20 migrate-*.sql hits). Engine appends the column to the
@@ -563,7 +560,10 @@ pub enum PlPgSqlStmt {
     /// in the DECLARE scope. Single-column / single-row
     /// queries only at v7.16.2; multi-target (`INTO a, b`) is
     /// a v7.16.x follow-up.
-    SelectInto { var: String, body: Box<SelectStatement> },
+    SelectInto {
+        var: String,
+        body: Box<SelectStatement>,
+    },
     /// `RETURN <target>;` — trigger functions canonically return
     /// `NEW` / `OLD` / `NULL`; v7.12.4 also accepts a bare
     /// expression for forward compatibility with scalar UDFs.
@@ -840,10 +840,7 @@ pub enum TableConstraint {
     /// this same variant at parse time. Engine evaluates the
     /// predicate against each INSERT/UPDATE candidate row; a
     /// false / NULL result rejects the mutation.
-    Check {
-        name: Option<String>,
-        expr: Expr,
-    },
+    Check { name: Option<String>, expr: Expr },
     /// v7.15.0 — MySQL `KEY name (cols)` / `INDEX name (cols)`
     /// non-unique secondary-index declaration inline in CREATE
     /// TABLE. Engine builds a BTree index on the leading column
@@ -2250,7 +2247,11 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
             write!(f, "RENAME TO {}", quote_ident(new))
         }
         AlterTableTarget::SetTriggerEnabled { which, enabled } => {
-            f.write_str(if *enabled { "ENABLE TRIGGER " } else { "DISABLE TRIGGER " })?;
+            f.write_str(if *enabled {
+                "ENABLE TRIGGER "
+            } else {
+                "DISABLE TRIGGER "
+            })?;
             match which {
                 TriggerSelector::All => f.write_str("ALL"),
                 TriggerSelector::Named(n) => f.write_str(&quote_ident(n)),

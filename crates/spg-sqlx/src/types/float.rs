@@ -22,10 +22,7 @@ impl Type<Spg> for f64 {
 }
 
 impl<'q> Encode<'q, Spg> for f64 {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::Float(*self),
             type_info: Some(<f64 as Type<Spg>>::type_info()),
@@ -54,10 +51,7 @@ impl Type<Spg> for f32 {
 }
 
 impl<'q> Encode<'q, Spg> for f32 {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::Float(f64::from(*self)),
             type_info: Some(<f32 as Type<Spg>>::type_info()),

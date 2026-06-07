@@ -122,9 +122,7 @@ impl ConnectOptions for SpgConnectOptions {
             let inner = shared
                 .get_or_try_init(|| async {
                     match path {
-                        None => Ok::<_, Error>(
-                            spg_embedded_tokio::AsyncDatabase::open_in_memory(),
-                        ),
+                        None => Ok::<_, Error>(spg_embedded_tokio::AsyncDatabase::open_in_memory()),
                         Some(p) => spg_embedded_tokio::AsyncDatabase::open_path(p)
                             .await
                             .map_err(crate::error::engine_to_sqlx),

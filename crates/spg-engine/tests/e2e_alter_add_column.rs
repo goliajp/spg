@@ -39,10 +39,7 @@ fn add_column_with_literal_default_back_fills_existing_rows() {
     let table = eng.catalog().get("t").expect("table present");
     assert!(!table.schema().columns[1].nullable);
     for row in table.rows() {
-        assert!(matches!(
-            row.values[1],
-            spg_storage::Value::Bool(false)
-        ));
+        assert!(matches!(row.values[1], spg_storage::Value::Bool(false)));
     }
 }
 

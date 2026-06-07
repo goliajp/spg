@@ -23,10 +23,7 @@ impl Type<Spg> for bool {
 }
 
 impl<'q> Encode<'q, Spg> for bool {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::Bool(*self),
             type_info: Some(<bool as Type<Spg>>::type_info()),
