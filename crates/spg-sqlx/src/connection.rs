@@ -260,6 +260,7 @@ async fn run_one(
     }
 }
 
+#[allow(dead_code)]
 fn affected_from(qr: &EngineQueryResult) -> u64 {
     match qr {
         EngineQueryResult::CommandOk { affected, .. } => u64::try_from(*affected).unwrap_or(0),

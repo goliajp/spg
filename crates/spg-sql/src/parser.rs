@@ -934,7 +934,7 @@ impl Parser {
                 ) =>
             {
                 self.consume_until_statement_boundary();
-                return Ok(Statement::Empty);
+                Ok(Statement::Empty)
             }
             other => Err(self.err(format!(
                 "expected TABLE / INDEX / USER / EXTENSION / PUBLICATION / SUBSCRIPTION / FUNCTION / TRIGGER / SEQUENCE / SCHEMA / VIEW / TYPE / DOMAIN [OR REPLACE …] after CREATE, got {other:?}"
@@ -3219,14 +3219,9 @@ impl Parser {
         }
         self.advance();
         let mut cols: Vec<String> = Vec::new();
-        loop {
-            match self.peek().clone() {
-                Token::Ident(s) | Token::QuotedIdent(s) => {
-                    self.advance();
-                    cols.push(s);
-                }
-                _ => break,
-            }
+        while let Token::Ident(s) | Token::QuotedIdent(s) = self.peek().clone() {
+            self.advance();
+            cols.push(s);
             // Skip optional `(length)` per-column prefix.
             if matches!(self.peek(), Token::LParen) {
                 let mut depth = 1usize;
@@ -4963,14 +4958,9 @@ impl Parser {
         let mut cols: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
             self.advance();
-            loop {
-                match self.peek().clone() {
-                    Token::Ident(s) | Token::QuotedIdent(s) => {
-                        self.advance();
-                        cols.push(s);
-                    }
-                    _ => break,
-                }
+            while let Token::Ident(s) | Token::QuotedIdent(s) = self.peek().clone() {
+                self.advance();
+                cols.push(s);
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                     continue;

@@ -856,6 +856,7 @@ pub enum TableConstraint {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // grammar-driven; each flag maps to a distinct PG column-constraint keyword
 pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnTypeName,

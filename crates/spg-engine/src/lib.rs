@@ -1341,7 +1341,7 @@ impl Engine {
                 .map_err(|e| {
                     EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}")))
                 })?;
-        drop(engine_cell);
+        // engine_cell goes out of scope here, releasing the &mut self borrow
         // Run each embedded statement against the engine. The
         // statements were already substitute-walked for NEW/OLD/
         // locals (those evaluate to engine literals before they
@@ -3653,7 +3653,7 @@ impl Engine {
                 // INSERT batch — reusing the v7.6.2 enforce helper.
                 let existing_rows: Vec<Vec<Value>> = self
                     .active_catalog()
-                    .get(&s.name)
+                    .get(s.name)
                     .expect("checked above")
                     .rows()
                     .iter()
@@ -5959,6 +5959,7 @@ impl Engine {
             .to_string();
         // Owned (rows, schema) per peer — borrows from the catalog
         // would not survive UNNEST-side materialisation.
+        #[allow(clippy::type_complexity)]
         let mut joined: Vec<(Vec<Row>, Vec<ColumnSchema>, String, JoinKind, Option<&Expr>)> =
             Vec::new();
         for j in &from.joins {

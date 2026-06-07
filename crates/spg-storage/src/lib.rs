@@ -1927,7 +1927,7 @@ impl Table {
             }
             // Same shift for any included-columns reference.
             for inc in &mut idx.included_columns {
-                if *inc as usize > col_pos {
+                if *inc > col_pos {
                     *inc -= 1;
                 }
             }
