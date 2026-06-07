@@ -1268,6 +1268,22 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // x=0 with negative y → error (1/0). NULL → NULL.
         // PG `sqrt(x)` — square root. Negative input → error.
         // PG `sign(x)` — -1 / 0 / 1.
+        // PG `random()` — uniform float in [0, 1). Per-row /
+        // per-call: each evaluation returns a different value
+        // even within the same statement. Backed by a xorshift64*
+        // PRNG with a process-static seed; not cryptographically
+        // secure (use a cryptographic source for security tokens).
+        "random" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "random() takes 0 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            Ok(Value::Float(prng_next_f64()))
+        }
         "sign" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -3409,6 +3425,45 @@ fn f64_trunc(x: f64) -> f64 {
         return x;
     }
     (x as i64) as f64
+}
+
+/// xorshift64* PRNG state — process-static seed advanced on
+/// every `random()` call. Not cryptographically secure; use
+/// `gen_random_uuid` / future crypto-RNG functions when
+/// security matters.
+static PRNG_STATE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
+
+/// Advance the PRNG and return a uniform double in [0, 1).
+fn prng_next_f64() -> f64 {
+    use core::sync::atomic::Ordering;
+    // CAS-loop ensures concurrent random() callers don't see the
+    // same value; the xorshift64* recurrence is deterministic
+    // given a seed, so atomic exchange is enough.
+    let mut x = PRNG_STATE.load(Ordering::Relaxed);
+    loop {
+        if x == 0 {
+            x = 0x2545_F491_4F6C_DD1D;
+        }
+        let mut next = x;
+        next ^= next << 13;
+        next ^= next >> 7;
+        next ^= next << 17;
+        match PRNG_STATE.compare_exchange_weak(
+            x,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                // 53 bits of randomness mapped to [0, 1).
+                let mantissa = next >> 11;
+                let denom = (1u64 << 53) as f64;
+                return mantissa as f64 / denom;
+            }
+            Err(seen) => x = seen,
+        }
+    }
 }
 
 /// no_std `f64::sqrt(x)` — square root via Newton's method
