@@ -8,6 +8,98 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.16.2] — 2026-06-07 (mailrs round-10 closures: DO blocks + information_schema + SELECT INTO + table/index RENAME)
+
+The "mailrs migrate-042 unblocks + DO blocks stop silently no-op'ing" patch.
+Closes mailrs round-10's three SPG-side items (A.1 `SET SESSION
+AUTHORIZATION DEFAULT`, A.2 DO-block executor — was SEV-1 silent
+no-op, A.3 `information_schema.columns` / `.tables` virtual views)
+plus the migrate-042 surfaces: SELECT INTO inside plpgsql, whole-table
+RENAME, index RENAME. Also reverts the v7.13.3 "reconcile" path on
+`CREATE TABLE IF NOT EXISTS` back to PG-strict no-op — it was silently
+re-adding schema-renamed columns on prod-upgrade, masking real
+breakage in migrate-040.
+
+### What shipped
+
+1. **`SET SESSION AUTHORIZATION DEFAULT`** (round-10 A.1). pg_dump
+   emits this before every reload to clear any
+   `SESSION AUTHORIZATION` an earlier dump-step might have left
+   stuck. SPG now parses + no-ops it as PG does for unauthenticated
+   sessions.
+
+2. **DO blocks execute their body for real** (round-10 A.2 — SEV-1).
+   Pre-v7.16.2 SPG silently no-op'd top-level
+   `DO $$ BEGIN … END $$;` blocks: pg_dump's tagged dollar-quoted
+   prelude (e.g. mailrs migrate-038 idempotent column-add idiom)
+   returned `DO` without ever running the body, so migrations that
+   wrapped real work in a DO block went through "OK" while
+   silently doing nothing. v7.16.2 parses the body as
+   `PlPgSqlBlock` and runs it through the same trigger executor
+   path (IF / RAISE / RETURN / embedded INSERT-UPDATE-DELETE-SELECT
+   + new CREATE/ALTER/DROP routing). A `SelectIntoResolver`
+   callback lets the DO body run SELECT INTO into local plpgsql
+   vars using the engine's own SELECT path.
+
+3. **`information_schema.{columns,tables}` + `pg_catalog.{pg_class,pg_attribute}` virtual views**
+   (round-10 A.3). mailrs's migrate-038/040/042 all use
+   `SELECT EXISTS (SELECT 1 FROM information_schema.columns …)`
+   as the idempotency guard. Pre-v7.16.2 SPG resolved
+   `information_schema.columns` as a missing table and the whole
+   migration aborted. v7.16.2 detects the `information_schema.X`
+   / `pg_catalog.X` qualified name at parse time, rewrites to a
+   synthetic table name (`__spg_info_columns` etc.), and
+   materialises the view on demand into a clone-engine so the
+   primary catalog is never mutated. plpgsql `Expr::Exists` /
+   `Expr::ScalarSubquery` slots are pre-resolved into literals
+   before row eval to avoid re-entering the meta-view dispatch
+   mid-evaluation.
+
+4. **SELECT INTO inside plpgsql** (mailrs migrate-042). The
+   plpgsql parser walks the token stream after a `SELECT`, finds
+   the `INTO` at paren-depth 0, and splits the stream into
+   "pre-INTO projection" + "var name" + "post-INTO FROM/WHERE…"
+   — then rebuilds and parses as a regular SELECT body. The new
+   `PlPgSqlStmt::SelectInto { var, body }` runs via the
+   `SelectIntoResolver` callback so the next plpgsql statement
+   sees the assigned value in the locals scope.
+
+5. **`ALTER TABLE … RENAME TO new_name`** (mailrs migrate-042).
+   Storage gets a new `rename_table` that updates the schema's
+   `name`, the catalog's `by_name` index, every dangling FK
+   `parent_table` reference, and every trigger's `table` field —
+   in one pass. AST: `AlterTableTarget::RenameTable { new: String }`.
+
+6. **`ALTER INDEX [IF EXISTS] name RENAME TO new_name`** (mailrs
+   migrate-042). Storage gets `rename_index` that walks tables to
+   find the owner of `name`, rejects duplicate target name, and
+   renames in place. `AlterIndexTarget::Rename { new, if_exists }`.
+
+7. **`CREATE TABLE IF NOT EXISTS` reverts to PG-strict no-op on
+   existing table** (mailrs round-10 root-cause find). v7.13.3
+   added a "reconcile" path that added missing columns when the
+   existing table's shape was a subset of the new definition.
+   PG doesn't do that. mailrs's migrate-040 renamed
+   `system_config.key` → `config_key`, then migrate-009 ran
+   again on re-deploy with the new `config_key` shape — the
+   reconcile path silently re-added the renamed-away `key` column
+   under a different name, breaking the next reload. v7.16.2
+   restores PG-strict semantics. Round-7's actual S9 requirement
+   — inline `REFERENCES` in `CREATE TABLE` column defs on a
+   fresh create — is unchanged and verified by the new
+   `e2e_round7_surfaces::create_table_inline_fk_lands_on_column_on_fresh_create`
+   test.
+
+### Gate state
+
+- **Workspace tests** — green
+- **sqllogictest** — 476/476 (148 duckdb + 34 mysql + 231 pg_regress + 63 pgvector), 100%
+- **dump_compat** — 10/10 corpora PASS (pg/mysql/mariadb × {blog, forum, minimal})
+- **data_compat** — 2/2 fixtures PASS (mailrs-prod-shape, posts)
+- **mailrs zero-change cutover** — 42/42 ZERO-CHANGE CUTOVER VERIFIED
+
+---
+
 ## [7.16.1] — 2026-06-07 (mailrs round-9 closures: TSVECTOR wire + DISABLE/ENABLE TRIGGER + trigger NEW.col regression fix)
 
 The "mailrs server + embed cutover paths both unblock" patch.
