@@ -1,0 +1,29 @@
+# v7.17.0 Phase 4.1 — MySQL DELIMITER directive.
+# Parsed as Empty (no-op) so mysqldump scripts that emit
+# `DELIMITER //` … `DELIMITER ;` brackets around stored-routine
+# bodies load without parser noise. SPG processes one statement
+# at a time so the actual terminator switching is moot.
+
+statement ok
+DELIMITER //
+
+statement ok
+DELIMITER ;
+
+# DELIMITER does not interrupt subsequent statements.
+statement ok
+DELIMITER //
+
+statement ok
+CREATE TABLE t (id INT NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+DELIMITER ;
+
+query I
+SELECT id FROM t
+----
+1

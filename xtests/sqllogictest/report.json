@@ -45,13 +45,15 @@
         { "file": "21_order_by_desc.test", "pass": 8, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "mysql", "pass": 34, "fail": 0, "skip": 0,
+    { "name": "mysql", "pass": 41, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_dialect.test", "pass": 12, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "02_int_types.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "03_inline_key.test", "pass": 17, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "05_delimiter.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pg_regress", "pass": 560, "fail": 0, "skip": 0,
