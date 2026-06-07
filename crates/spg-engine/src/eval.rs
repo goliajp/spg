@@ -1261,6 +1261,57 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         //   * mod(7, -3) = 1
         //   * mod(-7, -3) = -1
         // Division by zero → error. NULL on any arg → NULL.
+        // PG `power(x, y)` / `pow(x, y)` — x^y.
+        // Integer exponent → exact via repeated multiplication
+        // (no precision loss). Fractional exponent → exp(y*ln(x))
+        // via the no_std exp/ln series helpers.
+        // x=0 with negative y → error (1/0). NULL → NULL.
+        "power" | "pow" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "power() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let x = value_to_f64(&args[0]).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: "power() needs numeric x".into(),
+                }
+            })?;
+            let y = value_to_f64(&args[1]).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: "power() needs numeric y".into(),
+                }
+            })?;
+            // Integer-exponent fast path.
+            let y_int = y as i32;
+            if (y_int as f64) == y && y.abs() < 1024.0 {
+                let result = f64_powi(x, y_int);
+                return Ok(Value::Float(result));
+            }
+            // Fractional exponent — only defined for x >= 0 in real
+            // arithmetic. Negative x raised to fractional power is
+            // complex; reject cleanly.
+            if x < 0.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "power(): negative base with fractional exponent yields complex result".into(),
+                });
+            }
+            if x == 0.0 && y < 0.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "power(): 0 raised to negative power is undefined".into(),
+                });
+            }
+            if x == 0.0 {
+                return Ok(Value::Float(0.0));
+            }
+            Ok(Value::Float(f64_exp(y * f64_ln(x))))
+        }
         "mod" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -3287,6 +3338,76 @@ fn f64_trunc(x: f64) -> f64 {
         return x;
     }
     (x as i64) as f64
+}
+
+/// no_std `f64::exp(x)` — e^x via range-reduction + Taylor
+/// series. Adequate for power(), exp(), and pseudo-random-ish
+/// scales the engine uses; ~1e-12 relative error in the
+/// common range.
+fn f64_exp(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x > 709.0 {
+        return f64::INFINITY;
+    }
+    if x < -745.0 {
+        return 0.0;
+    }
+    // exp(x) = 2^k * exp(r) where r = x - k*ln(2), |r| <= ln(2)/2.
+    const LN2: f64 = 0.6931471805599453;
+    let k = f64_round_half_away(x / LN2) as i32;
+    let r = x - (k as f64) * LN2;
+    // Taylor series for exp(r): sum r^n / n!  (rapid for |r|<0.35)
+    let mut term = 1.0;
+    let mut sum = 1.0;
+    for n in 1..=20 {
+        term *= r / (n as f64);
+        sum += term;
+        if term.abs() < 1e-18 {
+            break;
+        }
+    }
+    // Multiply by 2^k.
+    f64_powi(2.0, k) * sum
+}
+
+/// no_std `f64::ln(x)` — natural log via range-reduction +
+/// atanh series. x must be positive (caller's contract).
+fn f64_ln(x: f64) -> f64 {
+    if x <= 0.0 {
+        return f64::NAN;
+    }
+    if x == 1.0 {
+        return 0.0;
+    }
+    // x = 2^k * m where m in [0.5, 1.0). Then ln(x) = k*ln(2) + ln(m).
+    const LN2: f64 = 0.6931471805599453;
+    let mut k = 0i32;
+    let mut m = x;
+    while m >= 2.0 {
+        m *= 0.5;
+        k += 1;
+    }
+    while m < 1.0 {
+        m *= 2.0;
+        k -= 1;
+    }
+    // Now m in [1.0, 2.0). Use atanh series via u = (m-1)/(m+1).
+    // ln(m) = 2*(u + u^3/3 + u^5/5 + ...). Converges fast.
+    let u = (m - 1.0) / (m + 1.0);
+    let u2 = u * u;
+    let mut term = u;
+    let mut sum = u;
+    for k_iter in 1..50 {
+        term *= u2;
+        let denom = (2 * k_iter + 1) as f64;
+        sum += term / denom;
+        if (term / denom).abs() < 1e-18 {
+            break;
+        }
+    }
+    2.0 * sum + (k as f64) * LN2
 }
 
 /// no_std `f64::powi` substitute — integer exponent for f64

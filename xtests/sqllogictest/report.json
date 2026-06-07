@@ -62,7 +62,7 @@
         { "file": "08_create_procedure.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 894, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 907, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -167,6 +167,8 @@
         { "file": "51_greatest_least.test", "pass": 18, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "52_mod.test", "pass": 14, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "53_power.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
