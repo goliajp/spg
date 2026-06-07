@@ -557,12 +557,17 @@ impl Parser {
                     }
                     // v7.14.0 — DROP SCHEMA [IF EXISTS] name
                     // [CASCADE|RESTRICT]. SPG is single-database;
-                    // schemas are accepted as no-ops (any name
-                    // resolves to the single catalog).
+                    // v7.17.0 Phase 1.6 — DROP SCHEMA [IF EXISTS]
+                    // name [, name…] [CASCADE | RESTRICT]. Real
+                    // unregister (was silent no-op pre-v7.17).
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("schema") => {
                         self.advance();
-                        let _ = self.consume_if_exists();
-                        let _ = self.expect_ident_like()?;
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
                         if matches!(
                             self.peek(),
                             Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
@@ -570,7 +575,7 @@ impl Parser {
                         ) {
                             self.advance();
                         }
-                        Ok(Statement::Empty)
+                        Ok(Statement::DropSchema { names, if_exists })
                     }
                     // v7.17.0 Phase 1.4 — DROP TYPE [IF EXISTS]
                     // name [, name…] [CASCADE|RESTRICT].
@@ -1043,6 +1048,23 @@ impl Parser {
                 self.advance();
                 self.parse_create_domain_after_keyword()
             }
+            // v7.17.0 Phase 1.6 — CREATE SCHEMA [IF NOT EXISTS]
+            // name [AUTHORIZATION user]. Real catalog registry
+            // (was silent-no-op'd pre-v7.17).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("schema") => {
+                self.advance();
+                let if_not_exists = self.parse_if_not_exists();
+                let name = self.expect_ident_like()?;
+                // Optional `AUTHORIZATION <user>` trailer — accepted,
+                // ignored (single-user catalog).
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("authorization"))
+                {
+                    self.advance();
+                    let _ = self.expect_ident_like()?;
+                }
+                Ok(Statement::CreateSchema { name, if_not_exists })
+            }
             // v7.17.0 Phase 1.3 — CREATE MATERIALIZED VIEW …
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("materialized") => {
                 self.advance();
@@ -1083,15 +1105,14 @@ impl Parser {
             // SPG is single-schema / single-database; these have
             // no behavioural effect, so consume + return Empty.
             // v7.17.0 NOTE: SEQUENCE / VIEW / MATERIALIZED VIEW /
-            // TYPE / DOMAIN were here pre-v7.17; all moved up to
-            // real parser branches. SCHEMA / DATABASE / ROLE /
+            // TYPE / DOMAIN / SCHEMA were here pre-v7.17; all
+            // moved up to real parser branches. DATABASE / ROLE /
             // POLICY / OPERATOR stay no-op forever
-            // (single-namespace).
+            // (single-database, hardcoded roles).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
-                    "schema"
-                        | "database"
+                    "database"
                         | "role"
                         | "policy"
                         | "operator"

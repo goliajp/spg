@@ -1852,6 +1852,12 @@ impl Engine {
             Statement::DropDomain { names, if_exists } => {
                 self.exec_drop_domain(&names, if_exists)
             }
+            Statement::CreateSchema { name, if_not_exists } => {
+                self.exec_create_schema(name, if_not_exists)
+            }
+            Statement::DropSchema { names, if_exists } => {
+                self.exec_drop_schema(&names, if_exists)
+            }
             Statement::ResetParameter(target) => {
                 match target {
                     None => self.session_params.clear(),
@@ -3439,6 +3445,53 @@ impl Engine {
             } else if !if_exists {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                     alloc::format!("domain {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.6 — `CREATE SCHEMA [IF NOT EXISTS] name`.
+    /// Registers the schema in the catalog. Schema-qualified
+    /// table references continue to strip the prefix at lookup
+    /// time (prefix routing, not isolation — see project-next-
+    /// docket for the v7.18+ real-isolation tracking).
+    fn exec_create_schema(
+        &mut self,
+        name: String,
+        if_not_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        self.active_catalog_mut()
+            .create_schema(name, if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.6 — `DROP SCHEMA [IF EXISTS] names`.
+    /// Built-in schemas always reject the drop with a clear
+    /// error.
+    fn exec_drop_schema(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self
+                .active_catalog_mut()
+                .drop_schema(name)
+                .map_err(EngineError::Storage)?;
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("schema {name:?} does not exist"),
                 )));
             }
         }

@@ -3370,6 +3370,15 @@ pub struct Catalog {
     /// Persisted in catalog FILE_VERSION 30+; older catalogs
     /// deserialise with an empty map.
     domain_types: BTreeMap<String, DomainDef>,
+    /// v7.17.0 — schema-namespace registry (Phase 1.6). Tracks
+    /// which schemas exist. `public`, `pg_catalog`, and
+    /// `information_schema` are built-in and always present.
+    /// Schema-qualified table references still strip the prefix
+    /// at lookup time per v7.16-and-earlier — full
+    /// schema-as-isolation is v7.18+ scope. Persisted in catalog
+    /// FILE_VERSION 31+; older catalogs deserialise with just
+    /// the built-ins.
+    schemas: alloc::collections::BTreeSet<String>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -3470,6 +3479,17 @@ pub enum SequenceDataType {
     BigInt,
 }
 
+/// v7.17.0 Phase 1.6 — built-in schema names that every Catalog
+/// understands without an explicit CREATE SCHEMA. Used by
+/// [`Catalog::schema_exists`] and the engine's schema-qualified
+/// lookup path.
+#[must_use]
+pub fn is_builtin_schema(name: &str) -> bool {
+    name.eq_ignore_ascii_case("public")
+        || name.eq_ignore_ascii_case("pg_catalog")
+        || name.eq_ignore_ascii_case("information_schema")
+}
+
 /// v7.17.0 Phase 1.5 — catalogued user-defined DOMAIN. A domain
 /// is a named CHECK-constrained alias over a built-in type;
 /// columns bound to it inherit the base type plus the CHECK
@@ -3557,6 +3577,7 @@ impl Catalog {
             materialized_views: BTreeMap::new(),
             enum_types: BTreeMap::new(),
             domain_types: BTreeMap::new(),
+            schemas: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -3835,6 +3856,66 @@ impl Catalog {
     /// v7.17.0 Phase 1.5 — drop a DOMAIN by name.
     pub fn drop_domain_type(&mut self, name: &str) -> bool {
         self.domain_types.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.6 — read-only handle to the user-created
+    /// schema registry. Built-in schemas (`public`, `pg_catalog`,
+    /// `information_schema`) are NOT included here; use
+    /// [`schema_exists`](Self::schema_exists) for the full
+    /// check.
+    pub const fn user_schemas(&self) -> &alloc::collections::BTreeSet<String> {
+        &self.schemas
+    }
+
+    /// v7.17.0 Phase 1.6 — schema-name resolver. Returns true
+    /// for built-in schemas + every user-CREATEd one. Used by
+    /// CREATE SCHEMA collision checks and (future) by
+    /// information_schema.schemata.
+    pub fn schema_exists(&self, name: &str) -> bool {
+        is_builtin_schema(name) || self.schemas.contains(name)
+    }
+
+    /// v7.17.0 Phase 1.6 — register a new schema. Errors if the
+    /// name already exists and `if_not_exists=false`. Built-in
+    /// names cannot be redeclared.
+    pub fn create_schema(
+        &mut self,
+        name: String,
+        if_not_exists: bool,
+    ) -> Result<(), StorageError> {
+        if is_builtin_schema(&name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "schema {name:?} is built-in and cannot be redeclared"
+            )));
+        }
+        if self.schemas.contains(&name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "schema {name:?} already exists"
+            )));
+        }
+        self.schemas.insert(name);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.6 — drop a user-created schema. Returns
+    /// true if a schema was removed. Built-in names always
+    /// return false (cannot be dropped). Tables that previously
+    /// used the schema as a prefix keep their bare name and stay
+    /// queryable — this is the "prefix routing, not isolation"
+    /// posture documented in v7.17 Phase 1.6.
+    pub fn drop_schema(&mut self, name: &str) -> Result<bool, StorageError> {
+        if is_builtin_schema(name) {
+            return Err(StorageError::Corrupt(format!(
+                "schema {name:?} is built-in and cannot be dropped"
+            )));
+        }
+        Ok(self.schemas.remove(name))
     }
 
     /// v7.17.0 — ALTER SEQUENCE option merge. Caller-provided
@@ -5384,7 +5465,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     `u16 check_count` then `check_count` Display-form
 ///     CHECK strings. v29-and-below catalogs deserialise with
 ///     an empty domain_types map and `user_domain_type = None`.
-const FILE_VERSION: u8 = 30;
+/// v31 introduces (v7.17.0 Phase 1.6):
+///   * Trailing user-schemas block after the DOMAIN block.
+///     Encoded as `u32 count` followed by `count` schema-name
+///     short strings. Built-in schemas (`public`, `pg_catalog`,
+///     `information_schema`) are NOT serialised — they're
+///     hardcoded in `is_builtin_schema`. v30-and-below catalogs
+///     deserialise with an empty user-schemas set.
+const FILE_VERSION: u8 = 31;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5893,6 +5981,16 @@ impl Catalog {
                 write_str(&mut out, c);
             }
         }
+        // v7.17.0 Phase 1.6 — user-schemas registry
+        // (FILE_VERSION 31+). Built-ins are hardcoded in
+        // `is_builtin_schema` and not persisted.
+        write_u32(
+            &mut out,
+            u32::try_from(self.schemas.len()).expect("≤ 4G schemas"),
+        );
+        for name in &self.schemas {
+            write_str(&mut out, name);
+        }
         out
     }
 
@@ -6120,6 +6218,15 @@ impl Catalog {
                         checks,
                     },
                 );
+            }
+        }
+        // v7.17.0 Phase 1.6 — user-schemas registry
+        // (FILE_VERSION 31+).
+        if version >= 31 {
+            let sch_count = cur.read_u32()? as usize;
+            for _ in 0..sch_count {
+                let name = cur.read_str()?;
+                cat.schemas.insert(name);
             }
         }
         if cur.pos < buf.len() {
