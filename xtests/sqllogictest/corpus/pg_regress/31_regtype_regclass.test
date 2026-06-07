@@ -1,0 +1,41 @@
+# v7.17.0 Phase 5.3 — `::regtype` / `::regclass` cast.
+#
+# PG semantics: each is a name-or-OID dressed up as a numeric type
+# that renders back textually. SPG has no OID space, but pg_dump /
+# Django ORM / sqlx code uses the cast purely for textual round-
+# trip — `'public.users'::regclass::text` → `'users'`. Pre-3.3 the
+# cast hard-errored (`v7.9.26` accept-and-fail-at-eval); Phase 5.3
+# lifts to text-in / text-out so the dominant dump-loader pattern
+# unblocks.
+
+# `'public.tbl'::regclass` strips the schema prefix.
+query T
+SELECT 'public.t'::REGCLASS
+----
+t
+
+# Unqualified name passes through as-is.
+query T
+SELECT 'users'::REGCLASS
+----
+users
+
+# `::regtype` is the same text-in / text-out contract for type
+# names. mailrs migration emits `'int4'::regtype` in catalog probes.
+query T
+SELECT 'int4'::REGTYPE
+----
+int4
+
+# Integer-shaped input renders as a textual OID.
+query T
+SELECT 16384::REGCLASS
+----
+16384
+
+# Chained `::regclass::text` round-trip (the dominant pg_dump
+# shape).
+query T
+SELECT ('public.users'::REGCLASS)::TEXT
+----
+users
