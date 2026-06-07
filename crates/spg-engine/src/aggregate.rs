@@ -178,7 +178,23 @@ pub fn run(
             .iter()
             .map(|g| eval::eval_expr(g, row, &ctx))
             .collect::<Result<_, _>>()?;
-        let key = encode_key(&group_vals);
+        // v7.17.0 Phase 2.5b — case-insensitive group keying.
+        // For each group_expr that's a column reference on a
+        // CaseInsensitive text column, fold the corresponding
+        // value before encoding the key. Display value
+        // (`group_vals`) stays original — only the key folds.
+        let mut key_vals = group_vals.clone();
+        for (i, g) in group_exprs.iter().enumerate() {
+            if matches!(
+                eval::column_collation(g, &ctx),
+                Some(spg_storage::Collation::CaseInsensitive)
+            ) {
+                if let Value::Text(s) = &key_vals[i] {
+                    key_vals[i] = Value::Text(s.to_ascii_lowercase());
+                }
+            }
+        }
+        let key = encode_key(&key_vals);
         let entry = groups.entry(key.clone()).or_insert_with(|| {
             key_order.push(key.clone());
             let init: Vec<AggState> = (0..agg_specs.len()).map(|_| AggState::default()).collect();
