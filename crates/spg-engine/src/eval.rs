@@ -1121,6 +1121,36 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // is an error in PG; NULL for %L renders as the SQL
         // literal `NULL`. Args missing for a position → error.
         "format" => format_string(args),
+        // PG `concat(args...)` — variadic; coerces every arg to
+        // its text representation; NULL arguments are silently
+        // skipped (the canonical PG semantic — `concat()` is the
+        // NULL-tolerant counterpart to the `||` operator which
+        // propagates NULL).
+        //
+        // Reference:
+        //   https://www.postgresql.org/docs/current/functions-string.html
+        //   "Concatenates the text representations of all the
+        //   arguments. NULL arguments are ignored."
+        //
+        // Edge cases:
+        //   * `concat()` (no args) → ''
+        //   * Every arg NULL → '' (NEVER returns NULL — distinct
+        //     from `||` and from `array_agg`)
+        //   * Bool → PG single-char form 't' / 'f'
+        //   * SmallInt / Int / BigInt / Float / Numeric / Date /
+        //     Timestamp / Json / Bytes → their canonical text
+        //     rendering (shared with `format()`'s %s specifier
+        //     via `value_to_format_text`).
+        "concat" => {
+            let mut out = String::new();
+            for v in args {
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                out.push_str(&value_to_format_text(v));
+            }
+            Ok(Value::Text(out))
+        }
         // v7.17.0 Phase 3.7 — PG regex function family.
         "regexp_matches" => regexp_matches(args),
         "regexp_replace" => regexp_replace(args),

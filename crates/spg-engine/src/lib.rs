@@ -13751,9 +13751,24 @@ fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
             }
             Ok(array_literal_widen(materialised))
         }
-        other => Err(EngineError::Unsupported(alloc::format!(
-            "non-literal INSERT value expression: {other:?}"
-        ))),
+        // Any other Expr shape — fall back to a general evaluation
+        // against an empty row + empty schema. This unblocks the
+        // app-common patterns where INSERT VALUES carries a
+        // non-correlated function call:
+        //   INSERT INTO t VALUES (concat('U-', 42))
+        //   INSERT INTO t VALUES (now())
+        //   INSERT INTO t VALUES (format('%s-%s', 'a', 'b'))
+        // Any expression that references a column or `$N`
+        // placeholder fails cleanly inside `eval_expr` with a
+        // descriptive error; literals + casts + ARRAY[…] continue
+        // to take the fast paths above so the hot INSERT path is
+        // unchanged on the common case.
+        other => {
+            let empty_schema: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
+            let ctx = EvalContext::new(&empty_schema, None);
+            let empty_row = spg_storage::Row::new(alloc::vec::Vec::new());
+            crate::eval::eval_expr(&other, &empty_row, &ctx).map_err(EngineError::Eval)
+        }
     }
 }
 
