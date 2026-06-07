@@ -54,7 +54,7 @@
         { "file": "03_inline_key.test", "pass": 17, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 427, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 434, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -101,6 +101,8 @@
         { "file": "22_fulltext_index.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "23_statement_timeout.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "24_application_name.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,

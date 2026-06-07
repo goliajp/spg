@@ -79,7 +79,14 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
 
     // ---- Startup phase ----
     let (user, params) = read_startup(&mut stream)?;
-    let _ = params; // database / options / etc. — we only honor `user`
+    // v7.17 Phase 2.4 — surface `application_name` from the startup
+    // params on the per-connection ConnState (read back via
+    // `spg_stat_activity.application_name`). Other params
+    // (database / options / etc.) we still ignore.
+    let startup_app_name = params
+        .iter()
+        .find_map(|(k, v)| (k == "application_name").then(|| v.clone()))
+        .unwrap_or_default();
 
     // v6.5.2 — register this connection in the activity registry.
     // Removed when `_conn_guard` drops at function exit.
@@ -98,6 +105,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
         wait_event: std::sync::atomic::AtomicU8::new(0),
         last_query_start_us: std::sync::atomic::AtomicI64::new(0),
         in_transaction: std::sync::atomic::AtomicBool::new(false),
+        application_name: std::sync::RwLock::new(startup_app_name.clone()),
     });
     if let Ok(mut conns) = state.connections.write() {
         conns.push(Arc::clone(&conn_state));
@@ -185,6 +193,14 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     // map first, falls back to a known-defaults table.
     let mut settings: std::collections::HashMap<String, String> =
         std::collections::HashMap::default();
+    // v7.17 Phase 2.4 — seed the per-session SHOW map with whatever
+    // the client declared in the startup `application_name` param so
+    // `SHOW application_name` returns the right value without a
+    // prior SET. Empty string is fine; that matches PG's behaviour
+    // for unset GUCs.
+    if !startup_app_name.is_empty() {
+        settings.insert("application_name".to_string(), startup_app_name.clone());
+    }
     // v6.3.2 — pipelined-query response buffer. Every send_*
     // helper writes here instead of straight to the socket; the
     // buffer is flushed at strategic sync points:
@@ -262,6 +278,18 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 if let Some((name, value)) = parse_set_statement(&sql) {
                     let name_lc = name.to_ascii_lowercase();
                     settings.insert(name_lc.clone(), value.clone());
+                    // v7.17 Phase 2.4 — `application_name` is a
+                    // session GUC; mirror it onto ConnState so
+                    // `spg_stat_activity.application_name` reflects
+                    // the live value. PG's own `application_name`
+                    // is session-scoped — `SET LOCAL` does NOT scope
+                    // it to a tx (its GUC context is U / S, not L),
+                    // so we don't special-case SET LOCAL here either.
+                    if name_lc == "application_name" {
+                        if let Ok(mut g) = conn_state.application_name.write() {
+                            *g = value.clone();
+                        }
+                    }
                     let engine_affecting = matches!(
                         name_lc.as_str(),
                         "foreign_key_checks"

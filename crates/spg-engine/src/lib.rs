@@ -784,6 +784,10 @@ pub struct ActivityRow {
     pub wait_event: String,
     pub elapsed_us: i64,
     pub in_transaction: bool,
+    /// v7.17 Phase 2.4 — startup-param `application_name` (or the
+    /// last value the client sent via `SET application_name = '...'`).
+    /// Empty when the client never declared one.
+    pub application_name: String,
 }
 
 /// v6.5.2 — provider callback type. Fresh snapshot returned each
@@ -2296,6 +2300,7 @@ impl Engine {
             ColumnSchema::new("wait_event", DataType::Text, false),
             ColumnSchema::new("elapsed_us", DataType::BigInt, false),
             ColumnSchema::new("in_transaction", DataType::Bool, false),
+            ColumnSchema::new("application_name", DataType::Text, false),
         ];
         let rows: Vec<Row> = self
             .activity_provider
@@ -2311,6 +2316,7 @@ impl Engine {
                     Value::Text(r.wait_event),
                     Value::BigInt(r.elapsed_us),
                     Value::Bool(r.in_transaction),
+                    Value::Text(r.application_name),
                 ])
             })
             .collect();
