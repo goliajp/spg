@@ -1179,6 +1179,16 @@ impl Parser {
                         | "language"
                         | "collation"
                         | "conversion"
+                        // v7.17.0 Phase 8 (audit N6) — rarely-
+                        // emitted pg_dump shapes that should
+                        // load through without a parser error.
+                        // SPG has no planner statistics catalog,
+                        // no event-trigger hooks, no foreign-
+                        // data-wrapper infrastructure; consume
+                        // + return Empty.
+                        | "statistics"
+                        | "event"
+                        | "foreign"
                 ) =>
             {
                 self.consume_until_statement_boundary();
