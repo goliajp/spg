@@ -3313,6 +3313,12 @@ pub struct Catalog {
     /// alphabetical-by-default with insertion-stable tie-break
     /// behaviour — we just keep insertion order for now).
     triggers: Vec<TriggerDef>,
+    /// v7.17.0 — catalogued SEQUENCE objects (Phase 1.1). Each
+    /// `nextval(name)` reaches in here, atomically increments
+    /// `last_value` / flips `is_called`, returns the new value.
+    /// Persisted in catalog FILE_VERSION 26+; older catalogs
+    /// deserialise with an empty map.
+    sequences: BTreeMap<String, SequenceDef>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -3380,6 +3386,68 @@ pub struct TriggerDef {
     pub enabled: bool,
 }
 
+/// v7.17.0 — catalogued SEQUENCE. PG semantics: a counter object
+/// returning monotonically increasing values via `nextval(name)`.
+/// `last_value` is the most recent value handed out; `is_called`
+/// is false until the first `nextval`/`setval`. Stored separately
+/// from tables in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceDef {
+    pub name: String,
+    /// Data type — narrows the i64 range. PG default BIGINT.
+    pub data_type: SequenceDataType,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    /// `OWNED BY` target — `(table, column)` or NONE.
+    pub owned_by: Option<(String, String)>,
+    /// Most recently handed-out value. Meaningless when
+    /// `is_called == false`; in that case the NEXT `nextval`
+    /// will return `start`.
+    pub last_value: i64,
+    pub is_called: bool,
+}
+
+/// v7.17.0 — sequence integer width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceDataType {
+    SmallInt,
+    Int,
+    BigInt,
+}
+
+impl SequenceDataType {
+    /// PG default min/max per AS clause.
+    pub fn default_bounds(self, increment_positive: bool) -> (i64, i64) {
+        match self {
+            Self::SmallInt => {
+                if increment_positive {
+                    (1, i64::from(i16::MAX))
+                } else {
+                    (i64::from(i16::MIN), -1)
+                }
+            }
+            Self::Int => {
+                if increment_positive {
+                    (1, i64::from(i32::MAX))
+                } else {
+                    (i64::from(i32::MIN), -1)
+                }
+            }
+            Self::BigInt => {
+                if increment_positive {
+                    (1, i64::MAX)
+                } else {
+                    (i64::MIN, -1)
+                }
+            }
+        }
+    }
+}
+
 impl Catalog {
     pub const fn new() -> Self {
         Self {
@@ -3388,6 +3456,7 @@ impl Catalog {
             cold_segments: Vec::new(),
             functions: BTreeMap::new(),
             triggers: Vec::new(),
+            sequences: BTreeMap::new(),
         }
     }
 
@@ -3421,6 +3490,180 @@ impl Catalog {
     /// Caller decides whether to surface `if_exists` semantics.
     pub fn drop_function(&mut self, name: &str) -> bool {
         self.functions.remove(name).is_some()
+    }
+
+    /// v7.17.0 — read-only handle to catalogued sequences.
+    pub const fn sequences(&self) -> &BTreeMap<String, SequenceDef> {
+        &self.sequences
+    }
+
+    /// v7.17.0 — register a new SEQUENCE. Errors if `name`
+    /// collides with an existing sequence and `if_not_exists`
+    /// is false.
+    pub fn create_sequence(
+        &mut self,
+        def: SequenceDef,
+        if_not_exists: bool,
+    ) -> Result<(), StorageError> {
+        if self.sequences.contains_key(&def.name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "sequence {:?} already exists",
+                def.name
+            )));
+        }
+        self.sequences.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 — remove a SEQUENCE by name. Returns `true` if a
+    /// sequence was removed, `false` if none matched. Caller
+    /// surfaces IF EXISTS semantics.
+    pub fn drop_sequence(&mut self, name: &str) -> bool {
+        self.sequences.remove(name).is_some()
+    }
+
+    /// v7.17.0 — atomic nextval. Increments `last_value` per
+    /// `increment`, returns the new value, sets `is_called`.
+    /// Returns an error on CYCLE-less overflow.
+    pub fn sequence_next_value(&mut self, name: &str) -> Result<i64, StorageError> {
+        let Some(seq) = self.sequences.get_mut(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        // PG semantics: when !is_called (fresh sequence or
+        // setval(_, false)), the next nextval returns the stored
+        // `last_value`. When is_called, it advances by `increment`
+        // and CYCLE-wraps on overflow.
+        let candidate = if seq.is_called {
+            let next = seq.last_value.checked_add(seq.increment).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "sequence {name:?} arithmetic overflow"
+                ))
+            })?;
+            if seq.increment > 0 {
+                if next > seq.max_value {
+                    if seq.cycle {
+                        seq.min_value
+                    } else {
+                        return Err(StorageError::Corrupt(format!(
+                            "sequence {name:?} reached MAXVALUE ({})",
+                            seq.max_value
+                        )));
+                    }
+                } else {
+                    next
+                }
+            } else if next < seq.min_value {
+                if seq.cycle {
+                    seq.max_value
+                } else {
+                    return Err(StorageError::Corrupt(format!(
+                        "sequence {name:?} reached MINVALUE ({})",
+                        seq.min_value
+                    )));
+                }
+            } else {
+                next
+            }
+        } else {
+            seq.last_value
+        };
+        seq.last_value = candidate;
+        seq.is_called = true;
+        Ok(candidate)
+    }
+
+    /// v7.17.0 — currval. Errors if the session has never called
+    /// nextval on this sequence (PG semantics). At the catalog
+    /// level we approximate "session" with "is_called persisted";
+    /// the engine session-tracking layer can wrap this for the
+    /// strict per-session semantics later.
+    pub fn sequence_current_value(&self, name: &str) -> Result<i64, StorageError> {
+        let Some(seq) = self.sequences.get(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        if !seq.is_called {
+            return Err(StorageError::Corrupt(format!(
+                "currval of sequence {name:?} is not yet defined in this session"
+            )));
+        }
+        Ok(seq.last_value)
+    }
+
+    /// v7.17.0 — setval(name, value [, is_called]). PG returns
+    /// `value` regardless. `is_called=true` means the NEXT
+    /// nextval will return `value + increment`; `is_called=false`
+    /// means the next nextval will return `value`.
+    pub fn sequence_set_value(
+        &mut self,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, StorageError> {
+        let Some(seq) = self.sequences.get_mut(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        seq.last_value = value;
+        seq.is_called = is_called;
+        Ok(value)
+    }
+
+    /// v7.17.0 — ALTER SEQUENCE option merge. Caller-provided
+    /// updates overwrite the matching fields; unset fields keep
+    /// their stored values. RESTART variants update last_value
+    /// directly per PG: `RESTART` resets to current `start`;
+    /// `RESTART WITH n` resets to `n`.
+    pub fn alter_sequence(
+        &mut self,
+        name: &str,
+        increment: Option<i64>,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        start: Option<i64>,
+        restart: Option<Option<i64>>,
+        cache: Option<i64>,
+        cycle: Option<bool>,
+        owned_by: Option<Option<(String, String)>>,
+    ) -> Result<(), StorageError> {
+        let Some(seq) = self.sequences.get_mut(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        if let Some(v) = increment {
+            seq.increment = v;
+        }
+        if let Some(v) = min_value {
+            seq.min_value = v;
+        }
+        if let Some(v) = max_value {
+            seq.max_value = v;
+        }
+        if let Some(v) = start {
+            seq.start = v;
+        }
+        if let Some(restart_value) = restart {
+            seq.last_value = restart_value.unwrap_or(seq.start);
+            seq.is_called = false;
+        }
+        if let Some(v) = cache {
+            seq.cache = v;
+        }
+        if let Some(v) = cycle {
+            seq.cycle = v;
+        }
+        if let Some(v) = owned_by {
+            seq.owned_by = v;
+        }
+        Ok(())
     }
 
     /// v7.12.4 — read-only slice of all catalogued triggers.
@@ -4874,7 +5117,16 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     round-9 A.2.b — `ALTER TABLE … { ENABLE | DISABLE }
 ///     TRIGGER …`). v24 catalogs deserialise with every trigger
 ///     `enabled = true`, matching pre-v7.16.1 behaviour.
-const FILE_VERSION: u8 = 25;
+/// v26 introduces (v7.17.0 Phase 1.1):
+///   * Trailing SEQUENCE catalog block after triggers. Encoded
+///     as `u32 count` followed by per-sequence:
+///     `name`, `data_type: u8` (0=SmallInt,1=Int,2=BigInt),
+///     `start i64`, `increment i64`, `min_value i64`,
+///     `max_value i64`, `cache i64`, `cycle u8`,
+///     `owned_by_tag u8` (0=NONE, 1=Column → `table`,`column`),
+///     `last_value i64`, `is_called u8`. v25-and-below catalogs
+///     deserialise with an empty sequences map.
+const FILE_VERSION: u8 = 26;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5251,6 +5503,35 @@ impl Catalog {
             // v7.16.1 — TriggerDef.enabled (FILE_VERSION 25+).
             out.push(u8::from(td.enabled));
         }
+        // v7.17.0 Phase 1.1 — SEQUENCE catalog block (FILE_VERSION 26+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.sequences.len()).expect("≤ 4G sequences"),
+        );
+        for seq in self.sequences.values() {
+            write_str(&mut out, &seq.name);
+            out.push(match seq.data_type {
+                SequenceDataType::SmallInt => 0,
+                SequenceDataType::Int => 1,
+                SequenceDataType::BigInt => 2,
+            });
+            out.extend_from_slice(&seq.start.to_le_bytes());
+            out.extend_from_slice(&seq.increment.to_le_bytes());
+            out.extend_from_slice(&seq.min_value.to_le_bytes());
+            out.extend_from_slice(&seq.max_value.to_le_bytes());
+            out.extend_from_slice(&seq.cache.to_le_bytes());
+            out.push(u8::from(seq.cycle));
+            match &seq.owned_by {
+                None => out.push(0),
+                Some((table, column)) => {
+                    out.push(1);
+                    write_str(&mut out, table);
+                    write_str(&mut out, column);
+                }
+            }
+            out.extend_from_slice(&seq.last_value.to_le_bytes());
+            out.push(u8::from(seq.is_called));
+        }
         out
     }
 
@@ -5340,6 +5621,61 @@ impl Catalog {
                     update_columns,
                     enabled,
                 });
+            }
+        }
+        // v7.17.0 Phase 1.1 — SEQUENCE block (FILE_VERSION 26+).
+        // v25-and-below catalogs omit; we leave the map empty.
+        if version >= 26 {
+            let seq_count = cur.read_u32()? as usize;
+            for _ in 0..seq_count {
+                let name = cur.read_str()?;
+                let data_type = match cur.read_u8()? {
+                    0 => SequenceDataType::SmallInt,
+                    1 => SequenceDataType::Int,
+                    2 => SequenceDataType::BigInt,
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown SEQUENCE data-type tag {other}"
+                        )));
+                    }
+                };
+                let start = cur.read_i64()?;
+                let increment = cur.read_i64()?;
+                let min_value = cur.read_i64()?;
+                let max_value = cur.read_i64()?;
+                let cache = cur.read_i64()?;
+                let cycle = cur.read_u8()? != 0;
+                let owned_by = match cur.read_u8()? {
+                    0 => None,
+                    1 => {
+                        let t = cur.read_str()?;
+                        let c = cur.read_str()?;
+                        Some((t, c))
+                    }
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown SEQUENCE owned-by tag {other}"
+                        )));
+                    }
+                };
+                let last_value = cur.read_i64()?;
+                let is_called = cur.read_u8()? != 0;
+                cat.sequences.insert(
+                    name.clone(),
+                    SequenceDef {
+                        name,
+                        data_type,
+                        start,
+                        increment,
+                        min_value,
+                        max_value,
+                        cache,
+                        cycle,
+                        owned_by,
+                        last_value,
+                        is_called,
+                    },
+                );
             }
         }
         if cur.pos < buf.len() {

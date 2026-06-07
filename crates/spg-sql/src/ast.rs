@@ -204,6 +204,29 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    /// v7.17.0 — `CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] name
+    /// [AS data_type]
+    /// [INCREMENT [BY] n]
+    /// [MINVALUE n | NO MINVALUE]
+    /// [MAXVALUE n | NO MAXVALUE]
+    /// [START [WITH] n]
+    /// [CACHE n]
+    /// [[NO] CYCLE]
+    /// [OWNED BY {table.col | NONE}]`.
+    /// Closes the round-7+ silent-no-op SEQUENCE story so pg_dump
+    /// emits + nextval/currval/setval downstream all work.
+    CreateSequence(CreateSequenceStatement),
+    /// v7.17.0 — `ALTER SEQUENCE [IF EXISTS] name <options>` with
+    /// the same option grammar as CREATE SEQUENCE, plus
+    /// `RESTART [WITH n]` and `OWNED BY ...` re-attach.
+    AlterSequence(AlterSequenceStatement),
+    /// v7.17.0 — `DROP SEQUENCE [IF EXISTS] name [, name…]
+    /// [CASCADE | RESTRICT]`. CASCADE / RESTRICT trailers parsed
+    /// silently (no FK on sequences).
+    DropSequence {
+        names: Vec<String>,
+        if_exists: bool,
+    },
 }
 
 /// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
@@ -235,6 +258,64 @@ pub struct CreateSubscriptionStatement {
     /// in this order. v6.1.4 records the list; v6.1.5
     /// publisher-side filtering enforces it.
     pub publications: Vec<String>,
+}
+
+/// v7.17.0 — `CREATE SEQUENCE` AST node. See [`Statement::CreateSequence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSequenceStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub temporary: bool,
+    /// Optional `AS data_type`. Default in PG is BIGINT; SPG matches.
+    pub data_type: Option<SequenceDataType>,
+    pub options: SequenceOptions,
+}
+
+/// v7.17.0 — narrow type for `AS` clause of CREATE SEQUENCE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceDataType {
+    SmallInt,
+    Int,
+    BigInt,
+}
+
+/// v7.17.0 — option grammar shared by CREATE / ALTER SEQUENCE.
+/// All fields are optional. `min_value`/`max_value` carry
+/// `Some(SeqBound::NoBound)` for `NO MINVALUE` / `NO MAXVALUE`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SequenceOptions {
+    pub increment: Option<i64>,
+    pub min_value: Option<SeqBound>,
+    pub max_value: Option<SeqBound>,
+    pub start: Option<i64>,
+    /// `RESTART [WITH n]` — ALTER-only. `Some(None)` = bare
+    /// RESTART, `Some(Some(n))` = RESTART WITH n.
+    pub restart: Option<Option<i64>>,
+    pub cache: Option<i64>,
+    pub cycle: Option<bool>,
+    pub owned_by: Option<SequenceOwnedBy>,
+}
+
+/// v7.17.0 — `MINVALUE n` / `NO MINVALUE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqBound {
+    Value(i64),
+    NoBound,
+}
+
+/// v7.17.0 — `OWNED BY {table.col | NONE}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceOwnedBy {
+    None,
+    Column { table: String, column: String },
+}
+
+/// v7.17.0 — `ALTER SEQUENCE` AST node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterSequenceStatement {
+    pub name: String,
+    pub if_exists: bool,
+    pub options: SequenceOptions,
 }
 
 /// v6.1.2 — `CREATE PUBLICATION` AST node. The `scope` field uses
@@ -1891,8 +1972,103 @@ impl fmt::Display for Statement {
                 }
                 write!(f, "{}", quote_ident(name))
             }
+            Self::CreateSequence(s) => s.fmt(f),
+            Self::AlterSequence(s) => s.fmt(f),
+            Self::DropSequence { names, if_exists } => {
+                f.write_str("DROP SEQUENCE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
         }
     }
+}
+
+impl fmt::Display for CreateSequenceStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.temporary {
+            f.write_str("TEMPORARY ")?;
+        }
+        f.write_str("SEQUENCE ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        if let Some(dt) = self.data_type {
+            write!(f, " AS {dt}")?;
+        }
+        write_sequence_options(f, &self.options)
+    }
+}
+
+impl fmt::Display for AlterSequenceStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ALTER SEQUENCE ")?;
+        if self.if_exists {
+            f.write_str("IF EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        write_sequence_options(f, &self.options)
+    }
+}
+
+impl fmt::Display for SequenceDataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SmallInt => "smallint",
+            Self::Int => "integer",
+            Self::BigInt => "bigint",
+        })
+    }
+}
+
+fn write_sequence_options(f: &mut fmt::Formatter<'_>, o: &SequenceOptions) -> fmt::Result {
+    if let Some(n) = o.increment {
+        write!(f, " INCREMENT BY {n}")?;
+    }
+    match o.min_value {
+        Some(SeqBound::Value(n)) => write!(f, " MINVALUE {n}")?,
+        Some(SeqBound::NoBound) => f.write_str(" NO MINVALUE")?,
+        None => {}
+    }
+    match o.max_value {
+        Some(SeqBound::Value(n)) => write!(f, " MAXVALUE {n}")?,
+        Some(SeqBound::NoBound) => f.write_str(" NO MAXVALUE")?,
+        None => {}
+    }
+    if let Some(n) = o.start {
+        write!(f, " START WITH {n}")?;
+    }
+    match o.restart {
+        Some(Some(n)) => write!(f, " RESTART WITH {n}")?,
+        Some(None) => f.write_str(" RESTART")?,
+        None => {}
+    }
+    if let Some(n) = o.cache {
+        write!(f, " CACHE {n}")?;
+    }
+    match o.cycle {
+        Some(true) => f.write_str(" CYCLE")?,
+        Some(false) => f.write_str(" NO CYCLE")?,
+        None => {}
+    }
+    if let Some(ob) = &o.owned_by {
+        match ob {
+            SequenceOwnedBy::None => f.write_str(" OWNED BY NONE")?,
+            SequenceOwnedBy::Column { table, column } => {
+                write!(f, " OWNED BY {}.{}", quote_ident(table), quote_ident(column))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for CreateFunctionStatement {

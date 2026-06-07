@@ -572,15 +572,17 @@ impl Parser {
                         }
                         Ok(Statement::Empty)
                     }
-                    // v7.14.0 — DROP SEQUENCE [IF EXISTS] name
-                    // [CASCADE|RESTRICT]. SPG has no separate
-                    // sequence object — SERIAL/BIGSERIAL is column-
-                    // local AUTO_INCREMENT — so DROP SEQUENCE
-                    // resolves as a no-op.
+                    // v7.17.0 — DROP SEQUENCE [IF EXISTS] name [,name…]
+                    // [CASCADE|RESTRICT]. Real removal from catalog
+                    // (was a silent no-op pre-v7.17).
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
                         self.advance();
-                        let _ = self.consume_if_exists();
-                        let _ = self.expect_ident_like()?;
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
                         if matches!(
                             self.peek(),
                             Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
@@ -588,7 +590,7 @@ impl Parser {
                         ) {
                             self.advance();
                         }
-                        Ok(Statement::Empty)
+                        Ok(Statement::DropSequence { names, if_exists })
                     }
                     other => Err(self.err(format!(
                         "expected TABLE / INDEX / SCHEMA / SEQUENCE / USER / PUBLICATION / \
@@ -907,16 +909,42 @@ impl Parser {
                 self.advance();
                 self.parse_create_trigger_after_keyword(false)
             }
+            // v7.17.0 — CREATE [TEMPORARY] SEQUENCE …
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
+                self.advance();
+                self.parse_create_sequence_after_keyword(false)
+            }
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") =>
+            {
+                self.advance();
+                // TEMPORARY/TEMP must be followed by SEQUENCE for v7.17.
+                // (TEMP TABLE could come later; for now route the few
+                // known shapes and fall back to silent-noop.)
+                let next = self.peek().clone();
+                if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("sequence"))
+                {
+                    self.advance();
+                    self.parse_create_sequence_after_keyword(true)
+                } else {
+                    // TEMP TABLE etc — consume to boundary as noop for now.
+                    self.consume_until_statement_boundary();
+                    Ok(Statement::Empty)
+                }
+            }
             // v7.14.0 — pg_dump / mysqldump emit
-            // `CREATE SEQUENCE / SCHEMA / VIEW / MATERIALIZED VIEW
-            // / TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
+            // `CREATE SCHEMA / VIEW / MATERIALIZED VIEW /
+            // TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
             // SPG is single-schema / single-database; these have
             // no behavioural effect, so consume + return Empty.
+            // v7.17.0 NOTE: SEQUENCE was here pre-v7.17; moved up
+            // to a real parser branch above. VIEW / MATERIALIZED
+            // VIEW / TYPE / DOMAIN move out one-by-one in Phase
+            // 1.2–1.5.
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
-                    "sequence"
-                        | "schema"
+                    "schema"
                         | "view"
                         | "materialized"
                         | "type"
@@ -1199,6 +1227,240 @@ impl Parser {
             }
             _ => Ok(None),
         }
+    }
+
+    /// v7.17.0 — body of `CREATE [TEMPORARY] SEQUENCE`. The
+    /// `[TEMPORARY]` and `SEQUENCE` tokens have already been
+    /// consumed; `temporary` carries whether TEMPORARY was seen.
+    fn parse_create_sequence_after_keyword(
+        &mut self,
+        temporary: bool,
+    ) -> Result<Statement, ParseError> {
+        let if_not_exists = self.parse_if_not_exists();
+        let name = self.expect_ident_like()?;
+        // Optional `AS data_type`.
+        let data_type = if matches!(self.peek(), Token::As) {
+            self.advance();
+            Some(self.parse_sequence_data_type()?)
+        } else {
+            None
+        };
+        let options = self.parse_sequence_options(/* allow_restart = */ false)?;
+        Ok(Statement::CreateSequence(crate::ast::CreateSequenceStatement {
+            name,
+            if_not_exists,
+            temporary,
+            data_type,
+            options,
+        }))
+    }
+
+    /// v7.17.0 — body of `ALTER SEQUENCE`. The `ALTER` keyword has
+    /// already been consumed; this is reached after `SEQUENCE`.
+    fn parse_alter_sequence_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let if_exists = self.parse_if_exists();
+        let name = self.expect_ident_like()?;
+        let options = self.parse_sequence_options(/* allow_restart = */ true)?;
+        Ok(Statement::AlterSequence(crate::ast::AlterSequenceStatement {
+            name,
+            if_exists,
+            options,
+        }))
+    }
+
+    fn parse_sequence_data_type(&mut self) -> Result<crate::ast::SequenceDataType, ParseError> {
+        let kw = self.expect_ident_like()?;
+        match kw.to_ascii_lowercase().as_str() {
+            "smallint" | "int2" => Ok(crate::ast::SequenceDataType::SmallInt),
+            "integer" | "int" | "int4" => Ok(crate::ast::SequenceDataType::Int),
+            "bigint" | "int8" => Ok(crate::ast::SequenceDataType::BigInt),
+            other => Err(self.err(alloc::format!(
+                "expected SMALLINT / INTEGER / BIGINT after SEQUENCE AS, got {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_sequence_options(
+        &mut self,
+        allow_restart: bool,
+    ) -> Result<crate::ast::SequenceOptions, ParseError> {
+        use crate::ast::{SeqBound, SequenceOptions, SequenceOwnedBy};
+        let mut opts = SequenceOptions::default();
+        loop {
+            // Match an ident; stop at any non-ident token (sentinel,
+            // semicolon, end of statement).
+            let kw_lc = match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                _ => break,
+            };
+            match kw_lc.as_str() {
+                "increment" => {
+                    self.advance();
+                    // Optional BY.
+                    if matches!(self.peek(), Token::By) {
+                        self.advance();
+                    }
+                    opts.increment = Some(self.expect_signed_int()?);
+                }
+                "minvalue" => {
+                    self.advance();
+                    opts.min_value = Some(SeqBound::Value(self.expect_signed_int()?));
+                }
+                "maxvalue" => {
+                    self.advance();
+                    opts.max_value = Some(SeqBound::Value(self.expect_signed_int()?));
+                }
+                "no" => {
+                    self.advance();
+                    let what = self.expect_ident_like()?;
+                    match what.to_ascii_lowercase().as_str() {
+                        "minvalue" => opts.min_value = Some(SeqBound::NoBound),
+                        "maxvalue" => opts.max_value = Some(SeqBound::NoBound),
+                        "cycle" => opts.cycle = Some(false),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected MINVALUE / MAXVALUE / CYCLE after NO, got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                "start" => {
+                    self.advance();
+                    // Optional WITH.
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("with"))
+                    {
+                        self.advance();
+                    }
+                    opts.start = Some(self.expect_signed_int()?);
+                }
+                "restart" if allow_restart => {
+                    self.advance();
+                    // Optional WITH n; bare RESTART means restart at START.
+                    let mut with_val: Option<i64> = None;
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("with"))
+                    {
+                        self.advance();
+                        with_val = Some(self.expect_signed_int()?);
+                    } else if matches!(self.peek(), Token::Integer(_) | Token::Minus) {
+                        with_val = Some(self.expect_signed_int()?);
+                    }
+                    opts.restart = Some(with_val);
+                }
+                "cache" => {
+                    self.advance();
+                    opts.cache = Some(self.expect_signed_int()?);
+                }
+                "cycle" => {
+                    self.advance();
+                    opts.cycle = Some(true);
+                }
+                "owned" => {
+                    self.advance();
+                    // BY is a reserved Token::By; accept either form.
+                    match self.peek() {
+                        Token::By => {
+                            self.advance();
+                        }
+                        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("by") => {
+                            self.advance();
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected BY after OWNED, got {other:?}"
+                            )));
+                        }
+                    }
+                    // OWNED BY {NONE | tab.col}. Read just one ident
+                    // (NOT expect_ident_like which would auto-strip
+                    // a schema prefix and consume the `.col` we need).
+                    let first = match self.advance() {
+                        Token::Ident(s) | Token::QuotedIdent(s) => s,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected identifier or NONE after OWNED BY, got {other:?}"
+                            )));
+                        }
+                    };
+                    if first.eq_ignore_ascii_case("none") {
+                        opts.owned_by = Some(SequenceOwnedBy::None);
+                    } else if matches!(self.peek(), Token::Dot) {
+                        self.advance();
+                        let col = match self.advance() {
+                            Token::Ident(s) | Token::QuotedIdent(s) => s,
+                            other => {
+                                return Err(self.err(alloc::format!(
+                                    "expected column name after OWNED BY {first}., got {other:?}"
+                                )));
+                            }
+                        };
+                        opts.owned_by = Some(SequenceOwnedBy::Column {
+                            table: first,
+                            column: col,
+                        });
+                    } else {
+                        return Err(self.err(alloc::format!(
+                            "expected table.column or NONE after OWNED BY, got {first:?}"
+                        )));
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(opts)
+    }
+
+    fn expect_signed_int(&mut self) -> Result<i64, ParseError> {
+        let neg = if matches!(self.peek(), Token::Minus) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        match self.peek() {
+            Token::Integer(n) => {
+                let v = *n;
+                self.advance();
+                Ok(if neg { -v } else { v })
+            }
+            other => Err(self.err(alloc::format!(
+                "expected signed integer, got {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_if_not_exists(&mut self) -> bool {
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("if"))
+        {
+            let save = self.pos;
+            self.advance();
+            if matches!(self.peek(), Token::Not) {
+                self.advance();
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exists"))
+                {
+                    self.advance();
+                    return true;
+                }
+            }
+            self.pos = save;
+        }
+        false
+    }
+
+    fn parse_if_exists(&mut self) -> bool {
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("if"))
+        {
+            let save = self.pos;
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exists"))
+            {
+                self.advance();
+                return true;
+            }
+            self.pos = save;
+        }
+        false
     }
 
     /// v7.12.4 — body of `CREATE [OR REPLACE] TRIGGER`. The
@@ -2210,16 +2472,20 @@ impl Parser {
                 }
                 return self.parse_alter_table_after_keyword();
             }
-            // v7.14.0 — ALTER SEQUENCE / ALTER VIEW / ALTER
-            // FUNCTION / ALTER TYPE / ALTER DOMAIN / ALTER
-            // DATABASE / ALTER USER / ALTER ROLE / ALTER SCHEMA
-            // / ALTER OWNER / ALTER DEFAULT PRIVILEGES — accept
-            // as no-op so pg_dump's tail loads.
+            // v7.17.0 — ALTER SEQUENCE name <options>. Moved out
+            // of the silent-noop tail.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
+                return self.parse_alter_sequence_after_keyword();
+            }
+            // v7.14.0 — ALTER VIEW / ALTER FUNCTION / ALTER TYPE /
+            // ALTER DOMAIN / ALTER DATABASE / ALTER USER / ALTER
+            // ROLE / ALTER SCHEMA / ALTER OWNER / ALTER DEFAULT
+            // PRIVILEGES — accept as no-op so pg_dump's tail loads.
+            // v7.17.0 NOTE: ALTER SEQUENCE moved out (above).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
-                    "sequence"
-                        | "view"
+                    "view"
                         | "function"
                         | "type"
                         | "domain"

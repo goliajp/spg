@@ -1707,6 +1707,23 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.17.0 Phase 1.1 — pre-resolve nextval / currval /
+        // setval calls in the statement tree. Walks SELECT
+        // projection, INSERT VALUES, UPDATE SET, DELETE WHERE,
+        // and DEFAULT exprs; replaces sequence FunctionCall
+        // nodes with concrete Literal values minted against the
+        // catalog. This is the only place that mutates sequence
+        // state from a SELECT-shaped path (exec_select_cancel is
+        // `&self` and can't reach the catalog mutably).
+        //
+        // Fast-path: when no sequences exist anywhere in the
+        // catalog (the typical hot-path INSERT load), skip the
+        // walker entirely. Single map-emptiness check on the
+        // catalog beats walking every expression on every call.
+        let mut stmt = stmt;
+        if !self.active_catalog().sequences().is_empty() {
+            self.pre_resolve_sequence_calls_in_statement(&mut stmt)?;
+        }
         let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             // v7.9.15 — CREATE EXTENSION is a no-op on SPG. Returns
@@ -1810,6 +1827,11 @@ impl Engine {
             } => self.exec_drop_trigger(&name, &table, if_exists),
             Statement::DropFunction { name, if_exists } => {
                 self.exec_drop_function(&name, if_exists)
+            }
+            Statement::CreateSequence(s) => self.exec_create_sequence(s),
+            Statement::AlterSequence(s) => self.exec_alter_sequence(s),
+            Statement::DropSequence { names, if_exists } => {
+                self.exec_drop_sequence(&names, if_exists)
             }
             Statement::ResetParameter(target) => {
                 match target {
@@ -2874,6 +2896,346 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: usize::from(removed),
             modified_catalog: removed,
+        })
+    }
+
+    /// v7.17.0 — `CREATE SEQUENCE` engine path. Resolves
+    /// `min_value` / `max_value` / `start` against PG defaults
+    /// when omitted, then installs the SequenceDef in the catalog.
+    fn exec_create_sequence(
+        &mut self,
+        s: spg_sql::ast::CreateSequenceStatement,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::{SeqBound, SequenceDataType as AstDt};
+        use spg_storage::{SequenceDataType, SequenceDef};
+        let dt = match s.data_type {
+            None => SequenceDataType::BigInt,
+            Some(AstDt::SmallInt) => SequenceDataType::SmallInt,
+            Some(AstDt::Int) => SequenceDataType::Int,
+            Some(AstDt::BigInt) => SequenceDataType::BigInt,
+        };
+        let increment = s.options.increment.unwrap_or(1);
+        if increment == 0 {
+            return Err(EngineError::Unsupported(
+                "INCREMENT must not be zero".into(),
+            ));
+        }
+        let (def_min, def_max) = dt.default_bounds(increment > 0);
+        let min_value = match s.options.min_value {
+            None | Some(SeqBound::NoBound) => def_min,
+            Some(SeqBound::Value(n)) => n,
+        };
+        let max_value = match s.options.max_value {
+            None | Some(SeqBound::NoBound) => def_max,
+            Some(SeqBound::Value(n)) => n,
+        };
+        if min_value > max_value {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "MINVALUE ({min_value}) must be <= MAXVALUE ({max_value})"
+            )));
+        }
+        let start = s
+            .options
+            .start
+            .unwrap_or(if increment > 0 { min_value } else { max_value });
+        if start < min_value || start > max_value {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "START WITH ({start}) is outside MINVALUE..MAXVALUE ({min_value}..{max_value})"
+            )));
+        }
+        let cache = s.options.cache.unwrap_or(1);
+        if cache < 1 {
+            return Err(EngineError::Unsupported(
+                "CACHE must be >= 1".into(),
+            ));
+        }
+        let cycle = s.options.cycle.unwrap_or(false);
+        let owned_by = match s.options.owned_by {
+            None | Some(spg_sql::ast::SequenceOwnedBy::None) => None,
+            Some(spg_sql::ast::SequenceOwnedBy::Column { table, column }) => {
+                Some((table, column))
+            }
+        };
+        let def = SequenceDef {
+            name: s.name.clone(),
+            data_type: dt,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cache,
+            cycle,
+            owned_by,
+            last_value: start,
+            is_called: false,
+        };
+        self.active_catalog_mut()
+            .create_sequence(def, s.if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 — `ALTER SEQUENCE` engine path. Re-uses the catalog
+    /// `alter_sequence` merge helper.
+    fn exec_alter_sequence(
+        &mut self,
+        s: spg_sql::ast::AlterSequenceStatement,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::SeqBound;
+        let cat = self.active_catalog_mut();
+        if !cat.sequences().contains_key(&s.name) {
+            if s.if_exists {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("sequence {:?} does not exist", s.name),
+            )));
+        }
+        let min_value = match s.options.min_value {
+            None => None,
+            Some(SeqBound::NoBound) => None, // NO MINVALUE → keep current
+            Some(SeqBound::Value(n)) => Some(n),
+        };
+        let max_value = match s.options.max_value {
+            None => None,
+            Some(SeqBound::NoBound) => None,
+            Some(SeqBound::Value(n)) => Some(n),
+        };
+        let owned_by = s.options.owned_by.map(|ob| match ob {
+            spg_sql::ast::SequenceOwnedBy::None => None,
+            spg_sql::ast::SequenceOwnedBy::Column { table, column } => {
+                Some((table, column))
+            }
+        });
+        cat.alter_sequence(
+            &s.name,
+            s.options.increment,
+            min_value,
+            max_value,
+            s.options.start,
+            s.options.restart,
+            s.options.cache,
+            s.options.cycle,
+            owned_by,
+        )
+        .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.1 — walk a Statement tree and pre-resolve
+    /// any sequence FunctionCall nodes inside its Expr slots.
+    /// Delegates per-statement-kind: SELECT projection +
+    /// WHERE, INSERT VALUES, UPDATE SET, DELETE WHERE.
+    fn pre_resolve_sequence_calls_in_statement(
+        &mut self,
+        stmt: &mut Statement,
+    ) -> Result<(), EngineError> {
+        match stmt {
+            Statement::Select(s) => self.pre_resolve_sequence_calls_in_select(s),
+            Statement::Insert(s) => {
+                for tuple in &mut s.rows {
+                    for cell in tuple.iter_mut() {
+                        self.resolve_sequence_calls_in_expr(cell)?;
+                    }
+                }
+                Ok(())
+            }
+            Statement::Update(s) => {
+                for (_col, expr) in &mut s.assignments {
+                    self.resolve_sequence_calls_in_expr(expr)?;
+                }
+                if let Some(w) = &mut s.where_ {
+                    self.resolve_sequence_calls_in_expr(w)?;
+                }
+                Ok(())
+            }
+            Statement::Delete(s) => {
+                if let Some(w) = &mut s.where_ {
+                    self.resolve_sequence_calls_in_expr(w)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn pre_resolve_sequence_calls_in_select(
+        &mut self,
+        s: &mut spg_sql::ast::SelectStatement,
+    ) -> Result<(), EngineError> {
+        for item in &mut s.items {
+            match item {
+                spg_sql::ast::SelectItem::Expr { expr, .. } => {
+                    self.resolve_sequence_calls_in_expr(expr)?;
+                }
+                spg_sql::ast::SelectItem::Wildcard => {}
+            }
+        }
+        if let Some(w) = &mut s.where_ {
+            self.resolve_sequence_calls_in_expr(w)?;
+        }
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.1 — walk an Expr tree and pre-resolve any
+    /// `nextval(name)` / `currval(name)` / `setval(name, value[,
+    /// is_called])` FunctionCall nodes by calling the catalog and
+    /// replacing the node with the resulting `Expr::Literal`.
+    /// Used by INSERT VALUES / UPDATE SET / DEFAULT eval so the
+    /// row-eval path sees pre-computed sequence values instead of
+    /// needing mutable catalog access mid-eval.
+    #[allow(clippy::too_many_lines)]
+    fn resolve_sequence_calls_in_expr(
+        &mut self,
+        expr: &mut Expr,
+    ) -> Result<(), EngineError> {
+        match expr {
+            Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => Ok(()),
+            Expr::FunctionCall { name, args } => {
+                // Descend first so nested calls — e.g.
+                // setval('seq', currval('other')) — resolve
+                // innermost-first.
+                for a in args.iter_mut() {
+                    self.resolve_sequence_calls_in_expr(a)?;
+                }
+                let lc = name.to_ascii_lowercase();
+                if lc == "nextval" || lc == "currval" || lc == "setval" {
+                    let v = self.eval_sequence_call(&lc, args)?;
+                    *expr = Expr::Literal(value_to_literal(v));
+                }
+                Ok(())
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.resolve_sequence_calls_in_expr(lhs)?;
+                self.resolve_sequence_calls_in_expr(rhs)
+            }
+            Expr::Unary { expr, .. } => self.resolve_sequence_calls_in_expr(expr),
+            Expr::Cast { expr, .. } => self.resolve_sequence_calls_in_expr(expr),
+            Expr::IsNull { expr, .. } => self.resolve_sequence_calls_in_expr(expr),
+            Expr::Like { expr, pattern, .. } => {
+                self.resolve_sequence_calls_in_expr(expr)?;
+                self.resolve_sequence_calls_in_expr(pattern)
+            }
+            Expr::Extract { source, .. } => self.resolve_sequence_calls_in_expr(source),
+            Expr::Array(items) => {
+                for it in items.iter_mut() {
+                    self.resolve_sequence_calls_in_expr(it)?;
+                }
+                Ok(())
+            }
+            // Window / subquery / etc — sequence calls inside these
+            // are uncommon and require separate row-eval; leave
+            // untouched for now and rely on the eval-time error
+            // (no sequence_resolver attached).
+            _ => Ok(()),
+        }
+    }
+
+    /// v7.17.0 Phase 1.1 — evaluate a single nextval/currval/
+    /// setval call. `args` are already pre-resolved Expr nodes
+    /// (literals) — we extract their constant values.
+    fn eval_sequence_call(
+        &mut self,
+        op: &str,
+        args: &[Expr],
+    ) -> Result<Value, EngineError> {
+        if args.is_empty() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "{op}() takes at least one argument"
+            )));
+        }
+        let seq_name = match &args[0] {
+            Expr::Literal(spg_sql::ast::Literal::String(s)) => s.clone(),
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "{op}() first argument must be a literal sequence name, got {other:?}"
+                )));
+            }
+        };
+        match op {
+            "nextval" => {
+                let v = self
+                    .active_catalog_mut()
+                    .sequence_next_value(&seq_name)
+                    .map_err(EngineError::Storage)?;
+                Ok(Value::BigInt(v))
+            }
+            "currval" => {
+                let v = self
+                    .active_catalog()
+                    .sequence_current_value(&seq_name)
+                    .map_err(EngineError::Storage)?;
+                Ok(Value::BigInt(v))
+            }
+            "setval" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "setval() takes 2 or 3 arguments, got {}",
+                        args.len()
+                    )));
+                }
+                let value = match &args[1] {
+                    Expr::Literal(spg_sql::ast::Literal::Integer(n)) => *n,
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "setval() value argument must be a literal integer, got {other:?}"
+                        )));
+                    }
+                };
+                let is_called = if args.len() == 3 {
+                    match &args[2] {
+                        Expr::Literal(spg_sql::ast::Literal::Bool(b)) => *b,
+                        other => {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "setval() is_called argument must be a literal BOOL, got {other:?}"
+                            )));
+                        }
+                    }
+                } else {
+                    true
+                };
+                let v = self
+                    .active_catalog_mut()
+                    .sequence_set_value(&seq_name, value, is_called)
+                    .map_err(EngineError::Storage)?;
+                Ok(Value::BigInt(v))
+            }
+            other => Err(EngineError::Unsupported(alloc::format!(
+                "unknown sequence op {other:?}"
+            ))),
+        }
+    }
+
+    /// v7.17.0 — `DROP SEQUENCE [IF EXISTS] name [, name…]`.
+    fn exec_drop_sequence(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_sequence(name);
+            if !was_present && !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("sequence {name:?} does not exist"),
+                )));
+            }
+            if was_present {
+                removed += 1;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
         })
     }
 
@@ -4750,7 +5112,19 @@ impl Engine {
         })
     }
 
-    fn exec_insert(&mut self, stmt: InsertStatement) -> Result<QueryResult, EngineError> {
+    fn exec_insert(&mut self, mut stmt: InsertStatement) -> Result<QueryResult, EngineError> {
+        // v7.17.0 Phase 1.1 — pre-resolve any nextval / currval /
+        // setval calls against the catalog before the row loop. We
+        // walk each tuple expression and replace matching
+        // FunctionCall nodes with their concrete Literal. This
+        // keeps `literal_expr_to_value` free of `&mut self` and
+        // lets multi-row INSERT VALUES (… nextval('seq') …)
+        // mint a separate sequence value per row.
+        for tuple in &mut stmt.rows {
+            for cell in tuple.iter_mut() {
+                self.resolve_sequence_calls_in_expr(cell)?;
+            }
+        }
         // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
         // round-5 G4). Execute the inner SELECT first, then route
         // back through the regular VALUES code path with the
