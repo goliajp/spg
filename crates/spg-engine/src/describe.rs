@@ -90,13 +90,13 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
     out
 }
 
-struct ExprShape {
-    name: String,
-    ty: DataType,
-    nullable: bool,
+pub(crate) struct ExprShape {
+    pub(crate) name: String,
+    pub(crate) ty: DataType,
+    pub(crate) nullable: bool,
 }
 
-fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
+pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
     match e {
         Expr::Column(c) => {
             // Mirror resolve_projection_column's lookup: bare name first,
@@ -184,8 +184,103 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
                 nullable: inner.nullable,
             })
         }
+        // Function call — dispatch on name to recover the column
+        // type that the wire layer (and sqlx::Column type_info)
+        // advertises. Without this entry build_projection falls
+        // back to `Text` for every non-trivial expression, which
+        // breaks `sqlx::query_as::<_, (chrono::NaiveDateTime,)>(
+        // "SELECT now()")` and every similar typed-decode pattern.
+        Expr::FunctionCall { name, args } => {
+            function_return_shape(name, args, schema_cols)
+        }
         _ => None,
     }
+}
+
+/// Static return-type map for the SQL function library. Returns
+/// None for functions whose return type genuinely depends on
+/// runtime values in a way the planner can't statically resolve
+/// (e.g. `coalesce(arg1, arg2)` where arg1 is NULL literal — the
+/// caller's type-inference cascade handles those).
+fn function_return_shape(
+    name: &str,
+    args: &[Expr],
+    schema_cols: &[ColumnSchema],
+) -> Option<ExprShape> {
+    let lc = name.to_ascii_lowercase();
+    let (ty, nullable) = match lc.as_str() {
+        // Time-of-now → engine clock literals.
+        "now" | "current_timestamp" | "localtimestamp" | "transaction_timestamp"
+        | "statement_timestamp" | "clock_timestamp" => (DataType::Timestamptz, false),
+        "current_date" => (DataType::Date, false),
+        "current_time" | "localtime" => (DataType::Timestamp, false), // approx — SPG lacks TIME
+        // Text-returning library — every fn that produces a string.
+        "concat" | "concat_ws" | "format" | "lower" | "upper" | "trim"
+        | "ltrim" | "rtrim" | "substring" | "substr" | "replace"
+        | "split_part" | "repeat" | "lpad" | "rpad" | "left" | "right"
+        | "translate" | "regexp_replace" | "to_char" | "encode"
+        | "host" | "network" | "version" | "database" | "current_user"
+        | "session_user" | "user" | "pg_get_serial_sequence"
+        | "pg_get_constraintdef" | "pg_get_indexdef" => (DataType::Text, true),
+        // Bytes-returning.
+        "decode" | "hex" => (DataType::Bytes, true),
+        // Integer-returning length / position helpers.
+        "length" | "char_length" | "character_length" | "octet_length"
+        | "bit_length" | "position" | "strpos" | "ascii" | "masklen" => (DataType::Int, true),
+        // BigInt-returning.
+        "count" | "count_star" | "nextval" | "currval" | "lastval"
+        | "unix_timestamp" => (DataType::BigInt, true),
+        // Float / double-precision returns.
+        "random" | "ts_rank" | "ts_rank_cd" | "similarity" | "ln"
+        | "log" | "log2" | "exp" | "sin" | "cos" | "tan" | "asin"
+        | "acos" | "atan" | "atan2" | "degrees" | "radians" | "pi" => (DataType::Float, true),
+        // Boolean predicate-returning.
+        "starts_with" => (DataType::Bool, true),
+        // Arrays.
+        "regexp_matches" | "regexp_split_to_array" | "show_trgm"
+        | "string_to_array" | "array_remove" | "array_append"
+        | "array_cat" => (DataType::TextArray, true),
+        // JSON.
+        "to_json" | "to_jsonb" | "json_build_object" | "jsonb_build_object"
+        | "json_build_array" | "jsonb_build_array" | "json_object"
+        | "jsonb_object" | "jsonb_set" | "jsonb_insert"
+        | "jsonb_path_query" | "jsonb_path_query_first"
+        | "jsonb_path_query_array" | "json_path_query" => (DataType::Json, true),
+        // FTS types.
+        "to_tsvector" => (DataType::TsVector, true),
+        "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery"
+        | "websearch_to_tsquery" => (DataType::TsQuery, true),
+        // Interval.
+        "age" => (DataType::Interval, true),
+        // Timestamp-returning.
+        "date_trunc" | "from_unixtime" | "make_timestamp" => (DataType::Timestamp, true),
+        "make_date" | "to_date" => (DataType::Date, true),
+        "date_part" | "extract" => (DataType::Float, true),
+        // Pass-through aggregates / conditionals: derive the type
+        // from the first arg.
+        "sum" | "avg" | "max" | "min" | "abs" | "floor" | "ceil"
+        | "ceiling" | "round" | "trunc" | "mod" | "power" | "pow"
+        | "sqrt" | "sign" | "coalesce" | "nullif" | "greatest"
+        | "least" | "ifnull" | "isnull" => {
+            // Use the first arg's shape; fall back to Float for math
+            // that can promote (e.g. mod(2, 3) → Float? No — keep
+            // Int. The caller's coerce_value handles promotion at
+            // INSERT time.)
+            let first = args.first()?;
+            let inner = describe_expr(first, schema_cols)?;
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty: inner.ty,
+                nullable: true, // arithmetic / coalesce can produce NULL on bad input
+            });
+        }
+        _ => return None,
+    };
+    Some(ExprShape {
+        name: "?column?".to_string(),
+        ty,
+        nullable,
+    })
 }
 
 fn collect_parameter_oids(stmt: &Statement) -> Vec<u32> {
