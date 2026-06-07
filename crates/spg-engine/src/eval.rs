@@ -1224,6 +1224,44 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         //   * Negative floats floor TOWARD -infinity, NOT toward 0.
         //   * Integer types passthrough unchanged.
         //   * NULL → NULL.
+        // PG `ceil(x)` / `ceiling(x)` — smallest integer >= x.
+        //   * Negative floats round TOWARD zero (toward +inf):
+        //     ceil(-1.5) → -1, NOT -2.
+        //   * Integer types passthrough unchanged.
+        //   * NULL → NULL.
+        "ceil" | "ceiling" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ceil() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                    Ok(args[0].clone())
+                }
+                Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
+                Value::Numeric { scaled, scale } => {
+                    let factor = pow10_i128(*scale);
+                    let q = scaled.div_euclid(factor);
+                    let r = scaled.rem_euclid(factor);
+                    let result = if r == 0 { q } else { q + 1 };
+                    Ok(Value::Numeric {
+                        scaled: result * factor,
+                        scale: *scale,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ceil() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "floor" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -2825,6 +2863,25 @@ fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Val
         return Ok(Value::Text(String::new()));
     }
     Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// no_std-compatible `ceil(x)` for f64. Same shape as
+/// `f64_floor` but rounds toward +infinity for fractional
+/// values. Negative fractions round toward zero
+/// (ceil(-1.5) → -1, NOT -2).
+fn f64_ceil(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
+        return x;
+    }
+    let trunc = (x as i64) as f64;
+    if x > 0.0 && x != trunc {
+        trunc + 1.0
+    } else {
+        trunc
+    }
 }
 
 /// no_std-compatible `floor(x)` for f64. SPG's engine is
