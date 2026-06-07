@@ -3681,7 +3681,11 @@ fn apply_binary_calendar(op: BinOp, l: &Value, r: &Value) -> Result<Option<Value
 ///   interval ± interval  → interval
 /// Commutative for `+`. Returns `None` for unrecognised operand pairs so
 /// the caller can fall through.
-fn apply_binary_interval(op: BinOp, l: &Value, r: &Value) -> Result<Option<Value>, EvalError> {
+pub(crate) fn apply_binary_interval(
+    op: BinOp,
+    l: &Value,
+    r: &Value,
+) -> Result<Option<Value>, EvalError> {
     // Normalise so the interval (if any) is always on the right for Add;
     // Sub stays left-handed because it isn't commutative.
     let (lhs, rhs, sign): (&Value, &Value, i64) = match (l, r, op) {

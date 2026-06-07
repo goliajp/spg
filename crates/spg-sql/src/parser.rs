@@ -6020,6 +6020,56 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(expr)),
                 unnest_column_aliases,
+                generate_series_args: None,
+            });
+        }
+        // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
+        // [, step])` set-returning source. Same shape as unnest:
+        // detect at the head, parse the comma-separated arg list,
+        // dispatch downstream through the engine's set-returning
+        // path. Supports integer triplets (mailrs's `WITH row_no AS
+        // (SELECT * FROM generate_series(1, N))` pattern) and
+        // TIMESTAMP + INTERVAL triplets (the Tier-A audit's
+        // date-range iteration pattern, which pre-3.10 had no
+        // direct equivalent in SPG).
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("generate_series"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // generate_series
+            self.advance(); // (
+            let mut args: Vec<Expr> = Vec::new();
+            loop {
+                args.push(self.parse_expr(0)?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after generate_series() arguments, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if args.len() < 2 || args.len() > 3 {
+                return Err(self.err(alloc::format!(
+                    "generate_series() expects 2 or 3 arguments (start, stop [, step]); got {}",
+                    args.len()
+                )));
+            }
+            let (alias_ident, _column_aliases) = self.parse_optional_alias_with_columns();
+            let name = alias_ident
+                .clone()
+                .unwrap_or_else(|| "generate_series".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: Some(args),
             });
         }
         // v7.16.2 — preserve information_schema / pg_catalog
@@ -6082,6 +6132,7 @@ impl Parser {
             as_of_segment,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
+            generate_series_args: None,
         })
     }
 
