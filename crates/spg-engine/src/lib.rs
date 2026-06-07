@@ -170,26 +170,79 @@ pub type SaltFn = fn() -> [u8; 16];
 /// `CancelToken::none()` is a no-op — used by the legacy `execute`
 /// and `execute_readonly` entry points so existing callers don't
 /// change.
+/// v7.17.0 Phase 2.3 — monotonic time source for deadline-aware
+/// cancellation (PG `statement_timeout`). Returns microseconds
+/// since some host-stable monotonic origin (typically the first
+/// call into `Instant::now()` on the server). The engine never
+/// calls `Instant::now()` directly so the crate stays `#![no_std]`.
+pub type MonotonicNowFn = fn() -> u64;
+
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    now_fn: MonotonicNowFn,
+    /// Absolute deadline in `now_fn()` units (microseconds).
+    deadline_us: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CancelToken<'a> {
     flag: Option<&'a core::sync::atomic::AtomicBool>,
+    // v7.17.0 Phase 2.3 — when set, every existing `cancel.check()`
+    // checkpoint also fires `EngineError::Cancelled` once
+    // `(now_fn)() >= deadline_us`. No new check sites, no thread
+    // spawn per query — the monotonic now-fn read is a vDSO
+    // `clock_gettime(CLOCK_MONOTONIC)` (~20ns) and only runs when
+    // the host actually wired a deadline (statement_timeout > 0).
+    deadline: Option<Deadline>,
 }
 
 impl<'a> CancelToken<'a> {
     #[must_use]
     pub const fn none() -> Self {
-        Self { flag: None }
+        Self {
+            flag: None,
+            deadline: None,
+        }
     }
 
     #[must_use]
     pub const fn from_flag(f: &'a core::sync::atomic::AtomicBool) -> Self {
-        Self { flag: Some(f) }
+        Self {
+            flag: Some(f),
+            deadline: None,
+        }
+    }
+
+    /// v7.17.0 Phase 2.3 — attach a monotonic deadline. `now_fn`
+    /// must return microseconds since a stable origin; the token
+    /// trips when `now_fn() >= deadline_us`. Compose with
+    /// `from_flag(...)` when both a watchdog flag and a per-statement
+    /// timeout are in play (e.g. server-wide `SPG_QUERY_TIMEOUT_MS`
+    /// plus session `statement_timeout`); the tighter of the two
+    /// wins by virtue of either signaling first.
+    #[must_use]
+    pub const fn with_deadline(mut self, now_fn: MonotonicNowFn, deadline_us: u64) -> Self {
+        self.deadline = Some(Deadline { now_fn, deadline_us });
+        self
     }
 
     #[must_use]
     pub fn is_cancelled(self) -> bool {
-        self.flag
+        if self
+            .flag
             .is_some_and(|f| f.load(core::sync::atomic::Ordering::Relaxed))
+        {
+            return true;
+        }
+        // Deadline check is the second branch so the "no timeout"
+        // hot path (`deadline: None`) elides the now-fn call —
+        // predicted-not-taken on the SLO INSERT loop.
+        if let Some(d) = self.deadline
+            && (d.now_fn)() >= d.deadline_us
+        {
+            return true;
+        }
+        false
     }
 
     /// Returns `Err(Cancelled)` if the token has been tripped.
@@ -1652,8 +1705,21 @@ impl Engine {
     /// Pgwire's `Execute` (E) message after a `Bind` (B) lands here.
     pub fn execute_prepared(
         &mut self,
+        stmt: Statement,
+        params: &[Value],
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_prepared_with_cancel(stmt, params, CancelToken::none())
+    }
+
+    /// v7.17.0 Phase 2.3 — prepared-statement entry that honors a
+    /// caller-supplied `CancelToken`. Mirrors `execute_prepared`'s
+    /// `current_tx` save/restore so the extended-query path stays
+    /// transactionally consistent with the simple-query path.
+    pub fn execute_prepared_with_cancel(
+        &mut self,
         mut stmt: Statement,
         params: &[Value],
+        cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         substitute_placeholders(&mut stmt, params)?;
         // v7.16.0 — set `current_tx` for the duration of the
@@ -1668,7 +1734,7 @@ impl Engine {
         // first transaction-visibility test.
         let saved = self.current_tx;
         self.current_tx = Some(IMPLICIT_TX);
-        let result = self.execute_stmt_with_cancel(stmt, CancelToken::none());
+        let result = self.execute_stmt_with_cancel(stmt, cancel);
         self.current_tx = saved;
         result
     }
