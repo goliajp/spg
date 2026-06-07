@@ -1,0 +1,52 @@
+# v7.17.0 Phase 4.4 — MySQL UNSIGNED range enforce. Pre-4.4 SPG
+# consumed and discarded the keyword silently; now negative
+# INSERT / UPDATE values are rejected.
+
+statement ok
+CREATE TABLE t (id INT UNSIGNED NOT NULL)
+
+# Positive values accepted.
+statement ok
+INSERT INTO t VALUES (0), (1), (100)
+
+query I rowsort
+SELECT id FROM t
+----
+0
+1
+100
+
+# Negative value rejected.
+statement error
+INSERT INTO t VALUES (-1)
+
+# UPDATE to negative rejected.
+statement error
+UPDATE t SET id = -42 WHERE id = 1
+
+# SMALLINT UNSIGNED — same enforcement.
+statement ok
+CREATE TABLE s (val SMALLINT UNSIGNED NOT NULL)
+
+statement error
+INSERT INTO s VALUES (-1)
+
+# BIGINT UNSIGNED — same enforcement.
+statement ok
+CREATE TABLE b (val BIGINT UNSIGNED NOT NULL)
+
+statement error
+INSERT INTO b VALUES (-1000)
+
+# Signed types unaffected.
+statement ok
+CREATE TABLE signed_t (id INT NOT NULL)
+
+statement ok
+INSERT INTO signed_t VALUES (-1), (-100)
+
+query I nosort
+SELECT id FROM signed_t ORDER BY id
+----
+-100
+-1

@@ -5221,13 +5221,13 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
     fn parse_type_with_implied_flags(
         &mut self,
-    ) -> Result<(ColumnTypeName, bool, bool, Option<String>, Collation), ParseError> {
+    ) -> Result<(ColumnTypeName, bool, bool, Option<String>, Collation, bool), ParseError> {
         let ty_ident = match self.advance() {
             Token::Ident(s) => s,
             other => {
@@ -5389,13 +5389,22 @@ impl Parser {
                 ColumnTypeName::Text
             }
         };
-        // MySQL's `UNSIGNED` modifier sits right after the type
-        // keyword. SPG doesn't carry a separate unsigned variant —
-        // accepting the keyword keeps existing schemas compatible
-        // without changing semantics. Drop it silently.
-        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unsigned")) {
+        // v7.17.0 Phase 4.4 — MySQL's `UNSIGNED` modifier sits
+        // right after the type keyword. Pre-4.4 SPG consumed +
+        // discarded the keyword, leaving a customer column
+        // declared `id INT UNSIGNED NOT NULL` silently accepting
+        // negative values — a Tier-A correctness drift where
+        // application invariants (auto-increment-IDs never
+        // negative) silently broke on cutover. Now: capture as
+        // a column flag, persist on the schema, enforce at
+        // INSERT / UPDATE time.
+        let is_unsigned = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unsigned"))
+        {
             self.advance();
-        }
+            true
+        } else {
+            false
+        };
         // v7.14.0 — mysqldump emits `<type> CHARACTER SET <name>` and
         // `<type> COLLATE <name>` post-fixes on text columns. SPG
         // stores text as UTF-8 always so CHARACTER SET is still a
@@ -5500,13 +5509,26 @@ impl Parser {
                 }
             };
         }
-        Ok((ty, implied_auto_increment, implied_not_null, user_type_ref, collation))
+        Ok((
+            ty,
+            implied_auto_increment,
+            implied_not_null,
+            user_type_ref,
+            collation,
+            is_unsigned,
+        ))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
         let name = self.expect_ident_like()?;
-        let (ty, implied_auto_increment, implied_not_null, user_type_ref, collation) =
-            self.parse_type_with_implied_flags()?;
+        let (
+            ty,
+            implied_auto_increment,
+            implied_not_null,
+            user_type_ref,
+            collation,
+            is_unsigned,
+        ) = self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
         // each at most once.
@@ -5709,6 +5731,7 @@ impl Parser {
             user_type_ref,
             on_update_runtime,
             collation,
+            is_unsigned,
         })
     }
 

@@ -3965,8 +3965,10 @@ impl Engine {
             let mut new_vals = row.values.clone();
             for (pos, expr) in &targets {
                 let v = eval::eval_expr(expr, row, &ctx)?;
-                new_vals[*pos] =
+                let coerced =
                     coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
+                check_unsigned_range(&coerced, &schema_cols[*pos], *pos)?;
+                new_vals[*pos] = coerced;
             }
             // v7.17.0 Phase 2.1 — apply ON UPDATE overrides for
             // any column the SET clause didn't touch.
@@ -6011,6 +6013,7 @@ impl Engine {
                     }
                     let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                     enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    check_unsigned_range(&coerced, col, i)?;
                     out.push(coerced);
                 }
                 out
@@ -6030,6 +6033,7 @@ impl Engine {
                     }
                     let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                     enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    check_unsigned_range(&coerced, col, i)?;
                     out.push(coerced);
                 }
                 out
@@ -12255,7 +12259,10 @@ fn apply_on_conflict_assignments(
             })?;
         let sub = substitute_excluded_refs(expr.clone(), &schema_cols, incoming);
         let v = eval::eval_expr(&sub, &existing, &ctx)?;
-        new_values[target_idx] = coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
+        let coerced =
+            coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
+        check_unsigned_range(&coerced, &schema_cols[target_idx], target_idx)?;
+        new_values[target_idx] = coerced;
     }
     Ok(Some(new_values))
 }
@@ -13388,6 +13395,9 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
         spg_sql::ast::Collation::Binary => spg_storage::Collation::Binary,
         spg_sql::ast::Collation::CaseInsensitive => spg_storage::Collation::CaseInsensitive,
     };
+    // v7.17.0 Phase 4.4 — MySQL `UNSIGNED` flag propagates to
+    // storage so engine INSERT / UPDATE can range-check.
+    schema.is_unsigned = c.is_unsigned;
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to
@@ -13776,6 +13786,33 @@ fn int_value_for(n: i64) -> Value {
 /// else returns `TypeMismatch` carrying the column name for caller diagnostics.
 /// `NULL` is always permitted; the nullability check happens later in storage.
 #[allow(clippy::too_many_lines)]
+/// v7.17.0 Phase 4.4 — reject negative integer values on UNSIGNED
+/// columns. Called after `coerce_value` at each INSERT / UPDATE
+/// site that has ColumnSchema context. NULL passes through (a
+/// nullable UNSIGNED column can legitimately hold NULL).
+fn check_unsigned_range(
+    v: &Value,
+    schema: &ColumnSchema,
+    position: usize,
+) -> Result<(), EngineError> {
+    if !schema.is_unsigned {
+        return Ok(());
+    }
+    let n = match v {
+        Value::SmallInt(x) => i64::from(*x),
+        Value::Int(x) => i64::from(*x),
+        Value::BigInt(x) => *x,
+        _ => return Ok(()), // non-integer cells (NULL, default) skip
+    };
+    if n < 0 {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "column {:?} is UNSIGNED but got negative value {n} at position {position}",
+            schema.name
+        )));
+    }
+    Ok(())
+}
+
 fn coerce_value(
     v: Value,
     expected: DataType,
