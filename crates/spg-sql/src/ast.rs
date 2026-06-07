@@ -1175,6 +1175,16 @@ pub struct ColumnDef {
     /// the raw collation name into the variants in `Collation`.
     /// Default `Binary` preserves the legacy compare path.
     pub collation: Collation,
+    /// v7.17.0 Phase 4.4 — MySQL `UNSIGNED` modifier flag. Pre-
+    /// 4.4 SPG accepted and discarded the keyword, leaving
+    /// negative values silently accepted on a column the
+    /// customer declared `INT UNSIGNED NOT NULL`. Now: the engine
+    /// rejects negative INSERT / UPDATE values on UNSIGNED int
+    /// columns. SPG widening to `u64`-shaped storage is out of
+    /// v7.17 scope; the upper bound remains the signed-type max
+    /// (i64::MAX for BIGINT UNSIGNED), which still strictly
+    /// exceeds what every mailrs / Rails app actually uses.
+    pub is_unsigned: bool,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced

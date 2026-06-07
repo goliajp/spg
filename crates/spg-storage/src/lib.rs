@@ -463,6 +463,17 @@ pub struct ColumnSchema {
     /// Persisted in catalog FILE_VERSION 34+; older catalogs
     /// deserialise every column as `Binary`.
     pub collation: Collation,
+    /// v7.17.0 Phase 4.4 — MySQL `UNSIGNED` modifier flag. Drives
+    /// engine-side INSERT / UPDATE range enforcement (rejects
+    /// negative values on UNSIGNED int columns). Pre-4.4 the
+    /// parser consumed and discarded the keyword silently, so
+    /// every UNSIGNED column quietly accepted negatives — a
+    /// Tier-A correctness drift. Sparse: only UNSIGNED columns
+    /// land in the catalog appendix; the default `false` keeps
+    /// snapshots compact for the common signed-int path.
+    /// Persisted in catalog FILE_VERSION 35+; older catalogs
+    /// deserialise every column as `is_unsigned = false`.
+    pub is_unsigned: bool,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -5522,6 +5533,7 @@ impl ColumnSchema {
             user_domain_type: None,
             on_update_runtime: None,
             collation: Collation::Binary,
+            is_unsigned: false,
         }
     }
 
@@ -5740,7 +5752,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     semantics. Unknown tags read back as Binary too — keeps
 ///     a forward-compat path if a future v35 adds variants
 ///     and someone rolls back to a v34 reader.
-const FILE_VERSION: u8 = 34;
+/// v35 introduces (v7.17.0 Phase 4.4):
+///   * Per-table is_unsigned appendix (after the collation
+///     appendix). Sparse layout: only `is_unsigned = true`
+///     columns land. `u16 count` then per-binding `[u16 col_pos]`.
+///     v34-and-below catalogs deserialise every column as
+///     `is_unsigned = false`, preserving the prior silent-
+///     accept behaviour for negative inserts on UNSIGNED columns.
+const FILE_VERSION: u8 = 35;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6158,6 +6177,23 @@ impl Catalog {
             for (pos, tag) in coll_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 out.push(tag);
+            }
+            // v7.17.0 Phase 4.4 — per-table is_unsigned appendix.
+            // Sparse: only UNSIGNED columns land. Layout:
+            // `[u16 count][u16 col_pos] × count`.
+            let mut unsigned_bindings: Vec<usize> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if c.is_unsigned {
+                    unsigned_bindings.push(i);
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(unsigned_bindings.len())
+                    .expect("≤ 65k UNSIGNED columns/table"),
+            );
+            for pos in unsigned_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
@@ -6609,6 +6645,7 @@ fn deserialize_table(
             user_domain_type: None,
             on_update_runtime: None,
             collation: Collation::Binary,
+            is_unsigned: false,
         });
     }
     let n_cols = cols.len();
@@ -6786,6 +6823,19 @@ fn deserialize_table(
             };
             if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
                 col.collation = collation;
+            }
+        }
+    }
+    // v7.17.0 Phase 4.4 — per-table is_unsigned appendix
+    // (FILE_VERSION 35+). Sparse: only UNSIGNED columns land.
+    // v34-and-below readers leave every column at
+    // `is_unsigned = false`.
+    if version >= 35 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.is_unsigned = true;
             }
         }
     }
