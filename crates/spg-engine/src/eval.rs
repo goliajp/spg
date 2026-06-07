@@ -1212,6 +1212,39 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // length<=0 → ''. Empty fill + needs padding → returns
         // input verbatim (potentially truncated). NULL on any
         // arg → NULL.
+        // PG `strpos(string, substring)` — same as position()
+        // but with reversed arg order. PG convention is
+        // strpos(haystack, needle); position(needle, haystack).
+        // Both are 1-indexed; 0 = not found; codepoint-counted.
+        "strpos" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "strpos() takes 2 args (haystack, needle), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let haystack = value_to_format_text(&args[0]);
+            let needle = value_to_format_text(&args[1]);
+            if needle.is_empty() {
+                return Ok(Value::Int(1));
+            }
+            let h_chars: Vec<char> = haystack.chars().collect();
+            let n_chars: Vec<char> = needle.chars().collect();
+            if n_chars.len() > h_chars.len() {
+                return Ok(Value::Int(0));
+            }
+            for i in 0..=h_chars.len() - n_chars.len() {
+                if h_chars[i..i + n_chars.len()] == n_chars[..] {
+                    return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
+                }
+            }
+            Ok(Value::Int(0))
+        }
         "lpad" => string_pad(args, true, "lpad"),
         "rpad" => string_pad(args, false, "rpad"),
         "repeat" => {
