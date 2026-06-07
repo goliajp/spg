@@ -6672,6 +6672,37 @@ impl Parser {
             Token::LBracket => self.parse_vector_literal_body(),
             Token::Extract => self.parse_extract_atom(),
             Token::Interval => self.parse_interval_atom(),
+            // `LEFT` is a reserved-keyword token because the
+            // grammar dedicates an arm for `LEFT [OUTER] JOIN`.
+            // When `left` is followed by `(` we're in expression
+            // position calling the PG `left(string, n)` function;
+            // rebuild the AST as a regular function call so the
+            // engine's apply_function dispatch picks it up.
+            Token::Left if matches!(self.peek(), Token::LParen) => {
+                self.advance(); // (
+                let mut args = Vec::new();
+                if !matches!(self.peek(), Token::RParen) {
+                    loop {
+                        args.push(self.parse_expr(0)?);
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RParen => break,
+                            other => {
+                                return Err(self.err(alloc::format!(
+                                    "expected ',' or ')' in left() args, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                self.advance(); // )
+                Ok(Expr::FunctionCall {
+                    name: "left".into(),
+                    args,
+                })
+            }
             // v4.10: EXISTS / NOT EXISTS. EXISTS isn't a reserved
             // token; we match on the bare ident. NOT is a token
             // (consumed in the comparison rung), but `EXISTS (...)`

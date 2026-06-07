@@ -1216,6 +1216,12 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // but with reversed arg order. PG convention is
         // strpos(haystack, needle); position(needle, haystack).
         // Both are 1-indexed; 0 = not found; codepoint-counted.
+        // PG `left(string, n)` / `right(string, n)` — head/tail
+        // substring helpers. Negative n means "all but last/first
+        // |n| chars" — slice from the OPPOSITE side. n=0 → ''.
+        // Codepoint-counted. NULL on any arg → NULL.
+        "left" => string_left_right(args, true, "left"),
+        "right" => string_left_right(args, false, "right"),
         "strpos" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -2724,6 +2730,63 @@ enum TrimSide {
     Left,
     Right,
     Both,
+}
+
+/// PG `left(s, n)` / `right(s, n)` shared implementation. Both
+/// support negative n which means "all but |n| chars from the
+/// opposite side". n=0 → ''. Codepoint-counted. NULL → NULL.
+fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fn_name}() takes 2 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let s = value_to_format_text(&args[0]);
+    let n = match &args[1] {
+        Value::SmallInt(x) => i64::from(*x),
+        Value::Int(x) => i64::from(*x),
+        Value::BigInt(x) => *x,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}(): n must be integer, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    if n == 0 {
+        return Ok(Value::Text(String::new()));
+    }
+    let (start, end) = if is_left {
+        if n > 0 {
+            (0usize, (n.min(len)) as usize)
+        } else {
+            // left(s, -k) → drop last |k| chars; keep [0..len - k]
+            let drop = (-n).min(len);
+            (0usize, (len - drop) as usize)
+        }
+    } else if n > 0 {
+        // right(s, k) → keep last k chars; start = max(0, len-k)
+        let start = (len - n).max(0);
+        (start as usize, len as usize)
+    } else {
+        // right(s, -k) → drop first |k| chars; keep [k..len]
+        let drop = (-n).min(len);
+        (drop as usize, len as usize)
+    };
+    if start >= end {
+        return Ok(Value::Text(String::new()));
+    }
+    Ok(Value::Text(chars[start..end].iter().collect()))
 }
 
 /// PG `lpad` / `rpad` shared implementation. Length is the
