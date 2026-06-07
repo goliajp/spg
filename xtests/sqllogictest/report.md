@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 34 | 0 | 0 | 100.0% |
-| `pg_regress` | 353 | 0 | 0 | 100.0% |
+| `pg_regress` | 381 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 
 ## Per-file detail
@@ -68,6 +68,7 @@ Per-corpus pass / fail / skip:
 | `17_views.test` | 28 | 0 | 0 |
 | `18_materialized_views.test` | 27 | 0 | 0 |
 | `19_enum_types.test` | 17 | 0 | 0 |
+| `20_domain_types.test` | 28 | 0 | 0 |
 
 ### `pgvector/`
 

@@ -79,6 +79,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     default: None,
                     runtime_default: None,
                     user_enum_type: None,
+                    user_domain_type: None,
                 });
             }
         }

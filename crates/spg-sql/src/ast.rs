@@ -279,6 +279,45 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
+    /// v7.17.0 Phase 1.5 — `CREATE DOMAIN name AS base_type
+    /// [DEFAULT expr] [NOT NULL | NULL] [CHECK (expr)]*`.
+    /// A DOMAIN is a named CHECK-constrained alias over a built-
+    /// in type. The CHECK + NOT NULL + DEFAULT clauses apply to
+    /// every column declared with the domain. Closes the
+    /// silent-no-op CREATE DOMAIN story so PG dumps that ship
+    /// validated identifier types (email, positive_int, …) keep
+    /// their guarantees.
+    CreateDomain(CreateDomainStatement),
+    /// v7.17.0 Phase 1.5 — `DROP DOMAIN [IF EXISTS] name
+    /// [, name…] [CASCADE | RESTRICT]`. Removes the matching
+    /// domain from the catalog.
+    DropDomain {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+}
+
+/// v7.17.0 Phase 1.5 — `CREATE DOMAIN` AST.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateDomainStatement {
+    pub name: String,
+    /// Base type for the domain (one of the built-in
+    /// `ColumnTypeName` variants). User-defined enum / domain
+    /// bases are deferred to Phase 1.5b.
+    pub base_type: ColumnTypeName,
+    /// Optional `DEFAULT <expr>`. Resolved at engine-side
+    /// CREATE TABLE time when a column is bound to this domain.
+    pub default: Option<Expr>,
+    /// `NOT NULL` from the domain definition. Engine ORs this
+    /// with the column-level nullability so the strictest of the
+    /// two wins (i.e. the column is non-nullable if either side
+    /// says so).
+    pub not_null: bool,
+    /// Zero-or-more `CHECK (expr)` predicates. Each one is
+    /// enforced as part of the column's CHECK list at INSERT /
+    /// UPDATE time, with `VALUE` substituted for the column's
+    /// current cell value.
+    pub checks: Vec<Expr>,
 }
 
 /// v7.17.0 Phase 1.4 — `CREATE TYPE` AST.
@@ -2149,7 +2188,37 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::CreateDomain(d) => d.fmt(f),
+            Self::DropDomain { names, if_exists } => {
+                f.write_str("DROP DOMAIN ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+impl fmt::Display for CreateDomainStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE DOMAIN {} AS {}", quote_ident(&self.name), self.base_type)?;
+        if let Some(d) = &self.default {
+            write!(f, " DEFAULT {d}")?;
+        }
+        if self.not_null {
+            f.write_str(" NOT NULL")?;
+        }
+        for c in &self.checks {
+            write!(f, " CHECK ({c})")?;
+        }
+        Ok(())
     }
 }
 

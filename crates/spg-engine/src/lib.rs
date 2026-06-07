@@ -1848,6 +1848,10 @@ impl Engine {
             Statement::DropType { names, if_exists } => {
                 self.exec_drop_type(&names, if_exists)
             }
+            Statement::CreateDomain(s) => self.exec_create_domain(s),
+            Statement::DropDomain { names, if_exists } => {
+                self.exec_drop_domain(&names, if_exists)
+            }
             Statement::ResetParameter(target) => {
                 match target {
                     None => self.session_params.clear(),
@@ -3369,6 +3373,78 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.5 — `CREATE DOMAIN name AS base [DEFAULT
+    /// expr] [NOT NULL] [CHECK (expr)]*` engine path. Stores the
+    /// base type + Display-rendered CHECK / DEFAULT sources so
+    /// INSERT/UPDATE on bound columns can re-eval the checks.
+    fn exec_create_domain(
+        &mut self,
+        s: spg_sql::ast::CreateDomainStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let cat = self.active_catalog();
+        if cat.domain_types().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("domain {:?} already exists", s.name),
+            )));
+        }
+        if cat.get(&s.name).is_some()
+            || cat.sequences().contains_key(&s.name)
+            || cat.views().contains_key(&s.name)
+            || cat.enum_types().contains_key(&s.name)
+        {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "domain {:?} would shadow an existing object",
+                    s.name
+                ),
+            )));
+        }
+        let base_type = column_type_to_data_type(s.base_type);
+        let default = s.default.as_ref().map(|e| alloc::format!("{e}"));
+        let checks = s
+            .checks
+            .iter()
+            .map(|e| alloc::format!("{e}"))
+            .collect::<Vec<_>>();
+        let def = spg_storage::DomainDef {
+            name: s.name.clone(),
+            base_type,
+            nullable: !s.not_null,
+            default,
+            checks,
+        };
+        self.active_catalog_mut()
+            .create_domain_type(def)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.5 — `DROP DOMAIN [IF EXISTS] names`.
+    fn exec_drop_domain(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_domain_type(name);
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("domain {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
         })
     }
 
@@ -5356,23 +5432,38 @@ impl Engine {
             .into_iter()
             .map(column_def_to_schema)
             .collect::<Result<Vec<_>, _>>()?;
-        // v7.17.0 Phase 1.4 — verify every user_enum_type
-        // reference resolves to a catalog enum. Unknown idents
-        // surface as a clear error here rather than silently
-        // accepting them as freeform TEXT.
-        for col in &cols {
-            if let Some(enum_name) = &col.user_enum_type {
-                if !self.active_catalog().enum_types().contains_key(enum_name) {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "column {:?}: unknown column type {:?} (not a built-in nor a CREATE TYPE … AS ENUM)",
-                        col.name,
-                        enum_name
-                    )));
-                }
-            }
-        }
-        // Composite NOT-NULL implication for PRIMARY KEY columns.
+        // v7.17.0 Phase 1.4 + 1.5 — classify every raw
+        // user_type_ref (parked as user_enum_type by
+        // column_def_to_schema) into either an enum binding or a
+        // domain binding. For domains, also rewrite the column's
+        // base DataType from the placeholder Text to the domain's
+        // declared base. Unknown idents are still a hard error
+        // here (same as Phase 1.4) so silent acceptance never
+        // happens.
         let mut cols = cols;
+        for col in cols.iter_mut() {
+            let Some(name) = col.user_enum_type.take() else {
+                continue;
+            };
+            let cat = self.active_catalog();
+            if cat.enum_types().contains_key(&name) {
+                col.user_enum_type = Some(name);
+                continue;
+            }
+            if let Some(dom) = cat.domain_types().get(&name) {
+                col.ty = dom.base_type;
+                col.user_domain_type = Some(name);
+                if !dom.nullable {
+                    col.nullable = false;
+                }
+                continue;
+            }
+            return Err(EngineError::Unsupported(alloc::format!(
+                "column {:?}: unknown column type {:?} (not a built-in, ENUM, or DOMAIN)",
+                col.name,
+                name
+            )));
+        }
         for tc in &stmt.table_constraints {
             if let spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } = tc {
                 for col_name in columns {
@@ -12020,7 +12111,33 @@ fn enforce_check_constraints(
         })
     })?;
     let schema = table.schema();
-    if schema.checks.is_empty() {
+    // v7.17.0 Phase 1.5 — domain-level CHECKs are enforced in
+    // parallel with table-level CHECKs. Collect both lists up
+    // front; if neither exists we early-out.
+    let mut domain_checks_per_col: alloc::vec::Vec<(usize, alloc::vec::Vec<Expr>)> =
+        alloc::vec::Vec::new();
+    for (idx, col) in schema.columns.iter().enumerate() {
+        let Some(dname) = &col.user_domain_type else {
+            continue;
+        };
+        let Some(dom) = catalog.domain_types().get(dname) else {
+            continue;
+        };
+        let mut parsed_for_col: alloc::vec::Vec<Expr> = alloc::vec::Vec::with_capacity(dom.checks.len());
+        for src in &dom.checks {
+            let expr = spg_sql::parser::parse_expression(src).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "DOMAIN {dname:?} CHECK ({src:?}) on column {:?}: re-parse failed: {e:?}",
+                    col.name
+                ))
+            })?;
+            parsed_for_col.push(expr);
+        }
+        if !parsed_for_col.is_empty() {
+            domain_checks_per_col.push((idx, parsed_for_col));
+        }
+    }
+    if schema.checks.is_empty() && domain_checks_per_col.is_empty() {
         return Ok(());
     }
     let ctx = eval::EvalContext::new(&schema.columns, None);
@@ -12049,6 +12166,37 @@ fn enforce_check_constraints(
                     "CHECK constraint violation on {table_name:?} (row #{batch_idx}): {:?}",
                     schema.checks[*i]
                 )));
+            }
+        }
+        // v7.17.0 Phase 1.5 — domain-level CHECKs. Each CHECK
+        // expression references VALUE as a column-name; we
+        // substitute the per-row cell into the eval context by
+        // synthesising a single-column row of just that value
+        // under a temporary `value` column schema.
+        for (col_idx, checks) in &domain_checks_per_col {
+            let cell = row_values.get(*col_idx).cloned().unwrap_or(spg_storage::Value::Null);
+            let synth_cols = alloc::vec![spg_storage::ColumnSchema::new(
+                "value",
+                schema.columns[*col_idx].ty,
+                schema.columns[*col_idx].nullable,
+            )];
+            let synth_ctx = eval::EvalContext::new(&synth_cols, None);
+            let synth_row = spg_storage::Row {
+                values: alloc::vec![cell],
+            };
+            for (ci, expr) in checks.iter().enumerate() {
+                let v = eval::eval_expr(expr, &synth_row, &synth_ctx).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "DOMAIN CHECK #{ci} on column {:?} eval at row #{batch_idx}: {e:?}",
+                        schema.columns[*col_idx].name
+                    ))
+                })?;
+                if matches!(v, spg_storage::Value::Bool(false)) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "DOMAIN CHECK violation on column {:?} (row #{batch_idx})",
+                        schema.columns[*col_idx].name
+                    )));
+                }
             }
         }
     }
@@ -12709,8 +12857,14 @@ fn enforce_enum_label(
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
-    if let Some(enum_name) = c.user_type_ref {
-        schema.user_enum_type = Some(enum_name);
+    // user_type_ref is the raw ident the parser couldn't resolve
+    // to a built-in; classification into enum vs domain happens
+    // at exec_create_table where we have catalog access. We
+    // park it temporarily as user_enum_type and the engine
+    // promotes domain bindings to user_domain_type before the
+    // table is stored.
+    if let Some(name) = c.user_type_ref {
+        schema.user_enum_type = Some(name);
     }
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
