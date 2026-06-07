@@ -62,7 +62,7 @@
         { "file": "08_create_procedure.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 560, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 575, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -131,6 +131,8 @@
         { "file": "33_regexp_family.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "34_jsonb_path_query.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "35_inet_types.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
