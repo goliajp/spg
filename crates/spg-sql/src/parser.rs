@@ -57,6 +57,15 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // PG-wire sees them as raw text.
             | "\\restrict"
             | "\\unrestrict"
+            // v7.17.0 Phase 4.1 — MySQL `DELIMITER //` and
+            // `DELIMITER ;` directives. Technically client-side
+            // (the `mysql` CLI uses them to set the statement
+            // terminator), not SQL — but mysqldump and stored-
+            // procedure scripts emit them inline. SPG's parser
+            // sees one statement at a time and doesn't care
+            // about the terminator, so consume DELIMITER lines
+            // as Empty.
+            | "delimiter"
     )
 }
 
