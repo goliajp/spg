@@ -1143,6 +1143,19 @@ impl Parser {
                     Ok(Statement::Empty)
                 }
             }
+            // v7.17.0 Phase 4.2 — MySQL `CREATE PROCEDURE name (…)
+            // BEGIN <body> END`. The body may reference `@var`
+            // session variables, SET statements, internal `;`
+            // terminators, etc. SPG has no procedure runtime, so
+            // consume the whole `CREATE PROCEDURE … END` block as
+            // a no-op so mysqldump scripts that include stored
+            // routines load through. The matching-END consumer
+            // tracks BEGIN/END nesting depth to handle nested
+            // BEGIN blocks correctly.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("procedure") => {
+                self.consume_mysql_routine_body();
+                Ok(Statement::Empty)
+            }
             // v7.14.0 — pg_dump / mysqldump emit
             // `CREATE SCHEMA / VIEW / MATERIALIZED VIEW /
             // TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
@@ -2020,6 +2033,86 @@ impl Parser {
             other => Err(self.err(alloc::format!(
                 "expected DEFERRED or IMMEDIATE after INITIALLY, got {other:?}"
             ))),
+        }
+    }
+
+    /// v7.17.0 Phase 4.2 — consume a MySQL `CREATE PROCEDURE` body
+    /// in its entirety so the parser returns Empty without
+    /// touching the runtime. The CREATE+PROCEDURE keywords are
+    /// already consumed; this swallows everything from the
+    /// procedure name through the matching `END`, including
+    /// nested `BEGIN`/`END` blocks, internal `;` terminators
+    /// (DELIMITER `//` makes the script splitter forward the
+    /// whole block as one statement), `@var` session-variable
+    /// references, and the trailing terminator.
+    ///
+    /// Tracks nesting depth so:
+    ///   BEGIN
+    ///     IF cond THEN
+    ///       BEGIN ... END;
+    ///     END IF;
+    ///   END
+    /// terminates at the outer END.
+    fn consume_mysql_routine_body(&mut self) {
+        // Outer skeleton: name, (...), optional clauses, BEGIN
+        // <body> END [;]. Scan for the first BEGIN — anything
+        // before it is signature decoration we don't care about.
+        // Once inside BEGIN, count up on BEGIN, down on END.
+        let mut depth: i32 = 0;
+        let mut started = false;
+        loop {
+            match self.peek().clone() {
+                Token::Begin => {
+                    self.advance();
+                    depth += 1;
+                    started = true;
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end") => {
+                    self.advance();
+                    if started {
+                        depth -= 1;
+                        if depth <= 0 {
+                            // Optional trailing ident (`END IF`,
+                            // `END LOOP`, `END WHILE`, `END CASE`,
+                            // `END label_name`) — eat the next
+                            // ident if present so we don't
+                            // mistake `END IF;` for the outer
+                            // close.
+                            if matches!(
+                                self.peek(),
+                                Token::Ident(_) | Token::QuotedIdent(_)
+                            ) {
+                                // If the next token is one of the
+                                // PL/SQL block-closer keywords,
+                                // the END belongs to an inner
+                                // block; bump depth back up.
+                                let is_inner_close = matches!(
+                                    self.peek(),
+                                    Token::Ident(s) | Token::QuotedIdent(s)
+                                        if matches!(
+                                            s.to_ascii_lowercase().as_str(),
+                                            "if" | "loop" | "while" | "case" | "repeat"
+                                        )
+                                );
+                                if is_inner_close {
+                                    self.advance();
+                                    depth += 1;
+                                    continue;
+                                }
+                            }
+                            // Eat optional trailing `;`.
+                            if matches!(self.peek(), Token::Semicolon) {
+                                self.advance();
+                            }
+                            return;
+                        }
+                    }
+                }
+                Token::Eof => return,
+                _ => {
+                    self.advance();
+                }
+            }
         }
     }
 
