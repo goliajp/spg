@@ -1200,6 +1200,56 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // from the end (PG 14+). Out-of-range n → '' (NOT NULL).
         // n = 0 → error. Empty delimiter → error. NULL on any
         // arg → NULL.
+        // PG `repeat(string, n)` — duplicate the input N times.
+        // n=0 → ''; n<0 → '' (PG does NOT error on negative);
+        // NULL on any arg → NULL.
+        "repeat" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "repeat() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let n = match &args[1] {
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "repeat(): n must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n <= 0 {
+                return Ok(Value::Text(String::new()));
+            }
+            // Safety cap so a runaway argument doesn't allocate
+            // terabytes. PG itself enforces a similar cap via
+            // work_mem; SPG inherits a defensive 64MiB cap.
+            const MAX_REPEAT_BYTES: usize = 64 * 1024 * 1024;
+            let needed = s.len().checked_mul(n as usize).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: "repeat(): result size overflows usize".into(),
+                }
+            })?;
+            if needed > MAX_REPEAT_BYTES {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "repeat(): result would exceed {MAX_REPEAT_BYTES} bytes"
+                    ),
+                });
+            }
+            Ok(Value::Text(s.repeat(n as usize)))
+        }
         "split_part" => {
             if args.len() != 3 {
                 return Err(EvalError::TypeMismatch {
