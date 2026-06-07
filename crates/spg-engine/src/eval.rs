@@ -1480,6 +1480,53 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             }
             Ok(best)
         }
+        // MySQL `ifnull(a, b)` — alias for coalesce(a, b).
+        // Used by every ORM with a MySQL target (Hibernate /
+        // Laravel / Sequelize).
+        "ifnull" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ifnull() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            for v in args {
+                if !matches!(v, Value::Null) {
+                    return Ok(v.clone());
+                }
+            }
+            Ok(Value::Null)
+        }
+        // MySQL `if(cond, then, else)` — alias for CASE WHEN.
+        // NULL condition → else branch (MySQL semantic).
+        // Integer condition: nonzero is true.
+        "if" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "if() takes 3 args (cond, then, else), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let truthy = match &args[0] {
+                Value::Null => false,
+                Value::Bool(b) => *b,
+                Value::SmallInt(n) => *n != 0,
+                Value::Int(n) => *n != 0,
+                Value::BigInt(n) => *n != 0,
+                Value::Float(x) => *x != 0.0,
+                Value::Text(s) => !s.is_empty() && s != "0",
+                _ => true,
+            };
+            if truthy {
+                Ok(args[1].clone())
+            } else {
+                Ok(args[2].clone())
+            }
+        }
         "nullif" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
