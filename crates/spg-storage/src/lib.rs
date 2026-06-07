@@ -437,6 +437,17 @@ pub struct ColumnSchema {
     /// + NOT NULL against the cell value. Persisted in catalog
     /// FILE_VERSION 30+; older catalogs deserialise with None.
     pub user_domain_type: Option<String>,
+    /// v7.17.0 Phase 2.1 — MySQL `ON UPDATE CURRENT_TIMESTAMP`
+    /// column attribute. When `Some(expr_src)`, an UPDATE that
+    /// does NOT bind this column overrides the new value with
+    /// the engine-evaluated expression (always `now()` in
+    /// v7.17.0). Stored as Display-form source so storage
+    /// stays free of spg-sql; the engine re-parses at UPDATE
+    /// time. Persisted in catalog FILE_VERSION 32+; older
+    /// catalogs deserialise with None — preserves the existing
+    /// "silent ignore" behaviour for snapshots written before
+    /// the upgrade.
+    pub on_update_runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5282,6 +5293,7 @@ impl ColumnSchema {
             auto_increment: false,
             user_enum_type: None,
             user_domain_type: None,
+            on_update_runtime: None,
         }
     }
 
@@ -5472,7 +5484,15 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     `information_schema`) are NOT serialised — they're
 ///     hardcoded in `is_builtin_schema`. v30-and-below catalogs
 ///     deserialise with an empty user-schemas set.
-const FILE_VERSION: u8 = 31;
+/// v32 introduces (v7.17.0 Phase 2.1):
+///   * Per-table on_update_runtime appendix (after the
+///     user_domain_type appendix). Layout: `u16 count` followed
+///     by per-binding `[u16 col_pos][str expr_src]`. Only
+///     columns whose `on_update_runtime` is Some land here;
+///     the catalog stays compact when no MySQL-shaped table
+///     uses the attribute. v31-and-below catalogs deserialise
+///     with every column's `on_update_runtime = None`.
+const FILE_VERSION: u8 = 32;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5829,6 +5849,22 @@ impl Catalog {
             for (pos, dname) in domain_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, dname);
+            }
+            // v7.17.0 Phase 2.1 — per-table on_update_runtime
+            // appendix. Sparse: only ON UPDATE-bound columns.
+            let mut on_update_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(e) = &c.on_update_runtime {
+                    on_update_bindings.push((i, e.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(on_update_bindings.len()).expect("≤ 65k ON UPDATE columns/table"),
+            );
+            for (pos, expr_src) in on_update_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, expr_src);
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
@@ -6278,6 +6314,7 @@ fn deserialize_table(
             auto_increment,
             user_enum_type: None,
             user_domain_type: None,
+            on_update_runtime: None,
         });
     }
     let n_cols = cols.len();
@@ -6423,6 +6460,19 @@ fn deserialize_table(
             let dname = cur.read_str()?;
             if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
                 col.user_domain_type = Some(dname);
+            }
+        }
+    }
+    // v7.17.0 Phase 2.1 — per-table on_update_runtime appendix
+    // (FILE_VERSION 32+). Sparse layout matches the enum/
+    // domain bindings.
+    if version >= 32 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let expr_src = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.on_update_runtime = Some(expr_src);
             }
         }
     }
