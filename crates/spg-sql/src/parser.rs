@@ -3757,7 +3757,116 @@ impl Parser {
         } else {
             None
         };
+        // v7.17.0 Phase 3.4 — trailing row-lock clauses:
+        //   FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
+        //       [ OF table_name [, …] ]
+        //       [ NOWAIT | SKIP LOCKED ]
+        // Multiple FOR clauses may stack (PG: `FOR UPDATE OF t1
+        // FOR SHARE OF t2`). SPG is a single-writer engine — every
+        // SELECT already returns a consistent snapshot — so these
+        // are accept-and-discard: the parser absorbs them so
+        // mailrs / Rails / Django code paths that emit `SELECT
+        // … FOR UPDATE` for advisory pessimistic locking load
+        // without a parser error. The on-disk locking model is
+        // unchanged; callers that rely on FOR UPDATE for read-
+        // through-write ordering still get the right answer
+        // because SPG serialises writes anyway.
+        self.consume_optional_for_lock_clauses();
         Ok(Statement::Select(head))
+    }
+
+    /// v7.17.0 Phase 3.4 — eat zero or more `FOR { UPDATE | NO KEY
+    /// UPDATE | SHARE | KEY SHARE } [ OF tbl[, …] ] [ NOWAIT | SKIP
+    /// LOCKED ]` trailers. Each clause is fully accepted and
+    /// discarded — SPG's single-writer model already satisfies the
+    /// callers' implicit ordering requirement. Stops at the first
+    /// token that isn't `FOR`.
+    fn consume_optional_for_lock_clauses(&mut self) {
+        while matches!(self.peek(), Token::For) {
+            self.advance(); // FOR
+            // `NO KEY` prefix (PG) — `NO` is reserved-keyword-shaped
+            // (`Token::Not` isn't it; PG `NO` lexes as Token::Ident).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("no"))
+            {
+                self.advance(); // NO
+                // The next ident should be KEY but be generous;
+                // anything followed by UPDATE/SHARE is accepted.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("key"))
+                {
+                    self.advance(); // KEY
+                }
+            }
+            // `KEY` prefix (PG `FOR KEY SHARE`).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("key"))
+            {
+                self.advance(); // KEY
+            }
+            // Lock-strength keyword: UPDATE / SHARE. Required, but
+            // we're lenient — an unexpected token here just bails
+            // (we already consumed FOR; caller's downstream
+            // dispatch will error if anything actually depends on
+            // the trailing tokens).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("update") || s.eq_ignore_ascii_case("share"))
+            {
+                self.advance();
+            } else {
+                // FOR by itself (or `FOR KEY` with nothing after) —
+                // give up on the lock-clause path. We've already
+                // advanced past FOR; further attempts to parse
+                // here would clobber state.
+                return;
+            }
+            // Optional `OF tbl[, tbl …]`. mailrs emits this when
+            // joining and locking only a subset of tables.
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("of"))
+            {
+                self.advance(); // OF
+                loop {
+                    match self.peek() {
+                        Token::Ident(_) | Token::QuotedIdent(_) => {
+                            self.advance();
+                            // Optional schema-qualified `schema.table`.
+                            if matches!(self.peek(), Token::Dot) {
+                                self.advance();
+                                if matches!(
+                                    self.peek(),
+                                    Token::Ident(_) | Token::QuotedIdent(_)
+                                ) {
+                                    self.advance();
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            // Optional `NOWAIT` | `SKIP LOCKED`.
+            match self.peek().clone() {
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("nowait") => {
+                    self.advance();
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("skip") => {
+                    self.advance(); // SKIP
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("locked"))
+                    {
+                        self.advance(); // LOCKED
+                    }
+                }
+                _ => {}
+            }
+            // Loop: PG allows multiple FOR clauses chained.
+        }
     }
 
     /// v7.9.24 — accept `LIMIT <int>` or `LIMIT $N`. mailrs H2.
