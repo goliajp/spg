@@ -1151,6 +1151,52 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             }
             Ok(Value::Text(out))
         }
+        // PG `concat_ws(sep, val1 [, val2 ...])` — like concat but
+        // with a separator inserted between each pair of NON-NULL
+        // arguments. Critical semantic subtleties:
+        //   * NULL separator → NULL result (the sep position is
+        //     mandatory and poison-prone; this is the ONLY way
+        //     concat_ws can return NULL).
+        //   * NULL data args silently SKIPPED — the separator is
+        //     NOT inserted around them. `concat_ws(',', 'a', NULL,
+        //     'b')` → `'a,b'`, not `'a,,b'`.
+        //   * Empty-string data args are KEPT (separator placed
+        //     around them). `concat_ws(',', 'a', '', 'b')` →
+        //     `'a,,b'`. Distinction with NULL matters for code
+        //     like `concat_ws(', ', first_name, middle_name,
+        //     last_name)`.
+        //   * 0 args → arity error (sep is mandatory).
+        //   * Only sep (no data) → '' (NOT NULL — distinct from
+        //     the all-NULL data case which also returns '').
+        //
+        // Reference:
+        //   https://www.postgresql.org/docs/current/functions-string.html
+        "concat_ws" => {
+            if args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "concat_ws() requires at least 1 arg (the separator)".into(),
+                });
+            }
+            // NULL separator poisons the result.
+            let sep = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                v => value_to_format_text(v),
+            };
+            let mut out = String::new();
+            let mut first = true;
+            for v in &args[1..] {
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                if first {
+                    first = false;
+                } else {
+                    out.push_str(&sep);
+                }
+                out.push_str(&value_to_format_text(v));
+            }
+            Ok(Value::Text(out))
+        }
         // v7.17.0 Phase 3.7 — PG regex function family.
         "regexp_matches" => regexp_matches(args),
         "regexp_replace" => regexp_replace(args),
