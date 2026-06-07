@@ -5262,13 +5262,32 @@ impl Parser {
             // since SPG doesn't have a dedicated i8. MEDIUMINT (MySQL
             // 24-bit) → INT. UNSIGNED modifiers are consumed below
             // without semantic effect.
-            "smallint" | "tinyint" => {
+            "smallint" => {
                 // v7.14.0 — MySQL display-width on integers
-                // (`TINYINT(1)`, `INT(11)`, `BIGINT(20)`). The
+                // (`SMALLINT(5)`, `INT(11)`, `BIGINT(20)`). The
                 // parenthesised number is purely cosmetic — it
                 // doesn't change storage. Accept + discard.
                 self.consume_optional_paren_size();
                 ColumnTypeName::SmallInt
+            }
+            // v7.17.0 Phase 4.3 — MySQL `TINYINT(1)` is the
+            // canonical encoding for BOOLEAN. Every MySQL driver
+            // (JDBC `tinyInt1isBit=true`, PHP `mysql_field_type`,
+            // .NET `MySqlConnection`, sqlx) maps it to bit. Pre-
+            // 4.3 SPG classified TINYINT(1) as SmallInt, which
+            // gave the customer i16-shaped values where the app
+            // expected bool — a Tier-A silent type drift on
+            // mysqldump restores. Now: `TINYINT(1)` → Bool;
+            // `TINYINT` (no width) and `TINYINT(N)` for N ≠ 1
+            // stay SmallInt (the legacy width-agnostic path).
+            "tinyint" => {
+                let width = self.peek_optional_paren_size_value();
+                self.consume_optional_paren_size();
+                if width == Some(1) {
+                    ColumnTypeName::Bool
+                } else {
+                    ColumnTypeName::SmallInt
+                }
             }
             "int" | "integer" | "mediumint" => {
                 self.consume_optional_paren_size();
@@ -5786,6 +5805,26 @@ impl Parser {
                 "unknown vector encoding {other:?}; supported: SQ8, HALF"
             ))),
         }
+    }
+
+    /// v7.17.0 Phase 4.3 — peek at the MySQL display-width
+    /// without consuming it. Returns `Some(N)` when the next
+    /// tokens are `( <int> )`; None otherwise. Used by the
+    /// TINYINT classifier to decide whether to map to Bool or
+    /// SmallInt.
+    fn peek_optional_paren_size_value(&self) -> Option<i64> {
+        if !matches!(self.peek(), Token::LParen) {
+            return None;
+        }
+        let next = self.tokens.get(self.pos + 1)?;
+        let n = match next {
+            Token::Integer(n) => *n,
+            _ => return None,
+        };
+        if !matches!(self.tokens.get(self.pos + 2), Some(Token::RParen)) {
+            return None;
+        }
+        Some(n)
     }
 
     /// v7.14.0 — consume an optional MySQL display-width
