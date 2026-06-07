@@ -295,6 +295,27 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
+    /// v7.17.0 Phase 1.6 — `CREATE SCHEMA [IF NOT EXISTS]
+    /// name [AUTHORIZATION user]`. SPG is single-database;
+    /// schemas are tracked as a namespace registry so pg_dump
+    /// multi-schema declarations land cleanly and `SELECT *
+    /// FROM information_schema.schemata` returns real entries.
+    /// Schema-qualified `schema.table` references still strip
+    /// the prefix at lookup time per PG (schemas are not
+    /// isolation boundaries in v7.17 — see project-next-docket
+    /// for the v7.18+ isolation tracking).
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// v7.17.0 Phase 1.6 — `DROP SCHEMA [IF EXISTS] name
+    /// [, name…] [CASCADE | RESTRICT]`. Removes the schema
+    /// from the registry; built-in `public` / `pg_catalog` /
+    /// `information_schema` cannot be dropped.
+    DropSchema {
+        names: Vec<String>,
+        if_exists: bool,
+    },
 }
 
 /// v7.17.0 Phase 1.5 — `CREATE DOMAIN` AST.
@@ -2191,6 +2212,26 @@ impl fmt::Display for Statement {
             Self::CreateDomain(d) => d.fmt(f),
             Self::DropDomain { names, if_exists } => {
                 f.write_str("DROP DOMAIN ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+            Self::CreateSchema { name, if_not_exists } => {
+                f.write_str("CREATE SCHEMA ")?;
+                if *if_not_exists {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                write!(f, "{}", quote_ident(name))
+            }
+            Self::DropSchema { names, if_exists } => {
+                f.write_str("DROP SCHEMA ")?;
                 if *if_exists {
                     f.write_str("IF EXISTS ")?;
                 }
