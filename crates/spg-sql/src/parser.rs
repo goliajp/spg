@@ -572,6 +572,27 @@ impl Parser {
                         }
                         Ok(Statement::Empty)
                     }
+                    // v7.17.0 Phase 1.4 — DROP TYPE [IF EXISTS]
+                    // name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("type") =>
+                    {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropType { names, if_exists })
+                    }
                     // v7.17.0 Phase 1.3 — DROP MATERIALIZED VIEW
                     // [IF EXISTS] name [, name…] [CASCADE|RESTRICT].
                     Token::Ident(s) | Token::QuotedIdent(s)
@@ -990,6 +1011,11 @@ impl Parser {
                 self.advance();
                 self.parse_create_view_after_keyword(false, false, false)
             }
+            // v7.17.0 Phase 1.4 — CREATE TYPE name AS ENUM (…).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("type") => {
+                self.advance();
+                self.parse_create_type_after_keyword()
+            }
             // v7.17.0 Phase 1.3 — CREATE MATERIALIZED VIEW …
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("materialized") => {
                 self.advance();
@@ -1029,16 +1055,15 @@ impl Parser {
             // TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
             // SPG is single-schema / single-database; these have
             // no behavioural effect, so consume + return Empty.
-            // v7.17.0 NOTE: SEQUENCE / VIEW / MATERIALIZED VIEW
-            // were here pre-v7.17; all moved up to real parser
-            // branches. TYPE / DOMAIN move out in Phase 1.4–1.5;
+            // v7.17.0 NOTE: SEQUENCE / VIEW / MATERIALIZED VIEW /
+            // TYPE were here pre-v7.17; all moved up to real
+            // parser branches. DOMAIN moves out in Phase 1.5;
             // SCHEMA / DATABASE / ROLE / POLICY / OPERATOR stay
             // no-op forever (single-namespace).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
                     "schema"
-                        | "type"
                         | "domain"
                         | "database"
                         | "role"
@@ -1335,6 +1360,78 @@ impl Parser {
             }
             _ => Ok(None),
         }
+    }
+
+    /// v7.17.0 Phase 1.4 — body of `CREATE TYPE name AS ENUM
+    /// ('a', 'b', …)`. The `TYPE` keyword has already been
+    /// consumed.
+    fn parse_create_type_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        // Required `AS`.
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS after CREATE TYPE {name:?}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Required `ENUM` ident.
+        let kind_ident = match self.peek().clone() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s,
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected ENUM after CREATE TYPE {name:?} AS, got {other:?}"
+                )));
+            }
+        };
+        if !kind_ident.eq_ignore_ascii_case("enum") {
+            return Err(self.err(alloc::format!(
+                "Phase 1.4 only supports ENUM; got {kind_ident:?}"
+            )));
+        }
+        self.advance();
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after ENUM, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut labels: Vec<String> = Vec::new();
+        loop {
+            match self.peek().clone() {
+                Token::String(s) => {
+                    self.advance();
+                    labels.push(s);
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected enum label string, got {other:?}"
+                    )));
+                }
+            }
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            if matches!(self.peek(), Token::RParen) {
+                self.advance();
+                break;
+            }
+            return Err(self.err(alloc::format!(
+                "expected , or ) in ENUM label list, got {:?}",
+                self.peek()
+            )));
+        }
+        if labels.is_empty() {
+            return Err(self.err(
+                "CREATE TYPE … AS ENUM must declare at least one label".into(),
+            ));
+        }
+        Ok(Statement::CreateType(crate::ast::CreateTypeStatement {
+            name,
+            kind: crate::ast::TypeKind::Enum { labels },
+        }))
     }
 
     /// v7.17.0 Phase 1.3 — body of `CREATE MATERIALIZED VIEW
@@ -4614,13 +4711,13 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
     fn parse_type_with_implied_flags(
         &mut self,
-    ) -> Result<(ColumnTypeName, bool, bool), ParseError> {
+    ) -> Result<(ColumnTypeName, bool, bool, Option<String>), ParseError> {
         let ty_ident = match self.advance() {
             Token::Ident(s) => s,
             other => {
@@ -4632,6 +4729,7 @@ impl Parser {
         };
         let mut implied_auto_increment = false;
         let mut implied_not_null = false;
+        let mut user_type_ref: Option<String> = None;
         let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
@@ -4752,11 +4850,14 @@ impl Parser {
             // mailrs's `scripts/init-schema.sql` runs unmodified.
             "tsvector" => ColumnTypeName::TsVector,
             "tsquery" => ColumnTypeName::TsQuery,
-            other => {
-                return Err(ParseError {
-                    message: format!("unsupported column type {other:?}"),
-                    token_pos: self.pos.saturating_sub(1),
-                });
+            _other => {
+                // v7.17.0 Phase 1.4 — unknown ident → defer
+                // resolution to the engine. Stored as Text in
+                // ColumnTypeName + the original name carried as
+                // `user_type_ref` so CREATE TABLE can look up
+                // user-defined enum / domain types.
+                user_type_ref = Some(ty_ident.clone());
+                ColumnTypeName::Text
             }
         };
         // MySQL's `UNSIGNED` modifier sits right after the type
@@ -4824,12 +4925,12 @@ impl Parser {
                 }
             };
         }
-        Ok((ty, implied_auto_increment, implied_not_null))
+        Ok((ty, implied_auto_increment, implied_not_null, user_type_ref))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
         let name = self.expect_ident_like()?;
-        let (ty, implied_auto_increment, implied_not_null) =
+        let (ty, implied_auto_increment, implied_not_null, user_type_ref) =
             self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -4984,6 +5085,7 @@ impl Parser {
             is_primary_key,
             is_unique,
             check,
+            user_type_ref,
         })
     }
 

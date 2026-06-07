@@ -1844,6 +1844,10 @@ impl Engine {
             Statement::DropMaterializedView { names, if_exists } => {
                 self.exec_drop_materialized_view(&names, if_exists)
             }
+            Statement::CreateType(s) => self.exec_create_type(s),
+            Statement::DropType { names, if_exists } => {
+                self.exec_drop_type(&names, if_exists)
+            }
             Statement::ResetParameter(target) => {
                 match target {
                     None => self.session_params.clear(),
@@ -3305,6 +3309,92 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.4 — `CREATE TYPE name AS ENUM (…)` engine
+    /// path. Registers the enum in the catalog with order-
+    /// preserving labels. PG semantics: CREATE TYPE errors if the
+    /// name is taken (no IF NOT EXISTS).
+    fn exec_create_type(
+        &mut self,
+        s: spg_sql::ast::CreateTypeStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Name-collision check against tables / sequences / views /
+        // materialized views.
+        let cat = self.active_catalog();
+        if cat.get(&s.name).is_some() {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing table", s.name),
+            )));
+        }
+        if cat.sequences().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing sequence", s.name),
+            )));
+        }
+        if cat.views().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing view", s.name),
+            )));
+        }
+        let def = match s.kind {
+            spg_sql::ast::TypeKind::Enum { labels } => {
+                if labels.is_empty() {
+                    return Err(EngineError::Unsupported(
+                        "CREATE TYPE … AS ENUM requires at least one label".into(),
+                    ));
+                }
+                // Reject duplicate labels per PG.
+                for i in 0..labels.len() {
+                    for j in (i + 1)..labels.len() {
+                        if labels[i] == labels[j] {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "CREATE TYPE {:?}: duplicate ENUM label {:?}",
+                                s.name,
+                                labels[i]
+                            )));
+                        }
+                    }
+                }
+                spg_storage::EnumDef {
+                    name: s.name.clone(),
+                    labels,
+                }
+            }
+        };
+        self.active_catalog_mut()
+            .create_enum_type(def)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.4 — `DROP TYPE [IF EXISTS] names`. Only
+    /// ENUM types are catalogued today; other types silently
+    /// no-op even outside IF EXISTS to mirror the prior
+    /// "everything's text" lax stance.
+    fn exec_drop_type(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_enum_type(name);
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("type {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
         })
     }
 
@@ -5266,6 +5356,21 @@ impl Engine {
             .into_iter()
             .map(column_def_to_schema)
             .collect::<Result<Vec<_>, _>>()?;
+        // v7.17.0 Phase 1.4 — verify every user_enum_type
+        // reference resolves to a catalog enum. Unknown idents
+        // surface as a clear error here rather than silently
+        // accepting them as freeform TEXT.
+        for col in &cols {
+            if let Some(enum_name) = &col.user_enum_type {
+                if !self.active_catalog().enum_types().contains_key(enum_name) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "column {:?}: unknown column type {:?} (not a built-in nor a CREATE TYPE … AS ENUM)",
+                        col.name,
+                        enum_name
+                    )));
+                }
+            }
+        }
         // Composite NOT-NULL implication for PRIMARY KEY columns.
         let mut cols = cols;
         for tc in &stmt.table_constraints {
@@ -5477,6 +5582,32 @@ impl Engine {
             .session_params
             .get("default_text_search_config")
             .cloned();
+        // v7.17.0 Phase 1.4 — snapshot the enum label lookup BEFORE
+        // opening the mutable borrow on the table below. We need
+        // catalog-level read access (enum_types lives at the
+        // catalog level, not the table) and the upcoming mutable
+        // borrow shadows it.
+        let pre_borrow_column_meta: Vec<ColumnSchema> = {
+            let preview_table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
+            preview_table.schema().columns.clone()
+        };
+        let enum_label_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
+            pre_borrow_column_meta
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| {
+                    col.user_enum_type.as_ref().and_then(|ename| {
+                        self.active_catalog()
+                            .enum_types()
+                            .get(ename)
+                            .map(|e| (i, e.labels.clone()))
+                    })
+                })
+                .collect();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -5574,7 +5705,9 @@ impl Engine {
                         })?;
                         raw = Value::BigInt(next);
                     }
-                    out.push(coerce_value(raw, col.ty, &col.name, i)?);
+                    let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                    enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    out.push(coerced);
                 }
                 out
             } else {
@@ -5591,7 +5724,9 @@ impl Engine {
                         })?;
                         raw = Value::BigInt(next);
                     }
-                    out.push(coerce_value(raw, col.ty, &col.name, i)?);
+                    let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                    enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    out.push(coerced);
                 }
                 out
             };
@@ -12540,9 +12675,43 @@ fn is_runtime_default_expr(expr: &Expr) -> bool {
     }
 }
 
+/// v7.17.0 Phase 1.4 — INSERT/UPDATE-time enum label check. When
+/// `col_idx` has a registered label list, the cell value must be
+/// NULL or one of the labels (case-sensitive per PG).
+fn enforce_enum_label(
+    lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    col_idx: usize,
+    col_name: &str,
+    value: &Value,
+) -> Result<(), EngineError> {
+    if let Some(labels) = lookup.get(&col_idx) {
+        match value {
+            Value::Null => Ok(()),
+            Value::Text(s) => {
+                if labels.iter().any(|l| l == s) {
+                    Ok(())
+                } else {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "column {col_name:?}: invalid enum label {s:?}; allowed: {labels:?}"
+                    )))
+                }
+            }
+            other => Err(EngineError::Unsupported(alloc::format!(
+                "column {col_name:?}: enum-typed column expects TEXT, got {:?}",
+                other.data_type()
+            ))),
+        }
+    } else {
+        Ok(())
+    }
+}
+
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
+    if let Some(enum_name) = c.user_type_ref {
+        schema.user_enum_type = Some(enum_name);
+    }
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to

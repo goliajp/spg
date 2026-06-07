@@ -265,6 +265,38 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
+    /// v7.17.0 Phase 1.4 — `CREATE TYPE name AS ENUM ('a', 'b',
+    /// …)`. Closes the silent-no-op CREATE TYPE story so PG
+    /// dumps that declare enum types load with real constraints
+    /// instead of becoming free-form TEXT. Future kinds
+    /// (composite / range / domain) extend the inner `kind`
+    /// enum.
+    CreateType(CreateTypeStatement),
+    /// v7.17.0 Phase 1.4 — `DROP TYPE [IF EXISTS] name [, name…]
+    /// [CASCADE | RESTRICT]`. Removes the matching enum/domain
+    /// from the catalog.
+    DropType {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+}
+
+/// v7.17.0 Phase 1.4 — `CREATE TYPE` AST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTypeStatement {
+    pub name: String,
+    pub kind: TypeKind,
+}
+
+/// v7.17.0 Phase 1.4 — flavour of the new type. Only ENUM is
+/// implemented; the variant set is open so Phase 1.5 (DOMAIN)
+/// and later (COMPOSITE, RANGE) can land without an AST shape
+/// migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeKind {
+    /// `AS ENUM ('a', 'b', …)`. Order is preserved (PG enum
+    /// labels are ordered).
+    Enum { labels: Vec<String> },
 }
 
 /// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
@@ -1038,6 +1070,16 @@ pub struct ColumnDef {
     /// CHECK constraints. Multiple inline CHECKs on the same
     /// column are concatenated with AND at the table level.
     pub check: Option<Expr>,
+    /// v7.17.0 Phase 1.4 — user-defined type reference. When the
+    /// parser sees an unknown column-type ident (anything not in
+    /// the built-in `parse_column_type_name` table), it sets
+    /// `ty = ColumnTypeName::Text` and records the original name
+    /// here. The engine resolves at CREATE TABLE time: if a
+    /// catalog enum/domain with this name exists, the column is
+    /// bound to it (label-checked on INSERT for enums; CHECK-
+    /// constrained for domains); otherwise the CREATE TABLE
+    /// errors with "unknown type".
+    pub user_type_ref: Option<String>,
 }
 
 /// v7.6.0 — A single FOREIGN KEY constraint. Both column-level
@@ -2092,6 +2134,38 @@ impl fmt::Display for Statement {
                     write!(f, "{}", quote_ident(n))?;
                 }
                 Ok(())
+            }
+            Self::CreateType(t) => t.fmt(f),
+            Self::DropType { names, if_exists } => {
+                f.write_str("DROP TYPE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl fmt::Display for CreateTypeStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE TYPE {} AS ", quote_ident(&self.name))?;
+        match &self.kind {
+            TypeKind::Enum { labels } => {
+                f.write_str("ENUM (")?;
+                for (i, l) in labels.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "'{}'", l.replace('\'', "''"))?;
+                }
+                f.write_str(")")
             }
         }
     }
