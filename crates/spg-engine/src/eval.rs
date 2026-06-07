@@ -1203,6 +1203,17 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // PG `repeat(string, n)` — duplicate the input N times.
         // n=0 → ''; n<0 → '' (PG does NOT error on negative);
         // NULL on any arg → NULL.
+        // PG `lpad(string, length [, fill])` / `rpad(...)`.
+        // length is the target CODEPOINT count. Truncation when
+        // input longer (lpad keeps the LEFT side, rpad keeps
+        // LEFT too — both wait truncate from the right side per
+        // PG-verified behavior). Padding when shorter, using
+        // `fill` (default SPACE) cycling for multi-char fills.
+        // length<=0 → ''. Empty fill + needs padding → returns
+        // input verbatim (potentially truncated). NULL on any
+        // arg → NULL.
+        "lpad" => string_pad(args, true, "lpad"),
+        "rpad" => string_pad(args, false, "rpad"),
         "repeat" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -2680,6 +2691,70 @@ enum TrimSide {
     Left,
     Right,
     Both,
+}
+
+/// PG `lpad` / `rpad` shared implementation. Length is the
+/// target codepoint count. When the input is longer than `length`,
+/// truncate keeping the LEFT side (both lpad and rpad agree with
+/// PG here). When shorter, pad with `fill` (default SPACE) cycling
+/// for multi-char fills, on the appropriate side. Empty fill +
+/// needs padding → returns input verbatim (potentially
+/// truncated). NULL on any arg → NULL.
+fn string_pad(args: &[Value], is_left: bool, fn_name: &str) -> Result<Value, EvalError> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fn_name}() takes 2 or 3 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let s = value_to_format_text(&args[0]);
+    let target = match &args[1] {
+        Value::SmallInt(x) => i64::from(*x),
+        Value::Int(x) => i64::from(*x),
+        Value::BigInt(x) => *x,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}(): length must be integer, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let fill = if args.len() == 3 {
+        value_to_format_text(&args[2])
+    } else {
+        String::from(" ")
+    };
+    if target <= 0 {
+        return Ok(Value::Text(String::new()));
+    }
+    let target = target as usize;
+    let s_chars: Vec<char> = s.chars().collect();
+    if s_chars.len() >= target {
+        // Truncate from the right (PG keeps LEFT side for both
+        // lpad and rpad).
+        return Ok(Value::Text(s_chars[..target].iter().collect()));
+    }
+    if fill.is_empty() {
+        return Ok(Value::Text(s));
+    }
+    let pad_needed = target - s_chars.len();
+    let fill_chars: Vec<char> = fill.chars().collect();
+    let mut padding = String::with_capacity(pad_needed * 4);
+    for i in 0..pad_needed {
+        padding.push(fill_chars[i % fill_chars.len()]);
+    }
+    if is_left {
+        Ok(Value::Text(padding + &s))
+    } else {
+        Ok(Value::Text(s + &padding))
+    }
 }
 
 /// PG `trim` / `ltrim` / `rtrim` / `btrim` shared implementation.
