@@ -31,10 +31,7 @@ impl TransactionManager for SpgTransactionManager {
                 .as_deref()
                 .map(std::string::ToString::to_string)
                 .unwrap_or_else(|| "BEGIN".to_string());
-            conn.inner
-                .execute(&sql)
-                .await
-                .map_err(engine_to_sqlx)?;
+            conn.inner.execute(&sql).await.map_err(engine_to_sqlx)?;
             conn.tx_depth = conn.tx_depth.saturating_add(1);
             Ok(())
         })
@@ -43,12 +40,11 @@ impl TransactionManager for SpgTransactionManager {
     fn commit(conn: &mut SpgConnection) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
             if conn.tx_depth == 0 {
-                return Err(engine_to_sqlx(spg_embedded::EngineError::NoActiveTransaction));
+                return Err(engine_to_sqlx(
+                    spg_embedded::EngineError::NoActiveTransaction,
+                ));
             }
-            conn.inner
-                .execute("COMMIT")
-                .await
-                .map_err(engine_to_sqlx)?;
+            conn.inner.execute("COMMIT").await.map_err(engine_to_sqlx)?;
             conn.tx_depth = conn.tx_depth.saturating_sub(1);
             Ok(())
         })
@@ -57,7 +53,9 @@ impl TransactionManager for SpgTransactionManager {
     fn rollback(conn: &mut SpgConnection) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
             if conn.tx_depth == 0 {
-                return Err(engine_to_sqlx(spg_embedded::EngineError::NoActiveTransaction));
+                return Err(engine_to_sqlx(
+                    spg_embedded::EngineError::NoActiveTransaction,
+                ));
             }
             conn.inner
                 .execute("ROLLBACK")

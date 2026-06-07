@@ -18,10 +18,8 @@ fn default_unique_treats_nulls_as_distinct() {
 #[test]
 fn nulls_not_distinct_rejects_duplicate_null_rows() {
     let mut eng = Engine::new();
-    eng.execute(
-        "CREATE TABLE t (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))",
-    )
-    .unwrap();
+    eng.execute("CREATE TABLE t (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))")
+        .unwrap();
     eng.execute("INSERT INTO t VALUES (NULL, NULL)").unwrap();
     let r = eng.execute("INSERT INTO t VALUES (NULL, NULL)");
     assert!(
@@ -50,10 +48,8 @@ fn nulls_not_distinct_still_rejects_non_null_duplicates() {
 #[test]
 fn nulls_not_distinct_persists_on_schema() {
     let mut eng = Engine::new();
-    eng.execute(
-        "CREATE TABLE t (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))",
-    )
-    .unwrap();
+    eng.execute("CREATE TABLE t (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))")
+        .unwrap();
     let table = eng.catalog().get("t").expect("table present");
     let uc = &table.schema().uniqueness_constraints[0];
     assert!(uc.nulls_not_distinct);

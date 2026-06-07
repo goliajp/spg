@@ -373,7 +373,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     // variable reference. Consume the ident-shaped
                     // tail and emit as Token::SessionVar so the
                     // SET parser can accept-and-ignore.
-                    let prefix_end = if peek_eq(bytes, i + 1, b'@') { i + 2 } else { i + 1 };
+                    let prefix_end = if peek_eq(bytes, i + 1, b'@') {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
                     let mut end = prefix_end;
                     while end < bytes.len() && is_session_var_ident_continue(bytes[end]) {
                         end += 1;

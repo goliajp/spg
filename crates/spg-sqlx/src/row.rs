@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
+use sqlx_core::HashMap;
 use sqlx_core::column::ColumnIndex;
 use sqlx_core::database::Database;
 use sqlx_core::error::Error;
 use sqlx_core::row::Row;
-use sqlx_core::HashMap;
 
 use spg_embedded::Value as EngineValue;
 
@@ -59,14 +59,20 @@ impl Row for SpgRow {
     {
         use sqlx_core::column::Column as _;
         let ord = index.index(self)?;
-        let col = self.columns.get(ord).ok_or_else(|| Error::ColumnIndexOutOfBounds {
-            index: ord,
-            len: self.columns.len(),
-        })?;
-        let val = self.values.get(ord).ok_or_else(|| Error::ColumnIndexOutOfBounds {
-            index: ord,
-            len: self.values.len(),
-        })?;
+        let col = self
+            .columns
+            .get(ord)
+            .ok_or_else(|| Error::ColumnIndexOutOfBounds {
+                index: ord,
+                len: self.columns.len(),
+            })?;
+        let val = self
+            .values
+            .get(ord)
+            .ok_or_else(|| Error::ColumnIndexOutOfBounds {
+                index: ord,
+                len: self.values.len(),
+            })?;
         Ok(SpgValueRef::new(val, col.type_info().clone()))
     }
 }

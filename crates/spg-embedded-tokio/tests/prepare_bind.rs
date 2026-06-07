@@ -23,17 +23,11 @@ async fn async_prepare_then_bind_query() {
         .prepare("SELECT name FROM users WHERE id = $1")
         .await
         .unwrap();
-    let rows = db
-        .query_prepared(&stmt, vec![Value::Int(1)])
-        .await
-        .unwrap();
+    let rows = db.query_prepared(&stmt, vec![Value::Int(1)]).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], Value::Text("alice".into()));
 
-    let rows = db
-        .query_prepared(&stmt, vec![Value::Int(2)])
-        .await
-        .unwrap();
+    let rows = db.query_prepared(&stmt, vec![Value::Int(2)]).await.unwrap();
     assert_eq!(rows[0][0], Value::Text("bob".into()));
 }
 
@@ -70,10 +64,7 @@ async fn async_clone_handle_concurrent_binds() {
         h.await.unwrap();
     }
 
-    let rows = db
-        .query("SELECT k, v FROM items ORDER BY k")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT k, v FROM items ORDER BY k").await.unwrap();
     assert_eq!(rows.len(), 10);
     for (i, row) in rows.iter().enumerate() {
         assert_eq!(row[0], Value::Int(i as i32));
@@ -98,10 +89,7 @@ async fn async_prepare_dml_persists_via_wal() {
         db.execute("CREATE TABLE kv (k INT NOT NULL, v TEXT NOT NULL)")
             .await
             .unwrap();
-        let stmt = db
-            .prepare("INSERT INTO kv VALUES ($1, $2)")
-            .await
-            .unwrap();
+        let stmt = db.prepare("INSERT INTO kv VALUES ($1, $2)").await.unwrap();
         db.execute_prepared(&stmt, vec![Value::Int(1), Value::Text("one".into())])
             .await
             .unwrap();

@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
+use sqlx_core::HashMap;
 use sqlx_core::connection::Connection;
 use sqlx_core::error::Error;
 use sqlx_core::executor::Executor;
 use sqlx_core::transaction::Transaction;
-use sqlx_core::HashMap;
 
 use spg_embedded::QueryResult as EngineQueryResult;
 use spg_embedded_tokio::AsyncDatabase;
@@ -118,7 +118,10 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
     ) -> BoxStream<
         'e,
         Result<
-            either::Either<<Self::Database as sqlx_core::database::Database>::QueryResult, crate::SpgRow>,
+            either::Either<
+                <Self::Database as sqlx_core::database::Database>::QueryResult,
+                crate::SpgRow,
+            >,
             Error,
         >,
     >
@@ -173,7 +176,10 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
         self,
         sql: &'q str,
         _parameters: &'e [<Self::Database as sqlx_core::database::Database>::TypeInfo],
-    ) -> BoxFuture<'e, Result<<Self::Database as sqlx_core::database::Database>::Statement<'q>, Error>>
+    ) -> BoxFuture<
+        'e,
+        Result<<Self::Database as sqlx_core::database::Database>::Statement<'q>, Error>,
+    >
     where
         'c: 'e,
     {
@@ -269,9 +275,7 @@ fn build_rows(
     let columns: Arc<Vec<SpgColumn>> = Arc::new(
         cols.iter()
             .enumerate()
-            .map(|(i, c)| {
-                SpgColumn::new(i, c.name.clone(), SpgTypeInfo::from_data_type(c.ty))
-            })
+            .map(|(i, c)| SpgColumn::new(i, c.name.clone(), SpgTypeInfo::from_data_type(c.ty)))
             .collect(),
     );
     let mut by_name: HashMap<String, usize> = HashMap::new();

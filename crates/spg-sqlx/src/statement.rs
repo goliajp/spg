@@ -6,10 +6,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use either::Either;
+use sqlx_core::HashMap;
 use sqlx_core::column::ColumnIndex;
 use sqlx_core::error::Error;
 use sqlx_core::statement::Statement;
-use sqlx_core::HashMap;
 
 use crate::column::SpgColumn;
 use crate::database::Spg;

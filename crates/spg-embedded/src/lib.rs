@@ -768,7 +768,10 @@ impl Database {
         // across all callers of this Database — a single
         // `PgPool`-shaped consumer (or, later, the spg-sqlx
         // adapter) prepares once and reaps the win on every bind.
-        let stmt = self.engine.prepare_cached(sql).map_err(EngineError::Parse)?;
+        let stmt = self
+            .engine
+            .prepare_cached(sql)
+            .map_err(EngineError::Parse)?;
         Ok(Statement {
             stmt,
             sql: sql.to_string(),

@@ -32,16 +32,11 @@ impl Type<Spg> for DateTime<Utc> {
 }
 
 impl<'q> Encode<'q, Spg> for DateTime<Utc> {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         // Convert to PG-canonical `YYYY-MM-DD HH:MM:SS.fff+00`
         // text. The engine's v7.15.0 TIMESTAMPTZ parser accepts
         // this shape and stores as i64 µs UTC.
-        let s = self
-            .format("%Y-%m-%d %H:%M:%S%.6f+00")
-            .to_string();
+        let s = self.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string();
         buf.push(SpgArgumentValue {
             value: EngineValue::Text(s),
             type_info: Some(<DateTime<Utc> as Type<Spg>>::type_info()),
@@ -58,9 +53,7 @@ impl<'r> Decode<'r, Spg> for DateTime<Utc> {
                 let secs = micros.div_euclid(1_000_000);
                 let nanos = (micros.rem_euclid(1_000_000) as u32) * 1_000;
                 let dt = DateTime::<Utc>::from_timestamp(secs, nanos)
-                    .ok_or_else(|| {
-                        format!("TIMESTAMPTZ value {micros} µs out of chrono range")
-                    })?;
+                    .ok_or_else(|| format!("TIMESTAMPTZ value {micros} µs out of chrono range"))?;
                 Ok(dt)
             }
             other => Err(format!("cannot decode {other:?} as chrono::DateTime<Utc>").into()),
@@ -80,10 +73,7 @@ impl Type<Spg> for NaiveDateTime {
 }
 
 impl<'q> Encode<'q, Spg> for NaiveDateTime {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         let s = self.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
         buf.push(SpgArgumentValue {
             value: EngineValue::Text(s),
@@ -101,9 +91,7 @@ impl<'r> Decode<'r, Spg> for NaiveDateTime {
                 let secs = micros.div_euclid(1_000_000);
                 let nanos = (micros.rem_euclid(1_000_000) as u32) * 1_000;
                 let dt = DateTime::<Utc>::from_timestamp(secs, nanos)
-                    .ok_or_else(|| {
-                        format!("TIMESTAMP value {micros} µs out of chrono range")
-                    })?;
+                    .ok_or_else(|| format!("TIMESTAMP value {micros} µs out of chrono range"))?;
                 Ok(dt.naive_utc())
             }
             other => Err(format!("cannot decode {other:?} as chrono::NaiveDateTime").into()),
@@ -123,10 +111,7 @@ impl Type<Spg> for NaiveDate {
 }
 
 impl<'q> Encode<'q, Spg> for NaiveDate {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         let s = format!("{:04}-{:02}-{:02}", self.year(), self.month(), self.day());
         buf.push(SpgArgumentValue {
             value: EngineValue::Text(s),

@@ -80,11 +80,7 @@ fn main() {
         .or_else(|| env::var("PGHOST").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "127.0.0.1".into());
     let port = port
-        .or_else(|| {
-            env::var("PGPORT")
-                .ok()
-                .and_then(|s| s.parse::<u16>().ok())
-        })
+        .or_else(|| env::var("PGPORT").ok().and_then(|s| s.parse::<u16>().ok()))
         .unwrap_or(5432);
     let target = format!("{host}:{port}");
     let addrs: Vec<SocketAddr> = match target.to_socket_addrs() {

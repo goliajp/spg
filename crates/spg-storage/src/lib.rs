@@ -2240,8 +2240,7 @@ impl Table {
                         for (i, row) in self.rows.iter().enumerate() {
                             if let Value::Text(s) = &row.values[column_position] {
                                 for tri in trgm::extract_trigrams(s) {
-                                    let mut entries =
-                                        map.get(&tri).cloned().unwrap_or_default();
+                                    let mut entries = map.get(&tri).cloned().unwrap_or_default();
                                     entries.push(RowLocator::Hot(i));
                                     map.insert_mut(tri, entries);
                                 }
@@ -2385,7 +2384,10 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
     ensure_node_slot(table, idx_pos, new_row_idx, level);
     let (entry, entry_level, m) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level, g.m),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
+        IndexKind::BTree(_)
+        | IndexKind::Brin { .. }
+        | IndexKind::Gin(_)
+        | IndexKind::GinTrgm(_) => {
             unreachable!("nsw_insert_at on a non-NSW index")
         }
     };
@@ -2501,7 +2503,10 @@ fn greedy_layer_walk(
 ) -> (usize, f32) {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
+        IndexKind::BTree(_)
+        | IndexKind::Brin { .. }
+        | IndexKind::Gin(_)
+        | IndexKind::GinTrgm(_) => {
             return (current, current_d);
         }
     };
@@ -2554,7 +2559,10 @@ fn layer_beam_search(
 ) -> Vec<(f32, usize)> {
     let g = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g,
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => return Vec::new(),
+        IndexKind::BTree(_)
+        | IndexKind::Brin { .. }
+        | IndexKind::Gin(_)
+        | IndexKind::GinTrgm(_) => return Vec::new(),
     };
     let col_pos = table.indices[idx_pos].column_position;
     let d0 = if matches!(metric, NswMetric::L2) {
@@ -2735,7 +2743,10 @@ fn connect_at_layer(
     let col_pos = table.indices[idx_pos].column_position;
     let cap = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => g.cap_for_layer(layer),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => return,
+        IndexKind::BTree(_)
+        | IndexKind::Brin { .. }
+        | IndexKind::Gin(_)
+        | IndexKind::GinTrgm(_) => return,
     };
     // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
     // each) rather than usize (8 B on 64-bit). Boundary casts here
@@ -2775,7 +2786,10 @@ fn connect_at_layer(
         //    insert path so connectivity stays consistent.
         let needs_trim = match &table.indices[idx_pos].kind {
             IndexKind::Nsw(g) => g.layers[layer as usize][peer].len() > cap,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => false,
+            IndexKind::BTree(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => false,
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
@@ -2783,7 +2797,10 @@ fn connect_at_layer(
                     .iter()
                     .map(|&n| n as usize)
                     .collect(),
-                IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => continue,
+                IndexKind::BTree(_)
+                | IndexKind::Brin { .. }
+                | IndexKind::Gin(_)
+                | IndexKind::GinTrgm(_) => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
             // heuristic receives candidates closest-first. `cell_l2_sq`
@@ -2920,7 +2937,10 @@ fn nsw_search(
 ) -> Vec<(f32, usize)> {
     let (entry, entry_level) = match &table.indices[idx_pos].kind {
         IndexKind::Nsw(g) => (g.entry, g.entry_level),
-        IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => return Vec::new(),
+        IndexKind::BTree(_)
+        | IndexKind::Brin { .. }
+        | IndexKind::Gin(_)
+        | IndexKind::GinTrgm(_) => return Vec::new(),
     };
     let Some(entry) = entry else {
         return Vec::new();
@@ -3536,9 +3556,10 @@ impl Catalog {
                 "rename_table: target name {new:?} already exists"
             )));
         }
-        let idx = self.by_name.remove(old).ok_or_else(|| {
-            StorageError::TableNotFound { name: old.into() }
-        })?;
+        let idx = self
+            .by_name
+            .remove(old)
+            .ok_or_else(|| StorageError::TableNotFound { name: old.into() })?;
         self.tables[idx].schema.name = new.to_string();
         self.by_name.insert(new.to_string(), idx);
         for t in &mut self.tables {
@@ -4395,7 +4416,10 @@ impl Catalog {
             })?;
         let map = match &idx.kind {
             IndexKind::BTree(m) => m,
-            IndexKind::Nsw(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "compact_cold_segments: index {index_name:?} is not BTree; \
                      compaction applies only to BTree cold-tier indices"
@@ -4997,15 +5021,13 @@ impl Catalog {
                         out.push(4);
                         write_u32(
                             &mut out,
-                            u32::try_from(map.len())
-                                .expect("≤ 4G trigram-GIN posting lists"),
+                            u32::try_from(map.len()).expect("≤ 4G trigram-GIN posting lists"),
                         );
                         for (tri, locators) in map {
                             write_str(&mut out, tri);
                             write_u32(
                                 &mut out,
-                                u32::try_from(locators.len())
-                                    .expect("≤ 4G locators/posting list"),
+                                u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
                             );
                             for loc in locators {
                                 loc.write_le(&mut out);
@@ -7360,7 +7382,10 @@ mod tests {
             .unwrap();
         let g = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g,
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
+            IndexKind::BTree(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => {
                 panic!("expected NSW")
             }
         };
@@ -7722,7 +7747,10 @@ mod tests {
             .unwrap();
         let original = match &cat.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
+            IndexKind::BTree(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => {
                 panic!("expected NSW")
             }
         };
@@ -7730,7 +7758,10 @@ mod tests {
         let restored = Catalog::deserialize(&bytes).expect("deserialize");
         let restored_graph = match &restored.get("docs").unwrap().indices()[0].kind {
             IndexKind::Nsw(g) => g.clone(),
-            IndexKind::BTree(_) | IndexKind::Brin { .. } | IndexKind::Gin(_) | IndexKind::GinTrgm(_) => {
+            IndexKind::BTree(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_) => {
                 panic!("expected NSW")
             }
         };

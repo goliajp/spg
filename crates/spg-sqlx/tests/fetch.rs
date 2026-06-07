@@ -35,10 +35,12 @@ async fn fetch_one_scalar_int() {
 #[tokio::test]
 async fn fetch_one_by_name() {
     let pool: SpgPool = SpgPool::connect_in_memory().await.unwrap();
-    sqlx::query("CREATE TABLE u (uid BIGINT NOT NULL, handle TEXT NOT NULL, active BOOLEAN NOT NULL)")
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "CREATE TABLE u (uid BIGINT NOT NULL, handle TEXT NOT NULL, active BOOLEAN NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO u VALUES ($1, $2, $3)")
         .bind(42_i64)
         .bind("bob")

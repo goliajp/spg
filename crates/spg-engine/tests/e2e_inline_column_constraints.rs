@@ -120,9 +120,8 @@ fn create_table_display_round_trips_table_constraints() {
     // WAL replay path: CreateTableStatement's Display form must
     // re-parse to a statement that recreates the same constraints.
     let mut eng = Engine::new();
-    let result = eng.execute(
-        "CREATE TABLE t (id INT NOT NULL UNIQUE, n INT NOT NULL CHECK (n > 0))",
-    );
+    let result =
+        eng.execute("CREATE TABLE t (id INT NOT NULL UNIQUE, n INT NOT NULL CHECK (n > 0))");
     assert!(matches!(result, Ok(QueryResult::CommandOk { .. })));
     let table = eng.catalog().get("t").expect("table present");
     assert_eq!(table.schema().uniqueness_constraints.len(), 1);

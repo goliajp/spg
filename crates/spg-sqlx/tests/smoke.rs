@@ -98,9 +98,6 @@ async fn transaction_rollback_discards_inserts() {
 }
 
 async fn count_rows(db: &spg_embedded_tokio::AsyncDatabase, table: &str) -> usize {
-    let rows = db
-        .query(&format!("SELECT * FROM {table}"))
-        .await
-        .unwrap();
+    let rows = db.query(&format!("SELECT * FROM {table}")).await.unwrap();
     rows.len()
 }

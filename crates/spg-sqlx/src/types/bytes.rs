@@ -33,10 +33,7 @@ impl Type<Spg> for Vec<u8> {
 }
 
 impl<'q> Encode<'q, Spg> for &'q [u8] {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::Bytes((*self).to_vec()),
             type_info: Some(<[u8] as Type<Spg>>::type_info()),
@@ -47,10 +44,7 @@ impl<'q> Encode<'q, Spg> for &'q [u8] {
 }
 
 impl<'q> Encode<'q, Spg> for Vec<u8> {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::Bytes(self.clone()),
             type_info: Some(<Vec<u8> as Type<Spg>>::type_info()),

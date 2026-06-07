@@ -924,9 +924,9 @@ impl Engine {
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
                     trigger_recursion_depth: 0,
-            foreign_key_checks: true,
-            meta_views_materialised: false,
-            pending_foreign_keys: Vec::new(),
+                    foreign_key_checks: true,
+                    meta_views_materialised: false,
+                    pending_foreign_keys: Vec::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -1249,7 +1249,10 @@ impl Engine {
                     self.resolve_expr_subqueries(e, cancel)?;
                 }
                 PlPgSqlStmt::Return(_) => {}
-                PlPgSqlStmt::If { branches, else_branch } => {
+                PlPgSqlStmt::If {
+                    branches,
+                    else_branch,
+                } => {
                     for (cond, body) in branches.iter_mut() {
                         self.resolve_expr_subqueries(cond, cancel)?;
                         self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
@@ -1293,7 +1296,9 @@ impl Engine {
         // information_schema.columns WHERE …) THEN …`.
         let mut body = body;
         self.resolve_plpgsql_block_subqueries(&mut body, CancelToken::none())?;
-        let dts = self.session_param("default_text_search_config").map(String::from);
+        let dts = self
+            .session_param("default_text_search_config")
+            .map(String::from);
         // v7.16.2 — SELECT … INTO resolver. The walker calls
         // this synchronously when it hits a SelectInto stmt
         // so the IF / locals scope sees the result before the
@@ -1307,34 +1312,35 @@ impl Engine {
         // for interior mutability since the closure is
         // Fn-shaped.
         let engine_cell = core::cell::RefCell::new(&mut *self);
-        let resolver_fn = |stmt: &spg_sql::ast::Statement| -> Result<Value, triggers::TriggerError> {
-            let mut eng = engine_cell.borrow_mut();
-            let r = eng.execute_stmt_with_cancel(stmt.clone(), CancelToken::none())
-                .map_err(|e| triggers::TriggerError::EvalFailed {
-                    function: "DO".into(),
-                    cause: eval::EvalError::TypeMismatch {
-                        detail: alloc::format!("SELECT … INTO failed: {e}"),
+        let resolver_fn =
+            |stmt: &spg_sql::ast::Statement| -> Result<Value, triggers::TriggerError> {
+                let mut eng = engine_cell.borrow_mut();
+                let r = eng
+                    .execute_stmt_with_cancel(stmt.clone(), CancelToken::none())
+                    .map_err(|e| triggers::TriggerError::EvalFailed {
+                        function: "DO".into(),
+                        cause: eval::EvalError::TypeMismatch {
+                            detail: alloc::format!("SELECT … INTO failed: {e}"),
+                        },
+                    })?;
+                match r {
+                    QueryResult::Rows { rows, .. } => match rows.into_iter().next() {
+                        Some(row) => Ok(row.values.into_iter().next().unwrap_or(Value::Null)),
+                        None => Ok(Value::Null),
                     },
+                    _ => Err(triggers::TriggerError::EvalFailed {
+                        function: "DO".into(),
+                        cause: eval::EvalError::TypeMismatch {
+                            detail: "SELECT … INTO body must be a SELECT".into(),
+                        },
+                    }),
+                }
+            };
+        let collected =
+            triggers::execute_do_block_top_level(&body, dts.as_deref(), Some(&resolver_fn))
+                .map_err(|e| {
+                    EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}")))
                 })?;
-            match r {
-                QueryResult::Rows { rows, .. } => match rows.into_iter().next() {
-                    Some(row) => Ok(row.values.into_iter().next().unwrap_or(Value::Null)),
-                    None => Ok(Value::Null),
-                },
-                _ => Err(triggers::TriggerError::EvalFailed {
-                    function: "DO".into(),
-                    cause: eval::EvalError::TypeMismatch {
-                        detail: "SELECT … INTO body must be a SELECT".into(),
-                    },
-                }),
-            }
-        };
-        let collected = triggers::execute_do_block_top_level(
-            &body,
-            dts.as_deref(),
-            Some(&resolver_fn),
-        )
-        .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}"))))?;
         drop(engine_cell);
         // Run each embedded statement against the engine. The
         // statements were already substitute-walked for NEW/OLD/
@@ -2471,8 +2477,7 @@ impl Engine {
             if value_off || key == "session_replication_role" {
                 self.foreign_key_checks = false;
             } else if value_on
-                || (key == "session_replication_role"
-                    && normalised.eq_ignore_ascii_case("origin"))
+                || (key == "session_replication_role" && normalised.eq_ignore_ascii_case("origin"))
             {
                 self.foreign_key_checks = true;
                 // Drain pending FK queue against the now-complete
@@ -2500,7 +2505,8 @@ impl Engine {
                 Some(t) => t.schema().columns.clone(),
                 None => continue,
             };
-            let storage_fk = resolve_foreign_key(&child, &cols_snapshot, fk, self.active_catalog())?;
+            let storage_fk =
+                resolve_foreign_key(&child, &cols_snapshot, fk, self.active_catalog())?;
             let table = self
                 .active_catalog_mut()
                 .get_mut(&child)
@@ -3725,8 +3731,7 @@ impl Engine {
                 }
                 let col_name = column.name.clone();
                 let nullable = column.nullable;
-                let has_default =
-                    column.default.is_some() || column.auto_increment;
+                let has_default = column.default.is_some() || column.auto_increment;
                 let col_schema = column_def_to_schema(column)?;
                 let row_count = table.row_count();
                 // Compute the back-fill value. Literal / runtime DEFAULT
@@ -3735,9 +3740,7 @@ impl Engine {
                 // the column is nullable and has no DEFAULT. NOT NULL
                 // without DEFAULT errors when the table has existing
                 // rows — same as PG.
-                let fill_value: Value = if has_default
-                    || col_schema.runtime_default.is_some()
-                {
+                let fill_value: Value = if has_default || col_schema.runtime_default.is_some() {
                     resolve_column_default_free(&col_schema, clock)?
                 } else if nullable || row_count == 0 {
                     Value::Null
@@ -3815,10 +3818,7 @@ impl Engine {
                         name: s.name.into(),
                     })
                 })?;
-                let is_pk = matches!(
-                    tc,
-                    spg_sql::ast::TableConstraint::PrimaryKey { .. }
-                );
+                let is_pk = matches!(tc, spg_sql::ast::TableConstraint::PrimaryKey { .. });
                 match tc {
                     spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
                     | spg_sql::ast::TableConstraint::Unique { columns, .. } => {
@@ -3867,8 +3867,7 @@ impl Engine {
                             let leading = &columns[0];
                             let already_idx = table.indices().iter().any(|idx| {
                                 matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                                    && table.schema().columns[idx.column_position].name
-                                        == *leading
+                                    && table.schema().columns[idx.column_position].name == *leading
                             });
                             if !already_idx {
                                 let suffix = if is_pk { "pkey" } else { "key" };
@@ -4138,9 +4137,7 @@ impl Engine {
         // IF EXISTS makes a missing index a no-op rather than an
         // error, mirroring PG semantics.
         if let spg_sql::ast::AlterIndexTarget::Rename { new, if_exists } = target {
-            let renamed = self
-                .active_catalog_mut()
-                .rename_index(&idx_name, &new);
+            let renamed = self.active_catalog_mut().rename_index(&idx_name, &new);
             return match renamed {
                 Ok(()) => Ok(QueryResult::CommandOk {
                     affected: 0,
@@ -4485,10 +4482,11 @@ impl Engine {
             // Only install FKs whose every local column resolves
             // — older catalogs may have a column the new FK
             // references but not the column the new FK declares.
-            let all_resolved = fk
-                .columns
-                .iter()
-                .all(|c| table_cols_now.iter().any(|sc| sc.name.eq_ignore_ascii_case(c)));
+            let all_resolved = fk.columns.iter().all(|c| {
+                table_cols_now
+                    .iter()
+                    .any(|sc| sc.name.eq_ignore_ascii_case(c))
+            });
             if !all_resolved {
                 continue;
             }
@@ -4632,8 +4630,7 @@ impl Engine {
                 && needs_parent
                 && self.active_catalog().get(&fk.parent_table).is_none()
             {
-                self.pending_foreign_keys
-                    .push((table_name.clone(), fk));
+                self.pending_foreign_keys.push((table_name.clone(), fk));
                 continue;
             }
             fks.push(resolve_foreign_key(
@@ -5926,19 +5923,18 @@ impl Engine {
                     }
                 };
             let alias = tref.alias.clone().unwrap_or_else(|| "unnest".to_string());
-            let col_name = tref
-                .unnest_column_aliases
-                .first()
-                .cloned()
-                .unwrap_or(alias);
-            return Ok((rows, alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)]));
+            let col_name = tref.unnest_column_aliases.first().cloned().unwrap_or(alias);
+            return Ok((
+                rows,
+                alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)],
+            ));
         }
-        let table = self
-            .active_catalog()
-            .get(&tref.name)
-            .ok_or_else(|| StorageError::TableNotFound {
-                name: tref.name.clone(),
-            })?;
+        let table =
+            self.active_catalog()
+                .get(&tref.name)
+                .ok_or_else(|| StorageError::TableNotFound {
+                    name: tref.name.clone(),
+                })?;
         let rows: Vec<Row> = table.rows().iter().cloned().collect();
         let cols = table.schema().columns.clone();
         Ok((rows, cols))
@@ -6510,10 +6506,7 @@ fn try_trgm_seek<'a>(
     // through `Expr::Like { expr, pattern, negated }`. The trigram
     // index posting-list keys are already lower-cased and
     // case-folded, so we only need the pattern's literal runs.
-    let Expr::Like {
-        expr, pattern, ..
-    } = where_expr
-    else {
+    let Expr::Like { expr, pattern, .. } = where_expr else {
         return None;
     };
     // Column side.
@@ -6555,7 +6548,8 @@ fn try_trgm_seek<'a>(
         next.sort_by_key(locator_sort_key);
         next.dedup_by_key(|l| locator_sort_key(l));
         // Sorted-merge intersection.
-        let mut merged: Vec<spg_storage::RowLocator> = Vec::with_capacity(acc.len().min(next.len()));
+        let mut merged: Vec<spg_storage::RowLocator> =
+            Vec::with_capacity(acc.len().min(next.len()));
         let (mut i, mut j) = (0usize, 0usize);
         while i < acc.len() && j < next.len() {
             let lk = locator_sort_key(&acc[i]);
@@ -7995,7 +7989,9 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
             branches,
             else_branch,
         } => {
-            operand.as_deref().is_some_and(|o| expr_refers_to(o, target))
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_refers_to(o, target))
                 || branches
                     .iter()
                     .any(|(w, t)| expr_refers_to(w, target) || expr_refers_to(t, target))
@@ -8069,7 +8065,11 @@ fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
                 Value::Text(tname.clone()),
                 Value::Text(col.name.clone()),
                 Value::Int(ordinal),
-                Value::Text(if col.nullable { "YES".into() } else { "NO".into() }),
+                Value::Text(if col.nullable {
+                    "YES".into()
+                } else {
+                    "NO".into()
+                }),
                 Value::Text(pg_data_type_text(col.ty)),
             ]));
         }
@@ -8196,7 +8196,10 @@ fn select_references_meta_view(stmt: &SelectStatement) -> bool {
 /// Returns a deduplicated, sorted list. Caller materialises
 /// each one into the enriched catalog before re-running the
 /// SELECT. Walks JOINs, CTEs, and the primary FROM.
-fn collect_meta_view_names(stmt: &SelectStatement, into: &mut alloc::collections::BTreeSet<String>) {
+fn collect_meta_view_names(
+    stmt: &SelectStatement,
+    into: &mut alloc::collections::BTreeSet<String>,
+) {
     fn is_meta(name: &str) -> bool {
         name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")
     }
@@ -9553,9 +9556,7 @@ fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineError> {
             Literal::String(format_timestamp_micros_as_date(micros))
         }
         Value::Timestamp(us) => Literal::String(format_timestamp_micros(us)),
-        Value::Numeric { scaled, scale } => {
-            Literal::String(format_numeric(scaled, scale))
-        }
+        Value::Numeric { scaled, scale } => Literal::String(format_numeric(scaled, scale)),
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
                 "INSERT … SELECT cannot materialise value of type {:?}; \
@@ -9618,10 +9619,7 @@ fn format_numeric(scaled: i128, scale: u8) -> String {
     let whole = abs / divisor;
     let frac = abs % divisor;
     let sign = if scaled < 0 { "-" } else { "" };
-    alloc::format!(
-        "{sign}{whole}.{frac:0width$}",
-        width = usize::from(scale)
-    )
+    alloc::format!("{sign}{whole}.{frac:0width$}", width = usize::from(scale))
 }
 
 /// v6.1.1 — walk the prepared `Statement` AST and replace every

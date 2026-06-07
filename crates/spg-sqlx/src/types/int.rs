@@ -25,10 +25,7 @@ impl Type<Spg> for i32 {
 }
 
 impl<'q> Encode<'q, Spg> for i32 {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::Int(*self),
             type_info: Some(<i32 as Type<Spg>>::type_info()),
@@ -43,8 +40,7 @@ impl<'r> Decode<'r, Spg> for i32 {
         match value.engine() {
             EngineValue::Int(n) => Ok(*n),
             EngineValue::SmallInt(n) => Ok(i32::from(*n)),
-            EngineValue::BigInt(n) => i32::try_from(*n)
-                .map_err(|e| Box::new(e) as BoxDynError),
+            EngineValue::BigInt(n) => i32::try_from(*n).map_err(|e| Box::new(e) as BoxDynError),
             other => Err(format!("cannot decode {other:?} as i32 / INT").into()),
         }
     }
@@ -63,10 +59,7 @@ impl Type<Spg> for i64 {
 }
 
 impl<'q> Encode<'q, Spg> for i64 {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::BigInt(*self),
             type_info: Some(<i64 as Type<Spg>>::type_info()),
@@ -100,10 +93,7 @@ impl Type<Spg> for i16 {
 }
 
 impl<'q> Encode<'q, Spg> for i16 {
-    fn encode_by_ref(
-        &self,
-        buf: &mut Vec<SpgArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
         buf.push(SpgArgumentValue {
             value: EngineValue::SmallInt(*self),
             type_info: Some(<i16 as Type<Spg>>::type_info()),
@@ -117,10 +107,8 @@ impl<'r> Decode<'r, Spg> for i16 {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
             EngineValue::SmallInt(n) => Ok(*n),
-            EngineValue::Int(n) => i16::try_from(*n)
-                .map_err(|e| Box::new(e) as BoxDynError),
-            EngineValue::BigInt(n) => i16::try_from(*n)
-                .map_err(|e| Box::new(e) as BoxDynError),
+            EngineValue::Int(n) => i16::try_from(*n).map_err(|e| Box::new(e) as BoxDynError),
+            EngineValue::BigInt(n) => i16::try_from(*n).map_err(|e| Box::new(e) as BoxDynError),
             other => Err(format!("cannot decode {other:?} as i16 / SMALLINT").into()),
         }
     }

@@ -225,9 +225,7 @@ impl Parser {
                 Token::Ident(s) | Token::QuotedIdent(s) => return Ok(s),
                 other => {
                     return Err(ParseError {
-                        message: format!(
-                            "expected identifier after '{first}.', got {other:?}"
-                        ),
+                        message: format!("expected identifier after '{first}.', got {other:?}"),
                         token_pos: self.pos.saturating_sub(1),
                     });
                 }
@@ -1250,9 +1248,9 @@ impl Parser {
             events.push(ev);
             if !cols.is_empty() {
                 if !update_columns.is_empty() {
-                    return Err(self.err(
-                        "CREATE TRIGGER: `UPDATE OF cols` may appear at most once".into(),
-                    ));
+                    return Err(
+                        self.err("CREATE TRIGGER: `UPDATE OF cols` may appear at most once".into())
+                    );
                 }
                 update_columns = cols;
             }
@@ -1356,9 +1354,9 @@ impl Parser {
             break;
         }
         if cols.is_empty() {
-            return Err(self.err(
-                "CREATE TRIGGER: `UPDATE OF` requires at least one column name".into(),
-            ));
+            return Err(
+                self.err("CREATE TRIGGER: `UPDATE OF` requires at least one column name".into())
+            );
         }
         Ok((ev, cols))
     }
@@ -3121,9 +3119,7 @@ impl Parser {
         };
         match cur {
             Token::Index => after_keyword_followed_by_paren_or_ident_paren(self.pos + 1),
-            Token::Ident(s)
-                if s.eq_ignore_ascii_case("key") || s.eq_ignore_ascii_case("index") =>
-            {
+            Token::Ident(s) if s.eq_ignore_ascii_case("key") || s.eq_ignore_ascii_case("index") => {
                 after_keyword_followed_by_paren_or_ident_paren(self.pos + 1)
             }
             Token::Ident(s)
@@ -4255,16 +4251,20 @@ impl Parser {
             {
                 self.advance(); // CHARACTER
                 self.advance(); // SET
-                if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_))
-                {
+                if matches!(
+                    self.peek(),
+                    Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                ) {
                     self.advance();
                 }
                 continue;
             }
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate")) {
                 self.advance(); // COLLATE
-                if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_))
-                {
+                if matches!(
+                    self.peek(),
+                    Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                ) {
                     self.advance();
                 }
                 continue;
@@ -4347,9 +4347,7 @@ impl Parser {
             // timestamps etc). Accept + no-op.
             if matches!(self.peek(), Token::Null) {
                 if nullability_seen && !nullable {
-                    return Err(self.err(
-                        "column declared NOT NULL then NULL — pick one".into(),
-                    ));
+                    return Err(self.err("column declared NOT NULL then NULL — pick one".into()));
                 }
                 self.advance();
                 nullable = true;
@@ -6601,10 +6599,7 @@ mod tests {
         // message" assertion is stale; verify the new contract:
         // empty / whitespace / comment-only input parses to
         // Statement::Empty.
-        assert!(matches!(
-            parse_statement("").unwrap(),
-            Statement::Empty
-        ));
+        assert!(matches!(parse_statement("").unwrap(), Statement::Empty));
         assert!(matches!(
             parse_statement("  \n\t ").unwrap(),
             Statement::Empty
