@@ -127,7 +127,7 @@ impl<'q> Statement<'q> for SpgStatement<'q> {
     }
 }
 
-impl<'i> ColumnIndex<SpgStatement<'_>> for &'i str {
+impl ColumnIndex<SpgStatement<'_>> for &str {
     fn index(&self, stmt: &SpgStatement<'_>) -> Result<usize, Error> {
         stmt.by_name
             .get(*self)

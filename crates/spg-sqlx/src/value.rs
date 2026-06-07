@@ -102,6 +102,7 @@ impl<'r> ValueRef<'r> for SpgValueRef<'r> {
 /// [`Kind`] tag — used when a fetched row carries cells whose
 /// column metadata is not yet known to the adapter.
 #[must_use]
+#[allow(dead_code)]
 pub fn engine_value_kind(v: &EngineValue) -> Kind {
     match v {
         EngineValue::Null => Kind::Null,

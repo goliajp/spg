@@ -57,11 +57,11 @@ impl<'q> Encode<'q, Spg> for Vec<i32> {
 impl<'r> Decode<'r, Spg> for Vec<i32> {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
-            EngineValue::IntArray(items) => Ok(items.iter().filter_map(|o| o.clone()).collect()),
+            EngineValue::IntArray(items) => Ok(items.iter().filter_map(|o| *o).collect()),
             // BIGINT[] narrows lossily.
             EngineValue::BigIntArray(items) => Ok(items
                 .iter()
-                .filter_map(|o| o.clone().and_then(|n| i32::try_from(n).ok()))
+                .filter_map(|o| (*o).and_then(|n| i32::try_from(n).ok()))
                 .collect()),
             other => Err(format!("cannot decode {other:?} as Vec<i32>").into()),
         }
@@ -101,10 +101,10 @@ impl<'q> Encode<'q, Spg> for Vec<i64> {
 impl<'r> Decode<'r, Spg> for Vec<i64> {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
-            EngineValue::BigIntArray(items) => Ok(items.iter().filter_map(|o| o.clone()).collect()),
+            EngineValue::BigIntArray(items) => Ok(items.iter().filter_map(|o| *o).collect()),
             EngineValue::IntArray(items) => Ok(items
                 .iter()
-                .filter_map(|o| o.clone().map(i64::from))
+                .filter_map(|o| (*o).map(i64::from))
                 .collect()),
             other => Err(format!("cannot decode {other:?} as Vec<i64>").into()),
         }
