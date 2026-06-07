@@ -1921,6 +1921,49 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             }
             Ok(Value::Text(parts[idx as usize].to_string()))
         }
+        // PG `translate(s, from, to)` — char-by-char positional
+        // mapping. Each codepoint in `from` is replaced by the
+        // codepoint at the same index in `to`. When `from` is
+        // longer than `to`, the extra `from` codepoints are
+        // DELETED (not replaced). When `from` has duplicates,
+        // the FIRST occurrence's mapping wins. NULL → NULL.
+        "translate" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "translate() takes 3 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let from = value_to_format_text(&args[1]);
+            let to = value_to_format_text(&args[2]);
+            let from_chars: Vec<char> = from.chars().collect();
+            let to_chars: Vec<char> = to.chars().collect();
+            // Build the codepoint map. First occurrence wins.
+            let mut map: alloc::collections::BTreeMap<char, Option<char>> =
+                alloc::collections::BTreeMap::new();
+            for (i, &fc) in from_chars.iter().enumerate() {
+                if map.contains_key(&fc) {
+                    continue;
+                }
+                let replacement = to_chars.get(i).copied();
+                map.insert(fc, replacement);
+            }
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match map.get(&c) {
+                    Some(Some(r)) => out.push(*r),
+                    Some(None) => {} // mapped to "deleted"
+                    None => out.push(c),
+                }
+            }
+            Ok(Value::Text(out))
+        }
         "replace" => {
             if args.len() != 3 {
                 return Err(EvalError::TypeMismatch {

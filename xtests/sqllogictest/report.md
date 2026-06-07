@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 82 | 0 | 0 | 100.0% |
-| `pg_regress` | 930 | 0 | 0 | 100.0% |
+| `pg_regress` | 942 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 
 ## Per-file detail
@@ -110,6 +110,7 @@ Per-corpus pass / fail / skip:
 | `54_sqrt.test` | 8 | 0 | 0 |
 | `55_sign.test` | 10 | 0 | 0 |
 | `56_random.test` | 5 | 0 | 0 |
+| `57_translate.test` | 12 | 0 | 0 |
 
 ### `pgvector/`
 
