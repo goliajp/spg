@@ -1125,6 +1125,40 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "regexp_matches" => regexp_matches(args),
         "regexp_replace" => regexp_replace(args),
         "regexp_split_to_array" => regexp_split_to_array(args),
+        // v7.17.0 Phase 3.9 — PG `jsonb_path_query` family.
+        "jsonb_path_query" | "json_path_query" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonb_path_query() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::path_query(&args[0], &args[1])
+        }
+        "jsonb_path_query_first" | "json_path_query_first" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonb_path_query_first() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::path_query_first(&args[0], &args[1])
+        }
+        "jsonb_path_query_array" | "json_path_query_array" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonb_path_query_array() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::path_query_array(&args[0], &args[1])
+        }
         // v6.4.3 — encode/decode + error_on_null SQL function bundle.
         "encode" => encode_text(args),
         "decode" => decode_text(args),

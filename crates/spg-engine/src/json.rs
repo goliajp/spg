@@ -637,6 +637,222 @@ fn parse_number(bytes: &[u8], p: &mut usize) -> Result<JsonValue, ParseError> {
     Ok(JsonValue::NumberText(text))
 }
 
+// ─── v7.17.0 Phase 3.9 — minimal JSONPath subset for jsonb_path_query ───
+//
+// Supported path syntax (PG-flavoured JSONPath subset):
+//   * `$` — document root (required leading segment)
+//   * `.field` — object field access (bare ident only; quoted form
+//                `."field with space"` accepted)
+//   * `[N]` — array index (non-negative integer; negative indices
+//             out of v7.17 scope)
+//   * `[*]` — array wildcard (fan-out — each element matched separately)
+//   * Chained: `$.a.b[0].c[*].name`
+//
+// NOT supported (errors clearly):
+//   * Filter expressions `? (@.price > 100)`
+//   * Range slices `[1:3]`
+//   * Recursive descent `..field`
+//   * Functions `keyvalue()`, `size()`, etc.
+//   * Path variables `$varname`
+
+#[derive(Debug, Clone)]
+enum PathStep {
+    Field(String),
+    Index(usize),
+    Wildcard,
+}
+
+fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
+    let chars: Vec<char> = p.chars().collect();
+    let mut i = 0;
+    if i >= chars.len() || chars[i] != '$' {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("jsonpath must start with '$', got {p:?}"),
+        });
+    }
+    i += 1;
+    let mut steps: Vec<PathStep> = Vec::new();
+    while i < chars.len() {
+        match chars[i] {
+            '.' => {
+                i += 1;
+                if i < chars.len() && chars[i] == '"' {
+                    i += 1;
+                    let start = i;
+                    while i < chars.len() && chars[i] != '"' {
+                        i += 1;
+                    }
+                    if i >= chars.len() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "jsonpath: unterminated quoted field".into(),
+                        });
+                    }
+                    steps.push(PathStep::Field(chars[start..i].iter().collect()));
+                    i += 1;
+                } else {
+                    let start = i;
+                    while i < chars.len()
+                        && chars[i] != '.'
+                        && chars[i] != '['
+                        && !chars[i].is_whitespace()
+                    {
+                        i += 1;
+                    }
+                    if start == i {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "jsonpath: missing field name after '.'".into(),
+                        });
+                    }
+                    steps.push(PathStep::Field(chars[start..i].iter().collect()));
+                }
+            }
+            '[' => {
+                i += 1;
+                if i < chars.len() && chars[i] == '*' {
+                    i += 1;
+                    if i >= chars.len() || chars[i] != ']' {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "jsonpath: expected ']' after '[*'".into(),
+                        });
+                    }
+                    i += 1;
+                    steps.push(PathStep::Wildcard);
+                } else {
+                    let start = i;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if start == i {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "jsonpath: only `[N]` (non-negative) or `[*]` supported in v7.17".into(),
+                        });
+                    }
+                    let idx: usize = chars[start..i]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .map_err(|_| EvalError::TypeMismatch {
+                            detail: "jsonpath: invalid array index".into(),
+                        })?;
+                    if i >= chars.len() || chars[i] != ']' {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "jsonpath: expected ']' after array index".into(),
+                        });
+                    }
+                    i += 1;
+                    steps.push(PathStep::Index(idx));
+                }
+            }
+            c if c.is_whitespace() => {
+                i += 1;
+            }
+            c => {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonpath: unexpected char '{c}' (v7.17 supports `$.field`, `[N]`, `[*]` only)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(steps)
+}
+
+fn apply_jsonpath(root: &JsonValue, steps: &[PathStep]) -> Vec<JsonValue> {
+    let mut cur: Vec<JsonValue> = alloc::vec![root.clone()];
+    for step in steps {
+        let mut next: Vec<JsonValue> = Vec::new();
+        for node in &cur {
+            match (step, node) {
+                (PathStep::Field(k), JsonValue::Object(entries)) => {
+                    if let Some((_, v)) = entries.iter().find(|(name, _)| name == k) {
+                        next.push(v.clone());
+                    }
+                }
+                (PathStep::Index(idx), JsonValue::Array(items)) => {
+                    if let Some(v) = items.get(*idx) {
+                        next.push(v.clone());
+                    }
+                }
+                (PathStep::Wildcard, JsonValue::Array(items)) => {
+                    next.extend(items.iter().cloned());
+                }
+                _ => {} // no match at this branch
+            }
+        }
+        cur = next;
+        if cur.is_empty() {
+            return Vec::new();
+        }
+    }
+    cur
+}
+
+/// v7.17.0 Phase 3.9 — `jsonb_path_query(doc, path)` — returns the
+/// matched JSON values as a TextArray (each element is the JSON
+/// encoding of one match).
+pub fn path_query(doc: &Value, path: &Value) -> Result<Value, EvalError> {
+    let (src, path_text) = match (doc, path) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Json(s) | Value::Text(s), Value::Text(p) | Value::Json(p)) => (s, p),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: "jsonb_path_query() expects (JSON, TEXT)".into(),
+            });
+        }
+    };
+    let root = parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON for jsonb_path_query: {e}"),
+    })?;
+    let steps = parse_jsonpath(path_text)?;
+    let matches = apply_jsonpath(&root, &steps);
+    let arr: Vec<Option<String>> = matches
+        .into_iter()
+        .map(|v| Some(v.to_json_text()))
+        .collect();
+    Ok(Value::TextArray(arr))
+}
+
+/// v7.17.0 Phase 3.9 — `jsonb_path_query_first(doc, path)` returns
+/// the first matched JSON value as a Json, or NULL on no match.
+pub fn path_query_first(doc: &Value, path: &Value) -> Result<Value, EvalError> {
+    let q = path_query(doc, path)?;
+    match q {
+        Value::TextArray(items) => {
+            if let Some(Some(first)) = items.into_iter().next() {
+                Ok(Value::Json(first))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+/// v7.17.0 Phase 3.9 — `jsonb_path_query_array(doc, path)` returns
+/// the matched values wrapped as a single JSON array.
+pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value, EvalError> {
+    let q = path_query(doc, path)?;
+    match q {
+        Value::TextArray(items) => {
+            let mut buf = String::from("[");
+            let mut first = true;
+            for it in items {
+                if let Some(s) = it {
+                    if !first {
+                        buf.push(',');
+                    }
+                    buf.push_str(&s);
+                    first = false;
+                }
+            }
+            buf.push(']');
+            Ok(Value::Json(buf))
+        }
+        other => Ok(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
