@@ -4173,7 +4173,10 @@ fn literal_to_value(l: &Literal) -> Value {
 /// expression is not a column reference (e.g. literal / function
 /// call) or the column can't be resolved (caller falls back to
 /// `Collation::Binary` semantics).
-fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_storage::Collation> {
+pub(crate) fn column_collation(
+    e: &Expr,
+    ctx: &EvalContext<'_>,
+) -> Option<spg_storage::Collation> {
     let Expr::Column(c) = e else {
         return None;
     };
