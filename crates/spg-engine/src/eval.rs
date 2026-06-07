@@ -1171,6 +1171,26 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         //
         // Reference:
         //   https://www.postgresql.org/docs/current/functions-string.html
+        // PG `trim` / `ltrim` / `rtrim` / `btrim`.
+        //
+        // Semantic anchors (PG-canonical):
+        //   * Default chars set is the ASCII SPACE only (NOT the
+        //     POSIX whitespace class — tab / newline / form-feed
+        //     stay put unless explicitly listed in `chars`).
+        //   * `chars` arg is a UTF-8 codepoint SET — any char in
+        //     the set is stripped, not the substring.
+        //   * `trim(s)` == `btrim(s)` == strip both ends.
+        //   * `ltrim(s, c)` / `rtrim(s, c)` strip only the named
+        //     side; inner occurrences are preserved.
+        //   * NULL on EITHER arg → NULL result.
+        //   * Non-text input is coerced via `value_to_format_text`
+        //     so trim(42) returns '42'.
+        //
+        // Reference:
+        //   https://www.postgresql.org/docs/current/functions-string.html
+        "trim" | "btrim" => string_trim(args, TrimSide::Both, "trim"),
+        "ltrim" => string_trim(args, TrimSide::Left, "ltrim"),
+        "rtrim" => string_trim(args, TrimSide::Right, "rtrim"),
         "concat_ws" => {
             if args.is_empty() {
                 return Err(EvalError::TypeMismatch {
@@ -2516,6 +2536,59 @@ fn text_arg(v: &Value) -> Result<Option<String>, EvalError> {
             ),
         }),
     }
+}
+
+// PG trim family: which side to strip.
+#[derive(Debug, Clone, Copy)]
+enum TrimSide {
+    Left,
+    Right,
+    Both,
+}
+
+/// PG `trim` / `ltrim` / `rtrim` / `btrim` shared implementation.
+/// Accepts 1 or 2 args; coerces both to text via the standard
+/// `value_to_format_text` helper; treats the chars arg as a SET
+/// of UTF-8 codepoints (not a substring). NULL on either arg
+/// poisons the result.
+fn string_trim(args: &[Value], side: TrimSide, fn_name: &str) -> Result<Value, EvalError> {
+    let (input, chars_str) = match args {
+        [v] => (v.clone(), String::from(" ")),
+        [v, c] => (v.clone(), {
+            // NULL chars poisons.
+            if matches!(c, Value::Null) {
+                return Ok(Value::Null);
+            }
+            value_to_format_text(c)
+        }),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}() takes 1 or 2 args, got {}",
+                    args.len()
+                ),
+            });
+        }
+    };
+    if matches!(input, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let s = value_to_format_text(&input);
+    let charset: alloc::collections::BTreeSet<char> = chars_str.chars().collect();
+    let chars: Vec<char> = s.chars().collect();
+    let mut start = 0usize;
+    let mut end = chars.len();
+    if matches!(side, TrimSide::Left | TrimSide::Both) {
+        while start < end && charset.contains(&chars[start]) {
+            start += 1;
+        }
+    }
+    if matches!(side, TrimSide::Right | TrimSide::Both) {
+        while end > start && charset.contains(&chars[end - 1]) {
+            end -= 1;
+        }
+    }
+    Ok(Value::Text(chars[start..end].iter().collect()))
 }
 
 /// v7.17.0 Phase 3.8 — PG `format(fmtstr, args…)` with
