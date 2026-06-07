@@ -1165,6 +1165,67 @@ pub struct ColumnDef {
     /// CURRENT_TIMESTAMP(6)`, `ON UPDATE LOCALTIMESTAMP`) reuse
     /// the same field; v7.17 only accepts CURRENT_TIMESTAMP.
     pub on_update_runtime: Option<Expr>,
+    /// v7.17.0 Phase 2.5 — text collation derived from the
+    /// post-fix `COLLATE <name>` clause (and / or the table-level
+    /// `COLLATE=<name>` for MySQL dumps that don't repeat it
+    /// per column). Pre-2.5 SPG accepted the clause and
+    /// discarded the name, leaving every column byte-compared
+    /// — a Tier-S silent failure when the customer expected
+    /// `_ci` / `case_insensitive` semantics. Parser normalises
+    /// the raw collation name into the variants in `Collation`.
+    /// Default `Binary` preserves the legacy compare path.
+    pub collation: Collation,
+}
+
+/// v7.17.0 Phase 2.5 — text collation classification surfaced
+/// from the SQL parser. Mirrors `spg_storage::Collation`; the
+/// engine bridges between the two at CREATE TABLE time.
+///
+/// Recognised collation-name patterns (case-insensitive):
+///   * `case_insensitive`, `*_ci`, `*_ai_ci`, `nocase`         → CaseInsensitive
+///   * Everything else (`C`, `POSIX`, `default`,
+///     `pg_catalog.default`, `*_cs`, `*_bin`, unknown names)   → Binary
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collation {
+    Binary,
+    CaseInsensitive,
+}
+
+impl Default for Collation {
+    fn default() -> Self {
+        Self::Binary
+    }
+}
+
+impl Collation {
+    /// Classify a `COLLATE <name>` ident into one of the supported
+    /// variants. Empty / unknown names fall back to `Binary` —
+    /// matches the pre-2.5 silent-accept behaviour for snapshots
+    /// that load through but don't actually depend on the
+    /// collation semantics.
+    #[must_use]
+    pub fn from_collation_name(name: &str) -> Self {
+        let lc = name.trim().to_ascii_lowercase();
+        // Strip any quotes / schema-qualifier the parser left on
+        // (e.g. `pg_catalog.default`).
+        let bare = lc
+            .trim_matches(|c: char| c == '"' || c == '\'')
+            .rsplit('.')
+            .next()
+            .unwrap_or("");
+        if bare.is_empty() {
+            return Self::Binary;
+        }
+        if bare == "case_insensitive" || bare == "nocase" {
+            return Self::CaseInsensitive;
+        }
+        // MySQL `_ci` suffix (covers `utf8mb4_general_ci`,
+        // `utf8mb4_unicode_ci`, `utf8mb4_0900_ai_ci`, …).
+        if bare.ends_with("_ci") {
+            return Self::CaseInsensitive;
+        }
+        Self::Binary
+    }
 }
 
 /// v7.6.0 — A single FOREIGN KEY constraint. Both column-level
@@ -2934,6 +2995,13 @@ impl fmt::Display for FkAction {
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", quote_ident(&self.name), self.ty)?;
+        // v7.17.0 Phase 2.5 — render COLLATE for round-trippable
+        // DDL. Only emits when non-default so the typical output
+        // stays unchanged.
+        match self.collation {
+            Collation::Binary => {}
+            Collation::CaseInsensitive => f.write_str(" COLLATE \"case_insensitive\"")?,
+        }
         if let Some(d) = &self.default {
             write!(f, " DEFAULT {d}")?;
         }

@@ -13098,6 +13098,13 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     if let Some(expr) = c.on_update_runtime {
         schema.on_update_runtime = Some(alloc::format!("{expr}"));
     }
+    // v7.17.0 Phase 2.5 — bridge the AST `Collation` enum to the
+    // storage one. Same variants, different crates (spg-storage
+    // owns no dep on spg-sql).
+    schema.collation = match c.collation {
+        spg_sql::ast::Collation::Binary => spg_storage::Collation::Binary,
+        spg_sql::ast::Collation::CaseInsensitive => spg_storage::Collation::CaseInsensitive,
+    };
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to

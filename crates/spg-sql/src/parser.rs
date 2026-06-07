@@ -18,7 +18,7 @@ use core::fmt;
 use core::mem;
 
 use crate::ast::{
-    AssignTarget, BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName,
+    AssignTarget, BinOp, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin, FunctionArg,
@@ -4851,13 +4851,13 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
     fn parse_type_with_implied_flags(
         &mut self,
-    ) -> Result<(ColumnTypeName, bool, bool, Option<String>), ParseError> {
+    ) -> Result<(ColumnTypeName, bool, bool, Option<String>, Collation), ParseError> {
         let ty_ident = match self.advance() {
             Token::Ident(s) => s,
             other => {
@@ -5009,9 +5009,20 @@ impl Parser {
         }
         // v7.14.0 — mysqldump emits `<type> CHARACTER SET <name>` and
         // `<type> COLLATE <name>` post-fixes on text columns. SPG
-        // stores text as UTF-8 always and orders bytewise; charset /
-        // collate are accepted as no-ops so PG / MySQL / MariaDB
-        // dumps load without parser noise.
+        // stores text as UTF-8 always so CHARACTER SET is still a
+        // no-op. v7.17.0 Phase 2.5 — COLLATE no longer drops the
+        // name: it gets classified into a `Collation` variant the
+        // engine consults at WHERE-eval time. PG `default` /
+        // `pg_catalog.default` / `C` / `POSIX` collations all
+        // resolve to `Binary` (the prior behaviour); `_ci` /
+        // `case_insensitive` / `nocase` shift to CaseInsensitive.
+        // The schema-qualifier form (`pg_catalog.default`) lexes
+        // as `Ident '.' Ident` — peek for the `.` and consume both
+        // halves so it's treated as one collation name. PG's
+        // `IDENT.IDENT` collation form (which can appear here) is
+        // resolved by Collation::from_collation_name on the bare
+        // identifier after the dot.
+        let mut collation = Collation::Binary;
         loop {
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("character"))
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("set"))
@@ -5028,11 +5039,46 @@ impl Parser {
             }
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate")) {
                 self.advance(); // COLLATE
-                if matches!(
-                    self.peek(),
-                    Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
-                ) {
-                    self.advance();
+                // Accept Ident / QuotedIdent / String AND the
+                // keyword-tokenised `Default` (PG `pg_catalog.default`
+                // and bare `DEFAULT` collation names — `default` is a
+                // reserved word so the lexer hands back Token::Default
+                // not Token::Ident).
+                let read_collation_atom = |this: &mut Self| -> Option<alloc::string::String> {
+                    match this.peek().clone() {
+                        Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => {
+                            this.advance();
+                            Some(s)
+                        }
+                        Token::Default => {
+                            this.advance();
+                            Some(alloc::string::String::from("default"))
+                        }
+                        _ => None,
+                    }
+                };
+                let raw = if let Some(head) = read_collation_atom(self) {
+                    // Schema-qualified PG form: `pg_catalog.default`.
+                    if matches!(self.peek(), Token::Dot) {
+                        self.advance();
+                        let tail = read_collation_atom(self).unwrap_or_default();
+                        alloc::format!("{head}.{tail}")
+                    } else {
+                        head
+                    }
+                } else {
+                    alloc::string::String::new()
+                };
+                if !raw.is_empty() {
+                    let parsed = Collation::from_collation_name(&raw);
+                    // Last COLLATE clause wins, but `Binary` from a
+                    // bare keyword like `default` should not
+                    // silently downgrade a stronger one set earlier
+                    // on the same column. v7.17 only ships one
+                    // non-Binary variant so a simple OR is enough.
+                    if parsed != Collation::Binary {
+                        collation = parsed;
+                    }
                 }
                 continue;
             }
@@ -5065,12 +5111,12 @@ impl Parser {
                 }
             };
         }
-        Ok((ty, implied_auto_increment, implied_not_null, user_type_ref))
+        Ok((ty, implied_auto_increment, implied_not_null, user_type_ref, collation))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
         let name = self.expect_ident_like()?;
-        let (ty, implied_auto_increment, implied_not_null, user_type_ref) =
+        let (ty, implied_auto_increment, implied_not_null, user_type_ref, collation) =
             self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -5273,6 +5319,7 @@ impl Parser {
             check,
             user_type_ref,
             on_update_runtime,
+            collation,
         })
     }
 
