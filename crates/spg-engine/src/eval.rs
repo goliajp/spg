@@ -1245,6 +1245,37 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         //     for negative n).
         //   * Integer types passthrough unchanged.
         //   * NULL on any arg → NULL.
+        // PG `nullif(a, b)` — returns NULL if a = b, else a.
+        // Canonical use cases:
+        //   * Divide-by-zero protection: `x / nullif(y, 0)`
+        //   * Empty-string normalisation: `nullif(field, '')`
+        // Edge: nullif(NULL, NULL) returns NULL. nullif(NULL, x)
+        // returns NULL. nullif(x, NULL) returns x (since NULL is
+        // not == to anything per IS DISTINCT FROM semantic, x ≠ NULL).
+        "nullif" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "nullif() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) => Ok(Value::Null),
+                (a, Value::Null) => Ok(a.clone()),
+                (a, b) => {
+                    // Use value_cmp (already defined as Ord-like
+                    // function in lib.rs) — but it's not accessible
+                    // here. Fall back to direct equality.
+                    if values_equal_for_nullif(a, b) {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(a.clone())
+                    }
+                }
+            }
+        }
         "trunc" => {
             match args.len() {
                 1 => match &args[0] {
@@ -3052,6 +3083,58 @@ fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Val
         return Ok(Value::Text(String::new()));
     }
     Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// PG-style equality for nullif. Handles cross-numeric-width
+/// comparison (Int vs BigInt vs SmallInt vs Float vs Numeric);
+/// text matches text exactly; everything else uses derived
+/// PartialEq.
+fn values_equal_for_nullif(a: &Value, b: &Value) -> bool {
+    // Same-type fast path.
+    if a == b {
+        return true;
+    }
+    // Cross-int widening: SmallInt / Int / BigInt all comparable.
+    let a_int = match a {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    let b_int = match b {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (a_int, b_int) {
+        return a == b;
+    }
+    // Float / Numeric: widen to f64.
+    let a_f = match a {
+        Value::Float(x) => Some(*x),
+        Value::SmallInt(x) => Some(f64::from(*x)),
+        Value::Int(x) => Some(f64::from(*x)),
+        Value::BigInt(x) => Some(*x as f64),
+        Value::Numeric { scaled, scale } => {
+            Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+        }
+        _ => None,
+    };
+    let b_f = match b {
+        Value::Float(x) => Some(*x),
+        Value::SmallInt(x) => Some(f64::from(*x)),
+        Value::Int(x) => Some(f64::from(*x)),
+        Value::BigInt(x) => Some(*x as f64),
+        Value::Numeric { scaled, scale } => {
+            Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+        }
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (a_f, b_f) {
+        return a == b;
+    }
+    false
 }
 
 /// no_std-compatible `trunc(x)` for f64 — truncate toward zero.
