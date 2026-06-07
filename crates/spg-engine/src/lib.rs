@@ -1837,6 +1837,13 @@ impl Engine {
             Statement::DropView { names, if_exists } => {
                 self.exec_drop_view(&names, if_exists)
             }
+            Statement::CreateMaterializedView(s) => self.exec_create_materialized_view(s),
+            Statement::RefreshMaterializedView { name, with_data } => {
+                self.exec_refresh_materialized_view(&name, with_data)
+            }
+            Statement::DropMaterializedView { names, if_exists } => {
+                self.exec_drop_materialized_view(&names, if_exists)
+            }
             Statement::ResetParameter(target) => {
                 match target {
                     None => self.session_params.clear(),
@@ -3298,6 +3305,194 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW` engine path.
+    /// Materialises the body at CREATE time (unless WITH NO DATA),
+    /// stores the result as a regular `Table`, and registers the
+    /// body source in the catalog so REFRESH can re-run it.
+    fn exec_create_materialized_view(
+        &mut self,
+        s: spg_sql::ast::CreateMaterializedViewStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Name-collision check (table / view / sequence / mat-view).
+        let cat = self.active_catalog();
+        if cat.materialized_views().contains_key(&s.name) || cat.get(&s.name).is_some() {
+            if s.if_not_exists {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} already exists",
+                    s.name
+                ),
+            )));
+        }
+        if cat.views().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} would shadow an existing view",
+                    s.name
+                ),
+            )));
+        }
+        if cat.sequences().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} would shadow an existing sequence",
+                    s.name
+                ),
+            )));
+        }
+        // Render the body to canonical form for the registry.
+        let body_repr = alloc::format!(
+            "{}",
+            spg_sql::ast::Statement::Select(s.body.clone())
+        );
+        // Execute the body to learn the columns. With WITH DATA we
+        // also materialise the rows; with WITH NO DATA we only need
+        // the schema, so re-use a LIMIT 0 wrap to keep the column
+        // inference path uniform without paying for the rows.
+        let result = self.exec_select_cancel(&s.body, CancelToken::none())?;
+        let (mut cols, rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CREATE MATERIALIZED VIEW body did not return rows: {other:?}"
+                )));
+            }
+        };
+        // Apply the column-rename list per PG semantics.
+        if !s.columns.is_empty() {
+            if s.columns.len() != cols.len() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CREATE MATERIALIZED VIEW {:?}: column list has {} names but body returns {}",
+                    s.name,
+                    s.columns.len(),
+                    cols.len()
+                )));
+            }
+            for (c, name) in cols.iter_mut().zip(s.columns.iter()) {
+                c.name.clone_from(name);
+            }
+        }
+        // Promote any synthetic-Text projections to their actual
+        // observed types so the backing table accepts the rows.
+        cols = infer_column_types(&cols, &rows);
+        let schema = spg_storage::TableSchema::new(s.name.clone(), cols);
+        let cat = self.active_catalog_mut();
+        cat.create_table(schema).map_err(EngineError::Storage)?;
+        if s.with_data {
+            let table = cat
+                .get_mut(&s.name)
+                .expect("just-created materialized-view backing table must exist");
+            for row in rows {
+                table.insert(row).map_err(EngineError::Storage)?;
+            }
+        }
+        cat.register_materialized_view(s.name.clone(), body_repr);
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `REFRESH MATERIALIZED VIEW name [WITH
+    /// [NO] DATA]`. Looks up the source, re-runs it, replaces the
+    /// backing table's rows.
+    fn exec_refresh_materialized_view(
+        &mut self,
+        name: &str,
+        with_data: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let source = self
+            .active_catalog()
+            .materialized_views()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "materialized view {name:?} does not exist"
+                )))
+            })?;
+        // Wipe the existing rows first (PG truncates the matview
+        // and rebuilds; we approximate with an empty INSERT loop).
+        {
+            let cat = self.active_catalog_mut();
+            let table = cat.get_mut(name).ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "materialized view {name:?} backing table missing"
+                )))
+            })?;
+            table.truncate();
+        }
+        if !with_data {
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: !self.in_transaction(),
+            });
+        }
+        let parsed = spg_sql::parser::parse_statement(&source).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body re-parse failed: {e}"
+            ))
+        })?;
+        let Statement::Select(body) = parsed else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body is not a SELECT (catalog corruption)"
+            )));
+        };
+        let rows = match self.exec_select_cancel(&body, CancelToken::none())? {
+            QueryResult::Rows { rows, .. } => rows,
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "REFRESH MATERIALIZED VIEW {name:?} body did not return rows: {other:?}"
+                )));
+            }
+        };
+        let cat = self.active_catalog_mut();
+        let table = cat
+            .get_mut(name)
+            .expect("backing table verified above");
+        let affected = rows.len();
+        for row in rows {
+            table.insert(row).map_err(EngineError::Storage)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `DROP MATERIALIZED VIEW [IF EXISTS]
+    /// names`. Drops the backing table + unregisters the source.
+    fn exec_drop_materialized_view(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self
+                .active_catalog_mut()
+                .drop_materialized_view_source(name);
+            if was_present {
+                // Drop the backing table too.
+                self.active_catalog_mut().drop_table(name);
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("materialized view {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
         })
     }
 

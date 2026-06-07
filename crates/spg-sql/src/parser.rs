@@ -572,6 +572,35 @@ impl Parser {
                         }
                         Ok(Statement::Empty)
                     }
+                    // v7.17.0 Phase 1.3 — DROP MATERIALIZED VIEW
+                    // [IF EXISTS] name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("materialized") =>
+                    {
+                        self.advance();
+                        let nxt = self.peek().clone();
+                        if !matches!(&nxt, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                        {
+                            return Err(self.err(alloc::format!(
+                                "expected VIEW after DROP MATERIALIZED, got {nxt:?}"
+                            )));
+                        }
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropMaterializedView { names, if_exists })
+                    }
                     // v7.17.0 Phase 1.2 — DROP VIEW [IF EXISTS]
                     // name [, name…] [CASCADE|RESTRICT].
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("view") => {
@@ -616,6 +645,29 @@ impl Parser {
                          SUBSCRIPTION / TRIGGER / FUNCTION after DROP, got {other:?}"
                     ))),
                 }
+            }
+            // v7.17.0 Phase 1.3 — REFRESH MATERIALIZED VIEW name [WITH [NO] DATA].
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("refresh") => {
+                self.advance();
+                let nxt = self.peek().clone();
+                if !matches!(&nxt, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("materialized"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected MATERIALIZED after REFRESH, got {nxt:?}"
+                    )));
+                }
+                self.advance();
+                let nxt2 = self.peek().clone();
+                if !matches!(&nxt2, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected VIEW after REFRESH MATERIALIZED, got {nxt2:?}"
+                    )));
+                }
+                self.advance();
+                let name = self.expect_ident_like()?;
+                let with_data = self.parse_optional_with_data(true)?;
+                Ok(Statement::RefreshMaterializedView { name, with_data })
             }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
                 self.advance();
@@ -938,6 +990,20 @@ impl Parser {
                 self.advance();
                 self.parse_create_view_after_keyword(false, false, false)
             }
+            // v7.17.0 Phase 1.3 — CREATE MATERIALIZED VIEW …
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("materialized") => {
+                self.advance();
+                let next = self.peek().clone();
+                if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                {
+                    self.advance();
+                    self.parse_create_materialized_view_after_keyword()
+                } else {
+                    Err(self.err(alloc::format!(
+                        "expected VIEW after CREATE MATERIALIZED, got {next:?}"
+                    )))
+                }
+            }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") =>
             {
@@ -963,17 +1029,15 @@ impl Parser {
             // TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
             // SPG is single-schema / single-database; these have
             // no behavioural effect, so consume + return Empty.
-            // v7.17.0 NOTE: SEQUENCE was here pre-v7.17; moved up
-            // to a real parser branch above. VIEW also moved out
-            // in Phase 1.2 (it has its own branch above). TYPE /
-            // DOMAIN / MATERIALIZED VIEW move out in Phase
-            // 1.3–1.5; SCHEMA / DATABASE / ROLE / POLICY /
-            // OPERATOR stay no-op forever (single-namespace).
+            // v7.17.0 NOTE: SEQUENCE / VIEW / MATERIALIZED VIEW
+            // were here pre-v7.17; all moved up to real parser
+            // branches. TYPE / DOMAIN move out in Phase 1.4–1.5;
+            // SCHEMA / DATABASE / ROLE / POLICY / OPERATOR stay
+            // no-op forever (single-namespace).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
                     "schema"
-                        | "materialized"
                         | "type"
                         | "domain"
                         | "database"
@@ -1270,6 +1334,105 @@ impl Parser {
                 Ok(Some(lang.to_ascii_lowercase()))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// v7.17.0 Phase 1.3 — body of `CREATE MATERIALIZED VIEW
+    /// [IF NOT EXISTS] name [(col, …)] AS <SELECT …> [WITH [NO] DATA]`.
+    /// The `CREATE MATERIALIZED VIEW` keywords have already been
+    /// consumed.
+    fn parse_create_materialized_view_after_keyword(
+        &mut self,
+    ) -> Result<Statement, ParseError> {
+        let if_not_exists = self.parse_if_not_exists();
+        let name = self.expect_ident_like()?;
+        let mut columns: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                let c = self.expect_ident_like()?;
+                columns.push(c);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                return Err(self.err(alloc::format!(
+                    "expected , or ) in MATERIALIZED VIEW column list, got {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS <SELECT …> after CREATE MATERIALIZED VIEW {name:?}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let body_stmt = self.parse_select_stmt()?;
+        let Statement::Select(body) = body_stmt else {
+            return Err(self.err(alloc::format!(
+                "CREATE MATERIALIZED VIEW body must be a SELECT, got {body_stmt:?}"
+            )));
+        };
+        // Optional trailing `WITH [NO] DATA`.
+        let with_data = self.parse_optional_with_data(true)?;
+        Ok(Statement::CreateMaterializedView(
+            crate::ast::CreateMaterializedViewStatement {
+                name,
+                if_not_exists,
+                columns,
+                body,
+                with_data,
+            },
+        ))
+    }
+
+    /// v7.17.0 Phase 1.3 — `WITH [NO] DATA` trailer.
+    /// `default_when_absent` is what to return if the tail is
+    /// missing (CREATE defaults to WITH DATA, REFRESH defaults to
+    /// WITH DATA).
+    fn parse_optional_with_data(
+        &mut self,
+        default_when_absent: bool,
+    ) -> Result<bool, ParseError> {
+        let save = self.pos;
+        // `WITH` is an Ident (not reserved in the lexer).
+        let is_with = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case("with"),
+            _ => false,
+        };
+        if !is_with {
+            return Ok(default_when_absent);
+        }
+        self.advance();
+        // Optional `NO`.
+        let mut with_data = true;
+        let is_no = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case("no"),
+            _ => false,
+        };
+        if is_no {
+            self.advance();
+            with_data = false;
+        }
+        // Required `DATA` ident.
+        let is_data = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case("data"),
+            _ => false,
+        };
+        if is_data {
+            self.advance();
+            Ok(with_data)
+        } else {
+            // Caller's WITH wasn't WITH-DATA — rewind so the outer
+            // parser can interpret it.
+            self.pos = save;
+            Ok(default_when_absent)
         }
     }
 
@@ -5437,7 +5600,17 @@ impl Parser {
             }
             return None;
         }
-        if let Token::Ident(_) | Token::QuotedIdent(_) = self.peek() {
+        // v7.17.0 Phase 1.3 — implicit alias (no `AS`). PG's
+        // grammar reserves a long list of follow-keywords from the
+        // alias slot. SPG's bareword approximation: skip a small
+        // set of idents that would otherwise be swallowed as the
+        // table alias and break trailing clauses like CREATE
+        // MATERIALIZED VIEW … WITH [NO] DATA or future ON
+        // CONFLICT WHERE shapes.
+        if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek() {
+            if is_alias_stopword(s) {
+                return None;
+            }
             return self.expect_ident_like().ok();
         }
         None
@@ -6586,6 +6759,45 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
 // purpose. i64 → f32 loses precision past 2^24, f64 → f32 loses precision
 // past ~15 decimal digits — both are acceptable for a fixed-precision
 // pgvector column.
+/// v7.17.0 Phase 1.3 — words that would otherwise be eaten as an
+/// implicit table alias and break trailing clauses. WITH lands
+/// here so `… FROM t WITH NO DATA` doesn't consume WITH as the
+/// alias for `t`; same for ON / WHERE / HAVING / GROUP / ORDER /
+/// LIMIT / OFFSET / UNION / EXCEPT / INTERSECT / RETURNING / SET
+/// / VALUES / FOR / LATERAL — all of which would otherwise be
+/// silently swallowed by `parse_optional_alias`.
+fn is_alias_stopword(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "with"
+            | "on"
+            | "where"
+            | "having"
+            | "group"
+            | "order"
+            | "limit"
+            | "offset"
+            | "union"
+            | "except"
+            | "intersect"
+            | "returning"
+            | "set"
+            | "values"
+            | "for"
+            | "lateral"
+            | "left"
+            | "right"
+            | "inner"
+            | "outer"
+            | "full"
+            | "cross"
+            | "join"
+            | "natural"
+            | "using"
+            | "fetch"
+    )
+}
+
 fn extract_numeric_literal(e: &Expr) -> Option<f32> {
     match e {
         Expr::Literal(Literal::Integer(n)) => Some(*n as f32),
