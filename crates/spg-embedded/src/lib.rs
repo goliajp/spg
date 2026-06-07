@@ -315,6 +315,19 @@ struct PersistenceCtx {
     /// segment + its CRC32 so the next boot can verify + reload.
     cold_segments_dir: PathBuf,
     cold_segment_paths: BTreeMap<u32, PathBuf>,
+    /// v7.17.0 Phase 6.2 — cross-process exclusion lock. Acquired
+    /// via `fs::create_dir` on `<db_path>.lock` at open_path
+    /// entry; released on Drop by `fs::remove_dir`. atomic on
+    /// every supported platform. A second process opening the
+    /// same path while the first is still alive hits the
+    /// create_dir failure and returns
+    /// `EngineError::Unsupported("database is locked by another
+    /// process: …")`. Stale locks (process crashed mid-session)
+    /// must be cleared via `Database::force_unlock(path)` —
+    /// SPG can't safely fingerprint who owned a stale directory
+    /// without a libc dep, which would violate spg-embedded's
+    /// zero-deps charter.
+    lock_path: PathBuf,
 }
 
 impl Database {
@@ -365,6 +378,36 @@ impl Database {
         {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
+        // v7.17.0 Phase 6.2 — acquire cross-process exclusion
+        // lock before touching any catalog / WAL bytes. atomic
+        // mkdir on every supported platform; a second process
+        // opening the same path while the first is still alive
+        // hits the create_dir failure and gets a clear error.
+        let lock_path = {
+            let mut p = db_path.clone();
+            let name = p
+                .file_name()
+                .map(|n| {
+                    let mut s = n.to_os_string();
+                    s.push(".lock");
+                    s
+                })
+                .unwrap_or_else(|| std::ffi::OsString::from(".lock"));
+            p.set_file_name(name);
+            p
+        };
+        std::fs::create_dir(&lock_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                EngineError::Unsupported(format!(
+                    "database is locked by another process (or stale lock): {}; \
+                     remove the directory manually after confirming no other \
+                     process holds it, or call Database::force_unlock()",
+                    lock_path.display()
+                ))
+            } else {
+                io_err(e)
+            }
+        })?;
         let mut engine = if db_path.exists() {
             let bytes = std::fs::read(&db_path).map_err(io_err)?;
             let engine = Engine::restore_envelope(&bytes).map_err(|e| {
@@ -460,6 +503,7 @@ impl Database {
                 checkpoint_threshold_bytes: default_checkpoint_threshold_bytes(),
                 cold_segments_dir,
                 cold_segment_paths,
+                lock_path,
             }),
         })
     }
@@ -1295,6 +1339,50 @@ impl Drop for Database {
                 );
             }
         }
+        // v7.17.0 Phase 6.2 — release the cross-process lock on
+        // clean shutdown. Failure is logged but never panics;
+        // the operator can clear a stale lock via
+        // `Database::force_unlock` if a crash kept the
+        // directory around.
+        if let Some(ctx) = &self.persistence
+            && ctx.lock_path.exists()
+        {
+            if let Err(e) = std::fs::remove_dir(&ctx.lock_path) {
+                eprintln!(
+                    "spg-embedded: lock release on Drop failed for {}: {e:?}",
+                    ctx.lock_path.display()
+                );
+            }
+        }
+    }
+}
+
+impl Database {
+    /// v7.17.0 Phase 6.2 — clear a stale cross-process lock.
+    /// Use when a previous process crashed mid-session and
+    /// left `<db_path>.lock` behind. Operators should confirm
+    /// no other process is currently using the database before
+    /// calling this — SPG cannot fingerprint stale-vs-live
+    /// without a libc dep, which would violate spg-embedded's
+    /// zero-deps charter.
+    pub fn force_unlock(db_path: impl AsRef<Path>) -> Result<(), EngineError> {
+        let lock_path = {
+            let mut p = db_path.as_ref().to_path_buf();
+            let name = p
+                .file_name()
+                .map(|n| {
+                    let mut s = n.to_os_string();
+                    s.push(".lock");
+                    s
+                })
+                .unwrap_or_else(|| std::ffi::OsString::from(".lock"));
+            p.set_file_name(name);
+            p
+        };
+        if !lock_path.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir(&lock_path).map_err(io_err)
     }
 }
 
