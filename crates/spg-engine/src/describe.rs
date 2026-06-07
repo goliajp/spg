@@ -78,6 +78,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     auto_increment: false,
                     default: None,
                     runtime_default: None,
+                    user_enum_type: None,
                 });
             }
         }

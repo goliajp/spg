@@ -421,6 +421,14 @@ pub struct ColumnSchema {
     /// this column unbound (or sets it to NULL) gets the next integer
     /// computed from the column's current max + 1.
     pub auto_increment: bool,
+    /// v7.17.0 Phase 1.4 — when the column is bound to a user-
+    /// defined ENUM type (the parser saw an unknown type ident
+    /// and the engine resolved it against `catalog.enum_types`),
+    /// this carries the enum name so INSERT/UPDATE can validate
+    /// the cell value against the enum's labels. `ty` is
+    /// `DataType::Text` in that case. Persisted in catalog
+    /// FILE_VERSION 29+; older catalogs deserialise with None.
+    pub user_enum_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3342,6 +3350,12 @@ pub struct Catalog {
     /// the table. Persisted in catalog FILE_VERSION 28+;
     /// older catalogs deserialise with an empty map.
     materialized_views: BTreeMap<String, String>,
+    /// v7.17.0 — catalogued user-defined ENUM types (Phase 1.4).
+    /// Maps name → label list. Columns reference these by name
+    /// via `ColumnSchema.user_enum_type`. Persisted in catalog
+    /// FILE_VERSION 29+; older catalogs deserialise with an empty
+    /// map.
+    enum_types: BTreeMap<String, EnumDef>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -3442,6 +3456,17 @@ pub enum SequenceDataType {
     BigInt,
 }
 
+/// v7.17.0 Phase 1.4 — catalogued user-defined ENUM type. The
+/// label vector is order-preserving (PG enum ordering follows the
+/// declared order). At INSERT/UPDATE on a column bound to this
+/// enum, the engine looks up the value against `labels` and
+/// rejects non-members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDef {
+    pub name: String,
+    pub labels: Vec<String>,
+}
+
 /// v7.17.0 Phase 1.2 — catalogued VIEW. The body is stored as the
 /// raw source text the parser saw between `AS` and the statement
 /// terminator; the engine re-parses on each invocation. Same
@@ -3500,6 +3525,7 @@ impl Catalog {
             sequences: BTreeMap::new(),
             views: BTreeMap::new(),
             materialized_views: BTreeMap::new(),
+            enum_types: BTreeMap::new(),
         }
     }
 
@@ -3729,6 +3755,32 @@ impl Catalog {
     /// the backing table.
     pub fn drop_materialized_view_source(&mut self, name: &str) -> bool {
         self.materialized_views.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.4 — read-only handle to user-defined ENUM
+    /// catalog.
+    pub const fn enum_types(&self) -> &BTreeMap<String, EnumDef> {
+        &self.enum_types
+    }
+
+    /// v7.17.0 Phase 1.4 — install a new ENUM type. Errors if
+    /// `name` collides with an existing enum (no IF NOT EXISTS
+    /// per PG semantics for CREATE TYPE).
+    pub fn create_enum_type(&mut self, def: EnumDef) -> Result<(), StorageError> {
+        if self.enum_types.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "type {:?} already exists",
+                def.name
+            )));
+        }
+        self.enum_types.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.4 — drop an ENUM type by name. Returns
+    /// true if a type was removed.
+    pub fn drop_enum_type(&mut self, name: &str) -> bool {
+        self.enum_types.remove(name).is_some()
     }
 
     /// v7.17.0 — ALTER SEQUENCE option merge. Caller-provided
@@ -5093,6 +5145,7 @@ impl ColumnSchema {
             default: None,
             runtime_default: None,
             auto_increment: false,
+            user_enum_type: None,
         }
     }
 
@@ -5254,7 +5307,19 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     as a regular Table of the same name (already covered by
 ///     the pre-existing tables block). v27-and-below catalogs
 ///     deserialise with an empty map.
-const FILE_VERSION: u8 = 28;
+/// v29 introduces (v7.17.0 Phase 1.4):
+///   * Per-table user_enum_type appendix (after the CHECK
+///     appendix). Layout: `u16 count` followed by per-binding
+///     `[u16 col_pos][str enum_name]`. Only columns whose
+///     `user_enum_type` is Some land here; the catalog stays
+///     compact for the common no-enum case.
+///   * Trailing ENUM types catalog block after materialized
+///     views. Encoded as `u32 count` followed by per-entry:
+///     `name`, `u16 label_count`, then `label_count` short
+///     strings. v28-and-below catalogs deserialise with an
+///     empty enum_types map and every column's
+///     `user_enum_type = None`.
+const FILE_VERSION: u8 = 29;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5577,6 +5642,24 @@ impl Catalog {
             for c in &t.schema.checks {
                 write_str(&mut out, c.as_str());
             }
+            // v7.17.0 Phase 1.4 — per-table user_enum_type
+            // appendix. Layout: [u16 count] then
+            // [u16 col_pos][str enum_name] per binding. Only
+            // columns whose user_enum_type is Some land here.
+            let mut enum_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(e) = &c.user_enum_type {
+                    enum_bindings.push((i, e.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(enum_bindings.len()).expect("≤ 65k enum-typed columns/table"),
+            );
+            for (pos, ename) in enum_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, ename);
+            }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier
@@ -5686,6 +5769,22 @@ impl Catalog {
         for (name, body) in &self.materialized_views {
             write_str(&mut out, name);
             write_str_long(&mut out, body);
+        }
+        // v7.17.0 Phase 1.4 — ENUM types catalog block
+        // (FILE_VERSION 29+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.enum_types.len()).expect("≤ 4G enum types"),
+        );
+        for e in self.enum_types.values() {
+            write_str(&mut out, &e.name);
+            write_u16(
+                &mut out,
+                u16::try_from(e.labels.len()).expect("≤ 65k labels / enum"),
+            );
+            for l in &e.labels {
+                write_str(&mut out, l);
+            }
         }
         out
     }
@@ -5865,6 +5964,23 @@ impl Catalog {
                 cat.materialized_views.insert(name, body);
             }
         }
+        // v7.17.0 Phase 1.4 — ENUM types catalog block
+        // (FILE_VERSION 29+).
+        if version >= 29 {
+            let etype_count = cur.read_u32()? as usize;
+            for _ in 0..etype_count {
+                let name = cur.read_str()?;
+                let label_count = cur.read_u16()? as usize;
+                let mut labels = Vec::with_capacity(label_count);
+                for _ in 0..label_count {
+                    labels.push(cur.read_str()?);
+                }
+                cat.enum_types.insert(
+                    name.clone(),
+                    EnumDef { name, labels },
+                );
+            }
+        }
         if cur.pos < buf.len() {
             return Err(StorageError::Corrupt(format!(
                 "trailing bytes: {} unread",
@@ -5912,6 +6028,7 @@ fn deserialize_table(
             default,
             runtime_default: None,
             auto_increment,
+            user_enum_type: None,
         });
     }
     let n_cols = cols.len();
@@ -6034,6 +6151,19 @@ fn deserialize_table(
             checks.push(cur.read_str()?);
         }
         t.schema_mut().checks = checks;
+    }
+    // v7.17.0 Phase 1.4 — per-table user_enum_type appendix
+    // (FILE_VERSION 29+). Layout: [u16 count] then
+    // [u16 col_pos][str enum_name] per binding.
+    if version >= 29 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let ename = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.user_enum_type = Some(ename);
+            }
+        }
     }
     let _ = table_name;
     Ok(())
