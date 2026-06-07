@@ -5960,8 +5960,13 @@ impl Engine {
         // Owned (rows, schema) per peer — borrows from the catalog
         // would not survive UNNEST-side materialisation.
         #[allow(clippy::type_complexity)]
-        let mut joined: Vec<(Vec<Row>, Vec<ColumnSchema>, String, JoinKind, Option<&Expr>)> =
-            Vec::new();
+        let mut joined: Vec<(
+            Vec<Row>,
+            Vec<ColumnSchema>,
+            String,
+            JoinKind,
+            Option<&Expr>,
+        )> = Vec::new();
         for j in &from.joins {
             let (rows, cols) = self.materialise_table_ref(&j.table)?;
             let a = j
