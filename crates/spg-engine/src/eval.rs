@@ -1267,6 +1267,46 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // via the no_std exp/ln series helpers.
         // x=0 with negative y → error (1/0). NULL → NULL.
         // PG `sqrt(x)` — square root. Negative input → error.
+        // PG `sign(x)` — -1 / 0 / 1.
+        "sign" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "sign() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::SmallInt(n) => Ok(Value::SmallInt(n.signum())),
+                Value::Int(n) => Ok(Value::Int(n.signum())),
+                Value::BigInt(n) => Ok(Value::BigInt(n.signum())),
+                Value::Float(x) => {
+                    let s = if *x > 0.0 {
+                        1.0
+                    } else if *x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    Ok(Value::Float(s))
+                }
+                Value::Numeric { scaled, scale } => {
+                    let s = scaled.signum();
+                    Ok(Value::Numeric {
+                        scaled: s * pow10_i128(*scale),
+                        scale: *scale,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "sign() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
         "sqrt" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
