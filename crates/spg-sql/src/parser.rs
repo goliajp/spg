@@ -593,6 +593,27 @@ impl Parser {
                         }
                         Ok(Statement::DropType { names, if_exists })
                     }
+                    // v7.17.0 Phase 1.5 — DROP DOMAIN [IF EXISTS]
+                    // name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("domain") =>
+                    {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropDomain { names, if_exists })
+                    }
                     // v7.17.0 Phase 1.3 — DROP MATERIALIZED VIEW
                     // [IF EXISTS] name [, name…] [CASCADE|RESTRICT].
                     Token::Ident(s) | Token::QuotedIdent(s)
@@ -1016,6 +1037,12 @@ impl Parser {
                 self.advance();
                 self.parse_create_type_after_keyword()
             }
+            // v7.17.0 Phase 1.5 — CREATE DOMAIN name AS base
+            // [DEFAULT expr] [NOT NULL] [CHECK (expr)]*.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("domain") => {
+                self.advance();
+                self.parse_create_domain_after_keyword()
+            }
             // v7.17.0 Phase 1.3 — CREATE MATERIALIZED VIEW …
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("materialized") => {
                 self.advance();
@@ -1056,15 +1083,14 @@ impl Parser {
             // SPG is single-schema / single-database; these have
             // no behavioural effect, so consume + return Empty.
             // v7.17.0 NOTE: SEQUENCE / VIEW / MATERIALIZED VIEW /
-            // TYPE were here pre-v7.17; all moved up to real
-            // parser branches. DOMAIN moves out in Phase 1.5;
-            // SCHEMA / DATABASE / ROLE / POLICY / OPERATOR stay
-            // no-op forever (single-namespace).
+            // TYPE / DOMAIN were here pre-v7.17; all moved up to
+            // real parser branches. SCHEMA / DATABASE / ROLE /
+            // POLICY / OPERATOR stay no-op forever
+            // (single-namespace).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
                     "schema"
-                        | "domain"
                         | "database"
                         | "role"
                         | "policy"
@@ -1360,6 +1386,85 @@ impl Parser {
             }
             _ => Ok(None),
         }
+    }
+
+    /// v7.17.0 Phase 1.5 — body of `CREATE DOMAIN name AS
+    /// base_type [DEFAULT expr] [NOT NULL | NULL] [CHECK
+    /// (expr)]*`. The `DOMAIN` keyword has already been
+    /// consumed. PG allows the trailing constraints in any
+    /// order; we approximate with a small loop.
+    fn parse_create_domain_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        // Optional `AS`.
+        if matches!(self.peek(), Token::As) {
+            self.advance();
+        }
+        let base_type = self.parse_column_type_name()?;
+        let mut default: Option<Expr> = None;
+        let mut not_null = false;
+        let mut checks: Vec<Expr> = Vec::new();
+        loop {
+            match self.peek() {
+                Token::Default => {
+                    if default.is_some() {
+                        return Err(self.err("DOMAIN DEFAULT specified twice".into()));
+                    }
+                    self.advance();
+                    default = Some(self.parse_expr(0)?);
+                }
+                Token::Not => {
+                    self.advance();
+                    if !matches!(self.peek(), Token::Null) {
+                        return Err(self.err(alloc::format!(
+                            "expected NULL after NOT in DOMAIN, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    not_null = true;
+                }
+                Token::Null => {
+                    self.advance();
+                    // NULL after a NOT NULL is contradictory, but
+                    // PG accepts bare NULL as the default-nullable
+                    // marker. No-op.
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("check") => {
+                    self.advance();
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected '(' after CHECK in DOMAIN, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let expr = self.parse_expr(0)?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected ')' after CHECK expr, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    checks.push(expr);
+                }
+                // CONSTRAINT <name> CHECK (…) — PG accepts a name
+                // prefix on the constraint; we drop the name and
+                // recurse into the constraint parsing.
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("constraint") => {
+                    self.advance();
+                    let _ = self.expect_ident_like()?;
+                }
+                _ => break,
+            }
+        }
+        Ok(Statement::CreateDomain(crate::ast::CreateDomainStatement {
+            name,
+            base_type,
+            default,
+            not_null,
+            checks,
+        }))
     }
 
     /// v7.17.0 Phase 1.4 — body of `CREATE TYPE name AS ENUM

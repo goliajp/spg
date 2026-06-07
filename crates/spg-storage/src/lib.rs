@@ -429,6 +429,14 @@ pub struct ColumnSchema {
     /// `DataType::Text` in that case. Persisted in catalog
     /// FILE_VERSION 29+; older catalogs deserialise with None.
     pub user_enum_type: Option<String>,
+    /// v7.17.0 Phase 1.5 — when the column is bound to a user-
+    /// defined DOMAIN (the parser saw an unknown type ident and
+    /// the engine resolved it against `catalog.domain_types`),
+    /// this carries the domain name. `ty` is the domain's base
+    /// type; INSERT/UPDATE re-evaluates the domain's CHECK list
+    /// + NOT NULL against the cell value. Persisted in catalog
+    /// FILE_VERSION 30+; older catalogs deserialise with None.
+    pub user_domain_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3356,6 +3364,12 @@ pub struct Catalog {
     /// FILE_VERSION 29+; older catalogs deserialise with an empty
     /// map.
     enum_types: BTreeMap<String, EnumDef>,
+    /// v7.17.0 — catalogued user-defined DOMAIN types (Phase 1.5).
+    /// Maps name → base + CHECK constraints. Columns reference
+    /// these by name via `ColumnSchema.user_domain_type`.
+    /// Persisted in catalog FILE_VERSION 30+; older catalogs
+    /// deserialise with an empty map.
+    domain_types: BTreeMap<String, DomainDef>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -3456,6 +3470,22 @@ pub enum SequenceDataType {
     BigInt,
 }
 
+/// v7.17.0 Phase 1.5 — catalogued user-defined DOMAIN. A domain
+/// is a named CHECK-constrained alias over a built-in type;
+/// columns bound to it inherit the base type plus the CHECK
+/// predicates + NOT NULL + DEFAULT at INSERT/UPDATE time.
+/// `default` / `checks` are stored as Display-form source so
+/// `spg-storage` stays free of `spg-sql` dependency — same
+/// pattern as FunctionDef / ViewDef.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainDef {
+    pub name: String,
+    pub base_type: DataType,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub checks: Vec<String>,
+}
+
 /// v7.17.0 Phase 1.4 — catalogued user-defined ENUM type. The
 /// label vector is order-preserving (PG enum ordering follows the
 /// declared order). At INSERT/UPDATE on a column bound to this
@@ -3526,6 +3556,7 @@ impl Catalog {
             views: BTreeMap::new(),
             materialized_views: BTreeMap::new(),
             enum_types: BTreeMap::new(),
+            domain_types: BTreeMap::new(),
         }
     }
 
@@ -3781,6 +3812,29 @@ impl Catalog {
     /// true if a type was removed.
     pub fn drop_enum_type(&mut self, name: &str) -> bool {
         self.enum_types.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.5 — read-only handle to DOMAIN catalog.
+    pub const fn domain_types(&self) -> &BTreeMap<String, DomainDef> {
+        &self.domain_types
+    }
+
+    /// v7.17.0 Phase 1.5 — install a DOMAIN. Errors on collision
+    /// with an existing domain.
+    pub fn create_domain_type(&mut self, def: DomainDef) -> Result<(), StorageError> {
+        if self.domain_types.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "domain {:?} already exists",
+                def.name
+            )));
+        }
+        self.domain_types.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.5 — drop a DOMAIN by name.
+    pub fn drop_domain_type(&mut self, name: &str) -> bool {
+        self.domain_types.remove(name).is_some()
     }
 
     /// v7.17.0 — ALTER SEQUENCE option merge. Caller-provided
@@ -5146,6 +5200,7 @@ impl ColumnSchema {
             runtime_default: None,
             auto_increment: false,
             user_enum_type: None,
+            user_domain_type: None,
         }
     }
 
@@ -5319,7 +5374,17 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     strings. v28-and-below catalogs deserialise with an
 ///     empty enum_types map and every column's
 ///     `user_enum_type = None`.
-const FILE_VERSION: u8 = 29;
+/// v30 introduces (v7.17.0 Phase 1.5):
+///   * Per-table user_domain_type appendix (after the
+///     user_enum_type appendix). Same shape as the enum one.
+///   * Trailing DOMAIN types catalog block after the enum
+///     block. Encoded as `u32 count` followed by per-entry:
+///     `name`, `data_type` byte, `nullable u8`,
+///     `default_present u8` + optional default string,
+///     `u16 check_count` then `check_count` Display-form
+///     CHECK strings. v29-and-below catalogs deserialise with
+///     an empty domain_types map and `user_domain_type = None`.
+const FILE_VERSION: u8 = 30;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5660,6 +5725,23 @@ impl Catalog {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, ename);
             }
+            // v7.17.0 Phase 1.5 — per-table user_domain_type
+            // appendix. Same layout as the enum one. v29-and-
+            // below readers stop after the enum appendix.
+            let mut domain_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(d) = &c.user_domain_type {
+                    domain_bindings.push((i, d.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(domain_bindings.len()).expect("≤ 65k domain-typed columns/table"),
+            );
+            for (pos, dname) in domain_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, dname);
+            }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier
@@ -5784,6 +5866,31 @@ impl Catalog {
             );
             for l in &e.labels {
                 write_str(&mut out, l);
+            }
+        }
+        // v7.17.0 Phase 1.5 — DOMAIN types catalog block
+        // (FILE_VERSION 30+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.domain_types.len()).expect("≤ 4G domain types"),
+        );
+        for d in self.domain_types.values() {
+            write_str(&mut out, &d.name);
+            write_data_type(&mut out, d.base_type);
+            out.push(u8::from(d.nullable));
+            match &d.default {
+                None => out.push(0),
+                Some(s) => {
+                    out.push(1);
+                    write_str(&mut out, s);
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(d.checks.len()).expect("≤ 65k CHECKs / domain"),
+            );
+            for c in &d.checks {
+                write_str(&mut out, c);
             }
         }
         out
@@ -5981,6 +6088,40 @@ impl Catalog {
                 );
             }
         }
+        // v7.17.0 Phase 1.5 — DOMAIN types catalog block
+        // (FILE_VERSION 30+).
+        if version >= 30 {
+            let dtype_count = cur.read_u32()? as usize;
+            for _ in 0..dtype_count {
+                let name = cur.read_str()?;
+                let base_type = cur.read_data_type()?;
+                let nullable = cur.read_u8()? != 0;
+                let default = match cur.read_u8()? {
+                    0 => None,
+                    1 => Some(cur.read_str()?),
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown DOMAIN default tag {other}"
+                        )));
+                    }
+                };
+                let check_count = cur.read_u16()? as usize;
+                let mut checks = Vec::with_capacity(check_count);
+                for _ in 0..check_count {
+                    checks.push(cur.read_str()?);
+                }
+                cat.domain_types.insert(
+                    name.clone(),
+                    DomainDef {
+                        name,
+                        base_type,
+                        nullable,
+                        default,
+                        checks,
+                    },
+                );
+            }
+        }
         if cur.pos < buf.len() {
             return Err(StorageError::Corrupt(format!(
                 "trailing bytes: {} unread",
@@ -6029,6 +6170,7 @@ fn deserialize_table(
             runtime_default: None,
             auto_increment,
             user_enum_type: None,
+            user_domain_type: None,
         });
     }
     let n_cols = cols.len();
@@ -6162,6 +6304,18 @@ fn deserialize_table(
             let ename = cur.read_str()?;
             if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
                 col.user_enum_type = Some(ename);
+            }
+        }
+    }
+    // v7.17.0 Phase 1.5 — per-table user_domain_type appendix
+    // (FILE_VERSION 30+). Same shape as the enum one.
+    if version >= 30 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let dname = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.user_domain_type = Some(dname);
             }
         }
     }
