@@ -77,6 +77,15 @@ pub enum Token {
     Comma,
     Semicolon,
     Dot,
+    /// v7.17.0 Phase 2.6 — standalone `@` punctuation. Emitted when
+    /// `@` is NOT followed by an ident-start byte (i.e. the
+    /// `@VAR` / `@@VAR` SessionVar path doesn't match). Lets the
+    /// parser stitch the MySQL `'user'@'host'` DEFINER form back
+    /// together as String + At + String. Pre-2.6 this same shape
+    /// surfaced as a `LexErrorKind::UnknownChar('@')` and broke
+    /// every mysqldump CREATE VIEW with a DEFINER clause at lex
+    /// time.
+    At,
     /// pgvector L2 distance operator `<->`. Lexed as one token so the
     /// parser can give it its own precedence rung.
     /// v4.14 `->` — JSON object/array element access, returns json.
@@ -383,10 +392,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                         end += 1;
                     }
                     if end == prefix_end {
-                        return Err(LexError {
-                            kind: LexErrorKind::UnknownChar('@'),
-                            pos: i,
-                        });
+                        // v7.17.0 Phase 2.6 — `@` not followed by an
+                        // ident-shaped tail. mysqldump's DEFINER
+                        // form `'user'@'host'` lands here (next
+                        // byte is `'`). Emit as Token::At so the
+                        // parser can stitch the surrounding String
+                        // tokens. Single `@@` already short-circuits
+                        // to Token::TsMatch above, so this only
+                        // fires for a true lone `@`.
+                        out.push(Token::At);
+                        i = prefix_end;
+                        continue;
                     }
                     out.push(Token::SessionVar(input[i..end].to_string()));
                     i = end;
@@ -1116,8 +1132,28 @@ mod tests {
 
     #[test]
     fn unknown_char_errors() {
-        let err = tokenize("@").unwrap_err();
-        assert!(matches!(err.kind, LexErrorKind::UnknownChar('@')));
+        // v7.17.0 Phase 2.6 — `@` standalone now lexes as
+        // Token::At (mysqldump `'user'@'host'` DEFINER stitching).
+        // Use `?` for the unknown-char regression; PG `?` operator
+        // family is parsed as JSON ops in the prefix `?` shape
+        // would land in lex paths; bare `?` is unknown.
+        let err = tokenize("\x07").unwrap_err();
+        assert!(matches!(err.kind, LexErrorKind::UnknownChar(_)));
+    }
+
+    #[test]
+    fn at_alone_lexes_as_punctuation() {
+        // v7.17.0 Phase 2.6 — the `'user'@'host'` MySQL DEFINER
+        // form needs `@` to lex as a standalone token.
+        assert_eq!(
+            lex("'u'@'h'"),
+            vec![
+                Token::String("u".into()),
+                Token::At,
+                Token::String("h".into()),
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]
