@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod bloom;
+pub mod fts_simple;
 pub mod halfvec;
 pub mod persistent;
 pub mod persistent_btree;
@@ -818,6 +819,19 @@ pub enum IndexKind {
     /// per candidate row to filter the over-approximation.
     /// Persisted via tag-4 index payload in `FILE_VERSION` 24+.
     GinTrgm(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY (col)` over a
+    /// `TEXT` / `VARCHAR` column. Posting lists map
+    /// `tsvector('simple') lexeme` to row locators. At insert /
+    /// build time the engine derives the lexemes from the cell
+    /// via the same lower-case tokenisation rule as
+    /// `to_tsvector('simple', ...)` — the column itself stays a
+    /// plain text type on disk (mysqldump round-trips would be
+    /// broken otherwise). The planner uses this index to
+    /// accelerate MySQL-shape `MATCH(col) AGAINST('term')`
+    /// queries by mapping them onto the existing tsquery `@@`
+    /// walker. Persisted via tag-5 index payload in
+    /// `FILE_VERSION` 33+.
+    GinFulltext(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
 }
 
 /// Multi-layer HNSW graph (v2.13). Each node is assigned a `top_level`;
@@ -987,6 +1001,24 @@ impl Index {
         }
     }
 
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` GIN constructor.
+    /// Same shape as `new_gin_trgm` but the posting-list keys
+    /// are lower-cased word lexemes (`to_tsvector('simple', col)`
+    /// equivalent) instead of trigrams, and the column type is
+    /// `TEXT` / `VARCHAR` (not `TSVECTOR`).
+    fn new_gin_fulltext(name: String, column_position: usize) -> Self {
+        Self {
+            name,
+            column_position,
+            kind: IndexKind::GinFulltext(PersistentBTreeMap::new()),
+            included_columns: Vec::new(),
+            partial_predicate: None,
+            expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
+        }
+    }
+
     /// Look up the locators stored under `key` (B-tree only). Returns
     /// an empty slice when the key is absent or the index isn't a
     /// BTree — callers can treat both cases uniformly.
@@ -998,13 +1030,14 @@ impl Index {
     pub fn lookup_eq(&self, key: &IndexKey) -> &[RowLocator] {
         match &self.kind {
             IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
-            // BRIN / NSW / GIN / trigram-GIN have no IndexKey-keyed
-            // map; lookup is a no-op. GIN uses
+            // BRIN / NSW / GIN / trigram-GIN / fulltext-GIN have
+            // no IndexKey-keyed map; lookup is a no-op. GIN uses
             // [`Index::gin_lookup_word`] instead.
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => &[][..],
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => &[][..],
         }
     }
 
@@ -1013,7 +1046,12 @@ impl Index {
     /// absent from the index or this isn't a GIN index.
     pub fn gin_lookup_word(&self, word: &str) -> &[RowLocator] {
         match &self.kind {
-            IndexKind::Gin(m) => m.get(&String::from(word)).map_or(&[][..], Vec::as_slice),
+            // v7.17.0 Phase 2.2 — fulltext-GIN shares the same
+            // lexeme-keyed posting list shape as the
+            // tsvector-typed GIN, so the same lookup applies.
+            IndexKind::Gin(m) | IndexKind::GinFulltext(m) => {
+                m.get(&String::from(word)).map_or(&[][..], Vec::as_slice)
+            }
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
@@ -1031,7 +1069,8 @@ impl Index {
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
-            | IndexKind::Gin(_) => &[][..],
+            | IndexKind::Gin(_)
+            | IndexKind::GinFulltext(_) => &[][..],
         }
     }
 
@@ -1043,7 +1082,8 @@ impl Index {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => None,
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => None,
         }
     }
 
@@ -1067,6 +1107,14 @@ impl Index {
     /// `WHERE col @@ tsquery` predicates.
     pub const fn is_gin(&self) -> bool {
         matches!(self.kind, IndexKind::Gin(_))
+    }
+
+    /// v7.17.0 Phase 2.2 — true when this index is a fulltext
+    /// GIN over a TEXT / VARCHAR column (MySQL `FULLTEXT KEY`
+    /// surface). Used by the planner to opt the FULLTEXT-indexed
+    /// column into MATCH AGAINST acceleration.
+    pub const fn is_gin_fulltext(&self) -> bool {
+        matches!(self.kind, IndexKind::GinFulltext(_))
     }
 }
 
@@ -1376,6 +1424,28 @@ impl Table {
                         }
                     }
                 }
+                IndexKind::GinFulltext(map) => {
+                    // v7.17.0 Phase 2.2 — MySQL FULLTEXT-shape
+                    // GIN over a TEXT / VARCHAR cell. Tokenise
+                    // via the storage-local `simple_lex` (same
+                    // rule as `to_tsvector('simple', text)`) and
+                    // extend each lexeme's posting list.
+                    let text_cell = match &row.values[idx.column_position] {
+                        Value::Text(s) => Some(s.as_str()),
+                        // mysqldump-style mediumtext / longtext
+                        // land as Value::Text on insert; varchar
+                        // cells likewise. Anything else (NULL,
+                        // integer, …) contributes no lexemes.
+                        _ => None,
+                    };
+                    if let Some(s) = text_cell {
+                        for lex in fts_simple::simple_lex(s) {
+                            let mut entries = map.get(&lex).cloned().unwrap_or_default();
+                            entries.push(RowLocator::Hot(new_row_idx));
+                            map.insert_mut(lex, entries);
+                        }
+                    }
+                }
                 // NSW handled below after the row push (so the new row
                 // is visible to the kNN-graph connect step). BRIN
                 // carries no per-row state.
@@ -1481,7 +1551,8 @@ impl Table {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Unsupported(format!(
                     "ALTER INDEX REBUILD on non-NSW index {name:?} — only NSW indexes can rebuild"
                 )));
@@ -1737,6 +1808,74 @@ impl Table {
         Ok(())
     }
 
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` GIN over a TEXT
+    /// column. Walks every row, tokenises the cell into lower-
+    /// cased word lexemes (`fts_simple::simple_lex` — same rule
+    /// as `to_tsvector('simple', text)`), and builds the
+    /// posting-list map. NULL / non-TEXT cells contribute
+    /// nothing (no lexemes).
+    pub fn add_gin_fulltext_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        if !matches!(
+            self.schema.columns[column_position].ty,
+            DataType::Text | DataType::Varchar(_)
+        ) {
+            return Err(StorageError::Corrupt(format!(
+                "fulltext-GIN index {name:?} requires a TEXT/VARCHAR column; \
+                 {column_name:?} is {:?}",
+                self.schema.columns[column_position].ty
+            )));
+        }
+        let mut idx = Index::new_gin_fulltext(name, column_position);
+        if let IndexKind::GinFulltext(map) = &mut idx.kind {
+            for (i, row) in self.rows.iter().enumerate() {
+                if let Value::Text(s) = &row.values[column_position] {
+                    for lex in fts_simple::simple_lex(s) {
+                        let mut entries = map.get(&lex).cloned().unwrap_or_default();
+                        entries.push(RowLocator::Hot(i));
+                        map.insert_mut(lex, entries);
+                    }
+                }
+            }
+        }
+        self.indices.push(idx);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 2.2 — restore a fulltext-GIN from its
+    /// catalog snapshot payload. Mirrors
+    /// [`Self::restore_gin_trgm_index`].
+    pub fn restore_gin_fulltext_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        let mut idx = Index::new_gin_fulltext(name, column_position);
+        idx.kind = IndexKind::GinFulltext(map);
+        self.indices.push(idx);
+        Ok(())
+    }
+
     /// v5.1: register cold-tier locators on a `BTree` index. Used
     /// after [`Catalog::load_segment_bytes`] to wire every cold-
     /// tier row's PK back to its segment so
@@ -1771,7 +1910,8 @@ impl Table {
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "index {index_name:?} is not BTree; cold locators apply only to BTree indices"
                 )));
@@ -1807,7 +1947,10 @@ impl Table {
             .find(|i| i.name == index_name)
             .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
         let map = match &mut idx.kind {
-            IndexKind::Gin(map) | IndexKind::GinTrgm(map) => map,
+            // v7.17.0 Phase 2.2 — fulltext-GIN posting lists are
+            // shape-compatible with tsvector / trigram GINs, so
+            // cold-locator re-attach handles all three.
+            IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => map,
             IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
                 return Err(StorageError::Corrupt(format!(
                     "register_gin_cold_locators: index {index_name:?} is not GIN"
@@ -1852,7 +1995,8 @@ impl Table {
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "remove_cold_locators_for_key: index {index_name:?} is not BTree; \
                      cold locators apply only to BTree indices"
@@ -2163,7 +2307,8 @@ impl Table {
                 IndexKind::Nsw(_)
                 | IndexKind::Brin { .. }
                 | IndexKind::Gin(_)
-                | IndexKind::GinTrgm(_) => None,
+                | IndexKind::GinTrgm(_)
+                | IndexKind::GinFulltext(_) => None,
             })
             .collect();
 
@@ -2178,7 +2323,11 @@ impl Table {
             .indices
             .iter()
             .filter_map(|idx| match &idx.kind {
-                IndexKind::Gin(map) | IndexKind::GinTrgm(map) => {
+                // v7.17.0 Phase 2.2 — fulltext-GIN posting lists
+                // share the `String → Vec<RowLocator>` shape, so
+                // cold preservation handles all three GIN flavours
+                // in one pass.
+                IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => {
                     let cold: Vec<(String, RowLocator)> = map
                         .iter()
                         .flat_map(|(w, locs)| {
@@ -2209,6 +2358,7 @@ impl Table {
             Brin(DataType),
             Gin,
             GinTrgm,
+            GinFulltext,
         }
         let descriptors: Vec<(String, usize, RebuildKind)> = self
             .indices
@@ -2220,6 +2370,7 @@ impl Table {
                     IndexKind::BTree(_) => RebuildKind::BTree,
                     IndexKind::Gin(_) => RebuildKind::Gin,
                     IndexKind::GinTrgm(_) => RebuildKind::GinTrgm,
+                    IndexKind::GinFulltext(_) => RebuildKind::GinFulltext,
                 };
                 (idx.name.clone(), idx.column_position, kind)
             })
@@ -2280,6 +2431,26 @@ impl Table {
                                     let mut entries = map.get(&tri).cloned().unwrap_or_default();
                                     entries.push(RowLocator::Hot(i));
                                     map.insert_mut(tri, entries);
+                                }
+                            }
+                        }
+                    }
+                    self.indices.push(idx);
+                }
+                RebuildKind::GinFulltext => {
+                    // v7.17.0 Phase 2.2 — re-derive the lexeme
+                    // posting list from each TEXT/VARCHAR cell.
+                    // Mirrors the GinTrgm rebuild shape but
+                    // tokenises via `fts_simple::simple_lex`
+                    // (same rule as `to_tsvector('simple')`).
+                    let mut idx = Index::new_gin_fulltext(name, column_position);
+                    if let IndexKind::GinFulltext(map) = &mut idx.kind {
+                        for (i, row) in self.rows.iter().enumerate() {
+                            if let Value::Text(s) = &row.values[column_position] {
+                                for lex in fts_simple::simple_lex(s) {
+                                    let mut entries = map.get(&lex).cloned().unwrap_or_default();
+                                    entries.push(RowLocator::Hot(i));
+                                    map.insert_mut(lex, entries);
                                 }
                             }
                         }
@@ -2424,7 +2595,8 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => {
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => {
             unreachable!("nsw_insert_at on a non-NSW index")
         }
     };
@@ -2543,7 +2715,8 @@ fn greedy_layer_walk(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => {
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => {
             return (current, current_d);
         }
     };
@@ -2599,7 +2772,8 @@ fn layer_beam_search(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => return Vec::new(),
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => return Vec::new(),
     };
     let col_pos = table.indices[idx_pos].column_position;
     let d0 = if matches!(metric, NswMetric::L2) {
@@ -2783,7 +2957,8 @@ fn connect_at_layer(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => return,
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => return,
     };
     // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
     // each) rather than usize (8 B on 64-bit). Boundary casts here
@@ -2826,7 +3001,8 @@ fn connect_at_layer(
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => false,
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => false,
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
@@ -2837,7 +3013,8 @@ fn connect_at_layer(
                 IndexKind::BTree(_)
                 | IndexKind::Brin { .. }
                 | IndexKind::Gin(_)
-                | IndexKind::GinTrgm(_) => continue,
+                | IndexKind::GinTrgm(_)
+                | IndexKind::GinFulltext(_) => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
             // heuristic receives candidates closest-first. `cell_l2_sq`
@@ -2977,7 +3154,8 @@ fn nsw_search(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => return Vec::new(),
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => return Vec::new(),
     };
     let Some(entry) = entry else {
         return Vec::new();
@@ -4975,7 +5153,8 @@ impl Catalog {
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "compact_cold_segments: index {index_name:?} is not BTree; \
                      compaction applies only to BTree cold-tier indices"
@@ -5492,7 +5671,16 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     the catalog stays compact when no MySQL-shaped table
 ///     uses the attribute. v31-and-below catalogs deserialise
 ///     with every column's `on_update_runtime = None`.
-const FILE_VERSION: u8 = 32;
+/// v33 introduces (v7.17.0 Phase 2.2):
+///   * Index kind tag 5 = fulltext-GIN (MySQL `FULLTEXT KEY`
+///     surface over a TEXT / VARCHAR column). Payload shape is
+///     identical to tag-3 / tag-4 GIN (`String → Vec<RowLocator>`);
+///     the keys are lower-cased word lexemes (same rule as
+///     `to_tsvector('simple', text)`). v32 catalogs deserialise
+///     unchanged — no v32 writer ever emitted tag 5, and FULLTEXT
+///     KEY was silently dropped pre-v7.17 so no rebuild shim is
+///     needed for round-tripped catalogs.
+const FILE_VERSION: u8 = 33;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5643,6 +5831,32 @@ impl Catalog {
                         );
                         for (tri, locators) in map {
                             write_str(&mut out, tri);
+                            write_u32(
+                                &mut out,
+                                u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
+                            );
+                            for loc in locators {
+                                loc.write_le(&mut out);
+                            }
+                        }
+                    }
+                    IndexKind::GinFulltext(map) => {
+                        // v7.17.0 Phase 2.2 — tag byte 5 =
+                        // GinFulltext (MySQL `FULLTEXT KEY` GIN
+                        // over a TEXT/VARCHAR column). Payload
+                        // shape mirrors tag-3 / tag-4 GIN —
+                        // `String → Vec<RowLocator>` posting
+                        // lists keyed by lower-cased word
+                        // lexemes. FILE_VERSION 33+; v32 catalogs
+                        // never wrote a fulltext-GIN (FULLTEXT
+                        // KEY was silently dropped pre-v7.17).
+                        out.push(5);
+                        write_u32(
+                            &mut out,
+                            u32::try_from(map.len()).expect("≤ 4G fulltext-GIN posting lists"),
+                        );
+                        for (lex, locators) in map {
+                            write_str(&mut out, lex);
                             write_u32(
                                 &mut out,
                                 u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
@@ -6577,6 +6791,20 @@ fn deserialize_indices(
                 }
                 let map = read_gin_map(cur)?;
                 t.restore_gin_trgm_index(idx_name, &column_name, map)?;
+            }
+            5 => {
+                // v7.17.0 Phase 2.2 — fulltext-GIN tag (MySQL
+                // `FULLTEXT KEY` surface). Same payload shape as
+                // tag 3 / tag 4 (String → posting list); only
+                // emitted by FILE_VERSION 33+ writers.
+                if version < 33 {
+                    return Err(StorageError::Corrupt(format!(
+                        "fulltext-GIN index tag 5 found in catalog FILE_VERSION {version}; \
+                         FILE_VERSION 33+ required (v7.17.0 Phase 2.2 introduced this tag)"
+                    )));
+                }
+                let map = read_gin_map(cur)?;
+                t.restore_gin_fulltext_index(idx_name, &column_name, map)?;
             }
             other => {
                 return Err(StorageError::Corrupt(format!(
@@ -8349,7 +8577,8 @@ mod tests {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 panic!("expected NSW")
             }
         };
@@ -8714,7 +8943,8 @@ mod tests {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 panic!("expected NSW")
             }
         };
@@ -8725,7 +8955,8 @@ mod tests {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 panic!("expected NSW")
             }
         };
@@ -9471,6 +9702,10 @@ mod tests {
                     IndexKind::GinTrgm(_) => panic!(
                         "v8 catalog writer cannot serialise trigram-GIN — \
                          tests with trgm indices must use the current writer"
+                    ),
+                    IndexKind::GinFulltext(_) => panic!(
+                        "v8 catalog writer cannot serialise fulltext-GIN — \
+                         tests with FULLTEXT KEY must use the current writer"
                     ),
                 }
             }
