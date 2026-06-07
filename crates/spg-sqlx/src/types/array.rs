@@ -102,10 +102,9 @@ impl<'r> Decode<'r, Spg> for Vec<i64> {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
             EngineValue::BigIntArray(items) => Ok(items.iter().filter_map(|o| *o).collect()),
-            EngineValue::IntArray(items) => Ok(items
-                .iter()
-                .filter_map(|o| (*o).map(i64::from))
-                .collect()),
+            EngineValue::IntArray(items) => {
+                Ok(items.iter().filter_map(|o| (*o).map(i64::from)).collect())
+            }
             other => Err(format!("cannot decode {other:?} as Vec<i64>").into()),
         }
     }
