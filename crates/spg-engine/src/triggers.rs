@@ -226,6 +226,7 @@ pub fn fire_row_trigger(
         params,
         default_text_search_config,
         is_after,
+        select_into_resolver: None,
     };
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
     let outcome = match execute_stmts(
@@ -264,7 +265,20 @@ struct BodyCtx<'a> {
     params: &'a [Value],
     default_text_search_config: Option<&'a str>,
     is_after: bool,
+    /// v7.16.2 — synchronous SELECT … INTO resolver. Provided
+    /// by `Engine::exec_do_block` so the walker can run a
+    /// SELECT against the engine right when SelectInto is
+    /// reached (so subsequent IF reads of the local see the
+    /// fresh value). `None` for trigger paths where SelectInto
+    /// isn't yet supported.
+    select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
 }
+
+/// v7.16.2 — callback shape the DO-block executor registers
+/// on `BodyCtx`. Runs the supplied SELECT statement against
+/// the engine, returns the first row's first column.
+pub type SelectIntoResolver<'a> =
+    dyn Fn(&spg_sql::ast::Statement) -> Result<Value, TriggerError> + 'a;
 
 fn execute_stmts(
     stmts: &[PlPgSqlStmt],
@@ -414,6 +428,34 @@ fn execute_stmts(
                 let _ = resolved;
                 let _ = level;
             }
+            PlPgSqlStmt::SelectInto { var, body } => {
+                // v7.16.2 — execute via the engine callback the
+                // caller (Engine::exec_do_block) registered on
+                // ctx, assign the result to the local. Trigger
+                // path (no callback) errors loudly: SELECT INTO
+                // doesn't fit in a row-write loop.
+                let mut substituted = spg_sql::ast::Statement::Select((**body).clone());
+                substitute_trigger_context_in_statement(
+                    &mut substituted,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let resolver =
+                    ctx.select_into_resolver.ok_or_else(|| TriggerError::UnsupportedConstruct {
+                        function: ctx.function.into(),
+                        detail: alloc::format!(
+                            "SELECT … INTO {var}: only supported inside DO blocks (not trigger bodies) in v7.16.2"
+                        ),
+                    })?;
+                let value = resolver(&substituted)?;
+                locals.insert(var.clone(), value);
+            }
             PlPgSqlStmt::EmbeddedSql(boxed_stmt) => {
                 // v7.12.7 — substitute NEW/OLD/locals into every
                 // Expr field of the statement, then queue for
@@ -442,6 +484,70 @@ fn execute_stmts(
         }
     }
     Ok(BodyOutcome::FellThrough)
+}
+
+/// v7.16.2 — execute a DO block's PlPgSqlBlock at top level.
+/// Different from `fire_row_trigger` in three ways:
+///   1. No NEW/OLD row context — DO blocks aren't row-scoped.
+///   2. EmbeddedSql statements collected into the returned vec
+///      so the caller (`Engine::exec_do_block`) can dispatch
+///      them via `Engine::execute_in_with_cancel` IMMEDIATELY,
+///      not defer. Triggers defer because they fire inside a
+///      row-write `&mut Catalog` borrow; DO has no such borrow.
+///   3. Embedded condition Expr (e.g. `IF EXISTS (SELECT ...)`)
+///      evaluation happens inline against the engine's
+///      current state — the caller resolves the subquery
+///      result before walking the body. We do that by
+///      collecting the IF / Assign / RAISE statements and
+///      letting the caller-side evaluator decide; v7.16.2's
+///      simple path lets `eval_with_new_old_and_locals` do
+///      it inline, falling back to the embedded sub-engine
+///      for SELECT subqueries via the regular eval path.
+///
+/// Returns the deferred SQL list in execution order. Errors
+/// from the walk propagate verbatim (parse / eval / engine).
+pub fn execute_do_block_top_level<'a>(
+    block: &spg_sql::ast::PlPgSqlBlock,
+    default_text_search_config: Option<&'a str>,
+    select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
+) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
+    let mut locals: BTreeMap<String, Value> = BTreeMap::new();
+    let empty_cols: &[ColumnSchema] = &[];
+    init_locals_from_declarations(
+        &block.declarations,
+        &mut locals,
+        None,
+        None,
+        empty_cols,
+        "",
+        &[],
+        default_text_search_config,
+        "DO",
+    )?;
+    let ctx = BodyCtx {
+        function: "DO",
+        table_name: "",
+        columns: empty_cols,
+        params: &[],
+        default_text_search_config,
+        is_after: false,
+        select_into_resolver,
+    };
+    let mut current_new: Option<Row> = None;
+    let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
+    // execute_stmts returns BodyOutcome — for DO top-level we
+    // ignore the return target (RETURN inside DO is a no-op
+    // by PG semantics: the block's outer scope has no return
+    // contract).
+    let _ = execute_stmts(
+        &block.statements,
+        &mut current_new,
+        None,
+        &mut locals,
+        &ctx,
+        &mut deferred,
+    )?;
+    Ok(deferred.into_iter().map(|d| d.stmt).collect())
 }
 
 fn resolve_return(

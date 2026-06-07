@@ -266,29 +266,42 @@ impl Parser {
         }
         match self.peek() {
             Token::Select => self.parse_select_stmt(),
-            // v7.9.27 — `DO $$ … $$ [LANGUAGE plpgsql]`. PG-only;
-            // SPG has no PL/pgSQL so the body is consumed (lexer
-            // already turned it into a Token::String) and the whole
-            // DO statement returns CommandOk no-op. mailrs H1 +
-            // pg_dump compat.
+            // v7.9.27 — `DO $$ … $$ [LANGUAGE plpgsql]`. The
+            // body is a dollar-quoted plpgsql block (lexer already
+            // collapsed `$$…$$` into a single Token::String).
+            // v7.16.2 — mailrs round-10 A.2: parse the body as a
+            // real PlPgSqlBlock so the engine can EXECUTE it at
+            // top level instead of silently swallowing. Pre-
+            // v7.16.2 the parser threw the body away and the
+            // engine returned CommandOk for the entire DO; that
+            // turned `DO BEGIN … IF EXISTS ... THEN ALTER …; END
+            // $$` into a SEV-1 silent no-op (the IF + the rename
+            // were both invisible — mailrs's migrate-042 didn't
+            // actually run). Now the body parses + executes;
+            // EmbeddedSql inside the block runs immediately
+            // against the engine (not deferred — we're at top
+            // level, not inside a trigger row-write loop).
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do") => {
                 self.advance();
-                // Body — single string token (dollar-quoted or
-                // ordinary).
-                match self.advance() {
-                    Token::String(_) => {}
+                let body_text = match self.advance() {
+                    Token::String(s) => s,
                     other => {
                         return Err(self.err(alloc::format!(
                             "expected dollar-quoted body after DO, got {other:?}"
                         )));
                     }
-                }
+                };
                 // Optional `LANGUAGE <name>` trailer (idents only).
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("language")) {
                     self.advance();
                     let _ = self.expect_ident_like()?;
                 }
-                Ok(Statement::DoBlock)
+                // Parse the body — same shape CREATE FUNCTION
+                // uses for trigger function bodies. If the body
+                // doesn't parse cleanly we surface the error
+                // (better than silent no-op).
+                let block = parse_plpgsql_body(&body_text)?;
+                Ok(Statement::DoBlock(block))
             }
             // v4.11: `WITH name AS (SELECT ...) [, ...] SELECT ...`.
             // WITH isn't a reserved token in our lexer — comes through
@@ -703,6 +716,35 @@ impl Parser {
                             Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
                         ) {
                             self.advance();
+                        }
+                    }
+                    return Ok(Statement::Empty);
+                }
+                // v7.16.2 — PG `SET [SESSION] AUTHORIZATION
+                // { DEFAULT | '<role>' | <ident> }` (mailrs
+                // round-10 A.1). pg_dump preamble emits the
+                // `DEFAULT` form to reset session authorization;
+                // SPG has no role system so this is a strict
+                // no-op. PG also accepts `RESET SESSION
+                // AUTHORIZATION` (handled by the RESET parser
+                // elsewhere). Reference:
+                // <https://www.postgresql.org/docs/current/sql-set-session-authorization.html>
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("authorization"))
+                {
+                    self.advance(); // AUTHORIZATION
+                    match self.peek().clone() {
+                        Token::Default => {
+                            self.advance();
+                        }
+                        Token::String(_)
+                        | Token::Ident(_)
+                        | Token::QuotedIdent(_) => {
+                            self.advance();
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected DEFAULT / '<role>' / <ident> after SET SESSION AUTHORIZATION, got {other:?}"
+                            )));
                         }
                     }
                     return Ok(Statement::Empty);
@@ -1463,14 +1505,41 @@ impl Parser {
             self.advance();
             return self.parse_plpgsql_raise();
         }
+        // v7.16.2 — `SELECT <projection> INTO <var> [FROM …]`
+        // plpgsql-specific shape (mailrs round-10 migrate-042).
+        // PG's SELECT INTO at top-level SQL would CREATE a new
+        // table; inside plpgsql it ASSIGNS the query result to
+        // a local variable. We detect the INTO at paren-depth
+        // 0 between SELECT and the statement boundary; if
+        // found, split the token stream into "pre-INTO
+        // projection" + "var" + "post-INTO FROM/WHERE…" and
+        // rebuild as a SelectInto with a regular SELECT body
+        // (no INTO clause).
+        if matches!(self.peek(), Token::Select)
+            && let Some((select_body, var_name)) = self.try_parse_plpgsql_select_into()?
+        {
+            return Ok(PlPgSqlStmt::SelectInto {
+                var: var_name,
+                body: Box::new(select_body),
+            });
+        }
         // v7.12.6 — embedded SQL statements. INSERT/UPDATE/DELETE/
         // SELECT can appear directly inside a trigger body; we
         // recurse into the regular Statement parser, which will
         // stop at the trailing `;` (which our caller then
         // consumes).
+        // v7.16.2 — top-level DO blocks (mailrs round-10 A.2)
+        // also embed ALTER / CREATE / DROP statements; route
+        // those through the same parser so the DO body parses
+        // cleanly.
         if matches!(self.peek(), Token::Insert)
             || matches!(self.peek(), Token::Select)
-            || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") || s.eq_ignore_ascii_case("delete"))
+            || matches!(self.peek(), Token::Create)
+            || matches!(self.peek(), Token::Drop)
+            || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("update")
+                    || s.eq_ignore_ascii_case("delete")
+                    || s.eq_ignore_ascii_case("alter"))
         {
             let stmt = self.parse_one_statement()?;
             return Ok(PlPgSqlStmt::EmbeddedSql(Box::new(stmt)));
@@ -1599,6 +1668,114 @@ impl Parser {
             message,
             args,
         })
+    }
+
+    /// v7.16.2 — scan ahead for a plpgsql-flavoured `SELECT
+    /// <projection> INTO <var> [FROM …]` (mailrs round-10
+    /// migrate-042). Returns `(rebuilt_select_without_into,
+    /// var_name)` when the pattern matches; `None` for
+    /// regular SELECTs (those go through the embedded-SQL
+    /// path). Token-stream surgery so the rebuilt SELECT
+    /// parses through the regular `parse_select_stmt`.
+    #[allow(clippy::too_many_lines)]
+    fn try_parse_plpgsql_select_into(
+        &mut self,
+    ) -> Result<Option<(SelectStatement, String)>, ParseError> {
+        // Scan forward from `self.pos + 1` (past Token::Select)
+        // for Token::Into at paren-depth 0, stopping at the
+        // first `;`, `END`, `ELSE`, `ELSIF` keyword that would
+        // end the plpgsql statement.
+        let start = self.pos;
+        let mut into_pos: Option<usize> = None;
+        let mut depth: i32 = 0;
+        let mut i = start + 1;
+        while i < self.tokens.len() {
+            match &self.tokens[i] {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Semicolon if depth == 0 => break,
+                Token::Ident(s)
+                    if depth == 0
+                        && (s.eq_ignore_ascii_case("end")
+                            || s.eq_ignore_ascii_case("else")
+                            || s.eq_ignore_ascii_case("elsif")) =>
+                {
+                    break;
+                }
+                Token::Into if depth == 0 => {
+                    into_pos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(into_at) = into_pos else {
+            return Ok(None);
+        };
+        // The token immediately after INTO must be the target
+        // var ident; anything else (e.g. INSERT INTO table)
+        // ruled out by the depth-0 check above. Capture it.
+        let var = match self.tokens.get(into_at + 1) {
+            Some(Token::Ident(s) | Token::QuotedIdent(s)) => s.clone(),
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected variable name after SELECT … INTO, got {other:?}"
+                )));
+            }
+        };
+        // Find the end of the plpgsql SELECT INTO statement —
+        // same boundary rules as the depth-0 scan above.
+        let mut end = into_at + 2;
+        let mut depth2: i32 = 0;
+        while end < self.tokens.len() {
+            match &self.tokens[end] {
+                Token::LParen => depth2 += 1,
+                Token::RParen => depth2 -= 1,
+                Token::Semicolon if depth2 == 0 => break,
+                Token::Ident(s)
+                    if depth2 == 0
+                        && (s.eq_ignore_ascii_case("end")
+                            || s.eq_ignore_ascii_case("else")
+                            || s.eq_ignore_ascii_case("elsif")) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        // Rebuild a token stream that represents the SELECT
+        // WITHOUT the INTO clause: [SELECT .. up-to-INTO] + [
+        // post-var tokens up to statement end]. Run the
+        // regular `parse_select_stmt` against it.
+        let mut rebuilt: Vec<Token> = Vec::with_capacity(end - start);
+        for j in start..into_at {
+            rebuilt.push(self.tokens[j].clone());
+        }
+        for j in (into_at + 2)..end {
+            rebuilt.push(self.tokens[j].clone());
+        }
+        rebuilt.push(Token::Eof);
+        let saved_pos = self.pos;
+        let saved_tokens = core::mem::replace(&mut self.tokens, rebuilt);
+        self.pos = 0;
+        // parse_select_stmt → parse_bare_select consumes Token::Select itself.
+        if !matches!(self.peek(), Token::Select) {
+            self.tokens = saved_tokens;
+            self.pos = saved_pos;
+            return Err(self.err("plpgsql SELECT … INTO: rebuilt stream missing SELECT".into()));
+        }
+        let sel = self.parse_select_stmt();
+        self.tokens = saved_tokens;
+        self.pos = end;
+        let sel = sel?;
+        let Statement::Select(body) = sel else {
+            return Err(self.err(alloc::format!(
+                "plpgsql SELECT … INTO: rebuilt SELECT did not produce a Select node, got {sel:?}"
+            )));
+        };
+        Ok(Some((body, var)))
     }
 
     fn parse_plpgsql_assign_target(&mut self) -> Result<AssignTarget, ParseError> {
@@ -2070,7 +2247,39 @@ impl Parser {
                 )));
             }
         }
+        // v7.16.2 — optional `IF EXISTS` after ALTER INDEX
+        // (mailrs migrate-042 ships these). The presence of an
+        // IF EXISTS makes the subsequent name lookup tolerate
+        // a missing index — engine returns CommandOk no-op.
+        let if_exists = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
+            let next = self.tokens.get(self.pos + 1);
+            if matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("exists")) {
+                self.advance();
+                self.advance();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let name = self.expect_ident_like()?;
+        // v7.16.2 — RENAME TO new_name shape (mailrs migrate-042).
+        // Detect BEFORE the REBUILD path so the existing REBUILD
+        // arm stays untouched.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("rename")) {
+            self.advance();
+            if matches!(self.peek(), Token::To) {
+                self.advance();
+            } else {
+                self.expect_keyword_ident("to")?;
+            }
+            let new = self.expect_ident_like()?;
+            return Ok(Statement::AlterIndex(crate::ast::AlterIndexStatement {
+                name,
+                target: crate::ast::AlterIndexTarget::Rename { new, if_exists },
+            }));
+        }
         // REBUILD
         self.expect_keyword_ident("rebuild")?;
         // Optional: WITH (encoding = <enc>)
@@ -2451,17 +2660,18 @@ impl Parser {
             // message rather than misparsing `TO` as a column name.
             Token::Ident(s) if s.eq_ignore_ascii_case("rename") => {
                 self.advance();
-                // `TO` is a reserved keyword token (Token::To), not
-                // Token::Ident("to"); detect both shapes so the
-                // table-rename surface (RENAME TO) produces a clear
-                // error rather than misparsing.
+                // v7.16.2 — `ALTER TABLE t RENAME TO new_table`
+                // table-name rename (mailrs round-10 A.5 — used
+                // by migrate-042's `RENAME TO email_contacts`).
+                // `TO` lexes as Token::To.
                 if matches!(self.peek(), Token::To)
                     || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("to"))
                 {
-                    return Err(self.err(alloc::format!(
-                        "ALTER TABLE RENAME TO <new_name> (table rename) is not supported; \
-                         use RENAME COLUMN <old> TO <new> instead"
-                    )));
+                    self.advance();
+                    let new = self.expect_ident_like()?;
+                    return Ok(alloc::vec![crate::ast::AlterTableTarget::RenameTable {
+                        new,
+                    }]);
                 }
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
                     self.advance();
@@ -2524,6 +2734,55 @@ impl Parser {
                 "expected SET / ADD / DROP / ALTER / RENAME / ENABLE / DISABLE in ALTER TABLE, got {other:?}"
             ))),
         }
+    }
+
+    /// v7.16.2 — peek for `information_schema.<tbl>` /
+    /// `pg_catalog.<tbl>` triples and, if matched, consume all
+    /// three tokens + return a synthetic table name the engine's
+    /// SELECT path recognises as a virtual view. Returns `None`
+    /// when the head doesn't look like a meta-qualified name.
+    /// Used by `parse_table_ref` to bypass the
+    /// `expect_ident_like` schema-strip for these specific PG
+    /// meta schemas (mailrs round-10 A.3).
+    fn try_peek_meta_qualified(&mut self) -> Option<String> {
+        // Extract the schema name. Must be a plain ident token.
+        let schema = match self.tokens.get(self.pos) {
+            Some(Token::Ident(s) | Token::QuotedIdent(s)) => s.clone(),
+            _ => return None,
+        };
+        // Dot.
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token::Dot)) {
+            return None;
+        }
+        // The table-side ident may lex as a reserved keyword
+        // (e.g. `Token::Tables`). Tolerate the common ones via a
+        // helper that reads the trailing token's underlying name.
+        let tbl = match self.tokens.get(self.pos + 2)? {
+            Token::Ident(t) | Token::QuotedIdent(t) => t.clone(),
+            Token::Tables => "tables".to_string(),
+            // Other PG meta table names that may collide with
+            // reserved keywords land here as needed.
+            _ => return None,
+        };
+        // Strip the `pg_` prefix from `pg_catalog.pg_class`-style
+        // names so the synthetic name doesn't double-prefix
+        // (`__spg_pg_class`, not `__spg_pg_pg_class`).
+        let (prefix, normalised) = if schema.eq_ignore_ascii_case("information_schema") {
+            ("__spg_info_", tbl.to_ascii_lowercase())
+        } else if schema.eq_ignore_ascii_case("pg_catalog") {
+            let bare = tbl
+                .to_ascii_lowercase()
+                .strip_prefix("pg_")
+                .map(alloc::string::String::from)
+                .unwrap_or_else(|| tbl.to_ascii_lowercase());
+            ("__spg_pg_", bare)
+        } else {
+            return None;
+        };
+        self.advance(); // schema
+        self.advance(); // dot
+        self.advance(); // tbl
+        Some(alloc::format!("{prefix}{normalised}"))
     }
 
     /// Consume a bare ident if its lowercase matches `kw`, else err.
@@ -4630,7 +4889,19 @@ impl Parser {
                 unnest_column_aliases,
             });
         }
-        let name = self.expect_ident_like()?;
+        // v7.16.2 — preserve information_schema / pg_catalog
+        // qualifiers (mailrs round-10 A.3). The generic
+        // `expect_ident_like` strip silently drops the schema;
+        // we want the engine to recognise these PG meta tables
+        // and synthesise rows from the live catalog. Produce a
+        // synthetic name (`__spg_info_columns` etc.) so the
+        // engine's SELECT-side router can dispatch without
+        // clashing with any user-defined `columns` table.
+        let name = if let Some(synth) = self.try_peek_meta_qualified() {
+            synth
+        } else {
+            self.expect_ident_like()?
+        };
         // v6.10.2 — optional `AS OF SEGMENT '<id>'` cold-tier
         // time-travel clause. Parse BEFORE the alias so the
         // alias can still ride at the tail (`tbl AS OF SEGMENT

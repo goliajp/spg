@@ -1,6 +1,10 @@
 //! v7.13.3 — mailrs round-7 surface coverage.
 //! S8: ALTER TABLE … DROP [COLUMN] [IF EXISTS] col [CASCADE/RESTRICT]
-//! S9: CREATE TABLE IF NOT EXISTS schema-superset reconciliation
+//! S9: CREATE TABLE IF NOT EXISTS PG-strict semantics (existing table = no-op).
+//!     v7.13.3 originally implemented a "reconcile" path that added
+//!     missing columns; v7.16.2 reverts to PG-strict because the
+//!     reconcile path silently re-added schema-renamed columns
+//!     (mailrs round-10 migrate-040 / migrate-042).
 //! S10: '<text>'::jsonb cast produces JSONB (no JSON↔JSONB mismatch)
 
 use spg_engine::Engine;
@@ -70,14 +74,15 @@ fn drop_column_bare_drop_without_column_keyword() {
     assert_eq!(table.schema().columns.len(), 1);
 }
 
-// ── S9: CREATE TABLE IF NOT EXISTS reconciliation ────────────────
+// ── S9: CREATE TABLE IF NOT EXISTS PG-strict semantics ───────────
 
 #[test]
-fn create_table_if_not_exists_adds_missing_columns() {
+fn create_table_if_not_exists_is_noop_on_existing_table() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE contacts (id INT NOT NULL, email TEXT)").unwrap();
-    // Second create adds a CardDAV-style column. IF NOT EXISTS
-    // reconciles: existing columns stay, missing columns add.
+    // Second create with a different shape — PG-strict semantics:
+    // table already exists, so this is a no-op. The "added" columns
+    // must NOT appear in the existing table.
     e.execute(
         "CREATE TABLE IF NOT EXISTS contacts (\
            id INT NOT NULL, \
@@ -90,27 +95,12 @@ fn create_table_if_not_exists_adds_missing_columns() {
     let names: Vec<&str> = table.schema().columns.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"id"));
     assert!(names.contains(&"email"));
-    assert!(names.contains(&"address_book_id"));
-    assert!(names.contains(&"uid"));
+    assert!(!names.contains(&"address_book_id"));
+    assert!(!names.contains(&"uid"));
 }
 
 #[test]
-fn create_table_if_not_exists_then_create_index_on_added_column() {
-    let mut e = Engine::new();
-    e.execute("CREATE TABLE contacts (id INT NOT NULL, email TEXT)").unwrap();
-    e.execute(
-        "CREATE TABLE IF NOT EXISTS contacts (\
-           id INT NOT NULL, \
-           address_book_id BIGINT, \
-           uid TEXT\
-         )",
-    )
-    .unwrap();
-    e.execute("CREATE INDEX idx_book ON contacts(address_book_id)").unwrap();
-}
-
-#[test]
-fn create_table_if_not_exists_inline_fk_lands_on_added_column() {
+fn create_table_if_not_exists_does_not_register_inline_fk_on_existing_table() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE address_books (id BIGINT NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -123,8 +113,7 @@ fn create_table_if_not_exists_inline_fk_lands_on_added_column() {
     )
     .unwrap();
     let contacts = e.catalog().get("contacts").unwrap();
-    assert_eq!(contacts.schema().foreign_keys.len(), 1);
-    assert_eq!(contacts.schema().foreign_keys[0].parent_table, "address_books");
+    assert_eq!(contacts.schema().foreign_keys.len(), 0);
 }
 
 #[test]
@@ -142,11 +131,35 @@ fn create_table_if_not_exists_doesnt_modify_existing_columns() {
     )
     .unwrap();
     let table = e.catalog().get("t").unwrap();
-    // name column keeps its TEXT type from the original CREATE;
-    // extra was added.
     assert_eq!(table.schema().columns[1].name, "name");
     assert_eq!(table.schema().columns[1].ty, spg_storage::DataType::Text);
-    assert!(table.schema().columns.iter().any(|c| c.name == "extra"));
+    assert!(!table.schema().columns.iter().any(|c| c.name == "extra"));
+}
+
+#[test]
+fn create_table_inline_fk_lands_on_column_on_fresh_create() {
+    // Round-7 S9's actual requirement: inline REFERENCES in a CREATE
+    // TABLE column def must register the column AND the FK. This
+    // verifies the inline-FK path on a fresh table (the path exercised
+    // by mailrs migrate-023's CREATE TABLE IF NOT EXISTS contacts when
+    // `contacts` does NOT yet exist).
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE address_books (id BIGINT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    e.execute(
+        "CREATE TABLE contacts (\
+           id BIGSERIAL PRIMARY KEY, \
+           address_book_id BIGINT NOT NULL REFERENCES address_books(id) ON DELETE CASCADE, \
+           uid TEXT NOT NULL\
+         )",
+    )
+    .unwrap();
+    let contacts = e.catalog().get("contacts").unwrap();
+    let names: Vec<&str> = contacts.schema().columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"address_book_id"));
+    assert_eq!(contacts.schema().foreign_keys.len(), 1);
+    assert_eq!(contacts.schema().foreign_keys[0].parent_table, "address_books");
+    e.execute("CREATE INDEX idx_book ON contacts(address_book_id)").unwrap();
 }
 
 // ── S10: '<text>'::jsonb cast produces JSONB ─────────────────────
