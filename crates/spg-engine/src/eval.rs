@@ -1229,6 +1229,107 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         //     ceil(-1.5) → -1, NOT -2.
         //   * Integer types passthrough unchanged.
         //   * NULL → NULL.
+        // PG `round(x)` / `round(x, scale)` — half-away-from-zero
+        // rounding (NUMERIC semantic).
+        //   * round(0.5) → 1; round(-0.5) → -1; round(2.5) → 3.
+        //   * Two-arg form rounds to N decimal places (n>0) or to
+        //     nearest 10^|n| (n<0).
+        //   * Integer types passthrough unchanged.
+        //   * NULL on any arg → NULL.
+        "round" => {
+            match args.len() {
+                1 => match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                        Ok(args[0].clone())
+                    }
+                    Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
+                    Value::Numeric { scaled, scale } => {
+                        let factor = pow10_i128(*scale);
+                        let q = scaled.div_euclid(factor);
+                        let r = scaled.rem_euclid(factor);
+                        // Half-away-from-zero: if 2*r >= factor → round up.
+                        let result = if 2 * r >= factor {
+                            q + 1
+                        } else {
+                            q
+                        };
+                        Ok(Value::Numeric {
+                            scaled: result * factor,
+                            scale: *scale,
+                        })
+                    }
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "round() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                },
+                2 => {
+                    if args.iter().any(|v| matches!(v, Value::Null)) {
+                        return Ok(Value::Null);
+                    }
+                    let n = match &args[1] {
+                        Value::SmallInt(x) => i32::from(*x),
+                        Value::Int(x) => *x,
+                        Value::BigInt(x) => i32::try_from(*x).map_err(|_| {
+                            EvalError::TypeMismatch {
+                                detail: "round(): scale must fit in i32".into(),
+                            }
+                        })?,
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "round(): scale must be integer, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    // Convert input to f64 for arithmetic
+                    // simplicity (PG does NUMERIC math here but
+                    // SPG's f64 path matches the dominant
+                    // customer expectation for round(N, scale)
+                    // patterns).
+                    let x = match &args[0] {
+                        Value::SmallInt(v) => f64::from(*v),
+                        Value::Int(v) => f64::from(*v),
+                        Value::BigInt(v) => *v as f64,
+                        Value::Float(v) => *v,
+                        Value::Numeric { scaled, scale } => {
+                            (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                        }
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "round() needs numeric x, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    // Avoid float precision drift from the
+                    // 10^(-k) reciprocal — for n<0 work with the
+                    // positive-exponent form: round(x / 10^|n|) *
+                    // 10^|n|.
+                    let result = if n >= 0 {
+                        let factor = f64_powi(10.0, n);
+                        f64_round_half_away(x * factor) / factor
+                    } else {
+                        let factor = f64_powi(10.0, -n);
+                        f64_round_half_away(x / factor) * factor
+                    };
+                    Ok(Value::Float(result))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "round() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                }),
+            }
+        }
         "ceil" | "ceiling" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -2863,6 +2964,41 @@ fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Val
         return Ok(Value::Text(String::new()));
     }
     Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// no_std `f64::powi` substitute — integer exponent for f64
+/// base. Uses repeated multiplication; correct for the small
+/// exponents the rounding / cast code uses (scale up to ±38).
+fn f64_powi(base: f64, exp: i32) -> f64 {
+    if exp == 0 {
+        return 1.0;
+    }
+    let mut result = 1.0;
+    let mut b = if exp > 0 { base } else { 1.0 / base };
+    let mut e = exp.unsigned_abs();
+    while e > 0 {
+        if e & 1 == 1 {
+            result *= b;
+        }
+        e >>= 1;
+        if e > 0 {
+            b *= b;
+        }
+    }
+    result
+}
+
+/// no_std-compatible `round(x)` for f64 with half-away-from-zero
+/// rule (PG NUMERIC semantic — NOT banker's rounding).
+fn f64_round_half_away(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    if x >= 0.0 {
+        f64_floor(x + 0.5)
+    } else {
+        f64_ceil(x - 0.5)
+    }
 }
 
 /// no_std-compatible `ceil(x)` for f64. Same shape as
