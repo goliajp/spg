@@ -1255,6 +1255,64 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // PG `greatest(...)` / `least(...)` — variadic max/min.
         // NULL args silently skipped (PG-canonical). All-NULL → NULL.
         // Cross-type widening for numeric comparisons.
+        // PG `mod(y, x)` — modulo. Result sign follows dividend.
+        //   * mod(7, 3) = 1
+        //   * mod(-7, 3) = -1
+        //   * mod(7, -3) = 1
+        //   * mod(-7, -3) = -1
+        // Division by zero → error. NULL on any arg → NULL.
+        "mod" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "mod() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let to_i64 = |v: &Value| -> Result<i64, EvalError> {
+                match v {
+                    Value::SmallInt(x) => Ok(i64::from(*x)),
+                    Value::Int(x) => Ok(i64::from(*x)),
+                    Value::BigInt(x) => Ok(*x),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "mod() needs integer, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            };
+            let y = to_i64(&args[0])?;
+            let x = to_i64(&args[1])?;
+            if x == 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "mod(): division by zero".into(),
+                });
+            }
+            // Rust's `%` operator on signed integers follows the
+            // dividend's sign — same as PG.
+            let result = y % x;
+            // Pick the narrowest type that holds the result.
+            if let Ok(small) = i16::try_from(result) {
+                if matches!(args[0], Value::SmallInt(_))
+                    && matches!(args[1], Value::SmallInt(_))
+                {
+                    return Ok(Value::SmallInt(small));
+                }
+            }
+            if let Ok(int_) = i32::try_from(result) {
+                if !matches!(args[0], Value::BigInt(_))
+                    && !matches!(args[1], Value::BigInt(_))
+                {
+                    return Ok(Value::Int(int_));
+                }
+            }
+            Ok(Value::BigInt(result))
+        }
         "greatest" | "least" => {
             if args.is_empty() {
                 return Err(EvalError::TypeMismatch {
