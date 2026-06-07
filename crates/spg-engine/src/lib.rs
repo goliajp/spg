@@ -3827,6 +3827,10 @@ impl Engine {
         let ts_cfg: Option<String> = self
             .session_param("default_text_search_config")
             .map(String::from);
+        // v7.17.0 Phase 2.1 — snapshot the clock pointer before
+        // we hold the catalog mutably so ON UPDATE runtime
+        // overrides see the engine wall clock.
+        let clock_for_on_update = self.clock;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -3848,6 +3852,22 @@ impl Engine {
                     EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
                 })?;
             targets.push((pos, expr));
+        }
+        // v7.17.0 Phase 2.1 — for every column with an
+        // `ON UPDATE CURRENT_TIMESTAMP` binding that the caller
+        // did NOT explicitly set, schedule an automatic override.
+        // Reuses `eval_runtime_default_free` so the same
+        // canonical runtime-expression whitelist (now /
+        // current_timestamp / current_date / …) governs both
+        // DEFAULT and ON UPDATE.
+        let mut on_update_overrides: Vec<(usize, String)> = Vec::new();
+        for (i, col) in schema_cols.iter().enumerate() {
+            if targets.iter().any(|(p, _)| *p == i) {
+                continue;
+            }
+            if let Some(src) = &col.on_update_runtime {
+                on_update_overrides.push((i, src.clone()));
+            }
         }
         let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
             .with_default_text_search_config(ts_cfg.as_deref());
@@ -3875,6 +3895,16 @@ impl Engine {
                 let v = eval::eval_expr(expr, row, &ctx)?;
                 new_vals[*pos] =
                     coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
+            }
+            // v7.17.0 Phase 2.1 — apply ON UPDATE overrides for
+            // any column the SET clause didn't touch.
+            for (pos, src) in &on_update_overrides {
+                let v = eval_runtime_default_free(
+                    src,
+                    schema_cols[*pos].ty,
+                    clock_for_on_update,
+                )?;
+                new_vals[*pos] = v;
             }
             planned.push((i, new_vals));
         }
@@ -12842,7 +12872,21 @@ fn eval_runtime_default_free(
     clock_fn: Option<ClockFn>,
 ) -> Result<Value, EngineError> {
     let s = rt.trim().to_ascii_lowercase();
-    let canonical = s.trim_end_matches("()");
+    // v7.17.0 Phase 2.1 — also strip `(N)` precision suffix
+    // so MySQL `CURRENT_TIMESTAMP(6)` resolves the same as
+    // bare `CURRENT_TIMESTAMP`. SPG stores TIMESTAMP at fixed
+    // microsecond resolution; the precision modifier is
+    // parser-only.
+    let with_no_parens = s.trim_end_matches("()");
+    let canonical: &str = if let Some(open_idx) = with_no_parens.find('(') {
+        if with_no_parens.ends_with(')') {
+            &with_no_parens[..open_idx]
+        } else {
+            with_no_parens
+        }
+    } else {
+        with_no_parens
+    };
     let now_us = match clock_fn {
         Some(f) => f(),
         None => 0,
@@ -12918,6 +12962,11 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     // table is stored.
     if let Some(name) = c.user_type_ref {
         schema.user_enum_type = Some(name);
+    }
+    // v7.17.0 Phase 2.1 — render the ON UPDATE expression to
+    // canonical text (the engine re-parses at UPDATE time).
+    if let Some(expr) = c.on_update_runtime {
+        schema.on_update_runtime = Some(alloc::format!("{expr}"));
     }
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once

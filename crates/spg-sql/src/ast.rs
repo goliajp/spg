@@ -1140,6 +1140,18 @@ pub struct ColumnDef {
     /// constrained for domains); otherwise the CREATE TABLE
     /// errors with "unknown type".
     pub user_type_ref: Option<String>,
+    /// v7.17.0 Phase 2.1 — MySQL-style `ON UPDATE
+    /// CURRENT_TIMESTAMP` column attribute. When set, an
+    /// UPDATE that does NOT explicitly bind this column
+    /// overrides the new value with `now()` (engine clock).
+    /// Pre-v7.17 SPG silently accepted the syntax and never
+    /// fired the override — `updated_at` columns from mysqldump
+    /// stayed pinned at their initial DEFAULT forever, an
+    /// audit Tier-S silent-failure. Generalised as a stored
+    /// expression source so future shapes (`ON UPDATE
+    /// CURRENT_TIMESTAMP(6)`, `ON UPDATE LOCALTIMESTAMP`) reuse
+    /// the same field; v7.17 only accepts CURRENT_TIMESTAMP.
+    pub on_update_runtime: Option<Expr>,
 }
 
 /// v7.6.0 — A single FOREIGN KEY constraint. Both column-level

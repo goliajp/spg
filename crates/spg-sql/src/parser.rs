@@ -5068,7 +5068,53 @@ impl Parser {
         let mut is_primary_key = false;
         let mut is_unique = false;
         let mut check: Option<Expr> = None;
+        let mut on_update_runtime: Option<Expr> = None;
         loop {
+            // v7.17.0 Phase 2.1 — MySQL `ON UPDATE
+            // CURRENT_TIMESTAMP[(N)]`. Only CURRENT_TIMESTAMP
+            // is accepted today. The "ON" token is an Ident
+            // (not reserved) — peek before consuming.
+            if matches!(self.peek(), Token::On)
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("update"))
+            {
+                self.advance(); // ON
+                self.advance(); // update
+                // Accept CURRENT_TIMESTAMP / CURRENT_TIMESTAMP(N).
+                let next = self.peek().clone();
+                match next {
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("current_timestamp") =>
+                    {
+                        self.advance();
+                        // Optional `(N)` precision.
+                        if matches!(self.peek(), Token::LParen) {
+                            self.advance();
+                            if !matches!(self.peek(), Token::Integer(_)) {
+                                return Err(self.err(alloc::format!(
+                                    "expected integer precision inside CURRENT_TIMESTAMP(…), got {:?}",
+                                    self.peek()
+                                )));
+                            }
+                            self.advance();
+                            if !matches!(self.peek(), Token::RParen) {
+                                return Err(self.err(alloc::format!(
+                                    "expected ')' after CURRENT_TIMESTAMP precision, got {:?}",
+                                    self.peek()
+                                )));
+                            }
+                            self.advance();
+                        }
+                        on_update_runtime =
+                            Some(Expr::FunctionCall { name: "now".into(), args: Vec::new() });
+                        continue;
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "v7.17 only supports ON UPDATE CURRENT_TIMESTAMP, got {other:?}"
+                        )));
+                    }
+                }
+            }
             if matches!(self.peek(), Token::Default) {
                 if default.is_some() {
                     return Err(self.err("DEFAULT specified twice".into()));
@@ -5212,6 +5258,7 @@ impl Parser {
             is_unique,
             check,
             user_type_ref,
+            on_update_runtime,
         })
     }
 
