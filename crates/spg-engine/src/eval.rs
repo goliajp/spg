@@ -1236,6 +1236,94 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         //     nearest 10^|n| (n<0).
         //   * Integer types passthrough unchanged.
         //   * NULL on any arg → NULL.
+        // PG `trunc(x)` / `trunc(x, scale)` — truncate TOWARD zero.
+        //   * Distinct from floor() which rounds toward -inf:
+        //     trunc(-1.7)→-1; floor(-1.7)→-2.
+        //   * Distinct from round() which rounds half-away:
+        //     trunc(1.5)→1; round(1.5)→2.
+        //   * Two-arg form truncates to N decimal places (or 10^|n|
+        //     for negative n).
+        //   * Integer types passthrough unchanged.
+        //   * NULL on any arg → NULL.
+        "trunc" => {
+            match args.len() {
+                1 => match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                        Ok(args[0].clone())
+                    }
+                    Value::Float(x) => Ok(Value::Float(f64_trunc(*x))),
+                    Value::Numeric { scaled, scale } => {
+                        let factor = pow10_i128(*scale);
+                        // Truncate toward zero — sign-preserving division.
+                        let q = scaled / factor;
+                        Ok(Value::Numeric {
+                            scaled: q * factor,
+                            scale: *scale,
+                        })
+                    }
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "trunc() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                },
+                2 => {
+                    if args.iter().any(|v| matches!(v, Value::Null)) {
+                        return Ok(Value::Null);
+                    }
+                    let n = match &args[1] {
+                        Value::SmallInt(x) => i32::from(*x),
+                        Value::Int(x) => *x,
+                        Value::BigInt(x) => i32::try_from(*x).map_err(|_| {
+                            EvalError::TypeMismatch {
+                                detail: "trunc(): scale must fit in i32".into(),
+                            }
+                        })?,
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "trunc(): scale must be integer, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    let x = match &args[0] {
+                        Value::SmallInt(v) => f64::from(*v),
+                        Value::Int(v) => f64::from(*v),
+                        Value::BigInt(v) => *v as f64,
+                        Value::Float(v) => *v,
+                        Value::Numeric { scaled, scale } => {
+                            (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                        }
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "trunc() needs numeric x, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    let result = if n >= 0 {
+                        let factor = f64_powi(10.0, n);
+                        f64_trunc(x * factor) / factor
+                    } else {
+                        let factor = f64_powi(10.0, -n);
+                        f64_trunc(x / factor) * factor
+                    };
+                    Ok(Value::Float(result))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "trunc() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                }),
+            }
+        }
         "round" => {
             match args.len() {
                 1 => match &args[0] {
@@ -2964,6 +3052,20 @@ fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Val
         return Ok(Value::Text(String::new()));
     }
     Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// no_std-compatible `trunc(x)` for f64 — truncate toward zero.
+/// `as i64 as f64` already truncates toward zero for the in-range
+/// case; the |x| > 2^53 branch returns x verbatim because the f64
+/// is already integer-precision.
+fn f64_trunc(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
+        return x;
+    }
+    (x as i64) as f64
 }
 
 /// no_std `f64::powi` substitute — integer exponent for f64
