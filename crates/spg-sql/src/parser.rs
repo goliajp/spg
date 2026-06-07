@@ -3808,16 +3808,77 @@ impl Parser {
         };
         head.limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
-            Some(self.parse_limit_expr("LIMIT")?)
+            // v7.17.0 Phase 5.1 — `LIMIT NULL` / `LIMIT ALL` are
+            // PG synonyms for "no limit". Treat both as None
+            // (no head.limit set) so the engine's existing
+            // unlimited-result path takes over. Reject was the
+            // pre-5.1 behaviour and broke pg_dump-flavoured
+            // tooling that occasionally emits LIMIT NULL.
+            if self.consume_limit_unbounded_sentinel() {
+                None
+            } else {
+                Some(self.parse_limit_expr("LIMIT")?)
+            }
         } else {
             None
         };
         head.offset = if matches!(self.peek(), Token::Offset) {
             self.advance();
-            Some(self.parse_limit_expr("OFFSET")?)
+            // PG also accepts an optional `ROW` / `ROWS` trailer
+            // after the offset value (`OFFSET 10 ROWS`). The
+            // FETCH-FIRST branch below relies on the same.
+            let off = self.parse_limit_expr("OFFSET")?;
+            self.consume_optional_rows_keyword();
+            Some(off)
         } else {
             None
         };
+        // v7.17.0 Phase 5.1 — `FETCH FIRST <int|$N> ROWS ONLY` is
+        // the SQL-standard alias for LIMIT. PG accepts both
+        // spellings interchangeably; pg_dump emits FETCH FIRST in
+        // newer versions. We map it onto `head.limit` so the
+        // engine path is unified.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("fetch"))
+        {
+            self.advance(); // FETCH
+            // `FIRST` or `NEXT` (both legal per SQL standard).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("first") || s.eq_ignore_ascii_case("next"))
+            {
+                self.advance();
+            }
+            // Count (optional in the bare `FETCH FIRST ROW ONLY` —
+            // implicit 1 — but we always consume one if present).
+            let count = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("row") || s.eq_ignore_ascii_case("rows"))
+            {
+                // Bare `FETCH FIRST ROW ONLY` = LIMIT 1.
+                crate::ast::LimitExpr::Literal(1)
+            } else {
+                self.parse_limit_expr("FETCH FIRST")?
+            };
+            // Eat `ROW` / `ROWS` if not already consumed above.
+            self.consume_optional_rows_keyword();
+            // Optional `ONLY` (the spec form) — also accept the
+            // PG-accepted `WITH TIES` (parsed-and-discarded for now;
+            // SPG's planner doesn't model the tie semantics yet,
+            // out-of-scope for Phase 5.1).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("only"))
+            {
+                self.advance();
+            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("with"))
+            {
+                self.advance(); // WITH
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("ties"))
+                {
+                    self.advance();
+                }
+            }
+            head.limit = Some(count);
+        }
         // v7.17.0 Phase 3.4 — trailing row-lock clauses:
         //   FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
         //       [ OF table_name [, …] ]
@@ -3934,6 +3995,33 @@ impl Parser {
     /// Bind value gets resolved during prepared-statement Execute;
     /// the Pratt expression parser would over-accept here (e.g.
     /// `LIMIT 5 + 5`), so we narrowly accept only the two PG forms.
+    /// v7.17.0 Phase 5.1 — consume the `LIMIT NULL` / `LIMIT ALL`
+    /// sentinel tokens (PG synonyms for "no limit"). Returns true
+    /// when one was consumed; caller skips the regular
+    /// limit-value parse and leaves `head.limit` at None.
+    fn consume_limit_unbounded_sentinel(&mut self) -> bool {
+        if matches!(self.peek(), Token::Null) {
+            self.advance();
+            return true;
+        }
+        if matches!(self.peek(), Token::All) {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    /// v7.17.0 Phase 5.1 — eat an optional trailing `ROW` / `ROWS`
+    /// keyword after a LIMIT / OFFSET / FETCH FIRST value, the
+    /// SQL-standard shape. No-op when missing.
+    fn consume_optional_rows_keyword(&mut self) {
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+            if s.eq_ignore_ascii_case("row") || s.eq_ignore_ascii_case("rows"))
+        {
+            self.advance();
+        }
+    }
+
     fn parse_limit_expr(&mut self, label: &str) -> Result<crate::ast::LimitExpr, ParseError> {
         match self.advance() {
             Token::Integer(n) if n >= 0 => u32::try_from(n)
