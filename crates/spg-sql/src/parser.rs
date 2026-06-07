@@ -1037,6 +1037,41 @@ impl Parser {
                 self.advance();
                 self.parse_create_view_after_keyword(false, false, false)
             }
+            // v7.17.0 Phase 2.6 — MySQL view prefix clauses
+            // `ALGORITHM = {UNDEFINED|MERGE|TEMPTABLE}` /
+            // `DEFINER = <user>` / `SQL SECURITY {DEFINER|INVOKER}`
+            // appear (in any order) between `CREATE` and `VIEW` in
+            // every mysqldump-emitted view. Pre-2.6 the parser
+            // rejected the prefix and the customer's whole view
+            // backup failed on the first view. The hints are pure
+            // planner / permission metadata; SPG's view-rewrite
+            // path is semantically equivalent for all three
+            // algorithms in v7.17 (TEMPTABLE differs only in
+            // perf for huge views — out of v7.17 scope), and
+            // DEFINER / SQL SECURITY are pure single-user
+            // permissioning that SPG ignores by design.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("algorithm")
+                    || s.eq_ignore_ascii_case("definer")
+                    || s.eq_ignore_ascii_case("sql") =>
+            {
+                self.consume_mysql_view_prefix()?;
+                // After absorbing ALGORITHM / DEFINER / SQL SECURITY
+                // (in any order, in any combination), the next
+                // keyword must be VIEW. mysqldump never emits these
+                // prefixes on non-view statements.
+                let next = self.peek().clone();
+                if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2)
+                    if s2.eq_ignore_ascii_case("view"))
+                {
+                    self.advance();
+                    self.parse_create_view_after_keyword(false, false, false)
+                } else {
+                    Err(self.err(alloc::format!(
+                        "expected VIEW after MySQL view prefix (ALGORITHM/DEFINER/SQL SECURITY), got {next:?}"
+                    )))
+                }
+            }
             // v7.17.0 Phase 1.4 — CREATE TYPE name AS ENUM (…).
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("type") => {
                 self.advance();
@@ -1915,6 +1950,97 @@ impl Parser {
             other => Err(self.err(alloc::format!(
                 "expected signed integer, got {other:?}"
             ))),
+        }
+    }
+
+    /// v7.17.0 Phase 2.6 — absorb the MySQL view-prefix clauses
+    /// that appear between `CREATE` and `VIEW` in mysqldump output:
+    ///
+    /// * `ALGORITHM = {UNDEFINED|MERGE|TEMPTABLE}`
+    /// * `DEFINER = <user>`  (user may be a quoted string, a bare
+    ///   ident, or `ident @ ident-or-quoted-string` host form)
+    /// * `SQL SECURITY {DEFINER|INVOKER}`
+    ///
+    /// Each clause may appear at most once but in any order.
+    /// The hints are pure planner / permission metadata that
+    /// SPG's view-rewrite engine handles uniformly; we accept
+    /// and discard. Returns `Ok(())` once a non-clause token is
+    /// peeked (the caller then checks for the `VIEW` keyword).
+    fn consume_mysql_view_prefix(&mut self) -> Result<(), ParseError> {
+        loop {
+            match self.peek().clone() {
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("algorithm") =>
+                {
+                    self.advance(); // ALGORITHM
+                    // Optional `=`. MySQL spec requires it but be
+                    // generous.
+                    if matches!(self.peek(), Token::Eq) {
+                        self.advance();
+                    }
+                    // UNDEFINED / MERGE / TEMPTABLE — accept any
+                    // bare ident; unknown values still parse so
+                    // future MySQL versions don't break.
+                    if matches!(
+                        self.peek(),
+                        Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                    ) {
+                        self.advance();
+                    }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("definer") =>
+                {
+                    self.advance(); // DEFINER
+                    if matches!(self.peek(), Token::Eq) {
+                        self.advance();
+                    }
+                    // User: quoted string, ident, OR ident @ host
+                    // (host may itself be quoted or bare).
+                    match self.peek().clone() {
+                        Token::String(_) | Token::Ident(_) | Token::QuotedIdent(_) => {
+                            self.advance();
+                            // Optional `@host`.
+                            if matches!(self.peek(), Token::At) {
+                                self.advance();
+                                if matches!(
+                                    self.peek(),
+                                    Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                                ) {
+                                    self.advance();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sql") => {
+                    // `SQL SECURITY {DEFINER|INVOKER}`. Only honoured
+                    // when followed by SECURITY — the dispatcher must
+                    // not consume a bare `SQL` token (it's not a
+                    // legal CREATE prefix on its own).
+                    let save = self.pos;
+                    self.advance(); // SQL
+                    if matches!(self.peek(), Token::Ident(s2) | Token::QuotedIdent(s2)
+                        if s2.eq_ignore_ascii_case("security"))
+                    {
+                        self.advance(); // SECURITY
+                        // DEFINER / INVOKER trailing ident.
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(_) | Token::QuotedIdent(_)
+                        ) {
+                            self.advance();
+                        }
+                    } else {
+                        // Not a SQL SECURITY clause — roll back and
+                        // bail; the caller will error out cleanly.
+                        self.pos = save;
+                        return Ok(());
+                    }
+                }
+                _ => return Ok(()),
+            }
         }
     }
 
