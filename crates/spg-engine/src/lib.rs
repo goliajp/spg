@@ -640,6 +640,15 @@ pub struct Engine {
     /// catalog. Empty by default; the queue is drained on every
     /// `RESET ALL` too.
     foreign_key_checks: bool,
+    /// v7.16.2 — true on the temp Engine an outer
+    /// `exec_select_with_meta_views` builds, telling that
+    /// temp engine "stop short-circuiting into the meta-view
+    /// path — your catalog already has the materialised
+    /// tables; just run the regular SELECT." Without this we'd
+    /// infinite-loop since the meta-view name (e.g.
+    /// `__spg_info_columns`) still triggers
+    /// `select_references_meta_view`.
+    meta_views_materialised: bool,
     pending_foreign_keys: Vec<(alloc::string::String, spg_sql::ast::ForeignKeyConstraint)>,
 }
 
@@ -770,6 +779,7 @@ impl Engine {
             session_params: BTreeMap::new(),
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
+            meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
         }
     }
@@ -852,6 +862,7 @@ impl Engine {
             session_params: BTreeMap::new(),
             trigger_recursion_depth: 0,
             foreign_key_checks: true,
+            meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
         }
     }
@@ -914,6 +925,7 @@ impl Engine {
                     session_params: BTreeMap::new(),
                     trigger_recursion_depth: 0,
             foreign_key_checks: true,
+            meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
                 })
             }
@@ -1195,6 +1207,151 @@ impl Engine {
     /// `FunctionDef` so the row-write loop can fire them without
     /// holding a borrow on the catalog (which would conflict with
     /// the table.insert / update_row / delete mutable borrows).
+    /// v7.16.2 — top-level DO block executor. Walks the
+    /// PlPgSqlBlock via [`triggers::execute_do_block_top_level`],
+    /// then runs each collected EmbeddedSql statement through
+    /// the engine's regular execute path (NOT deferred — DO is
+    /// outside any row-write borrow). Errors from any step
+    /// abort the block and propagate verbatim.
+    /// v7.16.2 — resolve every subquery inside a PlPgSqlBlock's
+    /// expression slots so the downstream trigger-flavoured
+    /// evaluator (which expects pre-resolved Expr::Literal /
+    /// Binary chains) doesn't trip on raw Exists/ScalarSubquery
+    /// nodes. Walks IF conditions, Assign values, RAISE args.
+    /// EmbeddedSql statements re-enter the engine for execution
+    /// later so their subqueries get the normal SELECT-side
+    /// resolution.
+    fn resolve_plpgsql_block_subqueries(
+        &self,
+        block: &mut spg_sql::ast::PlPgSqlBlock,
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        for d in &mut block.declarations {
+            if let Some(e) = &mut d.default {
+                self.resolve_expr_subqueries(e, cancel)?;
+            }
+        }
+        self.resolve_plpgsql_stmts_subqueries(&mut block.statements, cancel)
+    }
+
+    fn resolve_plpgsql_stmts_subqueries(
+        &self,
+        stmts: &mut [spg_sql::ast::PlPgSqlStmt],
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        use spg_sql::ast::PlPgSqlStmt;
+        for stmt in stmts {
+            match stmt {
+                PlPgSqlStmt::Assign { value, .. } => {
+                    self.resolve_expr_subqueries(value, cancel)?;
+                }
+                PlPgSqlStmt::Return(spg_sql::ast::ReturnTarget::Expr(e)) => {
+                    self.resolve_expr_subqueries(e, cancel)?;
+                }
+                PlPgSqlStmt::Return(_) => {}
+                PlPgSqlStmt::If { branches, else_branch } => {
+                    for (cond, body) in branches.iter_mut() {
+                        self.resolve_expr_subqueries(cond, cancel)?;
+                        self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
+                    }
+                    self.resolve_plpgsql_stmts_subqueries(else_branch, cancel)?;
+                }
+                PlPgSqlStmt::Raise { args, .. } => {
+                    for a in args {
+                        self.resolve_expr_subqueries(a, cancel)?;
+                    }
+                }
+                PlPgSqlStmt::EmbeddedSql(_) => {
+                    // Embedded SQL goes back through execute_stmt
+                    // _with_cancel which runs the SELECT-side
+                    // resolver itself; nothing to do here.
+                }
+                PlPgSqlStmt::SelectInto { body, .. } => {
+                    // SELECT INTO runs through Engine::execute
+                    // when reached, so subquery resolution
+                    // happens via the normal SELECT-side path.
+                    // Still walk for nested subqueries inside
+                    // the SELECT body so eval doesn't trip.
+                    self.resolve_select_subqueries(body, cancel)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn exec_do_block(
+        &mut self,
+        body: spg_sql::ast::PlPgSqlBlock,
+    ) -> Result<QueryResult, EngineError> {
+        // v7.16.2 — pre-resolve every subquery the body's
+        // expressions reach. `eval::eval_expr` errors on
+        // unresolved Exists/ScalarSubquery/InSubquery; the
+        // top-level SELECT path runs `resolve_select_subqueries`
+        // for the caller — for plpgsql we have to do the
+        // equivalent before the body walker runs. Catches the
+        // mailrs idiom `IF EXISTS (SELECT 1 FROM
+        // information_schema.columns WHERE …) THEN …`.
+        let mut body = body;
+        self.resolve_plpgsql_block_subqueries(&mut body, CancelToken::none())?;
+        let dts = self.session_param("default_text_search_config").map(String::from);
+        // v7.16.2 — SELECT … INTO resolver. The walker calls
+        // this synchronously when it hits a SelectInto stmt
+        // so the IF / locals scope sees the result before the
+        // next statement. Body walks for trigger paths (no
+        // resolver) error loudly on SelectInto.
+        // SAFETY: the closure shares this engine borrow with
+        // the walker, but the walker only borrows for the
+        // duration of `execute_do_block_top_level` and doesn't
+        // reach back into the engine through any other path —
+        // so the recursive `&mut` is sound. We use a `RefCell`
+        // for interior mutability since the closure is
+        // Fn-shaped.
+        let engine_cell = core::cell::RefCell::new(&mut *self);
+        let resolver_fn = |stmt: &spg_sql::ast::Statement| -> Result<Value, triggers::TriggerError> {
+            let mut eng = engine_cell.borrow_mut();
+            let r = eng.execute_stmt_with_cancel(stmt.clone(), CancelToken::none())
+                .map_err(|e| triggers::TriggerError::EvalFailed {
+                    function: "DO".into(),
+                    cause: eval::EvalError::TypeMismatch {
+                        detail: alloc::format!("SELECT … INTO failed: {e}"),
+                    },
+                })?;
+            match r {
+                QueryResult::Rows { rows, .. } => match rows.into_iter().next() {
+                    Some(row) => Ok(row.values.into_iter().next().unwrap_or(Value::Null)),
+                    None => Ok(Value::Null),
+                },
+                _ => Err(triggers::TriggerError::EvalFailed {
+                    function: "DO".into(),
+                    cause: eval::EvalError::TypeMismatch {
+                        detail: "SELECT … INTO body must be a SELECT".into(),
+                    },
+                }),
+            }
+        };
+        let collected = triggers::execute_do_block_top_level(
+            &body,
+            dts.as_deref(),
+            Some(&resolver_fn),
+        )
+        .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}"))))?;
+        drop(engine_cell);
+        // Run each embedded statement against the engine. The
+        // statements were already substitute-walked for NEW/OLD/
+        // locals (those evaluate to engine literals before they
+        // land here) so dispatch is plain execute_stmt_with_cancel.
+        for stmt in collected {
+            // v7.16.2 — preserve current_tx wrap so an outer
+            // BEGIN/COMMIT around a DO block keeps the
+            // EmbeddedSql writes inside that same tx slot.
+            self.execute_stmt_with_cancel(stmt, CancelToken::none())?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     fn snapshot_row_triggers(
         &self,
         table: &str,
@@ -1553,12 +1710,16 @@ impl Engine {
                 affected: 0,
                 modified_catalog: false,
             }),
-            // v7.9.27 — DO $$ ... $$ is also a no-op (SPG has no
-            // PL/pgSQL). mailrs H1 + pg_dump compat.
-            Statement::DoBlock => Ok(QueryResult::CommandOk {
-                affected: 0,
-                modified_catalog: false,
-            }),
+            // v7.16.2 — DO $$ ... $$ block. mailrs round-10 A.2
+            // — the pre-v7.9.27 no-op SILENTLY swallowed every
+            // mailrs migrate-038/-040/-042 idempotent rename
+            // (the IF EXISTS … THEN ALTER … END block never
+            // ran). v7.16.2 dispatches to exec_do_block which
+            // runs the PlPgSqlBlock at top level via the same
+            // execute_stmts machinery the trigger executor
+            // uses (NEW=None, OLD=None — DO blocks have no
+            // row context).
+            Statement::DoBlock(body) => self.exec_do_block(body),
             // v7.14.0 — empty-statement no-op for pg_dump /
             // mysqldump preamble lines that collapse to nothing
             // after comment-stripping.
@@ -3850,6 +4011,18 @@ impl Engine {
                     }
                 }
             }
+            spg_sql::ast::AlterTableTarget::RenameTable { new } => {
+                // v7.16.2 — table-level rename (mailrs round-10
+                // A.5 — used by migrate-042's `ALTER TABLE
+                // contacts RENAME TO email_contacts`). Storage
+                // helper updates the schema + by_name index +
+                // dangling FK / trigger references in one
+                // atomic step.
+                let old = s.name.to_string();
+                self.active_catalog_mut()
+                    .rename_table(&old, &new)
+                    .map_err(EngineError::Storage)?;
+            }
             spg_sql::ast::AlterTableTarget::RenameColumn { old, new } => {
                 // v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO
                 // new`. Rename the column in the schema; rewrite
@@ -3961,7 +4134,30 @@ impl Engine {
             name: idx_name,
             target,
         } = stmt;
-        let spg_sql::ast::AlterIndexTarget::Rebuild { encoding } = target;
+        // v7.16.2 — RENAME TO branch (mailrs round-10 migrate-042).
+        // IF EXISTS makes a missing index a no-op rather than an
+        // error, mirroring PG semantics.
+        if let spg_sql::ast::AlterIndexTarget::Rename { new, if_exists } = target {
+            let renamed = self
+                .active_catalog_mut()
+                .rename_index(&idx_name, &new);
+            return match renamed {
+                Ok(()) => Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: !self.in_transaction(),
+                }),
+                Err(StorageError::IndexNotFound { .. }) if if_exists => {
+                    Ok(QueryResult::CommandOk {
+                        affected: 0,
+                        modified_catalog: false,
+                    })
+                }
+                Err(e) => Err(EngineError::Storage(e)),
+            };
+        }
+        let spg_sql::ast::AlterIndexTarget::Rebuild { encoding } = target else {
+            unreachable!("Rename branch returned above");
+        };
         let target = encoding.map(|e| match e {
             SqlVecEncoding::F32 => VecEncoding::F32,
             SqlVecEncoding::Sq8 => VecEncoding::Sq8,
@@ -4362,21 +4558,28 @@ impl Engine {
         stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
         if stmt.if_not_exists && self.active_catalog().get(&stmt.name).is_some() {
-            // v7.13.3 — mailrs round-7 S9 reconciliation. PG's
-            // semantics for `CREATE TABLE IF NOT EXISTS` is a
-            // silent no-op when the table exists, even if the new
-            // definition adds columns or constraints. SPG extends
-            // this: any column in the new definition that's
-            // missing from the existing table is added (with
-            // DEFAULT back-fill / NULL); inline FKs likewise.
-            // Existing columns are NOT modified. This makes
-            // mailrs's schema layering (init-schema's `contacts`
-            // sender-tracking table + migrate-023's CardDAV
-            // `contacts` extension) converge correctly without
-            // mailrs-side edits. PG users who want PG-strict
-            // silent-no-op behaviour can use SPG's `--strict-pg`
-            // flag (deferred to v7.14).
-            return self.reconcile_table_if_not_exists(stmt);
+            // v7.16.2 — PG-strict silent no-op (mailrs round-10
+            // surfaced this). v7.13.3's "reconcile by adding
+            // missing columns" was friendly for mailrs round-7
+            // where init-schema's `contacts` and migrate-023's
+            // CardDAV `contacts` collided; but it ALSO silently
+            // added columns to existing tables when later
+            // migrations had a duplicate `CREATE TABLE IF NOT
+            // EXISTS <t> (different-shape-cols)` shape. mailrs's
+            // migrate-030 has exactly that — re-declares
+            // system_config with `key` even though init-schema
+            // already created it with `config_key`. PG's silent
+            // no-op leaves system_config at `config_key`;
+            // v7.13.3 added a phantom `key` column that then
+            // tripped migrate-040's idempotent rename guard.
+            // mailrs v1.7.106 ships the proper PG-style
+            // contacts rename via DO + IF EXISTS, so SPG can
+            // revert to PG-strict here without re-breaking the
+            // round-7 case.
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
         }
         let table_name = stmt.name.clone();
         // v7.9.13 — pluck the names of any columns marked
@@ -5118,6 +5321,17 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.16.2 — information_schema / pg_catalog virtual
+        // views (mailrs round-10 A.3). If the SELECT touches a
+        // synthetic meta-table name (`__spg_info_*` /
+        // `__spg_pg_*` — produced by the parser for
+        // `information_schema.X` / `pg_catalog.X`), clone the
+        // catalog, materialise the requested view as a real
+        // temporary table, and re-execute against an enriched
+        // engine. Same pattern as `exec_with_ctes` for CTEs.
+        if !self.meta_views_materialised && select_references_meta_view(stmt) {
+            return self.exec_select_with_meta_views(stmt, cancel);
+        }
         // v6.10.2 — cold-tier time-travel short-circuit. When the
         // primary TableRef carries `AS OF SEGMENT '<id>'`, run a
         // dedicated cold-segment scan instead of the regular
@@ -5411,6 +5625,16 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.16.2 — same meta-view dispatch as
+        // `exec_select_cancel`, applied here too because
+        // `subquery_replacement` enters this function directly
+        // for Exists / ScalarSubquery / InSubquery resolution
+        // (bypassing the top-level entry to avoid double
+        // subquery walking). Without this dispatch the subquery
+        // hits `__spg_info_columns` and reports TableNotFound.
+        if !self.meta_views_materialised && select_references_meta_view(stmt) {
+            return self.exec_select_with_meta_views(stmt, cancel);
+        }
         // v4.12: window-function path. When the projection contains
         // any `name(args) OVER (...)` we route to the dedicated
         // executor — partition + sort + per-row window value before
@@ -6998,6 +7222,65 @@ impl Engine {
     /// is moderately expensive — only paid by CTE-bearing queries.
     /// Subqueries inside CTE bodies / the main body resolve as
     /// usual; `clock_fn` is propagated so `NOW()` lines up.
+    /// v7.16.2 — mailrs round-10 A.3. Materialise the
+    /// `information_schema.*` / `pg_catalog.*` virtual views
+    /// the SELECT references, then re-execute the SELECT
+    /// against an enriched catalog where those views are real
+    /// tables. Same pattern as `exec_with_ctes`. The temp
+    /// engine carries `meta_views_materialised = true` so its
+    /// own meta-dispatch short-circuits — without that we'd
+    /// infinite-recurse since the temp catalog's view name
+    /// still starts with `__spg_info_` and re-triggers the
+    /// check.
+    fn exec_select_with_meta_views(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let mut needed: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+        collect_meta_view_names(stmt, &mut needed);
+        let mut catalog = self.active_catalog().clone();
+        for view in &needed {
+            if catalog.get(view).is_some() {
+                continue;
+            }
+            match view.as_str() {
+                "__spg_info_columns" => {
+                    let (schema, rows) = synth_information_schema_columns(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_info_tables" => {
+                    let (schema, rows) = synth_information_schema_tables(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_class" => {
+                    let (schema, rows) = synth_pg_class(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_attribute" => {
+                    let (schema, rows) = synth_pg_attribute(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                _ => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "meta view {view:?} is not yet materialisable; \
+                         v7.16.2 covers information_schema.columns / .tables \
+                         and pg_catalog.pg_class / pg_attribute"
+                    )));
+                }
+            }
+        }
+        let mut temp = Engine::restore(catalog);
+        if let Some(c) = self.clock {
+            temp = temp.with_clock(c);
+        }
+        if let Some(f) = self.salt_fn {
+            temp = temp.with_salt_fn(f);
+        }
+        temp.meta_views_materialised = true;
+        temp.exec_select_cancel(stmt, cancel)
+    }
+
     fn exec_with_ctes(
         &self,
         stmt: &SelectStatement,
@@ -7728,6 +8011,210 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
 /// non-column expressions). Lets `WITH t(n) AS (SELECT 1 ...)`
 /// land an Int column in the CTE storage table rather than failing
 /// the insert with "expected TEXT, got INT".
+/// v7.16.2 — map an SPG [`DataType`] to the PG-canonical
+/// `information_schema.columns.data_type` text. Covers the
+/// values mailrs's migrations probe (`'ARRAY'`, `'integer'`,
+/// `'text'`, …). Unknown variants fall back to the SPG name
+/// downcased — better than panicking on a future DataType.
+fn pg_data_type_text(ty: DataType) -> alloc::string::String {
+    let s = match ty {
+        DataType::Int => "integer",
+        DataType::BigInt => "bigint",
+        DataType::SmallInt => "smallint",
+        DataType::Float => "double precision",
+        DataType::Bool => "boolean",
+        DataType::Text => "text",
+        DataType::Varchar(_) => "character varying",
+        DataType::Date => "date",
+        DataType::Timestamp => "timestamp without time zone",
+        DataType::Timestamptz => "timestamp with time zone",
+        DataType::Json => "jsonb",
+        DataType::Bytes => "bytea",
+        DataType::TextArray | DataType::IntArray | DataType::BigIntArray => "ARRAY",
+        DataType::TsVector => "tsvector",
+        DataType::TsQuery => "tsquery",
+        DataType::Vector { .. } => "USER-DEFINED",
+        // Non-exhaustive — fall back to "USER-DEFINED" the way
+        // PG labels any pg_type it doesn't recognise.
+        _ => "USER-DEFINED",
+    };
+    alloc::string::String::from(s)
+}
+
+/// v7.16.2 — synthesise `information_schema.columns`. mailrs
+/// queries are of shape `SELECT 1 FROM information_schema.columns
+/// WHERE table_name = … AND column_name = … AND data_type = …` —
+/// the v7.16.2 view returns the columns mailrs probes; broader
+/// PG-spec parity (ordinal_position, is_nullable, character_
+/// maximum_length, udt_name, …) lands as needed.
+fn synth_information_schema_columns(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("ordinal_position", DataType::Int, false),
+        ColumnSchema::new("is_nullable", DataType::Text, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for (i, col) in t.schema().columns.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            rows.push(Row::new(alloc::vec![
+                Value::Text("spg".into()),
+                Value::Text("public".into()),
+                Value::Text(tname.clone()),
+                Value::Text(col.name.clone()),
+                Value::Int(ordinal),
+                Value::Text(if col.nullable { "YES".into() } else { "NO".into() }),
+                Value::Text(pg_data_type_text(col.ty)),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.16.2 — synthesise `information_schema.tables`.
+fn synth_information_schema_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("table_type", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        rows.push(Row::new(alloc::vec![
+            Value::Text("spg".into()),
+            Value::Text("public".into()),
+            Value::Text(tname.clone()),
+            Value::Text("BASE TABLE".into()),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.16.2 — synthesise `pg_catalog.pg_class`. Minimum shape
+/// for psql `\d` / ORM probes: `relname` + `relkind`. Each
+/// user table emits one row.
+fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("relname", DataType::Text, false),
+        ColumnSchema::new("relkind", DataType::Text, false),
+        ColumnSchema::new("relnamespace", DataType::BigInt, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        rows.push(Row::new(alloc::vec![
+            Value::Text(tname.clone()),
+            Value::Text("r".into()),
+            Value::BigInt(2200), // PG's `public` namespace OID
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.16.2 — synthesise `pg_catalog.pg_attribute`. Minimum
+/// shape: `attrelid` (text — SPG has no OID), `attname`,
+/// `attnum`, `atttypid` (text), `attnotnull`.
+fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("attrelid", DataType::Text, false),
+        ColumnSchema::new("attname", DataType::Text, false),
+        ColumnSchema::new("attnum", DataType::Int, false),
+        ColumnSchema::new("atttypid", DataType::Text, false),
+        ColumnSchema::new("attnotnull", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for (i, col) in t.schema().columns.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            rows.push(Row::new(alloc::vec![
+                Value::Text(tname.clone()),
+                Value::Text(col.name.clone()),
+                Value::Int(ordinal),
+                Value::Text(pg_data_type_text(col.ty)),
+                Value::Bool(!col.nullable),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.16.2 — drop the synthesised meta view into the enriched
+/// catalog so the regular FROM-resolution path can see it.
+fn materialise_meta_view(
+    catalog: &mut Catalog,
+    name: &str,
+    columns: Vec<ColumnSchema>,
+    rows: Vec<Row>,
+) -> Result<(), EngineError> {
+    let schema = TableSchema::new(name.to_string(), columns);
+    catalog.create_table(schema).map_err(EngineError::Storage)?;
+    let table = catalog
+        .get_mut(name)
+        .expect("just-created meta view must exist");
+    for row in rows {
+        table.insert(row).map_err(EngineError::Storage)?;
+    }
+    Ok(())
+}
+
+/// v7.16.2 — true when the SELECT statement references any
+/// `__spg_info_*` or `__spg_pg_*` synthetic table name (the
+/// parser produces these for `information_schema.X` /
+/// `pg_catalog.X`). Used by `exec_select_cancel` to short-
+/// circuit into the meta-view materialisation path.
+fn select_references_meta_view(stmt: &SelectStatement) -> bool {
+    fn is_meta(name: &str) -> bool {
+        name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")
+    }
+    if let Some(from) = &stmt.from {
+        if is_meta(&from.primary.name) {
+            return true;
+        }
+        for j in &from.joins {
+            if is_meta(&j.table.name) {
+                return true;
+            }
+        }
+    }
+    for cte in &stmt.ctes {
+        if select_references_meta_view(&cte.body) {
+            return true;
+        }
+    }
+    false
+}
+
+/// v7.16.2 — collect every meta-view name a SELECT touches.
+/// Returns a deduplicated, sorted list. Caller materialises
+/// each one into the enriched catalog before re-running the
+/// SELECT. Walks JOINs, CTEs, and the primary FROM.
+fn collect_meta_view_names(stmt: &SelectStatement, into: &mut alloc::collections::BTreeSet<String>) {
+    fn is_meta(name: &str) -> bool {
+        name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")
+    }
+    if let Some(from) = &stmt.from {
+        if is_meta(&from.primary.name) {
+            into.insert(from.primary.name.clone());
+        }
+        for j in &from.joins {
+            if is_meta(&j.table.name) {
+                into.insert(j.table.name.clone());
+            }
+        }
+    }
+    for cte in &stmt.ctes {
+        collect_meta_view_names(&cte.body, into);
+    }
+}
+
 fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchema> {
     let mut out = columns.to_vec();
     for (col_idx, col) in out.iter_mut().enumerate() {

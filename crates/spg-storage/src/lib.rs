@@ -3515,6 +3515,74 @@ impl Catalog {
         true
     }
 
+    /// v7.16.2 — rename a table (mailrs round-10 A.5). Updates
+    /// the schema name, the catalog name → index map, and
+    /// rewrites every reference dangling at the table name:
+    ///   * every FK on every OTHER table whose `parent_table`
+    ///     pointed at the old name now points at the new
+    ///     name, so FK enforcement keeps working
+    ///   * every trigger watching the table updates its `table`
+    ///     field
+    /// Returns `Ok` on success; `Err(StorageError::TableNotFound)`
+    /// when the old name isn't in the catalog and
+    /// `Err(StorageError::DuplicateTable)` when the new name is
+    /// already taken.
+    pub fn rename_table(&mut self, old: &str, new: &str) -> Result<(), StorageError> {
+        if old == new {
+            return Ok(());
+        }
+        if self.by_name.contains_key(new) {
+            return Err(StorageError::Corrupt(format!(
+                "rename_table: target name {new:?} already exists"
+            )));
+        }
+        let idx = self.by_name.remove(old).ok_or_else(|| {
+            StorageError::TableNotFound { name: old.into() }
+        })?;
+        self.tables[idx].schema.name = new.to_string();
+        self.by_name.insert(new.to_string(), idx);
+        for t in &mut self.tables {
+            for fk in &mut t.schema.foreign_keys {
+                if fk.parent_table == old {
+                    fk.parent_table = new.to_string();
+                }
+            }
+        }
+        for trig in &mut self.triggers {
+            if trig.table == old {
+                trig.table = new.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    /// v7.16.2 — rename an index by name. Walks every table
+    /// since the index lives on its owning table; updates the
+    /// name in place. Errors with `IndexNotFound` when no
+    /// index matches. mailrs round-10 A.5.
+    pub fn rename_index(&mut self, old: &str, new: &str) -> Result<(), StorageError> {
+        if old == new {
+            return Ok(());
+        }
+        // Reject the new name if it already exists anywhere.
+        for t in &self.tables {
+            if t.indices.iter().any(|i| i.name == new) {
+                return Err(StorageError::Corrupt(format!(
+                    "rename_index: target name {new:?} already exists"
+                )));
+            }
+        }
+        for t in &mut self.tables {
+            for i in &mut t.indices {
+                if i.name == old {
+                    i.name = new.to_string();
+                    return Ok(());
+                }
+            }
+        }
+        Err(StorageError::IndexNotFound { name: old.into() })
+    }
+
     /// v7.14.0 — remove a named index across the catalog.
     /// Returns `true` when found + dropped.
     pub fn drop_named_index(&mut self, name: &str) -> bool {

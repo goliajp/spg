@@ -45,13 +45,14 @@ pub enum Statement {
     /// (notably `pgvector`) load against SPG without splitting
     /// init scripts. mailrs migration follow-up F3.
     CreateExtension(String),
-    /// v7.9.27 — PG `DO $$ … $$ [LANGUAGE plpgsql];` block. SPG
-    /// has no PL/pgSQL; engine returns CommandOk no-op so
-    /// `pg_dump` output with idempotent DO migrations loads
-    /// against SPG without splitting scripts. The lexer
-    /// consumes the dollar-quoted body into a discarded
-    /// Token::String. mailrs migration follow-up H1.
-    DoBlock,
+    /// v7.9.27 → v7.16.2 — PG `DO $$ … $$ [LANGUAGE plpgsql];`
+    /// block. The body is now CAPTURED as a [`PlPgSqlBlock`] and
+    /// the engine executes it at top level (mailrs round-10
+    /// A.2). Pre-v7.16.2 the parser discarded the body and the
+    /// engine returned CommandOk — a SEV-1 silent no-op that
+    /// turned mailrs's `DO BEGIN IF EXISTS … THEN ALTER … END
+    /// $$` idempotent migrations into invisible no-ops.
+    DoBlock(PlPgSqlBlock),
     CreateIndex(CreateIndexStatement),
     Insert(InsertStatement),
     /// v4.4 — `UPDATE <table> SET col=expr [, ...] [WHERE cond]`.
@@ -264,12 +265,18 @@ pub struct AlterIndexStatement {
     pub target: AlterIndexTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlterIndexTarget {
     /// `REBUILD [WITH (encoding = <enc>)]`. `encoding = None`
     /// rebuilds the existing graph in place without touching the
     /// column encoding; `Some(enc)` re-encodes every cell first.
     Rebuild { encoding: Option<VecEncoding> },
+    /// v7.16.2 — `[IF EXISTS] RENAME TO <new>`. mailrs migrate-042
+    /// uses this; PG drops the IF EXISTS noisily as ERROR, mailrs
+    /// uses it to make the migration idempotent (re-running on a
+    /// DB where the rename already happened is a no-op rather
+    /// than an error).
+    Rename { new: String, if_exists: bool },
 }
 
 /// v6.7.2 — `ALTER TABLE t SET <setting> = <value>`. v6.7.2 ships
@@ -355,6 +362,13 @@ pub enum AlterTableTarget {
     /// column referenced by a function body update the function
     /// body separately.
     RenameColumn { old: String, new: String },
+    /// v7.16.2 — `ALTER TABLE old RENAME TO new`. Renames the
+    /// table itself (mailrs round-10 A.5 carve-out — mailrs's
+    /// migrate-042 uses it). The engine moves the table entry
+    /// in the catalog under the new name; child catalog state
+    /// (FKs pointing at this table, triggers watching this
+    /// table) tracks the rename through the storage layer.
+    RenameTable { new: String },
     /// v7.16.1 — `ALTER TABLE t { ENABLE | DISABLE } TRIGGER
     /// { ALL | <name> }`. Toggles whether row-level triggers
     /// fire on subsequent INSERT/UPDATE/DELETE on the table.
@@ -541,6 +555,15 @@ pub enum PlPgSqlStmt {
     /// for clarity in error reporting (PG also forbids it) — the
     /// executor errors with a clear "OLD is read-only" message.
     Assign { target: AssignTarget, value: Expr },
+    /// v7.16.2 — plpgsql `SELECT <projection> INTO <var>
+    /// [FROM …]` (mailrs round-10 migrate-042). The `body` is
+    /// the SELECT statement with the INTO clause stripped; the
+    /// engine runs it via `Engine::execute`, takes the first
+    /// row's first column, and assigns to the local variable
+    /// in the DECLARE scope. Single-column / single-row
+    /// queries only at v7.16.2; multi-target (`INTO a, b`) is
+    /// a v7.16.x follow-up.
+    SelectInto { var: String, body: Box<SelectStatement> },
     /// `RETURN <target>;` — trigger functions canonically return
     /// `NEW` / `OLD` / `NULL`; v7.12.4 also accepts a bare
     /// expression for forward compatibility with scalar UDFs.
@@ -1765,14 +1788,20 @@ impl fmt::Display for Statement {
                 }
             }
             Self::AlterIndex(a) => {
-                write!(f, "ALTER INDEX {} ", quote_ident(&a.name))?;
-                match a.target {
+                write!(f, "ALTER INDEX ")?;
+                match &a.target {
                     AlterIndexTarget::Rebuild { encoding } => {
-                        f.write_str("REBUILD")?;
+                        write!(f, "{} REBUILD", quote_ident(&a.name))?;
                         if let Some(enc) = encoding {
                             write!(f, " WITH (encoding = {enc})")?;
                         }
                         Ok(())
+                    }
+                    AlterIndexTarget::Rename { new, if_exists } => {
+                        if *if_exists {
+                            f.write_str("IF EXISTS ")?;
+                        }
+                        write!(f, "{} RENAME TO {}", quote_ident(&a.name), quote_ident(new))
                     }
                 }
             }
@@ -1815,7 +1844,7 @@ impl fmt::Display for Statement {
             Self::CreateExtension(name) => {
                 write!(f, "CREATE EXTENSION IF NOT EXISTS {}", quote_ident(name))
             }
-            Self::DoBlock => f.write_str("DO $$ /* SPG no-op */ $$"),
+            Self::DoBlock(body) => write!(f, "DO $$ {body} $$"),
             Self::DropPublication(name) => {
                 write!(f, "DROP PUBLICATION {}", quote_ident(name))
             }
@@ -1936,6 +1965,7 @@ impl fmt::Display for PlPgSqlStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Assign { target, value } => write!(f, "{target} := {value}"),
+            Self::SelectInto { var, body } => write!(f, "{body} INTO {var}"),
             Self::Return(t) => match t {
                 ReturnTarget::New => f.write_str("RETURN NEW"),
                 ReturnTarget::Old => f.write_str("RETURN OLD"),
@@ -2215,6 +2245,9 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
                 quote_ident(old),
                 quote_ident(new)
             )
+        }
+        AlterTableTarget::RenameTable { new } => {
+            write!(f, "RENAME TO {}", quote_ident(new))
         }
         AlterTableTarget::SetTriggerEnabled { which, enabled } => {
             f.write_str(if *enabled { "ENABLE TRIGGER " } else { "DISABLE TRIGGER " })?;

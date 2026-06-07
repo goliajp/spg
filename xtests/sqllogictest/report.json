@@ -54,7 +54,7 @@
         { "file": "03_inline_key.test", "pass": 17, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 210, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 231, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -83,6 +83,8 @@
         { "file": "13_timestamptz_offset.test", "pass": 11, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "14_disable_trigger_tsvector.test", "pass": 23, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "15_do_block_information_schema.test", "pass": 21, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
