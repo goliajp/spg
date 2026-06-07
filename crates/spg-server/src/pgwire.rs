@@ -42,7 +42,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-use spg_engine::{EngineError, QueryResult, Role};
+use spg_engine::{CancelToken, EngineError, MonotonicNowFn, QueryResult, Role};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::ServerState;
@@ -340,7 +340,11 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 conn_state
                     .wait_event
                     .store(1, std::sync::atomic::Ordering::Relaxed);
-                let result = execute_with_role(state, &sql, role);
+                // v7.17.0 Phase 2.3 — resolve per-statement deadline
+                // from the session `statement_timeout` GUC (default
+                // `0` → `CancelToken::none()`, hot path unchanged).
+                let cancel = statement_cancel(&settings);
+                let result = execute_with_role(state, &sql, role, cancel);
                 conn_state
                     .wait_event
                     .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -376,7 +380,12 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         };
                     }
                     Err(e) => {
-                        send_error(&mut wbuf, "42000", &e.to_string())?;
+                        // v7.17.0 Phase 2.3 — map `Cancelled` to
+                        // SQLSTATE `57014` so PG client libraries
+                        // surface it as a statement-timeout, not a
+                        // generic `42000` syntax / access error.
+                        let (sqlstate, msg) = engine_error_to_wire(&e);
+                        send_error(&mut wbuf, sqlstate, &msg)?;
                         // After an error inside a TX, PG goes to 'E'
                         // and stays there until ROLLBACK. We track
                         // best-effort: if engine still in TX, mark
@@ -489,16 +498,17 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             }
             // Execute (E): portal name + max-rows (0 = all).
             b'E' => {
-                if let Err(msg) = handle_execute(
+                if let Err((sqlstate, msg)) = handle_execute(
                     &body,
                     &portals,
                     &prepared,
+                    &settings,
                     &mut wbuf,
                     state,
                     role,
                     &mut tx_state,
                 ) {
-                    send_error(&mut wbuf, "42000", &msg)?;
+                    send_error(&mut wbuf, sqlstate, &msg)?;
                 }
             }
             // Close (C): drop the named statement or portal. Reply
@@ -571,6 +581,7 @@ fn execute_with_role(
     state: &Arc<ServerState>,
     sql: &str,
     role: Role,
+    cancel: CancelToken<'_>,
 ) -> Result<QueryResult, EngineError> {
     // v5.1: cold-tier preload — kept symmetric with the native
     // Op::Query path so a sweep that drives the server through
@@ -608,13 +619,13 @@ fn execute_with_role(
             .engine
             .read()
             .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
-        engine.execute_readonly(sql)
+        engine.execute_readonly_with_cancel(sql, cancel)
     } else {
         let mut engine = state
             .engine
             .write()
             .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
-        engine.execute(sql)
+        engine.execute_with_cancel(sql, cancel)
     }
 }
 
@@ -1450,29 +1461,39 @@ fn handle_execute(
     body: &[u8],
     portals: &std::collections::HashMap<String, Portal>,
     prepared: &std::collections::HashMap<String, PreparedStmt>,
+    settings: &std::collections::HashMap<String, String>,
     stream: &mut dyn Write,
     state: &Arc<ServerState>,
     role: Role,
     tx_state: &mut u8,
-) -> Result<(), String> {
+) -> Result<(), (&'static str, String)> {
+    // v7.17.0 Phase 2.3 — protocol-level errors keep SQLSTATE
+    // `42000` to match prior behavior; only `EngineError::Cancelled`
+    // promotes to `57014` via `engine_error_to_wire`.
+    let proto = |m: String| ("42000", m);
     let mut cur = 0;
     let portal_name = read_cstring(body, &mut cur)
-        .ok_or("Execute: portal name not UTF-8")?
+        .ok_or_else(|| proto("Execute: portal name not UTF-8".to_string()))?
         .to_string();
     // Max-rows (i32, 0 = unlimited). We always return everything;
     // partial-cursor support is future work.
     if cur + 4 > body.len() {
-        return Err("Execute: missing max-rows".into());
+        return Err(proto("Execute: missing max-rows".to_string()));
     }
     let portal = portals
         .get(&portal_name)
-        .ok_or_else(|| format!("Execute: portal {portal_name:?} not found"))?;
+        .ok_or_else(|| proto(format!("Execute: portal {portal_name:?} not found")))?;
     let stmt = prepared.get(&portal.stmt_name).ok_or_else(|| {
-        format!(
+        proto(format!(
             "Execute: prepared statement {:?} dropped while a portal held a reference",
             portal.stmt_name
-        )
+        ))
     })?;
+    // v7.17.0 Phase 2.3 — resolve per-statement deadline before
+    // taking the engine lock so the lock-hold window matches the
+    // simple-query path; the cancel token rides into
+    // `execute_prepared_with_cancel`.
+    let cancel = statement_cancel(settings);
     // v6.1.1: dispatch through `Engine::execute_prepared` — the
     // AST is reused from Parse; only the substitute walk + dispatch
     // happen here. No SQL re-parse, no canned-response check (the
@@ -1490,7 +1511,7 @@ fn handle_execute(
             state
                 .engine
                 .write()
-                .map_err(|_| "Execute: engine lock poisoned".to_string())?
+                .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?
         } else {
             // SELECT-only path could take a read lock today —
             // but execute_prepared takes &mut self for symmetry
@@ -1503,22 +1524,23 @@ fn handle_execute(
             state
                 .engine
                 .write()
-                .map_err(|_| "Execute: engine lock poisoned".to_string())?
+                .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?
         };
         // Role gate — same shape as `execute_with_role`.
         if needs_write && matches!(role, Role::ReadOnly) {
-            return Err("permission denied: readonly role".into());
+            return Err(proto("permission denied: readonly role".to_string()));
         }
-        eng.execute_prepared(stmt.ast.clone(), &portal.params)
+        eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel)
     };
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
-            send_row_description(stream, &columns).map_err(|e| e.to_string())?;
+            send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
             let n = rows.len();
             for row in &rows {
-                send_data_row(stream, &columns, row).map_err(|e| e.to_string())?;
+                send_data_row(stream, &columns, row).map_err(|e| proto(e.to_string()))?;
             }
-            send_command_complete(stream, &format!("SELECT {n}")).map_err(|e| e.to_string())?;
+            send_command_complete(stream, &format!("SELECT {n}"))
+                .map_err(|e| proto(e.to_string()))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             // Synthesise a command tag from the statement kind so
@@ -1527,16 +1549,19 @@ fn handle_execute(
             // the tag from the AST root, not the original SQL
             // text — text is owned by Parse, not Execute.
             let tag = command_tag_for_ast(&stmt.ast, affected);
-            send_command_complete(stream, &tag).map_err(|e| e.to_string())?;
+            send_command_complete(stream, &tag).map_err(|e| proto(e.to_string()))?;
             *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
                 b'T'
             } else {
                 b'I'
             };
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => {
+            let (sqlstate, msg) = engine_error_to_wire(&e);
+            return Err((sqlstate, msg));
+        }
         // v7.5.0 — QueryResult is #[non_exhaustive].
-        Ok(_) => return Err("unexpected QueryResult variant".to_string()),
+        Ok(_) => return Err(proto("unexpected QueryResult variant".to_string())),
     }
     Ok(())
 }
@@ -1677,6 +1702,94 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
         ("transaction_isolation", "read committed"),
         ("transaction_read_only", "off"),
     ]
+}
+
+// ---- v7.17.0 Phase 2.3 — statement_timeout ----
+
+/// Monotonic now in microseconds. Origin = first call into
+/// `Instant::now()` on this process; subsequent calls measure
+/// elapsed time against that origin. Used to feed
+/// `CancelToken::with_deadline`'s `now_fn` slot — the engine is
+/// `#![no_std]` and so can't reach `std::time::Instant` itself.
+fn monotonic_now_us() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(Instant::now);
+    let micros = origin.elapsed().as_micros();
+    u64::try_from(micros).unwrap_or(u64::MAX)
+}
+
+/// Parse PG `statement_timeout` value into milliseconds. Accepts:
+/// bare integer (ms), or `<n>` followed by a unit suffix
+/// (`us` / `ms` / `s` / `min` / `h` / `d`). `0` is valid and
+/// disables the timeout. Returns `None` on garbage.
+fn parse_timeout_ms(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // Bare integer = milliseconds (matches PG: `SET ... = 5000`).
+    if let Ok(n) = t.parse::<u64>() {
+        return Some(n);
+    }
+    let split_at = t
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(t.len());
+    let (num_part, unit) = t.split_at(split_at);
+    let num: u64 = num_part.trim().parse().ok()?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        // Sub-ms granularity floors to 0; PG itself clamps to ≥1ms
+        // in practice, so this matches observed behavior closely.
+        "us" => return Some(num / 1000),
+        "ms" => 1,
+        "s" => 1_000,
+        "min" | "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    num.checked_mul(mult)
+}
+
+/// Build the engine `CancelToken` for the next statement off the
+/// pgwire session `settings` map. When `statement_timeout` is `0`,
+/// missing, or unparseable, returns `CancelToken::none()` so the
+/// hot path (default SLO load) elides the deadline check entirely
+/// — costing only one predicted-not-taken branch in
+/// `CancelToken::is_cancelled`.
+fn statement_cancel(
+    settings: &std::collections::HashMap<String, String>,
+) -> CancelToken<'static> {
+    let raw = settings
+        .get("statement_timeout")
+        .map(String::as_str)
+        .unwrap_or("0");
+    let Some(ms) = parse_timeout_ms(raw) else {
+        return CancelToken::none();
+    };
+    if ms == 0 {
+        return CancelToken::none();
+    }
+    let now_fn: MonotonicNowFn = monotonic_now_us;
+    let deadline_us = monotonic_now_us().saturating_add(ms.saturating_mul(1_000));
+    CancelToken::none().with_deadline(now_fn, deadline_us)
+}
+
+/// Map an `EngineError` to (SQLSTATE, wire message). v7.17.0
+/// Phase 2.3 — separates `Cancelled` so it lands as PG's standard
+/// `57014` (`query_canceled`) with the canonical "canceling
+/// statement due to statement timeout" text driver libraries grep
+/// for. Everything else stays on the legacy `42000` to preserve
+/// existing client-side error parsing.
+fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
+    match e {
+        EngineError::Cancelled => (
+            "57014",
+            "canceling statement due to statement timeout".to_string(),
+        ),
+        _ => ("42000", e.to_string()),
+    }
 }
 
 // ---- v4.17 COPY FROM STDIN / COPY TO STDOUT ----
@@ -2274,7 +2387,12 @@ fn handle_copy_to_stdout(
 ) -> std::io::Result<()> {
     let _ = role.can_read(); // every role can read
     let sql = format!("SELECT * FROM {table}");
-    let result = execute_with_role(state, &sql, role);
+    // v7.17.0 Phase 2.3 — COPY TO STDOUT does not honor
+    // `statement_timeout` in this phase (the existing settings map
+    // does not cross the COPY boundary); bulk-export paths get
+    // `CancelToken::none()`. SPG_QUERY_TIMEOUT_MS / server-wide cap
+    // still applies via the server-state watchdog.
+    let result = execute_with_role(state, &sql, role, CancelToken::none());
     let (columns, rows) = match result {
         Ok(QueryResult::Rows { columns, rows }) => (columns, rows),
         Ok(QueryResult::CommandOk { .. }) => {
