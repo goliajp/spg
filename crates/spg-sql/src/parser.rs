@@ -572,6 +572,25 @@ impl Parser {
                         }
                         Ok(Statement::Empty)
                     }
+                    // v7.17.0 Phase 1.2 — DROP VIEW [IF EXISTS]
+                    // name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("view") => {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropView { names, if_exists })
+                    }
                     // v7.17.0 — DROP SEQUENCE [IF EXISTS] name [,name…]
                     // [CASCADE|RESTRICT]. Real removal from catalog
                     // (was a silent no-op pre-v7.17).
@@ -914,18 +933,25 @@ impl Parser {
                 self.advance();
                 self.parse_create_sequence_after_keyword(false)
             }
+            // v7.17.0 Phase 1.2 — CREATE [TEMPORARY] VIEW …
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("view") => {
+                self.advance();
+                self.parse_create_view_after_keyword(false, false, false)
+            }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") =>
             {
                 self.advance();
-                // TEMPORARY/TEMP must be followed by SEQUENCE for v7.17.
-                // (TEMP TABLE could come later; for now route the few
-                // known shapes and fall back to silent-noop.)
+                // TEMPORARY/TEMP followed by SEQUENCE / VIEW.
                 let next = self.peek().clone();
                 if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("sequence"))
                 {
                     self.advance();
                     self.parse_create_sequence_after_keyword(true)
+                } else if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                {
+                    self.advance();
+                    self.parse_create_view_after_keyword(false, false, true)
                 } else {
                     // TEMP TABLE etc — consume to boundary as noop for now.
                     self.consume_until_statement_boundary();
@@ -938,14 +964,15 @@ impl Parser {
             // SPG is single-schema / single-database; these have
             // no behavioural effect, so consume + return Empty.
             // v7.17.0 NOTE: SEQUENCE was here pre-v7.17; moved up
-            // to a real parser branch above. VIEW / MATERIALIZED
-            // VIEW / TYPE / DOMAIN move out one-by-one in Phase
-            // 1.2–1.5.
+            // to a real parser branch above. VIEW also moved out
+            // in Phase 1.2 (it has its own branch above). TYPE /
+            // DOMAIN / MATERIALIZED VIEW move out in Phase
+            // 1.3–1.5; SCHEMA / DATABASE / ROLE / POLICY /
+            // OPERATOR stay no-op forever (single-namespace).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
                     "schema"
-                        | "view"
                         | "materialized"
                         | "type"
                         | "domain"
@@ -981,7 +1008,7 @@ impl Parser {
         let tok = self.peek();
         let (Token::Ident(s) | Token::QuotedIdent(s)) = tok else {
             return Err(self.err(alloc::format!(
-                "expected FUNCTION / TRIGGER after CREATE OR REPLACE, got {tok:?}"
+                "expected FUNCTION / TRIGGER / VIEW after CREATE OR REPLACE, got {tok:?}"
             )));
         };
         if s.eq_ignore_ascii_case("function") {
@@ -990,9 +1017,26 @@ impl Parser {
         } else if s.eq_ignore_ascii_case("trigger") {
             self.advance();
             self.parse_create_trigger_after_keyword(or_replace)
+        } else if s.eq_ignore_ascii_case("view") {
+            // v7.17.0 Phase 1.2 — CREATE OR REPLACE VIEW name AS SELECT …
+            self.advance();
+            self.parse_create_view_after_keyword(or_replace, false, false)
+        } else if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") {
+            // CREATE OR REPLACE TEMPORARY VIEW … (rare but legal).
+            self.advance();
+            let nxt = self.peek().clone();
+            if matches!(&nxt, Token::Ident(n) | Token::QuotedIdent(n) if n.eq_ignore_ascii_case("view"))
+            {
+                self.advance();
+                self.parse_create_view_after_keyword(or_replace, false, true)
+            } else {
+                Err(self.err(alloc::format!(
+                    "expected VIEW after CREATE OR REPLACE TEMPORARY, got {nxt:?}"
+                )))
+            }
         } else {
             Err(self.err(alloc::format!(
-                "expected FUNCTION / TRIGGER after CREATE OR REPLACE, got {s:?}"
+                "expected FUNCTION / TRIGGER / VIEW after CREATE OR REPLACE, got {s:?}"
             )))
         }
     }
@@ -1227,6 +1271,64 @@ impl Parser {
             }
             _ => Ok(None),
         }
+    }
+
+    /// v7.17.0 Phase 1.2 — body of `CREATE [OR REPLACE]
+    /// [TEMPORARY] VIEW [IF NOT EXISTS] name [(col, …)] AS <SELECT>`.
+    /// All keyword prefixes have already been consumed; the flags
+    /// say which were present.
+    fn parse_create_view_after_keyword(
+        &mut self,
+        or_replace: bool,
+        _materialized_unused: bool,
+        temporary: bool,
+    ) -> Result<Statement, ParseError> {
+        let if_not_exists = self.parse_if_not_exists();
+        let name = self.expect_ident_like()?;
+        // Optional `(col, col, …)` rename list.
+        let mut columns: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                let c = self.expect_ident_like()?;
+                columns.push(c);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                return Err(self.err(alloc::format!(
+                    "expected , or ) in VIEW column list, got {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        // Required `AS`.
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS <SELECT …> after CREATE VIEW {name:?}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Body: a regular SELECT statement.
+        let body_stmt = self.parse_select_stmt()?;
+        let Statement::Select(body) = body_stmt else {
+            return Err(self.err(alloc::format!(
+                "CREATE VIEW body must be a SELECT statement, got {body_stmt:?}"
+            )));
+        };
+        Ok(Statement::CreateView(crate::ast::CreateViewStatement {
+            name,
+            or_replace,
+            if_not_exists,
+            temporary,
+            columns,
+            body,
+        }))
     }
 
     /// v7.17.0 — body of `CREATE [TEMPORARY] SEQUENCE`. The
