@@ -1953,6 +1953,67 @@ impl Parser {
         }
     }
 
+    /// v7.17.0 Phase 3.1 — absorb `[NOT] DEFERRABLE [INITIALLY
+    /// {DEFERRED | IMMEDIATE}]` constraint-timing clauses. Each
+    /// clause is fully accepted and discarded — SPG always runs
+    /// constraint checks immediately (single-writer model). The
+    /// loop allows DEFERRABLE and the INITIALLY suffix to appear
+    /// in either order (per the SQL spec they're independent),
+    /// though pg_dump always emits them in the canonical
+    /// `[NOT] DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE}` shape.
+    /// Stops at the first token that isn't part of the clause.
+    fn consume_optional_deferrable_clauses(&mut self) -> Result<(), ParseError> {
+        loop {
+            // Bare `DEFERRABLE` (Phase 3.1 — was hard-error pre-3.1).
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable")) {
+                self.advance();
+                self.consume_optional_initially_clause()?;
+                continue;
+            }
+            // `NOT DEFERRABLE` — already worked pre-3.1.
+            if matches!(self.peek(), Token::Not) {
+                let look = self.tokens.get(self.pos + 1);
+                if matches!(look, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")) {
+                    self.advance(); // NOT
+                    self.advance(); // DEFERRABLE
+                    self.consume_optional_initially_clause()?;
+                    continue;
+                }
+                break;
+            }
+            // Standalone `INITIALLY {DEFERRED|IMMEDIATE}` — PG
+            // accepts this without a leading [NOT] DEFERRABLE
+            // (the timing keyword alone). pg_dump occasionally
+            // emits it on FK constraints that inherit timing.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially")) {
+                self.consume_optional_initially_clause()?;
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    /// Helper for [`consume_optional_deferrable_clauses`]. When the
+    /// next token is `INITIALLY`, consume it plus the required
+    /// `DEFERRED` | `IMMEDIATE` trailer. No-op otherwise.
+    fn consume_optional_initially_clause(&mut self) -> Result<(), ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially")) {
+            return Ok(());
+        }
+        self.advance(); // INITIALLY
+        match self.advance() {
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("deferred") || s.eq_ignore_ascii_case("immediate") =>
+            {
+                Ok(())
+            }
+            other => Err(self.err(alloc::format!(
+                "expected DEFERRED or IMMEDIATE after INITIALLY, got {other:?}"
+            ))),
+        }
+    }
+
     /// v7.17.0 Phase 2.6 — absorb the MySQL view-prefix clauses
     /// that appear between `CREATE` and `VIEW` in mysqldump output:
     ///
@@ -4614,53 +4675,30 @@ impl Parser {
                 parent_columns.len()
             )));
         }
-        // v7.6.7 — accept and reject `[NOT] DEFERRABLE [INITIALLY
-        // {DEFERRED | IMMEDIATE}]` so existing PG dumps don't fail
-        // at parse time. SPG's single-writer model has no deferred
-        // constraint window, so we surface this as a clean
-        // unsupported-feature error rather than a syntax error.
-        loop {
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable")) {
-                return Err(self.err(
-                    "DEFERRABLE constraints are not supported (SPG is single-writer; \
-                     constraints are always evaluated immediately at commit)"
-                        .into(),
-                ));
-            }
-            if matches!(self.peek(), Token::Not) {
-                let look = self.tokens.get(self.pos + 1);
-                if matches!(look, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")) {
-                    // NOT DEFERRABLE — accept as the SPG default
-                    // and consume both tokens silently.
-                    self.advance();
-                    self.advance();
-                    // Optional `INITIALLY IMMEDIATE` clause.
-                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially"))
-                    {
-                        self.advance();
-                        match self.advance() {
-                            Token::Ident(s) if s.eq_ignore_ascii_case("immediate") => {}
-                            other => {
-                                return Err(self.err(format!(
-                                    "expected IMMEDIATE after INITIALLY for NOT DEFERRABLE, \
-                                     got {other:?}"
-                                )));
-                            }
-                        }
-                    }
-                    continue;
-                }
-                break;
-            }
-            break;
-        }
-        // Optional `ON DELETE <action>` and `ON UPDATE <action>` in
-        // either order, each at most once.
+        // v7.6.7 / v7.17.0 Phase 3.1 — interleave `[NOT] DEFERRABLE
+        // [INITIALLY {DEFERRED | IMMEDIATE}]` and `ON DELETE
+        // <action>` / `ON UPDATE <action>` in either order. PG /
+        // pg_dump emits the timing clause AFTER the ON clauses
+        // (`ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED`),
+        // but the SQL spec allows either order. We loop over
+        // every possible trailer and dispatch on the next token,
+        // stopping when nothing matches. Phase 3.1 changes the
+        // bare DEFERRABLE form from hard-error to accept-as-
+        // immediate; SPG is single-writer with no deferred-
+        // constraint window so the runtime semantics are always
+        // immediate even when INITIALLY DEFERRED is requested.
         let mut on_delete = FkAction::Restrict;
         let mut on_update = FkAction::Restrict;
         let mut seen_on_delete = false;
         let mut seen_on_update = false;
         loop {
+            // DEFERRABLE / NOT DEFERRABLE / INITIALLY shapes.
+            let before = self.pos;
+            self.consume_optional_deferrable_clauses()?;
+            if self.pos != before {
+                continue;
+            }
+            // ON DELETE / ON UPDATE.
             if !matches!(self.peek(), Token::On) {
                 break;
             }
