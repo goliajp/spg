@@ -170,6 +170,15 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
         Expr::Binary { lhs, op, rhs } => {
             let l = eval_expr(lhs, row, ctx)?;
             let r = eval_expr(rhs, row, ctx)?;
+            // v7.17.0 Phase 2.5 — collation-aware text comparison.
+            // When either operand of a comparison op references a
+            // column declared `COLLATE "case_insensitive"` (or any
+            // MySQL `_ci` collation), case-fold both sides before
+            // the byte-wise compare so `WHERE name = 'foo'` matches
+            // stored `'Foo'`. Non-Text values fall straight through
+            // — the helper is a no-op outside Text-Text equality
+            // and inequality.
+            let (l, r) = collation_fold_for_compare(*op, lhs, rhs, l, r, ctx);
             apply_binary(*op, l, r)
         }
         Expr::Cast { expr, target } => {
@@ -3389,6 +3398,71 @@ fn literal_to_value(l: &Literal) -> Value {
             micros: *micros,
         },
     }
+}
+
+/// v7.17.0 Phase 2.5 — look up the collation of a column reference
+/// in the current evaluation context. Returns `None` when the
+/// expression is not a column reference (e.g. literal / function
+/// call) or the column can't be resolved (caller falls back to
+/// `Collation::Binary` semantics).
+fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_storage::Collation> {
+    let Expr::Column(c) = e else {
+        return None;
+    };
+    if let Some(q) = &c.qualifier {
+        let composite = alloc::format!("{q}.{name}", name = c.name);
+        if let Some(s) = ctx.columns.iter().find(|s| s.name == composite) {
+            return Some(s.collation);
+        }
+    }
+    if let Some(s) = ctx.columns.iter().find(|s| s.name == c.name) {
+        return Some(s.collation);
+    }
+    // Bare-name fallback for joined schemas (same shape as
+    // resolve_column): match a single composite ending in
+    // ".<name>".
+    let suffix = alloc::format!(".{name}", name = c.name);
+    let mut matches = ctx.columns.iter().filter(|s| s.name.ends_with(&suffix));
+    let first = matches.next();
+    let extra = matches.next();
+    match (first, extra) {
+        (Some(s), None) => Some(s.collation),
+        _ => None,
+    }
+}
+
+/// v7.17.0 Phase 2.5 — if the comparison op is text-equality and
+/// either operand references a CaseInsensitive column, return
+/// ASCII-folded copies of both Text values; otherwise pass
+/// through. Only Eq / NotEq / Lt / LtEq / Gt / GtEq trigger the
+/// fold — relational operators on text still honour collation
+/// the same way (PG semantics). Non-Text values pass through.
+fn collation_fold_for_compare(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    l: Value,
+    r: Value,
+    ctx: &EvalContext<'_>,
+) -> (Value, Value) {
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    ) {
+        return (l, r);
+    }
+    let lhs_col = column_collation(lhs, ctx);
+    let rhs_col = column_collation(rhs, ctx);
+    let ci = matches!(lhs_col, Some(spg_storage::Collation::CaseInsensitive))
+        || matches!(rhs_col, Some(spg_storage::Collation::CaseInsensitive));
+    if !ci {
+        return (l, r);
+    }
+    let fold = |v: Value| match v {
+        Value::Text(s) => Value::Text(s.to_ascii_lowercase()),
+        other => other,
+    };
+    (fold(l), fold(r))
 }
 
 fn resolve_column(c: &ColumnName, row: &Row, ctx: &EvalContext<'_>) -> Result<Value, EvalError> {

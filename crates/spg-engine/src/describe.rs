@@ -81,6 +81,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     user_enum_type: None,
                     user_domain_type: None,
                     on_update_runtime: None,
+                    collation: spg_storage::Collation::Binary,
                 });
             }
         }

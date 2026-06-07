@@ -449,6 +449,54 @@ pub struct ColumnSchema {
     /// "silent ignore" behaviour for snapshots written before
     /// the upgrade.
     pub on_update_runtime: Option<String>,
+    /// v7.17.0 Phase 2.5 — text collation. Pre-2.5 SPG accepted
+    /// `COLLATE <name>` clauses but discarded the name, so a
+    /// column declared `COLLATE "case_insensitive"` (or any
+    /// MySQL `_ci` collation) still compared byte-wise — a
+    /// Tier-S silent failure where `WHERE name = 'foo'` never
+    /// matched stored `'Foo'`. This carries the parser-derived
+    /// classification so the engine's WHERE evaluator can route
+    /// text equality through a case-aware compare. `Binary` (the
+    /// default) preserves the prior byte-wise behaviour. Only
+    /// CaseInsensitive lands in the catalog appendix — Binary
+    /// columns stay implicit, keeping snapshots compact.
+    /// Persisted in catalog FILE_VERSION 34+; older catalogs
+    /// deserialise every column as `Binary`.
+    pub collation: Collation,
+}
+
+/// v7.17.0 Phase 2.5 — column-level text collation. Drives the
+/// engine's WHERE / GROUP BY equality routing for `Value::Text`.
+/// Only two variants are modelled in v7.17:
+///   * `Binary`  — byte-wise comparison (the SPG default;
+///                 matches PG `COLLATE "C"` / `pg_catalog.default`
+///                 and MySQL `*_bin`).
+///   * `CaseInsensitive` — ASCII case-folded comparison
+///                 (matches PG `COLLATE "case_insensitive"` and
+///                 MySQL `*_ci` collations). Non-ASCII bytes
+///                 still compare byte-wise; full ICU folding is
+///                 out of v7.17 scope.
+/// New variants append at the end — older catalogs read missing
+/// columns as `Binary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collation {
+    Binary,
+    CaseInsensitive,
+}
+
+impl Default for Collation {
+    fn default() -> Self {
+        Self::Binary
+    }
+}
+
+impl Collation {
+    /// Wire tag persisted in the FILE_VERSION 34+ catalog appendix.
+    /// Stable: future variants append above the recognised range
+    /// and unknown tags read back as `Binary` for forward-compat
+    /// on rollback.
+    pub const TAG_BINARY: u8 = 0;
+    pub const TAG_CASE_INSENSITIVE: u8 = 1;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5473,6 +5521,7 @@ impl ColumnSchema {
             user_enum_type: None,
             user_domain_type: None,
             on_update_runtime: None,
+            collation: Collation::Binary,
         }
     }
 
@@ -5680,7 +5729,18 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     unchanged — no v32 writer ever emitted tag 5, and FULLTEXT
 ///     KEY was silently dropped pre-v7.17 so no rebuild shim is
 ///     needed for round-tripped catalogs.
-const FILE_VERSION: u8 = 33;
+/// v34 introduces (v7.17.0 Phase 2.5):
+///   * Per-table collation appendix (after the on_update_runtime
+///     appendix). Sparse layout: only columns whose `collation`
+///     is non-Binary land here. `u16 count` then per-binding
+///     `[u16 col_pos][u8 collation_tag]` where the tag matches
+///     `Collation::TAG_*`. Snapshots written by v33-and-below
+///     readers deserialise every column with `collation =
+///     Binary`, preserving the prior byte-wise compare
+///     semantics. Unknown tags read back as Binary too — keeps
+///     a forward-compat path if a future v35 adds variants
+///     and someone rolls back to a v34 reader.
+const FILE_VERSION: u8 = 34;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6079,6 +6139,25 @@ impl Catalog {
             for (pos, expr_src) in on_update_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, expr_src);
+            }
+            // v7.17.0 Phase 2.5 — per-table collation appendix.
+            // Sparse: only non-Binary columns land. Layout:
+            // `[u16 count][u16 col_pos][u8 tag] × count`.
+            let mut coll_bindings: Vec<(usize, u8)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                let tag = match c.collation {
+                    Collation::Binary => continue,
+                    Collation::CaseInsensitive => Collation::TAG_CASE_INSENSITIVE,
+                };
+                coll_bindings.push((i, tag));
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(coll_bindings.len()).expect("≤ 65k collation bindings/table"),
+            );
+            for (pos, tag) in coll_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                out.push(tag);
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
@@ -6529,6 +6608,7 @@ fn deserialize_table(
             user_enum_type: None,
             user_domain_type: None,
             on_update_runtime: None,
+            collation: Collation::Binary,
         });
     }
     let n_cols = cols.len();
@@ -6687,6 +6767,25 @@ fn deserialize_table(
             let expr_src = cur.read_str()?;
             if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
                 col.on_update_runtime = Some(expr_src);
+            }
+        }
+    }
+    // v7.17.0 Phase 2.5 — per-table collation appendix
+    // (FILE_VERSION 34+). Sparse: only non-Binary columns
+    // land. v33-and-below readers leave every column at its
+    // ColumnSchema::new default (Binary). Unknown tags from a
+    // forward-incompat snapshot read back as Binary.
+    if version >= 34 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let tag = cur.read_u8()?;
+            let collation = match tag {
+                Collation::TAG_CASE_INSENSITIVE => Collation::CaseInsensitive,
+                _ => Collation::Binary,
+            };
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.collation = collation;
             }
         }
     }
