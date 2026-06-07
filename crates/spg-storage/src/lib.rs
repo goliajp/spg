@@ -3319,6 +3319,12 @@ pub struct Catalog {
     /// Persisted in catalog FILE_VERSION 26+; older catalogs
     /// deserialise with an empty map.
     sequences: BTreeMap<String, SequenceDef>,
+    /// v7.17.0 — catalogued VIEW objects (Phase 1.2). Each
+    /// `SELECT FROM v` at engine exec-time looks up `v` here and
+    /// prepends the view body as a synthetic CTE. Persisted in
+    /// catalog FILE_VERSION 27+; older catalogs deserialise with
+    /// an empty map.
+    views: BTreeMap<String, ViewDef>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -3419,6 +3425,24 @@ pub enum SequenceDataType {
     BigInt,
 }
 
+/// v7.17.0 Phase 1.2 — catalogued VIEW. The body is stored as the
+/// raw source text the parser saw between `AS` and the statement
+/// terminator; the engine re-parses on each invocation. Same
+/// pattern as `FunctionDef` — keeps `spg-storage` free of
+/// `spg-sql` dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    pub name: String,
+    /// Optional `(col, col, …)` rename list. Empty when the body's
+    /// projected names are used directly.
+    pub columns: Vec<String>,
+    /// Raw SELECT source. Display-rendered at storage time so the
+    /// catalog round-trips a deterministic form regardless of
+    /// whitespace / comments in the original input. Re-parsed at
+    /// SELECT-from-view time to materialise as a synthetic CTE.
+    pub body: String,
+}
+
 impl SequenceDataType {
     /// PG default min/max per AS clause.
     pub fn default_bounds(self, increment_positive: bool) -> (i64, i64) {
@@ -3457,6 +3481,7 @@ impl Catalog {
             functions: BTreeMap::new(),
             triggers: Vec::new(),
             sequences: BTreeMap::new(),
+            views: BTreeMap::new(),
         }
     }
 
@@ -3614,6 +3639,58 @@ impl Catalog {
         seq.last_value = value;
         seq.is_called = is_called;
         Ok(value)
+    }
+
+    /// v7.17.0 Phase 1.2 — read-only handle to catalogued views.
+    pub const fn views(&self) -> &BTreeMap<String, ViewDef> {
+        &self.views
+    }
+
+    /// v7.17.0 Phase 1.2 — install a VIEW. `or_replace=true`
+    /// overwrites an existing entry; `if_not_exists=true` is a
+    /// silent no-op when the name is taken. Errors if both flags
+    /// are off and the name collides.
+    pub fn create_view(
+        &mut self,
+        def: ViewDef,
+        or_replace: bool,
+        if_not_exists: bool,
+    ) -> Result<(), StorageError> {
+        if self.views.contains_key(&def.name) {
+            if or_replace {
+                self.views.insert(def.name.clone(), def);
+                return Ok(());
+            }
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "view {:?} already exists",
+                def.name
+            )));
+        }
+        // Reject name collision with tables / sequences — same
+        // namespace per PG.
+        if self.by_name.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "view {:?} would shadow an existing table",
+                def.name
+            )));
+        }
+        if self.sequences.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "view {:?} would shadow an existing sequence",
+                def.name
+            )));
+        }
+        self.views.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.2 — remove a view by name. Returns true if
+    /// a view was removed.
+    pub fn drop_view(&mut self, name: &str) -> bool {
+        self.views.remove(name).is_some()
     }
 
     /// v7.17.0 — ALTER SEQUENCE option merge. Caller-provided
@@ -5126,7 +5203,13 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     `owned_by_tag u8` (0=NONE, 1=Column → `table`,`column`),
 ///     `last_value i64`, `is_called u8`. v25-and-below catalogs
 ///     deserialise with an empty sequences map.
-const FILE_VERSION: u8 = 26;
+/// v27 introduces (v7.17.0 Phase 1.2):
+///   * Trailing VIEW catalog block after sequences. Encoded as
+///     `u32 count` followed by per-view:
+///     `name`, `column_count u16`, then column names, then
+///     `body` long-string. v26-and-below catalogs deserialise
+///     with an empty views map.
+const FILE_VERSION: u8 = 27;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5532,6 +5615,22 @@ impl Catalog {
             out.extend_from_slice(&seq.last_value.to_le_bytes());
             out.push(u8::from(seq.is_called));
         }
+        // v7.17.0 Phase 1.2 — VIEW catalog block (FILE_VERSION 27+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.views.len()).expect("≤ 4G views"),
+        );
+        for view in self.views.values() {
+            write_str(&mut out, &view.name);
+            write_u16(
+                &mut out,
+                u16::try_from(view.columns.len()).expect("≤ 65k cols / view"),
+            );
+            for c in &view.columns {
+                write_str(&mut out, c);
+            }
+            write_str_long(&mut out, &view.body);
+        }
         out
     }
 
@@ -5674,6 +5773,28 @@ impl Catalog {
                         owned_by,
                         last_value,
                         is_called,
+                    },
+                );
+            }
+        }
+        // v7.17.0 Phase 1.2 — VIEW block (FILE_VERSION 27+).
+        // v26-and-below catalogs omit; we leave the map empty.
+        if version >= 27 {
+            let view_count = cur.read_u32()? as usize;
+            for _ in 0..view_count {
+                let name = cur.read_str()?;
+                let col_count = cur.read_u16()? as usize;
+                let mut columns = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    columns.push(cur.read_str()?);
+                }
+                let body = cur.read_str_long()?;
+                cat.views.insert(
+                    name.clone(),
+                    ViewDef {
+                        name,
+                        columns,
+                        body,
                     },
                 );
             }

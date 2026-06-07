@@ -1833,6 +1833,10 @@ impl Engine {
             Statement::DropSequence { names, if_exists } => {
                 self.exec_drop_sequence(&names, if_exists)
             }
+            Statement::CreateView(s) => self.exec_create_view(s),
+            Statement::DropView { names, if_exists } => {
+                self.exec_drop_view(&names, if_exists)
+            }
             Statement::ResetParameter(target) => {
                 match target {
                     None => self.session_params.clear(),
@@ -3213,6 +3217,112 @@ impl Engine {
                 "unknown sequence op {other:?}"
             ))),
         }
+    }
+
+    /// v7.17.0 Phase 1.2 — find every catalog VIEW referenced in
+    /// the SELECT's FROM / JOIN graph, re-parse each view's body
+    /// source, and prepend it as a synthetic CTE on the
+    /// returned SelectStatement. Returns `None` when no view
+    /// references are found (caller proceeds with the original
+    /// statement); returns `Some(rewritten)` otherwise (caller
+    /// re-runs exec_select_cancel on the rewritten form so the
+    /// regular CTE materialiser handles it).
+    fn expand_views_in_select(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<SelectStatement>, EngineError> {
+        let cat = self.active_catalog();
+        let mut referenced: Vec<String> = Vec::new();
+        if let Some(from) = &stmt.from {
+            collect_view_refs(&from.primary, cat, &mut referenced);
+            for j in &from.joins {
+                collect_view_refs(&j.table, cat, &mut referenced);
+            }
+        }
+        // Don't expand a view name that's already shadowed by a
+        // CTE on the same SELECT — the CTE wins per PG.
+        referenced.retain(|n| !stmt.ctes.iter().any(|c| c.name == *n));
+        if referenced.is_empty() {
+            return Ok(None);
+        }
+        let mut new_ctes: Vec<spg_sql::ast::Cte> = Vec::with_capacity(referenced.len());
+        for name in &referenced {
+            let view = cat.views().get(name).ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "view {name:?} disappeared mid-expansion"
+                )))
+            })?;
+            let parsed = spg_sql::parser::parse_statement(&view.body).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "view {name:?} body re-parse failed: {e}"
+                ))
+            })?;
+            let Statement::Select(body) = parsed else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "view {name:?} body is not a SELECT (catalog corruption)"
+                )));
+            };
+            new_ctes.push(spg_sql::ast::Cte {
+                name: name.clone(),
+                body,
+                recursive: false,
+                column_overrides: view.columns.clone(),
+            });
+        }
+        let mut out = stmt.clone();
+        // Prepend so view CTEs are visible to caller-supplied CTEs.
+        new_ctes.extend(out.ctes.into_iter());
+        out.ctes = new_ctes;
+        Ok(Some(out))
+    }
+
+    /// v7.17.0 Phase 1.2 — `CREATE VIEW` engine path. Stores the
+    /// Display-rendered body verbatim in the catalog; SELECT-from-
+    /// view at exec time re-parses + prepends as a synthetic CTE.
+    fn exec_create_view(
+        &mut self,
+        s: spg_sql::ast::CreateViewStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Render the SELECT body to canonical form so the catalog
+        // round-trips a deterministic source (no whitespace /
+        // comment surprises in the on-disk snapshot).
+        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body));
+        let def = spg_storage::ViewDef {
+            name: s.name.clone(),
+            columns: s.columns,
+            body: body_repr,
+        };
+        self.active_catalog_mut()
+            .create_view(def, s.or_replace, s.if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.2 — `DROP VIEW [IF EXISTS] name [, name…]`.
+    fn exec_drop_view(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_view(name);
+            if !was_present && !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("view {name:?} does not exist"),
+                )));
+            }
+            if was_present {
+                removed += 1;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
     }
 
     /// v7.17.0 — `DROP SEQUENCE [IF EXISTS] name [, name…]`.
@@ -5692,6 +5802,17 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.17.0 Phase 1.2 — user-defined VIEW expansion. If the
+        // FROM / JOIN graph references any catalogued view name,
+        // re-parse the view body and prepend it as a synthetic
+        // CTE. Recurses on views-in-views via the regular CTE
+        // dispatch below. Fast-path: skip the walker entirely when
+        // the catalog has no views (the typical OLTP load).
+        if !self.active_catalog().views().is_empty() {
+            if let Some(rewritten) = self.expand_views_in_select(stmt)? {
+                return self.exec_select_cancel(&rewritten, cancel);
+            }
+        }
         // v7.16.2 — information_schema / pg_catalog virtual
         // views (mailrs round-10 A.3). If the SELECT touches a
         // synthetic meta-table name (`__spg_info_*` /
@@ -8550,6 +8671,26 @@ fn materialise_meta_view(
 /// parser produces these for `information_schema.X` /
 /// `pg_catalog.X`). Used by `exec_select_cancel` to short-
 /// circuit into the meta-view materialisation path.
+/// v7.17.0 Phase 1.2 — append the names of any catalog-known
+/// views referenced by `tref` to `into`. Helper for
+/// `Engine::expand_views_in_select`. A view that's been already
+/// materialised as a table (e.g. via the synthetic CTE pass for
+/// SELECT FROM v) is skipped — the table form wins so the
+/// recursive exec_select_cancel call inside exec_with_ctes
+/// doesn't re-expand and trigger the CTE-shadow guard.
+fn collect_view_refs(
+    tref: &spg_sql::ast::TableRef,
+    cat: &spg_storage::Catalog,
+    into: &mut Vec<String>,
+) {
+    if cat.views().contains_key(&tref.name)
+        && cat.get(&tref.name).is_none()
+        && !into.iter().any(|n| n == &tref.name)
+    {
+        into.push(tref.name.clone());
+    }
+}
+
 fn select_references_meta_view(stmt: &SelectStatement) -> bool {
     fn is_meta(name: &str) -> bool {
         name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")

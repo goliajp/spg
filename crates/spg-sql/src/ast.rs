@@ -227,6 +227,22 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
+    /// v7.17.0 Phase 1.2 — `CREATE [OR REPLACE] [TEMPORARY] VIEW
+    /// [IF NOT EXISTS] name [(col, …)] AS <SELECT …>`. Closes the
+    /// silent-no-op VIEW story from the v7.17 customer-readiness
+    /// audit: pre-v7.17 SPG parsed CREATE VIEW as Statement::Empty
+    /// so any downstream `SELECT FROM v` errored with table-not-
+    /// found. The view body is stored verbatim; SELECT FROM <v>
+    /// rewrites at exec-time by prepending the view body as a
+    /// synthetic CTE.
+    CreateView(CreateViewStatement),
+    /// v7.17.0 Phase 1.2 — `DROP VIEW [IF EXISTS] name [, name…]
+    /// [CASCADE | RESTRICT]`. Removes the matching view from the
+    /// catalog; CASCADE/RESTRICT parsed silently.
+    DropView {
+        names: Vec<String>,
+        if_exists: bool,
+    },
 }
 
 /// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
@@ -308,6 +324,22 @@ pub enum SeqBound {
 pub enum SequenceOwnedBy {
     None,
     Column { table: String, column: String },
+}
+
+/// v7.17.0 Phase 1.2 — `CREATE VIEW` AST node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStatement {
+    pub name: String,
+    pub or_replace: bool,
+    pub if_not_exists: bool,
+    pub temporary: bool,
+    /// Optional `(col, col, …)` rename list. When non-empty,
+    /// these override the body's projected column names per-
+    /// position at SELECT-from-view time.
+    pub columns: Vec<String>,
+    /// Underlying SELECT. Re-parsed lazily at SELECT-from-view
+    /// time to materialise the view as a synthetic CTE.
+    pub body: SelectStatement,
 }
 
 /// v7.17.0 — `ALTER SEQUENCE` AST node.
@@ -1987,7 +2019,49 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::CreateView(v) => v.fmt(f),
+            Self::DropView { names, if_exists } => {
+                f.write_str("DROP VIEW ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+impl fmt::Display for CreateViewStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.or_replace {
+            f.write_str("OR REPLACE ")?;
+        }
+        if self.temporary {
+            f.write_str("TEMPORARY ")?;
+        }
+        f.write_str("VIEW ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        if !self.columns.is_empty() {
+            f.write_str(" (")?;
+            for (i, c) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        write!(f, " AS {}", self.body)
     }
 }
 
