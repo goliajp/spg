@@ -1266,6 +1266,37 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // (no precision loss). Fractional exponent → exp(y*ln(x))
         // via the no_std exp/ln series helpers.
         // x=0 with negative y → error (1/0). NULL → NULL.
+        // PG `sqrt(x)` — square root. Negative input → error.
+        "sqrt" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "sqrt() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                v => {
+                    let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "sqrt() needs numeric, got {:?}",
+                            v.data_type()
+                        ),
+                    })?;
+                    if x < 0.0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "sqrt(): negative input outside real domain".into(),
+                        });
+                    }
+                    if x == 0.0 {
+                        return Ok(Value::Float(0.0));
+                    }
+                    Ok(Value::Float(f64_sqrt(x)))
+                }
+            }
+        }
         "power" | "pow" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -3338,6 +3369,31 @@ fn f64_trunc(x: f64) -> f64 {
         return x;
     }
     (x as i64) as f64
+}
+
+/// no_std `f64::sqrt(x)` — square root via Newton's method
+/// (Babylonian). Gives EXACT results for perfect squares
+/// because the iteration converges to bit-exact precision in
+/// floating-point. x must be non-negative (caller's contract).
+fn f64_sqrt(x: f64) -> f64 {
+    if x == 0.0 || x.is_nan() {
+        return x;
+    }
+    if x.is_infinite() {
+        return x;
+    }
+    // Initial guess via bit manipulation of the exponent: divide
+    // the exponent by 2. Avoids needing a logarithm for the
+    // seed and converges in ~5 iterations.
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let new_exp = (exp / 2) + 1023;
+    let mut guess = f64::from_bits(((new_exp as u64) & 0x7ff) << 52);
+    // 5 Newton iterations are MORE than enough for f64 precision.
+    for _ in 0..8 {
+        guess = 0.5 * (guess + x / guess);
+    }
+    guess
 }
 
 /// no_std `f64::exp(x)` — e^x via range-reduction + Taylor
