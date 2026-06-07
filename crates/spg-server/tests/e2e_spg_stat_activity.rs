@@ -158,5 +158,5 @@ fn columns_match_design() {
     let rd = msgs.iter().find(|m| m.ty == b'T').expect("RowDescription");
     // Body: [u16 cell_count] [name\0 ...] per column.
     let cell_count = u16::from_be_bytes([rd.body[0], rd.body[1]]) as usize;
-    assert_eq!(cell_count, 7, "spg_stat_activity has 7 columns");
+    assert_eq!(cell_count, 8, "spg_stat_activity has 8 columns");
 }

@@ -351,6 +351,11 @@ pub(crate) struct ConnState {
     pub(crate) wait_event: AtomicU8,
     pub(crate) last_query_start_us: AtomicI64,
     pub(crate) in_transaction: AtomicBool,
+    /// v7.17 Phase 2.4 — startup-param `application_name` (or the
+    /// last value the client sent via `SET application_name = '...'`).
+    /// Session-scoped per PG semantics; SET LOCAL is not honored
+    /// because PG itself treats this GUC as session-only.
+    pub(crate) application_name: RwLock<String>,
 }
 
 impl ConnState {
@@ -463,6 +468,11 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
         .iter()
         .map(|c| {
             let current_sql = c.current_sql.read().map(|g| g.clone()).unwrap_or_default();
+            let application_name = c
+                .application_name
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
             spg_engine::ActivityRow {
                 pid: c.pid,
                 user: c.user.clone(),
@@ -471,6 +481,7 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
                 wait_event: c.wait_event_str().to_string(),
                 elapsed_us: c.elapsed_us(),
                 in_transaction: c.in_transaction.load(Ordering::Relaxed),
+                application_name,
             }
         })
         .collect()
