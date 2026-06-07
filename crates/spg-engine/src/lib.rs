@@ -6746,6 +6746,159 @@ impl Engine {
         })
     }
 
+    /// v7.17.0 Phase 3.10 — `FROM generate_series(start, stop [,
+    /// step])` set-returning source. Mirrors `exec_select_unnest`'s
+    /// shape: evaluate the arg list once against an empty row,
+    /// materialise the row stream by stepping start → stop, then
+    /// route through the standard WHERE / projection / ORDER BY /
+    /// LIMIT pipeline. Two arg-type combos in v7.17:
+    ///   * integer / integer [/ integer] — SmallInt, Int, BigInt
+    ///     (widened to BigInt internally; step defaults to 1)
+    ///   * timestamp / timestamp / interval — date-range
+    ///     iteration (mailrs's daily-report pattern)
+    fn exec_select_generate_series(
+        &self,
+        stmt: &SelectStatement,
+        primary: &TableRef,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let args = primary
+            .generate_series_args
+            .as_ref()
+            .expect("caller guards generate_series_args.is_some()");
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = EvalContext::new(&empty_schema, None);
+        let dummy_row = Row::new(alloc::vec::Vec::new());
+        let mut arg_values: alloc::vec::Vec<Value> = alloc::vec::Vec::with_capacity(args.len());
+        for a in args {
+            arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
+        }
+        // Dispatch on the start value's shape. Reject mixed-shape
+        // calls early (e.g. start = timestamp, stop = integer) so
+        // the caller gets a clean error rather than a panic.
+        let (elem_dtype, rows) = match arg_values.as_slice() {
+            [Value::Timestamp(start), Value::Timestamp(stop), step] => {
+                let interval_step = match step {
+                    Value::Interval { .. } => step.clone(),
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "generate_series(timestamp, timestamp, …): \
+                             step must be INTERVAL, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                };
+                let rows = generate_series_timestamps(*start, *stop, interval_step, &cancel)?;
+                (DataType::Timestamp, rows)
+            }
+            [start, stop, step]
+                if value_is_integer(start)
+                    && value_is_integer(stop)
+                    && value_is_integer(step) =>
+            {
+                let s = value_to_i64(start);
+                let e = value_to_i64(stop);
+                let st = value_to_i64(step);
+                let rows = generate_series_integers(s, e, st, &cancel)?;
+                (DataType::BigInt, rows)
+            }
+            [start, stop] if value_is_integer(start) && value_is_integer(stop) => {
+                let s = value_to_i64(start);
+                let e = value_to_i64(stop);
+                let rows = generate_series_integers(s, e, 1, &cancel)?;
+                (DataType::BigInt, rows)
+            }
+            _ => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
+                     argument shapes; got {:?}",
+                    arg_values.iter().map(|v| v.data_type()).collect::<alloc::vec::Vec<_>>()
+                )));
+            }
+        };
+        let alias = primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| "generate_series".to_string());
+        let col_name = alias.clone();
+        let col_schema = ColumnSchema::new(col_name, elem_dtype, true);
+        let schema_cols = alloc::vec![col_schema.clone()];
+        let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
+        // WHERE.
+        let filtered: alloc::vec::Vec<Row> = if let Some(w) = &stmt.where_ {
+            let mut out = alloc::vec::Vec::with_capacity(rows.len());
+            for row in rows {
+                cancel.check()?;
+                let v = eval::eval_expr(w, &row, &scan_ctx).map_err(EngineError::Eval)?;
+                if matches!(v, Value::Bool(true)) {
+                    out.push(row);
+                }
+            }
+            out
+        } else {
+            rows
+        };
+        // Projection.
+        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let mut projected_rows: alloc::vec::Vec<Row> =
+            alloc::vec::Vec::with_capacity(filtered.len());
+        for row in &filtered {
+            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+            for p in &projection {
+                vals.push(eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?);
+            }
+            projected_rows.push(Row::new(vals));
+        }
+        let columns: alloc::vec::Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+        // ORDER BY against the source schema.
+        if !stmt.order_by.is_empty() {
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value>)> = filtered
+                .iter()
+                .enumerate()
+                .map(|(i, r)| -> Result<_, EngineError> {
+                    let keys: Result<Vec<Value>, EngineError> = stmt
+                        .order_by
+                        .iter()
+                        .map(|ob| {
+                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
+                        })
+                        .collect();
+                    Ok((i, keys?))
+                })
+                .collect::<Result<_, _>>()?;
+            indexed.sort_by(|a, b| {
+                for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
+                    let mut cmp = value_cmp(ka, kb);
+                    if stmt.order_by[idx].desc {
+                        cmp = cmp.reverse();
+                    }
+                    if cmp != core::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            projected_rows = indexed
+                .into_iter()
+                .map(|(i, _)| projected_rows[i].clone())
+                .collect();
+        }
+        if let Some(offset) = stmt.offset_literal() {
+            let off = (offset as usize).min(projected_rows.len());
+            projected_rows.drain(..off);
+        }
+        if let Some(limit) = stmt.limit_literal() {
+            projected_rows.truncate(limit as usize);
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: projected_rows,
+        })
+    }
+
     fn exec_bare_select_cancel(
         &self,
         stmt: &SelectStatement,
@@ -6804,6 +6957,14 @@ impl Engine {
         // catalog, then route to the regular scan path.
         if from.primary.unnest_expr.is_some() {
             return self.exec_select_unnest(stmt, &from.primary, cancel);
+        }
+        // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
+        // [, step])` set-returning source. Dispatch mirrors UNNEST:
+        // materialise the row stream from a single eval pass, then
+        // run the regular projection / WHERE / ORDER BY / LIMIT
+        // pipeline over the synthetic single-column table.
+        if from.primary.generate_series_args.is_some() {
+            return self.exec_select_generate_series(stmt, &from.primary, cancel);
         }
         let primary = &from.primary;
         let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
@@ -10012,6 +10173,128 @@ fn order_key_cmp(a: &[(Value, bool)], b: &[(Value, bool)]) -> core::cmp::Orderin
         }
     }
     a.len().cmp(&b.len())
+}
+
+/// v7.17.0 Phase 3.10 — true when the Value is one of the
+/// integer-shaped variants `generate_series` accepts as a start
+/// / stop / step component. Float / NUMERIC are rejected — PG's
+/// `generate_series(numeric, numeric)` overload is out of v7.17
+/// scope.
+const fn value_is_integer(v: &Value) -> bool {
+    matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
+}
+
+/// v7.17.0 Phase 3.10 — widen any integer-shaped Value to i64 for
+/// the generate_series iteration loop. Non-integer inputs panic;
+/// caller guards via `value_is_integer`.
+const fn value_to_i64(v: &Value) -> i64 {
+    match v {
+        Value::SmallInt(n) => *n as i64,
+        Value::Int(n) => *n as i64,
+        Value::BigInt(n) => *n,
+        _ => panic!("value_to_i64 called on non-integer Value"),
+    }
+}
+
+/// v7.17.0 Phase 3.10 — integer-mode generate_series materialiser.
+/// Step direction follows the sign: positive step iterates upward
+/// (stops when current > stop); negative iterates downward; zero
+/// errors. Caller-facing row stream is `BigInt`-typed so a single
+/// projection schema covers SmallInt / Int / BigInt callers.
+fn generate_series_integers(
+    start: i64,
+    stop: i64,
+    step: i64,
+    cancel: &CancelToken<'_>,
+) -> Result<alloc::vec::Vec<Row>, EngineError> {
+    if step == 0 {
+        return Err(EngineError::Unsupported(
+            "generate_series(): step argument cannot be zero".into(),
+        ));
+    }
+    let mut out = alloc::vec::Vec::new();
+    let mut cur = start;
+    // Hard cap to keep a runaway call from eating all memory. PG
+    // has no such cap but does honour query timeout; SPG's cancel
+    // token will fire too — this is a defense-in-depth backstop.
+    const MAX_ROWS: usize = 10_000_000;
+    loop {
+        cancel.check()?;
+        if step > 0 && cur > stop {
+            break;
+        }
+        if step < 0 && cur < stop {
+            break;
+        }
+        out.push(Row::new(alloc::vec![Value::BigInt(cur)]));
+        if out.len() > MAX_ROWS {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "generate_series(): exceeded {MAX_ROWS} rows; \
+                 narrow start/stop or use a larger step"
+            )));
+        }
+        cur = match cur.checked_add(step) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+    Ok(out)
+}
+
+/// v7.17.0 Phase 3.10 — timestamp-mode generate_series. step is a
+/// `Value::Interval { months, micros }` per the caller's guard;
+/// each iteration adds the interval via `apply_binary_interval`
+/// so month-shifting handles short-month rollover (PG semantics).
+fn generate_series_timestamps(
+    start: i64,
+    stop: i64,
+    step: Value,
+    cancel: &CancelToken<'_>,
+) -> Result<alloc::vec::Vec<Row>, EngineError> {
+    let (months, micros) = match &step {
+        Value::Interval { months, micros } => (*months, *micros),
+        _ => unreachable!("caller guards step.is_interval"),
+    };
+    if months == 0 && micros == 0 {
+        return Err(EngineError::Unsupported(
+            "generate_series(): INTERVAL step cannot be zero".into(),
+        ));
+    }
+    let ascending = months > 0 || micros > 0;
+    let mut out = alloc::vec::Vec::new();
+    let mut cur = Value::Timestamp(start);
+    const MAX_ROWS: usize = 10_000_000;
+    loop {
+        cancel.check()?;
+        let cur_t = match cur {
+            Value::Timestamp(t) => t,
+            _ => unreachable!("loop invariant: cur is Timestamp"),
+        };
+        if ascending && cur_t > stop {
+            break;
+        }
+        if !ascending && cur_t < stop {
+            break;
+        }
+        out.push(Row::new(alloc::vec![Value::Timestamp(cur_t)]));
+        if out.len() > MAX_ROWS {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "generate_series(): exceeded {MAX_ROWS} rows; \
+                 narrow start/stop or use a larger step"
+            )));
+        }
+        let next = eval::apply_binary_interval(
+            spg_sql::ast::BinOp::Add,
+            &cur,
+            &Value::Interval { months, micros },
+        )
+        .map_err(EngineError::Eval)?;
+        cur = match next {
+            Some(v) => v,
+            None => break,
+        };
+    }
+    Ok(out)
 }
 
 #[allow(clippy::match_same_arms)] // explicit arms per type document the supported pairs

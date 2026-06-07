@@ -1653,6 +1653,17 @@ pub struct TableRef {
     /// column name for the unnested column. Empty = fall back to
     /// the table alias (pre-v7.13.2 behaviour).
     pub unnest_column_aliases: Vec<String>,
+    /// v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
+    /// [, step])` set-returning source. When `Some`, the engine
+    /// materialises a single-column virtual table by stepping
+    /// `start` to `stop` inclusive. Args are the literal arg list
+    /// (2 for default-step, 3 for explicit-step). Supports:
+    ///   * SmallInt / Int / BigInt with integer step (default = 1)
+    ///   * Timestamp with INTERVAL step (PG date-range pattern)
+    /// Mutually exclusive with `unnest_expr` — both populate the
+    /// same downstream dispatch slot. `name` defaults to
+    /// `"generate_series"` when no alias is provided.
+    pub generate_series_args: Option<Vec<Expr>>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -3576,6 +3587,7 @@ mod tests {
                     as_of_segment: None,
                     unnest_expr: None,
                     unnest_column_aliases: Vec::new(),
+                    generate_series_args: None,
                 },
                 joins: vec![],
             }),
