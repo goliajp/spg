@@ -5466,6 +5466,16 @@ impl Parser {
             // resolver. Literal forms are handled at coerce_value
             // time so the lexer stays untouched.
             "bytea" | "bytes" => ColumnTypeName::Bytes,
+            // v7.17.0 Phase 7 — PG network address types
+            // (`inet`, `cidr`, `macaddr`). pg_dump / Django ORM
+            // emit these for IP-address columns; pre-7 SPG
+            // errored with "unknown type", breaking schema
+            // restores. Accept as Text-backed (no new storage
+            // shape): the customer's data round-trips, and the
+            // host() / network() helpers added in the same
+            // phase work textually. Containment operators
+            // `<<=` / `>>=` are out of v7.17 scope.
+            "inet" | "cidr" | "macaddr" => ColumnTypeName::Text,
             // v7.12.0 — PG full-text search types. mailrs G-CRIT-3.
             // The actual `to_tsvector` / `@@` / `ts_rank` surface
             // arrives in v7.12.1+; the type itself loads here so

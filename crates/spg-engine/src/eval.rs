@@ -1159,6 +1159,10 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             }
             crate::json::path_query_array(&args[0], &args[1])
         }
+        // v7.17.0 Phase 7 — INET / CIDR network helpers.
+        "host" => inet_host(args),
+        "network" => inet_network(args),
+        "masklen" => inet_masklen(args),
         // v6.4.3 — encode/decode + error_on_null SQL function bundle.
         "encode" => encode_text(args),
         "decode" => decode_text(args),
@@ -1811,6 +1815,98 @@ fn age(args: &[Value]) -> Result<Value, EvalError> {
 ///   YYYY YY MM Mon Month DD HH24 HH12 MI SS MS US AM PM
 /// Unrecognised characters pass through literally so the template's
 /// punctuation ('-', ':', ' ', '/') needs no escape mechanism.
+// ─── v7.17.0 Phase 7 — INET / CIDR text helpers ───────────────────────
+//
+// SPG stores network address types as Text. The host() / network() /
+// masklen() helpers parse the textual `addr[/mask]` form and return
+// the constituent pieces, matching PG's contract for the dominant
+// customer surface (Django ORM / Rails ORM normalisation).
+
+fn inet_host(args: &[Value]) -> Result<Value, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "host() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    let host = s.split('/').next().unwrap_or("").to_string();
+    Ok(Value::Text(host))
+}
+
+fn inet_network(args: &[Value]) -> Result<Value, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "network() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    // For a `host/mask` form return the masked-network address.
+    // SPG ships the simple "drop trailing octets per byte" path
+    // for IPv4; full bit-level masking is out of v7.17 scope.
+    let mut split = s.splitn(2, '/');
+    let host = split.next().unwrap_or("").to_string();
+    let mask: u32 = split
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(32);
+    if !host.contains('.') {
+        // IPv6 / MACADDR — return the input unmasked.
+        return Ok(Value::Text(s));
+    }
+    let octets: Vec<&str> = host.split('.').collect();
+    if octets.len() != 4 {
+        return Ok(Value::Text(s));
+    }
+    let keep_bytes = ((mask + 7) / 8) as usize;
+    let mut out = alloc::string::String::new();
+    for (i, oct) in octets.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        if i < keep_bytes {
+            out.push_str(oct);
+        } else {
+            out.push('0');
+        }
+    }
+    out.push('/');
+    out.push_str(&mask.to_string());
+    Ok(Value::Text(out))
+}
+
+fn inet_masklen(args: &[Value]) -> Result<Value, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "masklen() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    let mask: i32 = s
+        .splitn(2, '/')
+        .nth(1)
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(32);
+    Ok(Value::Int(mask))
+}
+
 // ─── v7.17.0 Phase 3.7 — minimal POSIX-ERE-shaped regex matcher ───────
 //
 // SPG-engine is `#![no_std]` and has no external regex dependency, so
