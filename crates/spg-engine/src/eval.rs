@@ -1252,6 +1252,38 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // Edge: nullif(NULL, NULL) returns NULL. nullif(NULL, x)
         // returns NULL. nullif(x, NULL) returns x (since NULL is
         // not == to anything per IS DISTINCT FROM semantic, x ≠ NULL).
+        // PG `greatest(...)` / `least(...)` — variadic max/min.
+        // NULL args silently skipped (PG-canonical). All-NULL → NULL.
+        // Cross-type widening for numeric comparisons.
+        "greatest" | "least" => {
+            if args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{lc}() takes at least 1 arg",
+                        lc = if name.eq_ignore_ascii_case("greatest") { "greatest" } else { "least" }
+                    ),
+                });
+            }
+            let non_null: alloc::vec::Vec<&Value> =
+                args.iter().filter(|v| !matches!(v, Value::Null)).collect();
+            if non_null.is_empty() {
+                return Ok(Value::Null);
+            }
+            let is_greatest = name.eq_ignore_ascii_case("greatest");
+            let mut best = non_null[0].clone();
+            for v in &non_null[1..] {
+                let ord = value_cmp_for_min_max(&best, v);
+                let take = if is_greatest {
+                    ord == core::cmp::Ordering::Less
+                } else {
+                    ord == core::cmp::Ordering::Greater
+                };
+                if take {
+                    best = (*v).clone();
+                }
+            }
+            Ok(best)
+        }
         "nullif" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -3083,6 +3115,54 @@ fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Val
         return Ok(Value::Text(String::new()));
     }
     Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// Compare two values for min/max selection. Returns Equal when
+/// values are equal (including cross-numeric-width), Less when
+/// a < b, Greater when a > b. NULL handling is upstream.
+fn value_cmp_for_min_max(a: &Value, b: &Value) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    // Integer-widen first (covers SmallInt vs Int vs BigInt).
+    let a_int = match a {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    let b_int = match b {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    if let (Some(av), Some(bv)) = (a_int, b_int) {
+        return av.cmp(&bv);
+    }
+    // Float-widen.
+    let a_f = value_to_f64(a);
+    let b_f = value_to_f64(b);
+    if let (Some(av), Some(bv)) = (a_f, b_f) {
+        return av.partial_cmp(&bv).unwrap_or(Ordering::Equal);
+    }
+    // Text/Text.
+    match (a, b) {
+        (Value::Text(av), Value::Text(bv)) => av.cmp(bv),
+        (Value::Bytes(av), Value::Bytes(bv)) => av.cmp(bv),
+        _ => Ordering::Equal,
+    }
+}
+
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(x) => Some(*x),
+        Value::SmallInt(x) => Some(f64::from(*x)),
+        Value::Int(x) => Some(f64::from(*x)),
+        Value::BigInt(x) => Some(*x as f64),
+        Value::Numeric { scaled, scale } => {
+            Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+        }
+        _ => None,
+    }
 }
 
 /// PG-style equality for nullif. Handles cross-numeric-width
