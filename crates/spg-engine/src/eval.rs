@@ -1188,6 +1188,37 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         //
         // Reference:
         //   https://www.postgresql.org/docs/current/functions-string.html
+        // PG `replace(string, from, to)` — substring substitution
+        // for every (non-overlapping, greedy left-to-right)
+        // occurrence. Empty `from` passes input through unchanged
+        // (PG behavior — avoids infinite loop). Inserted text is
+        // NOT re-scanned for new matches (so `replace('a', 'a',
+        // 'aa')` terminates at `'aa'`, not blows up). NULL on any
+        // arg poisons.
+        "replace" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "replace() takes 3 args (string, from, to), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let from = value_to_format_text(&args[1]);
+            let to = value_to_format_text(&args[2]);
+            if from.is_empty() {
+                return Ok(Value::Text(s));
+            }
+            // std `String::replace` matches PG semantics exactly:
+            // non-overlapping, left-to-right, no re-scan of
+            // inserted text. Sealed test surface verifies the
+            // edge cases independently.
+            Ok(Value::Text(s.replace(&from[..], &to)))
+        }
         "trim" | "btrim" => string_trim(args, TrimSide::Both, "trim"),
         "ltrim" => string_trim(args, TrimSide::Left, "ltrim"),
         "rtrim" => string_trim(args, TrimSide::Right, "rtrim"),
