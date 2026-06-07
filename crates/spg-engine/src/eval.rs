@@ -1985,13 +1985,41 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                 ),
             }),
         },
-        // v7.9.26 — `::regtype` / `::regclass`. SPG has no
-        // pg_catalog; surface a clear error.
-        CastTarget::RegType | CastTarget::RegClass => Err(EvalError::TypeMismatch {
-            detail: "::regtype / ::regclass not supported on SPG \
-                 (no pg_catalog); use SHOW TABLES / spg_table_ddl instead"
-                .into(),
-        }),
+        // v7.17.0 Phase 5.3 — `::regtype` / `::regclass`. PG
+        // semantics: each is a textual catalog-name surfacing as
+        // a numeric OID at the wire layer that renders back as
+        // the original name. SPG has no OID space, but pg_dump /
+        // mailrs / Django code uses the cast purely for textual
+        // round-trip — feeding `'public.t'::regclass::text` into
+        // a downstream `format(…)` or string concat. We map to
+        // that textual contract: Text in → Text out (the schema-
+        // qualifier `public.` is stripped to match PG's default
+        // search_path-aware rendering); numeric in → re-cast to
+        // Text as best-effort; anything else errors.
+        //
+        // Pre-3.3 / pre-5.3 (v7.9.26) the cast surfaced a clean
+        // error; this lifts to accept-and-textify so the dominant
+        // dump-loader pattern unblocks. SPG-shaped queries that
+        // genuinely need an OID for runtime joins are still
+        // documented as unsupported.
+        CastTarget::RegType | CastTarget::RegClass => match v {
+            Value::Text(s) => {
+                // Strip an optional `<schema>.` prefix — PG's
+                // regclass render drops it when the schema is on
+                // the search_path; SPG is single-schema so
+                // dropping is always safe.
+                let bare = s.rsplit('.').next().unwrap_or(&s).to_string();
+                Ok(Value::Text(bare))
+            }
+            Value::Int(n) => Ok(Value::Text(alloc::format!("{n}"))),
+            Value::BigInt(n) => Ok(Value::Text(alloc::format!("{n}"))),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::regtype / ::regclass accepts TEXT (name) or integer (oid), got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
         // v7.10.11 — `::TEXT[]`. Decode PG external array form
         // when input is Text; pass through unchanged when it is
         // already TextArray. Anything else is a type mismatch.
