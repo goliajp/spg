@@ -1195,6 +1195,61 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // NOT re-scanned for new matches (so `replace('a', 'a',
         // 'aa')` terminates at `'aa'`, not blows up). NULL on any
         // arg poisons.
+        // PG `split_part(string, delimiter, n)` — split on delim,
+        // return the n-th field (1-indexed). Negative n counts
+        // from the end (PG 14+). Out-of-range n → '' (NOT NULL).
+        // n = 0 → error. Empty delimiter → error. NULL on any
+        // arg → NULL.
+        "split_part" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "split_part() takes 3 args (string, delim, n), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let delim = value_to_format_text(&args[1]);
+            if delim.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "split_part(): delimiter cannot be empty".into(),
+                });
+            }
+            let n = match &args[2] {
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "split_part(): n must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n == 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "split_part(): n must be nonzero (PG: 1-indexed)".into(),
+                });
+            }
+            let parts: alloc::vec::Vec<&str> = s.split(&delim[..]).collect();
+            let total = parts.len() as i64;
+            let idx = if n > 0 {
+                n - 1
+            } else {
+                // n=-1 → last (idx = total - 1)
+                total + n
+            };
+            if idx < 0 || idx >= total {
+                return Ok(Value::Text(String::new()));
+            }
+            Ok(Value::Text(parts[idx as usize].to_string()))
+        }
         "replace" => {
             if args.len() != 3 {
                 return Err(EvalError::TypeMismatch {
