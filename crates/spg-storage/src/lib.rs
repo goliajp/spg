@@ -1973,6 +1973,16 @@ impl Table {
     /// are rebuilt from scratch (cheaper than tracking incremental
     /// shifts across both B-tree and NSW). Returns the number of
     /// rows removed.
+    /// v7.17.0 Phase 1.3 — wipe every row. Used by REFRESH
+    /// MATERIALIZED VIEW; same effect as `delete_rows((0..N).into())`
+    /// but skips the per-position bookkeeping for the all-removed
+    /// fast path. Indices are rebuilt (empty).
+    pub fn truncate(&mut self) {
+        self.rows = PersistentVec::new();
+        self.hot_bytes = 0;
+        self.rebuild_indices();
+    }
+
     pub fn delete_rows(&mut self, positions: &[usize]) -> usize {
         if positions.is_empty() {
             return 0;
@@ -3325,6 +3335,13 @@ pub struct Catalog {
     /// catalog FILE_VERSION 27+; older catalogs deserialise with
     /// an empty map.
     views: BTreeMap<String, ViewDef>,
+    /// v7.17.0 — catalogued MATERIALIZED VIEW source registry
+    /// (Phase 1.3). Maps name → SELECT source. The materialised
+    /// rows themselves live as a regular `Table` with the same
+    /// name; REFRESH re-parses + re-executes the source against
+    /// the table. Persisted in catalog FILE_VERSION 28+;
+    /// older catalogs deserialise with an empty map.
+    materialized_views: BTreeMap<String, String>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -3482,6 +3499,7 @@ impl Catalog {
             triggers: Vec::new(),
             sequences: BTreeMap::new(),
             views: BTreeMap::new(),
+            materialized_views: BTreeMap::new(),
         }
     }
 
@@ -3691,6 +3709,26 @@ impl Catalog {
     /// a view was removed.
     pub fn drop_view(&mut self, name: &str) -> bool {
         self.views.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.3 — read-only handle to the materialised-
+    /// view source registry. Each entry pairs with a regular
+    /// table of the same name that holds the cached rows.
+    pub const fn materialized_views(&self) -> &BTreeMap<String, String> {
+        &self.materialized_views
+    }
+
+    /// v7.17.0 Phase 1.3 — register a source for a materialised
+    /// view. Caller has already created the backing table.
+    pub fn register_materialized_view(&mut self, name: String, body: String) {
+        self.materialized_views.insert(name, body);
+    }
+
+    /// v7.17.0 Phase 1.3 — drop the source registry entry. Returns
+    /// true if a source was unregistered. Caller separately drops
+    /// the backing table.
+    pub fn drop_materialized_view_source(&mut self, name: &str) -> bool {
+        self.materialized_views.remove(name).is_some()
     }
 
     /// v7.17.0 — ALTER SEQUENCE option merge. Caller-provided
@@ -5209,7 +5247,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     `name`, `column_count u16`, then column names, then
 ///     `body` long-string. v26-and-below catalogs deserialise
 ///     with an empty views map.
-const FILE_VERSION: u8 = 27;
+/// v28 introduces (v7.17.0 Phase 1.3):
+///   * Trailing MATERIALIZED VIEW source registry block after
+///     views. Encoded as `u32 count` followed by per-entry:
+///     `name`, `body` long-string. The materialised rows live
+///     as a regular Table of the same name (already covered by
+///     the pre-existing tables block). v27-and-below catalogs
+///     deserialise with an empty map.
+const FILE_VERSION: u8 = 28;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5631,6 +5676,17 @@ impl Catalog {
             }
             write_str_long(&mut out, &view.body);
         }
+        // v7.17.0 Phase 1.3 — MATERIALIZED VIEW source registry
+        // (FILE_VERSION 28+). The backing rows live as a regular
+        // table of the same name already in the tables block.
+        write_u32(
+            &mut out,
+            u32::try_from(self.materialized_views.len()).expect("≤ 4G materialized views"),
+        );
+        for (name, body) in &self.materialized_views {
+            write_str(&mut out, name);
+            write_str_long(&mut out, body);
+        }
         out
     }
 
@@ -5797,6 +5853,16 @@ impl Catalog {
                         body,
                     },
                 );
+            }
+        }
+        // v7.17.0 Phase 1.3 — MATERIALIZED VIEW source registry
+        // (FILE_VERSION 28+). v27-and-below catalogs omit.
+        if version >= 28 {
+            let mv_count = cur.read_u32()? as usize;
+            for _ in 0..mv_count {
+                let name = cur.read_str()?;
+                let body = cur.read_str_long()?;
+                cat.materialized_views.insert(name, body);
             }
         }
         if cur.pos < buf.len() {

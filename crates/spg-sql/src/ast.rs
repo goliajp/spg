@@ -243,6 +243,28 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
+    /// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW [IF NOT
+    /// EXISTS] name [(col, …)] AS <SELECT …> [WITH [NO] DATA]`.
+    /// Closes the silent-no-op MATERIALIZED VIEW story. Storage
+    /// model: the materialised result lives as a regular table
+    /// with the matching name + a parallel
+    /// `materialized_views` registry mapping name → body source
+    /// (used by REFRESH).
+    CreateMaterializedView(CreateMaterializedViewStatement),
+    /// v7.17.0 Phase 1.3 — `REFRESH MATERIALIZED VIEW name [WITH
+    /// [NO] DATA]`. Re-runs the stored body and replaces the
+    /// cached rows. `WITH NO DATA` truncates without re-running.
+    RefreshMaterializedView {
+        name: String,
+        with_data: bool,
+    },
+    /// v7.17.0 Phase 1.3 — `DROP MATERIALIZED VIEW [IF EXISTS]
+    /// name [, name…] [CASCADE | RESTRICT]`. Drops both the
+    /// backing table and the source registry entry.
+    DropMaterializedView {
+        names: Vec<String>,
+        if_exists: bool,
+    },
 }
 
 /// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
@@ -324,6 +346,23 @@ pub enum SeqBound {
 pub enum SequenceOwnedBy {
     None,
     Column { table: String, column: String },
+}
+
+/// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW` AST node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateMaterializedViewStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    /// Optional `(col, col, …)` rename list. Applies to the
+    /// backing table at CREATE / REFRESH time.
+    pub columns: Vec<String>,
+    /// Underlying SELECT. Re-parsed at REFRESH time to rebuild
+    /// the cached rows.
+    pub body: SelectStatement,
+    /// `WITH DATA` (default) = materialise the rows at CREATE
+    /// time. `WITH NO DATA` = create an empty backing table;
+    /// callers must REFRESH before SELECT returns rows.
+    pub with_data: bool,
 }
 
 /// v7.17.0 Phase 1.2 — `CREATE VIEW` AST node.
@@ -2033,7 +2072,53 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::CreateMaterializedView(v) => v.fmt(f),
+            Self::RefreshMaterializedView { name, with_data } => {
+                write!(f, "REFRESH MATERIALIZED VIEW {}", quote_ident(name))?;
+                if !*with_data {
+                    f.write_str(" WITH NO DATA")?;
+                }
+                Ok(())
+            }
+            Self::DropMaterializedView { names, if_exists } => {
+                f.write_str("DROP MATERIALIZED VIEW ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+impl fmt::Display for CreateMaterializedViewStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE MATERIALIZED VIEW ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        if !self.columns.is_empty() {
+            f.write_str(" (")?;
+            for (i, c) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        write!(f, " AS {}", self.body)?;
+        if !self.with_data {
+            f.write_str(" WITH NO DATA")?;
+        }
+        Ok(())
     }
 }
 
