@@ -64,7 +64,7 @@
         { "file": "09_if_ifnull.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 974, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 985, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -183,6 +183,8 @@
         { "file": "58_uuid.test", "pass": 20, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "59_string_agg.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "60_bool_agg.test", "pass": 11, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,

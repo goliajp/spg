@@ -117,6 +117,11 @@ pub fn is_aggregate_name(name: &str) -> bool {
             // aggregate".
             | "string_agg"
             | "array_agg"
+            // v7.17.0 — boolean aggregates. `every` is SQL-standard
+            // alias for `bool_and`.
+            | "bool_and"
+            | "bool_or"
+            | "every"
     )
 }
 
@@ -141,6 +146,10 @@ struct AggState {
     /// non-NULL text it sees, which matches PG's "use the latest
     /// row's value" behaviour.
     separator: Option<String>,
+    /// v7.17.0 — running boolean accumulator for bool_and /
+    /// bool_or / every. `None` until the first non-NULL input;
+    /// at finalize None → SQL NULL.
+    bool_acc: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -395,7 +404,11 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
             let lower = name.to_ascii_lowercase();
             let expected: Option<usize> = match lower.as_str() {
                 "count_star" => Some(0),
-                "count" | "sum" | "avg" | "min" | "max" | "array_agg" => Some(1),
+                "count" | "sum" | "avg" | "min" | "max" | "array_agg"
+                // v7.17.0 — boolean aggregates also take exactly
+                // one arg. `every` is an alias normalised inside
+                // collect_aggregates / rewrite_expr.
+                | "bool_and" | "bool_or" | "every" => Some(1),
                 "string_agg" => Some(2),
                 _ => None,
             };
@@ -453,8 +466,16 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                 } else {
                     None
                 };
+                // v7.17.0 — `every` is the SQL-standard alias for
+                // `bool_and`; collapse at collection time so
+                // update_state / finalize need only one arm.
+                let canonical = if lower == "every" {
+                    "bool_and".to_string()
+                } else {
+                    lower
+                };
                 let spec = AggSpec {
-                    name: lower,
+                    name: canonical,
                     arg: arg.clone(),
                     arg2: arg2.clone(),
                 };
@@ -623,6 +644,45 @@ fn update_state(
             st.items.push(v.clone());
             st.count += 1;
         }
+        // v7.17.0 — bool_and(p): TRUE iff every non-NULL input is
+        // TRUE. NULL skipped; running accumulator stays at TRUE
+        // until the first non-NULL FALSE.
+        "bool_and" => {
+            if is_null {
+                return Ok(());
+            }
+            let b = match v {
+                Value::Bool(b) => *b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "bool_and requires bool, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            st.bool_acc = Some(st.bool_acc.map_or(b, |acc| acc && b));
+        }
+        // v7.17.0 — bool_or(p): TRUE iff any non-NULL input is
+        // TRUE. NULL skipped.
+        "bool_or" => {
+            if is_null {
+                return Ok(());
+            }
+            let b = match v {
+                Value::Bool(b) => *b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "bool_or requires bool, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            st.bool_acc = Some(st.bool_acc.map_or(b, |acc| acc || b));
+        }
         _ => unreachable!("non-aggregate {name} in update_state"),
     }
     Ok(())
@@ -722,6 +782,10 @@ fn finalize(name: &str, st: &AggState) -> Value {
                 }
             }
         }
+        // v7.17.0 — bool_and / bool_or finalize: lazy-init pattern
+        // means `None` is exactly "empty group or all-NULL", which
+        // PG surfaces as SQL NULL.
+        "bool_and" | "bool_or" => st.bool_acc.map_or(Value::Null, Value::Bool),
         _ => unreachable!(),
     }
 }
@@ -742,6 +806,9 @@ fn infer_agg_type(spec: &AggSpec) -> DataType {
         // numeric. Downstream column metadata reports TextArray
         // which is the lowest common denominator.
         "array_agg" => DataType::TextArray,
+        // v7.17.0 — boolean aggregates always return BOOL (nullable
+        // — empty / all-NULL group → NULL).
+        "bool_and" | "bool_or" => DataType::Bool,
         // min/max: we don't know the input type without probing — default
         // to Text and let downstream rendering coerce.
         _ => DataType::Text,
@@ -776,8 +843,16 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             } else {
                 None
             };
+            // v7.17.0 — `every` collapses into `bool_and` at
+            // collection; mirror that here so the rewrite finds
+            // the matching synth column.
+            let canonical: &str = if lower == "every" {
+                "bool_and"
+            } else {
+                lower.as_str()
+            };
             for (i, spec) in aggs.iter().enumerate() {
-                if spec.name == lower && spec.arg == arg && spec.arg2 == arg2 {
+                if spec.name == canonical && spec.arg == arg && spec.arg2 == arg2 {
                     return Expr::Column(spg_sql::ast::ColumnName {
                         qualifier: None,
                         name: format!("__agg_{i}"),
