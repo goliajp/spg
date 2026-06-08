@@ -220,6 +220,8 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
         // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.
         Value::Time(us) => spg_engine::eval::format_time(*us),
+        // v7.17.0 Phase 3.P0-33 — MySQL YEAR 4-digit zero-padded.
+        Value::Year(y) => format!("{y:04}"),
         Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
         Value::Json(s) => s.clone(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side
