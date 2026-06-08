@@ -610,6 +610,9 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v7.17.0 Phase 3.P0-39 — hstore avg ~64 bytes
                 // (k=>v map, varlena).
                 DataType::Hstore => 64,
+                // v7.17.0 Phase 3.P0-40 — 2D arrays avg ~96 bytes
+                // (4×3 matrix × per-element cost).
+                DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => 96,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

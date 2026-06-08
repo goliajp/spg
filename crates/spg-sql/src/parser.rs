@@ -5766,6 +5766,29 @@ impl Parser {
                     )));
                 }
             };
+            // v7.17.0 Phase 3.P0-40 — second `[]` widens 1D → 2D
+            // for INT/TEXT/BIGINT. Anything else is an error.
+            if matches!(self.peek(), Token::LBracket) {
+                self.advance();
+                if !matches!(self.peek(), Token::RBracket) {
+                    return Err(self.err(alloc::format!(
+                        "TYPE[][] second dimension takes no size; got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                ty = match ty {
+                    ColumnTypeName::IntArray => ColumnTypeName::IntArray2D,
+                    ColumnTypeName::BigIntArray => ColumnTypeName::BigIntArray2D,
+                    ColumnTypeName::TextArray => ColumnTypeName::TextArray2D,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "v7.17 2D arrays support INT[][] / BIGINT[][] / \
+                             TEXT[][] only; got {other:?}"
+                        )));
+                    }
+                };
+            }
         }
         Ok((
             ty,

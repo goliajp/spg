@@ -5007,6 +5007,10 @@ fn value_to_text(v: &Value) -> String {
         Value::Range { .. } => crate::format_range_text(v),
         // v7.17.0 Phase 3.P0-39 — Hstore canonical PG text form.
         Value::Hstore(pairs) => crate::format_hstore_text(pairs),
+        // v7.17.0 Phase 3.P0-40 — 2D array canonical PG text form.
+        Value::IntArray2D(rows) => crate::format_int_2d_text_pub(rows),
+        Value::BigIntArray2D(rows) => crate::format_bigint_2d_text_pub(rows),
+        Value::TextArray2D(rows) => crate::format_text_2d_text_pub(rows),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }

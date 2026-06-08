@@ -1435,6 +1435,10 @@ pub enum ColumnTypeName {
     /// v7.17.0 Phase 3.P0-39 PG `hstore` extension type — flat
     /// `text => text` map with NULL value support.
     Hstore,
+    /// v7.17.0 Phase 3.P0-40 — 2D arrays for INT / TEXT / BIGINT.
+    IntArray2D,
+    BigIntArray2D,
+    TextArray2D,
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1498,6 +1502,9 @@ impl fmt::Display for ColumnTypeName {
                 RangeKindAst::Date => "DATERANGE",
             }),
             Self::Hstore => f.write_str("HSTORE"),
+            Self::IntArray2D => f.write_str("INT[][]"),
+            Self::BigIntArray2D => f.write_str("BIGINT[][]"),
+            Self::TextArray2D => f.write_str("TEXT[][]"),
         }
     }
 }
