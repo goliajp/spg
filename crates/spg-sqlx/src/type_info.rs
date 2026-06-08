@@ -65,6 +65,11 @@ pub enum Kind {
     /// int8range / numrange / tsrange / tstzrange / daterange).
     /// Bridges decode into `String` (canonical `[a,b)`).
     Range,
+    /// v7.17.0 Phase 3.P0-39 — PG `hstore` extension type.
+    /// Bridges decode into `String` (canonical `"k"=>"v"`)
+    /// or `HashMap<String, Option<String>>` (in the language
+    /// dialect that ships the hstore feature).
+    Hstore,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -113,6 +118,7 @@ impl SpgTypeInfo {
             DataType::TimeTz => Kind::TimeTz,
             DataType::Money => Kind::Money,
             DataType::Range(_) => Kind::Range,
+            DataType::Hstore => Kind::Hstore,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -147,6 +153,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::TimeTz => "TIMETZ",
             Kind::Money => "MONEY",
             Kind::Range => "RANGE",
+            Kind::Hstore => "HSTORE",
             Kind::Null => "NULL",
         }
     }

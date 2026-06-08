@@ -64,7 +64,7 @@
         { "file": "09_if_ifnull.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1125, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1134, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -207,6 +207,8 @@
         { "file": "70_mysql_inline_set.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "71_pg_range.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "72_pg_hstore.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,

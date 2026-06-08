@@ -5540,6 +5540,8 @@ impl Parser {
             "tsrange" => ColumnTypeName::Range(RangeKindAst::Ts),
             "tstzrange" => ColumnTypeName::Range(RangeKindAst::TsTz),
             "daterange" => ColumnTypeName::Range(RangeKindAst::Date),
+            // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
+            "hstore" => ColumnTypeName::Hstore,
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
             // `ENUM('a','b','c')`. Storage is TEXT; the value
             // list lands on `inline_enum_variants` for the

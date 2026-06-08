@@ -4237,7 +4237,10 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // v7.17.0 Phase 3.P0-38 — range types collapse to Text
         // on the wire as canonical `[a,b)` / `(a,b]` form. PG
         // OIDs (3904/3926/...) advertised via `pg_type_oid`.
-        | DataType::Range(_) => WireType::Text,
+        | DataType::Range(_)
+        // v7.17.0 Phase 3.P0-39 — hstore collapses to Text on
+        // the wire as canonical `"k"=>"v"` form.
+        | DataType::Hstore => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.

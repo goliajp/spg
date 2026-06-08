@@ -775,6 +775,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::TimeTz => "TIMETZ".into(),
         DataType::Money => "MONEY".into(),
         DataType::Range(k) => k.keyword().into(),
+        DataType::Hstore => "HSTORE".into(),
     }
 }
 
@@ -7501,6 +7502,10 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Range { .. } => Err(EngineError::Unsupported(
             "ORDER BY of a range value is not supported in v7.17.0".into(),
         )),
+        // v7.17.0 Phase 3.P0-39 — hstore is not orderable.
+        Value::Hstore(_) => Err(EngineError::Unsupported(
+            "ORDER BY of a hstore value is not supported".into(),
+        )),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -11586,6 +11591,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::Money(c) => eval::format_money(*c),
         // v7.17.0 Phase 3.P0-38 — PG range canonical text form.
         v @ Value::Range { .. } => format_range_str(v),
+        // v7.17.0 Phase 3.P0-39 — PG hstore canonical text form.
+        Value::Hstore(pairs) => format_hstore_str(pairs),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -13851,6 +13858,133 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
+/// v7.17.0 Phase 3.P0-39 — parse a PG `hstore` text literal into
+/// a flat key→value map. Empty string → empty map. Duplicate
+/// keys take last-write-wins (matches PG `hstore_in`).
+///
+/// Accepted shapes (minimal subset):
+///   * `'a=>1, b=>2'`            — bareword keys/values
+///   * `'"a"=>"1", "b"=>"2"'`    — quoted keys/values
+///   * `'a=>NULL'`               — case-insensitive NULL token
+///     surfaces as `None` (no quotes around NULL)
+///
+/// Returns None on parse failure → caller surfaces as hard error.
+fn parse_hstore_str(s: &str) -> Option<Vec<(alloc::string::String, Option<alloc::string::String>)>> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut out: Vec<(alloc::string::String, Option<alloc::string::String>)> = Vec::new();
+    let skip_ws = |bytes: &[u8], i: &mut usize| {
+        while *i < bytes.len() && matches!(bytes[*i], b' ' | b'\t' | b'\n' | b'\r') {
+            *i += 1;
+        }
+    };
+    let parse_token = |bytes: &[u8], i: &mut usize| -> Option<alloc::string::String> {
+        if *i >= bytes.len() {
+            return None;
+        }
+        if bytes[*i] == b'"' {
+            *i += 1;
+            let mut out = alloc::string::String::new();
+            while *i < bytes.len() {
+                match bytes[*i] {
+                    b'"' => {
+                        *i += 1;
+                        return Some(out);
+                    }
+                    b'\\' if *i + 1 < bytes.len() => {
+                        out.push(bytes[*i + 1] as char);
+                        *i += 2;
+                    }
+                    c => {
+                        out.push(c as char);
+                        *i += 1;
+                    }
+                }
+            }
+            None
+        } else {
+            let start = *i;
+            while *i < bytes.len()
+                && !matches!(bytes[*i], b' ' | b'\t' | b'\n' | b'\r' | b',' | b'=')
+            {
+                *i += 1;
+            }
+            if *i == start {
+                return None;
+            }
+            Some(alloc::str::from_utf8(&bytes[start..*i]).ok()?.to_string())
+        }
+    };
+    skip_ws(bytes, &mut i);
+    while i < bytes.len() {
+        let key = parse_token(bytes, &mut i)?;
+        skip_ws(bytes, &mut i);
+        if i + 1 >= bytes.len() || bytes[i] != b'=' || bytes[i + 1] != b'>' {
+            return None;
+        }
+        i += 2;
+        skip_ws(bytes, &mut i);
+        // Check for unquoted NULL token (case-insensitive).
+        let val_token = if i + 4 <= bytes.len()
+            && bytes[i..i + 4].eq_ignore_ascii_case(b"NULL")
+            && (i + 4 == bytes.len()
+                || matches!(bytes[i + 4], b' ' | b'\t' | b',' | b'\n' | b'\r'))
+        {
+            i += 4;
+            None
+        } else {
+            Some(parse_token(bytes, &mut i)?)
+        };
+        // Replace any existing entry with the same key (last-wins).
+        if let Some(pos) = out.iter().position(|(k, _)| k == &key) {
+            out[pos] = (key, val_token);
+        } else {
+            out.push((key, val_token));
+        }
+        skip_ws(bytes, &mut i);
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+            skip_ws(bytes, &mut i);
+            continue;
+        }
+        return None;
+    }
+    Some(out)
+}
+
+/// v7.17.0 Phase 3.P0-39 — render a hstore as canonical PG text
+/// form `"k"=>"v"` (keys and non-NULL values always quoted;
+/// NULL token is bare).
+fn format_hstore_str(pairs: &[(alloc::string::String, Option<alloc::string::String>)]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push('"');
+        out.push_str(k);
+        out.push_str("\"=>");
+        match v {
+            None => out.push_str("NULL"),
+            Some(val) => {
+                out.push('"');
+                out.push_str(val);
+                out.push('"');
+            }
+        }
+    }
+    out
+}
+
+/// v7.17.0 Phase 3.P0-39 — pub re-export so pgwire + sqllogictest
+/// share the single hstore renderer.
+pub fn format_hstore_text(pairs: &[(alloc::string::String, Option<alloc::string::String>)]) -> alloc::string::String {
+    format_hstore_str(pairs)
+}
+
 /// v7.17.0 Phase 3.P0-38 — parse a PG range literal of the form
 /// `'[lo,up)'` / `'(lo,up]'` / `'[lo,up]'` / `'(lo,up)'` /
 /// `'empty'`. Lower / upper may be empty (unbounded). Returns
@@ -14184,6 +14318,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
             spg_sql::ast::RangeKindAst::TsTz => spg_storage::RangeKind::TsTz,
             spg_sql::ast::RangeKindAst::Date => spg_storage::RangeKind::Date,
         }),
+        ColumnTypeName::Hstore => DataType::Hstore,
     }
 }
 
@@ -14552,6 +14687,19 @@ fn coerce_value(
         (v @ Value::Range { .. }, DataType::Text) => {
             Some(Value::Text(format_range_str(&v)))
         }
+        // v7.17.0 Phase 3.P0-39 — Text → Hstore.
+        (Value::Text(s), DataType::Hstore) => match parse_hstore_str(&s) {
+            Some(pairs) => Some(Value::Hstore(pairs)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type hstore: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // Hstore → Text canonical `"k"=>"v"` form.
+        (Value::Hstore(pairs), DataType::Text) => Some(Value::Text(format_hstore_str(&pairs))),
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or
