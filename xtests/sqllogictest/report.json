@@ -64,7 +64,7 @@
         { "file": "09_if_ifnull.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1033, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1048, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -191,6 +191,8 @@
         { "file": "62_mysql_time_alias.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "63_session_funcs.test", "pass": 8, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "64_pg_typeof.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
