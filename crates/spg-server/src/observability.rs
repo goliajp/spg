@@ -604,6 +604,9 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::TimeTz => 12,
                 // v7.17.0 Phase 3.P0-35 — MONEY is fixed i64 (8 bytes).
                 DataType::Money => 8,
+                // v7.17.0 Phase 3.P0-38 — range cells avg ~24 bytes
+                // (flags + two element values).
+                DataType::Range(_) => 24,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

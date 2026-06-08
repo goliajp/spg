@@ -4993,6 +4993,18 @@ fn value_to_text(v: &Value) -> String {
         // v7.17.0 — UUID renders canonical lowercase 8-4-4-4-12
         // hyphenated form (PG `uuid_out`).
         Value::Uuid(b) => spg_storage::format_uuid(b),
+        // v7.17.0 Phase 3.P0-32 — TIME canonical text.
+        Value::Time(us) => format_time(*us),
+        // v7.17.0 Phase 3.P0-34 — TIMETZ canonical text.
+        Value::TimeTz { us, offset_secs } => format_timetz(*us, *offset_secs),
+        // v7.17.0 Phase 3.P0-33 — YEAR 4-digit zero-padded.
+        Value::Year(y) => format!("{y:04}"),
+        // v7.17.0 Phase 3.P0-35 — MONEY en_US locale.
+        Value::Money(c) => format_money(*c),
+        // v7.17.0 Phase 3.P0-38 — Range canonical form. Routes
+        // through the engine's format_range_text to share the
+        // single renderer with pgwire / sqllogictest.
+        Value::Range { .. } => crate::format_range_text(v),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }
