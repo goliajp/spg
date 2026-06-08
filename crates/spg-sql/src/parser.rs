@@ -5492,6 +5492,10 @@ impl Parser {
             // mailrs's `scripts/init-schema.sql` runs unmodified.
             "tsvector" => ColumnTypeName::TsVector,
             "tsquery" => ColumnTypeName::TsQuery,
+            // v7.17.0 — PG `UUID`. Wire OID 2950. The drop-in PG
+            // surface for Django / Rails / Hibernate's default
+            // PK pattern.
+            "uuid" => ColumnTypeName::Uuid,
             _other => {
                 // v7.17.0 Phase 1.4 — unknown ident → defer
                 // resolution to the engine. Stored as Text in
@@ -6834,6 +6838,9 @@ impl Parser {
                         // external form parser.
                         "tsvector" => CastTarget::TsVector,
                         "tsquery" => CastTarget::TsQuery,
+                        // v7.17.0 — `::uuid`. Engine decodes the LHS
+                        // text via `spg_storage::parse_uuid_str`.
+                        "uuid" => CastTarget::Uuid,
                         other => {
                             return Err(ParseError {
                                 message: format!("unsupported cast target `::{other}`"),
@@ -8007,6 +8014,7 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "bytea" | "bytes" => ColumnTypeName::Bytes,
         "tsvector" => ColumnTypeName::TsVector,
         "tsquery" => ColumnTypeName::TsQuery,
+        "uuid" => ColumnTypeName::Uuid,
         _ => return None,
     })
 }

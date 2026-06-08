@@ -40,6 +40,10 @@ pub enum Kind {
     Timestamptz,
     /// `JSON` / `JSONB` (text-backed JSON).
     Json,
+    /// v7.17.0 — `UUID` (128-bit identifier, RFC 4122 byte order).
+    /// Bridges decode into `uuid::Uuid` or `String` (canonical
+    /// hyphenated lowercase form).
+    Uuid,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -80,6 +84,9 @@ impl SpgTypeInfo {
             DataType::Timestamp => Kind::Timestamp,
             DataType::Timestamptz => Kind::Timestamptz,
             DataType::Json => Kind::Json,
+            // v7.17.0 — UUID bridges to `uuid::Uuid` (when the
+            // `uuid` feature is enabled on sqlx) or to `String`.
+            DataType::Uuid => Kind::Uuid,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -108,6 +115,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Timestamp => "TIMESTAMP",
             Kind::Timestamptz => "TIMESTAMPTZ",
             Kind::Json => "JSON",
+            Kind::Uuid => "UUID",
             Kind::Null => "NULL",
         }
     }

@@ -174,6 +174,16 @@ pub enum DataType {
     /// `&` `|` `!` and phrase operators. PG wire OID 3615.
     /// Catalog FILE_VERSION 20+.
     TsQuery,
+    /// v7.17.0: PG `uuid` — 128-bit identifier stored as
+    /// `Value::Uuid([u8; 16])`. PG wire OID 2950. Canonical
+    /// text form is lowercase 8-4-4-4-12 hyphenated; input
+    /// also accepts uppercase, unhyphenated, and brace-wrapped
+    /// forms (`{xxxx…}`). Catalog FILE_VERSION 36+; tag 24 on
+    /// the dense type-tag side, tag 20 on the schema-agnostic
+    /// value side. The drop-in PG/MySQL surface for Django /
+    /// Rails / Hibernate "id UUID PRIMARY KEY DEFAULT
+    /// gen_random_uuid()" default-PK pattern.
+    Uuid,
 }
 
 impl fmt::Display for DataType {
@@ -211,6 +221,7 @@ impl fmt::Display for DataType {
             Self::BigIntArray => f.write_str("BIGINT[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
+            Self::Uuid => f.write_str("UUID"),
         }
     }
 }
@@ -325,6 +336,11 @@ pub enum Value {
     /// v7.12.0 `tsquery` — boolean / phrase parse tree over
     /// lexemes. Engine builds via `to_tsquery` family.
     TsQuery(TsQueryAst),
+    /// v7.17.0 `uuid` — 128-bit identifier. Stored as 16 bytes
+    /// (big-endian / network-byte order, same as RFC 4122).
+    /// Display normalises to canonical lowercase 8-4-4-4-12
+    /// hyphenated form. Equality is byte-wise.
+    Uuid([u8; 16]),
     Null,
 }
 
@@ -370,6 +386,7 @@ impl Value {
             Self::BigIntArray(_) => Some(DataType::BigIntArray),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
+            Self::Uuid(_) => Some(DataType::Uuid),
             Self::Null => None,
         }
     }
@@ -644,6 +661,10 @@ pub enum IndexKey {
     Int(i64),
     Text(String),
     Bool(bool),
+    /// v7.17.0 — `Value::Uuid` index key. Comparison is byte-wise
+    /// (RFC 4122 byte order) so PRIMARY KEY UUID lookups land on
+    /// the same fast-path as Int / Text.
+    Uuid([u8; 16]),
 }
 
 impl IndexKey {
@@ -658,6 +679,10 @@ impl IndexKey {
             // index key — same order semantics, same comparison.
             Value::Date(d) => Some(Self::Int(i64::from(*d))),
             Value::Timestamp(t) => Some(Self::Int(*t)),
+            // v7.17.0: UUID indexable via byte-wise ordering. Lookup
+            // on `id = '...'::uuid` resolves through the secondary
+            // index rather than full-scan.
+            Value::Uuid(b) => Some(Self::Uuid(*b)),
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -3738,6 +3763,83 @@ pub fn is_builtin_schema(name: &str) -> bool {
         || name.eq_ignore_ascii_case("information_schema")
 }
 
+/// v7.17.0 — parse a PG-canonical UUID text representation into the
+/// 16-byte network-order layout used by `Value::Uuid`. Accepted input
+/// shapes (all case-insensitive):
+///   * Canonical hyphenated 8-4-4-4-12 (`550e8400-e29b-41d4-a716-446655440000`)
+///   * Unhyphenated 32-char hex (`550e8400e29b41d4a716446655440000`)
+///   * Either form wrapped in `{ ... }`
+///
+/// Returns `None` for any malformed input (wrong length, non-hex
+/// characters, misplaced hyphens). The caller surfaces a SQL error
+/// at coercion time — silent acceptance of garbage would mask
+/// application bugs and is exactly the divergence from PG that
+/// breaks the 0-change cutover promise.
+#[must_use]
+pub fn parse_uuid_str(input: &str) -> Option<[u8; 16]> {
+    let s = input.trim();
+    // Strip surrounding braces if present.
+    let s = if let Some(inner) = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        inner
+    } else {
+        s
+    };
+    // Two valid shapes after braces are stripped: 32 hex chars or
+    // the canonical 36-char hyphenated form.
+    let hex: String = match s.len() {
+        32 => s.to_ascii_lowercase(),
+        36 => {
+            // Hyphens must be exactly at positions 8, 13, 18, 23.
+            let b = s.as_bytes();
+            if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+                return None;
+            }
+            let mut out = String::with_capacity(32);
+            out.push_str(&s[0..8]);
+            out.push_str(&s[9..13]);
+            out.push_str(&s[14..18]);
+            out.push_str(&s[19..23]);
+            out.push_str(&s[24..36]);
+            out.make_ascii_lowercase();
+            out
+        }
+        _ => return None,
+    };
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(10 + b - b'a'),
+        b'A'..=b'F' => Some(10 + b - b'A'),
+        _ => None,
+    }
+}
+
+/// v7.17.0 — render a `Value::Uuid` payload as the canonical
+/// lowercase 8-4-4-4-12 hyphenated form PG `text` cast surfaces.
+#[must_use]
+pub fn format_uuid(b: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// v7.17.0 Phase 1.5 — catalogued user-defined DOMAIN. A domain
 /// is a named CHECK-constrained alias over a built-in type;
 /// columns bound to it inherit the base type plus the CHECK
@@ -5442,7 +5544,11 @@ fn index_key_as_u64(key: &IndexKey) -> Option<u64> {
         // and lookup — using cast_unsigned keeps both sides honest
         // and silences clippy::cast_sign_loss.
         IndexKey::Int(n) => Some(n.cast_unsigned()),
-        IndexKey::Text(_) | IndexKey::Bool(_) => None,
+        // Text / Bool / Uuid PKs aren't representable as u64 and so
+        // can't participate in the u64-sorted cold-tier segment
+        // PK layout. Same deferral story as Text — lookup falls
+        // through the in-memory btree.
+        IndexKey::Text(_) | IndexKey::Bool(_) | IndexKey::Uuid(_) => None,
     }
 }
 
@@ -5759,7 +5865,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 35;
+const FILE_VERSION: u8 = 36;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -5771,6 +5877,10 @@ const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
 const INDEX_KEY_TAG_INT: u8 = 0;
 const INDEX_KEY_TAG_TEXT: u8 = 1;
 const INDEX_KEY_TAG_BOOL: u8 = 2;
+/// v7.17.0 — `IndexKey::Uuid([u8; 16])`. Body = raw 16 bytes
+/// (RFC 4122 byte order). Persisted only in FILE_VERSION 36+
+/// catalogs.
+const INDEX_KEY_TAG_UUID: u8 = 3;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -7237,6 +7347,9 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.12.0: tag 23 for `tsquery`. No body. Catalog
         // FILE_VERSION 20+.
         DataType::TsQuery => out.push(23),
+        // v7.17.0: tag 24 for `UUID`. No body — type identity
+        // alone. Catalog FILE_VERSION 36+.
+        DataType::Uuid => out.push(24),
     }
 }
 
@@ -7294,6 +7407,8 @@ impl Cursor<'_> {
             // FILE_VERSION 20+.
             22 => Ok(DataType::TsVector),
             23 => Ok(DataType::TsQuery),
+            // v7.17.0: tag 24 — UUID. Catalog FILE_VERSION 36+.
+            24 => Ok(DataType::Uuid),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -7397,6 +7512,8 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         // v7.12.0: tsquery dense body — prefix-coded tree.
         // Sizing must match `write_tsquery_body` walker.
         Value::TsQuery(ast) => tsquery_encoded_len(ast),
+        // v7.17.0: UUID dense body — fixed 16 bytes, no prefix.
+        Value::Uuid(_) => 16,
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -7606,6 +7723,10 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         (Value::TsVector(lexs), DataType::TsVector) => write_tsvector_body(out, lexs),
         // v7.12.0: tsquery dense body — prefix-coded tree.
         (Value::TsQuery(ast), DataType::TsQuery) => write_tsquery_body(out, ast),
+        // v7.17.0: UUID dense body — raw 16 bytes (RFC 4122 byte
+        // order). No length prefix; the type's fixed width makes
+        // the codec stateless.
+        (Value::Uuid(b), DataType::Uuid) => out.extend_from_slice(&b[..]),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -7772,6 +7893,12 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.push(19);
             write_tsquery_body(out, ast);
         }
+        // v7.17.0: UUID — tag 20. Body = raw 16 bytes (RFC 4122
+        // byte order).
+        Value::Uuid(b) => {
+            out.push(20);
+            out.extend_from_slice(&b[..]);
+        }
     }
 }
 
@@ -7885,6 +8012,10 @@ fn write_index_key(out: &mut Vec<u8>, key: &IndexKey) {
             out.push(INDEX_KEY_TAG_BOOL);
             out.push(u8::from(*b));
         }
+        IndexKey::Uuid(b) => {
+            out.push(INDEX_KEY_TAG_UUID);
+            out.extend_from_slice(&b[..]);
+        }
     }
 }
 
@@ -7979,6 +8110,12 @@ impl<'a> Cursor<'a> {
             INDEX_KEY_TAG_INT => Ok(IndexKey::Int(self.read_i64()?)),
             INDEX_KEY_TAG_TEXT => Ok(IndexKey::Text(self.read_str()?)),
             INDEX_KEY_TAG_BOOL => Ok(IndexKey::Bool(self.read_u8()? != 0)),
+            INDEX_KEY_TAG_UUID => {
+                let s = self.take(16)?;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(s);
+                Ok(IndexKey::Uuid(b))
+            }
             other => Err(StorageError::Corrupt(format!(
                 "unknown index key tag: {other}"
             ))),
@@ -8116,6 +8253,13 @@ impl<'a> Cursor<'a> {
             // + (u16 LE * pos_count) + u8 weight].
             DataType::TsVector => Ok(Value::TsVector(self.read_tsvector_body()?)),
             DataType::TsQuery => Ok(Value::TsQuery(self.read_tsquery_body()?)),
+            // v7.17.0: UUID dense body — raw 16 bytes.
+            DataType::Uuid => {
+                let s = self.take(16)?;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(s);
+                Ok(Value::Uuid(b))
+            }
         }
     }
 
@@ -8290,6 +8434,13 @@ impl<'a> Cursor<'a> {
             18 => Ok(Value::TsVector(self.read_tsvector_body()?)),
             // v7.12.0: tag 19 — tsquery.
             19 => Ok(Value::TsQuery(self.read_tsquery_body()?)),
+            // v7.17.0: tag 20 — UUID. Raw 16 bytes.
+            20 => {
+                let s = self.take(16)?;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(s);
+                Ok(Value::Uuid(b))
+            }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }

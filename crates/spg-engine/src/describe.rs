@@ -165,6 +165,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 // v7.12.0 — `::tsvector` / `::tsquery`.
                 CastTarget::TsVector => DataType::TsVector,
                 CastTarget::TsQuery => DataType::TsQuery,
+                CastTarget::Uuid => DataType::Uuid,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),
@@ -250,6 +251,11 @@ fn function_return_shape(
         "to_tsvector" => (DataType::TsVector, true),
         "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery"
         | "websearch_to_tsquery" => (DataType::TsQuery, true),
+        // v7.17.0 — UUID generators. `gen_random_uuid()` is the
+        // PG built-in; `uuid_generate_v4()` is the historical
+        // uuid-ossp alias. Both return a NOT NULL UUID — non-
+        // nullable since neither takes args and neither can fail.
+        "gen_random_uuid" | "uuid_generate_v4" => (DataType::Uuid, false),
         // Interval.
         "age" => (DataType::Interval, true),
         // Timestamp-returning.
