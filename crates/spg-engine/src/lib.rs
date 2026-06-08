@@ -11727,24 +11727,37 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
         Expr::Column(c) if c.qualifier.is_none() => (ClockSite::BareIdent, c.name.as_str()),
         _ => return None,
     };
-    // ASCII case-insensitive name match. Limited to the three keywords
-    // that actually need rewriting.
-    let matched = match name.len() {
-        3 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("now") => Some(true),
-        12 if name.eq_ignore_ascii_case("current_date") => Some(false),
-        17 if name.eq_ignore_ascii_case("current_timestamp") => Some(true),
+    // ASCII case-insensitive name match. Each entry decides what
+    // synthetic literal the call expands to.
+    //
+    // v7.17.0 Phase 3.P0-29 — `unix_timestamp` (no args) joins this
+    // table as MySQL's epoch-seconds equivalent of `now()`. Folded
+    // to a BigInt literal here so apply_function never needs a
+    // clock dependency.
+    enum ClockShape {
+        Timestamp,
+        Date,
+        UnixSeconds,
+    }
+    let shape = match name.len() {
+        3 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("now") => Some(ClockShape::Timestamp),
+        12 if name.eq_ignore_ascii_case("current_date") => Some(ClockShape::Date),
+        14 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("unix_timestamp") => {
+            Some(ClockShape::UnixSeconds)
+        }
+        17 if name.eq_ignore_ascii_case("current_timestamp") => Some(ClockShape::Timestamp),
         _ => None,
     };
-    let is_timestamp = matched?;
-    let payload = if is_timestamp {
-        now
-    } else {
-        now.div_euclid(86_400_000_000)
+    let shape = shape?;
+    let payload = match shape {
+        ClockShape::Timestamp => now,
+        ClockShape::Date => now.div_euclid(86_400_000_000),
+        ClockShape::UnixSeconds => now.div_euclid(1_000_000),
     };
-    let target = if is_timestamp {
-        spg_sql::ast::CastTarget::Timestamp
-    } else {
-        spg_sql::ast::CastTarget::Date
+    let target = match shape {
+        ClockShape::Timestamp => spg_sql::ast::CastTarget::Timestamp,
+        ClockShape::Date => spg_sql::ast::CastTarget::Date,
+        ClockShape::UnixSeconds => spg_sql::ast::CastTarget::BigInt,
     };
     Some(Expr::Cast {
         expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(payload))),

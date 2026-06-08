@@ -1113,6 +1113,14 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "date_part" => date_part(args),
         "age" => age(args),
         "to_char" => to_char(args),
+        // v7.17.0 Phase 3.P0-29 — MySQL time aliases. WordPress,
+        // Laravel, mysql-connector-python emit these constantly.
+        // `unix_timestamp()` (bare) is folded by clock_replacement_for
+        // into a BigInt literal — this arm only handles the 1-arg
+        // form (TIMESTAMP / DATE → epoch seconds).
+        "date_format" => date_format_mysql(args),
+        "unix_timestamp" => unix_timestamp_of(args),
+        "from_unixtime" => from_unixtime(args),
         // v7.17.0 Phase 3.8 — PG `format(fmt, args…)` sprintf-style.
         // Conversion specifiers: `%s` (literal string from arg),
         // `%I` (quoted identifier), `%L` (quoted SQL literal),
@@ -4186,6 +4194,213 @@ const MONTH_FULL: [&str; 12] = [
 const MONTH_ABBR: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+/// v7.17.0 Phase 3.P0-29 — MySQL `DATE_FORMAT(t, fmt)`.
+///
+/// Format tokens (MySQL 8.0 surface):
+///   * `%Y` — 4-digit year  `%y` — 2-digit year
+///   * `%m` — 01-12 month   `%c` — 1-12 month (no zero pad)
+///   * `%d` — 01-31 day     `%e` — 1-31 day (no zero pad)
+///   * `%H` — 00-23 hour    `%h` / `%I` — 01-12 hour
+///   * `%i` — 00-59 MINUTE (NB: `%M` is month name in MySQL — easy
+///     footgun if we mirror PG's `to_char` tokens by accident)
+///   * `%s` / `%S` — 00-59 second
+///   * `%f` — 000000-999999 microseconds (always 6 digits)
+///   * `%p` — AM / PM
+///   * `%M` — January-December (full month name)
+///   * `%b` — Jan-Dec (abbreviated month name)
+///   * `%%` — literal `%`
+///
+/// Unknown `%X` tokens pass through verbatim (MySQL emits the `%`
+/// then the unknown letter).
+fn date_format_mysql(args: &[Value]) -> Result<Value, EvalError> {
+    use core::fmt::Write as _;
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("date_format() takes 2 args, got {}", args.len()),
+        });
+    }
+    if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(fmt) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "date_format() needs a text format, got {:?}",
+                args[1].data_type()
+            ),
+        });
+    };
+    let (days, day_micros) = match &args[0] {
+        Value::Date(d) => (*d, 0_i64),
+        Value::Timestamp(t) => {
+            let days = t.div_euclid(86_400_000_000);
+            (
+                i32::try_from(days).unwrap_or(i32::MAX),
+                t.rem_euclid(86_400_000_000),
+            )
+        }
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "date_format() needs DATE or TIMESTAMP, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let (y, mo, d) = civil_from_days(days);
+    let secs = day_micros / 1_000_000;
+    let frac = day_micros % 1_000_000;
+    let hh24 = u32::try_from(secs / 3600).unwrap_or(0);
+    let mi = u32::try_from((secs / 60) % 60).unwrap_or(0);
+    let ss = u32::try_from(secs % 60).unwrap_or(0);
+    let hh12 = match hh24 % 12 {
+        0 => 12,
+        x => x,
+    };
+    let ampm = if hh24 < 12 { "AM" } else { "PM" };
+    let us = u32::try_from(frac).unwrap_or(0);
+
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            // Trailing `%` with no specifier — emit verbatim.
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        let token = bytes[i + 1];
+        match token {
+            b'Y' => {
+                let _ = write!(out, "{y:04}");
+            }
+            b'y' => {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let yy = (y.rem_euclid(100)) as u32;
+                let _ = write!(out, "{yy:02}");
+            }
+            b'm' => {
+                let _ = write!(out, "{mo:02}");
+            }
+            b'c' => {
+                let _ = write!(out, "{mo}");
+            }
+            b'd' => {
+                let _ = write!(out, "{d:02}");
+            }
+            b'e' => {
+                let _ = write!(out, "{d}");
+            }
+            b'H' => {
+                let _ = write!(out, "{hh24:02}");
+            }
+            b'h' | b'I' => {
+                let _ = write!(out, "{hh12:02}");
+            }
+            b'i' => {
+                // MINUTE — distinct from PG's `MI` and from MySQL's
+                // own `%M` (month name).
+                let _ = write!(out, "{mi:02}");
+            }
+            b's' | b'S' => {
+                let _ = write!(out, "{ss:02}");
+            }
+            b'f' => {
+                let _ = write!(out, "{us:06}");
+            }
+            b'p' => {
+                out.push_str(ampm);
+            }
+            b'M' => {
+                out.push_str(MONTH_FULL[(mo - 1) as usize]);
+            }
+            b'b' => {
+                out.push_str(MONTH_ABBR[(mo - 1) as usize]);
+            }
+            b'%' => {
+                out.push('%');
+            }
+            other => {
+                // Unknown specifier — MySQL emits the letter
+                // verbatim (without the `%`).
+                out.push(other as char);
+            }
+        }
+        i += 2;
+    }
+    Ok(Value::Text(out))
+}
+
+/// v7.17.0 Phase 3.P0-29 — `UNIX_TIMESTAMP(t)` returns epoch
+/// seconds (BIGINT) for a TIMESTAMP / DATE.
+///
+/// Bare `UNIX_TIMESTAMP()` (no args) is folded to a BigInt literal
+/// by clock_replacement_for at the rewrite layer — never reaches
+/// this arm.
+fn unix_timestamp_of(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("unix_timestamp() takes 0 or 1 arg, got {}", args.len()),
+        });
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Timestamp(t) => Ok(Value::BigInt(t.div_euclid(1_000_000))),
+        Value::Date(d) => Ok(Value::BigInt(i64::from(*d) * 86_400)),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "unix_timestamp() needs DATE or TIMESTAMP, got {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-29 — `FROM_UNIXTIME(n)` returns a TIMESTAMP
+/// at `n` seconds past the Unix epoch. `FROM_UNIXTIME(n, fmt)`
+/// applies MySQL date_format on top, returning TEXT.
+fn from_unixtime(args: &[Value]) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("from_unixtime() takes 1 or 2 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let secs: i64 = match &args[0] {
+        Value::SmallInt(n) => i64::from(*n),
+        Value::Int(n) => i64::from(*n),
+        Value::BigInt(n) => *n,
+        Value::Float(x) => *x as i64,
+        Value::Numeric { scaled, scale } => {
+            let denom = 10_i128.pow(u32::from(*scale));
+            i64::try_from(scaled.div_euclid(denom)).unwrap_or(i64::MAX)
+        }
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "from_unixtime() needs a numeric epoch second count, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let ts = Value::Timestamp(secs.saturating_mul(1_000_000));
+    if args.len() == 1 {
+        Ok(ts)
+    } else {
+        date_format_mysql(&[ts, args[1].clone()])
+    }
+}
 
 /// `date_trunc(unit, timestamp)` — round a `TIMESTAMP` down to the
 /// requested calendar boundary (year / month / day / hour / minute /
