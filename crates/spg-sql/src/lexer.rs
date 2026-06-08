@@ -68,6 +68,21 @@ pub enum Token {
     LtEq,
     Gt,
     GtEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contained-in
+    /// `<<`. LHS is strictly inside RHS (no equality).
+    InetContainedBy,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contained-in-or-equal
+    /// `<<=`. LHS network ⊆ RHS network.
+    InetContainedByEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contains `>>`.
+    /// LHS strictly contains RHS.
+    InetContains,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contains-or-equal `>>=`.
+    /// LHS network ⊇ RHS network.
+    InetContainsEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR network overlap `&&`.
+    /// Either side contains any address of the other.
+    InetOverlap,
 
     // Punctuation
     LParen,
@@ -428,6 +443,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 } else if peek_eq(bytes, i + 1, b'-') && peek_eq(bytes, i + 2, b'>') {
                     out.push(Token::L2Distance);
                     i += 3;
+                } else if peek_eq(bytes, i + 1, b'<') && peek_eq(bytes, i + 2, b'=') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `<<=` contained-or-equal.
+                    out.push(Token::InetContainedByEq);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'<') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `<<` strict contained.
+                    out.push(Token::InetContainedBy);
+                    i += 2;
                 } else if peek_eq(bytes, i + 1, b'=') {
                     out.push(Token::LtEq);
                     i += 2;
@@ -460,13 +483,26 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 i += 2;
             }
             b'>' => {
-                if peek_eq(bytes, i + 1, b'=') {
+                if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `>>=` contains-or-equal.
+                    out.push(Token::InetContainsEq);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'>') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `>>` strict contains.
+                    out.push(Token::InetContains);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'=') {
                     out.push(Token::GtEq);
                     i += 2;
                 } else {
                     out.push(Token::Gt);
                     i += 1;
                 }
+            }
+            b'&' if peek_eq(bytes, i + 1, b'&') => {
+                // v7.17.0 Phase 3.P0-47 — PG INET network overlap `&&`.
+                out.push(Token::InetOverlap);
+                i += 2;
             }
             b'!' if peek_eq(bytes, i + 1, b'=') => {
                 out.push(Token::NotEq);

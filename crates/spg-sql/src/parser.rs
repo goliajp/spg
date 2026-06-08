@@ -7011,6 +7011,11 @@ impl Parser {
                         // v7.17.0 — `::uuid`. Engine decodes the LHS
                         // text via `spg_storage::parse_uuid_str`.
                         "uuid" => CastTarget::Uuid,
+                        // v7.17.0 Phase 3.P0-47 — `::inet` / `::cidr` /
+                        // `::macaddr`. SPG stores these as Text (Phase 7);
+                        // the cast is a no-op passthrough so containment
+                        // and overlap operators can read the textual form.
+                        "inet" | "cidr" | "macaddr" => CastTarget::Text,
                         other => {
                             return Err(ParseError {
                                 message: format!("unsupported cast target `::{other}`"),
@@ -8055,6 +8060,14 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // arithmetic, tighter than AND / OR). PG places `@@` at
         // the same precedence as `=` / `<`, so we follow.
         Token::TsMatch => (BinOp::TsMatch, 4),
+        // v7.17.0 Phase 3.P0-47 — PG INET / CIDR containment + overlap.
+        // PG places these at the comparison rung (same level as `=`),
+        // so we follow.
+        Token::InetContainedBy => (BinOp::InetContainedBy, 4),
+        Token::InetContainedByEq => (BinOp::InetContainedByEq, 4),
+        Token::InetContains => (BinOp::InetContains, 4),
+        Token::InetContainsEq => (BinOp::InetContainsEq, 4),
+        Token::InetOverlap => (BinOp::InetOverlap, 4),
         _ => return None,
     };
     Some(pair)

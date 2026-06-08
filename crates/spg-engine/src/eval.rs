@@ -2877,6 +2877,182 @@ fn inet_masklen(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Int(mask))
 }
 
+// ─── v7.17.0 Phase 3.P0-47 — INET / CIDR containment + overlap ────────
+//
+// SPG stores INET / CIDR as Text (Phase 7 design); these helpers parse
+// the textual `addr[/mask]` form into a (family, bytes, prefix_bits)
+// triple and implement PG's network-comparison operators on that
+// representation.
+//
+// PG semantics:
+//   * `<<`  — strictly contained-in (LHS ⊊ RHS)
+//   * `<<=` — contained-in-or-equal (LHS ⊆ RHS)
+//   * `>>`, `>>=` — mirrors of the above
+//   * `&&`  — overlap (either LHS ⊆ RHS or RHS ⊆ LHS)
+//
+// NULL on either side → NULL (3VL). Mixed family (v4 vs v6) is never
+// contained / never overlaps but is not an error — same as PG.
+
+/// Parsed inet network: address bytes (4 for v4, 16 for v6) and the
+/// network prefix length in bits.
+struct InetNet {
+    bytes: [u8; 16],
+    /// 4 for IPv4, 16 for IPv6.
+    family_bytes: u8,
+    /// 0..=32 for v4, 0..=128 for v6.
+    prefix_bits: u8,
+}
+
+fn parse_inet_text(s: &str) -> Option<InetNet> {
+    let mut split = s.splitn(2, '/');
+    let host = split.next()?;
+    let mask_str = split.next();
+    if host.contains(':') {
+        let bytes = parse_ipv6(host)?;
+        let prefix_bits = match mask_str {
+            Some(m) => m.parse::<u8>().ok().filter(|&n| n <= 128)?,
+            None => 128,
+        };
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes);
+        Some(InetNet { bytes: out, family_bytes: 16, prefix_bits })
+    } else {
+        let bytes = parse_ipv4(host)?;
+        let prefix_bits = match mask_str {
+            Some(m) => m.parse::<u8>().ok().filter(|&n| n <= 32)?,
+            None => 32,
+        };
+        let mut out = [0u8; 16];
+        out[..4].copy_from_slice(&bytes);
+        Some(InetNet { bytes: out, family_bytes: 4, prefix_bits })
+    }
+}
+
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<u8>().ok()?;
+    }
+    Some(out)
+}
+
+fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
+    // Split on the `::` shorthand at most once.
+    let (head, tail) = match s.find("::") {
+        Some(idx) => (&s[..idx], Some(&s[idx + 2..])),
+        None => (s, None),
+    };
+    let head_groups: Vec<&str> = if head.is_empty() {
+        Vec::new()
+    } else {
+        head.split(':').collect()
+    };
+    let tail_groups: Vec<&str> = match tail {
+        Some(t) if t.is_empty() => Vec::new(),
+        Some(t) => t.split(':').collect(),
+        None => Vec::new(),
+    };
+    let head_len = head_groups.len();
+    let tail_len = tail_groups.len();
+    // Without `::` we need exactly 8 groups; with `::` we need ≤ 7.
+    if tail.is_none() {
+        if head_len != 8 {
+            return None;
+        }
+    } else if head_len + tail_len > 7 {
+        return None;
+    }
+    let mut words = [0u16; 8];
+    for (i, g) in head_groups.iter().enumerate() {
+        words[i] = u16::from_str_radix(g, 16).ok()?;
+    }
+    let tail_start = 8 - tail_len;
+    for (i, g) in tail_groups.iter().enumerate() {
+        words[tail_start + i] = u16::from_str_radix(g, 16).ok()?;
+    }
+    let mut out = [0u8; 16];
+    for (i, w) in words.iter().enumerate() {
+        out[i * 2] = (w >> 8) as u8;
+        out[i * 2 + 1] = (w & 0xff) as u8;
+    }
+    Some(out)
+}
+
+/// Compare the first `prefix_bits` bits of `a` and `b`. Returns true if
+/// they match. `prefix_bits` must not exceed the family size.
+fn network_prefix_eq(a: &InetNet, b: &InetNet, prefix_bits: u8) -> bool {
+    let full_bytes = (prefix_bits / 8) as usize;
+    if a.bytes[..full_bytes] != b.bytes[..full_bytes] {
+        return false;
+    }
+    let extra = prefix_bits % 8;
+    if extra == 0 {
+        return true;
+    }
+    let mask: u8 = 0xff << (8 - extra);
+    (a.bytes[full_bytes] & mask) == (b.bytes[full_bytes] & mask)
+}
+
+/// True iff network `a` is fully contained in network `b` (a ⊆ b).
+fn inet_contained_eq(a: &InetNet, b: &InetNet) -> bool {
+    if a.family_bytes != b.family_bytes {
+        return false;
+    }
+    if a.prefix_bits < b.prefix_bits {
+        return false;
+    }
+    network_prefix_eq(a, b, b.prefix_bits)
+}
+
+/// True iff a and b are exactly the same network (same family + same
+/// prefix + same masked address).
+fn inet_networks_equal(a: &InetNet, b: &InetNet) -> bool {
+    if a.family_bytes != b.family_bytes {
+        return false;
+    }
+    if a.prefix_bits != b.prefix_bits {
+        return false;
+    }
+    network_prefix_eq(a, b, a.prefix_bits)
+}
+
+fn inet_op_bool_result(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (lt, rt) = match (l, r) {
+        (Value::Text(a), Value::Text(b)) => (a, b),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "inet operator requires TEXT/INET operands, got {:?} and {:?}",
+                    l.data_type(),
+                    r.data_type()
+                ),
+            });
+        }
+    };
+    let a = parse_inet_text(lt).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("invalid inet text: {:?}", lt),
+    })?;
+    let b = parse_inet_text(rt).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("invalid inet text: {:?}", rt),
+    })?;
+    let result = match op {
+        BinOp::InetContainedByEq => inet_contained_eq(&a, &b),
+        BinOp::InetContainedBy => inet_contained_eq(&a, &b) && !inet_networks_equal(&a, &b),
+        BinOp::InetContainsEq => inet_contained_eq(&b, &a),
+        BinOp::InetContains => inet_contained_eq(&b, &a) && !inet_networks_equal(&a, &b),
+        BinOp::InetOverlap => inet_contained_eq(&a, &b) || inet_contained_eq(&b, &a),
+        _ => unreachable!("inet_op_bool_result called with non-inet op"),
+    };
+    Ok(Value::Bool(result))
+}
+
 // ─── v7.17.0 Phase 3.7 — minimal POSIX-ERE-shaped regex matcher ───────
 //
 // SPG-engine is `#![no_std]` and has no external regex dependency, so
@@ -6310,6 +6486,12 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
+        // v7.17.0 Phase 3.P0-47 — PG INET / CIDR containment + overlap.
+        BinOp::InetContainedBy
+        | BinOp::InetContainedByEq
+        | BinOp::InetContains
+        | BinOp::InetContainsEq
+        | BinOp::InetOverlap => inet_op_bool_result(op, &l, &r),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
@@ -7139,7 +7321,12 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::JsonContains
         | BinOp::TsMatch
         | BinOp::IsDistinctFrom
-        | BinOp::IsNotDistinctFrom => {
+        | BinOp::IsNotDistinctFrom
+        | BinOp::InetContainedBy
+        | BinOp::InetContainedByEq
+        | BinOp::InetContains
+        | BinOp::InetContainsEq
+        | BinOp::InetOverlap => {
             unreachable!("compare() only called with comparison ops")
         }
     };
