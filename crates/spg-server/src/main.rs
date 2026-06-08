@@ -4211,7 +4211,13 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // v7.12.0 — tsvector / tsquery collapse to Text on the
         // wire; OIDs 3614 / 3615 advertised via `pg_type_oid`.
         | DataType::TsVector
-        | DataType::TsQuery => WireType::Text,
+        | DataType::TsQuery
+        // v7.17.0 — UUID collapses to Text on the wire as the
+        // canonical 8-4-4-4-12 lowercase hyphenated form. PG
+        // OID 2950 is advertised via `pg_type_oid`; binary
+        // 16-byte format lands when binary-format clients
+        // arrive.
+        | DataType::Uuid => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.

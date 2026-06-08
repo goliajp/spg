@@ -82,17 +82,27 @@ fn composite_fk_batch_self_ref_supported() {
 }
 
 #[test]
-fn deferrable_clause_is_rejected_at_parse_time() {
+fn deferrable_clause_accepted_as_immediate() {
+    // v7.17.0 Phase 3.1 — pg_dump emits DEFERRABLE INITIALLY
+    // DEFERRED on FK constraints by default. SPG accepts the
+    // clause but evaluates the constraint immediately at INSERT
+    // time (we don't (yet) implement deferred-until-commit
+    // semantics). The 0-change cutover contract requires that the
+    // dump round-trips without a parse error; mismatches between
+    // accept and behaviour are caught by the FK violation tests
+    // elsewhere in this file.
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE u (id INT NOT NULL)").unwrap();
     eng.execute("CREATE INDEX u_pk ON u (id)").unwrap();
-    let r = eng.execute(
+    eng.execute(
         "CREATE TABLE o (uid INT NOT NULL REFERENCES u(id) DEFERRABLE INITIALLY DEFERRED)",
-    );
-    assert!(
-        matches!(r, Err(EngineError::Parse(_))),
-        "DEFERRABLE must surface as a parse error, got {r:?}"
-    );
+    )
+    .unwrap();
+    eng.execute("INSERT INTO u VALUES (1)").unwrap();
+    eng.execute("INSERT INTO o VALUES (1)").unwrap();
+    // Violating FK still errors immediately (not deferred).
+    let bad = eng.execute("INSERT INTO o VALUES (99)");
+    assert!(bad.is_err(), "FK violated even with DEFERRABLE accept");
 }
 
 #[test]

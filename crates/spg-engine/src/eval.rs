@@ -1284,6 +1284,23 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             }
             Ok(Value::Float(prng_next_f64()))
         }
+        // v7.17.0 — PG `gen_random_uuid()` (built-in, no extension)
+        // and the historical uuid-ossp `uuid_generate_v4()` alias.
+        // Both produce a RFC 4122 v4 (random) UUID. This is the
+        // function Django / Rails / Hibernate emit in `id UUID
+        // PRIMARY KEY DEFAULT gen_random_uuid()`, the modern
+        // default PK pattern.
+        "gen_random_uuid" | "uuid_generate_v4" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{name}() takes 0 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            Ok(Value::Uuid(gen_random_uuid_bytes()))
+        }
         "sign" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -3524,12 +3541,13 @@ fn f64_trunc(x: f64) -> f64 {
 static PRNG_STATE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
 
-/// Advance the PRNG and return a uniform double in [0, 1).
-fn prng_next_f64() -> f64 {
+/// Advance the PRNG and return the raw next 64-bit state.
+/// Shared between `random()` and `gen_random_uuid()`. The CAS
+/// loop guarantees concurrent callers each see a distinct value
+/// — important for `gen_random_uuid` collision freedom under
+/// concurrent INSERTs.
+fn prng_next_u64() -> u64 {
     use core::sync::atomic::Ordering;
-    // CAS-loop ensures concurrent random() callers don't see the
-    // same value; the xorshift64* recurrence is deterministic
-    // given a seed, so atomic exchange is enough.
     let mut x = PRNG_STATE.load(Ordering::Relaxed);
     loop {
         if x == 0 {
@@ -3545,15 +3563,37 @@ fn prng_next_f64() -> f64 {
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => {
-                // 53 bits of randomness mapped to [0, 1).
-                let mantissa = next >> 11;
-                let denom = (1u64 << 53) as f64;
-                return mantissa as f64 / denom;
-            }
+            Ok(_) => return next,
             Err(seen) => x = seen,
         }
     }
+}
+
+/// Advance the PRNG and return a uniform double in [0, 1).
+fn prng_next_f64() -> f64 {
+    // 53 bits of randomness mapped to [0, 1).
+    let mantissa = prng_next_u64() >> 11;
+    let denom = (1u64 << 53) as f64;
+    mantissa as f64 / denom
+}
+
+/// v7.17.0 — generate a RFC 4122 v4 (random) UUID. Layout: 16
+/// random bytes with the version nibble (high nibble of byte 6)
+/// pinned to `0100` (= 4) and the variant top bits (high two bits
+/// of byte 8) pinned to `10` — exactly what PG's
+/// `gen_random_uuid()` and the historical uuid-ossp
+/// `uuid_generate_v4()` produce.
+pub fn gen_random_uuid_bytes() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let hi = prng_next_u64().to_be_bytes();
+    let lo = prng_next_u64().to_be_bytes();
+    out[..8].copy_from_slice(&hi);
+    out[8..].copy_from_slice(&lo);
+    // Version 4: top nibble of byte 6 must be 0100.
+    out[6] = (out[6] & 0x0f) | 0x40;
+    // Variant 1 (RFC 4122): top two bits of byte 8 must be 10.
+    out[8] = (out[8] & 0x3f) | 0x80;
+    out
 }
 
 /// no_std `f64::sqrt(x)` — square root via Newton's method
@@ -4296,6 +4336,25 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                 ),
             }),
         },
+        // v7.17.0 — `::uuid`. Identity for `uuid → uuid`; parse
+        // text via the shared `parse_uuid_str`. Anything else is a
+        // type mismatch — PG also rejects e.g. INT → UUID without
+        // an explicit text bridge.
+        CastTarget::Uuid => match v {
+            Value::Uuid(b) => Ok(Value::Uuid(b)),
+            Value::Text(s) => match spg_storage::parse_uuid_str(&s) {
+                Some(b) => Ok(Value::Uuid(b)),
+                None => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for type uuid: {s:?}"),
+                }),
+            },
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::uuid only accepts TEXT / uuid inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
     }
 }
 
@@ -4624,6 +4683,9 @@ fn value_to_text(v: &Value) -> String {
         // v7.12.0 — tsvector / tsquery render PG external form.
         Value::TsVector(lexs) => format_tsvector(lexs),
         Value::TsQuery(ast) => format_tsquery(ast),
+        // v7.17.0 — UUID renders canonical lowercase 8-4-4-4-12
+        // hyphenated form (PG `uuid_out`).
+        Value::Uuid(b) => spg_storage::format_uuid(b),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }
@@ -6637,6 +6699,25 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
                 detail: format!("cannot parse {a:?} as TIMESTAMP for comparison"),
             })?;
             at.cmp(b)
+        }
+        // v7.17.0 — UUID byte-wise comparison; both sides UUID.
+        (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
+        // v7.17.0 — PG promotes a `text` literal compared against a
+        // `uuid` column into uuid (unknown-type literal inference).
+        // Without this, `WHERE id = '550e...'` falls through to the
+        // generic TypeMismatch — the application's literal becomes
+        // an error rather than a comparison.
+        (Value::Uuid(a), Value::Text(b)) => {
+            let bu = spg_storage::parse_uuid_str(b).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("invalid input syntax for type uuid: {b:?}"),
+            })?;
+            a.cmp(&bu)
+        }
+        (Value::Text(a), Value::Uuid(b)) => {
+            let au = spg_storage::parse_uuid_str(a).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("invalid input syntax for type uuid: {a:?}"),
+            })?;
+            au.cmp(b)
         }
         (a, b) => {
             return Err(EvalError::TypeMismatch {

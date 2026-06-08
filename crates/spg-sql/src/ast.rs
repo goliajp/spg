@@ -1388,6 +1388,13 @@ pub enum ColumnTypeName {
     /// v7.12.0 `tsquery` — PG full-text search parse tree. PG
     /// wire OID 3615.
     TsQuery,
+    /// v7.17.0 `UUID` — 128-bit identifier. PG wire OID 2950.
+    /// Literal input accepts canonical hyphenated, unhyphenated,
+    /// uppercase, and `{...}`-braced forms; display normalises to
+    /// canonical lowercase 8-4-4-4-12. The drop-in PG surface for
+    /// Django / Rails / Hibernate `id UUID PRIMARY KEY DEFAULT
+    /// gen_random_uuid()`.
+    Uuid,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -1414,6 +1421,7 @@ impl fmt::Display for ColumnTypeName {
             Self::BigIntArray => f.write_str("BIGINT[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
+            Self::Uuid => f.write_str("UUID"),
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
@@ -1946,6 +1954,11 @@ pub enum CastTarget {
     /// and by `WHERE col @@ 'term'::tsquery` literal patterns.
     TsVector,
     TsQuery,
+    /// v7.17.0 — `::uuid`. Decodes the LHS Text via
+    /// `spg_storage::parse_uuid_str` (accepts canonical hyphenated,
+    /// unhyphenated, uppercase, and brace-wrapped forms); malformed
+    /// input is a SQL error.
+    Uuid,
 }
 
 impl fmt::Display for CastTarget {
@@ -1970,6 +1983,7 @@ impl fmt::Display for CastTarget {
             Self::BigIntArray => "BIGINT[]",
             Self::TsVector => "tsvector",
             Self::TsQuery => "tsquery",
+            Self::Uuid => "uuid",
         })
     }
 }

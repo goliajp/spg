@@ -769,6 +769,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::BigIntArray => "BIGINT[]".into(),
         DataType::TsVector => "TSVECTOR".into(),
         DataType::TsQuery => "TSQUERY".into(),
+        DataType::Uuid => "UUID".into(),
     }
 }
 
@@ -13325,12 +13326,21 @@ fn eval_runtime_default_free(
         "now" | "current_timestamp" | "localtimestamp" => Value::Timestamp(now_us),
         "current_date" => Value::Date((now_us / 86_400_000_000) as i32),
         "current_time" | "localtime" => Value::Timestamp(now_us),
+        // v7.17.0 — UUID generators in DEFAULT clauses. Required
+        // for the canonical Django / Rails / Hibernate `id UUID
+        // PRIMARY KEY DEFAULT gen_random_uuid()` pattern. Each
+        // INSERT evaluates the function fresh; the per-row UUID
+        // is the storage value, not a cached literal.
+        "gen_random_uuid" | "uuid_generate_v4" => {
+            Value::Uuid(eval::gen_random_uuid_bytes())
+        }
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
                 "runtime DEFAULT expression {other:?} not supported \
-                 (v7.9.21 whitelist: now() / current_timestamp / \
+                 (v7.17.0 whitelist: now() / current_timestamp / \
                  current_date / current_time / localtimestamp / \
-                 localtime)"
+                 localtime / gen_random_uuid() / \
+                 uuid_generate_v4())"
             )));
         }
     };
@@ -13716,6 +13726,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::BigIntArray => DataType::BigIntArray,
         ColumnTypeName::TsVector => DataType::TsVector,
         ColumnTypeName::TsQuery => DataType::TsQuery,
+        ColumnTypeName::Uuid => DataType::Uuid,
     }
 }
 
@@ -13940,6 +13951,28 @@ fn coerce_value(
         // output (lowercase, `\x` prefix). Important when a
         // SELECT pulls a bytea cell through a Text column path.
         (Value::Bytes(b), DataType::Text) => Some(Value::Text(encode_bytea_hex(&b))),
+        // v7.17.0 — Text → UUID. PG accepts canonical hyphenated,
+        // unhyphenated, uppercase, and `{...}`-braced forms; we
+        // funnel all four through `spg_storage::parse_uuid_str`.
+        // A malformed literal surfaces as a SQL TypeMismatch
+        // rather than silently inserting garbage — `0-change
+        // cutover` requires that an app inserting bad UUID text
+        // sees the same hard error PG would raise.
+        (Value::Text(s), DataType::Uuid) => match spg_storage::parse_uuid_str(&s) {
+            Some(b) => Some(Value::Uuid(b)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type uuid: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // v7.17.0 — UUID → Text canonical 8-4-4-4-12 lowercase.
+        // Surfaces when a SELECT plucks a uuid cell through a
+        // Text column path (e.g. INSERT INTO log SELECT id::text
+        // FROM other_table).
+        (Value::Uuid(b), DataType::Text) => Some(Value::Text(spg_storage::format_uuid(&b))),
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or
@@ -14520,11 +14553,16 @@ mod tests {
     }
 
     #[test]
-    fn insert_non_literal_expr_unsupported() {
+    fn insert_expression_evaluated_against_empty_context() {
+        // PG-canonical: INSERT VALUES accepts an arbitrary scalar
+        // expression. The engine evaluates against an empty row
+        // context — column references would error, but pure
+        // arithmetic / function calls are fine.
         let mut e = Engine::new();
         e.execute("CREATE TABLE foo (a INT NOT NULL)").unwrap();
-        let err = e.execute("INSERT INTO foo VALUES (1 + 2)").unwrap_err();
-        assert!(matches!(err, EngineError::Unsupported(_)));
+        e.execute("INSERT INTO foo VALUES (1 + 2)").unwrap();
+        let rows = e.catalog().get("foo").unwrap().rows();
+        assert_eq!(rows[0].values[0], Value::Int(3));
     }
 
     #[test]
