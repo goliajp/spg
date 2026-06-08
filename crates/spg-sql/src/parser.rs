@@ -5502,6 +5502,9 @@ impl Parser {
             // v7.17.0 Phase 3.P0-33 — MySQL `YEAR`. u16 in
             // 1901..=2155 + zero-year sentinel 0. Wire = INT4.
             "year" => ColumnTypeName::Year,
+            // v7.17.0 Phase 3.P0-34 — PG `TIMETZ` / `TIME WITH
+            // TIME ZONE`. i64 us + i32 offset_secs. Wire OID 1266.
+            "timetz" => ColumnTypeName::TimeTz,
             _other => {
                 // v7.17.0 Phase 1.4 — unknown ident → defer
                 // resolution to the engine. Stored as Text in
@@ -8023,6 +8026,7 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "uuid" => ColumnTypeName::Uuid,
         "time" => ColumnTypeName::Time,
         "year" => ColumnTypeName::Year,
+        "timetz" => ColumnTypeName::TimeTz,
         _ => return None,
     })
 }

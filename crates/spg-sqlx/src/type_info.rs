@@ -52,6 +52,11 @@ pub enum Kind {
     /// plus zero-year sentinel. Bridges decode into `i32` (wire
     /// shape collapses to INT4) or `String` (4-digit zero-pad).
     Year,
+    /// v7.17.0 Phase 3.P0-34 — PG `TIMETZ` (TIME WITH TIME
+    /// ZONE). i64 us since 00:00:00 local + i32 offset_secs.
+    /// Bridges decode into `String` (canonical
+    /// `HH:MM:SS[.ffffff]±HH[:MM]`).
+    TimeTz,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -97,6 +102,7 @@ impl SpgTypeInfo {
             DataType::Uuid => Kind::Uuid,
             DataType::Time => Kind::Time,
             DataType::Year => Kind::Year,
+            DataType::TimeTz => Kind::TimeTz,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -128,6 +134,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Uuid => "UUID",
             Kind::Time => "TIME",
             Kind::Year => "YEAR",
+            Kind::TimeTz => "TIMETZ",
             Kind::Null => "NULL",
         }
     }
