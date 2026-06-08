@@ -209,6 +209,14 @@ pub enum DataType {
     /// FILE_VERSION 39+; tag 27 on the dense type-tag side, tag
     /// 23 on the schema-agnostic value side.
     TimeTz,
+    /// v7.17.0 Phase 3.P0-35: PG `money` — i64 cents (locale-
+    /// independent storage). PG wire OID 790. Display: en_US
+    /// locale (`$N,NNN.CC`, negative → `-$1.23`). Input accepts
+    /// `$N.NN`, `$N,NNN.NN`, bare integer (treated as major
+    /// units), optional leading `-`. Range: full i64. Catalog
+    /// FILE_VERSION 40+; tag 28 on the dense type-tag side, tag
+    /// 24 on the schema-agnostic value side.
+    Money,
 }
 
 impl fmt::Display for DataType {
@@ -250,6 +258,7 @@ impl fmt::Display for DataType {
             Self::Time => f.write_str("TIME"),
             Self::Year => f.write_str("YEAR"),
             Self::TimeTz => f.write_str("TIMETZ"),
+            Self::Money => f.write_str("MONEY"),
         }
     }
 }
@@ -389,6 +398,10 @@ pub enum Value {
         us: i64,
         offset_secs: i32,
     },
+    /// v7.17.0 Phase 3.P0-35 — PG `money` — i64 cents
+    /// (locale-independent storage; the en_US locale renders on
+    /// display via `$N,NNN.CC`).
+    Money(i64),
     Null,
 }
 
@@ -438,6 +451,7 @@ impl Value {
             Self::Time(_) => Some(DataType::Time),
             Self::Year(_) => Some(DataType::Year),
             Self::TimeTz { .. } => Some(DataType::TimeTz),
+            Self::Money(_) => Some(DataType::Money),
             Self::Null => None,
         }
     }
@@ -749,6 +763,9 @@ impl IndexKey {
             Value::TimeTz { us, offset_secs } => {
                 Some(Self::Int(us - i64::from(*offset_secs) * 1_000_000))
             }
+            // v7.17.0 Phase 3.P0-35: MONEY indexable as i64 cents
+            // (no scaling needed — natural numeric ordering).
+            Value::Money(c) => Some(Self::Int(*c)),
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -5931,7 +5948,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 39;
+const FILE_VERSION: u8 = 40;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -7425,6 +7442,9 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.17.0 Phase 3.P0-34: tag 27 for `TIMETZ`. No body —
         // type identity alone. Catalog FILE_VERSION 39+.
         DataType::TimeTz => out.push(27),
+        // v7.17.0 Phase 3.P0-35: tag 28 for `MONEY`. No body —
+        // type identity alone. Catalog FILE_VERSION 40+.
+        DataType::Money => out.push(28),
     }
 }
 
@@ -7493,6 +7513,9 @@ impl Cursor<'_> {
             // v7.17.0 Phase 3.P0-34: tag 27 — TIMETZ. Catalog
             // FILE_VERSION 39+.
             27 => Ok(DataType::TimeTz),
+            // v7.17.0 Phase 3.P0-35: tag 28 — MONEY. Catalog
+            // FILE_VERSION 40+.
+            28 => Ok(DataType::Money),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -7604,6 +7627,8 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::Year(_) => 2,
         // v7.17.0 Phase 3.P0-34: TIMETZ dense body — i64 LE + i32 LE.
         Value::TimeTz { .. } => 12,
+        // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
+        Value::Money(_) => 8,
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -7828,6 +7853,8 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
             out.extend_from_slice(&us.to_le_bytes());
             out.extend_from_slice(&offset_secs.to_le_bytes());
         }
+        // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
+        (Value::Money(c), DataType::Money) => out.extend_from_slice(&c.to_le_bytes()),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -8017,6 +8044,11 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.push(23);
             out.extend_from_slice(&us.to_le_bytes());
             out.extend_from_slice(&offset_secs.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-35: MONEY — tag 24. Body = i64 LE cents.
+        Value::Money(c) => {
+            out.push(24);
+            out.extend_from_slice(&c.to_le_bytes());
         }
     }
 }
@@ -8390,6 +8422,8 @@ impl<'a> Cursor<'a> {
                 let offset_secs = self.read_i32()?;
                 Ok(Value::TimeTz { us, offset_secs })
             }
+            // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
+            DataType::Money => Ok(Value::Money(self.read_i64()?)),
         }
     }
 
@@ -8582,6 +8616,8 @@ impl<'a> Cursor<'a> {
                 let offset_secs = self.read_i32()?;
                 Ok(Value::TimeTz { us, offset_secs })
             }
+            // v7.17.0 Phase 3.P0-35: tag 24 — MONEY. i64 LE cents.
+            24 => Ok(Value::Money(self.read_i64()?)),
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }

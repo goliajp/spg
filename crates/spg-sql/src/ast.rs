@@ -1411,6 +1411,11 @@ pub enum ColumnTypeName {
     /// Wire OID 1266. Literal input is `'HH:MM:SS[.ffffff]±HH[:MM]'`.
     /// Offset range: ±14 hours.
     TimeTz,
+    /// v7.17.0 Phase 3.P0-35 PG `MONEY` — i64 cents
+    /// (locale-independent storage). Wire OID 790. Literal input
+    /// accepts `$N.NN`, `$N,NNN.NN`, bare integer (treated as
+    /// major units), optional leading `-`. Display: en_US locale.
+    Money,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -1451,6 +1456,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Time => f.write_str("TIME"),
             Self::Year => f.write_str("YEAR"),
             Self::TimeTz => f.write_str("TIMETZ"),
+            Self::Money => f.write_str("MONEY"),
         }
     }
 }

@@ -4229,7 +4229,11 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // v7.17.0 Phase 3.P0-34 — TIMETZ collapses to Text on
         // the wire as `HH:MM:SS[.ffffff]±HH[:MM]`. PG OID 1266
         // advertised via `pg_type_oid`.
-        | DataType::TimeTz => WireType::Text,
+        | DataType::TimeTz
+        // v7.17.0 Phase 3.P0-35 — MONEY collapses to Text on
+        // the wire as canonical `$N,NNN.CC`. PG OID 790
+        // advertised via `pg_type_oid`.
+        | DataType::Money => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.

@@ -5505,6 +5505,9 @@ impl Parser {
             // v7.17.0 Phase 3.P0-34 — PG `TIMETZ` / `TIME WITH
             // TIME ZONE`. i64 us + i32 offset_secs. Wire OID 1266.
             "timetz" => ColumnTypeName::TimeTz,
+            // v7.17.0 Phase 3.P0-35 — PG `MONEY` — i64 cents.
+            // Wire OID 790.
+            "money" => ColumnTypeName::Money,
             _other => {
                 // v7.17.0 Phase 1.4 — unknown ident → defer
                 // resolution to the engine. Stored as Text in
@@ -8027,6 +8030,7 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "time" => ColumnTypeName::Time,
         "year" => ColumnTypeName::Year,
         "timetz" => ColumnTypeName::TimeTz,
+        "money" => ColumnTypeName::Money,
         _ => return None,
     })
 }

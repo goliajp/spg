@@ -773,6 +773,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Time => "TIME".into(),
         DataType::Year => "YEAR".into(),
         DataType::TimeTz => "TIMETZ".into(),
+        DataType::Money => "MONEY".into(),
     }
 }
 
@@ -7458,6 +7459,9 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::TimeTz { us, offset_secs } => {
             Ok((us - i64::from(*offset_secs) * 1_000_000) as f64)
         }
+        // v7.17.0 Phase 3.P0-35 — PG MONEY ordered by i64 cents.
+        #[allow(clippy::cast_precision_loss)]
+        Value::Money(c) => Ok(*c as f64),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -11539,6 +11543,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::Year(y) => alloc::format!("{y:04}"),
         // v7.17.0 Phase 3.P0-34 — PG TIMETZ canonical text form.
         Value::TimeTz { us, offset_secs } => eval::format_timetz(*us, *offset_secs),
+        // v7.17.0 Phase 3.P0-35 — PG MONEY canonical en_US text form.
+        Value::Money(c) => eval::format_money(*c),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -13734,6 +13740,61 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
+/// v7.17.0 Phase 3.P0-35 — parse a PG `money` literal into i64
+/// cents. Accepts:
+///   * Optional leading `-` (negative)
+///   * Optional `$` prefix
+///   * Integer portion with optional `,` thousands separators
+///   * Optional `.` followed by 1-2 digits (cents); 1 digit
+///     auto-pads to 2 (`.5` → 50 cents).
+///
+/// Returns None on any parse failure — caller surfaces as hard
+/// SQL error.
+fn parse_money_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r.trim_start()),
+        None => (false, s),
+    };
+    let rest = rest.strip_prefix('$').unwrap_or(rest).trim_start();
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (rest, None),
+    };
+    if int_part.is_empty() {
+        return None;
+    }
+    // Validate + strip commas from the integer portion.
+    let mut int_digits = alloc::string::String::with_capacity(int_part.len());
+    for b in int_part.bytes() {
+        match b {
+            b',' => {}
+            b'0'..=b'9' => int_digits.push(b as char),
+            _ => return None,
+        }
+    }
+    if int_digits.is_empty() {
+        return None;
+    }
+    let dollars: i64 = int_digits.parse().ok()?;
+    let cents: i64 = match frac_part {
+        None => 0,
+        Some(f) => {
+            if f.is_empty() || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let padded = if f.len() == 1 {
+                alloc::format!("{f}0")
+            } else {
+                f.to_string()
+            };
+            padded.parse().ok()?
+        }
+    };
+    let total = dollars.checked_mul(100)?.checked_add(cents)?;
+    Some(if neg { -total } else { total })
+}
+
 /// v7.17.0 Phase 3.P0-34 — parse a PG `timetz` literal
 /// `HH:MM:SS[.fraction]±HH[:MM]` into (us, offset_secs).
 ///
@@ -13884,6 +13945,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Time => DataType::Time,
         ColumnTypeName::Year => DataType::Year,
         ColumnTypeName::TimeTz => DataType::TimeTz,
+        ColumnTypeName::Money => DataType::Money,
     }
 }
 
@@ -14187,6 +14249,54 @@ fn coerce_value(
         (Value::TimeTz { us, offset_secs }, DataType::Text) => {
             Some(Value::Text(eval::format_timetz(us, offset_secs)))
         }
+        // v7.17.0 Phase 3.P0-35 — Text → MONEY. Accepts `$N.NN`,
+        // `$N,NNN.NN`, optional leading `-`. Bare numeric literals
+        // arrive via the Int/BigInt/Float/Numeric arms below.
+        (Value::Text(s), DataType::Money) => match parse_money_str(&s) {
+            Some(c) => Some(Value::Money(c)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type money: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // Int / BigInt / SmallInt / Float / Numeric → MONEY.
+        // Bare numeric literal is interpreted as a major-unit
+        // amount (matches PG: `100`::money → $100.00 = 10000 cents).
+        (Value::SmallInt(n), DataType::Money) => Some(Value::Money(i64::from(n).saturating_mul(100))),
+        (Value::Int(n), DataType::Money) => Some(Value::Money(i64::from(n).saturating_mul(100))),
+        (Value::BigInt(n), DataType::Money) => Some(Value::Money(n.saturating_mul(100))),
+        (Value::Float(x), DataType::Money) => {
+            // Round half-away-from-zero to cents (no_std — no
+            // `f64::round`, so hand-roll via biased truncation).
+            let scaled = x * 100.0;
+            let cents = if scaled >= 0.0 {
+                (scaled + 0.5) as i64
+            } else {
+                (scaled - 0.5) as i64
+            };
+            Some(Value::Money(cents))
+        }
+        (Value::Numeric { scaled, scale }, DataType::Money) => {
+            // Convert exact decimal to cents (scale 2). If scale > 2,
+            // round half-away-from-zero. If scale < 2, multiply up.
+            let cents = if scale == 2 {
+                scaled
+            } else if scale < 2 {
+                let mult = 10_i128.pow(u32::from(2 - scale));
+                scaled.saturating_mul(mult)
+            } else {
+                let div = 10_i128.pow(u32::from(scale - 2));
+                let half = div / 2;
+                let bias = if scaled >= 0 { half } else { -half };
+                (scaled + bias) / div
+            };
+            Some(Value::Money(i64::try_from(cents).unwrap_or(i64::MAX)))
+        }
+        // MONEY → Text canonical `$N,NNN.CC`.
+        (Value::Money(c), DataType::Text) => Some(Value::Text(eval::format_money(c))),
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or

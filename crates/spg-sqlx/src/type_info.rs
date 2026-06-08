@@ -57,6 +57,10 @@ pub enum Kind {
     /// Bridges decode into `String` (canonical
     /// `HH:MM:SS[.ffffff]±HH[:MM]`).
     TimeTz,
+    /// v7.17.0 Phase 3.P0-35 — PG `MONEY` — i64 cents.
+    /// Bridges decode into `String` (canonical en_US
+    /// `$N,NNN.CC`) or `i64` (raw cents).
+    Money,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -103,6 +107,7 @@ impl SpgTypeInfo {
             DataType::Time => Kind::Time,
             DataType::Year => Kind::Year,
             DataType::TimeTz => Kind::TimeTz,
+            DataType::Money => Kind::Money,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -135,6 +140,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Time => "TIME",
             Kind::Year => "YEAR",
             Kind::TimeTz => "TIMETZ",
+            Kind::Money => "MONEY",
             Kind::Null => "NULL",
         }
     }
