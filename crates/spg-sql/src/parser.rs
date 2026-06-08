@@ -5324,7 +5324,7 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
@@ -5341,6 +5341,9 @@ impl Parser {
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant
             // list captured at type-parse time. None for all
             // non-ENUM types.
+            Option<Vec<String>>,
+            // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant
+            // list. Distinct from ENUM (subset semantics).
             Option<Vec<String>>,
         ),
         ParseError,
@@ -5362,6 +5365,8 @@ impl Parser {
         // ColumnDef so the engine can attach it to the column
         // schema (and validate INSERT cells against it).
         let mut inline_enum_variants: Option<Vec<String>> = None;
+        // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant list.
+        let mut inline_set_variants: Option<Vec<String>> = None;
         let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
@@ -5577,6 +5582,51 @@ impl Parser {
                 // the ColumnSchema side.
                 ColumnTypeName::Text
             }
+            // v7.17.0 Phase 3.P0-37 — MySQL inline SET
+            // `SET('a','b','c')`. Same parse shape as ENUM;
+            // semantics differ (subset rather than pick-one).
+            "set" => {
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after SET, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut variants: Vec<String> = Vec::new();
+                loop {
+                    match self.advance() {
+                        Token::String(s) => variants.push(s),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "SET(...) expects string literal variants, got {other:?}"
+                            )));
+                        }
+                    }
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                            continue;
+                        }
+                        Token::RParen => {
+                            self.advance();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected ',' or ')' in SET(...), got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                if variants.is_empty() {
+                    return Err(self.err(
+                        "SET(...) must declare at least one variant".into(),
+                    ));
+                }
+                inline_set_variants = Some(variants);
+                ColumnTypeName::Text
+            }
             _other => {
                 // v7.17.0 Phase 1.4 — unknown ident → defer
                 // resolution to the engine. Stored as Text in
@@ -5715,6 +5765,7 @@ impl Parser {
             collation,
             is_unsigned,
             inline_enum_variants,
+            inline_set_variants,
         ))
     }
 
@@ -5728,6 +5779,7 @@ impl Parser {
             collation,
             is_unsigned,
             inline_enum_variants,
+            inline_set_variants,
         ) = self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -5933,6 +5985,7 @@ impl Parser {
             collation,
             is_unsigned,
             inline_enum_variants,
+            inline_set_variants,
         })
     }
 

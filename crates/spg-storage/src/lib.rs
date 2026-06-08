@@ -568,6 +568,14 @@ pub struct ColumnSchema {
     /// deserialise with None — preserves silent-drop behaviour
     /// for snapshots written before P0-36.
     pub inline_enum_variants: Option<Vec<String>>,
+    /// v7.17.0 Phase 3.P0-37 — MySQL inline `SET('a','b','c')`
+    /// variant list. Storage is TEXT (canonical comma-joined in
+    /// definition order, de-duplicated). INSERT/UPDATE validates
+    /// every comma-separated token against this list. Sparse:
+    /// only SET columns land in the catalog appendix.
+    /// Persisted in catalog FILE_VERSION 42+; older catalogs
+    /// deserialise with None.
+    pub inline_set_variants: Option<Vec<String>>,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -5736,6 +5744,7 @@ impl ColumnSchema {
             collation: Collation::Binary,
             is_unsigned: false,
             inline_enum_variants: None,
+            inline_set_variants: None,
         }
     }
 
@@ -5961,7 +5970,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 41;
+const FILE_VERSION: u8 = 42;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6427,6 +6436,30 @@ impl Catalog {
                     write_str(&mut out, v.as_str());
                 }
             }
+            // v7.17.0 Phase 3.P0-37 — per-table inline_set_variants
+            // appendix. Same layout as the inline ENUM block.
+            // FILE_VERSION 42+; v41 readers never reach this block.
+            let mut set_inline_bindings: Vec<(usize, &[String])> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(vs) = &c.inline_set_variants {
+                    set_inline_bindings.push((i, vs.as_slice()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(set_inline_bindings.len())
+                    .expect("≤ 65k inline-SET columns/table"),
+            );
+            for (pos, variants) in set_inline_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_u16(
+                    &mut out,
+                    u16::try_from(variants.len()).expect("≤ 65k variants/SET"),
+                );
+                for v in variants {
+                    write_str(&mut out, v.as_str());
+                }
+            }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier
@@ -6879,6 +6912,7 @@ fn deserialize_table(
             collation: Collation::Binary,
             is_unsigned: false,
             inline_enum_variants: None,
+            inline_set_variants: None,
         });
     }
     let n_cols = cols.len();
@@ -7087,6 +7121,22 @@ fn deserialize_table(
             }
             if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
                 col.inline_enum_variants = Some(variants);
+            }
+        }
+    }
+    // v7.17.0 Phase 3.P0-37 — per-table inline_set_variants
+    // appendix (FILE_VERSION 42+). Sparse: only SET columns land.
+    if version >= 42 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let variant_count = cur.read_u16()? as usize;
+            let mut variants = Vec::with_capacity(variant_count);
+            for _ in 0..variant_count {
+                variants.push(cur.read_str()?);
+            }
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.inline_set_variants = Some(variants);
             }
         }
     }

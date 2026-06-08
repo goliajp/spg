@@ -1193,6 +1193,10 @@ pub struct ColumnDef {
     /// `ColumnSchema.inline_enum_variants`. None for all
     /// non-ENUM columns.
     pub inline_enum_variants: Option<Vec<String>>,
+    /// v7.17.0 Phase 3.P0-37 — MySQL inline `SET('a','b','c')`
+    /// value list. Distinct from ENUM (subset semantics rather
+    /// than pick-one). None for all non-SET columns.
+    pub inline_set_variants: Option<Vec<String>>,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced
