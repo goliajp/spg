@@ -217,6 +217,61 @@ pub enum DataType {
     /// FILE_VERSION 40+; tag 28 on the dense type-tag side, tag
     /// 24 on the schema-agnostic value side.
     Money,
+    /// v7.17.0 Phase 3.P0-38: PG range type. The same DataType
+    /// variant covers all six builtin ranges (int4range,
+    /// int8range, numrange, tsrange, tstzrange, daterange) —
+    /// `RangeKind` pins the element type so encode / decode /
+    /// display can route off one switch. Catalog FILE_VERSION
+    /// 43+; tag 29 + a 1-byte RangeKind on the dense type-tag
+    /// side, tag 25 on the schema-agnostic value side.
+    Range(RangeKind),
+}
+
+/// v7.17.0 Phase 3.P0-38 — pins the element type of a range value
+/// or column. Wire OIDs: Int4=3904, Int8=3926, Num=3906,
+/// Ts=3908, TsTz=3910, Date=3912.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RangeKind {
+    Int4,
+    Int8,
+    Num,
+    Ts,
+    TsTz,
+    Date,
+}
+
+impl RangeKind {
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Int4 => 0,
+            Self::Int8 => 1,
+            Self::Num => 2,
+            Self::Ts => 3,
+            Self::TsTz => 4,
+            Self::Date => 5,
+        }
+    }
+    pub const fn from_tag(t: u8) -> Option<Self> {
+        Some(match t {
+            0 => Self::Int4,
+            1 => Self::Int8,
+            2 => Self::Num,
+            3 => Self::Ts,
+            4 => Self::TsTz,
+            5 => Self::Date,
+            _ => return None,
+        })
+    }
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Int4 => "INT4RANGE",
+            Self::Int8 => "INT8RANGE",
+            Self::Num => "NUMRANGE",
+            Self::Ts => "TSRANGE",
+            Self::TsTz => "TSTZRANGE",
+            Self::Date => "DATERANGE",
+        }
+    }
 }
 
 impl fmt::Display for DataType {
@@ -259,6 +314,7 @@ impl fmt::Display for DataType {
             Self::Year => f.write_str("YEAR"),
             Self::TimeTz => f.write_str("TIMETZ"),
             Self::Money => f.write_str("MONEY"),
+            Self::Range(k) => f.write_str(k.keyword()),
         }
     }
 }
@@ -402,6 +458,22 @@ pub enum Value {
     /// (locale-independent storage; the en_US locale renders on
     /// display via `$N,NNN.CC`).
     Money(i64),
+    /// v7.17.0 Phase 3.P0-38 — PG range value. One shape covers
+    /// all six builtin range types; `kind` pins the element type
+    /// (must match the column's `DataType::Range(kind)`).
+    /// `lower` / `upper` are `None` for the unbounded sides;
+    /// `lower_inc` / `upper_inc` mirror the canonical PG
+    /// `[` / `(` / `]` / `)` bracket inclusivity. `empty=true`
+    /// supersedes all other fields (the empty range has no
+    /// bounds).
+    Range {
+        kind: RangeKind,
+        lower: Option<alloc::boxed::Box<Value>>,
+        upper: Option<alloc::boxed::Box<Value>>,
+        lower_inc: bool,
+        upper_inc: bool,
+        empty: bool,
+    },
     Null,
 }
 
@@ -452,6 +524,7 @@ impl Value {
             Self::Year(_) => Some(DataType::Year),
             Self::TimeTz { .. } => Some(DataType::TimeTz),
             Self::Money(_) => Some(DataType::Money),
+            Self::Range { kind, .. } => Some(DataType::Range(*kind)),
             Self::Null => None,
         }
     }
@@ -786,6 +859,10 @@ impl IndexKey {
             // v7.17.0 Phase 3.P0-35: MONEY indexable as i64 cents
             // (no scaling needed — natural numeric ordering).
             Value::Money(c) => Some(Self::Int(*c)),
+            // v7.17.0 Phase 3.P0-38: ranges are NOT indexable in
+            // v7.17.0 — they'd need a custom comparator (PG uses
+            // SP-GiST for this). Skip.
+            Value::Range { .. } => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -5970,7 +6047,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 42;
+const FILE_VERSION: u8 = 43;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -7553,6 +7630,12 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.17.0 Phase 3.P0-35: tag 28 for `MONEY`. No body —
         // type identity alone. Catalog FILE_VERSION 40+.
         DataType::Money => out.push(28),
+        // v7.17.0 Phase 3.P0-38: tag 29 for range types. Body
+        // = `[u8 RangeKind tag]`. Catalog FILE_VERSION 43+.
+        DataType::Range(k) => {
+            out.push(29);
+            out.push(k.tag());
+        }
     }
 }
 
@@ -7624,6 +7707,14 @@ impl Cursor<'_> {
             // v7.17.0 Phase 3.P0-35: tag 28 — MONEY. Catalog
             // FILE_VERSION 40+.
             28 => Ok(DataType::Money),
+            // v7.17.0 Phase 3.P0-38: tag 29 + RangeKind tag.
+            29 => {
+                let kt = self.read_u8()?;
+                let k = RangeKind::from_tag(kt).ok_or_else(|| {
+                    StorageError::Corrupt(format!("unknown RangeKind tag: {kt}"))
+                })?;
+                Ok(DataType::Range(k))
+            }
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -7737,6 +7828,15 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::TimeTz { .. } => 12,
         // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
         Value::Money(_) => 8,
+        // v7.17.0 Phase 3.P0-38: range dense body — `[u8 flags]
+        // [if lower: write_value(lower)] [if upper: write_value(upper)]`.
+        // Element uses the schema-agnostic write_value codec
+        // (which carries its own tag byte). The flags byte
+        // captures empty/lower_some/upper_some/lower_inc/upper_inc.
+        Value::Range { lower, upper, .. } => {
+            1 + lower.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
+                + upper.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
+        }
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -7963,6 +8063,24 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         }
         // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
         (Value::Money(c), DataType::Money) => out.extend_from_slice(&c.to_le_bytes()),
+        // v7.17.0 Phase 3.P0-38: range dense body — see
+        // value_body_encoded_len for layout. `kind` is implicit
+        // from the column DataType.
+        (Value::Range { lower, upper, lower_inc, upper_inc, empty, .. }, DataType::Range(_)) => {
+            let mut flags: u8 = 0;
+            if *empty { flags |= 0b0000_0001; }
+            if lower.is_some() { flags |= 0b0000_0010; }
+            if upper.is_some() { flags |= 0b0000_0100; }
+            if *lower_inc { flags |= 0b0000_1000; }
+            if *upper_inc { flags |= 0b0001_0000; }
+            out.push(flags);
+            if let Some(l) = lower {
+                write_value(out, l);
+            }
+            if let Some(u) = upper {
+                write_value(out, u);
+            }
+        }
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -7972,6 +8090,37 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
             other.data_type(),
             ty
         ),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-38 — length the schema-agnostic
+/// `write_value` would emit for `v`. Used by the range codec to
+/// pre-size cells. We mirror the tag-byte + body shape from
+/// `write_value` rather than serialising to a temp Vec.
+fn write_value_encoded_len(v: &Value) -> usize {
+    match v {
+        Value::Null => 1,
+        Value::SmallInt(_) => 1 + 2,
+        Value::Int(_) | Value::Date(_) => 1 + 4,
+        Value::BigInt(_)
+        | Value::Float(_)
+        | Value::Timestamp(_)
+        | Value::Time(_)
+        | Value::Money(_) => 1 + 8,
+        Value::Bool(_) => 1 + 1,
+        Value::Year(_) => 1 + 2,
+        Value::Text(s) | Value::Json(s) => 1 + 4 + s.len(),
+        Value::Bytes(b) => 1 + 4 + b.len(),
+        Value::Numeric { .. } => 1 + 16 + 1,
+        Value::Uuid(_) => 1 + 16,
+        Value::TimeTz { .. } => 1 + 12,
+        // Range-of-range and other nested cases — not currently
+        // representable but defensively measured via the dense
+        // body when the data_type is known.
+        other => {
+            let ty = other.data_type().unwrap_or(DataType::Int);
+            1 + value_body_encoded_len(other, ty)
+        }
     }
 }
 
@@ -8157,6 +8306,26 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         Value::Money(c) => {
             out.push(24);
             out.extend_from_slice(&c.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-38: range — tag 25. Body =
+        // [u8 RangeKind tag][u8 flags][if lower: write_value(lower)]
+        // [if upper: write_value(upper)].
+        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
+            out.push(25);
+            out.push(kind.tag());
+            let mut flags: u8 = 0;
+            if *empty { flags |= 0b0000_0001; }
+            if lower.is_some() { flags |= 0b0000_0010; }
+            if upper.is_some() { flags |= 0b0000_0100; }
+            if *lower_inc { flags |= 0b0000_1000; }
+            if *upper_inc { flags |= 0b0001_0000; }
+            out.push(flags);
+            if let Some(l) = lower {
+                write_value(out, l);
+            }
+            if let Some(u) = upper {
+                write_value(out, u);
+            }
         }
     }
 }
@@ -8532,6 +8701,34 @@ impl<'a> Cursor<'a> {
             }
             // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
             DataType::Money => Ok(Value::Money(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-38: range dense body. Element
+            // type is determined by the surrounding RangeKind.
+            DataType::Range(kind) => {
+                let flags = self.read_u8()?;
+                let empty = flags & 0b0000_0001 != 0;
+                let has_lower = flags & 0b0000_0010 != 0;
+                let has_upper = flags & 0b0000_0100 != 0;
+                let lower_inc = flags & 0b0000_1000 != 0;
+                let upper_inc = flags & 0b0001_0000 != 0;
+                let lower = if has_lower {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                let upper = if has_upper {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                Ok(Value::Range {
+                    kind,
+                    lower,
+                    upper,
+                    lower_inc,
+                    upper_inc,
+                    empty,
+                })
+            }
         }
     }
 
@@ -8726,6 +8923,38 @@ impl<'a> Cursor<'a> {
             }
             // v7.17.0 Phase 3.P0-35: tag 24 — MONEY. i64 LE cents.
             24 => Ok(Value::Money(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-38: tag 25 — Range.
+            // [u8 RangeKind tag][u8 flags][opt lower][opt upper].
+            25 => {
+                let kt = self.read_u8()?;
+                let kind = RangeKind::from_tag(kt).ok_or_else(|| {
+                    StorageError::Corrupt(format!("unknown RangeKind tag: {kt}"))
+                })?;
+                let flags = self.read_u8()?;
+                let empty = flags & 0b0000_0001 != 0;
+                let has_lower = flags & 0b0000_0010 != 0;
+                let has_upper = flags & 0b0000_0100 != 0;
+                let lower_inc = flags & 0b0000_1000 != 0;
+                let upper_inc = flags & 0b0001_0000 != 0;
+                let lower = if has_lower {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                let upper = if has_upper {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                Ok(Value::Range {
+                    kind,
+                    lower,
+                    upper,
+                    lower_inc,
+                    upper_inc,
+                    empty,
+                })
+            }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }

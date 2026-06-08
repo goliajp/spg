@@ -1428,6 +1428,23 @@ pub enum ColumnTypeName {
     /// accepts `$N.NN`, `$N,NNN.NN`, bare integer (treated as
     /// major units), optional leading `-`. Display: en_US locale.
     Money,
+    /// v7.17.0 Phase 3.P0-38 PG range types. Pair stores the
+    /// element kind tag (Int4 / Int8 / Num / Ts / TsTz / Date)
+    /// — the engine bridges to `DataType::Range(RangeKind)`.
+    Range(RangeKindAst),
+}
+
+/// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
+/// `spg_storage::RangeKind`; we keep it spg-sql-local so the AST
+/// crate doesn't depend on storage. Bridged at engine boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RangeKindAst {
+    Int4,
+    Int8,
+    Num,
+    Ts,
+    TsTz,
+    Date,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -1469,6 +1486,14 @@ impl fmt::Display for ColumnTypeName {
             Self::Year => f.write_str("YEAR"),
             Self::TimeTz => f.write_str("TIMETZ"),
             Self::Money => f.write_str("MONEY"),
+            Self::Range(k) => f.write_str(match k {
+                RangeKindAst::Int4 => "INT4RANGE",
+                RangeKindAst::Int8 => "INT8RANGE",
+                RangeKindAst::Num => "NUMRANGE",
+                RangeKindAst::Ts => "TSRANGE",
+                RangeKindAst::TsTz => "TSTZRANGE",
+                RangeKindAst::Date => "DATERANGE",
+            }),
         }
     }
 }

@@ -774,6 +774,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Year => "YEAR".into(),
         DataType::TimeTz => "TIMETZ".into(),
         DataType::Money => "MONEY".into(),
+        DataType::Range(k) => k.keyword().into(),
     }
 }
 
@@ -7495,6 +7496,11 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         // v7.17.0 Phase 3.P0-35 — PG MONEY ordered by i64 cents.
         #[allow(clippy::cast_precision_loss)]
         Value::Money(c) => Ok(*c as f64),
+        // v7.17.0 Phase 3.P0-38 — range ordering is not supported
+        // in v7.17.0 (needs lex-then-inclusivity tiebreak).
+        Value::Range { .. } => Err(EngineError::Unsupported(
+            "ORDER BY of a range value is not supported in v7.17.0".into(),
+        )),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -11578,6 +11584,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::TimeTz { us, offset_secs } => eval::format_timetz(*us, *offset_secs),
         // v7.17.0 Phase 3.P0-35 — PG MONEY canonical en_US text form.
         Value::Money(c) => eval::format_money(*c),
+        // v7.17.0 Phase 3.P0-38 — PG range canonical text form.
+        v @ Value::Range { .. } => format_range_str(v),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -13843,6 +13851,125 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
+/// v7.17.0 Phase 3.P0-38 — parse a PG range literal of the form
+/// `'[lo,up)'` / `'(lo,up]'` / `'[lo,up]'` / `'(lo,up)'` /
+/// `'empty'`. Lower / upper may be empty (unbounded). Returns
+/// `None` on any parse failure; caller surfaces as hard error.
+fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<Value> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("empty") {
+        return Some(Value::Range {
+            kind,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+            empty: true,
+        });
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 {
+        return None;
+    }
+    let lower_inc = match bytes[0] {
+        b'[' => true,
+        b'(' => false,
+        _ => return None,
+    };
+    let upper_inc = match bytes[bytes.len() - 1] {
+        b']' => true,
+        b')' => false,
+        _ => return None,
+    };
+    let inner = &s[1..s.len() - 1];
+    let (lo_text, up_text) = inner.split_once(',')?;
+    let lower = if lo_text.is_empty() {
+        None
+    } else {
+        Some(alloc::boxed::Box::new(parse_range_element(lo_text, kind)?))
+    };
+    let upper = if up_text.is_empty() {
+        None
+    } else {
+        Some(alloc::boxed::Box::new(parse_range_element(up_text, kind)?))
+    };
+    Some(Value::Range {
+        kind,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+        empty: false,
+    })
+}
+
+/// v7.17.0 Phase 3.P0-38 — parse a single range bound text into
+/// the matching element Value for the RangeKind.
+fn parse_range_element(text: &str, kind: spg_storage::RangeKind) -> Option<Value> {
+    let text = text.trim().trim_matches('"');
+    use spg_storage::RangeKind as K;
+    match kind {
+        K::Int4 => text.parse::<i32>().ok().map(Value::Int),
+        K::Int8 => text.parse::<i64>().ok().map(Value::BigInt),
+        K::Num => {
+            // Reuse the Numeric parse via the engine's text-coercion
+            // path; bail to None on failure.
+            let dot = text.find('.');
+            let scale: u8 = dot.map_or(0, |p| (text.len() - p - 1) as u8);
+            let digits: alloc::string::String =
+                text.chars().filter(|c| *c == '-' || c.is_ascii_digit()).collect();
+            let scaled: i128 = digits.parse().ok()?;
+            Some(Value::Numeric { scaled, scale })
+        }
+        K::Ts | K::TsTz => {
+            // Reuse the existing timestamp parse path. v7.17.0
+            // expects `'YYYY-MM-DD HH:MM:SS[.ffffff]'` in range
+            // bounds (TZ offset on TsTz is OOS for the initial
+            // P0-38; ship plain Timestamp shape).
+            crate::eval::parse_timestamp_literal(text).map(Value::Timestamp)
+        }
+        K::Date => crate::eval::parse_date_literal(text).map(Value::Date),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-38 — render a Range value as its canonical
+/// PG text form. Re-exported via [`format_range_text`] for use
+/// from spg-server's pgwire layer.
+pub fn format_range_text(v: &Value) -> alloc::string::String {
+    format_range_str(v)
+}
+
+fn format_range_str(v: &Value) -> alloc::string::String {
+    let Value::Range { lower, upper, lower_inc, upper_inc, empty, .. } = v else {
+        return alloc::string::String::new();
+    };
+    if *empty {
+        return "empty".into();
+    }
+    let mut out = alloc::string::String::new();
+    out.push(if *lower_inc { '[' } else { '(' });
+    if let Some(l) = lower {
+        out.push_str(&format_range_element(l));
+    }
+    out.push(',');
+    if let Some(u) = upper {
+        out.push_str(&format_range_element(u));
+    }
+    out.push(if *upper_inc { ']' } else { ')' });
+    out
+}
+
+fn format_range_element(v: &Value) -> alloc::string::String {
+    match v {
+        Value::Int(n) => alloc::format!("{n}"),
+        Value::BigInt(n) => alloc::format!("{n}"),
+        Value::Date(d) => crate::eval::format_date(*d),
+        Value::Timestamp(t) => crate::eval::format_timestamp(*t),
+        Value::Numeric { scaled, scale } => crate::eval::format_numeric(*scaled, *scale),
+        other => alloc::format!("{other:?}"),
+    }
+}
+
 /// v7.17.0 Phase 3.P0-35 — parse a PG `money` literal into i64
 /// cents. Accepts:
 ///   * Optional leading `-` (negative)
@@ -14049,6 +14176,14 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Year => DataType::Year,
         ColumnTypeName::TimeTz => DataType::TimeTz,
         ColumnTypeName::Money => DataType::Money,
+        ColumnTypeName::Range(k) => DataType::Range(match k {
+            spg_sql::ast::RangeKindAst::Int4 => spg_storage::RangeKind::Int4,
+            spg_sql::ast::RangeKindAst::Int8 => spg_storage::RangeKind::Int8,
+            spg_sql::ast::RangeKindAst::Num => spg_storage::RangeKind::Num,
+            spg_sql::ast::RangeKindAst::Ts => spg_storage::RangeKind::Ts,
+            spg_sql::ast::RangeKindAst::TsTz => spg_storage::RangeKind::TsTz,
+            spg_sql::ast::RangeKindAst::Date => spg_storage::RangeKind::Date,
+        }),
     }
 }
 
@@ -14400,6 +14535,23 @@ fn coerce_value(
         }
         // MONEY → Text canonical `$N,NNN.CC`.
         (Value::Money(c), DataType::Text) => Some(Value::Text(eval::format_money(c))),
+        // v7.17.0 Phase 3.P0-38 — Text → Range. Accepts canonical
+        // PG forms: `'empty'`, `'[a,b)'`, `'(a,b]'`, `'[a,b]'`,
+        // `'(a,b)'`, with empty lower or upper for unbounded.
+        (Value::Text(s), DataType::Range(kind)) => match parse_range_str(&s, kind) {
+            Some(v) => Some(v),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for range type: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // Range → Text canonical form (`[a,b)`, `'empty'`, etc).
+        (v @ Value::Range { .. }, DataType::Text) => {
+            Some(Value::Text(format_range_str(&v)))
+        }
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or

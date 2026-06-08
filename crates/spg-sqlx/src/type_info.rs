@@ -61,6 +61,10 @@ pub enum Kind {
     /// Bridges decode into `String` (canonical en_US
     /// `$N,NNN.CC`) or `i64` (raw cents).
     Money,
+    /// v7.17.0 Phase 3.P0-38 — PG range types (int4range /
+    /// int8range / numrange / tsrange / tstzrange / daterange).
+    /// Bridges decode into `String` (canonical `[a,b)`).
+    Range,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -108,6 +112,7 @@ impl SpgTypeInfo {
             DataType::Year => Kind::Year,
             DataType::TimeTz => Kind::TimeTz,
             DataType::Money => Kind::Money,
+            DataType::Range(_) => Kind::Range,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -141,6 +146,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Year => "YEAR",
             Kind::TimeTz => "TIMETZ",
             Kind::Money => "MONEY",
+            Kind::Range => "RANGE",
             Kind::Null => "NULL",
         }
     }

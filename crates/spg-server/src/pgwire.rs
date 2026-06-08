@@ -2922,6 +2922,15 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::TimeTz => 1266,
         // v7.17.0 Phase 3 P0-35 — PG MONEY OID 790.
         DataType::Money => 790,
+        // v7.17.0 Phase 3 P0-38 — PG range OIDs (pg_type.dat).
+        DataType::Range(k) => match k {
+            spg_storage::RangeKind::Int4 => 3904,
+            spg_storage::RangeKind::Int8 => 3926,
+            spg_storage::RangeKind::Num => 3906,
+            spg_storage::RangeKind::Ts => 3908,
+            spg_storage::RangeKind::TsTz => 3910,
+            spg_storage::RangeKind::Date => 3912,
+        },
     }
 }
 
@@ -2942,6 +2951,8 @@ const fn pg_type_len(ty: DataType) -> i16 {
         DataType::TimeTz => 12,
         // v7.17.0 Phase 3.P0-35 — MONEY is fixed i64 (8 bytes).
         DataType::Money => 8,
+        // v7.17.0 Phase 3.P0-38 — Range is variable-length (varlena).
+        DataType::Range(_) => -1,
         _ => -1, // varlena
     }
 }
@@ -3010,6 +3021,8 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         // helper so the canonical en_US text form matches PG
         // `cash_out` across all renderers.
         Value::Money(c) => spg_engine::eval::format_money(*c),
+        // v7.17.0 Phase 3.P0-38 — Range via shared engine helper.
+        Value::Range { .. } => spg_engine::format_range_text(v),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => format!("{v:?}"),
     })

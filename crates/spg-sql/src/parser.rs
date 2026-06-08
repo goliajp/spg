@@ -24,8 +24,9 @@ use crate::ast::{
     FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin, FunctionArg,
     FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
     JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
-    PublicationScope, RaiseLevel, ReturnTarget, SelectItem, SelectStatement, Statement, TableRef,
-    TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
+    PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
+    Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind,
+    VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -5532,6 +5533,13 @@ impl Parser {
             // v7.17.0 Phase 3.P0-35 — PG `MONEY` — i64 cents.
             // Wire OID 790.
             "money" => ColumnTypeName::Money,
+            // v7.17.0 Phase 3.P0-38 — PG range types.
+            "int4range" => ColumnTypeName::Range(RangeKindAst::Int4),
+            "int8range" => ColumnTypeName::Range(RangeKindAst::Int8),
+            "numrange" => ColumnTypeName::Range(RangeKindAst::Num),
+            "tsrange" => ColumnTypeName::Range(RangeKindAst::Ts),
+            "tstzrange" => ColumnTypeName::Range(RangeKindAst::TsTz),
+            "daterange" => ColumnTypeName::Range(RangeKindAst::Date),
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
             // `ENUM('a','b','c')`. Storage is TEXT; the value
             // list lands on `inline_enum_variants` for the
