@@ -236,7 +236,8 @@ fn function_return_shape(
         | "ltrim" | "rtrim" | "substring" | "substr" | "replace"
         | "split_part" | "repeat" | "lpad" | "rpad" | "left" | "right"
         | "translate" | "regexp_replace" | "to_char" | "encode"
-        | "host" | "network" | "version" | "database" | "current_user"
+        | "host" | "network" | "version" | "database" | "current_database"
+        | "current_schema" | "current_user"
         | "session_user" | "user" | "pg_get_serial_sequence"
         | "pg_get_constraintdef" | "pg_get_indexdef"
         | "date_format" => (DataType::Text, true),
