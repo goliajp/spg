@@ -127,7 +127,23 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
             use spg_sql::ast::Literal as L;
             let (ty, nullable) = match lit {
                 L::Null => (DataType::Text, true),
-                L::Integer(_) => (DataType::BigInt, false),
+                // PG-canonical literal-int typing: `pg_typeof(1) =
+                // integer`, `pg_typeof(2147483648) = bigint`. The
+                // engine's runtime Value::Int(i32) flows naturally
+                // into INT columns; widening to BIGINT happens in
+                // coerce_value only when the column type asks for
+                // it. Bisected to P0-4: pre-fix every literal was
+                // BigInt, which let `WITH RECURSIVE t(n) AS (SELECT
+                // 1 …)` infer the working table column as BIGINT
+                // while the second-iteration INSERT path produced a
+                // Value::Int(1) — type mismatch.
+                L::Integer(n) => {
+                    if i32::try_from(*n).is_ok() {
+                        (DataType::Int, false)
+                    } else {
+                        (DataType::BigInt, false)
+                    }
+                }
                 L::Float(_) => (DataType::Float, false),
                 L::String(_) => (DataType::Text, false),
                 L::Bool(_) => (DataType::Bool, false),
