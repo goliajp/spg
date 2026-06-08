@@ -2918,6 +2918,8 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         // OID; advertise as INT4 (23) so libpq / sqlx render it
         // as an integer.
         DataType::Year => 23,
+        // v7.17.0 Phase 3 P0-34 — PG TIMETZ OID 1266.
+        DataType::TimeTz => 1266,
     }
 }
 
@@ -2934,6 +2936,8 @@ const fn pg_type_len(ty: DataType) -> i16 {
         DataType::Time => 8,
         // v7.17.0 Phase 3.P0-33 — YEAR is fixed u16 (2 bytes).
         DataType::Year => 2,
+        // v7.17.0 Phase 3.P0-34 — TIMETZ is i64 + i32 (12 bytes).
+        DataType::TimeTz => 12,
         _ => -1, // varlena
     }
 }
@@ -2992,6 +2996,12 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         Value::Time(us) => spg_engine::eval::format_time(*us),
         // v7.17.0 Phase 3.P0-33 — YEAR renders 4-digit zero-padded.
         Value::Year(y) => format!("{y:04}"),
+        // v7.17.0 Phase 3.P0-34 — TIMETZ via the shared engine
+        // helper so the canonical `HH:MM:SS[.ffffff]±HH[:MM]`
+        // shape matches PG `timetz_out` across all renderers.
+        Value::TimeTz { us, offset_secs } => {
+            spg_engine::eval::format_timetz(*us, *offset_secs)
+        }
         // v7.5.0 — Value is #[non_exhaustive].
         _ => format!("{v:?}"),
     })

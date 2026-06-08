@@ -201,6 +201,14 @@ pub enum DataType {
     /// FILE_VERSION 38+; tag 26 on the dense type-tag side, tag
     /// 22 on the schema-agnostic value side.
     Year,
+    /// v7.17.0 Phase 3.P0-34: PG `time with time zone` (TIMETZ) —
+    /// i64 microseconds since 00:00:00 in the local wall clock
+    /// PLUS i32 offset-from-UTC in seconds. PG wire OID 1266.
+    /// Display: `HH:MM:SS[.ffffff]±HH[:MM]` (PG `timetz_out`).
+    /// Range: offset in ±50400 seconds (±14 hours). Catalog
+    /// FILE_VERSION 39+; tag 27 on the dense type-tag side, tag
+    /// 23 on the schema-agnostic value side.
+    TimeTz,
 }
 
 impl fmt::Display for DataType {
@@ -241,6 +249,7 @@ impl fmt::Display for DataType {
             Self::Uuid => f.write_str("UUID"),
             Self::Time => f.write_str("TIME"),
             Self::Year => f.write_str("YEAR"),
+            Self::TimeTz => f.write_str("TIMETZ"),
         }
     }
 }
@@ -370,6 +379,16 @@ pub enum Value {
     /// Display always 4 digits zero-padded (`0000` for the
     /// sentinel; `1985`/`2007` otherwise).
     Year(u16),
+    /// v7.17.0 Phase 3.P0-34 — PG `time with time zone` — i64
+    /// microseconds since 00:00:00 in the LOCAL wall clock PLUS
+    /// an i32 offset-from-UTC in seconds. PG preserves the
+    /// offset on output, so the wall-clock value is NOT shifted
+    /// to UTC at storage time. Offset range: ±50400 seconds
+    /// (±14 hours).
+    TimeTz {
+        us: i64,
+        offset_secs: i32,
+    },
     Null,
 }
 
@@ -418,6 +437,7 @@ impl Value {
             Self::Uuid(_) => Some(DataType::Uuid),
             Self::Time(_) => Some(DataType::Time),
             Self::Year(_) => Some(DataType::Year),
+            Self::TimeTz { .. } => Some(DataType::TimeTz),
             Self::Null => None,
         }
     }
@@ -721,6 +741,14 @@ impl IndexKey {
             // widens losslessly and gives the natural calendar
             // ordering.
             Value::Year(y) => Some(Self::Int(i64::from(*y))),
+            // v7.17.0 Phase 3.P0-34: TIMETZ indexable by its
+            // UTC-equivalent microseconds (local wall - offset).
+            // Without normalising, two values for the same
+            // physical instant in different zones would sort
+            // wrong. Matches PG's TIMETZ index behaviour.
+            Value::TimeTz { us, offset_secs } => {
+                Some(Self::Int(us - i64::from(*offset_secs) * 1_000_000))
+            }
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -5903,7 +5931,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 38;
+const FILE_VERSION: u8 = 39;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -7394,6 +7422,9 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.17.0 Phase 3.P0-33: tag 26 for `YEAR`. No body — type
         // identity alone. Catalog FILE_VERSION 38+.
         DataType::Year => out.push(26),
+        // v7.17.0 Phase 3.P0-34: tag 27 for `TIMETZ`. No body —
+        // type identity alone. Catalog FILE_VERSION 39+.
+        DataType::TimeTz => out.push(27),
     }
 }
 
@@ -7459,6 +7490,9 @@ impl Cursor<'_> {
             // v7.17.0 Phase 3.P0-33: tag 26 — YEAR. Catalog
             // FILE_VERSION 38+.
             26 => Ok(DataType::Year),
+            // v7.17.0 Phase 3.P0-34: tag 27 — TIMETZ. Catalog
+            // FILE_VERSION 39+.
+            27 => Ok(DataType::TimeTz),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -7568,6 +7602,8 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::Time(_) => 8,
         // v7.17.0 Phase 3.P0-33: YEAR dense body — fixed u16 LE.
         Value::Year(_) => 2,
+        // v7.17.0 Phase 3.P0-34: TIMETZ dense body — i64 LE + i32 LE.
+        Value::TimeTz { .. } => 12,
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -7786,6 +7822,12 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         (Value::Time(us), DataType::Time) => out.extend_from_slice(&us.to_le_bytes()),
         // v7.17.0 Phase 3.P0-33: YEAR dense body — u16 LE.
         (Value::Year(y), DataType::Year) => out.extend_from_slice(&y.to_le_bytes()),
+        // v7.17.0 Phase 3.P0-34: TIMETZ dense body — i64 LE us +
+        // i32 LE offset_secs.
+        (Value::TimeTz { us, offset_secs }, DataType::TimeTz) => {
+            out.extend_from_slice(&us.to_le_bytes());
+            out.extend_from_slice(&offset_secs.to_le_bytes());
+        }
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -7968,6 +8010,13 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         Value::Year(y) => {
             out.push(22);
             out.extend_from_slice(&y.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-34: TIMETZ — tag 23. Body = i64 LE
+        // us + i32 LE offset_secs.
+        Value::TimeTz { us, offset_secs } => {
+            out.push(23);
+            out.extend_from_slice(&us.to_le_bytes());
+            out.extend_from_slice(&offset_secs.to_le_bytes());
         }
     }
 }
@@ -8334,6 +8383,13 @@ impl<'a> Cursor<'a> {
             DataType::Time => Ok(Value::Time(self.read_i64()?)),
             // v7.17.0 Phase 3.P0-33: YEAR dense body — u16 LE.
             DataType::Year => Ok(Value::Year(self.read_u16()?)),
+            // v7.17.0 Phase 3.P0-34: TIMETZ dense body —
+            // i64 LE us + i32 LE offset_secs.
+            DataType::TimeTz => {
+                let us = self.read_i64()?;
+                let offset_secs = self.read_i32()?;
+                Ok(Value::TimeTz { us, offset_secs })
+            }
         }
     }
 
@@ -8519,6 +8575,13 @@ impl<'a> Cursor<'a> {
             21 => Ok(Value::Time(self.read_i64()?)),
             // v7.17.0 Phase 3.P0-33: tag 22 — YEAR. u16 LE.
             22 => Ok(Value::Year(self.read_u16()?)),
+            // v7.17.0 Phase 3.P0-34: tag 23 — TIMETZ. i64 LE us +
+            // i32 LE offset_secs.
+            23 => {
+                let us = self.read_i64()?;
+                let offset_secs = self.read_i32()?;
+                Ok(Value::TimeTz { us, offset_secs })
+            }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }

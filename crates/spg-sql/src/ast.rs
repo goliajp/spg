@@ -1406,6 +1406,11 @@ pub enum ColumnTypeName {
     /// PG OID; advertised as INT4 on the wire. Display always
     /// 4 digits zero-padded.
     Year,
+    /// v7.17.0 Phase 3.P0-34 PG `TIME WITH TIME ZONE` (TIMETZ) —
+    /// i64 us since 00:00:00 (local) + i32 offset_secs from UTC.
+    /// Wire OID 1266. Literal input is `'HH:MM:SS[.ffffff]±HH[:MM]'`.
+    /// Offset range: ±14 hours.
+    TimeTz,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -1445,6 +1450,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
             Self::Time => f.write_str("TIME"),
             Self::Year => f.write_str("YEAR"),
+            Self::TimeTz => f.write_str("TIMETZ"),
         }
     }
 }

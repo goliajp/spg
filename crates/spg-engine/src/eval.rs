@@ -5023,6 +5023,23 @@ pub fn format_timestamptz(micros: i64) -> String {
     s
 }
 
+/// v7.17.0 Phase 3.P0-34 — PG `TIMETZ` canonical text form
+/// `HH:MM:SS[.ffffff]±HH[:MM]`. Mirrors PG `timetz_out`. The
+/// offset uses `±HH` for whole-hour offsets and `±HH:MM` for
+/// sub-hour offsets (matching PG's "minimal display" rule).
+pub fn format_timetz(us: i64, offset_secs: i32) -> String {
+    let time = format_time(us);
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.unsigned_abs();
+    let oh = abs / 3600;
+    let om = (abs % 3600) / 60;
+    if om == 0 {
+        format!("{time}{sign}{oh:02}")
+    } else {
+        format!("{time}{sign}{oh:02}:{om:02}")
+    }
+}
+
 /// v7.17.0 Phase 3.P0-32 — PG `TIME` canonical text form
 /// `HH:MM:SS[.ffffff]`. Mirrors PG `time_out`. Trailing zeros in
 /// the fractional component are stripped — `12:00:00.500000`

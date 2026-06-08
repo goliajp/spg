@@ -772,6 +772,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Uuid => "UUID".into(),
         DataType::Time => "TIME".into(),
         DataType::Year => "YEAR".into(),
+        DataType::TimeTz => "TIMETZ".into(),
     }
 }
 
@@ -7449,6 +7450,14 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         // u16 (matches calendar ordering; zero-year sentinel
         // sorts before 1901).
         Value::Year(y) => Ok(f64::from(*y)),
+        // v7.17.0 Phase 3.P0-34 — PG TIMETZ ordered by the
+        // UTC-equivalent microseconds (local wall - offset). Two
+        // values for the same physical instant in different zones
+        // sort equal — matches PG TIMETZ index behaviour.
+        #[allow(clippy::cast_precision_loss)]
+        Value::TimeTz { us, offset_secs } => {
+            Ok((us - i64::from(*offset_secs) * 1_000_000) as f64)
+        }
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -11528,6 +11537,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::Time(us) => eval::format_time(*us),
         // v7.17.0 Phase 3.P0-33 — MySQL YEAR 4-digit zero-padded.
         Value::Year(y) => alloc::format!("{y:04}"),
+        // v7.17.0 Phase 3.P0-34 — PG TIMETZ canonical text form.
+        Value::TimeTz { us, offset_secs } => eval::format_timetz(*us, *offset_secs),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -13723,6 +13734,52 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
+/// v7.17.0 Phase 3.P0-34 — parse a PG `timetz` literal
+/// `HH:MM:SS[.fraction]±HH[:MM]` into (us, offset_secs).
+///
+/// The offset suffix is MANDATORY: SPG doesn't have a session TZ
+/// wired into eval, so a bare `HH:MM:SS` literal would be
+/// ambiguous. Returns None for any parse failure or out-of-range
+/// component — caller surfaces as a hard SQL error.
+///
+/// Offset range: ±14 hours (±50400 seconds), matching PG's
+/// internal limit.
+fn parse_timetz_str(s: &str) -> Option<(i64, i32)> {
+    let s = s.trim();
+    // Find the offset sign — scan from right since the time part
+    // never contains '+' / '-' (after the optional fractional dot
+    // it's all digits and ':').
+    let bytes = s.as_bytes();
+    let sign_pos = bytes
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|&(_, &b)| b == b'+' || b == b'-')
+        .map(|(i, _)| i)?;
+    if sign_pos == 0 {
+        return None; // bare sign — no time component
+    }
+    let time_part = &s[..sign_pos];
+    let offset_part = &s[sign_pos..];
+    let us = parse_time_str(time_part)?;
+    let sign: i32 = if offset_part.starts_with('+') { 1 } else { -1 };
+    let offset_body = &offset_part[1..];
+    let (hh_str, mm_str) = match offset_body.split_once(':') {
+        Some((h, m)) => (h, m),
+        None => (offset_body, "0"),
+    };
+    let hh: i32 = hh_str.parse().ok()?;
+    let mm: i32 = mm_str.parse().ok()?;
+    if !(0..=14).contains(&hh) || !(0..=59).contains(&mm) {
+        return None;
+    }
+    let total = sign * (hh * 3600 + mm * 60);
+    if total.abs() > 50_400 {
+        return None;
+    }
+    Some((us, total))
+}
+
 /// v7.17.0 Phase 3.P0-33 — funnel an integer literal through MySQL
 /// YEAR range validation: 0 sentinel or 1901..=2155. Out-of-range
 /// surfaces as a hard SQL error (no silent truncation, mirrors PG
@@ -13826,6 +13883,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Uuid => DataType::Uuid,
         ColumnTypeName::Time => DataType::Time,
         ColumnTypeName::Year => DataType::Year,
+        ColumnTypeName::TimeTz => DataType::TimeTz,
     }
 }
 
@@ -14111,6 +14169,24 @@ fn coerce_value(
         },
         // YEAR → Text 4-digit zero-padded.
         (Value::Year(y), DataType::Text) => Some(Value::Text(alloc::format!("{y:04}"))),
+        // v7.17.0 Phase 3.P0-34 — Text → TIMETZ. Mandatory
+        // signed offset suffix; missing offset is a hard error
+        // (SPG has no session TZ wired into eval, unlike PG).
+        (Value::Text(s), DataType::TimeTz) => match parse_timetz_str(&s) {
+            Some((us, offset_secs)) => Some(Value::TimeTz { us, offset_secs }),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type time with time zone: \
+                         {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // TIMETZ → Text canonical `HH:MM:SS[.ffffff]±HH[:MM]`.
+        (Value::TimeTz { us, offset_secs }, DataType::Text) => {
+            Some(Value::Text(eval::format_timetz(us, offset_secs)))
+        }
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or
