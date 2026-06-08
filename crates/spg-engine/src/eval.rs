@@ -5005,6 +5005,8 @@ fn value_to_text(v: &Value) -> String {
         // through the engine's format_range_text to share the
         // single renderer with pgwire / sqllogictest.
         Value::Range { .. } => crate::format_range_text(v),
+        // v7.17.0 Phase 3.P0-39 — Hstore canonical PG text form.
+        Value::Hstore(pairs) => crate::format_hstore_text(pairs),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }

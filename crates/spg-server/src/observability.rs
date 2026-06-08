@@ -607,6 +607,9 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v7.17.0 Phase 3.P0-38 — range cells avg ~24 bytes
                 // (flags + two element values).
                 DataType::Range(_) => 24,
+                // v7.17.0 Phase 3.P0-39 — hstore avg ~64 bytes
+                // (k=>v map, varlena).
+                DataType::Hstore => 64,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

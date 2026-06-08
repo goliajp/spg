@@ -2931,6 +2931,11 @@ const fn pg_type_oid(ty: DataType) -> u32 {
             spg_storage::RangeKind::TsTz => 3910,
             spg_storage::RangeKind::Date => 3912,
         },
+        // v7.17.0 Phase 3 P0-39 — hstore OID is installation-
+        // dependent in real PG. Advertise as TEXT (25) on the
+        // wire so clients without an installed hstore extension
+        // still decode the canonical `"k"=>"v"` text correctly.
+        DataType::Hstore => 25,
     }
 }
 
@@ -2953,6 +2958,8 @@ const fn pg_type_len(ty: DataType) -> i16 {
         DataType::Money => 8,
         // v7.17.0 Phase 3.P0-38 — Range is variable-length (varlena).
         DataType::Range(_) => -1,
+        // v7.17.0 Phase 3.P0-39 — Hstore is varlena.
+        DataType::Hstore => -1,
         _ => -1, // varlena
     }
 }
@@ -3023,6 +3030,8 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         Value::Money(c) => spg_engine::eval::format_money(*c),
         // v7.17.0 Phase 3.P0-38 — Range via shared engine helper.
         Value::Range { .. } => spg_engine::format_range_text(v),
+        // v7.17.0 Phase 3.P0-39 — Hstore via shared engine helper.
+        Value::Hstore(pairs) => spg_engine::format_hstore_text(pairs),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => format!("{v:?}"),
     })

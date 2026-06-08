@@ -230,6 +230,8 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Money(c) => spg_engine::eval::format_money(*c),
         // v7.17.0 Phase 3.P0-38 — PG range canonical text form.
         v @ Value::Range { .. } => spg_engine::format_range_text(v),
+        // v7.17.0 Phase 3.P0-39 — PG hstore canonical text form.
+        Value::Hstore(pairs) => spg_engine::format_hstore_text(pairs),
         Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
         Value::Json(s) => s.clone(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side

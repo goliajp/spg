@@ -225,6 +225,15 @@ pub enum DataType {
     /// 43+; tag 29 + a 1-byte RangeKind on the dense type-tag
     /// side, tag 25 on the schema-agnostic value side.
     Range(RangeKind),
+    /// v7.17.0 Phase 3.P0-39: PG `hstore` extension type — flat
+    /// `text => text` map with NULL value support. Catalog
+    /// FILE_VERSION 44+; tag 30 on the dense type-tag side, tag
+    /// 26 on the schema-agnostic value side. The contrib OID is
+    /// installation-dependent in real PG; SPG advertises it via
+    /// dynamic lookup, falling back to TEXT (OID 25) on the wire
+    /// when the installed `hstore` extension hasn't claimed an
+    /// OID yet.
+    Hstore,
 }
 
 /// v7.17.0 Phase 3.P0-38 — pins the element type of a range value
@@ -315,6 +324,7 @@ impl fmt::Display for DataType {
             Self::TimeTz => f.write_str("TIMETZ"),
             Self::Money => f.write_str("MONEY"),
             Self::Range(k) => f.write_str(k.keyword()),
+            Self::Hstore => f.write_str("HSTORE"),
         }
     }
 }
@@ -458,6 +468,11 @@ pub enum Value {
     /// (locale-independent storage; the en_US locale renders on
     /// display via `$N,NNN.CC`).
     Money(i64),
+    /// v7.17.0 Phase 3.P0-39 — PG `hstore` value: flat
+    /// `text => text` map with NULL value support. Insertion
+    /// order preserved on input; duplicate keys take last-write-
+    /// wins at parse time.
+    Hstore(Vec<(String, Option<String>)>),
     /// v7.17.0 Phase 3.P0-38 — PG range value. One shape covers
     /// all six builtin range types; `kind` pins the element type
     /// (must match the column's `DataType::Range(kind)`).
@@ -525,6 +540,7 @@ impl Value {
             Self::TimeTz { .. } => Some(DataType::TimeTz),
             Self::Money(_) => Some(DataType::Money),
             Self::Range { kind, .. } => Some(DataType::Range(*kind)),
+            Self::Hstore(_) => Some(DataType::Hstore),
             Self::Null => None,
         }
     }
@@ -863,6 +879,9 @@ impl IndexKey {
             // v7.17.0 — they'd need a custom comparator (PG uses
             // SP-GiST for this). Skip.
             Value::Range { .. } => None,
+            // v7.17.0 Phase 3.P0-39: hstore is NOT indexable in
+            // v7.17.0 — map columns need GIN with bespoke ops.
+            Value::Hstore(_) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -6047,7 +6066,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 43;
+const FILE_VERSION: u8 = 44;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -7636,6 +7655,9 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             out.push(29);
             out.push(k.tag());
         }
+        // v7.17.0 Phase 3.P0-39: tag 30 for hstore. No body —
+        // type identity alone. Catalog FILE_VERSION 44+.
+        DataType::Hstore => out.push(30),
     }
 }
 
@@ -7715,6 +7737,8 @@ impl Cursor<'_> {
                 })?;
                 Ok(DataType::Range(k))
             }
+            // v7.17.0 Phase 3.P0-39: tag 30 — HSTORE.
+            30 => Ok(DataType::Hstore),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -7836,6 +7860,19 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::Range { lower, upper, .. } => {
             1 + lower.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
                 + upper.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
+        }
+        // v7.17.0 Phase 3.P0-39: hstore dense body — `[u32 count]
+        // then per pair [u32 klen][k bytes][u8 has_val][if has_val:
+        // u32 vlen][v bytes]`.
+        Value::Hstore(pairs) => {
+            let mut n = 4;
+            for (k, v) in pairs {
+                n += 4 + k.len() + 1;
+                if let Some(val) = v {
+                    n += 4 + val.len();
+                }
+            }
+            n
         }
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
@@ -8081,6 +8118,10 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 write_value(out, u);
             }
         }
+        // v7.17.0 Phase 3.P0-39: hstore dense body — same shape
+        // as write_value_body for hstore (no leading tag — that
+        // lives on the data type).
+        (Value::Hstore(pairs), DataType::Hstore) => write_hstore_body(out, pairs),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -8114,6 +8155,16 @@ fn write_value_encoded_len(v: &Value) -> usize {
         Value::Numeric { .. } => 1 + 16 + 1,
         Value::Uuid(_) => 1 + 16,
         Value::TimeTz { .. } => 1 + 12,
+        Value::Hstore(pairs) => {
+            let mut n = 1 + 4;
+            for (k, v) in pairs {
+                n += 4 + k.len() + 1;
+                if let Some(val) = v {
+                    n += 4 + val.len();
+                }
+            }
+            n
+        }
         // Range-of-range and other nested cases — not currently
         // representable but defensively measured via the dense
         // body when the data_type is known.
@@ -8325,6 +8376,33 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             }
             if let Some(u) = upper {
                 write_value(out, u);
+            }
+        }
+        // v7.17.0 Phase 3.P0-39: hstore — tag 26. Body =
+        // [u32 count] then per pair `[u32 klen][k bytes][u8 has_val]
+        // [if has_val: u32 vlen][v bytes]`.
+        Value::Hstore(pairs) => {
+            out.push(26);
+            write_hstore_body(out, pairs);
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-39 — shared hstore body writer.
+fn write_hstore_body(out: &mut Vec<u8>, pairs: &[(String, Option<String>)]) {
+    let count = u32::try_from(pairs.len()).expect("hstore ≤ u32::MAX pairs");
+    out.extend_from_slice(&count.to_le_bytes());
+    for (k, v) in pairs {
+        let klen = u32::try_from(k.len()).expect("hstore key ≤ 4 GiB");
+        out.extend_from_slice(&klen.to_le_bytes());
+        out.extend_from_slice(k.as_bytes());
+        match v {
+            None => out.push(0),
+            Some(val) => {
+                out.push(1);
+                let vlen = u32::try_from(val.len()).expect("hstore val ≤ 4 GiB");
+                out.extend_from_slice(&vlen.to_le_bytes());
+                out.extend_from_slice(val.as_bytes());
             }
         }
     }
@@ -8701,6 +8779,9 @@ impl<'a> Cursor<'a> {
             }
             // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
             DataType::Money => Ok(Value::Money(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-39: hstore dense body. Body
+            // shape == read_hstore_body.
+            DataType::Hstore => Ok(Value::Hstore(self.read_hstore_body()?)),
             // v7.17.0 Phase 3.P0-38: range dense body. Element
             // type is determined by the surrounding RangeKind.
             DataType::Range(kind) => {
@@ -8730,6 +8811,32 @@ impl<'a> Cursor<'a> {
                 })
             }
         }
+    }
+
+    /// v7.17.0 Phase 3.P0-39 — read a hstore body emitted by
+    /// `write_hstore_body`.
+    fn read_hstore_body(&mut self) -> Result<Vec<(String, Option<String>)>, StorageError> {
+        let count = self.read_u32()? as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let klen = self.read_u32()? as usize;
+            let k_bytes = self.take(klen)?.to_vec();
+            let k = String::from_utf8(k_bytes).map_err(|_| {
+                StorageError::Corrupt("hstore key is not valid UTF-8".into())
+            })?;
+            let has_val = self.read_u8()? != 0;
+            let v = if has_val {
+                let vlen = self.read_u32()? as usize;
+                let v_bytes = self.take(vlen)?.to_vec();
+                Some(String::from_utf8(v_bytes).map_err(|_| {
+                    StorageError::Corrupt("hstore value is not valid UTF-8".into())
+                })?)
+            } else {
+                None
+            };
+            out.push((k, v));
+        }
+        Ok(out)
     }
 
     /// v7.12.0 — read a tsvector body emitted by `write_tsvector_body`.
@@ -8923,6 +9030,9 @@ impl<'a> Cursor<'a> {
             }
             // v7.17.0 Phase 3.P0-35: tag 24 — MONEY. i64 LE cents.
             24 => Ok(Value::Money(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-39: tag 26 — Hstore. Body shape
+            // == read_hstore_body.
+            26 => Ok(Value::Hstore(self.read_hstore_body()?)),
             // v7.17.0 Phase 3.P0-38: tag 25 — Range.
             // [u8 RangeKind tag][u8 flags][opt lower][opt upper].
             25 => {

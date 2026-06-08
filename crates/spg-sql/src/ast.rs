@@ -1432,6 +1432,9 @@ pub enum ColumnTypeName {
     /// element kind tag (Int4 / Int8 / Num / Ts / TsTz / Date)
     /// — the engine bridges to `DataType::Range(RangeKind)`.
     Range(RangeKindAst),
+    /// v7.17.0 Phase 3.P0-39 PG `hstore` extension type — flat
+    /// `text => text` map with NULL value support.
+    Hstore,
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1494,6 +1497,7 @@ impl fmt::Display for ColumnTypeName {
                 RangeKindAst::TsTz => "TSTZRANGE",
                 RangeKindAst::Date => "DATERANGE",
             }),
+            Self::Hstore => f.write_str("HSTORE"),
         }
     }
 }
