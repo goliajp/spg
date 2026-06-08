@@ -5324,13 +5324,27 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
     fn parse_type_with_implied_flags(
         &mut self,
-    ) -> Result<(ColumnTypeName, bool, bool, Option<String>, Collation, bool), ParseError> {
+    ) -> Result<
+        (
+            ColumnTypeName,
+            bool,
+            bool,
+            Option<String>,
+            Collation,
+            bool,
+            // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant
+            // list captured at type-parse time. None for all
+            // non-ENUM types.
+            Option<Vec<String>>,
+        ),
+        ParseError,
+    > {
         let ty_ident = match self.advance() {
             Token::Ident(s) => s,
             other => {
@@ -5343,6 +5357,11 @@ impl Parser {
         let mut implied_auto_increment = false;
         let mut implied_not_null = false;
         let mut user_type_ref: Option<String> = None;
+        // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM('a','b','c')
+        // value list, captured here and bubbled up through the
+        // ColumnDef so the engine can attach it to the column
+        // schema (and validate INSERT cells against it).
+        let mut inline_enum_variants: Option<Vec<String>> = None;
         let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
@@ -5508,6 +5527,56 @@ impl Parser {
             // v7.17.0 Phase 3.P0-35 — PG `MONEY` — i64 cents.
             // Wire OID 790.
             "money" => ColumnTypeName::Money,
+            // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
+            // `ENUM('a','b','c')`. Storage is TEXT; the value
+            // list lands on `inline_enum_variants` for the
+            // engine to validate INSERT cells against. Empty
+            // value list is a parse error (matches MySQL).
+            "enum" => {
+                // Expect the opening `(`.
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after ENUM, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut variants: Vec<String> = Vec::new();
+                loop {
+                    match self.advance() {
+                        Token::String(s) => variants.push(s),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "ENUM(...) expects string literal variants, got {other:?}"
+                            )));
+                        }
+                    }
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                            continue;
+                        }
+                        Token::RParen => {
+                            self.advance();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected ',' or ')' in ENUM(...), got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                if variants.is_empty() {
+                    return Err(self.err(
+                        "ENUM(...) must declare at least one variant".into(),
+                    ));
+                }
+                inline_enum_variants = Some(variants);
+                // Storage is plain TEXT; the variant list lives on
+                // the ColumnSchema side.
+                ColumnTypeName::Text
+            }
             _other => {
                 // v7.17.0 Phase 1.4 — unknown ident → defer
                 // resolution to the engine. Stored as Text in
@@ -5645,6 +5714,7 @@ impl Parser {
             user_type_ref,
             collation,
             is_unsigned,
+            inline_enum_variants,
         ))
     }
 
@@ -5657,6 +5727,7 @@ impl Parser {
             user_type_ref,
             collation,
             is_unsigned,
+            inline_enum_variants,
         ) = self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -5861,6 +5932,7 @@ impl Parser {
             on_update_runtime,
             collation,
             is_unsigned,
+            inline_enum_variants,
         })
     }
 

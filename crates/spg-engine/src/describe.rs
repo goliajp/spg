@@ -83,6 +83,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     on_update_runtime: None,
                     collation: spg_storage::Collation::Binary,
                     is_unsigned: false,
+                    inline_enum_variants: None,
                 });
             }
         }

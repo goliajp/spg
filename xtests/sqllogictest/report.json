@@ -64,7 +64,7 @@
         { "file": "09_if_ifnull.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1092, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1103, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -201,6 +201,8 @@
         { "file": "67_pg_timetz.test", "pass": 11, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "68_pg_money.test", "pass": 10, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "69_mysql_inline_enum.test", "pass": 11, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
