@@ -1,8 +1,9 @@
 # v7.17.0 Phase 7 — INET / CIDR / MACADDR types (text-backed)
 # + host() / network() / masklen() helpers.
 #
-# SPG stores network address types as Text. Containment ops
-# `<<=` / `>>=` are out of v7.17 scope.
+# SPG stores network address types as Text. Containment / overlap
+# operators (`<<` / `<<=` / `>>` / `>>=` / `&&`) land separately in
+# `74_inet_contains.test` (v7.17.0 Phase 3.P0-47).
 
 # INET column accepts dotted IPv4.
 statement ok

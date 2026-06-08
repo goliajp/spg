@@ -2138,6 +2138,21 @@ pub enum BinOp {
     /// 3VL on NULL. Symmetric: PG also accepts `tsquery @@
     /// tsvector` and engine eval normalises either ordering.
     TsMatch,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contained-in
+    /// `<<`. LHS network is strictly inside RHS network (no equality).
+    InetContainedBy,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contained-in-or-equal
+    /// `<<=`. LHS network ⊆ RHS network.
+    InetContainedByEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contains `>>`.
+    /// LHS network strictly contains RHS network.
+    InetContains,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contains-or-equal `>>=`.
+    /// LHS network ⊇ RHS network.
+    InetContainsEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR network overlap `&&`.
+    /// True iff either network contains any address of the other.
+    InetOverlap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3550,6 +3565,11 @@ impl fmt::Display for BinOp {
             Self::JsonGetPathText => "#>>",
             Self::JsonContains => "@>",
             Self::TsMatch => "@@",
+            Self::InetContainedBy => "<<",
+            Self::InetContainedByEq => "<<=",
+            Self::InetContains => ">>",
+            Self::InetContainsEq => ">>=",
+            Self::InetOverlap => "&&",
         })
     }
 }
