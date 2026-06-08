@@ -5926,6 +5926,20 @@ impl Engine {
                     })
                 })
                 .collect();
+        // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant lists.
+        // Distinct from enum_label_lookup: SET validates that
+        // every comma-separated token is in the variant list, and
+        // canonicalises the cell to definition-order de-duped text.
+        let set_variant_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
+            pre_borrow_column_meta
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| {
+                    col.inline_set_variants
+                        .as_ref()
+                        .map(|vs| (i, vs.clone()))
+                })
+                .collect();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -6025,6 +6039,12 @@ impl Engine {
                     }
                     let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                     enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    let coerced = canonicalize_set_value(
+                        &set_variant_lookup,
+                        i,
+                        &col.name,
+                        coerced,
+                    )?;
                     check_unsigned_range(&coerced, col, i)?;
                     out.push(coerced);
                 }
@@ -6045,6 +6065,12 @@ impl Engine {
                     }
                     let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                     enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    let coerced = canonicalize_set_value(
+                        &set_variant_lookup,
+                        i,
+                        &col.name,
+                        coerced,
+                    )?;
                     check_unsigned_range(&coerced, col, i)?;
                     out.push(coerced);
                 }
@@ -13414,6 +13440,68 @@ fn is_runtime_default_expr(expr: &Expr) -> bool {
 /// v7.17.0 Phase 1.4 — INSERT/UPDATE-time enum label check. When
 /// `col_idx` has a registered label list, the cell value must be
 /// NULL or one of the labels (case-sensitive per PG).
+/// v7.17.0 Phase 3.P0-37 — validate + canonicalise a MySQL inline
+/// SET cell. For non-SET columns this is a no-op pass-through.
+///
+/// Semantics:
+///   * NULL preserved.
+///   * Empty string → `''` (zero flags).
+///   * Otherwise split on ',', trim each token, validate every
+///     token against the column's variant list (error on miss),
+///     de-dup, then re-emit in DEFINITION order joined by ','.
+fn canonicalize_set_value(
+    lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    col_idx: usize,
+    col_name: &str,
+    value: Value,
+) -> Result<Value, EngineError> {
+    let Some(variants) = lookup.get(&col_idx) else {
+        return Ok(value);
+    };
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Text(s) => {
+            if s.is_empty() {
+                return Ok(Value::Text(alloc::string::String::new()));
+            }
+            // Collect a presence-set of variant indices to keep
+            // definition order + handle de-dup in one pass.
+            let mut present = alloc::vec![false; variants.len()];
+            for raw in s.split(',') {
+                let tok = raw.trim();
+                if tok.is_empty() {
+                    continue;
+                }
+                let idx = variants.iter().position(|v| v == tok).ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "column {col_name:?}: invalid SET token {tok:?}; \
+                         allowed: {variants:?}"
+                    ))
+                })?;
+                present[idx] = true;
+            }
+            // Re-emit in definition order.
+            let mut out = alloc::string::String::new();
+            let mut first = true;
+            for (i, keep) in present.iter().enumerate() {
+                if !keep {
+                    continue;
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&variants[i]);
+            }
+            Ok(Value::Text(out))
+        }
+        other => Err(EngineError::Unsupported(alloc::format!(
+            "column {col_name:?}: SET-typed column expects TEXT, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
 fn enforce_enum_label(
     lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
     col_idx: usize,
@@ -13473,6 +13561,10 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     // INSERT validation lives in coerce_value (Text → Text path
     // with the column's variant list as the accept-set).
     schema.inline_enum_variants = c.inline_enum_variants;
+    // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant list.
+    // INSERT canonicalisation (de-dup + sort by definition order)
+    // lives in the exec_insert path next to the ENUM check.
+    schema.inline_set_variants = c.inline_set_variants;
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to
