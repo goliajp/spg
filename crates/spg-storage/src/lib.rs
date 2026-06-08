@@ -556,6 +556,18 @@ pub struct ColumnSchema {
     /// Persisted in catalog FILE_VERSION 35+; older catalogs
     /// deserialise every column as `is_unsigned = false`.
     pub is_unsigned: bool,
+    /// v7.17.0 Phase 3.P0-36 — MySQL inline `ENUM('a','b','c')`
+    /// value list. Distinct from `user_enum_type` (which points
+    /// to a separately CREATE TYPE'd PG enum); this carries the
+    /// column-local list MySQL DDL declares inline. When `Some`,
+    /// `ty` is `DataType::Text` and INSERT/UPDATE validates the
+    /// cell value against this list. Variant ORDER is preserved
+    /// (MySQL uses it for `ORDER BY col`). Sparse: only ENUM
+    /// columns land in the catalog appendix.
+    /// Persisted in catalog FILE_VERSION 41+; older catalogs
+    /// deserialise with None — preserves silent-drop behaviour
+    /// for snapshots written before P0-36.
+    pub inline_enum_variants: Option<Vec<String>>,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -5723,6 +5735,7 @@ impl ColumnSchema {
             on_update_runtime: None,
             collation: Collation::Binary,
             is_unsigned: false,
+            inline_enum_variants: None,
         }
     }
 
@@ -5948,7 +5961,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 40;
+const FILE_VERSION: u8 = 41;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6387,6 +6400,32 @@ impl Catalog {
             );
             for pos in unsigned_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+            }
+            // v7.17.0 Phase 3.P0-36 — per-table inline_enum_variants
+            // appendix. Sparse: only ENUM columns land. Layout:
+            // `[u16 count] then per binding [u16 col_pos]
+            // [u16 variant_count] then variant strings`.
+            // FILE_VERSION 41+; v40 readers never reach this block.
+            let mut enum_inline_bindings: Vec<(usize, &[String])> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(vs) = &c.inline_enum_variants {
+                    enum_inline_bindings.push((i, vs.as_slice()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(enum_inline_bindings.len())
+                    .expect("≤ 65k inline-ENUM columns/table"),
+            );
+            for (pos, variants) in enum_inline_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_u16(
+                    &mut out,
+                    u16::try_from(variants.len()).expect("≤ 65k variants/ENUM"),
+                );
+                for v in variants {
+                    write_str(&mut out, v.as_str());
+                }
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
@@ -6839,6 +6878,7 @@ fn deserialize_table(
             on_update_runtime: None,
             collation: Collation::Binary,
             is_unsigned: false,
+            inline_enum_variants: None,
         });
     }
     let n_cols = cols.len();
@@ -7029,6 +7069,24 @@ fn deserialize_table(
             let col_pos = cur.read_u16()? as usize;
             if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
                 col.is_unsigned = true;
+            }
+        }
+    }
+    // v7.17.0 Phase 3.P0-36 — per-table inline_enum_variants
+    // appendix (FILE_VERSION 41+). Sparse: only ENUM columns land.
+    // v40-and-below readers leave every column at
+    // `inline_enum_variants = None`.
+    if version >= 41 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let variant_count = cur.read_u16()? as usize;
+            let mut variants = Vec::with_capacity(variant_count);
+            for _ in 0..variant_count {
+                variants.push(cur.read_str()?);
+            }
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.inline_enum_variants = Some(variants);
             }
         }
     }

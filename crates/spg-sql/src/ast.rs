@@ -1185,6 +1185,14 @@ pub struct ColumnDef {
     /// (i64::MAX for BIGINT UNSIGNED), which still strictly
     /// exceeds what every mailrs / Rails app actually uses.
     pub is_unsigned: bool,
+    /// v7.17.0 Phase 3.P0-36 — MySQL inline `ENUM('a','b','c')`
+    /// value list captured at parse time. When `Some`, the parser
+    /// recognised `ENUM(...)` in the type slot; the engine
+    /// validates INSERT cells against this list at
+    /// column_def_to_schema time and persists the variants on
+    /// `ColumnSchema.inline_enum_variants`. None for all
+    /// non-ENUM columns.
+    pub inline_enum_variants: Option<Vec<String>>,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced

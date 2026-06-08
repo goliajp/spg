@@ -5911,6 +5911,13 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, col)| {
+                    // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
+                    // variant lists take priority over the PG
+                    // catalog enum_types lookup (they're
+                    // column-local and authoritative when set).
+                    if let Some(inline) = &col.inline_enum_variants {
+                        return Some((i, inline.clone()));
+                    }
                     col.user_enum_type.as_ref().and_then(|ename| {
                         self.active_catalog()
                             .enum_types()
@@ -13462,6 +13469,10 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     // v7.17.0 Phase 4.4 — MySQL `UNSIGNED` flag propagates to
     // storage so engine INSERT / UPDATE can range-check.
     schema.is_unsigned = c.is_unsigned;
+    // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant list.
+    // INSERT validation lives in coerce_value (Text → Text path
+    // with the column's variant list as the accept-set).
+    schema.inline_enum_variants = c.inline_enum_variants;
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to
