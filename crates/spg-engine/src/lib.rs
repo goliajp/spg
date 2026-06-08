@@ -14710,6 +14710,17 @@ fn coerce_value(
             "1" | "true" | "t" | "yes" | "on" => Some(Value::Bool(true)),
             _ => None,
         },
+        // v7.17.0 Phase 3.P0-46 — MySQL TINYINT(1) (which Phase 4.3
+        // classifies as DataType::Bool) is the storage shape every
+        // mysqldump-restored boolean column lands in. mysqldump emits
+        // the values as integer `0` / `1` literals, so int → bool
+        // coerce on INSERT is required for a 0-change cutover. MySQL's
+        // rule is "any non-zero is truthy"; we follow that for all
+        // signed int widths so the same coerce path serves an
+        // explicit `BOOLEAN` column too.
+        (Value::Int(n), DataType::Bool) => Some(Value::Bool(n != 0)),
+        (Value::SmallInt(n), DataType::Bool) => Some(Value::Bool(n != 0)),
+        (Value::BigInt(n), DataType::Bool) => Some(Value::Bool(n != 0)),
         // v4.9: Text ↔ JSON coercion. No structural validation —
         // any text literal is accepted; the responsibility for
         // valid JSON lies with the producer.
