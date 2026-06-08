@@ -1401,6 +1401,11 @@ pub enum ColumnTypeName {
     /// (6-digit microsecond precision). Display normalises to
     /// the canonical `HH:MM:SS[.ffffff]`.
     Time,
+    /// v7.17.0 Phase 3.P0-33 MySQL `YEAR` — u16 in range
+    /// 1901..=2155 plus the zero-year sentinel 0. No dedicated
+    /// PG OID; advertised as INT4 on the wire. Display always
+    /// 4 digits zero-padded.
+    Year,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -1439,6 +1444,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
             Self::Time => f.write_str("TIME"),
+            Self::Year => f.write_str("YEAR"),
         }
     }
 }

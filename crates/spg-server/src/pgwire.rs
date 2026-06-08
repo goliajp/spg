@@ -2914,6 +2914,10 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::TsQuery => 3615,     // PG `tsquery` — v7.12.0 G-CRIT-3
         DataType::Uuid => 2950,        // PG `uuid` — v7.17.0 Phase 3 P0-25
         DataType::Time => 1083,        // PG `time` — v7.17.0 Phase 3 P0-32
+        // v7.17.0 Phase 3 P0-33 — MySQL YEAR has no dedicated PG
+        // OID; advertise as INT4 (23) so libpq / sqlx render it
+        // as an integer.
+        DataType::Year => 23,
     }
 }
 
@@ -2928,6 +2932,8 @@ const fn pg_type_len(ty: DataType) -> i16 {
         DataType::Uuid => 16,
         // v7.17.0 Phase 3.P0-32 — TIME is fixed i64 (8 bytes).
         DataType::Time => 8,
+        // v7.17.0 Phase 3.P0-33 — YEAR is fixed u16 (2 bytes).
+        DataType::Year => 2,
         _ => -1, // varlena
     }
 }
@@ -2984,6 +2990,8 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         // engine helper so the trim-trailing-zeros shape matches
         // PG `time_out` across pgwire, sqllogictest, and engine.
         Value::Time(us) => spg_engine::eval::format_time(*us),
+        // v7.17.0 Phase 3.P0-33 — YEAR renders 4-digit zero-padded.
+        Value::Year(y) => format!("{y:04}"),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => format!("{v:?}"),
     })

@@ -5499,6 +5499,9 @@ impl Parser {
             // v7.17.0 Phase 3.P0-32 — PG `TIME` (without time zone).
             // i64 microseconds since 00:00:00. Wire OID 1083.
             "time" => ColumnTypeName::Time,
+            // v7.17.0 Phase 3.P0-33 — MySQL `YEAR`. u16 in
+            // 1901..=2155 + zero-year sentinel 0. Wire = INT4.
+            "year" => ColumnTypeName::Year,
             _other => {
                 // v7.17.0 Phase 1.4 — unknown ident → defer
                 // resolution to the engine. Stored as Text in
@@ -8019,6 +8022,7 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "tsquery" => ColumnTypeName::TsQuery,
         "uuid" => ColumnTypeName::Uuid,
         "time" => ColumnTypeName::Time,
+        "year" => ColumnTypeName::Year,
         _ => return None,
     })
 }

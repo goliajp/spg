@@ -598,6 +598,8 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::Uuid => 16,
                 // v7.17.0 Phase 3.P0-32 — TIME is fixed i64 (8 bytes).
                 DataType::Time => 8,
+                // v7.17.0 Phase 3.P0-33 — YEAR is fixed u16 (2 bytes).
+                DataType::Year => 2,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

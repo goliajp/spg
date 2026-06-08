@@ -771,6 +771,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::TsQuery => "TSQUERY".into(),
         DataType::Uuid => "UUID".into(),
         DataType::Time => "TIME".into(),
+        DataType::Year => "YEAR".into(),
     }
 }
 
@@ -7444,6 +7445,10 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         // i64 microseconds (matches wall-clock ordering).
         #[allow(clippy::cast_precision_loss)]
         Value::Time(us) => Ok(*us as f64),
+        // v7.17.0 Phase 3.P0-33 — MySQL YEAR ordered by underlying
+        // u16 (matches calendar ordering; zero-year sentinel
+        // sorts before 1901).
+        Value::Year(y) => Ok(f64::from(*y)),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -11521,6 +11526,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::Timestamp(t) => eval::format_timestamp(*t),
         // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.
         Value::Time(us) => eval::format_time(*us),
+        // v7.17.0 Phase 3.P0-33 — MySQL YEAR 4-digit zero-padded.
+        Value::Year(y) => alloc::format!("{y:04}"),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -13716,6 +13723,24 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
+/// v7.17.0 Phase 3.P0-33 — funnel an integer literal through MySQL
+/// YEAR range validation: 0 sentinel or 1901..=2155. Out-of-range
+/// surfaces as a hard SQL error (no silent truncation, mirrors PG
+/// `time_in` / `uuid_in` discipline).
+fn coerce_int_to_year(n: i64, col_name: &str) -> Result<Value, EngineError> {
+    if n == 0 || (1901..=2155).contains(&n) {
+        // u16::try_from cannot fail in this range; the cast also
+        // covers the 0 sentinel.
+        return Ok(Value::Year(n as u16));
+    }
+    Err(EngineError::Eval(EvalError::TypeMismatch {
+        detail: alloc::format!(
+            "year value out of range: {n} (column `{col_name}`; \
+             MySQL accepts 0 or 1901..=2155)"
+        ),
+    }))
+}
+
 /// v7.17.0 Phase 3.P0-32 — parse a PG `time` literal
 /// `HH:MM:SS[.fraction]` into microseconds since 00:00:00.
 ///
@@ -13800,6 +13825,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::TsQuery => DataType::TsQuery,
         ColumnTypeName::Uuid => DataType::Uuid,
         ColumnTypeName::Time => DataType::Time,
+        ColumnTypeName::Year => DataType::Year,
     }
 }
 
@@ -14063,6 +14089,28 @@ fn coerce_value(
         },
         // v7.17.0 Phase 3.P0-32 — TIME → Text canonical `HH:MM:SS[.ffffff]`.
         (Value::Time(us), DataType::Text) => Some(Value::Text(eval::format_time(us))),
+        // v7.17.0 Phase 3.P0-33 — int / bigint → YEAR. Range
+        // check enforces the MySQL canonical 1901..=2155 + 0
+        // sentinel; out-of-range is a hard SQL error (no silent
+        // truncation, mirrors P0-32 / P0-25 discipline).
+        (Value::SmallInt(n), DataType::Year) => Some(coerce_int_to_year(i64::from(n), col_name)?),
+        (Value::Int(n), DataType::Year) => Some(coerce_int_to_year(i64::from(n), col_name)?),
+        (Value::BigInt(n), DataType::Year) => Some(coerce_int_to_year(n, col_name)?),
+        // Text → YEAR. Accepts the 4-digit decimal form only;
+        // two-digit YEAR (`'99'` → 1999) was deprecated in MySQL
+        // 5.7 and is out of scope for v7.17.0.
+        (Value::Text(s), DataType::Year) => match s.trim().parse::<i64>() {
+            Ok(n) => Some(coerce_int_to_year(n, col_name)?),
+            Err(_) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type year: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // YEAR → Text 4-digit zero-padded.
+        (Value::Year(y), DataType::Text) => Some(Value::Text(alloc::format!("{y:04}"))),
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or

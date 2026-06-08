@@ -48,6 +48,10 @@ pub enum Kind {
     /// microseconds since 00:00:00. Bridges decode into `String`
     /// (canonical `HH:MM:SS[.ffffff]` form).
     Time,
+    /// v7.17.0 Phase 3.P0-33 — MySQL `YEAR`. u16 in 1901..=2155
+    /// plus zero-year sentinel. Bridges decode into `i32` (wire
+    /// shape collapses to INT4) or `String` (4-digit zero-pad).
+    Year,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -92,6 +96,7 @@ impl SpgTypeInfo {
             // `uuid` feature is enabled on sqlx) or to `String`.
             DataType::Uuid => Kind::Uuid,
             DataType::Time => Kind::Time,
+            DataType::Year => Kind::Year,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -122,6 +127,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Json => "JSON",
             Kind::Uuid => "UUID",
             Kind::Time => "TIME",
+            Kind::Year => "YEAR",
             Kind::Null => "NULL",
         }
     }
