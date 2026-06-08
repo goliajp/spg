@@ -2146,6 +2146,23 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "current_database" | "database" => Ok(Value::Text("spg".into())),
         "current_schema" => Ok(Value::Text("public".into())),
         "current_user" | "session_user" | "user" => Ok(Value::Text("admin".into())),
+        // v7.17.0 Phase 3.P0-31 — `pg_typeof(any)` returns the
+        // canonical PG lowercase type name. sqlx / SQLAlchemy /
+        // Diesel emit this during describe; generic ORMs may
+        // branch on it (`CASE WHEN pg_typeof(x) = 'jsonb' ...`).
+        // NULL has no resolved value-level type → 'unknown' per
+        // PG semantics.
+        "pg_typeof" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_typeof() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            Ok(Value::Text(pg_typeof_name(&args[0]).into()))
+        }
         // v7.17.0 — `nextval` / `currval` / `setval` are handled
         // at the top of this match against the SequenceResolver.
         // `lastval()` (no-arg session memory) still degrades to
@@ -4064,6 +4081,49 @@ fn format_string(args: &[Value]) -> Result<Value, EvalError> {
 
 /// Helper: render a Value as text for format()'s %s / %I / %L
 /// payload. Reuses the regular text-coercion table.
+/// v7.17.0 Phase 3.P0-31 — map a `Value` to the canonical PG
+/// type-name string returned by `pg_typeof`. Lowercase, matches
+/// what real PostgreSQL emits (NOT SPG's UPPERCASE Display shape).
+fn pg_typeof_name(v: &Value) -> &'static str {
+    match v {
+        Value::SmallInt(_) => "smallint",
+        Value::Int(_) => "integer",
+        Value::BigInt(_) => "bigint",
+        Value::Float(_) => "double precision",
+        Value::Text(_) => "text",
+        Value::Bool(_) => "boolean",
+        Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => "vector",
+        Value::Numeric { .. } => "numeric",
+        Value::Date(_) => "date",
+        Value::Timestamp(_) => "timestamp without time zone",
+        Value::Interval { .. } => "interval",
+        Value::Json(_) => {
+            // SPG carries JSON and JSONB in the same Value::Json
+            // variant; without a column ty hint we cannot tell
+            // them apart at value level. Return "json" as the
+            // conservative answer (PG's pg_typeof on a literal
+            // `'{}'::json` returns "json"; the jsonb case is
+            // covered when an explicit ::jsonb cast lands as
+            // Value::Json too — see below override at call site).
+            //
+            // The eval-arm above for pg_typeof handles the
+            // disambiguation via Expr-shape probing.
+            "json"
+        }
+        Value::Bytes(_) => "bytea",
+        Value::TextArray(_) => "text[]",
+        Value::IntArray(_) => "integer[]",
+        Value::BigIntArray(_) => "bigint[]",
+        Value::TsVector(_) => "tsvector",
+        Value::TsQuery(_) => "tsquery",
+        Value::Uuid(_) => "uuid",
+        Value::Null => "unknown",
+        // Value is #[non_exhaustive]; future variants land here
+        // until the table is updated.
+        _ => "unknown",
+    }
+}
+
 fn value_to_format_text(v: &Value) -> String {
     match v {
         Value::Text(s) | Value::Json(s) => s.clone(),

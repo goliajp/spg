@@ -240,7 +240,7 @@ fn function_return_shape(
         | "current_schema" | "current_user"
         | "session_user" | "user" | "pg_get_serial_sequence"
         | "pg_get_constraintdef" | "pg_get_indexdef"
-        | "date_format" => (DataType::Text, true),
+        | "date_format" | "pg_typeof" => (DataType::Text, true),
         // Bytes-returning.
         "decode" | "hex" => (DataType::Bytes, true),
         // Integer-returning length / position helpers.
