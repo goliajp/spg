@@ -184,6 +184,14 @@ pub enum DataType {
     /// Rails / Hibernate "id UUID PRIMARY KEY DEFAULT
     /// gen_random_uuid()" default-PK pattern.
     Uuid,
+    /// v7.17.0 Phase 3.P0-32: PG `time` (without time zone) — i64
+    /// microseconds since 00:00:00. PG wire OID 1083. Display:
+    /// canonical zero-padded `HH:MM:SS` when fractional is zero,
+    /// `HH:MM:SS.ffffff` otherwise. Catalog FILE_VERSION 37+;
+    /// tag 25 on the dense type-tag side, tag 21 on the schema-
+    /// agnostic value side. The wall-clock-of-day half of PG's
+    /// date/time triplet (date / time / timestamp).
+    Time,
 }
 
 impl fmt::Display for DataType {
@@ -222,6 +230,7 @@ impl fmt::Display for DataType {
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
             Self::Uuid => f.write_str("UUID"),
+            Self::Time => f.write_str("TIME"),
         }
     }
 }
@@ -341,6 +350,11 @@ pub enum Value {
     /// Display normalises to canonical lowercase 8-4-4-4-12
     /// hyphenated form. Equality is byte-wise.
     Uuid([u8; 16]),
+    /// v7.17.0 Phase 3.P0-32 — PG `time` (without time zone) —
+    /// i64 microseconds since 00:00:00. Range 0..86_400_000_000.
+    /// Display: `HH:MM:SS` zero-padded, with optional `.ffffff`
+    /// suffix when fractional is non-zero.
+    Time(i64),
     Null,
 }
 
@@ -387,6 +401,7 @@ impl Value {
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
             Self::Uuid(_) => Some(DataType::Uuid),
+            Self::Time(_) => Some(DataType::Time),
             Self::Null => None,
         }
     }
@@ -683,6 +698,9 @@ impl IndexKey {
             // on `id = '...'::uuid` resolves through the secondary
             // index rather than full-scan.
             Value::Uuid(b) => Some(Self::Uuid(*b)),
+            // v7.17.0 Phase 3.P0-32: TIME indexable via i64 — same
+            // order semantics as Date/Timestamp.
+            Value::Time(us) => Some(Self::Int(*us)),
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -5865,7 +5883,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 36;
+const FILE_VERSION: u8 = 37;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -7350,6 +7368,9 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.17.0: tag 24 for `UUID`. No body — type identity
         // alone. Catalog FILE_VERSION 36+.
         DataType::Uuid => out.push(24),
+        // v7.17.0 Phase 3.P0-32: tag 25 for `TIME`. No body — type
+        // identity alone. Catalog FILE_VERSION 37+.
+        DataType::Time => out.push(25),
     }
 }
 
@@ -7409,6 +7430,9 @@ impl Cursor<'_> {
             23 => Ok(DataType::TsQuery),
             // v7.17.0: tag 24 — UUID. Catalog FILE_VERSION 36+.
             24 => Ok(DataType::Uuid),
+            // v7.17.0 Phase 3.P0-32: tag 25 — TIME. Catalog
+            // FILE_VERSION 37+.
+            25 => Ok(DataType::Time),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -7514,6 +7538,8 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         Value::TsQuery(ast) => tsquery_encoded_len(ast),
         // v7.17.0: UUID dense body — fixed 16 bytes, no prefix.
         Value::Uuid(_) => 16,
+        // v7.17.0 Phase 3.P0-32: TIME dense body — fixed i64 LE.
+        Value::Time(_) => 8,
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -7727,6 +7753,9 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         // order). No length prefix; the type's fixed width makes
         // the codec stateless.
         (Value::Uuid(b), DataType::Uuid) => out.extend_from_slice(&b[..]),
+        // v7.17.0 Phase 3.P0-32: TIME dense body — i64 LE
+        // microseconds since 00:00:00.
+        (Value::Time(us), DataType::Time) => out.extend_from_slice(&us.to_le_bytes()),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -7898,6 +7927,12 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         Value::Uuid(b) => {
             out.push(20);
             out.extend_from_slice(&b[..]);
+        }
+        // v7.17.0 Phase 3.P0-32: TIME — tag 21. Body = i64 LE
+        // microseconds since 00:00:00.
+        Value::Time(us) => {
+            out.push(21);
+            out.extend_from_slice(&us.to_le_bytes());
         }
     }
 }
@@ -8260,6 +8295,8 @@ impl<'a> Cursor<'a> {
                 b.copy_from_slice(s);
                 Ok(Value::Uuid(b))
             }
+            // v7.17.0 Phase 3.P0-32: TIME dense body — i64 LE.
+            DataType::Time => Ok(Value::Time(self.read_i64()?)),
         }
     }
 
@@ -8441,6 +8478,8 @@ impl<'a> Cursor<'a> {
                 b.copy_from_slice(s);
                 Ok(Value::Uuid(b))
             }
+            // v7.17.0 Phase 3.P0-32: tag 21 — TIME. i64 LE.
+            21 => Ok(Value::Time(self.read_i64()?)),
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }

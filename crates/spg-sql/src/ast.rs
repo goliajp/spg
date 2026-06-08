@@ -1395,6 +1395,12 @@ pub enum ColumnTypeName {
     /// Django / Rails / Hibernate `id UUID PRIMARY KEY DEFAULT
     /// gen_random_uuid()`.
     Uuid,
+    /// v7.17.0 Phase 3.P0-32 `TIME` (without time zone) — i64
+    /// microseconds since 00:00:00. PG wire OID 1083. Literal
+    /// input is `'HH:MM:SS'` with an optional `.fraction` suffix
+    /// (6-digit microsecond precision). Display normalises to
+    /// the canonical `HH:MM:SS[.ffffff]`.
+    Time,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -1432,6 +1438,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
+            Self::Time => f.write_str("TIME"),
         }
     }
 }

@@ -5496,6 +5496,9 @@ impl Parser {
             // surface for Django / Rails / Hibernate's default
             // PK pattern.
             "uuid" => ColumnTypeName::Uuid,
+            // v7.17.0 Phase 3.P0-32 — PG `TIME` (without time zone).
+            // i64 microseconds since 00:00:00. Wire OID 1083.
+            "time" => ColumnTypeName::Time,
             _other => {
                 // v7.17.0 Phase 1.4 — unknown ident → defer
                 // resolution to the engine. Stored as Text in
@@ -8015,6 +8018,7 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "tsvector" => ColumnTypeName::TsVector,
         "tsquery" => ColumnTypeName::TsQuery,
         "uuid" => ColumnTypeName::Uuid,
+        "time" => ColumnTypeName::Time,
         _ => return None,
     })
 }

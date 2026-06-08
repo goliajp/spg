@@ -4217,7 +4217,11 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // OID 2950 is advertised via `pg_type_oid`; binary
         // 16-byte format lands when binary-format clients
         // arrive.
-        | DataType::Uuid => WireType::Text,
+        | DataType::Uuid
+        // v7.17.0 Phase 3.P0-32 — TIME collapses to Text on the
+        // wire as canonical `HH:MM:SS[.ffffff]`. PG OID 1083
+        // advertised via `pg_type_oid`.
+        | DataType::Time => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.

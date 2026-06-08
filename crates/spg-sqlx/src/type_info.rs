@@ -44,6 +44,10 @@ pub enum Kind {
     /// Bridges decode into `uuid::Uuid` or `String` (canonical
     /// hyphenated lowercase form).
     Uuid,
+    /// v7.17.0 Phase 3.P0-32 — `TIME` (without time zone). i64
+    /// microseconds since 00:00:00. Bridges decode into `String`
+    /// (canonical `HH:MM:SS[.ffffff]` form).
+    Time,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -87,6 +91,7 @@ impl SpgTypeInfo {
             // v7.17.0 — UUID bridges to `uuid::Uuid` (when the
             // `uuid` feature is enabled on sqlx) or to `String`.
             DataType::Uuid => Kind::Uuid,
+            DataType::Time => Kind::Time,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -116,6 +121,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Timestamptz => "TIMESTAMPTZ",
             Kind::Json => "JSON",
             Kind::Uuid => "UUID",
+            Kind::Time => "TIME",
             Kind::Null => "NULL",
         }
     }
