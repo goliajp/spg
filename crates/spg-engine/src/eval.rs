@@ -903,7 +903,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // `length` is reduced by the clipped prefix). A NULL arg
         // makes the result NULL. Out-of-range windows return an
         // empty value, not NULL.
-        "substring" => {
+        "substring" | "substr" => {
             if !matches!(args.len(), 2 | 3) {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("substring() takes 2 or 3 args, got {}", args.len()),
@@ -2136,6 +2136,16 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // sequence — SPG has AUTO_INCREMENT instead).
         "pg_get_serial_sequence" | "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
         "version" => Ok(Value::Text("PostgreSQL 16 (SPG-compat)".into())),
+        // v7.17.0 Phase 3.P0-30 — session / introspection functions.
+        // Engine-level dispatch so these compose inside expressions
+        // (`WHERE schemaname = current_schema()`, `SELECT *,
+        // database() AS db FROM t`) — the pgwire layer's canned
+        // shortcuts only catch the bare top-level SELECT shape.
+        // SPG is single-database + single-schema; the values
+        // mirror the wire-layer canned defaults.
+        "current_database" | "database" => Ok(Value::Text("spg".into())),
+        "current_schema" => Ok(Value::Text("public".into())),
+        "current_user" | "session_user" | "user" => Ok(Value::Text("admin".into())),
         // v7.17.0 — `nextval` / `currval` / `setval` are handled
         // at the top of this match against the SequenceResolver.
         // `lastval()` (no-arg session memory) still degrades to
