@@ -234,6 +234,22 @@ pub enum DataType {
     /// when the installed `hstore` extension hasn't claimed an
     /// OID yet.
     Hstore,
+    /// v7.17.0 Phase 3.P0-40: PG `int[][]` — 2-dimensional INT
+    /// matrix. Storage: row-major Vec<Vec<Option<i32>>>. All
+    /// rows must share the same column count. Wire OID 1007
+    /// (same as INT[]; the dimension count travels in the data
+    /// header, not the OID). Catalog FILE_VERSION 45+; tag 31
+    /// on the dense type-tag side, tag 27 on the schema-agnostic
+    /// value side.
+    IntArray2D,
+    /// v7.17.0 Phase 3.P0-40: PG `bigint[][]` — 2-dimensional
+    /// BIGINT matrix. Storage / OID / tags mirror IntArray2D.
+    /// Tag 32 dense, tag 28 schema-agnostic.
+    BigIntArray2D,
+    /// v7.17.0 Phase 3.P0-40: PG `text[][]` — 2-dimensional TEXT
+    /// matrix. Storage: row-major Vec<Vec<Option<String>>>.
+    /// Tag 33 dense, tag 29 schema-agnostic.
+    TextArray2D,
 }
 
 /// v7.17.0 Phase 3.P0-38 — pins the element type of a range value
@@ -325,6 +341,9 @@ impl fmt::Display for DataType {
             Self::Money => f.write_str("MONEY"),
             Self::Range(k) => f.write_str(k.keyword()),
             Self::Hstore => f.write_str("HSTORE"),
+            Self::IntArray2D => f.write_str("INT[][]"),
+            Self::BigIntArray2D => f.write_str("BIGINT[][]"),
+            Self::TextArray2D => f.write_str("TEXT[][]"),
         }
     }
 }
@@ -473,6 +492,12 @@ pub enum Value {
     /// order preserved on input; duplicate keys take last-write-
     /// wins at parse time.
     Hstore(Vec<(String, Option<String>)>),
+    /// v7.17.0 Phase 3.P0-40 — 2D INT matrix (row-major).
+    IntArray2D(Vec<Vec<Option<i32>>>),
+    /// v7.17.0 Phase 3.P0-40 — 2D BIGINT matrix (row-major).
+    BigIntArray2D(Vec<Vec<Option<i64>>>),
+    /// v7.17.0 Phase 3.P0-40 — 2D TEXT matrix (row-major).
+    TextArray2D(Vec<Vec<Option<String>>>),
     /// v7.17.0 Phase 3.P0-38 — PG range value. One shape covers
     /// all six builtin range types; `kind` pins the element type
     /// (must match the column's `DataType::Range(kind)`).
@@ -541,6 +566,9 @@ impl Value {
             Self::Money(_) => Some(DataType::Money),
             Self::Range { kind, .. } => Some(DataType::Range(*kind)),
             Self::Hstore(_) => Some(DataType::Hstore),
+            Self::IntArray2D(_) => Some(DataType::IntArray2D),
+            Self::BigIntArray2D(_) => Some(DataType::BigIntArray2D),
+            Self::TextArray2D(_) => Some(DataType::TextArray2D),
             Self::Null => None,
         }
     }
@@ -882,6 +910,8 @@ impl IndexKey {
             // v7.17.0 Phase 3.P0-39: hstore is NOT indexable in
             // v7.17.0 — map columns need GIN with bespoke ops.
             Value::Hstore(_) => None,
+            // v7.17.0 Phase 3.P0-40: 2D arrays aren't indexable.
+            Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -6066,7 +6096,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 44;
+const FILE_VERSION: u8 = 45;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -7658,6 +7688,11 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.17.0 Phase 3.P0-39: tag 30 for hstore. No body —
         // type identity alone. Catalog FILE_VERSION 44+.
         DataType::Hstore => out.push(30),
+        // v7.17.0 Phase 3.P0-40: tag 31/32/33 for 2D arrays.
+        // No body — type identity alone. Catalog FILE_VERSION 45+.
+        DataType::IntArray2D => out.push(31),
+        DataType::BigIntArray2D => out.push(32),
+        DataType::TextArray2D => out.push(33),
     }
 }
 
@@ -7739,6 +7774,10 @@ impl Cursor<'_> {
             }
             // v7.17.0 Phase 3.P0-39: tag 30 — HSTORE.
             30 => Ok(DataType::Hstore),
+            // v7.17.0 Phase 3.P0-40: tag 31/32/33 — 2D arrays.
+            31 => Ok(DataType::IntArray2D),
+            32 => Ok(DataType::BigIntArray2D),
+            33 => Ok(DataType::TextArray2D),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -7870,6 +7909,29 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
                 n += 4 + k.len() + 1;
                 if let Some(val) = v {
                     n += 4 + val.len();
+                }
+            }
+            n
+        }
+        // v7.17.0 Phase 3.P0-40: 2D arrays dense body — `[u32 rows]
+        // [u32 cols] then row-major elements with per-element
+        // `[u8 null_flag][if non-null: element body]`.
+        Value::IntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            8 + rows.len() * cols * (1 + 4)
+        }
+        Value::BigIntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            8 + rows.len() * cols * (1 + 8)
+        }
+        Value::TextArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut n = 8 + rows.len() * cols * 1;
+            for row in rows {
+                for cell in row {
+                    if let Some(s) = cell {
+                        n += 4 + s.len();
+                    }
                 }
             }
             n
@@ -8122,6 +8184,10 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         // as write_value_body for hstore (no leading tag — that
         // lives on the data type).
         (Value::Hstore(pairs), DataType::Hstore) => write_hstore_body(out, pairs),
+        // v7.17.0 Phase 3.P0-40: 2D array dense body.
+        (Value::IntArray2D(rows), DataType::IntArray2D) => write_int_2d_body(out, rows),
+        (Value::BigIntArray2D(rows), DataType::BigIntArray2D) => write_bigint_2d_body(out, rows),
+        (Value::TextArray2D(rows), DataType::TextArray2D) => write_text_2d_body(out, rows),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -8161,6 +8227,26 @@ fn write_value_encoded_len(v: &Value) -> usize {
                 n += 4 + k.len() + 1;
                 if let Some(val) = v {
                     n += 4 + val.len();
+                }
+            }
+            n
+        }
+        Value::IntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            1 + 8 + rows.len() * cols * (1 + 4)
+        }
+        Value::BigIntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            1 + 8 + rows.len() * cols * (1 + 8)
+        }
+        Value::TextArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut n = 1 + 8 + rows.len() * cols;
+            for row in rows {
+                for cell in row {
+                    if let Some(s) = cell {
+                        n += 4 + s.len();
+                    }
                 }
             }
             n
@@ -8384,6 +8470,82 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         Value::Hstore(pairs) => {
             out.push(26);
             write_hstore_body(out, pairs);
+        }
+        // v7.17.0 Phase 3.P0-40: 2D arrays — tag 27/28/29.
+        Value::IntArray2D(rows) => {
+            out.push(27);
+            write_int_2d_body(out, rows);
+        }
+        Value::BigIntArray2D(rows) => {
+            out.push(28);
+            write_bigint_2d_body(out, rows);
+        }
+        Value::TextArray2D(rows) => {
+            out.push(29);
+            write_text_2d_body(out, rows);
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-40 — shared 2D INT writer.
+fn write_int_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i32>>]) {
+    let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
+        .expect("≤ 4G cols");
+    out.extend_from_slice(&nrows.to_le_bytes());
+    out.extend_from_slice(&ncols.to_le_bytes());
+    for row in rows {
+        for cell in row {
+            match cell {
+                None => out.push(1),
+                Some(n) => {
+                    out.push(0);
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-40 — shared 2D BIGINT writer.
+fn write_bigint_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i64>>]) {
+    let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
+        .expect("≤ 4G cols");
+    out.extend_from_slice(&nrows.to_le_bytes());
+    out.extend_from_slice(&ncols.to_le_bytes());
+    for row in rows {
+        for cell in row {
+            match cell {
+                None => out.push(1),
+                Some(n) => {
+                    out.push(0);
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-40 — shared 2D TEXT writer. Cells use
+/// `[u8 null_flag][if non-null: u32 len][utf-8 bytes]` layout.
+fn write_text_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<String>>]) {
+    let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
+        .expect("≤ 4G cols");
+    out.extend_from_slice(&nrows.to_le_bytes());
+    out.extend_from_slice(&ncols.to_le_bytes());
+    for row in rows {
+        for cell in row {
+            match cell {
+                None => out.push(1),
+                Some(s) => {
+                    out.push(0);
+                    let l = u32::try_from(s.len()).expect("≤ 4 GiB cell");
+                    out.extend_from_slice(&l.to_le_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
         }
     }
 }
@@ -8782,6 +8944,10 @@ impl<'a> Cursor<'a> {
             // v7.17.0 Phase 3.P0-39: hstore dense body. Body
             // shape == read_hstore_body.
             DataType::Hstore => Ok(Value::Hstore(self.read_hstore_body()?)),
+            // v7.17.0 Phase 3.P0-40: 2D arrays dense body.
+            DataType::IntArray2D => Ok(Value::IntArray2D(self.read_int_2d_body()?)),
+            DataType::BigIntArray2D => Ok(Value::BigIntArray2D(self.read_bigint_2d_body()?)),
+            DataType::TextArray2D => Ok(Value::TextArray2D(self.read_text_2d_body()?)),
             // v7.17.0 Phase 3.P0-38: range dense body. Element
             // type is determined by the surrounding RangeKind.
             DataType::Range(kind) => {
@@ -8811,6 +8977,65 @@ impl<'a> Cursor<'a> {
                 })
             }
         }
+    }
+
+    /// v7.17.0 Phase 3.P0-40 — read a 2D INT array body emitted
+    /// by `write_int_2d_body`.
+    fn read_int_2d_body(&mut self) -> Result<Vec<Vec<Option<i32>>>, StorageError> {
+        let nrows = self.read_u32()? as usize;
+        let ncols = self.read_u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                let null = self.read_u8()?;
+                row.push(if null == 1 { None } else { Some(self.read_i32()?) });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// v7.17.0 Phase 3.P0-40 — read a 2D BIGINT array body.
+    fn read_bigint_2d_body(&mut self) -> Result<Vec<Vec<Option<i64>>>, StorageError> {
+        let nrows = self.read_u32()? as usize;
+        let ncols = self.read_u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                let null = self.read_u8()?;
+                row.push(if null == 1 { None } else { Some(self.read_i64()?) });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// v7.17.0 Phase 3.P0-40 — read a 2D TEXT array body. Each
+    /// cell is `[u8 null_flag][if non-null: u32 len + utf-8 bytes]`.
+    fn read_text_2d_body(&mut self) -> Result<Vec<Vec<Option<String>>>, StorageError> {
+        let nrows = self.read_u32()? as usize;
+        let ncols = self.read_u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                let null = self.read_u8()?;
+                if null == 1 {
+                    row.push(None);
+                } else {
+                    let l = self.read_u32()? as usize;
+                    let bytes = self.take(l)?.to_vec();
+                    let s = String::from_utf8(bytes).map_err(|_| {
+                        StorageError::Corrupt("2D TEXT cell is not valid UTF-8".into())
+                    })?;
+                    row.push(Some(s));
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     /// v7.17.0 Phase 3.P0-39 — read a hstore body emitted by
@@ -9033,6 +9258,10 @@ impl<'a> Cursor<'a> {
             // v7.17.0 Phase 3.P0-39: tag 26 — Hstore. Body shape
             // == read_hstore_body.
             26 => Ok(Value::Hstore(self.read_hstore_body()?)),
+            // v7.17.0 Phase 3.P0-40: tag 27/28/29 — 2D arrays.
+            27 => Ok(Value::IntArray2D(self.read_int_2d_body()?)),
+            28 => Ok(Value::BigIntArray2D(self.read_bigint_2d_body()?)),
+            29 => Ok(Value::TextArray2D(self.read_text_2d_body()?)),
             // v7.17.0 Phase 3.P0-38: tag 25 — Range.
             // [u8 RangeKind tag][u8 flags][opt lower][opt upper].
             25 => {

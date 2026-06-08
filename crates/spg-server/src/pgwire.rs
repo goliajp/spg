@@ -2936,6 +2936,12 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         // wire so clients without an installed hstore extension
         // still decode the canonical `"k"=>"v"` text correctly.
         DataType::Hstore => 25,
+        // v7.17.0 Phase 3 P0-40 — 2D arrays reuse the 1D OIDs
+        // (PG carries dimension count in the array data header,
+        // not the OID).
+        DataType::IntArray2D => 1007,
+        DataType::BigIntArray2D => 1016,
+        DataType::TextArray2D => 1009,
     }
 }
 
@@ -2960,6 +2966,8 @@ const fn pg_type_len(ty: DataType) -> i16 {
         DataType::Range(_) => -1,
         // v7.17.0 Phase 3.P0-39 — Hstore is varlena.
         DataType::Hstore => -1,
+        // v7.17.0 Phase 3.P0-40 — 2D arrays are varlena.
+        DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => -1,
         _ => -1, // varlena
     }
 }
@@ -3032,6 +3040,10 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         Value::Range { .. } => spg_engine::format_range_text(v),
         // v7.17.0 Phase 3.P0-39 — Hstore via shared engine helper.
         Value::Hstore(pairs) => spg_engine::format_hstore_text(pairs),
+        // v7.17.0 Phase 3.P0-40 — 2D arrays via shared helpers.
+        Value::IntArray2D(rows) => spg_engine::format_int_2d_text_pub(rows),
+        Value::BigIntArray2D(rows) => spg_engine::format_bigint_2d_text_pub(rows),
+        Value::TextArray2D(rows) => spg_engine::format_text_2d_text_pub(rows),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => format!("{v:?}"),
     })

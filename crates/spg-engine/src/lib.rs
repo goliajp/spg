@@ -776,6 +776,9 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Money => "MONEY".into(),
         DataType::Range(k) => k.keyword().into(),
         DataType::Hstore => "HSTORE".into(),
+        DataType::IntArray2D => "INT[][]".into(),
+        DataType::BigIntArray2D => "BIGINT[][]".into(),
+        DataType::TextArray2D => "TEXT[][]".into(),
     }
 }
 
@@ -7506,6 +7509,12 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Hstore(_) => Err(EngineError::Unsupported(
             "ORDER BY of a hstore value is not supported".into(),
         )),
+        // v7.17.0 Phase 3.P0-40 — 2D arrays not orderable.
+        Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => {
+            Err(EngineError::Unsupported(
+                "ORDER BY of a 2D array is not supported in v7.17.0".into(),
+            ))
+        }
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -11593,6 +11602,10 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         v @ Value::Range { .. } => format_range_str(v),
         // v7.17.0 Phase 3.P0-39 — PG hstore canonical text form.
         Value::Hstore(pairs) => format_hstore_str(pairs),
+        // v7.17.0 Phase 3.P0-40 — 2D array canonical text form.
+        Value::IntArray2D(rows) => format_int_2d_text(rows),
+        Value::BigIntArray2D(rows) => format_bigint_2d_text(rows),
+        Value::TextArray2D(rows) => format_text_2d_text(rows),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -13985,6 +13998,190 @@ pub fn format_hstore_text(pairs: &[(alloc::string::String, Option<alloc::string:
     format_hstore_str(pairs)
 }
 
+// ─── v7.17.0 Phase 3.P0-40 — 2D array parse + display ─────────
+
+/// Split a PG external 2D-array literal `'{{a,b},{c,d}}'` into
+/// per-row token lists. Returns Err on shape mismatch.
+fn split_2d_literal(s: &str) -> Result<Vec<Vec<alloc::string::String>>, &'static str> {
+    let s = s.trim();
+    let outer = s
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or("missing outer '{...}' braces")?;
+    let trimmed = outer.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows: Vec<Vec<alloc::string::String>> = Vec::new();
+    let mut i = 0;
+    let bytes = trimmed.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'{' {
+            return Err("expected '{' opening a row");
+        }
+        i += 1;
+        let row_start = i;
+        let mut depth = 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                i += 1;
+            }
+        }
+        if depth != 0 {
+            return Err("unbalanced '{...}' in row");
+        }
+        let row_text = &trimmed[row_start..i];
+        i += 1;
+        let cells: Vec<alloc::string::String> = if row_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            row_text
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .collect()
+        };
+        rows.push(cells);
+    }
+    if let Some(first) = rows.first() {
+        let cols = first.len();
+        for r in &rows {
+            if r.len() != cols {
+                return Err("ragged 2D array (rows have different column counts)");
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_int_2d_literal(s: &str) -> Result<Vec<Vec<Option<i32>>>, &'static str> {
+    let raw = split_2d_literal(s)?;
+    raw.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    if cell.eq_ignore_ascii_case("NULL") {
+                        Ok(None)
+                    } else {
+                        cell.parse::<i32>().map(Some).map_err(|_| "invalid int element")
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn parse_bigint_2d_literal(s: &str) -> Result<Vec<Vec<Option<i64>>>, &'static str> {
+    let raw = split_2d_literal(s)?;
+    raw.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    if cell.eq_ignore_ascii_case("NULL") {
+                        Ok(None)
+                    } else {
+                        cell.parse::<i64>().map(Some).map_err(|_| "invalid bigint element")
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn parse_text_2d_literal(s: &str) -> Result<Vec<Vec<Option<alloc::string::String>>>, &'static str> {
+    let raw = split_2d_literal(s)?;
+    Ok(raw
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    if cell.eq_ignore_ascii_case("NULL") {
+                        None
+                    } else {
+                        Some(cell.trim_matches('"').to_string())
+                    }
+                })
+                .collect()
+        })
+        .collect())
+}
+
+fn format_int_2d_text(rows: &[Vec<Option<i32>>]) -> alloc::string::String {
+    let mut out = alloc::string::String::from("{");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            match cell {
+                None => out.push_str("NULL"),
+                Some(n) => out.push_str(&alloc::format!("{n}")),
+            }
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
+}
+
+fn format_bigint_2d_text(rows: &[Vec<Option<i64>>]) -> alloc::string::String {
+    let mut out = alloc::string::String::from("{");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            match cell {
+                None => out.push_str("NULL"),
+                Some(n) => out.push_str(&alloc::format!("{n}")),
+            }
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
+}
+
+fn format_text_2d_text(rows: &[Vec<Option<alloc::string::String>>]) -> alloc::string::String {
+    let mut out = alloc::string::String::from("{");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            match cell {
+                None => out.push_str("NULL"),
+                Some(s) => out.push_str(s),
+            }
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
+}
+
+/// v7.17.0 Phase 3.P0-40 — pub re-exports so pgwire + sqllogictest
+/// share the single 2D-array renderer.
+pub fn format_int_2d_text_pub(rows: &[Vec<Option<i32>>]) -> alloc::string::String {
+    format_int_2d_text(rows)
+}
+pub fn format_bigint_2d_text_pub(rows: &[Vec<Option<i64>>]) -> alloc::string::String {
+    format_bigint_2d_text(rows)
+}
+pub fn format_text_2d_text_pub(rows: &[Vec<Option<alloc::string::String>>]) -> alloc::string::String {
+    format_text_2d_text(rows)
+}
+
 /// v7.17.0 Phase 3.P0-38 — parse a PG range literal of the form
 /// `'[lo,up)'` / `'(lo,up]'` / `'[lo,up]'` / `'(lo,up)'` /
 /// `'empty'`. Lower / upper may be empty (unbounded). Returns
@@ -14319,6 +14516,9 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
             spg_sql::ast::RangeKindAst::Date => spg_storage::RangeKind::Date,
         }),
         ColumnTypeName::Hstore => DataType::Hstore,
+        ColumnTypeName::IntArray2D => DataType::IntArray2D,
+        ColumnTypeName::BigIntArray2D => DataType::BigIntArray2D,
+        ColumnTypeName::TextArray2D => DataType::TextArray2D,
     }
 }
 
@@ -14700,6 +14900,46 @@ fn coerce_value(
         },
         // Hstore → Text canonical `"k"=>"v"` form.
         (Value::Hstore(pairs), DataType::Text) => Some(Value::Text(format_hstore_str(&pairs))),
+        // v7.17.0 Phase 3.P0-40 — Text → 2D arrays via PG
+        // external `'{{a,b},{c,d}}'` literal.
+        (Value::Text(s), DataType::IntArray2D) => match parse_int_2d_literal(&s) {
+            Ok(m) => Some(Value::IntArray2D(m)),
+            Err(e) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for INT[][]: {s:?} (column `{col_name}`): {e}"
+                    ),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::BigIntArray2D) => match parse_bigint_2d_literal(&s) {
+            Ok(m) => Some(Value::BigIntArray2D(m)),
+            Err(e) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for BIGINT[][]: {s:?} (column `{col_name}`): {e}"
+                    ),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::TextArray2D) => match parse_text_2d_literal(&s) {
+            Ok(m) => Some(Value::TextArray2D(m)),
+            Err(e) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for TEXT[][]: {s:?} (column `{col_name}`): {e}"
+                    ),
+                }));
+            }
+        },
+        // 2D arrays → Text canonical nested form.
+        (Value::IntArray2D(rows), DataType::Text) => Some(Value::Text(format_int_2d_text(&rows))),
+        (Value::BigIntArray2D(rows), DataType::Text) => {
+            Some(Value::Text(format_bigint_2d_text(&rows)))
+        }
+        (Value::TextArray2D(rows), DataType::Text) => {
+            Some(Value::Text(format_text_2d_text(&rows)))
+        }
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or

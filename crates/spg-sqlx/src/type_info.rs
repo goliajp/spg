@@ -119,6 +119,9 @@ impl SpgTypeInfo {
             DataType::Money => Kind::Money,
             DataType::Range(_) => Kind::Range,
             DataType::Hstore => Kind::Hstore,
+            // v7.17.0 Phase 3.P0-40 — 2D arrays decode as TEXT
+            // on the sqlx side (canonical PG nested external form).
+            DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => Kind::Text,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
