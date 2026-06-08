@@ -2913,6 +2913,7 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::TsVector => 3614,    // PG `tsvector` — v7.12.0 G-CRIT-3
         DataType::TsQuery => 3615,     // PG `tsquery` — v7.12.0 G-CRIT-3
         DataType::Uuid => 2950,        // PG `uuid` — v7.17.0 Phase 3 P0-25
+        DataType::Time => 1083,        // PG `time` — v7.17.0 Phase 3 P0-32
     }
 }
 
@@ -2925,6 +2926,8 @@ const fn pg_type_len(ty: DataType) -> i16 {
         DataType::Interval => 16,
         // v7.17.0 — UUID is fixed 16 bytes (RFC 4122 / PG OID 2950).
         DataType::Uuid => 16,
+        // v7.17.0 Phase 3.P0-32 — TIME is fixed i64 (8 bytes).
+        DataType::Time => 8,
         _ => -1, // varlena
     }
 }
@@ -2977,6 +2980,10 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         // psql `\d`, and sqlx text-mode decoders all read the
         // standard form.
         Value::Uuid(b) => spg_storage::format_uuid(b),
+        // v7.17.0 Phase 3.P0-32 — TIME renders via the shared
+        // engine helper so the trim-trailing-zeros shape matches
+        // PG `time_out` across pgwire, sqllogictest, and engine.
+        Value::Time(us) => spg_engine::eval::format_time(*us),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => format!("{v:?}"),
     })

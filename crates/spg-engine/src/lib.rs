@@ -770,6 +770,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::TsVector => "TSVECTOR".into(),
         DataType::TsQuery => "TSQUERY".into(),
         DataType::Uuid => "UUID".into(),
+        DataType::Time => "TIME".into(),
     }
 }
 
@@ -7439,6 +7440,10 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Date(d) => Ok(f64::from(*d)),
         #[allow(clippy::cast_precision_loss)]
         Value::Timestamp(t) => Ok(*t as f64),
+        // v7.17.0 Phase 3.P0-32 — PG TIME ordered by underlying
+        // i64 microseconds (matches wall-clock ordering).
+        #[allow(clippy::cast_precision_loss)]
+        Value::Time(us) => Ok(*us as f64),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -11514,6 +11519,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
         Value::Date(d) => eval::format_date(*d),
         Value::Timestamp(t) => eval::format_timestamp(*t),
+        // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.
+        Value::Time(us) => eval::format_time(*us),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -13709,6 +13716,58 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
+/// v7.17.0 Phase 3.P0-32 — parse a PG `time` literal
+/// `HH:MM:SS[.fraction]` into microseconds since 00:00:00.
+///
+/// Accepts:
+///   * `HH:MM:SS`            — exact-second precision
+///   * `HH:MM:SS.f` .. `.ffffff` — 1-6 fractional digits, right-padded
+///     with zeros to microseconds
+///
+/// Range: hour 0..=23, minute 0..=59, second 0..=59. Anything else
+/// returns None — caller surfaces as a hard SQL error (no silent
+/// truncation, matches PG's `time_in` behaviour).
+fn parse_time_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (s, None),
+    };
+    let mut parts = hms.split(':');
+    let hh: u32 = parts.next()?.parse().ok()?;
+    let mm: u32 = parts.next()?.parse().ok()?;
+    let ss: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let frac_us: i64 = match frac {
+        None => 0,
+        Some(f) => {
+            if f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // Right-pad with zeros so '.5' = 500000 µsec.
+            let mut padded = alloc::string::String::with_capacity(6);
+            padded.push_str(f);
+            while padded.len() < 6 {
+                padded.push('0');
+            }
+            padded.parse().ok()?
+        }
+    };
+    Some(
+        i64::from(hh) * 3_600_000_000
+            + i64::from(mm) * 60_000_000
+            + i64::from(ss) * 1_000_000
+            + frac_us,
+    )
+}
+
+
+
 const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
     match t {
         ColumnTypeName::SmallInt => DataType::SmallInt,
@@ -13740,6 +13799,7 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::TsVector => DataType::TsVector,
         ColumnTypeName::TsQuery => DataType::TsQuery,
         ColumnTypeName::Uuid => DataType::Uuid,
+        ColumnTypeName::Time => DataType::Time,
     }
 }
 
@@ -13986,6 +14046,23 @@ fn coerce_value(
         // Text column path (e.g. INSERT INTO log SELECT id::text
         // FROM other_table).
         (Value::Uuid(b), DataType::Text) => Some(Value::Text(spg_storage::format_uuid(&b))),
+        // v7.17.0 Phase 3.P0-32 — Text → TIME. Accepts
+        // `HH:MM:SS` and `HH:MM:SS.ffffff` (1-6 fractional digits).
+        // Out-of-range hour/min/sec is a hard SQL error (no
+        // silent truncation — same 0-change-cutover discipline
+        // we apply to UUID).
+        (Value::Text(s), DataType::Time) => match parse_time_str(&s) {
+            Some(us) => Some(Value::Time(us)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type time: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // v7.17.0 Phase 3.P0-32 — TIME → Text canonical `HH:MM:SS[.ffffff]`.
+        (Value::Time(us), DataType::Text) => Some(Value::Text(eval::format_time(us))),
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or

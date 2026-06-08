@@ -5023,6 +5023,25 @@ pub fn format_timestamptz(micros: i64) -> String {
     s
 }
 
+/// v7.17.0 Phase 3.P0-32 — PG `TIME` canonical text form
+/// `HH:MM:SS[.ffffff]`. Mirrors PG `time_out`. Trailing zeros in
+/// the fractional component are stripped — `12:00:00.500000`
+/// renders as `12:00:00.5` to match PG's text output.
+pub fn format_time(us: i64) -> String {
+    let total_secs = us.div_euclid(1_000_000);
+    let frac = us.rem_euclid(1_000_000);
+    let hh = total_secs / 3600;
+    let mm = (total_secs / 60) % 60;
+    let ss = total_secs % 60;
+    if frac == 0 {
+        format!("{hh:02}:{mm:02}:{ss:02}")
+    } else {
+        let raw = format!("{frac:06}");
+        let trimmed = raw.trim_end_matches('0');
+        format!("{hh:02}:{mm:02}:{ss:02}.{trimmed}")
+    }
+}
+
 pub fn format_timestamp(micros: i64) -> String {
     const MICROS_PER_DAY: i64 = 86_400_000_000;
     // Split into day + intra-day part with proper floor division so

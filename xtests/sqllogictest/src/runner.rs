@@ -218,6 +218,8 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
+        // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.
+        Value::Time(us) => spg_engine::eval::format_time(*us),
         Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
         Value::Json(s) => s.clone(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side
