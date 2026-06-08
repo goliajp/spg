@@ -2038,6 +2038,28 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "regexp_matches" => regexp_matches(args),
         "regexp_replace" => regexp_replace(args),
         "regexp_split_to_array" => regexp_split_to_array(args),
+        // v7.17.0 Phase 3.P0-28 — PG JSON builder family.
+        // to_json / to_jsonb coerce any value to JSON text (NULL
+        // becomes the JSON literal 'null', not SQL NULL).
+        "to_json" | "to_jsonb" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "to_json() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            // Json input passes through verbatim — PG identity.
+            if let Value::Json(s) = &args[0] {
+                return Ok(Value::Json(s.clone()));
+            }
+            Ok(Value::Json(crate::json::value_to_json_text(&args[0])))
+        }
+        "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
+        "json_build_array" | "jsonb_build_array" => crate::json::build_array(args),
+        "jsonb_set" | "json_set" => crate::json::set(args),
+        "jsonb_insert" | "json_insert" => crate::json::insert(args),
         // v7.17.0 Phase 3.9 — PG `jsonb_path_query` family.
         "jsonb_path_query" | "json_path_query" => {
             if args.len() != 2 {

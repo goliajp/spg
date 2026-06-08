@@ -853,6 +853,438 @@ pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value, EvalError> {
     }
 }
 
+// ─── v7.17.0 Phase 3.P0-28 — JSON builder family ───────────────
+//
+// Surface: to_json / to_jsonb, json_build_object / jsonb_build_object,
+// json_build_array / jsonb_build_array, jsonb_set, jsonb_insert.
+//
+// PG `json` vs `jsonb` differ in storage shape only — both surface
+// as Value::Json textually. The pair just shares an implementation.
+
+/// Encode a Value as its canonical JSON text (no surrounding quotes
+/// for non-strings). Used by every builder below.
+///
+/// Rules:
+///   * NULL → "null" (json literal; NOT SQL NULL).
+///   * BOOL → "true" / "false".
+///   * Numbers → bare decimal text (BigInt prints exact 64-bit form).
+///   * Text → quoted+escaped JSON string.
+///   * Json/Jsonb → pass-through (assumed valid; parser is forgiving).
+///   * Arrays → "[..,..]" with element-wise encoding.
+///   * Bytes / Date / Timestamp / Uuid / Numeric → quoted textual
+///     form via Display; PG canonical text shape.
+pub fn value_to_json_text(v: &Value) -> String {
+    let mut out = String::new();
+    encode_value_into(v, &mut out);
+    out
+}
+
+fn encode_value_into(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::SmallInt(n) => out.push_str(&alloc::format!("{n}")),
+        Value::Int(n) => out.push_str(&alloc::format!("{n}")),
+        Value::BigInt(n) => out.push_str(&alloc::format!("{n}")),
+        Value::Float(x) => out.push_str(&alloc::format!("{x}")),
+        Value::Numeric { scaled, scale } => {
+            // Render the exact decimal text — same shape display uses.
+            out.push_str(&render_numeric(*scaled, *scale));
+        }
+        Value::Text(s) => write_json(&JsonValue::String(s.clone()), out),
+        Value::Json(s) => {
+            // Pass through verbatim; re-parsing would re-format and
+            // drift `1.0` → `1` etc. PG's to_json on a json input is
+            // identity.
+            out.push_str(s);
+        }
+        Value::TextArray(items) => {
+            out.push('[');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match it {
+                    Some(s) => write_json(&JsonValue::String(s.clone()), out),
+                    None => out.push_str("null"),
+                }
+            }
+            out.push(']');
+        }
+        Value::IntArray(items) => {
+            out.push('[');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match it {
+                    Some(n) => out.push_str(&alloc::format!("{n}")),
+                    None => out.push_str("null"),
+                }
+            }
+            out.push(']');
+        }
+        Value::BigIntArray(items) => {
+            out.push('[');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match it {
+                    Some(n) => out.push_str(&alloc::format!("{n}")),
+                    None => out.push_str("null"),
+                }
+            }
+            out.push(']');
+        }
+        // Fall-through: render via Debug-stripped textual form,
+        // wrapped as a JSON string. Date/Timestamp/Uuid/Bytes/etc.
+        // PG itself stringifies these to their text-out form.
+        other => {
+            let txt = alloc::format!("{other:?}");
+            write_json(&JsonValue::String(txt), out);
+        }
+    }
+}
+
+fn render_numeric(scaled: i128, scale: u8) -> String {
+    let neg = scaled < 0;
+    let mag_str = alloc::format!("{}", scaled.unsigned_abs());
+    let s = scale as usize;
+    let body = if s == 0 {
+        mag_str
+    } else if mag_str.len() > s {
+        let p = mag_str.len() - s;
+        alloc::format!("{}.{}", &mag_str[..p], &mag_str[p..])
+    } else {
+        let pad = s - mag_str.len();
+        alloc::format!("0.{}{}", "0".repeat(pad), mag_str)
+    };
+    if neg { alloc::format!("-{body}") } else { body }
+}
+
+/// `json_build_object(k, v, k, v, …)` — variadic, even-length.
+/// NULL key → error (PG: "argument cannot be null"). Values encoded
+/// via `value_to_json_text`. Returns Value::Json.
+pub fn build_object(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.len().is_multiple_of(2) {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "json_build_object() needs an even number of args, got {}",
+                args.len()
+            ),
+        });
+    }
+    let mut out = String::from("{");
+    let mut first = true;
+    for pair in args.chunks_exact(2) {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        let key = match &pair[0] {
+            Value::Null => {
+                return Err(EvalError::TypeMismatch {
+                    detail: "json_build_object() key cannot be NULL".into(),
+                });
+            }
+            Value::Text(s) | Value::Json(s) => s.clone(),
+            other => format_value_as_text(other),
+        };
+        write_json(&JsonValue::String(key), &mut out);
+        out.push(':');
+        encode_value_into(&pair[1], &mut out);
+    }
+    out.push('}');
+    Ok(Value::Json(out))
+}
+
+/// `json_build_array(...)` — variadic; empty → "[]". Each arg
+/// encoded via `value_to_json_text`.
+pub fn build_array(args: &[Value]) -> Result<Value, EvalError> {
+    let mut out = String::from("[");
+    for (i, v) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        encode_value_into(v, &mut out);
+    }
+    out.push(']');
+    Ok(Value::Json(out))
+}
+
+fn format_value_as_text(v: &Value) -> String {
+    match v {
+        Value::SmallInt(n) => alloc::format!("{n}"),
+        Value::Int(n) => alloc::format!("{n}"),
+        Value::BigInt(n) => alloc::format!("{n}"),
+        Value::Float(x) => alloc::format!("{x}"),
+        Value::Bool(b) => alloc::format!("{b}"),
+        other => alloc::format!("{other:?}"),
+    }
+}
+
+/// `jsonb_set(target, path, new_value [, create_missing])` — replace
+/// at PG text-array path. `create_missing` defaults to true.
+///
+///   * Path step on object: treated as key. If missing & create_missing
+///     → insert; else no-op.
+///   * Path step on array: integer index, negative counts from end.
+///     Out-of-range with create_missing → append; without → no-op.
+///   * Type mismatch (e.g. step on a scalar) → no-op (PG semantics).
+pub fn set(args: &[Value]) -> Result<Value, EvalError> {
+    if !(3..=4).contains(&args.len()) {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("jsonb_set() takes 3 or 4 args, got {}", args.len()),
+        });
+    }
+    if args.iter().take(3).any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let create_missing = match args.get(3) {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "jsonb_set() create_missing must be BOOL, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc_text = json_text_arg(&args[0], "jsonb_set", "target")?;
+    let path = path_text_arg(&args[1], "jsonb_set")?;
+    let new_text = json_text_arg(&args[2], "jsonb_set", "new_value")?;
+    let mut root = parse(doc_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonb_set(): invalid JSON target — {e}"),
+    })?;
+    let new_val = parse(new_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonb_set(): invalid JSON new_value — {e}"),
+    })?;
+    set_at_path(&mut root, &path, new_val, create_missing);
+    Ok(Value::Json(root.to_json_text()))
+}
+
+fn set_at_path(node: &mut JsonValue, path: &[String], new_val: JsonValue, create_missing: bool) {
+    if path.is_empty() {
+        *node = new_val;
+        return;
+    }
+    let step = &path[0];
+    let rest = &path[1..];
+    match node {
+        JsonValue::Object(entries) => {
+            if let Some(pos) = entries.iter().position(|(k, _)| k == step) {
+                if rest.is_empty() {
+                    entries[pos].1 = new_val;
+                } else {
+                    set_at_path(&mut entries[pos].1, rest, new_val, create_missing);
+                }
+            } else if create_missing && rest.is_empty() {
+                entries.push((step.clone(), new_val));
+            }
+            // Missing intermediate path with create_missing — PG only
+            // creates the LEAF, never intermediate parents. No-op.
+        }
+        JsonValue::Array(items) => {
+            let Some(idx) = resolve_array_index(step, items.len()) else {
+                if create_missing && rest.is_empty() {
+                    // PG: positive overshoot appends, negative prepends.
+                    if let Ok(n) = step.parse::<i64>() {
+                        if n < 0 {
+                            items.insert(0, new_val);
+                        } else {
+                            items.push(new_val);
+                        }
+                    }
+                }
+                return;
+            };
+            if rest.is_empty() {
+                items[idx] = new_val;
+            } else {
+                set_at_path(&mut items[idx], rest, new_val, create_missing);
+            }
+        }
+        _ => {
+            // Scalar — no replacement possible at non-empty path.
+        }
+    }
+}
+
+fn resolve_array_index(step: &str, len: usize) -> Option<usize> {
+    let n = step.parse::<i64>().ok()?;
+    if n >= 0 {
+        let i = n as usize;
+        if i < len { Some(i) } else { None }
+    } else {
+        let from_end = len as i64 + n;
+        if from_end >= 0 {
+            Some(from_end as usize)
+        } else {
+            None
+        }
+    }
+}
+
+/// `jsonb_insert(target, path, new_value [, insert_after])` —
+/// insert at path. `insert_after` defaults to false.
+///
+///   * Array parent: insert before (or after) the index. Out-of-range
+///     positive index → append; out-of-range negative → prepend.
+///   * Object parent: key must NOT exist (PG raises). insert_after
+///     has no effect for objects.
+pub fn insert(args: &[Value]) -> Result<Value, EvalError> {
+    if !(3..=4).contains(&args.len()) {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("jsonb_insert() takes 3 or 4 args, got {}", args.len()),
+        });
+    }
+    if args.iter().take(3).any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let insert_after = match args.get(3) {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "jsonb_insert() insert_after must be BOOL, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let doc_text = json_text_arg(&args[0], "jsonb_insert", "target")?;
+    let path = path_text_arg(&args[1], "jsonb_insert")?;
+    let new_text = json_text_arg(&args[2], "jsonb_insert", "new_value")?;
+    if path.is_empty() {
+        return Err(EvalError::TypeMismatch {
+            detail: "jsonb_insert(): path cannot be empty".into(),
+        });
+    }
+    let mut root = parse(doc_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonb_insert(): invalid JSON target — {e}"),
+    })?;
+    let new_val = parse(new_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("jsonb_insert(): invalid JSON new_value — {e}"),
+    })?;
+    insert_at_path(&mut root, &path, new_val, insert_after)?;
+    Ok(Value::Json(root.to_json_text()))
+}
+
+fn insert_at_path(
+    node: &mut JsonValue,
+    path: &[String],
+    new_val: JsonValue,
+    insert_after: bool,
+) -> Result<(), EvalError> {
+    debug_assert!(!path.is_empty());
+    if path.len() == 1 {
+        let step = &path[0];
+        match node {
+            JsonValue::Object(entries) => {
+                if entries.iter().any(|(k, _)| k == step) {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "jsonb_insert(): cannot replace existing key {step:?}"
+                        ),
+                    });
+                }
+                entries.push((step.clone(), new_val));
+                Ok(())
+            }
+            JsonValue::Array(items) => {
+                let Ok(n) = step.parse::<i64>() else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "jsonb_insert(): array step must be integer, got {step:?}"
+                        ),
+                    });
+                };
+                let mut idx = if n >= 0 {
+                    let i = n as usize;
+                    if i > items.len() { items.len() } else { i }
+                } else {
+                    let from_end = items.len() as i64 + n;
+                    if from_end < 0 { 0 } else { from_end as usize }
+                };
+                if insert_after && idx < items.len() {
+                    idx += 1;
+                }
+                items.insert(idx, new_val);
+                Ok(())
+            }
+            _ => Err(EvalError::TypeMismatch {
+                detail: "jsonb_insert(): parent at path is a scalar".into(),
+            }),
+        }
+    } else {
+        let step = &path[0];
+        let rest = &path[1..];
+        match node {
+            JsonValue::Object(entries) => {
+                if let Some(pos) = entries.iter().position(|(k, _)| k == step) {
+                    insert_at_path(&mut entries[pos].1, rest, new_val, insert_after)
+                } else {
+                    Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "jsonb_insert(): path {step:?} does not exist"
+                        ),
+                    })
+                }
+            }
+            JsonValue::Array(items) => {
+                let Some(idx) = resolve_array_index(step, items.len()) else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "jsonb_insert(): array index {step:?} out of range"
+                        ),
+                    });
+                };
+                insert_at_path(&mut items[idx], rest, new_val, insert_after)
+            }
+            _ => Err(EvalError::TypeMismatch {
+                detail: "jsonb_insert(): parent at path is a scalar".into(),
+            }),
+        }
+    }
+}
+
+fn json_text_arg<'a>(
+    v: &'a Value,
+    fname: &str,
+    role: &str,
+) -> Result<&'a str, EvalError> {
+    match v {
+        Value::Json(s) | Value::Text(s) => Ok(s.as_str()),
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fname}() {role} must be JSON or TEXT, got {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+fn path_text_arg(v: &Value, fname: &str) -> Result<Vec<String>, EvalError> {
+    match v {
+        Value::Text(s) | Value::Json(s) => parse_text_array(s.as_str()),
+        Value::TextArray(items) => Ok(items
+            .iter()
+            .map(|o| o.clone().unwrap_or_default())
+            .collect()),
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fname}() path must be TEXT[] or TEXT, got {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
