@@ -226,6 +226,8 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::TimeTz { us, offset_secs } => {
             spg_engine::eval::format_timetz(*us, *offset_secs)
         }
+        // v7.17.0 Phase 3.P0-35 — PG MONEY canonical en_US text form.
+        Value::Money(c) => spg_engine::eval::format_money(*c),
         Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
         Value::Json(s) => s.clone(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side

@@ -5023,6 +5023,31 @@ pub fn format_timestamptz(micros: i64) -> String {
     s
 }
 
+/// v7.17.0 Phase 3.P0-35 — PG `money` canonical text form, en_US
+/// locale: `$N,NNN.CC`, negative → `-$1.23`. Mirrors PG's
+/// `cash_out` for `lc_monetary = 'en_US.UTF-8'`.
+pub fn format_money(cents: i64) -> String {
+    let neg = cents < 0;
+    let abs = cents.unsigned_abs();
+    let dollars = abs / 100;
+    let cc = abs % 100;
+    // Insert comma thousands separators in the integer portion.
+    let dollar_str = dollars.to_string();
+    let bytes = dollar_str.as_bytes();
+    let mut int_part = String::with_capacity(dollar_str.len() + dollar_str.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        // Position from the right: insert ',' before every 3rd
+        // digit (except the first).
+        let from_right = bytes.len() - i;
+        if i > 0 && from_right % 3 == 0 {
+            int_part.push(',');
+        }
+        int_part.push(*b as char);
+    }
+    let sign = if neg { "-" } else { "" };
+    format!("{sign}${int_part}.{cc:02}")
+}
+
 /// v7.17.0 Phase 3.P0-34 — PG `TIMETZ` canonical text form
 /// `HH:MM:SS[.ffffff]±HH[:MM]`. Mirrors PG `timetz_out`. The
 /// offset uses `±HH` for whole-hour offsets and `±HH:MM` for

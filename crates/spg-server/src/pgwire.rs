@@ -2920,6 +2920,8 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Year => 23,
         // v7.17.0 Phase 3 P0-34 — PG TIMETZ OID 1266.
         DataType::TimeTz => 1266,
+        // v7.17.0 Phase 3 P0-35 — PG MONEY OID 790.
+        DataType::Money => 790,
     }
 }
 
@@ -2938,6 +2940,8 @@ const fn pg_type_len(ty: DataType) -> i16 {
         DataType::Year => 2,
         // v7.17.0 Phase 3.P0-34 — TIMETZ is i64 + i32 (12 bytes).
         DataType::TimeTz => 12,
+        // v7.17.0 Phase 3.P0-35 — MONEY is fixed i64 (8 bytes).
+        DataType::Money => 8,
         _ => -1, // varlena
     }
 }
@@ -3002,6 +3006,10 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         Value::TimeTz { us, offset_secs } => {
             spg_engine::eval::format_timetz(*us, *offset_secs)
         }
+        // v7.17.0 Phase 3.P0-35 — MONEY via the shared engine
+        // helper so the canonical en_US text form matches PG
+        // `cash_out` across all renderers.
+        Value::Money(c) => spg_engine::eval::format_money(*c),
         // v7.5.0 — Value is #[non_exhaustive].
         _ => format!("{v:?}"),
     })
