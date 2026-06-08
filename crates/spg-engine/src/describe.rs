@@ -238,7 +238,8 @@ fn function_return_shape(
         | "translate" | "regexp_replace" | "to_char" | "encode"
         | "host" | "network" | "version" | "database" | "current_user"
         | "session_user" | "user" | "pg_get_serial_sequence"
-        | "pg_get_constraintdef" | "pg_get_indexdef" => (DataType::Text, true),
+        | "pg_get_constraintdef" | "pg_get_indexdef"
+        | "date_format" => (DataType::Text, true),
         // Bytes-returning.
         "decode" | "hex" => (DataType::Bytes, true),
         // Integer-returning length / position helpers.
@@ -274,8 +275,17 @@ fn function_return_shape(
         "gen_random_uuid" | "uuid_generate_v4" => (DataType::Uuid, false),
         // Interval.
         "age" => (DataType::Interval, true),
-        // Timestamp-returning.
-        "date_trunc" | "from_unixtime" | "make_timestamp" => (DataType::Timestamp, true),
+        // Timestamp-returning. `from_unixtime` switches to TEXT
+        // when called with a format-string second arg — handled
+        // below via arity check.
+        "date_trunc" | "make_timestamp" => (DataType::Timestamp, true),
+        "from_unixtime" => {
+            if args.len() >= 2 {
+                (DataType::Text, true)
+            } else {
+                (DataType::Timestamp, true)
+            }
+        }
         "make_date" | "to_date" => (DataType::Date, true),
         "date_part" | "extract" => (DataType::Float, true),
         // Pass-through aggregates / conditionals: derive the type
