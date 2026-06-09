@@ -139,6 +139,76 @@ fn v3_records_still_load_for_backward_compat() {
 }
 
 #[test]
+fn checkpoint_marker_parses_back_to_lsn_ts_path() {
+    // The encode_v4_checkpoint_marker helper isn't pub, but the
+    // checkpoint() call inside Database emits one before WAL
+    // truncate. Since the truncate erases it from disk, we
+    // exercise the marker by hand-crafting a WAL chunk: a v4 SQL
+    // record + a marker record, then parse both back and assert
+    // the marker exposes lsn / ts / snapshot_path.
+    let tmp = TempDir::new().unwrap();
+    let wal_path = tmp.path().join("synthetic.wal");
+
+    // Hand-write a v4 auto-commit record + v4 checkpoint marker.
+    // Re-derive the marker layout from the docs so this test
+    // catches accidental layout changes in the encoder.
+    const WAL_V2_SENTINEL: u32 = 0x8000_0000;
+    const WAL_V3_FLAG: u32 = 0x4000_0000;
+    const WAL_V4_TYPE_AUTO_COMMIT_SQL: u8 = 0x10;
+    const WAL_V4_TYPE_CHECKPOINT_MARKER: u8 = 0x11;
+
+    // 1) v4 auto-commit record carrying lsn=7, ts=100.
+    let sql = b"CREATE TABLE t (a INT)";
+    let mut payload_buf = Vec::new();
+    payload_buf.push(WAL_V4_TYPE_AUTO_COMMIT_SQL);
+    payload_buf.extend_from_slice(&7u64.to_le_bytes());
+    payload_buf.extend_from_slice(&100i64.to_le_bytes());
+    payload_buf.extend_from_slice(sql);
+    let crc = spg_crypto::crc32::crc32(&payload_buf);
+    let mut wal = Vec::new();
+    wal.extend_from_slice(&((sql.len() as u32) | WAL_V2_SENTINEL | WAL_V3_FLAG).to_le_bytes());
+    wal.extend_from_slice(&crc.to_le_bytes());
+    wal.push(WAL_V4_TYPE_AUTO_COMMIT_SQL);
+    wal.extend_from_slice(&7u64.to_le_bytes());
+    wal.extend_from_slice(&100i64.to_le_bytes());
+    wal.extend_from_slice(sql);
+
+    // 2) v4 checkpoint marker carrying lsn=8, ts=200, path=/tmp/x.spg.
+    let snap_path = "/tmp/x.spg";
+    let mut m_payload = Vec::new();
+    m_payload.extend_from_slice(&8u64.to_le_bytes());
+    m_payload.extend_from_slice(&200i64.to_le_bytes());
+    m_payload.extend_from_slice(&(snap_path.len() as u16).to_le_bytes());
+    m_payload.extend_from_slice(snap_path.as_bytes());
+    let mut m_crc_buf = Vec::with_capacity(1 + m_payload.len());
+    m_crc_buf.push(WAL_V4_TYPE_CHECKPOINT_MARKER);
+    m_crc_buf.extend_from_slice(&m_payload);
+    let m_crc = spg_crypto::crc32::crc32(&m_crc_buf);
+    let m_payload_len = m_payload.len() as u32;
+    wal.extend_from_slice(&(m_payload_len | WAL_V2_SENTINEL | WAL_V3_FLAG).to_le_bytes());
+    wal.extend_from_slice(&m_crc.to_le_bytes());
+    wal.push(WAL_V4_TYPE_CHECKPOINT_MARKER);
+    wal.extend_from_slice(&m_payload);
+
+    std::fs::write(&wal_path, &wal).unwrap();
+    let bytes = std::fs::read(&wal_path).unwrap();
+    let recs = parse_wal_records(&bytes).unwrap();
+    assert_eq!(recs.len(), 2);
+
+    // First record is the SQL.
+    assert_eq!(recs[0].type_byte, WAL_V4_TYPE_AUTO_COMMIT_SQL);
+    assert_eq!(recs[0].commit_lsn, Some(7));
+    assert_eq!(recs[0].commit_unix_us, Some(100));
+    assert_eq!(recs[0].sql, sql);
+
+    // Second is the marker — sql field carries the snapshot path bytes.
+    assert_eq!(recs[1].type_byte, WAL_V4_TYPE_CHECKPOINT_MARKER);
+    assert_eq!(recs[1].commit_lsn, Some(8));
+    assert_eq!(recs[1].commit_unix_us, Some(200));
+    assert_eq!(recs[1].sql, snap_path.as_bytes());
+}
+
+#[test]
 fn mixed_v3_v4_wal_replays_in_order() {
     // Same setup as the previous test but assert the engine sees
     // both statements applied — i.e. the v3 record applies first,
