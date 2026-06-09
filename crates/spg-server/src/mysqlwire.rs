@@ -43,6 +43,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
+use spg_engine::QueryResult;
+use spg_storage::{ColumnSchema, DataType, Value};
+
 use crate::ServerState;
 
 // ---- capability flags ---------------------------------------
@@ -223,14 +226,14 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             write_packet(&mut stream, reply_seqno.wrapping_add(1), &encode_ok_packet())?;
         }
         AuthOutcome::AccessDenied(msg) => {
-            write_packet(
+            return write_packet(
                 &mut stream,
                 reply_seqno,
                 &encode_err_packet(1045, "28000", &msg),
-            )?;
+            );
         }
         AuthOutcome::PluginMismatch(plugin) => {
-            write_packet(
+            return write_packet(
                 &mut stream,
                 reply_seqno,
                 &encode_err_packet(
@@ -240,10 +243,314 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         "auth plugin {plugin:?} not yet supported — Segment G covers mysql_native_password and caching_sha2_password (fast path)",
                     ),
                 ),
+            );
+        }
+    }
+
+    // ---- Command phase ---------------------------------------
+    //
+    // v7.17.0 Phase 3.P0-73 — text-protocol COM_QUERY. Each new
+    // command resets the sequence counter; the server's reply
+    // starts at seqno=1 (the command itself was seqno=0).
+    command_loop(&mut stream, state)
+}
+
+fn command_loop(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+) -> std::io::Result<()> {
+    loop {
+        let (seqno_in, payload) = match read_packet(stream) {
+            Ok(t) => t,
+            // Client closed the connection — normal exit.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if payload.is_empty() {
+            return write_packet(
+                stream,
+                seqno_in.wrapping_add(1),
+                &encode_err_packet(1064, "42000", "empty command packet"),
+            );
+        }
+        let cmd = payload[0];
+        let reply_seqno = seqno_in.wrapping_add(1);
+        match cmd {
+            CMD_QUIT => return Ok(()),
+            CMD_QUERY => {
+                let sql = std::str::from_utf8(&payload[1..])
+                    .unwrap_or("")
+                    .to_string();
+                handle_com_query(stream, state, &sql, reply_seqno)?;
+            }
+            _ => {
+                // Unknown command. P0-74 / P0-75 add binary-protocol
+                // commands (STMT_PREPARE / EXECUTE / RESET / CLOSE,
+                // PING / INIT_DB / FIELD_LIST). Until then surface
+                // a structured error.
+                write_packet(
+                    stream,
+                    reply_seqno,
+                    &encode_err_packet(
+                        1047,
+                        "08S01",
+                        &format!(
+                            "unknown MySQL command 0x{cmd:02x} (Segment G follow-ons land in P0-74/75)"
+                        ),
+                    ),
+                )?;
+            }
+        }
+    }
+}
+
+// ---- COM_QUERY handler --------------------------------------
+
+pub(crate) const CMD_QUIT: u8 = 0x01;
+pub(crate) const CMD_QUERY: u8 = 0x03;
+
+fn handle_com_query(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    sql: &str,
+    start_seqno: u8,
+) -> std::io::Result<()> {
+    // Run the SQL through the engine. Mirrors what pgwire's
+    // 'Q' (simple query) path does — single-statement form, no
+    // transaction state changes here (autocommit-only for v7.17
+    // mysql-wire; BEGIN/COMMIT through pgwire still works).
+    let outcome = {
+        let Ok(mut engine) = state.engine.write() else {
+            return write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(1815, "HY000", "engine lock poisoned"),
+            );
+        };
+        engine.execute(sql)
+    };
+    match outcome {
+        Err(e) => {
+            // Map engine errors to MySQL errno 1064 (parse / unsupported)
+            // unless the error is a typed mismatch (1146 missing table)
+            // — but the engine doesn't surface that today, so just
+            // surface 1064 with the message.
+            let msg = format!("{e}");
+            write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg))?;
+        }
+        Ok(QueryResult::CommandOk { affected, .. }) => {
+            write_packet(stream, start_seqno, &encode_ok_with_affected(affected as u64))?;
+        }
+        Ok(QueryResult::Rows { columns, rows }) => {
+            encode_text_result_set(stream, &columns, &rows, start_seqno)?;
+        }
+        // `QueryResult` is `#[non_exhaustive]` — future variants
+        // surface as a structured error here until the wire shim
+        // learns about them.
+        Ok(_) => {
+            write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(
+                    1815,
+                    "HY000",
+                    "engine returned a QueryResult variant the MySQL-wire shim doesn't yet encode",
+                ),
             )?;
         }
     }
     Ok(())
+}
+
+// ---- text-protocol result set -------------------------------
+
+fn encode_text_result_set(
+    stream: &mut TcpStream,
+    columns: &[ColumnSchema],
+    rows: &[spg_storage::Row],
+    start_seqno: u8,
+) -> std::io::Result<()> {
+    // 1) column_count packet — single length-encoded integer.
+    let mut payload = Vec::new();
+    encode_lenenc_int(&mut payload, columns.len() as u64);
+    let mut seq = start_seqno;
+    write_packet(stream, seq, &payload)?;
+    seq = seq.wrapping_add(1);
+    // 2) column_def_41 packets — one per column.
+    for c in columns {
+        let buf = encode_column_def_41(c);
+        write_packet(stream, seq, &buf)?;
+        seq = seq.wrapping_add(1);
+    }
+    // 3) row packets. CLIENT_DEPRECATE_EOF means we skip the
+    // intermediate EOF marker and just stream rows.
+    for row in rows {
+        let buf = encode_text_row(&row.values, columns);
+        write_packet(stream, seq, &buf)?;
+        seq = seq.wrapping_add(1);
+    }
+    // 4) trailing OK packet (CLIENT_DEPRECATE_EOF replaces the
+    // trailing EOF with OK). status_flags + warnings.
+    write_packet(stream, seq, &encode_ok_packet())?;
+    Ok(())
+}
+
+fn encode_column_def_41(c: &ColumnSchema) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    // catalog — always "def" per MySQL spec.
+    encode_lenenc_string(&mut buf, b"def");
+    // schema (empty for v7.17 — no SHOW SCHEMAS dispatch here)
+    encode_lenenc_string(&mut buf, b"");
+    // table / org_table (empty for now — engine doesn't surface
+    // the source table for projection items)
+    encode_lenenc_string(&mut buf, b"");
+    encode_lenenc_string(&mut buf, b"");
+    // name / org_name — the projected column label.
+    encode_lenenc_string(&mut buf, c.name.as_bytes());
+    encode_lenenc_string(&mut buf, c.name.as_bytes());
+    // 1-byte fixed-length field length marker.
+    buf.push(0x0c);
+    // character set. utf8mb4 = 0x002d (45) — matches what we
+    // advertise in the greeting (the 0xff byte in HandshakeV10
+    // is the same collation in a different namespace).
+    buf.extend_from_slice(&0x002d_u16.to_le_bytes());
+    // column length — set per-type, padded large enough for the
+    // text representation of any value the engine could produce.
+    let column_length = column_length_for(c.ty);
+    buf.extend_from_slice(&column_length.to_le_bytes());
+    // column type byte
+    buf.push(mysql_field_type(c.ty));
+    // flags: NOT NULL = 0x0001; mostly leave 0 elsewhere.
+    let flags: u16 = if c.nullable { 0 } else { 0x0001 };
+    buf.extend_from_slice(&flags.to_le_bytes());
+    // decimals: 0x1f = "no fixed decimal point" for floats.
+    let decimals: u8 = match c.ty {
+        DataType::Float => 0x1f,
+        DataType::Numeric { scale, .. } => scale,
+        _ => 0x00,
+    };
+    buf.push(decimals);
+    // 2-byte trailing filler.
+    buf.extend_from_slice(&[0u8, 0u8]);
+    buf
+}
+
+fn encode_text_row(values: &[Value], _columns: &[ColumnSchema]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 8);
+    for v in values {
+        match v {
+            Value::Null => {
+                // MySQL text protocol: NULL is a single byte 0xfb.
+                buf.push(0xfb);
+            }
+            other => {
+                let text = value_to_mysql_text(other);
+                encode_lenenc_string(&mut buf, text.as_bytes());
+            }
+        }
+    }
+    buf
+}
+
+fn value_to_mysql_text(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(), // handled by caller
+        Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(f) => format!("{f}"),
+        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::Date(days) => format_date_mysql(*days),
+        Value::Timestamp(us) => format_timestamp_mysql(*us),
+        // Other types fall through to engine's canonical text
+        // renderer when SPG ships one; otherwise the Debug shape
+        // keeps the wire flow alive without losing the row.
+        other => format!("{other:?}"),
+    }
+}
+
+fn format_date_mysql(days_since_epoch: i32) -> String {
+    // `YYYY-MM-DD` per MySQL DATE text format — same shape as
+    // SPG engine's canonical PG-style DATE render.
+    spg_engine::eval::format_date(days_since_epoch)
+}
+
+fn format_timestamp_mysql(us: i64) -> String {
+    // `YYYY-MM-DD HH:MM:SS[.ffffff]` per MySQL DATETIME text
+    // format. SPG's format_timestamp produces the PG-canonical
+    // `YYYY-MM-DD HH:MM:SS` form already.
+    spg_engine::eval::format_timestamp(us)
+}
+
+fn mysql_field_type(ty: DataType) -> u8 {
+    match ty {
+        DataType::Bool => 0x01,            // MYSQL_TYPE_TINY
+        DataType::SmallInt => 0x02,        // MYSQL_TYPE_SHORT
+        DataType::Int => 0x03,             // MYSQL_TYPE_LONG
+        DataType::BigInt => 0x08,          // MYSQL_TYPE_LONGLONG
+        DataType::Float => 0x05,           // MYSQL_TYPE_DOUBLE
+        DataType::Date => 0x0a,            // MYSQL_TYPE_DATE
+        DataType::Timestamp => 0x07,       // MYSQL_TYPE_TIMESTAMP
+        DataType::Timestamptz => 0x07,
+        DataType::Json | DataType::Jsonb => 0xf5,  // MYSQL_TYPE_JSON
+        DataType::Numeric { .. } => 0xf6,  // MYSQL_TYPE_NEWDECIMAL
+        DataType::Bytes => 0xfc,           // MYSQL_TYPE_BLOB
+        // Everything else (Text, Char, Varchar, Uuid, vectors,
+        // arrays, ts*, range, hstore, money, time*) decodes as a
+        // varchar-string on the wire — clients see the engine's
+        // canonical text rendering.
+        _ => 0xfd, // MYSQL_TYPE_VAR_STRING
+    }
+}
+
+fn column_length_for(ty: DataType) -> u32 {
+    match ty {
+        DataType::Bool => 1,
+        DataType::SmallInt => 6,
+        DataType::Int => 11,
+        DataType::BigInt => 20,
+        DataType::Float => 22,
+        DataType::Date => 10,
+        DataType::Timestamp | DataType::Timestamptz => 26,
+        DataType::Numeric { precision, .. } => u32::from(precision) + 2,
+        // Large pad for text-shaped — most clients only use this
+        // as an upper bound for column display width.
+        _ => 16_777_215,
+    }
+}
+
+// ---- OK / lenenc helpers ------------------------------------
+
+pub(crate) fn encode_ok_with_affected(affected: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(11);
+    out.push(0x00);
+    encode_lenenc_int(&mut out, affected);
+    out.push(0); // last_insert_id = 0
+    out.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // warnings
+    out
+}
+
+pub(crate) fn encode_lenenc_int(buf: &mut Vec<u8>, v: u64) {
+    if v < 251 {
+        buf.push(v as u8);
+    } else if v < 1 << 16 {
+        buf.push(0xfc);
+        buf.extend_from_slice(&(v as u16).to_le_bytes());
+    } else if v < 1 << 24 {
+        buf.push(0xfd);
+        let bytes = (v as u32).to_le_bytes();
+        buf.extend_from_slice(&bytes[..3]);
+    } else {
+        buf.push(0xfe);
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+pub(crate) fn encode_lenenc_string(buf: &mut Vec<u8>, bytes: &[u8]) {
+    encode_lenenc_int(buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
 }
 
 /// Outcome of verifying a HandshakeResponse41 against the engine's
