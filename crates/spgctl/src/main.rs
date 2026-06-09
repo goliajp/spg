@@ -80,6 +80,47 @@ fn main() {
         // STABILITY § "Out of v6.10" — the v6.10.7 ship freezes
         // the CLI shape so the future revisit drops in the audit
         // lookup without changing the operator surface.
+        // v7.18 PITR P5 — `spg verify-pitr --dir <backup_dir>
+        // [--write-missing-checksums]` walks the backup layout
+        // backup-pitr produces:
+        //   * snapshot.spg must deserialize.
+        //   * each wal/*.wal must parse to a monotonic LSN sequence
+        //     with no hole inside the chunk.
+        //   * each wal/<chunk>.checksum is BLAKE3 of the chunk
+        //     bytes; missing checksums are computed and (with
+        //     --write-missing-checksums) persisted on the spot,
+        //     mismatches are reported and fail the verify.
+        //   * replay dry-run: feed snapshot + chunks (sorted by
+        //     filename = (unix_us, max_lsn)) into a fresh in-memory
+        //     database and confirm every SQL record applies.
+        // exit 0 = clean, 1 = corrupt, 2 = harness error.
+        Some("verify-pitr") => {
+            let mut dir: Option<String> = None;
+            let mut write_missing = false;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--dir" => dir = args.next(),
+                    "--write-missing-checksums" => write_missing = true,
+                    other => {
+                        die(&format!("unknown verify-pitr arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let Some(dir) = dir else {
+                die("usage: spg verify-pitr --dir <backup_dir>", 2);
+                return;
+            };
+            match verify_pitr(&dir, write_missing) {
+                Ok(report) => {
+                    println!("{}", report.render());
+                    if !report.is_clean() {
+                        process::exit(1);
+                    }
+                }
+                Err(e) => die(&format!("verify-pitr: {e}"), 2),
+            }
+        }
         // v7.18 PITR P4 — `spg backup-pitr --src <db_path>
         // --dst <backup_dir>` copies the catalog snapshot + the
         // current WAL into a layout pitr-restore can consume:
@@ -252,6 +293,266 @@ fn main() {
 /// snapshot to `out_path`. `to_seq == 0` is a special case
 /// meaning "replay no records" — the snapshot is the empty
 /// catalog. Returns the count of records applied.
+/// v7.18 PITR P5 — backup verification.
+///
+/// Walks the backup directory `backup-pitr` produced and asserts
+/// the snapshot + every WAL chunk are intact + can replay. See
+/// the CLI doc-comment in `main` for the layout.
+#[derive(Debug)]
+struct VerifyReport {
+    snapshot_ok: bool,
+    snapshot_msg: String,
+    chunks: Vec<ChunkReport>,
+    replay_ok: bool,
+    replay_msg: String,
+}
+
+#[derive(Debug)]
+struct ChunkReport {
+    path: std::path::PathBuf,
+    parse_ok: bool,
+    parse_msg: String,
+    checksum_state: ChecksumState,
+}
+
+#[derive(Debug)]
+enum ChecksumState {
+    Match { hex: String },
+    WrittenFresh { hex: String },
+    Mismatch { expected: String, actual: String },
+    Missing { actual: String },
+}
+
+impl VerifyReport {
+    fn is_clean(&self) -> bool {
+        if !self.snapshot_ok || !self.replay_ok {
+            return false;
+        }
+        for c in &self.chunks {
+            if !c.parse_ok {
+                return false;
+            }
+            if matches!(
+                c.checksum_state,
+                ChecksumState::Mismatch { .. } | ChecksumState::Missing { .. }
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+    fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# verify-pitr report — {}\n\n",
+            if self.is_clean() { "PASS" } else { "FAIL" }
+        ));
+        out.push_str(&format!(
+            "snapshot.spg: {} — {}\n",
+            if self.snapshot_ok { "OK" } else { "FAIL" },
+            self.snapshot_msg
+        ));
+        out.push_str(&format!(
+            "replay dry-run: {} — {}\n",
+            if self.replay_ok { "OK" } else { "FAIL" },
+            self.replay_msg
+        ));
+        out.push_str(&format!("\nchunks: {}\n", self.chunks.len()));
+        for c in &self.chunks {
+            let parse_status = if c.parse_ok { "OK" } else { "FAIL" };
+            let csum_status = match &c.checksum_state {
+                ChecksumState::Match { hex } => format!("checksum-match ({hex})"),
+                ChecksumState::WrittenFresh { hex } => format!("checksum-fresh ({hex})"),
+                ChecksumState::Mismatch { expected, actual } => {
+                    format!("checksum-MISMATCH expected={expected} actual={actual}")
+                }
+                ChecksumState::Missing { actual } => {
+                    format!("checksum-MISSING actual={actual} (rerun with --write-missing-checksums)")
+                }
+            };
+            out.push_str(&format!(
+                "  {} — parse: {}; {}\n  parse-msg: {}\n",
+                c.path.display(),
+                parse_status,
+                csum_status,
+                c.parse_msg
+            ));
+        }
+        out
+    }
+}
+
+fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport, String> {
+    use spg_embedded::{Database, parse_wal_records};
+
+    let dir_path = std::path::PathBuf::from(dir);
+    let snap_path = dir_path.join("snapshot.spg");
+    let wal_dir = dir_path.join("wal");
+
+    // ---- snapshot ----
+    let (snapshot_ok, snapshot_msg, snapshot_bytes) = match fs::read(&snap_path) {
+        Ok(bytes) => match Database::restore(&bytes) {
+            Ok(_) => (
+                true,
+                format!("{} bytes deserialize cleanly", bytes.len()),
+                bytes,
+            ),
+            Err(e) => (
+                false,
+                format!("deserialize failed: {e:?}"),
+                Vec::new(),
+            ),
+        },
+        Err(e) => (false, format!("read failed: {e}"), Vec::new()),
+    };
+
+    // ---- chunks ----
+    let mut chunks_meta: Vec<std::path::PathBuf> = Vec::new();
+    if wal_dir.exists() {
+        for entry in fs::read_dir(&wal_dir).map_err(|e| format!("read wal dir: {e}"))? {
+            let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("wal") {
+                chunks_meta.push(p);
+            }
+        }
+    }
+    chunks_meta.sort();
+
+    let mut chunks: Vec<ChunkReport> = Vec::new();
+    let mut replay_chunks: Vec<Vec<u8>> = Vec::new();
+    for path in &chunks_meta {
+        let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let actual_hash = spg_crypto::hex(&spg_crypto::hash(&bytes));
+        let cs_path = {
+            let mut p = path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".checksum");
+            p.set_file_name(name);
+            p
+        };
+        let csum_state = match fs::read_to_string(&cs_path) {
+            Ok(expected) => {
+                let expected = expected.trim().to_string();
+                if expected.eq_ignore_ascii_case(&actual_hash) {
+                    ChecksumState::Match { hex: actual_hash.clone() }
+                } else {
+                    ChecksumState::Mismatch {
+                        expected,
+                        actual: actual_hash.clone(),
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if write_missing_checksums {
+                    fs::write(&cs_path, format!("{actual_hash}\n"))
+                        .map_err(|e| format!("write checksum {}: {e}", cs_path.display()))?;
+                    ChecksumState::WrittenFresh { hex: actual_hash.clone() }
+                } else {
+                    ChecksumState::Missing { actual: actual_hash.clone() }
+                }
+            }
+            Err(e) => return Err(format!("read checksum {}: {e}", cs_path.display())),
+        };
+        let (parse_ok, parse_msg) = match parse_wal_records(&bytes) {
+            Ok(recs) => {
+                // Assert LSN monotonic inside the chunk.
+                let mut last: Option<u64> = None;
+                let mut hole_msg: Option<String> = None;
+                for r in &recs {
+                    if let Some(l) = r.commit_lsn {
+                        if let Some(prev) = last {
+                            if l <= prev {
+                                hole_msg = Some(format!(
+                                    "LSN {l} at offset {} not strictly greater than previous {prev}",
+                                    r.offset
+                                ));
+                                break;
+                            }
+                        }
+                        last = Some(l);
+                    }
+                }
+                if let Some(m) = hole_msg {
+                    (false, m)
+                } else {
+                    (true, format!("{} records parsed", recs.len()))
+                }
+            }
+            Err(e) => (false, e),
+        };
+        if parse_ok {
+            replay_chunks.push(bytes);
+        }
+        chunks.push(ChunkReport {
+            path: path.clone(),
+            parse_ok,
+            parse_msg,
+            checksum_state: csum_state,
+        });
+    }
+
+    // ---- replay dry-run ----
+    let (replay_ok, replay_msg) = if snapshot_ok {
+        match Database::restore(&snapshot_bytes) {
+            Ok(mut db) => {
+                let mut applied = 0u64;
+                let mut last_err: Option<String> = None;
+                'outer: for chunk in &replay_chunks {
+                    match parse_wal_records(chunk) {
+                        Ok(recs) => {
+                            for r in recs {
+                                if r.type_byte == 0x01 || r.type_byte == 0x10 {
+                                    let sql = match std::str::from_utf8(r.sql) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            last_err = Some(format!(
+                                                "non-UTF-8 SQL at offset {}: {e}",
+                                                r.offset
+                                            ));
+                                            break 'outer;
+                                        }
+                                    };
+                                    if let Err(e) = db.execute(sql) {
+                                        last_err = Some(format!(
+                                            "apply rejected at offset {}: {e:?}",
+                                            r.offset
+                                        ));
+                                        break 'outer;
+                                    }
+                                    applied += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last_err = Some(format!("parse during replay: {e}"));
+                            break;
+                        }
+                    }
+                }
+                match last_err {
+                    Some(msg) => (false, msg),
+                    None => (true, format!("{applied} records replayed cleanly")),
+                }
+            }
+            Err(e) => (false, format!("snapshot restore for replay failed: {e:?}")),
+        }
+    } else {
+        (false, "skipped — snapshot did not deserialize".into())
+    };
+
+    Ok(VerifyReport {
+        snapshot_ok,
+        snapshot_msg,
+        chunks,
+        replay_ok,
+        replay_msg,
+    })
+}
+
 /// v7.18 PITR P4 — copy a SPG database's catalog snapshot + WAL
 /// into a backup directory layout `pitr-restore` can consume.
 ///
@@ -1106,6 +1407,130 @@ mod tests {
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(&wal_path);
         let _ = fs::remove_file(&empty_wal);
+    }
+
+    #[test]
+    fn verify_pitr_passes_on_fresh_backup_with_writes() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("vf-src-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        // Realistic PITR backup: checkpoint() materialises the
+        // base snapshot file + truncates the WAL, then subsequent
+        // writes go into the WAL as incremental records. backup_pitr
+        // captures (snapshot, wal-incremental) and verify-pitr
+        // replays just the WAL on top of the snapshot — no
+        // double-apply of the writes that pre-dated the
+        // checkpoint.
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.checkpoint().unwrap(); // snapshot = empty-table t
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        std::mem::forget(db);
+        Database::force_unlock(&db_path).unwrap();
+
+        let backup_dir = tmp_path("vf-bk-dir");
+        let summary = backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(summary.starts_with("OK "));
+
+        // First verify without checksums — must report Missing
+        // for the chunk and NOT-clean.
+        let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
+        assert!(report.snapshot_ok);
+        assert!(report.replay_ok, "replay msg: {}", report.replay_msg);
+        assert_eq!(report.chunks.len(), 1);
+        assert!(
+            matches!(report.chunks[0].checksum_state, ChecksumState::Missing { .. }),
+            "got: {:?}",
+            report.chunks[0].checksum_state
+        );
+        assert!(!report.is_clean(), "report should not be clean without checksum");
+
+        // Now write the checksum file via the flag and verify
+        // again — must be clean.
+        let report = verify_pitr(backup_dir.to_str().unwrap(), true).unwrap();
+        assert!(matches!(
+            report.chunks[0].checksum_state,
+            ChecksumState::WrittenFresh { .. }
+        ));
+
+        let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
+        assert!(report.is_clean(), "report: {}", report.render());
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn verify_pitr_detects_checksum_mismatch() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("vf-bad-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        std::mem::forget(db);
+        Database::force_unlock(&db_path).unwrap();
+
+        let backup_dir = tmp_path("vf-bad-bk-dir");
+        backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+
+        // Stamp a phony checksum.
+        let chunks: Vec<_> = fs::read_dir(backup_dir.join("wal"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(chunks.len(), 1);
+        let cs_path = {
+            let mut p = chunks[0].clone();
+            let mut name = p.file_name().unwrap().to_os_string();
+            name.push(".checksum");
+            p.set_file_name(name);
+            p
+        };
+        fs::write(&cs_path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n")
+            .unwrap();
+
+        let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
+        assert!(
+            matches!(report.chunks[0].checksum_state, ChecksumState::Mismatch { .. }),
+            "got: {:?}",
+            report.chunks[0].checksum_state
+        );
+        assert!(!report.is_clean());
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
     }
 
     #[test]
