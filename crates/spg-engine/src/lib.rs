@@ -907,6 +907,66 @@ impl Engine {
         transient.execute_readonly_with_cancel(sql, cancel)
     }
 
+    /// v7.18 — execute a previously-prepared `Statement` against a
+    /// `CatalogSnapshot` in read-only mode. Mirror of
+    /// [`Engine::execute_prepared`] for the fan-out read path:
+    /// substitutes `Expr::Placeholder(n)` nodes from `params`, then
+    /// dispatches through [`Engine::execute_readonly_stmt_with_cancel`]
+    /// (writes / DDL hit `EngineError::WriteRequired`). Static-on-Self
+    /// so multiple readonly threads can dispatch against the same
+    /// snapshot concurrently without an `Engine` borrow.
+    ///
+    /// **Schema drift contract**. The `Statement` was prepared against
+    /// some prior catalog. If the snapshot's catalog has since
+    /// diverged (DDL renamed / dropped a referenced column / table),
+    /// execution surfaces the normal `EngineError` — same shape as
+    /// PG's "cached plan must not change result type". Caller decides
+    /// whether to re-prepare; engine does NOT auto-retry.
+    pub fn execute_readonly_prepared_on_snapshot(
+        snapshot: &CatalogSnapshot,
+        stmt: Statement,
+        params: &[Value],
+    ) -> Result<QueryResult, EngineError> {
+        Self::execute_readonly_prepared_on_snapshot_with_cancel(
+            snapshot,
+            stmt,
+            params,
+            CancelToken::none(),
+        )
+    }
+
+    /// v7.18 — cancellable variant of
+    /// [`Engine::execute_readonly_prepared_on_snapshot`].
+    pub fn execute_readonly_prepared_on_snapshot_with_cancel(
+        snapshot: &CatalogSnapshot,
+        mut stmt: Statement,
+        params: &[Value],
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        cancel.check()?;
+        substitute_placeholders(&mut stmt, params)?;
+        let transient = Engine {
+            catalog: snapshot.catalog.clone(),
+            statistics: snapshot.statistics.clone(),
+            clock: snapshot.clock,
+            max_query_rows: snapshot.max_query_rows,
+            ..Engine::default()
+        };
+        transient.execute_readonly_stmt_with_cancel(stmt, cancel)
+    }
+
+    /// v7.18 — describe a prepared `Statement` against a
+    /// `CatalogSnapshot`. Same `(parameter_oids, output_columns)`
+    /// shape as [`Engine::describe_prepared`]; resolves names
+    /// against the snapshot's catalog instead of `self`. Pure
+    /// function — no engine state read.
+    pub fn describe_prepared_on_snapshot(
+        snapshot: &CatalogSnapshot,
+        stmt: &Statement,
+    ) -> (Vec<u32>, Vec<ColumnSchema>) {
+        describe::describe_prepared(stmt, &snapshot.catalog)
+    }
+
     /// Construct an engine restored from a previously-snapshotted catalog
     /// (see `snapshot()`).
     pub fn restore(catalog: Catalog) -> Self {
@@ -1555,6 +1615,23 @@ impl Engine {
             // v6.2.3 — cost-based JOIN reorder (read path).
             reorder::reorder_joins(s, &self.catalog, &self.statistics);
         }
+        self.execute_readonly_stmt_with_cancel(stmt, cancel)
+    }
+
+    /// v7.18 — readonly dispatch on a pre-parsed `Statement`.
+    /// Internal helper shared by the SQL-string path
+    /// ([`Engine::execute_readonly_with_cancel`]) and the prepared-
+    /// statement path ([`Engine::execute_readonly_prepared_on_snapshot_with_cancel`]).
+    /// Statement-level transforms (clock rewrite, ORDER BY position,
+    /// JOIN reorder, placeholder substitution) are the caller's
+    /// responsibility — this helper assumes the AST is already
+    /// execution-ready. Writes / DDL hit
+    /// [`EngineError::WriteRequired`] the same way the SQL path does.
+    fn execute_readonly_stmt_with_cancel(
+        &self,
+        stmt: Statement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
         let result = match stmt {
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::ShowTables => Ok(self.exec_show_tables()),
@@ -17518,6 +17595,90 @@ mod tests {
             ),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn readonly_prepared_on_snapshot_select_with_placeholder() {
+        // v7.18 — sqlx Pool fan-out relies on running prepared
+        // SELECTs against a frozen snapshot without re-entering
+        // the writer engine. Mirrors the simple-query SELECT path
+        // in `execute_readonly_on_snapshot` but takes a Statement
+        // + bound params (the shape sqlx's Execute path produces).
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
+            .unwrap();
+        for i in 0..10_i32 {
+            e.execute(&alloc::format!("INSERT INTO t VALUES ({i}, {})", i * 7))
+                .unwrap();
+        }
+        let snapshot = e.clone_snapshot();
+        let stmt = e.prepare("SELECT id FROM t WHERE v = $1").unwrap();
+        let QueryResult::Rows { rows, .. } =
+            Engine::execute_readonly_prepared_on_snapshot(&snapshot, stmt, &[Value::Int(35)])
+                .unwrap()
+        else {
+            panic!("expected Rows")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(5));
+    }
+
+    #[test]
+    fn readonly_prepared_on_snapshot_rejects_writes() {
+        // DDL / DML prepared statements on the readonly path must
+        // surface `WriteRequired` so the spg-sqlx connection layer
+        // routes them to the writer mutex instead of the snapshot.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        let snapshot = e.clone_snapshot();
+        let stmt = e.prepare("INSERT INTO t VALUES ($1)").unwrap();
+        let err = Engine::execute_readonly_prepared_on_snapshot(&snapshot, stmt, &[Value::Int(1)])
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::WriteRequired),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn readonly_prepared_on_snapshot_frozen_view() {
+        // The snapshot reflects engine state at clone_snapshot()
+        // time. Writes after the snapshot are NOT visible — caller
+        // takes a fresh snapshot (or `AsyncReadHandle::refresh()`)
+        // to see them. This is the contract the per-statement
+        // refresh in spg-sqlx relies on.
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        e.execute("INSERT INTO t VALUES (1)").unwrap();
+        let snapshot = e.clone_snapshot();
+        e.execute("INSERT INTO t VALUES (2)").unwrap();
+        let stmt = e.prepare("SELECT id FROM t WHERE id = $1").unwrap();
+        let QueryResult::Rows { rows, .. } =
+            Engine::execute_readonly_prepared_on_snapshot(&snapshot, stmt, &[Value::Int(2)])
+                .unwrap()
+        else {
+            panic!("expected Rows")
+        };
+        assert!(rows.is_empty(), "id=2 was inserted after snapshot");
+    }
+
+    #[test]
+    fn describe_prepared_on_snapshot_resolves_columns() {
+        // v7.18 — sqlx's Executor::describe path on the readonly
+        // fan-out needs to resolve column names + types against
+        // the snapshot's catalog (not the live engine's catalog,
+        // which may have moved on).
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+        let snapshot = e.clone_snapshot();
+        let stmt = e.prepare("SELECT id, name FROM t WHERE id = $1").unwrap();
+        let (_params, cols) = Engine::describe_prepared_on_snapshot(&snapshot, &stmt);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[0].ty, DataType::Int);
+        assert_eq!(cols[1].name, "name");
+        assert_eq!(cols[1].ty, DataType::Text);
     }
 
     #[test]
