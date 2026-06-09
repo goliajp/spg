@@ -119,9 +119,17 @@ pub fn engine_value_kind(v: &EngineValue) -> Kind {
         // v7.17.0 Phase 3.P0-67 — NUMERIC bridges to bigdecimal /
         // String.
         EngineValue::Numeric { .. } => Kind::Numeric,
+        // v7.17.0 Phase 3.P0-68 — pgvector (all encodings) /
+        // tsvector. Sq8 + Half storage variants dequantise to
+        // f32 inside Decode, so the column-side kind is still
+        // Vector.
+        EngineValue::Vector(_)
+        | EngineValue::Sq8Vector(_)
+        | EngineValue::HalfVector(_) => Kind::Vector,
+        EngineValue::TsVector(_) => Kind::TsVector,
         // v7.16.0 — non-exhaustive enum; future types
-        // (Interval, vector, tsvector, arrays) decode to
-        // Kind::Null until the corresponding Decode lands.
+        // (Interval, arrays beyond text/int/bigint, hstore) decode
+        // to Kind::Null until the corresponding Decode lands.
         _ => Kind::Null,
     }
 }

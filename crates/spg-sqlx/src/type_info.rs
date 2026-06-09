@@ -76,6 +76,21 @@ pub enum Kind {
     /// `bigdecimal::BigDecimal` (under the `bigdecimal`
     /// feature) or `String` (canonical PG decimal text).
     Numeric,
+    /// v7.17.0 Phase 3.P0-68 — pgvector `VECTOR(N)` (any of the
+    /// three storage encodings: default f32, `USING SQ8`,
+    /// `USING HALF`). Bridges decode into `Vec<f32>` or
+    /// `String` (canonical pgvector external form
+    /// `'[1, 2.5, -3]'`). Quantised storage variants
+    /// (`Sq8Vector` / `HalfVector`) dequantise to f32 at the
+    /// adapter boundary.
+    Vector,
+    /// v7.17.0 Phase 3.P0-68 — PG `TSVECTOR` (full-text search
+    /// document representation). Bridges decode into `String`
+    /// (canonical PG external form
+    /// `'word1':1 'word2':2,3A'`). Encode is intentionally not
+    /// supported — clients build `tsvector` via the `to_tsvector`
+    /// SQL function, not by binding raw lexeme lists.
+    TsVector,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -127,6 +142,9 @@ impl SpgTypeInfo {
             DataType::Hstore => Kind::Hstore,
             // v7.17.0 Phase 3.P0-67 — NUMERIC(p, s) → exact-decimal.
             DataType::Numeric { .. } => Kind::Numeric,
+            // v7.17.0 Phase 3.P0-68 — pgvector + tsvector.
+            DataType::Vector { .. } => Kind::Vector,
+            DataType::TsVector => Kind::TsVector,
             // v7.17.0 Phase 3.P0-40 — 2D arrays decode as TEXT
             // on the sqlx side (canonical PG nested external form).
             DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => Kind::Text,
@@ -166,6 +184,8 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Range => "RANGE",
             Kind::Hstore => "HSTORE",
             Kind::Numeric => "NUMERIC",
+            Kind::Vector => "VECTOR",
+            Kind::TsVector => "TSVECTOR",
             Kind::Null => "NULL",
         }
     }

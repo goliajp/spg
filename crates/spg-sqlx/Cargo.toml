@@ -17,6 +17,12 @@ name = "spg_sqlx"
 # transitively through spg-embedded.
 spg-embedded       = { workspace = true }
 spg-embedded-tokio = { workspace = true }
+# v7.17.0 Phase 3.P0-68 — the sqlx Vector / TsVector Decode
+# helpers need `spg_storage::quantize::dequantize` and
+# `HalfVector::to_f32_vec`. spg-storage is already in the
+# transitive set via spg-embedded, but we declare it explicitly
+# so the use sites can name it without a glob re-export.
+spg-storage        = { workspace = true }
 # sqlx-core ONLY — we implement Database against sqlx-core's traits;
 # we don't ship our own runtime or macro layer. Users add sqlx
 # itself for the query!() macro + runtime selection.

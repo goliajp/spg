@@ -15,3 +15,4 @@ mod int;
 #[cfg(feature = "json")]
 mod json;
 mod text;
+pub(crate) mod vector;
