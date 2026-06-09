@@ -1823,6 +1823,16 @@ pub struct TableRef {
     /// same downstream dispatch slot. `name` defaults to
     /// `"generate_series"` when no alias is provided.
     pub generate_series_args: Option<Vec<Expr>>,
+    /// v7.17.0 Phase 3.P0-41 — `LATERAL ( SELECT … )` derived
+    /// table. When `Some`, the TableRef is a parenthesised SELECT
+    /// that may reference columns from the preceding FROM items
+    /// (correlated derived table). The executor materialises the
+    /// subquery per left-row, substituting outer-column references
+    /// against the current join row's values before running the
+    /// inner SELECT, then cross-joins the result back.
+    /// Mutually exclusive with `name` / `unnest_expr` /
+    /// `generate_series_args`.
+    pub lateral_subquery: Option<Box<SelectStatement>>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -3831,6 +3841,7 @@ mod tests {
                     unnest_expr: None,
                     unnest_column_aliases: Vec::new(),
                     generate_series_args: None,
+                    lateral_subquery: None,
                 },
                 joins: vec![],
             }),

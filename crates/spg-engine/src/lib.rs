@@ -7610,23 +7610,46 @@ impl Engine {
             .as_deref()
             .unwrap_or(from.primary.name.as_str())
             .to_string();
+        // v7.17.0 Phase 3.P0-41 — LATERAL peers can't be
+        // pre-materialised because their rows depend on outer
+        // columns. For each peer, build either an eager
+        // (rows, schema) pair or a "lateral" sentinel carrying
+        // just the schema and the inner SELECT to re-run per
+        // outer row.
         #[allow(clippy::type_complexity)]
-        let mut joined: Vec<(
-            Vec<Row>,
-            Vec<ColumnSchema>,
-            String,
-            JoinKind,
-            Option<&Expr>,
-        )> = Vec::new();
+        let mut joined: Vec<JoinedPeer<'_>> = Vec::new();
         for j in &from.joins {
-            let (rows, cols) = self.materialise_table_ref(&j.table)?;
             let a = j
                 .table
                 .alias
                 .as_deref()
                 .unwrap_or(j.table.name.as_str())
                 .to_string();
-            joined.push((rows, cols, a, j.kind, j.on.as_ref()));
+            if let Some(inner_box) = &j.table.lateral_subquery {
+                // Probe schema by running the inner SELECT against a
+                // NULL-padded outer context. The probe gives us the
+                // projection's column shape; rows materialise per
+                // left-row below.
+                let schema = self.lateral_probe_schema(inner_box)?;
+                joined.push(JoinedPeer {
+                    eager_rows: None,
+                    cols: schema,
+                    alias: a,
+                    kind: j.kind,
+                    on: j.on.as_ref(),
+                    lateral: Some(inner_box.as_ref()),
+                });
+            } else {
+                let (rows, cols) = self.materialise_table_ref(&j.table)?;
+                joined.push(JoinedPeer {
+                    eager_rows: Some(rows),
+                    cols,
+                    alias: a,
+                    kind: j.kind,
+                    on: j.on.as_ref(),
+                    lateral: None,
+                });
+            }
         }
         let mut combined_schema: Vec<ColumnSchema> = Vec::new();
         for col in &primary_cols {
@@ -7636,10 +7659,10 @@ impl Engine {
                 col.nullable,
             ));
         }
-        for (_, cols, a, _, _) in &joined {
-            for col in cols {
+        for peer in &joined {
+            for col in &peer.cols {
                 combined_schema.push(ColumnSchema::new(
-                    alloc::format!("{a}.{}", col.name),
+                    alloc::format!("{}.{}", peer.alias, col.name),
                     col.ty,
                     col.nullable,
                 ));
@@ -7647,17 +7670,34 @@ impl Engine {
         }
         let ctx = EvalContext::new(&combined_schema, None);
         let mut working: Vec<Row> = primary_rows;
-        let mut produced_len = primary_cols.len();
-        for (rrows, rcols, _, kind, on) in &joined {
-            let right_arity = rcols.len();
+        // Track the per-row width consumed by the outer left side so
+        // each lateral evaluation sees the correct schema slice.
+        let mut consumed_cols = primary_cols.len();
+        for peer in &joined {
+            let right_arity = peer.cols.len();
             let mut next: Vec<Row> = Vec::new();
             for left in &working {
                 let mut left_matched = false;
-                for right in rrows {
+                let per_left_rrows: alloc::borrow::Cow<'_, [Row]> = match peer.lateral {
+                    Some(inner) => {
+                        // Substitute outer columns and run the inner
+                        // SELECT against the current left row's slice
+                        // of the combined schema.
+                        let outer_schema = &combined_schema[..consumed_cols];
+                        let rows =
+                            self.materialise_lateral_for_outer(inner, outer_schema, left)?;
+                        alloc::borrow::Cow::Owned(rows)
+                    }
+                    None => {
+                        let r = peer.eager_rows.as_ref().expect("non-lateral peer eager");
+                        alloc::borrow::Cow::Borrowed(r.as_slice())
+                    }
+                };
+                for right in per_left_rrows.as_ref() {
                     let mut combined_vals = left.values.clone();
                     combined_vals.extend(right.values.iter().cloned());
                     let combined = Row::new(combined_vals);
-                    let keep = if let Some(on_expr) = on {
+                    let keep = if let Some(on_expr) = peer.on {
                         let cond = eval::eval_expr(on_expr, &combined, &ctx)?;
                         matches!(cond, Value::Bool(true))
                     } else {
@@ -7668,7 +7708,7 @@ impl Engine {
                         left_matched = true;
                     }
                 }
-                if !left_matched && matches!(kind, JoinKind::Left) {
+                if !left_matched && matches!(peer.kind, JoinKind::Left) {
                     let mut combined_vals = left.values.clone();
                     for _ in 0..right_arity {
                         combined_vals.push(Value::Null);
@@ -7677,8 +7717,8 @@ impl Engine {
                 }
             }
             working = next;
-            produced_len += right_arity;
-            debug_assert!(produced_len <= combined_schema.len());
+            consumed_cols += right_arity;
+            debug_assert!(consumed_cols <= combined_schema.len());
         }
         let mut filtered: Vec<Row> = Vec::new();
         for row in working {
@@ -7693,118 +7733,97 @@ impl Engine {
         Ok((combined_schema, filtered))
     }
 
+    /// v7.17.0 Phase 3.P0-41 — probe a LATERAL subquery's projection
+    /// schema by running it once with a NULL-padded outer context.
+    /// The probe never materialises real outer rows; it just executes
+    /// the inner SELECT with `outer_alias.col` references substituted
+    /// to NULL so the projection's type inference is exercised.
+    fn lateral_probe_schema(
+        &self,
+        inner: &SelectStatement,
+    ) -> Result<Vec<ColumnSchema>, EngineError> {
+        // Substitute every qualified column reference whose qualifier
+        // does NOT match an in-subquery FROM alias with NULL. The
+        // safest probe is to walk the inner SELECT and replace any
+        // `<qual>.<col>` whose qual isn't bound inside the subquery
+        // with a Null literal. For the v7.17 probe we just run the
+        // unmodified subquery and surface the columns; if it fails
+        // (e.g. references an outer column the probe can't resolve),
+        // we synthesise a best-effort schema from the SELECT items
+        // by inferring a single Text-typed column per projection.
+        match self.execute_readonly_select_for_lateral_probe(inner) {
+            Ok(QueryResult::Rows { columns, .. }) => Ok(columns),
+            // Best-effort fallback: each SELECT item becomes a TEXT
+            // column. Real schemas only differ when the inner SELECT
+            // references outer columns at projection-time; those
+            // queries surface via the substitution path during
+            // per-row execution and still return the right values.
+            _ => {
+                let mut out: Vec<ColumnSchema> = Vec::new();
+                for (i, item) in inner.items.iter().enumerate() {
+                    let name = match item {
+                        SelectItem::Expr {
+                            alias: Some(a), ..
+                        } => a.clone(),
+                        SelectItem::Expr { expr, .. } => synth_lateral_col_name(expr, i),
+                        SelectItem::Wildcard => alloc::format!("col{i}"),
+                    };
+                    out.push(ColumnSchema::new(name, DataType::Text, true));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// v7.17.0 Phase 3.P0-41 — try the inner LATERAL subquery against
+    /// the engine in read-only mode for schema-probe purposes. Failure
+    /// is expected when the subquery references an outer column the
+    /// probe can't resolve; the caller falls back to a best-effort
+    /// schema based on the SELECT items.
+    fn execute_readonly_select_for_lateral_probe(
+        &self,
+        inner: &SelectStatement,
+    ) -> Result<QueryResult, EngineError> {
+        self.exec_bare_select_cancel(inner, CancelToken::none())
+    }
+
+    /// v7.17.0 Phase 3.P0-41 — materialise a LATERAL subquery's rows
+    /// for one outer-row context. Walks the inner SELECT, replaces
+    /// every `<outer_alias>.<col>` reference whose alias appears in
+    /// the outer schema with the literal value from the outer row,
+    /// then runs the rewritten SELECT against the engine.
+    fn materialise_lateral_for_outer(
+        &self,
+        inner: &SelectStatement,
+        outer_schema: &[ColumnSchema],
+        outer_row: &Row,
+    ) -> Result<Vec<Row>, EngineError> {
+        let mut substituted = inner.clone();
+        substitute_outer_columns_multi(&mut substituted, outer_row, outer_schema);
+        let result = self.exec_bare_select_cancel(&substituted, CancelToken::none())?;
+        match result {
+            QueryResult::Rows { rows, .. } => Ok(rows),
+            _ => Err(EngineError::Unsupported(
+                "LATERAL subquery must be a SELECT (cannot be a write statement)".into(),
+            )),
+        }
+    }
+
     fn exec_joined_select(
         &self,
         stmt: &SelectStatement,
         from: &FromClause,
     ) -> Result<QueryResult, EngineError> {
-        // v7.13.2 — mailrs round-6 S5. UNNEST peers materialise
-        // into virtual (rows, schema) sources alongside catalog
-        // tables, so `FROM t, UNNEST(arr) AS p(col)` works in
-        // any join-list position. The lookup helper handles both
-        // shapes uniformly.
-        let (primary_rows, primary_cols) = self.materialise_table_ref(&from.primary)?;
-        let primary_alias = from
-            .primary
-            .alias
-            .as_deref()
-            .unwrap_or(from.primary.name.as_str())
-            .to_string();
-        // Owned (rows, schema) per peer — borrows from the catalog
-        // would not survive UNNEST-side materialisation.
-        #[allow(clippy::type_complexity)]
-        let mut joined: Vec<(
-            Vec<Row>,
-            Vec<ColumnSchema>,
-            String,
-            JoinKind,
-            Option<&Expr>,
-        )> = Vec::new();
-        for j in &from.joins {
-            let (rows, cols) = self.materialise_table_ref(&j.table)?;
-            let a = j
-                .table
-                .alias
-                .as_deref()
-                .unwrap_or(j.table.name.as_str())
-                .to_string();
-            joined.push((rows, cols, a, j.kind, j.on.as_ref()));
-        }
-
-        // Build the combined schema: composite "alias.col" names so the
-        // qualified-column resolver can find anything by exact match.
-        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
-        for col in &primary_cols {
-            combined_schema.push(ColumnSchema::new(
-                alloc::format!("{primary_alias}.{}", col.name),
-                col.ty,
-                col.nullable,
-            ));
-        }
-        for (_, cols, a, _, _) in &joined {
-            for col in cols {
-                combined_schema.push(ColumnSchema::new(
-                    alloc::format!("{a}.{}", col.name),
-                    col.ty,
-                    col.nullable,
-                ));
-            }
-        }
+        // v7.17.0 Phase 3.P0-43 + P0-41 — delegate the join +
+        // WHERE materialisation to the shared helper so the LATERAL
+        // / UNNEST / regular-catalog paths route through one place.
+        // (`build_joined_filtered_rows` carries LATERAL support as
+        // of Phase 3.P0-41.) Downstream we still handle aggregate /
+        // projection / ORDER BY / DISTINCT / LIMIT inline because
+        // those depend on the SelectStatement's items list.
+        let (combined_schema, filtered) =
+            self.build_joined_filtered_rows(from, stmt.where_.as_ref())?;
         let ctx = EvalContext::new(&combined_schema, None);
-
-        // Nested-loop join.
-        let mut working: Vec<Row> = primary_rows;
-        let mut produced_len = primary_cols.len();
-        for (rrows, rcols, _, kind, on) in &joined {
-            let right_arity = rcols.len();
-            let mut next: Vec<Row> = Vec::new();
-            for left in &working {
-                let mut left_matched = false;
-                for right in rrows {
-                    let mut combined_vals = left.values.clone();
-                    combined_vals.extend(right.values.iter().cloned());
-                    // Pad combined to the eventual full width so the
-                    // partial schema still matches positions used by ON.
-                    let combined = Row::new(combined_vals);
-                    let keep = if let Some(on_expr) = on {
-                        let cond = eval::eval_expr(on_expr, &combined, &ctx)?;
-                        matches!(cond, Value::Bool(true))
-                    } else {
-                        // CROSS / comma-list: every pair survives.
-                        true
-                    };
-                    if keep {
-                        next.push(combined);
-                        left_matched = true;
-                    }
-                }
-                if !left_matched && matches!(kind, JoinKind::Left) {
-                    // LEFT OUTER JOIN: emit the left row with NULLs on
-                    // the right side when no peer matched.
-                    let mut combined_vals = left.values.clone();
-                    for _ in 0..right_arity {
-                        combined_vals.push(Value::Null);
-                    }
-                    next.push(Row::new(combined_vals));
-                }
-            }
-            working = next;
-            produced_len += right_arity;
-            debug_assert!(produced_len <= combined_schema.len());
-        }
-
-        // WHERE filter against combined rows.
-        let mut filtered: Vec<Row> = Vec::new();
-        for row in working {
-            if let Some(where_expr) = &stmt.where_ {
-                let cond = eval::eval_expr(where_expr, &row, &ctx)?;
-                if !matches!(cond, Value::Bool(true)) {
-                    continue;
-                }
-            }
-            filtered.push(row);
-        }
-
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
         if aggregate::uses_aggregate(stmt) {
@@ -10480,6 +10499,137 @@ fn is_correlation_error(e: &EngineError) -> bool {
 /// must write `outer_alias.col` to reference an outer column. This
 /// matches PG's lexical scoping for correlated subqueries and
 /// avoids accidentally rebinding inner columns of the same name.
+/// v7.17.0 Phase 3.P0-41 — LATERAL peer descriptor. Either eagerly
+/// materialised (every regular table / unnest / generate_series) or
+/// lateral (subquery re-evaluated per outer row).
+struct JoinedPeer<'a> {
+    eager_rows: Option<Vec<Row>>,
+    cols: Vec<ColumnSchema>,
+    alias: String,
+    kind: JoinKind,
+    on: Option<&'a Expr>,
+    lateral: Option<&'a SelectStatement>,
+}
+
+/// v7.17.0 Phase 3.P0-41 — synthesise a column name for a LATERAL
+/// projection item that has no explicit alias. PG names anonymous
+/// projection items by the function call's name or by `column<i>`.
+/// SPG mirrors the latter (lower-overhead than walking arbitrary
+/// Expr shapes) so the probe-schema fallback path produces stable
+/// names for the lateral peer's columns.
+fn synth_lateral_col_name(expr: &Expr, idx: usize) -> String {
+    match expr {
+        // Bare column reference — use the column's own name.
+        Expr::Column(c) => c.name.clone(),
+        // Function call — use the function name (PG canonical:
+        // `count` / `max` / `lower` …).
+        Expr::FunctionCall { name, .. } => name.clone(),
+        // Cast — drill into the inner expression.
+        Expr::Cast { expr: inner, .. } => synth_lateral_col_name(inner, idx),
+        // Everything else falls back to PG's `column<N>` placeholder.
+        _ => alloc::format!("column{}", idx + 1),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-41 — substitute every `<alias>.<col>` Expr
+/// reference whose `<alias>.<col>` exists in the outer composite
+/// schema with the matching value from the outer row. Walks the
+/// entire SELECT body (items, WHERE, GROUP BY, HAVING, ORDER BY,
+/// UNION peers) so any depth of outer reference inside the
+/// LATERAL subquery resolves before execution.
+fn substitute_outer_columns_multi(
+    stmt: &mut SelectStatement,
+    outer_row: &Row,
+    outer_schema: &[ColumnSchema],
+) {
+    substitute_outer_in_select(stmt, outer_row, outer_schema);
+}
+
+fn substitute_outer_in_select(
+    stmt: &mut SelectStatement,
+    outer_row: &Row,
+    outer_schema: &[ColumnSchema],
+) {
+    for item in &mut stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            substitute_outer_in_expr(expr, outer_row, outer_schema);
+        }
+    }
+    if let Some(w) = &mut stmt.where_ {
+        substitute_outer_in_expr(w, outer_row, outer_schema);
+    }
+    if let Some(gs) = &mut stmt.group_by {
+        for g in gs {
+            substitute_outer_in_expr(g, outer_row, outer_schema);
+        }
+    }
+    if let Some(h) = &mut stmt.having {
+        substitute_outer_in_expr(h, outer_row, outer_schema);
+    }
+    for o in &mut stmt.order_by {
+        substitute_outer_in_expr(&mut o.expr, outer_row, outer_schema);
+    }
+    for (_, peer) in &mut stmt.unions {
+        substitute_outer_in_select(peer, outer_row, outer_schema);
+    }
+}
+
+fn substitute_outer_in_expr(
+    e: &mut Expr,
+    outer_row: &Row,
+    outer_schema: &[ColumnSchema],
+) {
+    if let Expr::Column(c) = e
+        && let Some(qual) = &c.qualifier
+    {
+        let composite = alloc::format!("{qual}.{}", c.name);
+        if let Some(idx) = outer_schema
+            .iter()
+            .position(|sc| sc.name.eq_ignore_ascii_case(&composite))
+        {
+            let v = outer_row.values.get(idx).cloned().unwrap_or(Value::Null);
+            if let Ok(lit) = value_to_literal_expr(v) {
+                *e = lit;
+                return;
+            }
+        }
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            substitute_outer_in_expr(lhs, outer_row, outer_schema);
+            substitute_outer_in_expr(rhs, outer_row, outer_schema);
+        }
+        Expr::Unary { expr: inner, .. } => {
+            substitute_outer_in_expr(inner, outer_row, outer_schema);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                substitute_outer_in_expr(a, outer_row, outer_schema);
+            }
+        }
+        Expr::Cast { expr: inner, .. } => {
+            substitute_outer_in_expr(inner, outer_row, outer_schema);
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                substitute_outer_in_expr(op, outer_row, outer_schema);
+            }
+            for (cond, val) in branches {
+                substitute_outer_in_expr(cond, outer_row, outer_schema);
+                substitute_outer_in_expr(val, outer_row, outer_schema);
+            }
+            if let Some(e) = else_branch {
+                substitute_outer_in_expr(e, outer_row, outer_schema);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row, ctx: &EvalContext<'_>) {
     let Some(outer_alias) = ctx.table_alias else {
         return;

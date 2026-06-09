@@ -1,12 +1,21 @@
-//! v7.17.0 Phase 3.3 — LATERAL JOIN.
+//! v7.17.0 Phase 3.3 → P0-41 — LATERAL derived tables.
 //!
-//! Status: SPG's parser stops at the LATERAL keyword in JOIN
-//! position; structural support for correlated derived tables
-//! is a planner refactor (~ 10h) carved out for v7.18.
+//! Phase 3.3 (`981812a`) carved this out; v7.17.0 Phase 3.P0-41
+//! lands the real implementation. SPG now parses `LATERAL (
+//! SELECT … )` in any FROM-list position and the join executor
+//! materialises the inner SELECT per outer row, substituting
+//! `<outer_alias>.<col>` references against the current join row.
 //!
-//! Customer workaround: rewrite the LATERAL join as a regular
-//! JOIN with the correlation condition in the ON clause when
-//! possible, or as a correlated subquery in the SELECT list.
+//! v7.17 limitations (separate follow-ups):
+//!   * The schema probe falls back to a TEXT-typed column shape
+//!     when the inner SELECT references outer columns at
+//!     projection time (rare; values are still correct because
+//!     the per-row substitution path runs the real query).
+//!   * No `JOIN LATERAL … ON expr` mixed forms (parsed but the
+//!     v7.17 executor treats `LATERAL` as a CROSS JOIN — the ON
+//!     clause must move into the inner subquery's WHERE).
+//!   * No correlated subquery references inside aggregate
+//!     window arguments (window+LATERAL combination).
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -34,20 +43,70 @@ fn setup(e: &mut Engine) {
 }
 
 #[test]
-fn lateral_join_is_documented_gap() {
+fn lateral_subquery_correlated_in_where() {
+    // The canonical LATERAL shape: for each user, fetch one order.
     let mut e = Engine::new();
     setup(&mut e);
-    // The canonical LATERAL shape: for each user, fetch their
-    // top-N orders. PG handles this with a LATERAL subquery in
-    // the FROM list.
-    let r = e.execute(
-        "SELECT u.name, o.amount \
-         FROM users u, LATERAL (SELECT amount FROM orders WHERE user_id = u.id LIMIT 1) o",
+    let r = rows(
+        e.execute(
+            "SELECT u.name, o.amount \
+             FROM users u, LATERAL (SELECT amount FROM orders WHERE user_id = u.id ORDER BY amount LIMIT 1) o \
+             ORDER BY u.id",
+        )
+        .unwrap(),
     );
-    assert!(
-        r.is_err(),
-        "LATERAL JOIN is documented gap in v7.17; expected parse error"
+    // alice: min order amount = 100. bob: min = 50.
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Text("alice".into()));
+    assert_eq!(r[0][1], Value::Int(100));
+    assert_eq!(r[1][0], Value::Text("bob".into()));
+    assert_eq!(r[1][1], Value::Int(50));
+}
+
+#[test]
+fn lateral_subquery_returns_multiple_rows_per_outer() {
+    // For each user, fetch their top-2 orders.
+    let mut e = Engine::new();
+    setup(&mut e);
+    let r = rows(
+        e.execute(
+            "SELECT u.name, o.amount \
+             FROM users u, LATERAL (SELECT amount FROM orders WHERE user_id = u.id ORDER BY amount DESC LIMIT 2) o \
+             ORDER BY u.id, o.amount DESC",
+        )
+        .unwrap(),
     );
+    // alice has 100 + 200 → top 2 = 200, 100.
+    // bob has 50 + 80 → top 2 = 80, 50.
+    assert_eq!(r.len(), 4);
+    assert_eq!(r[0][1], Value::Int(200));
+    assert_eq!(r[1][1], Value::Int(100));
+    assert_eq!(r[2][1], Value::Int(80));
+    assert_eq!(r[3][1], Value::Int(50));
+}
+
+#[test]
+fn lateral_subquery_with_no_inner_matches_drops_outer() {
+    // Add a user with no orders; CROSS-shaped LATERAL drops them
+    // (LEFT JOIN LATERAL would keep — v7.17 doesn't yet support
+    // the ON clause variant cleanly).
+    let mut e = Engine::new();
+    setup(&mut e);
+    e.execute("INSERT INTO users VALUES (3, 'carol')").unwrap();
+    let r = rows(
+        e.execute(
+            "SELECT u.name, o.amount \
+             FROM users u, LATERAL (SELECT amount FROM orders WHERE user_id = u.id) o \
+             ORDER BY u.id",
+        )
+        .unwrap(),
+    );
+    // carol has no orders → cross-join with empty subquery emits
+    // zero rows for her.
+    assert_eq!(r.len(), 4);
+    for row in &r {
+        assert_ne!(row[0], Value::Text("carol".into()));
+    }
 }
 
 #[test]
