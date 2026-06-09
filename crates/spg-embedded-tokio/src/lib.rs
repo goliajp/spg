@@ -352,6 +352,74 @@ impl AsyncReadHandle {
         .expect("spawn_blocking join")
     }
 
+    /// v7.18 — parse + plan a SQL string against this handle's
+    /// frozen snapshot. Mirror of [`AsyncDatabase::prepare`] for
+    /// the readonly fan-out path: clock rewrite + JOIN reorder +
+    /// position resolve happen against the snapshot's catalog +
+    /// statistics, no writer lock acquired. Multiple read handles
+    /// can prepare concurrently; the returned [`AsyncStatement`]
+    /// is `Clone + Send`.
+    ///
+    /// # Errors
+    /// Propagates [`EngineError`] from the parser
+    /// (`EngineError::Parse`).
+    pub async fn prepare(&self, sql: &str) -> Result<AsyncStatement, EngineError> {
+        let snapshot = self.snapshot.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            Database::prepare_on_snapshot(&snapshot, &sql).map(|stmt| AsyncStatement {
+                inner: Arc::new(stmt),
+            })
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.18 — execute a prepared statement against this handle's
+    /// frozen snapshot with bound params. Mirror of
+    /// [`AsyncDatabase::execute_prepared`] on the readonly path —
+    /// writes / DDL hit `EngineError::WriteRequired` so the caller
+    /// can route them to the writer mutex. No writer lock
+    /// acquired; multiple handles run truly concurrently.
+    ///
+    /// # Errors
+    /// Propagates engine errors (placeholder arity mismatch,
+    /// schema drift surfacing as catalog lookups, etc.).
+    pub async fn execute_prepared(
+        &self,
+        stmt: &AsyncStatement,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, EngineError> {
+        let snapshot = self.snapshot.clone();
+        let stmt_inner = Arc::clone(&stmt.inner);
+        tokio::task::spawn_blocking(move || {
+            Database::execute_prepared_on_snapshot(&snapshot, &stmt_inner, &params)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.18 — describe a prepared SQL string against this
+    /// handle's frozen snapshot. Returns `(parameter_oids,
+    /// output_columns)`. Drives the spg-sqlx adapter's readonly
+    /// `Executor::describe` path so `sqlx::query!()` compile-time
+    /// validation can resolve column types without touching the
+    /// writer engine.
+    ///
+    /// # Errors
+    /// Propagates [`EngineError`] from the parser
+    /// (`EngineError::Parse`).
+    pub async fn describe(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<u32>, Vec<spg_embedded::ColumnSchema>), EngineError> {
+        let snapshot = self.snapshot.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || Database::describe_on_snapshot(&snapshot, &sql))
+            .await
+            .expect("spawn_blocking join")
+    }
+
     /// Re-snapshot the underlying engine. Briefly takes the
     /// writer lock; subsequent `query()` calls see the new state.
     /// Idempotent on a quiet engine (clones the same trie roots).
