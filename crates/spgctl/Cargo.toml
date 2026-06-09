@@ -24,6 +24,10 @@ spg-storage = { workspace = true }
 # reach a live server.
 spg-engine  = { workspace = true }
 spg-crypto  = { workspace = true }
+# v7.18 PITR — `spg pitr-restore` reuses the in-process Database
+# + parse_wal_records to replay WAL records up to a wall-clock
+# / LSN target and write a fresh catalog snapshot.
+spg-embedded = { workspace = true }
 
 [lints]
 workspace = true

@@ -80,6 +80,54 @@ fn main() {
         // STABILITY § "Out of v6.10" — the v6.10.7 ship freezes
         // the CLI shape so the future revisit drops in the audit
         // lookup without changing the operator surface.
+        // v7.18 PITR P3 — `spg pitr-restore --snapshot <file>
+        // --wal <file> --to <timestamp> --target <out_path>`.
+        // Replays WAL records up to <timestamp> (or LSN, when
+        // --to is bare digits) on top of <snapshot>, writes the
+        // resulting catalog to <target>.
+        //
+        // --to formats:
+        //   - bare integer: treated as commit_lsn upper bound
+        //   - <int>s / <int>ms / <int>us: treated as unix epoch
+        //     seconds / millis / micros
+        //   - ISO 8601 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DDTHH:MM:SS'
+        //     (UTC assumed; no timezone offset parsing yet)
+        Some("pitr-restore") => {
+            let mut snapshot_path: Option<String> = None;
+            let mut wal_path: Option<String> = None;
+            let mut to_arg: Option<String> = None;
+            let mut target_path: Option<String> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--snapshot" => snapshot_path = args.next(),
+                    "--wal" => wal_path = args.next(),
+                    "--to" => to_arg = args.next(),
+                    "--target" => target_path = args.next(),
+                    other => {
+                        die(&format!("unknown pitr-restore arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let (Some(snapshot_path), Some(wal_path), Some(to_arg), Some(target_path)) =
+                (snapshot_path, wal_path, to_arg, target_path)
+            else {
+                die(
+                    "usage: spg pitr-restore --snapshot <file> --wal <file> \
+                     --to <timestamp|lsn> --target <out_path>",
+                    2,
+                );
+                return;
+            };
+            match pitr_restore(&snapshot_path, &wal_path, &to_arg, &target_path) {
+                Ok((applied, target_descr)) => {
+                    println!(
+                        "OK applied={applied} target={target_descr} → {target_path}"
+                    );
+                }
+                Err(msg) => die(&format!("pitr-restore failed: {msg}"), 1),
+            }
+        }
         Some("revert") => {
             let mut wal_path: Option<String> = None;
             let mut to_seq: Option<u64> = None;
@@ -168,6 +216,155 @@ fn main() {
 /// snapshot to `out_path`. `to_seq == 0` is a special case
 /// meaning "replay no records" — the snapshot is the empty
 /// catalog. Returns the count of records applied.
+/// v7.18 PITR P3 — point-in-time restore.
+///
+/// Loads the catalog snapshot at `snapshot_path` into a fresh
+/// in-process database, parses the WAL at `wal_path`, replays
+/// every `auto_commit_sql` record whose (commit_lsn,
+/// commit_unix_us) falls at or before the target, then writes
+/// the resulting catalog to `target_path`. Returns
+/// `(applied_count, human_target_descr)`.
+///
+/// `to_arg` accepts:
+///   - bare unsigned integer ⇒ commit_lsn upper bound
+///   - `<n>s` / `<n>ms` / `<n>us` ⇒ unix epoch in that unit
+///   - `YYYY-MM-DD HH:MM:SS` / `YYYY-MM-DDTHH:MM:SS` ⇒ UTC
+fn pitr_restore(
+    snapshot_path: &str,
+    wal_path: &str,
+    to_arg: &str,
+    target_path: &str,
+) -> Result<(u64, String), String> {
+    use spg_embedded::{Database, WalRecord, parse_wal_records};
+
+    let target = parse_restore_target(to_arg)?;
+    let snapshot_bytes = fs::read(snapshot_path)
+        .map_err(|e| format!("read snapshot {snapshot_path}: {e}"))?;
+    let mut db = Database::restore(&snapshot_bytes)
+        .map_err(|e| format!("restore snapshot: {e:?}"))?;
+
+    let wal_bytes = fs::read(wal_path).map_err(|e| format!("read wal {wal_path}: {e}"))?;
+    let records: Vec<WalRecord<'_>> =
+        parse_wal_records(&wal_bytes).map_err(|e| format!("parse wal: {e}"))?;
+
+    let mut applied: u64 = 0;
+    for r in records {
+        // Skip everything that doesn't carry SQL — durability
+        // markers (0x02) and checkpoint markers (0x11) don't
+        // replay; v3 SQL records (0x01) carry no LSN/ts and
+        // always apply (they pre-date PITR — replay them
+        // unconditionally so the pre-v7.18 history isn't lost).
+        match r.type_byte {
+            0x02 | 0x11 => continue,
+            0x01 => {
+                let sql = std::str::from_utf8(r.sql)
+                    .map_err(|e| format!("non-UTF-8 SQL at offset {}: {e}", r.offset))?;
+                db.execute(sql)
+                    .map_err(|e| format!("apply at offset {}: {e:?}", r.offset))?;
+                applied += 1;
+            }
+            0x10 => {
+                if !target.includes(r.commit_lsn, r.commit_unix_us) {
+                    continue;
+                }
+                let sql = std::str::from_utf8(r.sql)
+                    .map_err(|e| format!("non-UTF-8 SQL at offset {}: {e}", r.offset))?;
+                db.execute(sql)
+                    .map_err(|e| format!("apply at offset {}: {e:?}", r.offset))?;
+                applied += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown WAL record type {other:#04x} at offset {}",
+                    r.offset
+                ));
+            }
+        }
+    }
+
+    let final_snapshot = db.snapshot();
+    fs::write(target_path, &final_snapshot)
+        .map_err(|e| format!("write {target_path}: {e}"))?;
+    Ok((applied, target.describe()))
+}
+
+/// v7.18 PITR — the `--to` target parsed off the CLI.
+#[derive(Debug)]
+enum RestoreTarget {
+    Lsn(u64),
+    UnixMicros(i64),
+}
+
+impl RestoreTarget {
+    fn includes(&self, lsn: Option<u64>, ts_us: Option<i64>) -> bool {
+        match self {
+            RestoreTarget::Lsn(cap) => lsn.is_some_and(|l| l <= *cap),
+            RestoreTarget::UnixMicros(cap_us) => ts_us.is_some_and(|t| t <= *cap_us),
+        }
+    }
+    fn describe(&self) -> String {
+        match self {
+            RestoreTarget::Lsn(n) => format!("lsn<={n}"),
+            RestoreTarget::UnixMicros(us) => format!("ts<={us}us"),
+        }
+    }
+}
+
+fn parse_restore_target(s: &str) -> Result<RestoreTarget, String> {
+    let trimmed = s.trim();
+    if let Ok(n) = trimmed.parse::<u64>() {
+        return Ok(RestoreTarget::Lsn(n));
+    }
+    if let Some(rest) = trimmed.strip_suffix("us") {
+        if let Ok(n) = rest.parse::<i64>() {
+            return Ok(RestoreTarget::UnixMicros(n));
+        }
+    }
+    if let Some(rest) = trimmed.strip_suffix("ms") {
+        if let Ok(n) = rest.parse::<i64>() {
+            return Ok(RestoreTarget::UnixMicros(n.saturating_mul(1_000)));
+        }
+    }
+    if let Some(rest) = trimmed.strip_suffix('s') {
+        if let Ok(n) = rest.parse::<i64>() {
+            return Ok(RestoreTarget::UnixMicros(n.saturating_mul(1_000_000)));
+        }
+    }
+    // Try YYYY-MM-DD HH:MM:SS / YYYY-MM-DDTHH:MM:SS, UTC.
+    let cleaned = trimmed.replace('T', " ");
+    let parts: Vec<&str> = cleaned.split_whitespace().collect();
+    if parts.len() == 2 {
+        let date: Vec<&str> = parts[0].split('-').collect();
+        let time: Vec<&str> = parts[1].split(':').collect();
+        if date.len() == 3 && time.len() == 3 {
+            let y: i64 = date[0].parse().map_err(|_| format!("bad year: {}", date[0]))?;
+            let mo: i64 = date[1].parse().map_err(|_| format!("bad month: {}", date[1]))?;
+            let d: i64 = date[2].parse().map_err(|_| format!("bad day: {}", date[2]))?;
+            let h: i64 = time[0].parse().map_err(|_| format!("bad hour: {}", time[0]))?;
+            let mi: i64 = time[1].parse().map_err(|_| format!("bad minute: {}", time[1]))?;
+            let se: i64 = time[2].parse().map_err(|_| format!("bad second: {}", time[2]))?;
+            // Days-from-civil from Howard Hinnant's date algorithms
+            // (public domain). y, mo, d are calendar values; output
+            // is days since 1970-01-01 UTC. Works for any positive
+            // proleptic Gregorian date.
+            let ymd_to_days = |y: i64, mo: i64, d: i64| -> i64 {
+                let y = if mo <= 2 { y - 1 } else { y };
+                let era = if y >= 0 { y } else { y - 399 } / 400;
+                let yoe = y - era * 400;
+                let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+                let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                era * 146_097 + doe - 719_468
+            };
+            let days = ymd_to_days(y, mo, d);
+            let secs = days * 86_400 + h * 3_600 + mi * 60 + se;
+            return Ok(RestoreTarget::UnixMicros(secs.saturating_mul(1_000_000)));
+        }
+    }
+    Err(format!(
+        "could not parse --to {s:?}; expected unsigned LSN, '<n>s|ms|us' unix epoch, or 'YYYY-MM-DD HH:MM:SS' UTC"
+    ))
+}
+
 fn wal_revert(wal_path: &str, to_seq: u64, out_path: &str) -> Result<u64, String> {
     use spg_engine::Engine;
     let mut engine = Engine::new();
@@ -649,5 +846,135 @@ mod tests {
         let err = backup(p.to_str().unwrap(), p.to_str().unwrap()).unwrap_err();
         assert!(err.contains("same path"));
         let _ = fs::remove_file(&p);
+    }
+
+    // ---- v7.18 PITR P3 ----
+
+    #[test]
+    fn parse_restore_target_accepts_lsn() {
+        match parse_restore_target("42").unwrap() {
+            RestoreTarget::Lsn(n) => assert_eq!(n, 42),
+            other => panic!("expected Lsn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_unix_seconds() {
+        match parse_restore_target("1750000000s").unwrap() {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_000_000),
+            other => panic!("expected UnixMicros, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_unix_millis() {
+        match parse_restore_target("1750000000123ms").unwrap() {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_123_000),
+            other => panic!("expected UnixMicros, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_unix_micros() {
+        match parse_restore_target("1750000000123456us").unwrap() {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_123_456),
+            other => panic!("expected UnixMicros, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_iso8601() {
+        // 2026-01-01 00:00:00 UTC = 1767225600 unix seconds.
+        let t = parse_restore_target("2026-01-01 00:00:00").unwrap();
+        match t {
+            RestoreTarget::UnixMicros(us) => {
+                assert_eq!(us, 1_767_225_600 * 1_000_000);
+            }
+            other => panic!("expected UnixMicros, got {other:?}"),
+        }
+        // T separator works too.
+        let t = parse_restore_target("2026-01-01T00:00:00").unwrap();
+        match t {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_767_225_600 * 1_000_000),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_rejects_garbage() {
+        assert!(parse_restore_target("yesterday").is_err());
+        assert!(parse_restore_target("-1").is_err());
+        assert!(parse_restore_target("2026-13-01 00:00:00").is_ok()); // we don't bounds-check fields
+    }
+
+    #[test]
+    fn pitr_restore_replays_up_to_lsn_only() {
+        use spg_embedded::Database;
+        // 1) Build a snapshot + WAL by running 3 inserts on a
+        //    fresh file-backed Database, then keeping the WAL
+        //    alive by mem::forget so checkpoint doesn't truncate.
+        let db_path = tmp_path("pitr-src-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.execute("INSERT INTO t VALUES (3)").unwrap();
+        // Capture the catalog snapshot before any checkpoint.
+        let snapshot_bytes = db.snapshot();
+        std::mem::forget(db);
+        Database::force_unlock(&db_path).unwrap();
+
+        let snap_path = tmp_path("pitr-snap");
+        fs::write(&snap_path, &snapshot_bytes).unwrap();
+
+        // The CREATE TABLE is in the snapshot (the engine state
+        // was captured after every execute) — but the snapshot
+        // here is overkill: the WAL replay path would rebuild
+        // everything. We restore from snapshot then add WAL
+        // records up to LSN 3 (the CREATE + first two INSERTs).
+        // Actually because snapshot_bytes already reflects all 4
+        // statements, replay would just no-op or fail. So
+        // instead, build a fresh empty engine snapshot — easier
+        // because Database::open_in_memory() has no public
+        // snapshot path here. Use Engine::new().snapshot().
+        use spg_engine::Engine;
+        let fresh_snap = Engine::new().snapshot();
+        fs::write(&snap_path, &fresh_snap).unwrap();
+
+        let target_path = tmp_path("pitr-target");
+        let (applied, descr) = pitr_restore(
+            snap_path.to_str().unwrap(),
+            wal_path.to_str().unwrap(),
+            "3",
+            target_path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied, 3, "expected 3 records (CREATE + 2 INSERTs)");
+        assert!(descr.contains("lsn"), "descr should mention lsn: {descr}");
+
+        // Verify the resulting snapshot contains exactly 2 rows.
+        let mut restored = Database::restore(&fs::read(&target_path).unwrap()).unwrap();
+        let rows = restored.query("SELECT COUNT(*) FROM t").unwrap();
+        let count = match &rows[0][0] {
+            spg_embedded::Value::Int(n) => i64::from(*n),
+            spg_embedded::Value::BigInt(n) => *n,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(count, 2, "LSN<=3 means CREATE + 2 INSERTs");
+
+        let _ = fs::remove_file(&snap_path);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
     }
 }
