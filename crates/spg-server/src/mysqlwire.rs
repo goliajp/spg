@@ -283,6 +283,30 @@ fn command_loop(
                     .to_string();
                 handle_com_query(stream, state, &sql, reply_seqno)?;
             }
+            CMD_PING => {
+                // Single OK packet, no body — what mysqladmin
+                // ping expects.
+                write_packet(stream, reply_seqno, &encode_ok_packet())?;
+            }
+            CMD_INIT_DB => {
+                // SPG runs in single-database mode. mysql clients
+                // issue COM_INIT_DB after `USE <db>`; we accept
+                // any non-empty name with OK so the client can
+                // proceed. Empty name → 1049 unknown database.
+                let db_name = std::str::from_utf8(&payload[1..]).unwrap_or("").trim();
+                if db_name.is_empty() {
+                    write_packet(
+                        stream,
+                        reply_seqno,
+                        &encode_err_packet(1049, "42000", "Unknown database (empty name)"),
+                    )?;
+                } else {
+                    write_packet(stream, reply_seqno, &encode_ok_packet())?;
+                }
+            }
+            CMD_FIELD_LIST => {
+                handle_com_field_list(stream, state, &payload[1..], reply_seqno)?;
+            }
             _ => {
                 // Unknown command. P0-74 / P0-75 add binary-protocol
                 // commands (STMT_PREPARE / EXECUTE / RESET / CLOSE,
@@ -307,7 +331,16 @@ fn command_loop(
 // ---- COM_QUERY handler --------------------------------------
 
 pub(crate) const CMD_QUIT: u8 = 0x01;
+/// v7.17.0 Phase 3.P0-75 — `USE <db>` from the mysql CLI. SPG
+/// is single-database; we accept the command for compatibility
+/// but the payload (target database name) doesn't change state.
+pub(crate) const CMD_INIT_DB: u8 = 0x02;
 pub(crate) const CMD_QUERY: u8 = 0x03;
+/// v7.17.0 Phase 3.P0-75 — `mysqldump --opt` issues this for
+/// every table to learn the column shape ahead of `SELECT * …`.
+pub(crate) const CMD_FIELD_LIST: u8 = 0x04;
+/// v7.17.0 Phase 3.P0-75 — `mysqladmin ping` / connector keepalive.
+pub(crate) const CMD_PING: u8 = 0x0e;
 
 fn handle_com_query(
     stream: &mut TcpStream,
@@ -359,6 +392,61 @@ fn handle_com_query(
             )?;
         }
     }
+    Ok(())
+}
+
+// ---- COM_FIELD_LIST -----------------------------------------
+
+/// v7.17.0 Phase 3.P0-75 — `mysqldump --opt` uses this to
+/// probe a table's column shape ahead of `SELECT * FROM <table>`.
+/// Payload shape (post-cmd byte): `<table_name>\0[<wildcard>]`.
+/// We ignore the wildcard (every column gets a column_def_41
+/// regardless) and return either:
+///   * N column_def_41 packets + EOF / OK on success
+///   * ERR(1146) when the table is missing.
+fn handle_com_field_list(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    payload: &[u8],
+    start_seqno: u8,
+) -> std::io::Result<()> {
+    let nul = payload.iter().position(|b| *b == 0).unwrap_or(payload.len());
+    let table = std::str::from_utf8(&payload[..nul]).unwrap_or("");
+    let cols_opt = {
+        let Ok(engine) = state.engine.read() else {
+            return write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(1815, "HY000", "engine lock poisoned"),
+            );
+        };
+        engine
+            .catalog()
+            .get(table)
+            .map(|t| t.schema().columns.clone())
+    };
+    let cols = match cols_opt {
+        Some(c) => c,
+        None => {
+            return write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(
+                    1146,
+                    "42S02",
+                    &format!("Table '{table}' doesn't exist"),
+                ),
+            );
+        }
+    };
+    let mut seq = start_seqno;
+    for c in &cols {
+        let buf = encode_column_def_41(c);
+        write_packet(stream, seq, &buf)?;
+        seq = seq.wrapping_add(1);
+    }
+    // CLIENT_DEPRECATE_EOF — trailing OK marker.
+    write_packet(stream, seq, &encode_ok_packet())?;
     Ok(())
 }
 
