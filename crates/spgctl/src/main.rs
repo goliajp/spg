@@ -80,6 +80,163 @@ fn main() {
         // STABILITY § "Out of v6.10" — the v6.10.7 ship freezes
         // the CLI shape so the future revisit drops in the audit
         // lookup without changing the operator surface.
+        // v7.18 PITR P6 — `spg prune-pitr --dir <backup_dir>
+        // --retention-hours <N>` walks <dir>/wal/, removes any
+        // chunk whose filename prefix (unix_us) is older than
+        // `now - N hours`, plus the matching <chunk>.checksum.
+        // Reports how many chunks were kept / removed.
+        Some("prune-pitr") => {
+            let mut dir: Option<String> = None;
+            let mut retention_hours: Option<u64> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--dir" => dir = args.next(),
+                    "--retention-hours" => {
+                        retention_hours = args.next().and_then(|s| s.parse::<u64>().ok());
+                    }
+                    other => {
+                        die(&format!("unknown prune-pitr arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let (Some(dir), Some(retention_hours)) = (dir, retention_hours) else {
+                die(
+                    "usage: spg prune-pitr --dir <backup_dir> --retention-hours <N>",
+                    2,
+                );
+                return;
+            };
+            match prune_pitr(&dir, retention_hours) {
+                Ok(report) => println!("{report}"),
+                Err(e) => die(&format!("prune-pitr failed: {e}"), 1),
+            }
+        }
+        // v7.18 PITR P5 — `spg verify-pitr --dir <backup_dir>
+        // [--write-missing-checksums]` walks the backup layout
+        // backup-pitr produces:
+        //   * snapshot.spg must deserialize.
+        //   * each wal/*.wal must parse to a monotonic LSN sequence
+        //     with no hole inside the chunk.
+        //   * each wal/<chunk>.checksum is BLAKE3 of the chunk
+        //     bytes; missing checksums are computed and (with
+        //     --write-missing-checksums) persisted on the spot,
+        //     mismatches are reported and fail the verify.
+        //   * replay dry-run: feed snapshot + chunks (sorted by
+        //     filename = (unix_us, max_lsn)) into a fresh in-memory
+        //     database and confirm every SQL record applies.
+        // exit 0 = clean, 1 = corrupt, 2 = harness error.
+        Some("verify-pitr") => {
+            let mut dir: Option<String> = None;
+            let mut write_missing = false;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--dir" => dir = args.next(),
+                    "--write-missing-checksums" => write_missing = true,
+                    other => {
+                        die(&format!("unknown verify-pitr arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let Some(dir) = dir else {
+                die("usage: spg verify-pitr --dir <backup_dir>", 2);
+                return;
+            };
+            match verify_pitr(&dir, write_missing) {
+                Ok(report) => {
+                    println!("{}", report.render());
+                    if !report.is_clean() {
+                        process::exit(1);
+                    }
+                }
+                Err(e) => die(&format!("verify-pitr: {e}"), 2),
+            }
+        }
+        // v7.18 PITR P4 — `spg backup-pitr --src <db_path>
+        // --dst <backup_dir>` copies the catalog snapshot + the
+        // current WAL into a layout pitr-restore can consume:
+        //   <dst>/snapshot.spg
+        //   <dst>/wal/<unix_us>_<max_lsn>.wal
+        // The dst directory is created if absent. Live-daemon
+        // safety is the caller's responsibility for v7.18 — P6
+        // wires chunk rotation + atomic snapshot capture into
+        // the engine so backups stay self-consistent under
+        // concurrent writes; P4 just ships the file-copy layer
+        // the rest of the PITR sub-epic builds on.
+        Some("backup-pitr") => {
+            let mut src: Option<String> = None;
+            let mut dst: Option<String> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--src" => src = args.next(),
+                    "--dst" => dst = args.next(),
+                    other => {
+                        die(&format!("unknown backup-pitr arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let (Some(src), Some(dst)) = (src, dst) else {
+                die(
+                    "usage: spg backup-pitr --src <db_path> --dst <backup_dir>",
+                    2,
+                );
+                return;
+            };
+            match backup_pitr(&src, &dst) {
+                Ok(report) => println!("{report}"),
+                Err(e) => die(&format!("backup-pitr failed: {e}"), 1),
+            }
+        }
+        // v7.18 PITR P3 — `spg pitr-restore --snapshot <file>
+        // --wal <file> --to <timestamp> --target <out_path>`.
+        // Replays WAL records up to <timestamp> (or LSN, when
+        // --to is bare digits) on top of <snapshot>, writes the
+        // resulting catalog to <target>.
+        //
+        // --to formats:
+        //   - bare integer: treated as commit_lsn upper bound
+        //   - <int>s / <int>ms / <int>us: treated as unix epoch
+        //     seconds / millis / micros
+        //   - ISO 8601 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DDTHH:MM:SS'
+        //     (UTC assumed; no timezone offset parsing yet)
+        Some("pitr-restore") => {
+            let mut snapshot_path: Option<String> = None;
+            let mut wal_path: Option<String> = None;
+            let mut to_arg: Option<String> = None;
+            let mut target_path: Option<String> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--snapshot" => snapshot_path = args.next(),
+                    "--wal" => wal_path = args.next(),
+                    "--to" => to_arg = args.next(),
+                    "--target" => target_path = args.next(),
+                    other => {
+                        die(&format!("unknown pitr-restore arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let (Some(snapshot_path), Some(wal_path), Some(to_arg), Some(target_path)) =
+                (snapshot_path, wal_path, to_arg, target_path)
+            else {
+                die(
+                    "usage: spg pitr-restore --snapshot <file> --wal <file> \
+                     --to <timestamp|lsn> --target <out_path>",
+                    2,
+                );
+                return;
+            };
+            match pitr_restore(&snapshot_path, &wal_path, &to_arg, &target_path) {
+                Ok((applied, target_descr)) => {
+                    println!(
+                        "OK applied={applied} target={target_descr} → {target_path}"
+                    );
+                }
+                Err(msg) => die(&format!("pitr-restore failed: {msg}"), 1),
+            }
+        }
         Some("revert") => {
             let mut wal_path: Option<String> = None;
             let mut to_seq: Option<u64> = None;
@@ -168,6 +325,632 @@ fn main() {
 /// snapshot to `out_path`. `to_seq == 0` is a special case
 /// meaning "replay no records" — the snapshot is the empty
 /// catalog. Returns the count of records applied.
+/// v7.18 PITR P5 — backup verification.
+///
+/// Walks the backup directory `backup-pitr` produced and asserts
+/// the snapshot + every WAL chunk are intact + can replay. See
+/// the CLI doc-comment in `main` for the layout.
+#[derive(Debug)]
+struct VerifyReport {
+    snapshot_ok: bool,
+    snapshot_msg: String,
+    chunks: Vec<ChunkReport>,
+    replay_ok: bool,
+    replay_msg: String,
+}
+
+#[derive(Debug)]
+struct ChunkReport {
+    path: std::path::PathBuf,
+    parse_ok: bool,
+    parse_msg: String,
+    checksum_state: ChecksumState,
+}
+
+#[derive(Debug)]
+enum ChecksumState {
+    Match { hex: String },
+    WrittenFresh { hex: String },
+    Mismatch { expected: String, actual: String },
+    Missing { actual: String },
+}
+
+impl VerifyReport {
+    fn is_clean(&self) -> bool {
+        if !self.snapshot_ok || !self.replay_ok {
+            return false;
+        }
+        for c in &self.chunks {
+            if !c.parse_ok {
+                return false;
+            }
+            if matches!(
+                c.checksum_state,
+                ChecksumState::Mismatch { .. } | ChecksumState::Missing { .. }
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+    fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# verify-pitr report — {}\n\n",
+            if self.is_clean() { "PASS" } else { "FAIL" }
+        ));
+        out.push_str(&format!(
+            "snapshot.spg: {} — {}\n",
+            if self.snapshot_ok { "OK" } else { "FAIL" },
+            self.snapshot_msg
+        ));
+        out.push_str(&format!(
+            "replay dry-run: {} — {}\n",
+            if self.replay_ok { "OK" } else { "FAIL" },
+            self.replay_msg
+        ));
+        out.push_str(&format!("\nchunks: {}\n", self.chunks.len()));
+        for c in &self.chunks {
+            let parse_status = if c.parse_ok { "OK" } else { "FAIL" };
+            let csum_status = match &c.checksum_state {
+                ChecksumState::Match { hex } => format!("checksum-match ({hex})"),
+                ChecksumState::WrittenFresh { hex } => format!("checksum-fresh ({hex})"),
+                ChecksumState::Mismatch { expected, actual } => {
+                    format!("checksum-MISMATCH expected={expected} actual={actual}")
+                }
+                ChecksumState::Missing { actual } => {
+                    format!("checksum-MISSING actual={actual} (rerun with --write-missing-checksums)")
+                }
+            };
+            out.push_str(&format!(
+                "  {} — parse: {}; {}\n  parse-msg: {}\n",
+                c.path.display(),
+                parse_status,
+                csum_status,
+                c.parse_msg
+            ));
+        }
+        out
+    }
+}
+
+fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport, String> {
+    use spg_embedded::{Database, parse_wal_records};
+
+    let dir_path = std::path::PathBuf::from(dir);
+    let snap_path = dir_path.join("snapshot.spg");
+    let wal_dir = dir_path.join("wal");
+
+    // ---- snapshot ----
+    let (snapshot_ok, snapshot_msg, snapshot_bytes) = match fs::read(&snap_path) {
+        Ok(bytes) => match Database::restore(&bytes) {
+            Ok(_) => (
+                true,
+                format!("{} bytes deserialize cleanly", bytes.len()),
+                bytes,
+            ),
+            Err(e) => (
+                false,
+                format!("deserialize failed: {e:?}"),
+                Vec::new(),
+            ),
+        },
+        Err(e) => (false, format!("read failed: {e}"), Vec::new()),
+    };
+
+    // ---- chunks ----
+    let mut chunks_meta: Vec<std::path::PathBuf> = Vec::new();
+    if wal_dir.exists() {
+        for entry in fs::read_dir(&wal_dir).map_err(|e| format!("read wal dir: {e}"))? {
+            let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("wal") {
+                chunks_meta.push(p);
+            }
+        }
+    }
+    chunks_meta.sort();
+
+    let mut chunks: Vec<ChunkReport> = Vec::new();
+    let mut replay_chunks: Vec<Vec<u8>> = Vec::new();
+    for path in &chunks_meta {
+        let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let actual_hash = spg_crypto::hex(&spg_crypto::hash(&bytes));
+        let cs_path = {
+            let mut p = path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".checksum");
+            p.set_file_name(name);
+            p
+        };
+        let csum_state = match fs::read_to_string(&cs_path) {
+            Ok(expected) => {
+                let expected = expected.trim().to_string();
+                if expected.eq_ignore_ascii_case(&actual_hash) {
+                    ChecksumState::Match { hex: actual_hash.clone() }
+                } else {
+                    ChecksumState::Mismatch {
+                        expected,
+                        actual: actual_hash.clone(),
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if write_missing_checksums {
+                    fs::write(&cs_path, format!("{actual_hash}\n"))
+                        .map_err(|e| format!("write checksum {}: {e}", cs_path.display()))?;
+                    ChecksumState::WrittenFresh { hex: actual_hash.clone() }
+                } else {
+                    ChecksumState::Missing { actual: actual_hash.clone() }
+                }
+            }
+            Err(e) => return Err(format!("read checksum {}: {e}", cs_path.display())),
+        };
+        let (parse_ok, parse_msg) = match parse_wal_records(&bytes) {
+            Ok(recs) => {
+                // Assert LSN monotonic inside the chunk.
+                let mut last: Option<u64> = None;
+                let mut hole_msg: Option<String> = None;
+                for r in &recs {
+                    if let Some(l) = r.commit_lsn {
+                        if let Some(prev) = last {
+                            if l <= prev {
+                                hole_msg = Some(format!(
+                                    "LSN {l} at offset {} not strictly greater than previous {prev}",
+                                    r.offset
+                                ));
+                                break;
+                            }
+                        }
+                        last = Some(l);
+                    }
+                }
+                if let Some(m) = hole_msg {
+                    (false, m)
+                } else {
+                    (true, format!("{} records parsed", recs.len()))
+                }
+            }
+            Err(e) => (false, e),
+        };
+        if parse_ok {
+            replay_chunks.push(bytes);
+        }
+        chunks.push(ChunkReport {
+            path: path.clone(),
+            parse_ok,
+            parse_msg,
+            checksum_state: csum_state,
+        });
+    }
+
+    // ---- replay dry-run ----
+    let (replay_ok, replay_msg) = if snapshot_ok {
+        match Database::restore(&snapshot_bytes) {
+            Ok(mut db) => {
+                let mut applied = 0u64;
+                let mut last_err: Option<String> = None;
+                'outer: for chunk in &replay_chunks {
+                    match parse_wal_records(chunk) {
+                        Ok(recs) => {
+                            for r in recs {
+                                if r.type_byte == 0x01 || r.type_byte == 0x10 {
+                                    let sql = match std::str::from_utf8(r.sql) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            last_err = Some(format!(
+                                                "non-UTF-8 SQL at offset {}: {e}",
+                                                r.offset
+                                            ));
+                                            break 'outer;
+                                        }
+                                    };
+                                    if let Err(e) = db.execute(sql) {
+                                        last_err = Some(format!(
+                                            "apply rejected at offset {}: {e:?}",
+                                            r.offset
+                                        ));
+                                        break 'outer;
+                                    }
+                                    applied += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last_err = Some(format!("parse during replay: {e}"));
+                            break;
+                        }
+                    }
+                }
+                match last_err {
+                    Some(msg) => (false, msg),
+                    None => (true, format!("{applied} records replayed cleanly")),
+                }
+            }
+            Err(e) => (false, format!("snapshot restore for replay failed: {e:?}")),
+        }
+    } else {
+        (false, "skipped — snapshot did not deserialize".into())
+    };
+
+    Ok(VerifyReport {
+        snapshot_ok,
+        snapshot_msg,
+        chunks,
+        replay_ok,
+        replay_msg,
+    })
+}
+
+/// v7.18 PITR P4 — copy a SPG database's catalog snapshot + WAL
+/// into a backup directory layout `pitr-restore` can consume.
+///
+/// Output layout:
+///
+///   <dst>/snapshot.spg                 — bit-for-bit copy of <src>
+///   <dst>/wal/<unix_us>_<max_lsn>.wal  — bit-for-bit copy of <src>.wal
+///
+/// The directory and the `wal/` subdir are created if absent.
+/// Returns a human-readable summary line for stdout.
+///
+/// Live-daemon coordination is not enforced here — callers either
+/// pause the daemon, accept the WAL chunk being a snapshot of a
+/// concurrently-growing file (the chunk will deserialize cleanly
+/// to whichever record boundary the read happens to catch),
+/// or wait for the P6 atomic-snapshot capture path.
+fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
+    use spg_embedded::{WalRecord, parse_wal_records};
+    let src_path = std::path::PathBuf::from(src);
+    let dst_dir = std::path::PathBuf::from(dst);
+    fs::create_dir_all(&dst_dir).map_err(|e| format!("create dst dir {dst}: {e}"))?;
+    let wal_dir = dst_dir.join("wal");
+    fs::create_dir_all(&wal_dir).map_err(|e| format!("create wal dir: {e}"))?;
+
+    // 1) Snapshot — required.
+    let snap_bytes = fs::read(&src_path).map_err(|e| format!("read snapshot {src}: {e}"))?;
+    let snap_target = dst_dir.join("snapshot.spg");
+    fs::write(&snap_target, &snap_bytes)
+        .map_err(|e| format!("write snapshot {}: {e}", snap_target.display()))?;
+
+    // 2) WAL — may be empty / absent (fresh database). Allow
+    //    missing files but error on read failures.
+    let src_wal = {
+        let mut p = src_path.clone();
+        let mut name = p
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(".wal");
+        p.set_file_name(name);
+        p
+    };
+    let (wal_bytes, wal_present) = match fs::read(&src_wal) {
+        Ok(b) => (b, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+        Err(e) => return Err(format!("read wal {}: {e}", src_wal.display())),
+    };
+
+    let mut max_lsn: u64 = 0;
+    if !wal_bytes.is_empty() {
+        let recs: Vec<WalRecord<'_>> = parse_wal_records(&wal_bytes)
+            .map_err(|e| format!("parse wal for naming: {e}"))?;
+        for r in &recs {
+            if let Some(l) = r.commit_lsn {
+                if l > max_lsn {
+                    max_lsn = l;
+                }
+            }
+        }
+    }
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros());
+    let chunk_name = format!("{now_us}_{max_lsn}.wal");
+    let chunk_path = wal_dir.join(&chunk_name);
+    if !wal_bytes.is_empty() {
+        fs::write(&chunk_path, &wal_bytes)
+            .map_err(|e| format!("write chunk {}: {e}", chunk_path.display()))?;
+    }
+
+    // v7.18 PITR P6 — if SPG_PITR_ARCHIVE_CMD is set, fork it
+    // with the chunk path as $1 so external archival (rclone /
+    // aws s3 cp / restic backup / whatever the operator wires)
+    // happens synchronously inside backup-pitr. Nonzero exit
+    // means archival failed and we report that on the summary
+    // line — same loud failure mode PG's archive_command has.
+    let archive_status = if !wal_bytes.is_empty() {
+        archive_chunk(&chunk_path)?
+    } else {
+        ArchiveStatus::NotInvoked
+    };
+
+    Ok(format!(
+        "OK snapshot={} wal_present={} chunk={} max_lsn={} archive={}",
+        snap_target.display(),
+        wal_present,
+        if wal_bytes.is_empty() {
+            "(empty)".to_string()
+        } else {
+            chunk_path.display().to_string()
+        },
+        max_lsn,
+        archive_status.describe(),
+    ))
+}
+
+/// v7.18 PITR P6 — fork the SPG_PITR_ARCHIVE_CMD external
+/// archival command with `chunk_path` as `$1`. Returns:
+///
+///   ArchiveStatus::NotInvoked   — env unset (operator opted out).
+///   ArchiveStatus::Ok           — command exited 0.
+///   ArchiveStatus::Failed { exit_code, stderr_snippet }
+///                                — command produced a nonzero exit.
+///                                  backup-pitr surfaces this as a
+///                                  loud line on stdout but does
+///                                  NOT delete the chunk — the
+///                                  WAL data stays local even when
+///                                  archival is down, mirroring PG.
+fn archive_chunk(chunk_path: &std::path::Path) -> Result<ArchiveStatus, String> {
+    let Ok(cmd) = std::env::var("SPG_PITR_ARCHIVE_CMD") else {
+        return Ok(ArchiveStatus::NotInvoked);
+    };
+    if cmd.is_empty() {
+        return Ok(ArchiveStatus::NotInvoked);
+    }
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .arg("--") // shell positional arg shim — $0 swallowed
+        .arg(chunk_path)
+        .output()
+        .map_err(|e| format!("spawn archive cmd {cmd:?}: {e}"))?;
+    if output.status.success() {
+        Ok(ArchiveStatus::Ok)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = stderr.lines().next().unwrap_or("").chars().take(200).collect();
+        Ok(ArchiveStatus::Failed {
+            exit_code: output.status.code().unwrap_or(-1),
+            stderr_snippet: snippet,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum ArchiveStatus {
+    NotInvoked,
+    Ok,
+    Failed {
+        exit_code: i32,
+        stderr_snippet: String,
+    },
+}
+
+impl ArchiveStatus {
+    fn describe(&self) -> String {
+        match self {
+            ArchiveStatus::NotInvoked => "skipped (SPG_PITR_ARCHIVE_CMD unset)".into(),
+            ArchiveStatus::Ok => "ok".into(),
+            ArchiveStatus::Failed {
+                exit_code,
+                stderr_snippet,
+            } => format!("FAILED exit={exit_code} stderr={stderr_snippet:?}"),
+        }
+    }
+}
+
+/// v7.18 PITR P6 — delete WAL chunks older than the retention
+/// window. Walks `<dir>/wal/`, parses the unix_us prefix off each
+/// `<unix_us>_<max_lsn>.wal`, removes the chunk + its
+/// `<chunk>.checksum` sibling when `prefix_us / 1_000_000 +
+/// retention_hours * 3600 < now`. Returns a summary line.
+fn prune_pitr(dir: &str, retention_hours: u64) -> Result<String, String> {
+    let wal_dir = std::path::PathBuf::from(dir).join("wal");
+    if !wal_dir.exists() {
+        return Ok(format!(
+            "no wal/ subdir at {} — nothing to prune",
+            wal_dir.display()
+        ));
+    }
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let cutoff_s = now_s.saturating_sub(retention_hours * 3_600);
+    let mut kept = 0u64;
+    let mut removed = 0u64;
+    for entry in fs::read_dir(&wal_dir).map_err(|e| format!("read wal dir: {e}"))? {
+        let entry = entry.map_err(|e| format!("read entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wal") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let prefix_us: u128 = stem
+            .split_once('_')
+            .and_then(|(prefix, _)| prefix.parse().ok())
+            .unwrap_or(0);
+        let prefix_s = (prefix_us / 1_000_000) as u64;
+        if prefix_s < cutoff_s {
+            // Drop the chunk + its checksum sidecar.
+            fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+            let cs = {
+                let mut p = path.clone();
+                let mut name = p
+                    .file_name()
+                    .map(std::ffi::OsStr::to_os_string)
+                    .unwrap_or_default();
+                name.push(".checksum");
+                p.set_file_name(name);
+                p
+            };
+            if cs.exists() {
+                fs::remove_file(&cs).map_err(|e| format!("remove {}: {e}", cs.display()))?;
+            }
+            removed += 1;
+        } else {
+            kept += 1;
+        }
+    }
+    Ok(format!(
+        "OK retention_hours={retention_hours} kept={kept} removed={removed}"
+    ))
+}
+
+/// v7.18 PITR P3 — point-in-time restore.
+///
+/// Loads the catalog snapshot at `snapshot_path` into a fresh
+/// in-process database, parses the WAL at `wal_path`, replays
+/// every `auto_commit_sql` record whose (commit_lsn,
+/// commit_unix_us) falls at or before the target, then writes
+/// the resulting catalog to `target_path`. Returns
+/// `(applied_count, human_target_descr)`.
+///
+/// `to_arg` accepts:
+///   - bare unsigned integer ⇒ commit_lsn upper bound
+///   - `<n>s` / `<n>ms` / `<n>us` ⇒ unix epoch in that unit
+///   - `YYYY-MM-DD HH:MM:SS` / `YYYY-MM-DDTHH:MM:SS` ⇒ UTC
+fn pitr_restore(
+    snapshot_path: &str,
+    wal_path: &str,
+    to_arg: &str,
+    target_path: &str,
+) -> Result<(u64, String), String> {
+    use spg_embedded::{Database, WalRecord, parse_wal_records};
+
+    let target = parse_restore_target(to_arg)?;
+    let snapshot_bytes = fs::read(snapshot_path)
+        .map_err(|e| format!("read snapshot {snapshot_path}: {e}"))?;
+    let mut db = Database::restore(&snapshot_bytes)
+        .map_err(|e| format!("restore snapshot: {e:?}"))?;
+
+    let wal_bytes = fs::read(wal_path).map_err(|e| format!("read wal {wal_path}: {e}"))?;
+    let records: Vec<WalRecord<'_>> =
+        parse_wal_records(&wal_bytes).map_err(|e| format!("parse wal: {e}"))?;
+
+    let mut applied: u64 = 0;
+    for r in records {
+        // Skip everything that doesn't carry SQL — durability
+        // markers (0x02) and checkpoint markers (0x11) don't
+        // replay; v3 SQL records (0x01) carry no LSN/ts and
+        // always apply (they pre-date PITR — replay them
+        // unconditionally so the pre-v7.18 history isn't lost).
+        match r.type_byte {
+            0x02 | 0x11 => continue,
+            0x01 => {
+                let sql = std::str::from_utf8(r.sql)
+                    .map_err(|e| format!("non-UTF-8 SQL at offset {}: {e}", r.offset))?;
+                db.execute(sql)
+                    .map_err(|e| format!("apply at offset {}: {e:?}", r.offset))?;
+                applied += 1;
+            }
+            0x10 => {
+                if !target.includes(r.commit_lsn, r.commit_unix_us) {
+                    continue;
+                }
+                let sql = std::str::from_utf8(r.sql)
+                    .map_err(|e| format!("non-UTF-8 SQL at offset {}: {e}", r.offset))?;
+                db.execute(sql)
+                    .map_err(|e| format!("apply at offset {}: {e:?}", r.offset))?;
+                applied += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown WAL record type {other:#04x} at offset {}",
+                    r.offset
+                ));
+            }
+        }
+    }
+
+    let final_snapshot = db.snapshot();
+    fs::write(target_path, &final_snapshot)
+        .map_err(|e| format!("write {target_path}: {e}"))?;
+    Ok((applied, target.describe()))
+}
+
+/// v7.18 PITR — the `--to` target parsed off the CLI.
+#[derive(Debug)]
+enum RestoreTarget {
+    Lsn(u64),
+    UnixMicros(i64),
+}
+
+impl RestoreTarget {
+    fn includes(&self, lsn: Option<u64>, ts_us: Option<i64>) -> bool {
+        match self {
+            RestoreTarget::Lsn(cap) => lsn.is_some_and(|l| l <= *cap),
+            RestoreTarget::UnixMicros(cap_us) => ts_us.is_some_and(|t| t <= *cap_us),
+        }
+    }
+    fn describe(&self) -> String {
+        match self {
+            RestoreTarget::Lsn(n) => format!("lsn<={n}"),
+            RestoreTarget::UnixMicros(us) => format!("ts<={us}us"),
+        }
+    }
+}
+
+fn parse_restore_target(s: &str) -> Result<RestoreTarget, String> {
+    let trimmed = s.trim();
+    if let Ok(n) = trimmed.parse::<u64>() {
+        return Ok(RestoreTarget::Lsn(n));
+    }
+    if let Some(rest) = trimmed.strip_suffix("us") {
+        if let Ok(n) = rest.parse::<i64>() {
+            return Ok(RestoreTarget::UnixMicros(n));
+        }
+    }
+    if let Some(rest) = trimmed.strip_suffix("ms") {
+        if let Ok(n) = rest.parse::<i64>() {
+            return Ok(RestoreTarget::UnixMicros(n.saturating_mul(1_000)));
+        }
+    }
+    if let Some(rest) = trimmed.strip_suffix('s') {
+        if let Ok(n) = rest.parse::<i64>() {
+            return Ok(RestoreTarget::UnixMicros(n.saturating_mul(1_000_000)));
+        }
+    }
+    // Try YYYY-MM-DD HH:MM:SS / YYYY-MM-DDTHH:MM:SS, UTC.
+    let cleaned = trimmed.replace('T', " ");
+    let parts: Vec<&str> = cleaned.split_whitespace().collect();
+    if parts.len() == 2 {
+        let date: Vec<&str> = parts[0].split('-').collect();
+        let time: Vec<&str> = parts[1].split(':').collect();
+        if date.len() == 3 && time.len() == 3 {
+            let y: i64 = date[0].parse().map_err(|_| format!("bad year: {}", date[0]))?;
+            let mo: i64 = date[1].parse().map_err(|_| format!("bad month: {}", date[1]))?;
+            let d: i64 = date[2].parse().map_err(|_| format!("bad day: {}", date[2]))?;
+            let h: i64 = time[0].parse().map_err(|_| format!("bad hour: {}", time[0]))?;
+            let mi: i64 = time[1].parse().map_err(|_| format!("bad minute: {}", time[1]))?;
+            let se: i64 = time[2].parse().map_err(|_| format!("bad second: {}", time[2]))?;
+            // Days-from-civil from Howard Hinnant's date algorithms
+            // (public domain). y, mo, d are calendar values; output
+            // is days since 1970-01-01 UTC. Works for any positive
+            // proleptic Gregorian date.
+            let ymd_to_days = |y: i64, mo: i64, d: i64| -> i64 {
+                let y = if mo <= 2 { y - 1 } else { y };
+                let era = if y >= 0 { y } else { y - 399 } / 400;
+                let yoe = y - era * 400;
+                let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+                let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                era * 146_097 + doe - 719_468
+            };
+            let days = ymd_to_days(y, mo, d);
+            let secs = days * 86_400 + h * 3_600 + mi * 60 + se;
+            return Ok(RestoreTarget::UnixMicros(secs.saturating_mul(1_000_000)));
+        }
+    }
+    Err(format!(
+        "could not parse --to {s:?}; expected unsigned LSN, '<n>s|ms|us' unix epoch, or 'YYYY-MM-DD HH:MM:SS' UTC"
+    ))
+}
+
 fn wal_revert(wal_path: &str, to_seq: u64, out_path: &str) -> Result<u64, String> {
     use spg_engine::Engine;
     let mut engine = Engine::new();
@@ -649,5 +1432,431 @@ mod tests {
         let err = backup(p.to_str().unwrap(), p.to_str().unwrap()).unwrap_err();
         assert!(err.contains("same path"));
         let _ = fs::remove_file(&p);
+    }
+
+    // ---- v7.18 PITR P3 ----
+
+    #[test]
+    fn parse_restore_target_accepts_lsn() {
+        match parse_restore_target("42").unwrap() {
+            RestoreTarget::Lsn(n) => assert_eq!(n, 42),
+            t @ RestoreTarget::UnixMicros(_) => panic!("expected Lsn, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_unix_seconds() {
+        match parse_restore_target("1750000000s").unwrap() {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_000_000),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_unix_millis() {
+        match parse_restore_target("1750000000123ms").unwrap() {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_123_000),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_unix_micros() {
+        match parse_restore_target("1750000000123456us").unwrap() {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_123_456),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_accepts_iso8601() {
+        // 2026-01-01 00:00:00 UTC = 1767225600 unix seconds.
+        let t = parse_restore_target("2026-01-01 00:00:00").unwrap();
+        match t {
+            RestoreTarget::UnixMicros(us) => {
+                assert_eq!(us, 1_767_225_600 * 1_000_000);
+            }
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
+        }
+        // T separator works too.
+        let t = parse_restore_target("2026-01-01T00:00:00").unwrap();
+        match t {
+            RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_767_225_600 * 1_000_000),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_target_rejects_garbage() {
+        assert!(parse_restore_target("yesterday").is_err());
+        assert!(parse_restore_target("-1").is_err());
+        assert!(parse_restore_target("2026-13-01 00:00:00").is_ok()); // we don't bounds-check fields
+    }
+
+    #[test]
+    fn backup_pitr_round_trips_with_pitr_restore() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("bk-src-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        // Apply writes, then checkpoint() so the snapshot file
+        // is materialised on disk. checkpoint() truncates the
+        // WAL — so the data lives entirely in the snapshot for
+        // this round-trip test.
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+
+        // Backup → backup_dir.
+        let backup_dir = tmp_path("bk-dst-dir");
+        let summary = backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(summary.starts_with("OK "), "bad summary: {summary}");
+        let snap = backup_dir.join("snapshot.spg");
+        let wal_dir = backup_dir.join("wal");
+        assert!(snap.exists(), "snapshot.spg missing");
+        assert!(wal_dir.exists(), "wal/ subdir missing");
+        let chunks: Vec<_> = fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        // checkpoint() truncated the WAL to 0 bytes before the
+        // backup snapshot was read, so the chunk directory ends
+        // up empty — all data lives in snapshot.spg. Empty WAL
+        // chunks would clutter the backup dir without information
+        // and would still need verifier special-casing later, so
+        // backup_pitr skips them.
+        assert!(chunks.is_empty(), "expected 0 chunks after checkpoint, got {chunks:?}");
+
+        // Restore: feed pitr_restore an empty WAL file to confirm
+        // the snapshot-only path also works. Use the source WAL
+        // path (currently empty) for that.
+        let empty_wal = tmp_path("bk-empty-wal");
+        fs::write(&empty_wal, b"").unwrap();
+        let target_path = tmp_path("bk-restore-target");
+        let (applied, _) = pitr_restore(
+            snap.to_str().unwrap(),
+            empty_wal.to_str().unwrap(),
+            "999",
+            target_path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied, 0, "empty WAL → nothing to replay");
+
+        // Verify rows survived in the snapshot itself.
+        let mut restored = Database::restore(&fs::read(&target_path).unwrap()).unwrap();
+        let rows = restored.query("SELECT COUNT(*) FROM t").unwrap();
+        let count = match &rows[0][0] {
+            spg_embedded::Value::Int(n) => i64::from(*n),
+            spg_embedded::Value::BigInt(n) => *n,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(count, 2);
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_file(&empty_wal);
+    }
+
+    #[test]
+    fn verify_pitr_passes_on_fresh_backup_with_writes() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("vf-src-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        // Realistic PITR backup: checkpoint() materialises the
+        // base snapshot file + truncates the WAL, then subsequent
+        // writes go into the WAL as incremental records. backup_pitr
+        // captures (snapshot, wal-incremental) and verify-pitr
+        // replays just the WAL on top of the snapshot — no
+        // double-apply of the writes that pre-dated the
+        // checkpoint.
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.checkpoint().unwrap(); // snapshot = empty-table t
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        std::mem::forget(db);
+        Database::force_unlock(&db_path).unwrap();
+
+        let backup_dir = tmp_path("vf-bk-dir");
+        let summary = backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(summary.starts_with("OK "));
+
+        // First verify without checksums — must report Missing
+        // for the chunk and NOT-clean.
+        let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
+        assert!(report.snapshot_ok);
+        assert!(report.replay_ok, "replay msg: {}", report.replay_msg);
+        assert_eq!(report.chunks.len(), 1);
+        assert!(
+            matches!(report.chunks[0].checksum_state, ChecksumState::Missing { .. }),
+            "got: {:?}",
+            report.chunks[0].checksum_state
+        );
+        assert!(!report.is_clean(), "report should not be clean without checksum");
+
+        // Now write the checksum file via the flag and verify
+        // again — must be clean.
+        let report = verify_pitr(backup_dir.to_str().unwrap(), true).unwrap();
+        assert!(matches!(
+            report.chunks[0].checksum_state,
+            ChecksumState::WrittenFresh { .. }
+        ));
+
+        let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
+        assert!(report.is_clean(), "report: {}", report.render());
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn verify_pitr_detects_checksum_mismatch() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("vf-bad-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        std::mem::forget(db);
+        Database::force_unlock(&db_path).unwrap();
+
+        let backup_dir = tmp_path("vf-bad-bk-dir");
+        backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+
+        // Stamp a phony checksum.
+        let chunks: Vec<_> = fs::read_dir(backup_dir.join("wal"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(chunks.len(), 1);
+        let cs_path = {
+            let mut p = chunks[0].clone();
+            let mut name = p.file_name().unwrap().to_os_string();
+            name.push(".checksum");
+            p.set_file_name(name);
+            p
+        };
+        fs::write(&cs_path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n")
+            .unwrap();
+
+        let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
+        assert!(
+            matches!(report.chunks[0].checksum_state, ChecksumState::Mismatch { .. }),
+            "got: {:?}",
+            report.chunks[0].checksum_state
+        );
+        assert!(!report.is_clean());
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn prune_pitr_removes_chunks_past_retention() {
+        // Lay down two chunks: one timestamped "10 hours ago",
+        // one "1 minute ago". Retention=1h must keep the recent
+        // chunk and drop the old one (plus its checksum sibling).
+        let backup_dir = tmp_path("prune-dir");
+        let wal_dir = backup_dir.join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        let old_us = now_us.saturating_sub(10 * 3_600 * 1_000_000);
+        let recent_us = now_us.saturating_sub(60 * 1_000_000);
+        let old_chunk = wal_dir.join(format!("{old_us}_42.wal"));
+        let old_cs = wal_dir.join(format!("{old_us}_42.wal.checksum"));
+        let recent_chunk = wal_dir.join(format!("{recent_us}_43.wal"));
+        fs::write(&old_chunk, b"old").unwrap();
+        fs::write(&old_cs, b"abc\n").unwrap();
+        fs::write(&recent_chunk, b"recent").unwrap();
+
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), 1).unwrap();
+        assert!(summary.contains("removed=1"), "summary: {summary}");
+        assert!(summary.contains("kept=1"), "summary: {summary}");
+        assert!(!old_chunk.exists(), "old chunk should have been removed");
+        assert!(!old_cs.exists(), "old checksum should have been removed");
+        assert!(recent_chunk.exists(), "recent chunk should still exist");
+
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+
+    #[test]
+    fn prune_pitr_no_wal_dir_is_noop() {
+        let backup_dir = tmp_path("prune-empty");
+        // backup_dir doesn't exist at all — prune should treat as
+        // a noop, not error.
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), 24).unwrap();
+        assert!(summary.contains("nothing to prune"), "summary: {summary}");
+    }
+
+    // NOTE: archive_chunk end-to-end (SPG_PITR_ARCHIVE_CMD set /
+    // unset / failing) is exercised by the P7 CI suite where the
+    // test process can mutate its own env without racing the other
+    // unit tests in this binary. Inline env mutation here would
+    // need `unsafe` on the 2024 edition, which the workspace lint
+    // forbids — so we lean on integration coverage.
+
+    #[test]
+    fn backup_pitr_handles_missing_wal() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("bk-no-wal-db");
+        // Touch a snapshot file but never run any writes that
+        // would create the WAL.
+        let mut db = Database::open_path(&db_path).unwrap();
+        // No execute() — Drop will checkpoint an empty engine.
+        drop(db);
+        // Wipe the .wal file (Drop's empty-checkpoint may have
+        // created it; nuke explicitly to exercise the missing-
+        // WAL branch).
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        let _ = fs::remove_file(&wal_path);
+
+        let backup_dir = tmp_path("bk-no-wal-dst");
+        let summary = backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(summary.contains("wal_present=false"), "summary: {summary}");
+        let wal_dir = backup_dir.join("wal");
+        // wal/ subdir created but empty.
+        assert!(wal_dir.exists());
+        let chunks: Vec<_> = fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(chunks.is_empty(), "should have produced no chunks");
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn pitr_restore_replays_up_to_lsn_only() {
+        use spg_embedded::Database;
+        // 1) Build a snapshot + WAL by running 3 inserts on a
+        //    fresh file-backed Database, then keeping the WAL
+        //    alive by mem::forget so checkpoint doesn't truncate.
+        let db_path = tmp_path("pitr-src-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.execute("INSERT INTO t VALUES (3)").unwrap();
+        // Capture the catalog snapshot before any checkpoint.
+        let snapshot_bytes = db.snapshot();
+        std::mem::forget(db);
+        Database::force_unlock(&db_path).unwrap();
+
+        let snap_path = tmp_path("pitr-snap");
+        fs::write(&snap_path, &snapshot_bytes).unwrap();
+
+        // The CREATE TABLE is in the snapshot (the engine state
+        // was captured after every execute) — but the snapshot
+        // here is overkill: the WAL replay path would rebuild
+        // everything. We restore from snapshot then add WAL
+        // records up to LSN 3 (the CREATE + first two INSERTs).
+        // Actually because snapshot_bytes already reflects all 4
+        // statements, replay would just no-op or fail. So
+        // instead, build a fresh empty engine snapshot — easier
+        // because Database::open_in_memory() has no public
+        // snapshot path here. Use Engine::new().snapshot().
+        use spg_engine::Engine;
+        let fresh_snap = Engine::new().snapshot();
+        fs::write(&snap_path, &fresh_snap).unwrap();
+
+        let target_path = tmp_path("pitr-target");
+        let (applied, descr) = pitr_restore(
+            snap_path.to_str().unwrap(),
+            wal_path.to_str().unwrap(),
+            "3",
+            target_path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied, 3, "expected 3 records (CREATE + 2 INSERTs)");
+        assert!(descr.contains("lsn"), "descr should mention lsn: {descr}");
+
+        // Verify the resulting snapshot contains exactly 2 rows.
+        let mut restored = Database::restore(&fs::read(&target_path).unwrap()).unwrap();
+        let rows = restored.query("SELECT COUNT(*) FROM t").unwrap();
+        let count = match &rows[0][0] {
+            spg_embedded::Value::Int(n) => i64::from(*n),
+            spg_embedded::Value::BigInt(n) => *n,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(count, 2, "LSN<=3 means CREATE + 2 INSERTs");
+
+        let _ = fs::remove_file(&snap_path);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
     }
 }

@@ -9,12 +9,14 @@
 //! call returns. mailrs's cement (entirely tokio-based) is the
 //! load-bearing consumer that surfaced this.
 //!
-//! [`AsyncDatabase`] holds a `tokio::sync::Mutex<Database>` and
-//! dispatches every engine call through `spawn_blocking`. The
-//! Mutex matches the engine's single-writer invariant — there is
-//! at most one in-flight engine call at any moment — and
+//! v7.18 — [`AsyncDatabase`] holds a `tokio::sync::RwLock<Database>`
+//! (upgraded from Mutex). Writer calls take the write lock —
+//! the engine is still single-writer, that invariant hasn't
+//! changed. Snapshot-taking (`read_handle` init / refresh) only
+//! needs read access to `clone_snapshot`, so it takes the read
+//! lock and concurrent snapshot refreshes do not serialise.
 //! `spawn_blocking` insulates the runtime's worker pool from
-//! disk stalls.
+//! disk stalls the same way it did under Mutex.
 //!
 //! # Why a separate crate
 //!
@@ -36,15 +38,19 @@ pub use spg_embedded::{
 };
 pub use spg_engine::CatalogSnapshot;
 
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// Tokio-friendly handle to an embedded SPG database. Clone-cheap
 /// (`Arc` inside); every clone shares the same underlying engine.
-/// The internal `Mutex` serialises calls so the engine's
-/// single-writer invariant holds even under concurrent callers.
+///
+/// v7.18 — backed by a `tokio::sync::RwLock` so writer calls
+/// serialise (engine single-writer invariant) but snapshot-only
+/// operations (`read_handle` init / refresh, which just clone
+/// the catalog trie roots) take the read lock and run
+/// concurrently with each other.
 #[derive(Debug, Clone)]
 pub struct AsyncDatabase {
-    inner: Arc<Mutex<Database>>,
+    inner: Arc<RwLock<Database>>,
 }
 
 /// v7.16.0 — Tokio-flavoured prepared-statement handle. Wraps
@@ -84,7 +90,7 @@ impl AsyncDatabase {
     #[must_use]
     pub fn open_in_memory() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Database::open_in_memory())),
+            inner: Arc::new(RwLock::new(Database::open_in_memory())),
         }
     }
 
@@ -102,12 +108,12 @@ impl AsyncDatabase {
             .await
             .expect("spawn_blocking join")?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(db)),
+            inner: Arc::new(RwLock::new(db)),
         })
     }
 
     /// Execute a single SQL statement. Acquires the internal lock
-    /// (FIFO under Tokio's `Mutex`), then dispatches the engine
+    /// (FIFO under Tokio's `RwLock` write side), then dispatches the engine
     /// call to `spawn_blocking` so a WAL fsync or cold-tier read
     /// can't stall the runtime worker.
     ///
@@ -117,7 +123,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.execute(&sql)
         })
         .await
@@ -133,7 +139,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.query(&sql)
         })
         .await
@@ -154,7 +160,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.prepare(&sql).map(|stmt| AsyncStatement {
                 inner: Arc::new(stmt),
             })
@@ -180,7 +186,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.describe(&sql)
         })
         .await
@@ -204,7 +210,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let stmt_inner = Arc::clone(&stmt.inner);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.execute_prepared(&stmt_inner, &params)
         })
         .await
@@ -226,7 +232,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let stmt_inner = Arc::clone(&stmt.inner);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.query_prepared(&stmt_inner, &params)
         })
         .await
@@ -248,7 +254,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.query_with_columns(&sql)
         })
         .await
@@ -270,7 +276,7 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let stmt_inner = Arc::clone(&stmt.inner);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.query_prepared_with_columns(&stmt_inner, &params)
         })
         .await
@@ -286,7 +292,7 @@ impl AsyncDatabase {
     pub async fn checkpoint(&self) -> Result<(), EngineError> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.checkpoint()
         })
         .await
@@ -308,7 +314,7 @@ impl AsyncDatabase {
     pub async fn read_handle(&self) -> AsyncReadHandle {
         let inner = Arc::clone(&self.inner);
         let snapshot = tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
+            let guard = inner.blocking_read();
             guard.engine().clone_snapshot()
         })
         .await
@@ -326,13 +332,15 @@ impl AsyncDatabase {
 /// — the contract is that the handle reflects committed state at
 /// the moment of construction or the last `refresh()`.
 ///
-/// Holds a reference to the underlying `AsyncDatabase` (via the
-/// shared `Arc<Mutex<Database>>`) only so `refresh()` can briefly
-/// re-acquire the lock to take a fresh snapshot. Read paths never
-/// touch the Database directly.
+/// v7.18 — holds a reference to the underlying `AsyncDatabase`
+/// (via the shared `Arc<RwLock<Database>>`) only so `refresh()`
+/// can briefly take the read lock to clone a fresh snapshot.
+/// Read paths never touch the Database directly. Snapshot
+/// cloning is a trie-root `Arc` copy, so a busy writer barely
+/// affects refresh latency.
 #[derive(Debug)]
 pub struct AsyncReadHandle {
-    db: Arc<Mutex<Database>>,
+    db: Arc<RwLock<Database>>,
     snapshot: CatalogSnapshot,
 }
 
@@ -352,13 +360,81 @@ impl AsyncReadHandle {
         .expect("spawn_blocking join")
     }
 
+    /// v7.18 — parse + plan a SQL string against this handle's
+    /// frozen snapshot. Mirror of [`AsyncDatabase::prepare`] for
+    /// the readonly fan-out path: clock rewrite + JOIN reorder +
+    /// position resolve happen against the snapshot's catalog +
+    /// statistics, no writer lock acquired. Multiple read handles
+    /// can prepare concurrently; the returned [`AsyncStatement`]
+    /// is `Clone + Send`.
+    ///
+    /// # Errors
+    /// Propagates [`EngineError`] from the parser
+    /// (`EngineError::Parse`).
+    pub async fn prepare(&self, sql: &str) -> Result<AsyncStatement, EngineError> {
+        let snapshot = self.snapshot.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            Database::prepare_on_snapshot(&snapshot, &sql).map(|stmt| AsyncStatement {
+                inner: Arc::new(stmt),
+            })
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.18 — execute a prepared statement against this handle's
+    /// frozen snapshot with bound params. Mirror of
+    /// [`AsyncDatabase::execute_prepared`] on the readonly path —
+    /// writes / DDL hit `EngineError::WriteRequired` so the caller
+    /// can route them to the writer mutex. No writer lock
+    /// acquired; multiple handles run truly concurrently.
+    ///
+    /// # Errors
+    /// Propagates engine errors (placeholder arity mismatch,
+    /// schema drift surfacing as catalog lookups, etc.).
+    pub async fn execute_prepared(
+        &self,
+        stmt: &AsyncStatement,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, EngineError> {
+        let snapshot = self.snapshot.clone();
+        let stmt_inner = Arc::clone(&stmt.inner);
+        tokio::task::spawn_blocking(move || {
+            Database::execute_prepared_on_snapshot(&snapshot, &stmt_inner, &params)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
+    /// v7.18 — describe a prepared SQL string against this
+    /// handle's frozen snapshot. Returns `(parameter_oids,
+    /// output_columns)`. Drives the spg-sqlx adapter's readonly
+    /// `Executor::describe` path so `sqlx::query!()` compile-time
+    /// validation can resolve column types without touching the
+    /// writer engine.
+    ///
+    /// # Errors
+    /// Propagates [`EngineError`] from the parser
+    /// (`EngineError::Parse`).
+    pub async fn describe(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<u32>, Vec<spg_embedded::ColumnSchema>), EngineError> {
+        let snapshot = self.snapshot.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || Database::describe_on_snapshot(&snapshot, &sql))
+            .await
+            .expect("spawn_blocking join")
+    }
+
     /// Re-snapshot the underlying engine. Briefly takes the
     /// writer lock; subsequent `query()` calls see the new state.
     /// Idempotent on a quiet engine (clones the same trie roots).
     pub async fn refresh(&mut self) {
         let inner = Arc::clone(&self.db);
         let new_snapshot = tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
+            let guard = inner.blocking_read();
             guard.engine().clone_snapshot()
         })
         .await
