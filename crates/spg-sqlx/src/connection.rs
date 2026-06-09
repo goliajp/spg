@@ -1,12 +1,18 @@
 //! v7.16.0 — `sqlx::Connection` for SPG.
 //!
-//! Wraps [`spg_embedded_tokio::AsyncDatabase`]. Single-writer
-//! serialisation is the engine's invariant; every Connection
-//! shares the same underlying database via `Arc<Mutex<…>>` so
-//! `sqlx::Pool<Spg>` is a thin pass-through — the pool's
-//! per-connection slot reuses the same engine, and sqlx's
-//! `min_connections` / `max_connections` knobs just control
-//! how many cheap clones the pool keeps around.
+//! Wraps [`spg_embedded_tokio::AsyncDatabase`]. The engine is
+//! single-writer at the lock level, but read-only statements
+//! short-circuit through [`spg_embedded_tokio::AsyncReadHandle`]
+//! — each `SpgConnection` lazily attaches a read handle on first
+//! readonly statement and refreshes it per-statement so PG
+//! read-committed semantics hold (every statement sees the
+//! latest committed state). Writes / DDL / TX-control take the
+//! writer lock as before.
+//!
+//! Result: `SpgPoolOptions::new().max_connections(20)` behaves
+//! like its `PgPool` analogue — concurrent SELECTs run truly in
+//! parallel, transactions serialise. Stock sqlx code drops in
+//! unchanged.
 
 use std::sync::Arc;
 
@@ -19,7 +25,7 @@ use sqlx_core::executor::Executor;
 use sqlx_core::transaction::Transaction;
 
 use spg_embedded::QueryResult as EngineQueryResult;
-use spg_embedded_tokio::AsyncDatabase;
+use spg_embedded_tokio::{AsyncDatabase, AsyncReadHandle};
 
 use crate::column::SpgColumn;
 use crate::database::Spg;
@@ -30,11 +36,48 @@ use crate::row::SpgRow;
 use crate::type_info::SpgTypeInfo;
 
 /// One sqlx connection backed by an in-process SPG.
-#[derive(Debug, Clone)]
+///
+/// Holds two engine handles:
+///
+/// - `inner: AsyncDatabase` — writer path. Used for DDL / DML /
+///   transaction control and for statements running inside a
+///   transaction (where snapshot semantics would conflict with
+///   the user's TX isolation).
+///
+/// - `read_handle: Option<AsyncReadHandle>` — readonly fan-out
+///   path. Lazily built on the first readonly statement seen,
+///   refreshed per statement so each SELECT sees the latest
+///   committed state (PG read-committed default).
+///
+/// Both handles share the same underlying engine (the
+/// `AsyncDatabase` and the read handle clone the same `Arc` —
+/// snapshots are cheap trie-root clones).
+#[derive(Debug)]
 pub struct SpgConnection {
     pub(crate) inner: AsyncDatabase,
+    /// v7.18 — lazy fan-out reader. `None` until the connection
+    /// runs its first readonly statement outside a transaction.
+    /// `refresh()` is called per-statement so writes committed
+    /// elsewhere become visible without manual intervention.
+    pub(crate) read_handle: Option<AsyncReadHandle>,
     pub(crate) tx_depth: usize,
     pub(crate) pending_rollback: bool,
+}
+
+impl Clone for SpgConnection {
+    fn clone(&self) -> Self {
+        // The read_handle holds a snapshot frozen at its own
+        // creation time; cloning a connection should NOT inherit
+        // that snapshot — the clone gets a fresh None and will
+        // lazy-init its own. Same `inner` (the AsyncDatabase is
+        // `Arc`-shared by design) so writes are still consistent.
+        Self {
+            inner: self.inner.clone(),
+            read_handle: None,
+            tx_depth: self.tx_depth,
+            pending_rollback: self.pending_rollback,
+        }
+    }
 }
 
 impl SpgConnection {
@@ -44,17 +87,37 @@ impl SpgConnection {
     pub fn new(inner: AsyncDatabase) -> Self {
         Self {
             inner,
+            read_handle: None,
             tx_depth: 0,
             pending_rollback: false,
         }
     }
 
     /// Borrow the underlying `AsyncDatabase`. Lets advanced
-    /// callers reach for the spg-embedded API directly
-    /// (e.g. `read_handle()` for fan-out reads).
+    /// callers reach for the spg-embedded API directly. The
+    /// per-connection [`AsyncReadHandle`] used for readonly
+    /// fan-out is internal — sqlx code paths don't need to
+    /// know it exists.
     #[must_use]
     pub const fn engine(&self) -> &AsyncDatabase {
         &self.inner
+    }
+
+    /// v7.18 — return a `&mut AsyncReadHandle` with a snapshot
+    /// refreshed to the engine's latest committed state. Lazily
+    /// constructs the handle on first call; subsequent calls
+    /// refresh the existing one (cheap — clone_snapshot is an
+    /// Arc-clone of the trie roots). Used by the routing
+    /// helper below for every readonly statement so the
+    /// connection sees the same read-committed view a PG client
+    /// would see across statement boundaries.
+    pub(crate) async fn fresh_read_handle(&mut self) -> &mut AsyncReadHandle {
+        if let Some(rh) = self.read_handle.as_mut() {
+            rh.refresh().await;
+        } else {
+            self.read_handle = Some(self.inner.read_handle().await);
+        }
+        self.read_handle.as_mut().expect("set above")
     }
 }
 
@@ -106,9 +169,14 @@ impl Connection for SpgConnection {
 
 // v7.16.0 — Executor on &mut SpgConnection. fetch_many returns
 // `Either<QueryResult, Row>` per sqlx-core's stream contract.
-// MVP: execute path only — INSERT/UPDATE/DELETE/DDL go through;
-// SELECT (fetch_many / fetch / fetch_all) needs Decode coverage
-// for the column types, lands in v7.16.x.
+//
+// v7.18 — fetch_many / fetch_optional take `&mut SpgConnection`
+// across the future (allowed by sqlx's `'c: 'e` bound) so the
+// run_one routing can lazy-init / refresh the per-connection
+// read handle without cloning state. Readonly statements
+// outside a transaction fan out through the snapshot path;
+// writer statements + everything inside BEGIN keep using the
+// writer mutex.
 impl<'c> Executor<'c> for &'c mut SpgConnection {
     type Database = Spg;
 
@@ -137,8 +205,7 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
                 return Box::pin(stream::iter(std::iter::once(Err(Error::Encode(e)))));
             }
         };
-        let inner = self.inner.clone();
-        let outcome_fut = async move { run_one(&inner, &sql, arguments).await };
+        let outcome_fut = async move { run_one(self, &sql, arguments).await };
         Box::pin(stream::once(outcome_fut).flat_map(|outcome| {
             let items: Vec<Result<either::Either<SpgQueryResult, SpgRow>, Error>> = match outcome {
                 Ok(Outcome::Affected(qr)) => vec![Ok(either::Either::Left(qr))],
@@ -162,10 +229,9 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
     {
         let sql = query.sql().to_string();
         let arguments = query.take_arguments();
-        let inner = self.inner.clone();
         Box::pin(async move {
             let args = arguments.map_err(Error::Encode)?;
-            match run_one(&inner, &sql, args).await? {
+            match run_one(self, &sql, args).await? {
                 Outcome::Rows(mut rows) => Ok(rows.drain(..).next()),
                 Outcome::Affected(_) => Ok(None),
             }
@@ -257,23 +323,41 @@ enum Outcome {
 }
 
 async fn run_one(
-    db: &AsyncDatabase,
+    conn: &mut SpgConnection,
     sql: &str,
     arguments: Option<crate::SpgArguments<'_>>,
 ) -> Result<Outcome, Error> {
-    // Single-dispatch: hit the engine once and inspect the
-    // returned QueryResult shape. The prepared path picks up
-    // the bind-final SQL via execute_prepared; the bare path
-    // reuses execute(). Both surface column metadata for SELECT
-    // via the engine's QueryResult::Rows variant directly so we
-    // never double-run a statement.
-    let result: EngineQueryResult = if let Some(args) = arguments {
-        let stmt = db.prepare(sql).await.map_err(engine_to_sqlx)?;
-        db.execute_prepared(&stmt, args.into_engine_values())
-            .await
-            .map_err(engine_to_sqlx)?
+    // v7.18 routing decision. Inside a transaction the writer
+    // lock has to stay held end-to-end so the user's isolation
+    // contract holds; we never route to the snapshot path
+    // there. Outside a transaction, parse the SQL and look at
+    // `Statement::is_readonly()`. A parse error falls through
+    // to the writer path so the user sees the same parse error
+    // they'd get from a simple-query SELECT (no behaviour
+    // change vs pre-v7.18 for unsupported syntax).
+    let in_tx = conn.tx_depth > 0;
+    let use_readonly = !in_tx && spg_embedded::Engine::is_readonly_sql(sql);
+
+    let result: EngineQueryResult = if use_readonly {
+        let rh = conn.fresh_read_handle().await;
+        if let Some(args) = arguments {
+            let stmt = rh.prepare(sql).await.map_err(engine_to_sqlx)?;
+            rh.execute_prepared(&stmt, args.into_engine_values())
+                .await
+                .map_err(engine_to_sqlx)?
+        } else {
+            rh.query(sql).await.map_err(engine_to_sqlx)?
+        }
     } else {
-        db.execute(sql).await.map_err(engine_to_sqlx)?
+        let db = &conn.inner;
+        if let Some(args) = arguments {
+            let stmt = db.prepare(sql).await.map_err(engine_to_sqlx)?;
+            db.execute_prepared(&stmt, args.into_engine_values())
+                .await
+                .map_err(engine_to_sqlx)?
+        } else {
+            db.execute(sql).await.map_err(engine_to_sqlx)?
+        }
     };
     match result {
         EngineQueryResult::Rows { columns, rows } => {

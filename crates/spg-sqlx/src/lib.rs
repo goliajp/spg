@@ -60,7 +60,7 @@
 //! # }
 //! ```
 //!
-//! ## Concurrency, durability, and `Send + Sync` (mailrs round-9 B.4)
+//! ## Concurrency, durability, and `Send + Sync` (mailrs round-9 B.4 + v7.18)
 //!
 //! ### `SpgPool: Send + Sync + 'static`
 //!
@@ -70,19 +70,45 @@
 //! background workers, and long-lived spawn tasks works the
 //! same as `sqlx::PgPool`. Clones are cheap (Arc bumps).
 //!
-//! ### Single-process write semantics
+//! ### Pool semantics (v7.18 — drop-in PG-shape)
 //!
-//! Every connection acquired from one [`SpgPool`] shares the
-//! same underlying [`spg_embedded_tokio::AsyncDatabase`] (one
-//! `Arc<Mutex<Database>>` behind a `tokio::sync::OnceCell` on
-//! [`SpgConnectOptions`]). That's how
-//! `let mut tx = pool.begin().await?;` and a separate
-//! `pool.acquire().await?` see the same committed state.
-//! The single-writer invariant of the underlying spg-engine is
-//! upheld by the `tokio::sync::Mutex` inside `AsyncDatabase`:
-//! every `execute`/`query` serialises against every other call
-//! on the same pool, and `tx.commit().await?` is what makes
-//! the in-tx writes visible to subsequent reads.
+//! `SpgPoolOptions::new().max_connections(N).connect_with(...)`
+//! behaves like its `PgPool` analogue:
+//!
+//! - **Concurrent SELECTs scale**. Every [`SpgConnection`]
+//!   lazily attaches an `AsyncReadHandle` on first read-only
+//!   statement outside a transaction, then refreshes its
+//!   snapshot per statement so each SELECT sees the latest
+//!   committed state (PG read-committed default). N pool
+//!   connections → N concurrent reads, no writer-lock
+//!   serialisation.
+//! - **Writes serialise**. INSERT / UPDATE / DELETE / DDL take
+//!   the writer lock — the engine is single-writer at the
+//!   storage level and that invariant stays.
+//! - **Transactions stay on the writer path**. Everything
+//!   between `BEGIN` and `COMMIT/ROLLBACK` routes to the writer
+//!   even for the same-TX SELECTs — that's how the user's
+//!   uncommitted writes become visible to subsequent same-TX
+//!   reads (the snapshot path would not see them).
+//! - **Cross-connection read-committed**. After one connection
+//!   commits, another connection's next SELECT picks up the new
+//!   state via its per-statement snapshot refresh — same
+//!   visibility window PG users expect.
+//! - **`SpgConnectOptions` shares the underlying engine across
+//!   every `connect()`**: one `Arc<RwLock<Database>>` behind a
+//!   `tokio::sync::OnceCell` on the options. That's how
+//!   `let mut tx = pool.begin().await?;` and a separate
+//!   `pool.acquire().await?` reach the same in-process state.
+//!
+//! ### Escape hatch — `read_handle` for SPG-aware code
+//!
+//! For code paths that want to bypass sqlx entirely and hold
+//! an explicit snapshot lifetime (e.g. an IMAP fetch that
+//! shouldn't see writes mid-stream), reach for
+//! [`spg_embedded_tokio::AsyncReadHandle`] directly via
+//! [`SpgConnection::engine()`]. Stock sqlx users do not need
+//! this — the routing inside [`SpgConnection`] already fans
+//! out reads through that exact path under the hood.
 //!
 //! ### Cross-process write semantics
 //!

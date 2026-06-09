@@ -15,10 +15,16 @@ publish      = false
 # out unsafe_code for spg-crypto; this crate inherits the default deny.
 
 [dependencies]
-spg-engine  = { path = "../../crates/spg-engine",  version = "7.11" }
-spg-storage = { path = "../../crates/spg-storage", version = "7.11" }
-spg-wire    = { path = "../../crates/spg-wire",    version = "7.11" }
-spg-sql     = { path = "../../crates/spg-sql",     version = "7.11" }
+spg-engine         = { path = "../../crates/spg-engine",  version = "7.11" }
+spg-storage        = { path = "../../crates/spg-storage", version = "7.11" }
+spg-wire           = { path = "../../crates/spg-wire",    version = "7.11" }
+spg-sql            = { path = "../../crates/spg-sql",     version = "7.11" }
+# v7.18 — sqlx Pool concurrent-reads bench needs the sqlx adapter
+# + embed wrappers so the harness can stand up SpgPool and an
+# AsyncDatabase side-by-side with the wire-protocol PgPool.
+spg-embedded       = { workspace = true }
+spg-embedded-tokio = { workspace = true }
+spg-sqlx           = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
     "mysql",
@@ -27,6 +33,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "any",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tempfile = "3"
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -78,6 +85,10 @@ path = "src/bin/bake_segment.rs"
 [[bin]]
 name = "cold_tier_pk_bench"
 path = "src/bin/cold_tier_pk_bench.rs"
+
+[[bin]]
+name = "sqlx_pool_concurrent_reads"
+path = "src/bin/sqlx_pool_concurrent_reads.rs"
 
 [lints.rust]
 unsafe_code     = "deny"

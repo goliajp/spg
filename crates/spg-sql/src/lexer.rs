@@ -302,6 +302,18 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 out.push(tok);
                 i += consumed;
             }
+            // v7.18 — PG escape-string literal `E'...'` / `e'...'`.
+            // Closes the mailrs D-pre #3 reverse-acceptance gap:
+            // `INSERT INTO oq VALUES (E'\\xdeadbeef'::bytea)` needs
+            // the `E` prefix so `\\` decodes to a single `\`. The
+            // produced Token::String carries the decoded body so
+            // downstream parser / cast paths treat it identically
+            // to a regular string literal.
+            b'E' | b'e' if peek_eq(bytes, i + 1, b'\'') => {
+                let (tok, consumed) = lex_escape_string(input, i + 1)?;
+                out.push(tok);
+                i += 1 + consumed;
+            }
             b'"' => {
                 let (tok, consumed) = lex_quoted(input, i, b'"', true)?;
                 out.push(tok);
@@ -969,6 +981,128 @@ fn lex_quoted(
     Ok((tok, i - start))
 }
 
+/// v7.18 — Lex a PG escape-string literal `E'...'`. `start` points
+/// at the opening single quote (the `E` was matched by the caller
+/// and is NOT part of `start`'s offset semantics — the consumed
+/// count returned excludes the `E`, which the caller adds).
+///
+/// Recognised escape sequences:
+///   \\ \' \" — literal backslash / quote
+///   \n \r \t \b \f — standard whitespace controls
+///   \0 — NUL
+///   \xHH — single hex byte (1–2 hex digits)
+///   \NNN — octal byte (1–3 octal digits)
+/// Any other `\X` decodes to the literal byte `X` (PG warns; SPG
+/// follows the lenient behaviour pg_dump output relies on).
+///
+/// Doubled `''` is still a literal `'` (same as the non-E form).
+fn lex_escape_string(input: &str, start: usize) -> Result<(Token, usize), LexError> {
+    let bytes = input.as_bytes();
+    debug_assert_eq!(bytes[start], b'\'');
+    let mut i = start + 1;
+    let mut s = String::new();
+    loop {
+        if i >= bytes.len() {
+            return Err(LexError {
+                kind: LexErrorKind::UnterminatedString,
+                pos: start,
+            });
+        }
+        let b = bytes[i];
+        if b == b'\'' {
+            if peek_eq(bytes, i + 1, b'\'') {
+                s.push('\'');
+                i += 2;
+                continue;
+            }
+            i += 1;
+            break;
+        }
+        if b == b'\\' && i + 1 < bytes.len() {
+            let n = bytes[i + 1];
+            match n {
+                b'\\' => { s.push('\\'); i += 2; }
+                b'\'' => { s.push('\''); i += 2; }
+                b'"' => { s.push('"'); i += 2; }
+                b'n' => { s.push('\n'); i += 2; }
+                b'r' => { s.push('\r'); i += 2; }
+                b't' => { s.push('\t'); i += 2; }
+                b'b' => { s.push('\u{0008}'); i += 2; }
+                b'f' => { s.push('\u{000C}'); i += 2; }
+                b'0' if i + 2 >= bytes.len() || !bytes[i + 2].is_ascii_digit() => {
+                    s.push('\0');
+                    i += 2;
+                }
+                b'x' => {
+                    // \xH or \xHH — single byte by hex.
+                    let h1 = bytes.get(i + 2).copied();
+                    let h2 = bytes.get(i + 3).copied();
+                    let n1 = h1.and_then(hex_digit_value);
+                    let n2 = h2.and_then(hex_digit_value);
+                    match (n1, n2) {
+                        (Some(a), Some(b2)) => {
+                            s.push((((a << 4) | b2) as u8) as char);
+                            i += 4;
+                        }
+                        (Some(a), _) => {
+                            s.push((a as u8) as char);
+                            i += 3;
+                        }
+                        _ => {
+                            // \x with no hex follows — literal x.
+                            s.push('x');
+                            i += 2;
+                        }
+                    }
+                }
+                d if d.is_ascii_digit() && d < b'8' => {
+                    // \NNN octal — up to 3 octal digits.
+                    let mut value: u32 = u32::from(d - b'0');
+                    let mut take = 2;
+                    while take < 4 {
+                        let next = bytes.get(i + take).copied();
+                        match next {
+                            Some(c) if c.is_ascii_digit() && c < b'8' => {
+                                value = (value << 3) | u32::from(c - b'0');
+                                take += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let Some(c) = char::from_u32(value) {
+                        s.push(c);
+                    } else {
+                        // Invalid Unicode — preserve as raw byte char.
+                        s.push((value & 0xFF) as u8 as char);
+                    }
+                    i += take;
+                }
+                other => {
+                    // Lenient fallback — same as PG with
+                    // `standard_conforming_strings = off` warning:
+                    // decode `\X` to literal `X`.
+                    s.push(other as char);
+                    i += 2;
+                }
+            }
+        } else {
+            let ch = input[i..].chars().next().expect("non-empty UTF-8 boundary");
+            s.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Ok((Token::String(s), i - start))
+}
+
+fn hex_digit_value(b: u8) -> Option<u32> {
+    match b {
+        b'0'..=b'9' => Some(u32::from(b - b'0')),
+        b'a'..=b'f' => Some(u32::from(b - b'a' + 10)),
+        b'A'..=b'F' => Some(u32::from(b - b'A' + 10)),
+        _ => None,
+    }
+}
+
 fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -1315,5 +1449,45 @@ mod tests {
         let toks = tokenize("x := 1").expect("colon-eq lexes");
         // Tokens: Ident("x"), ColonEq, NumberLiteral
         assert!(matches!(toks[1], Token::ColonEq));
+    }
+
+    #[test]
+    fn pg_escape_string_double_backslash_decodes_to_single() {
+        // v7.18 — E'\\xdeadbeef' decodes to literal `\xdeadbeef`
+        // (10 chars: backslash + xdeadbeef). The downstream
+        // `::bytea` cast then reads that as the PG hex-form bytea
+        // literal. mailrs D-pre #3.
+        let toks = tokenize(r"E'\\xdeadbeef'").expect("E-string lexes");
+        assert_eq!(toks, vec![Token::String(r"\xdeadbeef".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn pg_escape_string_supports_basic_escapes() {
+        // \n / \t / \' / \\ — the PG standard set.
+        let toks = tokenize(r"E'a\nb\tc\'d\\e'").expect("E-string lexes");
+        assert_eq!(
+            toks,
+            vec![Token::String("a\nb\tc'd\\e".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn pg_escape_string_hex_byte() {
+        // \xHH single byte. \x41 = 'A'.
+        let toks = tokenize(r"E'\x41B\x42'").expect("E-string lexes");
+        assert_eq!(toks, vec![Token::String("ABB".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn pg_escape_string_lowercase_e_prefix() {
+        let toks = tokenize(r"e'hi\n'").expect("e-string lexes");
+        assert_eq!(toks, vec![Token::String("hi\n".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn pg_escape_string_doubled_quote() {
+        // Even in E-string the doubled '' is a literal '.
+        let toks = tokenize(r"E'it''s ok'").expect("E-string lexes");
+        assert_eq!(toks, vec![Token::String("it's ok".into()), Token::Eof]);
     }
 }
