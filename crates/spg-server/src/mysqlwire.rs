@@ -48,6 +48,15 @@ use spg_storage::{ColumnSchema, DataType, Value};
 
 use crate::ServerState;
 
+/// v7.17.0 Phase 3.P0-77 — trait object surface that bridges
+/// plain TCP and the rustls-wrapped TLS stream. Every command-
+/// loop helper takes `&mut dyn ConnIo` so we don't have to
+/// monomorphise the entire surface twice. Blanket impl below
+/// covers both `std::net::TcpStream` and
+/// `rustls::Stream<'_, ServerConnection, TcpStream>`.
+pub(crate) trait ReadWrite: Read + Write {}
+impl<T: Read + Write + ?Sized> ReadWrite for T {}
+
 // ---- capability flags ---------------------------------------
 
 /// CLIENT_LONG_PASSWORD — historical (use ≥ 4.1 password).
@@ -77,6 +86,10 @@ pub(crate) const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
 pub(crate) const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 /// CLIENT_DEPRECATE_EOF — replace EOF packets with OK packets.
 pub(crate) const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
+/// v7.17.0 Phase 3.P0-77 — CLIENT_SSL. Advertised in the
+/// greeting so any MySQL client that supports the
+/// `Protocol::SSLRequest` mid-handshake upgrade can opt in.
+pub(crate) const CLIENT_SSL: u32 = 0x0000_0800;
 
 /// Server-advertised capability mask for P0-70. Each follow-on
 /// P0 ORs additional bits in as it implements the feature
@@ -89,7 +102,8 @@ pub(crate) const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_TRANSACTIONS
     | CLIENT_SECURE_CONNECTION
     | CLIENT_PLUGIN_AUTH
-    | CLIENT_DEPRECATE_EOF;
+    | CLIENT_DEPRECATE_EOF
+    | CLIENT_SSL;
 
 /// utf8mb4 collation id — what MySQL 8.0+ servers advertise by
 /// default.
@@ -173,21 +187,65 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     // seqno starts at 0 for the server's first greeting.
     write_packet(&mut stream, 0, &encode_handshake_v10(&greeting))?;
 
-    // ---- HandshakeResponse41 (client → server) ---------------
+    // ---- SSLRequest / HandshakeResponse41 (client → server) ----
+    //
+    // v7.17.0 Phase 3.P0-77 — the first client packet can be
+    // either a 32-byte `Protocol::SSLRequest` (cap flags + max
+    // packet + charset + 23-byte filler, NO username) that
+    // triggers a mid-handshake TLS upgrade, or a full
+    // HandshakeResponse41. Detect by length + CLIENT_SSL bit.
     let (seqno_in, payload) = read_packet(&mut stream)?;
     if seqno_in != 1 {
-        // Spec: the client's HandshakeResponse must arrive with
-        // sequence id = 1. Any other id is a protocol error.
         return write_packet(
             &mut stream,
             seqno_in.wrapping_add(1),
             &encode_err_packet(
                 1043,
                 "08S01",
-                &format!(
-                    "bad handshake: expected client seqno 1, got {seqno_in}"
-                ),
+                &format!("bad handshake: expected client seqno 1, got {seqno_in}"),
             ),
+        );
+    }
+    if looks_like_ssl_request(&payload) {
+        // ---- TLS upgrade ----
+        let mut tls_conn = match build_server_connection() {
+            Ok(c) => c,
+            Err(e) => {
+                return write_packet(
+                    &mut stream,
+                    seqno_in.wrapping_add(1),
+                    &encode_err_packet(
+                        2026,
+                        "08000",
+                        &format!("SSL: server config init failed: {e}"),
+                    ),
+                );
+            }
+        };
+        // rustls::Stream owns the bridge between the connection
+        // state and the TCP socket. complete_io drives both
+        // halves of the handshake bytes through the socket. Then
+        // we read the post-handshake HandshakeResponse41 packet
+        // off the encrypted stream.
+        let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+        let (seqno_in, payload) = read_packet(&mut tls_stream)?;
+        let parsed = match parse_handshake_response_41(&payload) {
+            Ok(r) => r,
+            Err(msg) => {
+                return write_packet(
+                    &mut tls_stream,
+                    seqno_in.wrapping_add(1),
+                    &encode_err_packet(1043, "08S01", &msg),
+                );
+            }
+        };
+        let scramble = std::mem::take(&mut greeting.scramble);
+        return complete_auth_and_command(
+            &mut tls_stream,
+            state,
+            &parsed,
+            &scramble,
+            seqno_in,
         );
     }
     let parsed = match parse_handshake_response_41(&payload) {
@@ -212,29 +270,39 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     //     carve-out — fast-path failures surface as Access
     //     Denied here.
     let scramble = std::mem::take(&mut greeting.scramble);
-    let auth_outcome = verify_handshake_response(state, &parsed, &scramble);
+    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in)
+}
+
+/// v7.17.0 Phase 3.P0-77 — auth verification + command loop
+/// generic over the underlying stream. Plain-TCP and TLS paths
+/// converge here so the auth code only exists once.
+fn complete_auth_and_command(
+    stream: &mut dyn ReadWrite,
+    state: &Arc<ServerState>,
+    parsed: &HandshakeResponse41,
+    scramble: &[u8],
+    seqno_in: u8,
+) -> std::io::Result<()> {
+    let auth_outcome = verify_handshake_response(state, parsed, scramble);
     let reply_seqno = seqno_in.wrapping_add(1);
     match auth_outcome {
         AuthOutcome::Ok => {
-            write_packet(&mut stream, reply_seqno, &encode_ok_packet())?;
+            write_packet(stream, reply_seqno, &encode_ok_packet())?;
         }
         AuthOutcome::CachingSha2FastAuthOk => {
-            // Auth More Data packet: header byte 0x01 + status
-            // byte 0x03 ("fast auth success"). Client expects
-            // this, then OK on the next seqno.
-            write_packet(&mut stream, reply_seqno, &[0x01, 0x03])?;
-            write_packet(&mut stream, reply_seqno.wrapping_add(1), &encode_ok_packet())?;
+            write_packet(stream, reply_seqno, &[0x01, 0x03])?;
+            write_packet(stream, reply_seqno.wrapping_add(1), &encode_ok_packet())?;
         }
         AuthOutcome::AccessDenied(msg) => {
             return write_packet(
-                &mut stream,
+                stream,
                 reply_seqno,
                 &encode_err_packet(1045, "28000", &msg),
             );
         }
         AuthOutcome::PluginMismatch(plugin) => {
             return write_packet(
-                &mut stream,
+                stream,
                 reply_seqno,
                 &encode_err_packet(
                     1251,
@@ -246,13 +314,58 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             );
         }
     }
+    command_loop(stream, state)
+}
 
-    // ---- Command phase ---------------------------------------
-    //
-    // v7.17.0 Phase 3.P0-73 — text-protocol COM_QUERY. Each new
-    // command resets the sequence counter; the server's reply
-    // starts at seqno=1 (the command itself was seqno=0).
-    command_loop(&mut stream, state)
+/// v7.17.0 Phase 3.P0-77 — detect the `Protocol::SSLRequest`
+/// packet shape: exactly 32 bytes (cap flags 4 + max packet 4 +
+/// charset 1 + 23-byte reserved filler) AND the CLIENT_SSL bit
+/// is set in the cap flags. HandshakeResponse41 always has more
+/// than 32 bytes (at least a username + auth bytes), so the
+/// disambiguation is unambiguous.
+fn looks_like_ssl_request(payload: &[u8]) -> bool {
+    if payload.len() != 32 {
+        return false;
+    }
+    let caps = u32::from_le_bytes(payload[..4].try_into().unwrap_or([0; 4]));
+    caps & CLIENT_SSL != 0
+}
+
+/// v7.17.0 Phase 3.P0-77 — build a rustls server connection
+/// against the process-global self-signed cert. The cert is
+/// minted lazily on first connection so the listener startup
+/// cost stays zero when nothing's connected yet. Operator
+/// deployments that need a real cert hook `SPG_MYSQLWIRE_TLS_*`
+/// env vars in a follow-on commit.
+fn build_server_connection() -> Result<rustls::ServerConnection, String> {
+    let cfg = tls_server_config()?;
+    rustls::ServerConnection::new(cfg).map_err(|e| format!("rustls accept: {e}"))
+}
+
+fn tls_server_config() -> Result<Arc<rustls::ServerConfig>, String> {
+    static CFG: std::sync::OnceLock<Result<Arc<rustls::ServerConfig>, String>> =
+        std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        // Install the ring crypto provider if no provider has
+        // been registered yet. rustls 0.23 demands an explicit
+        // pick; ring is what we depend on.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .map_err(|e| format!("rcgen: {e}"))?;
+        let cert_der_bytes = cert.cert.der().to_vec();
+        let key_der_bytes = cert.key_pair.serialize_der();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert_der_bytes);
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der_bytes),
+        );
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .map_err(|e| format!("rustls cert: {e}"))?;
+        Ok(Arc::new(cfg))
+    })
+    .clone()
 }
 
 /// v7.17.0 Phase 3.P0-74 — per-session prepared-statement
@@ -275,7 +388,7 @@ struct PreparedEntry {
 }
 
 fn command_loop(
-    stream: &mut TcpStream,
+    stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
 ) -> std::io::Result<()> {
     let mut prepared = PreparedState::default();
@@ -398,7 +511,7 @@ pub(crate) const CMD_STMT_CLOSE: u8 = 0x19;
 pub(crate) const CMD_STMT_RESET: u8 = 0x1a;
 
 fn handle_com_query(
-    stream: &mut TcpStream,
+    stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
     sql: &str,
     start_seqno: u8,
@@ -453,7 +566,7 @@ fn handle_com_query(
 // ---- COM_STMT_PREPARE / EXECUTE ----------------------------
 
 fn handle_com_stmt_prepare(
-    stream: &mut TcpStream,
+    stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
     prepared: &mut PreparedState,
     sql: &str,
@@ -549,7 +662,7 @@ fn handle_com_stmt_prepare(
 }
 
 fn handle_com_stmt_execute(
-    stream: &mut TcpStream,
+    stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
     prepared: &mut PreparedState,
     payload: &[u8],
@@ -649,7 +762,7 @@ fn handle_com_stmt_execute(
 // ---- binary result set (P0-76) ------------------------------
 
 fn encode_binary_result_set(
-    stream: &mut TcpStream,
+    stream: &mut (dyn ReadWrite + '_),
     columns: &[ColumnSchema],
     rows: &[spg_storage::Row],
     start_seqno: u8,
@@ -968,7 +1081,7 @@ fn decode_binary_param(ty: u8, unsigned: bool, buf: &[u8]) -> Result<(Value, usi
 ///   * N column_def_41 packets + EOF / OK on success
 ///   * ERR(1146) when the table is missing.
 fn handle_com_field_list(
-    stream: &mut TcpStream,
+    stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
     payload: &[u8],
     start_seqno: u8,
@@ -1016,7 +1129,7 @@ fn handle_com_field_list(
 // ---- text-protocol result set -------------------------------
 
 fn encode_text_result_set(
-    stream: &mut TcpStream,
+    stream: &mut (dyn ReadWrite + '_),
     columns: &[ColumnSchema],
     rows: &[spg_storage::Row],
     start_seqno: u8,
@@ -1435,7 +1548,7 @@ pub(crate) fn encode_err_packet(errno: u16, sqlstate: &str, msg: &str) -> Vec<u8
 // ---- packet framing -----------------------------------------
 
 pub(crate) fn write_packet(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     seqno: u8,
     payload: &[u8],
 ) -> std::io::Result<()> {
@@ -1460,7 +1573,7 @@ pub(crate) fn write_packet(
     Ok(())
 }
 
-pub(crate) fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+pub(crate) fn read_packet(stream: &mut dyn Read) -> std::io::Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr)?;
     let len = u32::from(hdr[0]) | (u32::from(hdr[1]) << 8) | (u32::from(hdr[2]) << 16);
