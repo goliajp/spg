@@ -59,6 +59,14 @@ pub enum Statement {
     Update(UpdateStatement),
     /// v4.4 — `DELETE FROM <table> [WHERE cond]`.
     Delete(DeleteStatement),
+    /// v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ `MERGE` statement.
+    /// `MERGE INTO target [alias] USING source [alias] ON cond
+    /// WHEN MATCHED [AND cond] THEN { UPDATE SET … | DELETE | DO NOTHING }
+    /// WHEN NOT MATCHED [AND cond] THEN { INSERT (cols) VALUES (vals) | DO NOTHING }
+    /// [WHEN …]`. SPG v7.17 supports table-based source (subquery
+    /// source is a follow-up); BY SOURCE / BY TARGET and RETURNING
+    /// are also follow-ups.
+    Merge(MergeStatement),
     Begin,
     Commit,
     Rollback,
@@ -1535,6 +1543,57 @@ pub struct DeleteStatement {
     pub returning: Option<Vec<SelectItem>>,
 }
 
+/// v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ MERGE statement.
+/// One WHEN clause fires per source row depending on whether the
+/// `on` condition matched any target row(s); the executor walks
+/// `clauses` in declaration order and fires the first whose
+/// `matched` kind and optional `condition` are both satisfied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeStatement {
+    pub target: String,
+    pub target_alias: Option<String>,
+    pub source: String,
+    pub source_alias: Option<String>,
+    pub on: Expr,
+    pub clauses: Vec<MergeWhenClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeWhenClause {
+    pub matched: MergeMatched,
+    /// Optional `AND <expr>` filter — when present, the clause
+    /// only fires for the source rows whose match-pair satisfies
+    /// the predicate.
+    pub condition: Option<Expr>,
+    pub action: MergeAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMatched {
+    Matched,
+    NotMatched,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeAction {
+    /// `INSERT (cols) VALUES (vals)`. SPG v7.17 requires the
+    /// explicit column list (the bare `INSERT VALUES (vals)`
+    /// shape lands later).
+    Insert {
+        columns: Vec<String>,
+        values: Vec<Expr>,
+    },
+    /// `UPDATE SET col = expr [, …]` — applied to every matched
+    /// target row for the firing source row.
+    Update { assignments: Vec<(String, Expr)> },
+    /// `DELETE` — drop every matched target row.
+    Delete,
+    /// `DO NOTHING` — explicit no-op (the SQL standard accepts
+    /// the clause and SPG mirrors so a customer-side MERGE that
+    /// uses it for branch-control doesn't error).
+    DoNothing,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
     pub table: String,
@@ -2202,6 +2261,64 @@ impl fmt::Display for Statement {
             Self::Insert(s) => s.fmt(f),
             Self::Update(s) => s.fmt(f),
             Self::Delete(s) => s.fmt(f),
+            Self::Merge(s) => {
+                // v7.17.0 Phase 3.P0-42 — MERGE display is approximate
+                // (it round-trips for the cases tests cover, not for
+                // round-tripping every edge of the surface).
+                f.write_str("MERGE INTO ")?;
+                write!(f, "{}", quote_ident(&s.target))?;
+                if let Some(a) = &s.target_alias {
+                    write!(f, " {}", quote_ident(a))?;
+                }
+                f.write_str(" USING ")?;
+                write!(f, "{}", quote_ident(&s.source))?;
+                if let Some(a) = &s.source_alias {
+                    write!(f, " {}", quote_ident(a))?;
+                }
+                write!(f, " ON {}", s.on)?;
+                for clause in &s.clauses {
+                    f.write_str(" WHEN ")?;
+                    f.write_str(match clause.matched {
+                        MergeMatched::Matched => "MATCHED",
+                        MergeMatched::NotMatched => "NOT MATCHED",
+                    })?;
+                    if let Some(c) = &clause.condition {
+                        write!(f, " AND {c}")?;
+                    }
+                    f.write_str(" THEN ")?;
+                    match &clause.action {
+                        MergeAction::Insert { columns, values } => {
+                            f.write_str("INSERT (")?;
+                            for (i, c) in columns.iter().enumerate() {
+                                if i > 0 {
+                                    f.write_str(", ")?;
+                                }
+                                write!(f, "{}", quote_ident(c))?;
+                            }
+                            f.write_str(") VALUES (")?;
+                            for (i, v) in values.iter().enumerate() {
+                                if i > 0 {
+                                    f.write_str(", ")?;
+                                }
+                                write!(f, "{v}")?;
+                            }
+                            f.write_str(")")?;
+                        }
+                        MergeAction::Update { assignments } => {
+                            f.write_str("UPDATE SET ")?;
+                            for (i, (c, e)) in assignments.iter().enumerate() {
+                                if i > 0 {
+                                    f.write_str(", ")?;
+                                }
+                                write!(f, "{} = {e}", quote_ident(c))?;
+                            }
+                        }
+                        MergeAction::Delete => f.write_str("DELETE")?,
+                        MergeAction::DoNothing => f.write_str("DO NOTHING")?,
+                    }
+                }
+                Ok(())
+            }
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),

@@ -791,6 +791,16 @@ impl Parser {
                 self.advance();
                 Ok(Statement::CompactColdSegments)
             }
+            // v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ MERGE.
+            // Parsed as a case-insensitive identifier since MERGE
+            // isn't a reserved lexer keyword (collides with the
+            // mysqldump `ALGORITHM = MERGE` view clause if it
+            // were); the inner parser drives the rest of the
+            // surface (USING / ON / WHEN [NOT] MATCHED / THEN).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("merge") => {
+                self.advance();
+                self.parse_merge_after_keyword()
+            }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("analyze") => {
                 self.advance();
                 let target = match self.peek() {
@@ -3199,6 +3209,255 @@ impl Parser {
             table,
             where_,
             returning,
+        }))
+    }
+
+    /// v7.17.0 Phase 3.P0-42 — parse `MERGE INTO <target> [alias]
+    /// USING <source> [alias] ON <expr> WHEN [NOT] MATCHED [AND
+    /// <expr>] THEN <action> [WHEN …]` after the leading `MERGE`
+    /// keyword. v7.17 surface:
+    ///   * source: table reference (subquery source is a follow-up)
+    ///   * actions: UPDATE SET / DELETE / DO NOTHING (matched);
+    ///     INSERT (cols) VALUES (vals) / DO NOTHING (not matched)
+    ///   * AND-conditioned WHEN clauses; clauses tried in declaration
+    ///     order
+    fn parse_merge_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        // INTO
+        let is_into_kw = matches!(self.peek(), Token::Into)
+            || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("into"));
+        if !is_into_kw {
+            return Err(self.err(format!("expected INTO after MERGE, got {:?}", self.peek())));
+        }
+        self.advance();
+        let target = self.expect_ident_like()?;
+        // Optional alias — bare ident before USING.
+        let target_alias = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("using") => {
+                Some(self.expect_ident_like()?)
+            }
+            _ => None,
+        };
+        // USING
+        let is_using_kw = matches!(
+            self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("using")
+        );
+        if !is_using_kw {
+            return Err(self.err(format!(
+                "expected USING after MERGE INTO target, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let source = self.expect_ident_like()?;
+        let source_alias = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("on") => {
+                Some(self.expect_ident_like()?)
+            }
+            _ => None,
+        };
+        // ON
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(format!(
+                "expected ON after MERGE … USING source, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let on = self.parse_expr(0)?;
+        // One or more WHEN clauses.
+        let mut clauses: Vec<crate::ast::MergeWhenClause> = Vec::new();
+        loop {
+            let is_when_kw = matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("when")
+            );
+            if !is_when_kw {
+                break;
+            }
+            self.advance(); // WHEN
+            // [NOT] MATCHED
+            let matched = if matches!(self.peek(), Token::Not) {
+                self.advance();
+                crate::ast::MergeMatched::NotMatched
+            } else {
+                crate::ast::MergeMatched::Matched
+            };
+            let is_matched_kw = matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("matched")
+            );
+            if !is_matched_kw {
+                return Err(self.err(format!(
+                    "expected MATCHED in WHEN clause, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            // Optional AND <expr>
+            let condition = if matches!(self.peek(), Token::And) {
+                self.advance();
+                Some(self.parse_expr(0)?)
+            } else {
+                None
+            };
+            // THEN
+            let is_then_kw = matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("then")
+            );
+            if !is_then_kw {
+                return Err(self.err(format!(
+                    "expected THEN in WHEN clause, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            // Action: INSERT / UPDATE / DELETE / DO NOTHING
+            let action = match self.peek().clone() {
+                Token::Insert => {
+                    self.advance();
+                    // (cols)
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(format!(
+                            "expected '(' after INSERT in MERGE, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut columns: Vec<String> = Vec::new();
+                    loop {
+                        columns.push(self.expect_ident_like()?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after INSERT column list, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    // VALUES (...)
+                    if !matches!(self.peek(), Token::Values) {
+                        return Err(self.err(format!(
+                            "expected VALUES in MERGE INSERT, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(format!(
+                            "expected '(' after VALUES in MERGE INSERT, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut values: Vec<crate::ast::Expr> = Vec::new();
+                    loop {
+                        values.push(self.parse_expr(0)?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after MERGE INSERT values, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if columns.len() != values.len() {
+                        return Err(self.err(format!(
+                            "MERGE INSERT column count ({}) ≠ value count ({})",
+                            columns.len(),
+                            values.len()
+                        )));
+                    }
+                    crate::ast::MergeAction::Insert { columns, values }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
+                    self.advance();
+                    // SET
+                    let is_set_kw = matches!(
+                        self.peek(),
+                        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("set")
+                    );
+                    if !is_set_kw {
+                        return Err(self.err(format!(
+                            "expected SET after UPDATE in MERGE, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut assignments: Vec<(String, crate::ast::Expr)> = Vec::new();
+                    loop {
+                        let col = self.expect_ident_like()?;
+                        if !matches!(self.peek(), Token::Eq) {
+                            return Err(self.err(format!(
+                                "expected '=' in MERGE UPDATE assignment, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let expr = self.parse_expr(0)?;
+                        assignments.push((col, expr));
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    crate::ast::MergeAction::Update { assignments }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete") => {
+                    self.advance();
+                    crate::ast::MergeAction::Delete
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do") => {
+                    self.advance();
+                    let is_nothing_kw = matches!(
+                        self.peek(),
+                        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("nothing")
+                    );
+                    if !is_nothing_kw {
+                        return Err(self.err(format!(
+                            "expected NOTHING after DO in MERGE clause, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    crate::ast::MergeAction::DoNothing
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "expected INSERT / UPDATE / DELETE / DO NOTHING in MERGE clause, got {other:?}"
+                    )));
+                }
+            };
+            clauses.push(crate::ast::MergeWhenClause {
+                matched,
+                condition,
+                action,
+            });
+        }
+        if clauses.is_empty() {
+            return Err(self.err(String::from(
+                "MERGE requires at least one WHEN clause",
+            )));
+        }
+        Ok(Statement::Merge(crate::ast::MergeStatement {
+            target,
+            target_alias,
+            source,
+            source_alias,
+            on,
+            clauses,
         }))
     }
 

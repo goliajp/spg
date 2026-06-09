@@ -1,14 +1,22 @@
-//! v7.17.0 Phase 3.5 — MERGE statement (SQL:2003 / PG 15+).
+//! v7.17.0 Phase 3.5 → P0-42 — SQL:2003 / PG 15+ MERGE statement.
 //!
-//! Status: SPG's parser doesn't model the MERGE statement.
-//! Implementing MERGE end-to-end (target/source resolution,
-//! WHEN MATCHED / NOT MATCHED branches, action dispatch,
-//! row-level RETURNING) is a multi-day refactor carved out
-//! for v7.18.
+//! Status: Phase 3.5 carved this out; v7.17.0 Phase 3.P0-42 lands
+//! the real implementation. SPG accepts:
+//!   * `MERGE INTO target [alias] USING source [alias] ON expr`
+//!   * `WHEN MATCHED [AND expr] THEN { UPDATE SET … | DELETE | DO NOTHING }`
+//!   * `WHEN NOT MATCHED [AND expr] THEN { INSERT (cols) VALUES (vals) | DO NOTHING }`
 //!
-//! Customer workaround for the dominant upsert shape:
-//! PG's `INSERT … ON CONFLICT … DO UPDATE` (which SPG already
-//! supports) covers ~ 90% of the customer MERGE use cases.
+//! v7.17 limitations (carved out as separate follow-ups):
+//!   * Source must be a catalog table (no subquery source yet)
+//!   * No RETURNING clause
+//!   * No BY SOURCE / BY TARGET (PG 17+ extensions)
+//!   * No row triggers / WAL bookkeeping inside the MERGE write path
+//!   * No cardinality enforcement (PG-canonical: a target row
+//!     covered twice raises an error; SPG silently applies the
+//!     last firing action)
+//!
+//! INSERT … ON CONFLICT … DO UPDATE still works as the
+//! upsert-shaped alternative.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -31,18 +39,84 @@ fn setup(e: &mut Engine) {
 }
 
 #[test]
-fn merge_statement_is_documented_gap() {
+fn merge_upsert_updates_matched_and_inserts_not_matched() {
     let mut e = Engine::new();
     setup(&mut e);
-    let r = e.execute(
+    e.execute(
         "MERGE INTO target t USING source s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET val = s.val \
          WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)",
-    );
-    assert!(
-        r.is_err(),
-        "MERGE is documented gap in v7.17; expected parse error"
-    );
+    )
+    .unwrap();
+    let r = rows(e.execute("SELECT id, val FROM target ORDER BY id").unwrap());
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][1], Value::Int(150), "id=1 updated from 100 → 150");
+    assert_eq!(r[1][1], Value::Int(200), "id=2 unchanged");
+    assert_eq!(r[2][1], Value::Int(300), "id=3 inserted");
+}
+
+#[test]
+fn merge_matched_delete_removes_matched_rows() {
+    let mut e = Engine::new();
+    setup(&mut e);
+    e.execute(
+        "MERGE INTO target t USING source s ON t.id = s.id \
+         WHEN MATCHED THEN DELETE",
+    )
+    .unwrap();
+    let r = rows(e.execute("SELECT id FROM target ORDER BY id").unwrap());
+    // id=1 deleted (matched); id=2 stays (no match in source).
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int(2));
+}
+
+#[test]
+fn merge_with_when_matched_and_condition_filters() {
+    // Use AND condition to update only when source val > 100.
+    let mut e = Engine::new();
+    setup(&mut e);
+    e.execute(
+        "MERGE INTO target t USING source s ON t.id = s.id \
+         WHEN MATCHED AND s.val > 100 THEN UPDATE SET val = s.val",
+    )
+    .unwrap();
+    let r = rows(e.execute("SELECT id, val FROM target ORDER BY id").unwrap());
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][1], Value::Int(150), "id=1 update fired (150 > 100)");
+    assert_eq!(r[1][1], Value::Int(200), "id=2 unchanged (no source match)");
+}
+
+#[test]
+fn merge_when_not_matched_only() {
+    // Only the NOT MATCHED clause is provided — matched source
+    // rows fall through without changes.
+    let mut e = Engine::new();
+    setup(&mut e);
+    e.execute(
+        "MERGE INTO target t USING source s ON t.id = s.id \
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)",
+    )
+    .unwrap();
+    let r = rows(e.execute("SELECT id, val FROM target ORDER BY id").unwrap());
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0][1], Value::Int(100), "id=1 NOT updated");
+    assert_eq!(r[2][1], Value::Int(300), "id=3 inserted");
+}
+
+#[test]
+fn merge_do_nothing_explicit() {
+    let mut e = Engine::new();
+    setup(&mut e);
+    e.execute(
+        "MERGE INTO target t USING source s ON t.id = s.id \
+         WHEN MATCHED THEN DO NOTHING \
+         WHEN NOT MATCHED THEN DO NOTHING",
+    )
+    .unwrap();
+    let r = rows(e.execute("SELECT id, val FROM target ORDER BY id").unwrap());
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][1], Value::Int(100));
+    assert_eq!(r[1][1], Value::Int(200));
 }
 
 #[test]
