@@ -628,12 +628,8 @@ fn handle_com_stmt_execute(
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
-            // v7.17.0 Phase 3.P0-74 — SELECT through EXECUTE
-            // currently falls through to the text result-set
-            // shape so the client still gets the row data even
-            // though the column type bytes say VAR_STRING. P0-76
-            // lifts this to true binary result rows.
-            encode_text_result_set(stream, &columns, &rows, start_seqno)?;
+            // v7.17.0 Phase 3.P0-76 — true binary result rows.
+            encode_binary_result_set(stream, &columns, &rows, start_seqno)?;
         }
         Ok(_) => {
             write_packet(
@@ -648,6 +644,156 @@ fn handle_com_stmt_execute(
         }
     }
     Ok(())
+}
+
+// ---- binary result set (P0-76) ------------------------------
+
+fn encode_binary_result_set(
+    stream: &mut TcpStream,
+    columns: &[ColumnSchema],
+    rows: &[spg_storage::Row],
+    start_seqno: u8,
+) -> std::io::Result<()> {
+    // 1) column_count packet.
+    let mut payload = Vec::new();
+    encode_lenenc_int(&mut payload, columns.len() as u64);
+    let mut seq = start_seqno;
+    write_packet(stream, seq, &payload)?;
+    seq = seq.wrapping_add(1);
+    // 2) column_def_41 packets (same shape as text protocol).
+    for c in columns {
+        let buf = encode_column_def_41(c);
+        write_packet(stream, seq, &buf)?;
+        seq = seq.wrapping_add(1);
+    }
+    // 3) binary row packets.
+    for row in rows {
+        let buf = encode_binary_row(&row.values, columns);
+        write_packet(stream, seq, &buf)?;
+        seq = seq.wrapping_add(1);
+    }
+    // 4) trailing OK.
+    write_packet(stream, seq, &encode_ok_packet())?;
+    Ok(())
+}
+
+fn encode_binary_row(values: &[Value], columns: &[ColumnSchema]) -> Vec<u8> {
+    let n = values.len();
+    let bitmap_len = (n + 7 + 2) / 8;
+    let mut out = Vec::with_capacity(1 + bitmap_len + values.len() * 8);
+    out.push(0x00); // packet header
+    // Reserve space for the NULL bitmap; we'll fill in shortly.
+    let bitmap_start = out.len();
+    out.extend(std::iter::repeat(0u8).take(bitmap_len));
+    for (i, v) in values.iter().enumerate() {
+        if matches!(v, Value::Null) {
+            let bit_idx = i + 2; // first 2 bits reserved
+            out[bitmap_start + bit_idx / 8] |= 1 << (bit_idx % 8);
+            continue;
+        }
+        let ty = columns.get(i).map(|c| c.ty);
+        encode_binary_value(&mut out, v, ty);
+    }
+    out
+}
+
+fn encode_binary_value(out: &mut Vec<u8>, v: &Value, declared: Option<DataType>) {
+    match v {
+        Value::Null => {} // handled by NULL bitmap caller-side
+        Value::Bool(b) => out.push(if *b { 1 } else { 0 }),
+        Value::SmallInt(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Int(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::BigInt(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Float(f) => out.extend_from_slice(&f.to_le_bytes()),
+        Value::Text(s) | Value::Json(s) => {
+            encode_lenenc_string(out, s.as_bytes());
+        }
+        Value::Date(days) => encode_binary_date(out, *days),
+        Value::Timestamp(us) => {
+            let is_tz = matches!(declared, Some(DataType::Timestamptz));
+            encode_binary_datetime(out, *us, is_tz);
+        }
+        Value::Bytes(b) => encode_lenenc_string(out, b),
+        // Everything else (Numeric, Vector, TsVector, Range,
+        // Hstore, Money, UUID, Interval, Inet, MacAddr, etc.)
+        // serialises as the engine's canonical text — same
+        // shape clients see through the text-protocol path.
+        other => {
+            let text = value_to_mysql_text(other);
+            encode_lenenc_string(out, text.as_bytes());
+        }
+    }
+}
+
+fn encode_binary_date(out: &mut Vec<u8>, days_since_epoch: i32) {
+    // 1 byte length + (4 bytes: year u16, month u8, day u8)
+    let (year, month, day) = ymd_from_days_since_epoch(days_since_epoch);
+    out.push(4);
+    out.extend_from_slice(&year.to_le_bytes());
+    out.push(month);
+    out.push(day);
+}
+
+fn encode_binary_datetime(out: &mut Vec<u8>, micros_since_epoch: i64, _is_tz: bool) {
+    let days = micros_since_epoch.div_euclid(86_400_000_000) as i32;
+    let intra_day_us = micros_since_epoch.rem_euclid(86_400_000_000) as u64;
+    let (year, month, day) = ymd_from_days_since_epoch(days);
+    let hour = (intra_day_us / 3_600_000_000) as u8;
+    let rem = intra_day_us % 3_600_000_000;
+    let minute = (rem / 60_000_000) as u8;
+    let rem = rem % 60_000_000;
+    let second = (rem / 1_000_000) as u8;
+    let us = rem % 1_000_000;
+    if us == 0 && hour == 0 && minute == 0 && second == 0 {
+        // Date-only DATETIME — 4-byte form.
+        out.push(4);
+        out.extend_from_slice(&year.to_le_bytes());
+        out.push(month);
+        out.push(day);
+        return;
+    }
+    if us == 0 {
+        out.push(7);
+        out.extend_from_slice(&year.to_le_bytes());
+        out.push(month);
+        out.push(day);
+        out.push(hour);
+        out.push(minute);
+        out.push(second);
+        return;
+    }
+    out.push(11);
+    out.extend_from_slice(&year.to_le_bytes());
+    out.push(month);
+    out.push(day);
+    out.push(hour);
+    out.push(minute);
+    out.push(second);
+    out.extend_from_slice(&(us as u32).to_le_bytes());
+}
+
+/// Civil-calendar split — same algorithm SPG's engine uses for
+/// DATE rendering. Returns (year, month, day) where year fits
+/// u16 (1970-2155 covers the practical range; year < 0 is
+/// rendered as 0 to keep the field width sane).
+fn ymd_from_days_since_epoch(days: i32) -> (u16, u8, u8) {
+    // Re-use the engine's canonical formatter then re-parse —
+    // gives one source of truth for the Y/M/D split logic.
+    let text = spg_engine::eval::format_date(days);
+    let bytes = text.as_bytes();
+    let year: u16 = std::str::from_utf8(&bytes[..4])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let month: u8 = std::str::from_utf8(&bytes[5..7])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let day: u8 = std::str::from_utf8(&bytes[8..10])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    (year, month, day)
 }
 
 impl PreparedEntry {
