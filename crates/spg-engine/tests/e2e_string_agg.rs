@@ -130,9 +130,10 @@ fn string_agg_arity_three_args_errors() {
     let mut e = engine_with_tags();
     // 3-arg form (with ORDER BY) not yet supported — must error,
     // not silently drop.
-    assert!(e
-        .execute("SELECT string_agg(tag, ',', 'x') FROM t")
-        .is_err());
+    assert!(
+        e.execute("SELECT string_agg(tag, ',', 'x') FROM t")
+            .is_err()
+    );
 }
 
 #[test]
@@ -145,9 +146,7 @@ fn string_agg_int_input_coerced_to_text() {
     e.execute("INSERT INTO n VALUES (1), (2)").unwrap();
     // PG: `string_agg(integer, text)` errors. We accept the cast
     // form `string_agg(v::text, ',')` as the canonical workaround.
-    let r = e
-        .execute("SELECT string_agg(v::text, ',') FROM n")
-        .unwrap();
+    let r = e.execute("SELECT string_agg(v::text, ',') FROM n").unwrap();
     let row = one_row(r);
     assert_eq!(row[0], Value::Text("1,2".into()));
 }
@@ -216,10 +215,7 @@ fn array_agg_int_returns_int_array() {
     let row = one_row(r);
     match &row[0] {
         Value::IntArray(items) => {
-            assert_eq!(
-                items,
-                &vec![Some(3), Some(1), Some(4), Some(1), Some(5)]
-            );
+            assert_eq!(items, &vec![Some(3), Some(1), Some(4), Some(1), Some(5)]);
         }
         other => panic!("expected IntArray, got {other:?}"),
     }

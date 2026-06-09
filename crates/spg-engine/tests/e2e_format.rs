@@ -20,9 +20,7 @@ fn percent_s_text_substitution() {
 #[test]
 fn percent_s_multiple_args() {
     let mut e = Engine::new();
-    let r = rows(
-        e.execute("SELECT format('%s + %s = %s', 1, 2, 3)").unwrap(),
-    );
+    let r = rows(e.execute("SELECT format('%s + %s = %s', 1, 2, 3)").unwrap());
     assert_eq!(r[0][0], Value::Text("1 + 2 = 3".into()));
 }
 
@@ -30,7 +28,8 @@ fn percent_s_multiple_args() {
 fn percent_l_quoted_literal() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT format('WHERE name = %L', 'alice')").unwrap(),
+        e.execute("SELECT format('WHERE name = %L', 'alice')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("WHERE name = 'alice'".into()));
 }
@@ -38,9 +37,7 @@ fn percent_l_quoted_literal() {
 #[test]
 fn percent_l_escapes_single_quote() {
     let mut e = Engine::new();
-    let r = rows(
-        e.execute("SELECT format('= %L', 'O''Brien')").unwrap(),
-    );
+    let r = rows(e.execute("SELECT format('= %L', 'O''Brien')").unwrap());
     assert_eq!(r[0][0], Value::Text("= 'O''Brien'".into()));
 }
 
@@ -55,7 +52,8 @@ fn percent_l_null_renders_as_NULL_literal() {
 fn percent_capital_i_quoted_identifier() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT format('SELECT FROM %I', 'mytable')").unwrap(),
+        e.execute("SELECT format('SELECT FROM %I', 'mytable')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text(r#"SELECT FROM "mytable""#.into()));
 }
@@ -63,9 +61,7 @@ fn percent_capital_i_quoted_identifier() {
 #[test]
 fn percent_capital_i_escapes_double_quote() {
     let mut e = Engine::new();
-    let r = rows(
-        e.execute("SELECT format('%I', 'has\"quote')").unwrap(),
-    );
+    let r = rows(e.execute("SELECT format('%I', 'has\"quote')").unwrap());
     assert_eq!(r[0][0], Value::Text(r#""has""quote""#.into()));
 }
 
@@ -81,7 +77,8 @@ fn positional_argument_n_dollar() {
     // PG `format` supports `%n$X` positional refs (1-based).
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT format('%2$s %1$s', 'last', 'first')").unwrap(),
+        e.execute("SELECT format('%2$s %1$s', 'last', 'first')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("first last".into()));
 }

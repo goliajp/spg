@@ -55,10 +55,8 @@ fn pg_constraint_lists_foreign_key() {
 #[test]
 fn pg_constraint_lists_composite_unique() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b))",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b))")
+        .unwrap();
     let r = rows(
         e.execute(
             "SELECT contype, conkey FROM pg_catalog.pg_constraint \

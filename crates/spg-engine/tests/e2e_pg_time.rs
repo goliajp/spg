@@ -74,7 +74,9 @@ fn insert_with_microseconds() {
         "INSERT INTO t VALUES (1, '14:30:45.123456')",
     ]);
     let rows = select(&mut eng, "SELECT alarm FROM t");
-    let Value::Time(us) = &rows[0][0] else { panic!() };
+    let Value::Time(us) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*us, 52_245_123_456);
 }
 
@@ -85,7 +87,9 @@ fn time_zero_midnight_round_trips() {
         "INSERT INTO t VALUES (1, '00:00:00')",
     ]);
     let rows = select(&mut eng, "SELECT alarm FROM t");
-    let Value::Time(us) = &rows[0][0] else { panic!() };
+    let Value::Time(us) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*us, 0);
 }
 
@@ -96,7 +100,9 @@ fn time_end_of_day_round_trips() {
         "INSERT INTO t VALUES (1, '23:59:59.999999')",
     ]);
     let rows = select(&mut eng, "SELECT alarm FROM t");
-    let Value::Time(us) = &rows[0][0] else { panic!() };
+    let Value::Time(us) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*us, 86_399_999_999);
 }
 
@@ -111,8 +117,12 @@ fn time_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, alarm FROM schedule ORDER BY id");
     assert_eq!(rows.len(), 2);
-    let Value::Time(a) = &rows[0][1] else { panic!() };
-    let Value::Time(b) = &rows[1][1] else { panic!() };
+    let Value::Time(a) = &rows[0][1] else {
+        panic!()
+    };
+    let Value::Time(b) = &rows[1][1] else {
+        panic!()
+    };
     assert_eq!(*a, 30_600_000_000); // 08:30:00
     assert_eq!(*b, 63_930_000_000); // 17:45:30
 }
@@ -131,7 +141,10 @@ fn time_null_column() {
 fn time_malformed_input_is_error() {
     let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL, alarm TIME)"]);
     let r = eng.execute("INSERT INTO t VALUES (1, 'not a time')");
-    assert!(r.is_err(), "garbage TIME literal must error, not silently store");
+    assert!(
+        r.is_err(),
+        "garbage TIME literal must error, not silently store"
+    );
 }
 
 #[test]

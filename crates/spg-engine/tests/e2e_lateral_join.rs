@@ -30,16 +30,12 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)")
         .unwrap();
-    e.execute(
-        "CREATE TABLE orders (id INT NOT NULL, user_id INT NOT NULL, amount INT NOT NULL)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE orders (id INT NOT NULL, user_id INT NOT NULL, amount INT NOT NULL)")
+        .unwrap();
     e.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')")
         .unwrap();
-    e.execute(
-        "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50), (4, 2, 80)",
-    )
-    .unwrap();
+    e.execute("INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50), (4, 2, 80)")
+        .unwrap();
 }
 
 #[test]

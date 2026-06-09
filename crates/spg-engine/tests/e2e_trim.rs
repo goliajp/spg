@@ -117,7 +117,10 @@ fn trim_with_multi_char_set() {
 #[test]
 fn trim_with_chars_does_not_strip_inner_occurrences() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT trim('xhelloxxworld', 'x')"), "helloxxworld");
+    assert_eq!(
+        text(&mut e, "SELECT trim('xhelloxxworld', 'x')"),
+        "helloxxworld"
+    );
 }
 
 #[test]
@@ -298,7 +301,8 @@ fn trim_inside_where() {
 fn trim_inside_insert_values() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (n TEXT NOT NULL)").unwrap();
-    e.execute("INSERT INTO u VALUES (trim('   hello   '))").unwrap();
+    e.execute("INSERT INTO u VALUES (trim('   hello   '))")
+        .unwrap();
     let row = one_row(e.execute("SELECT n FROM u").unwrap());
     assert_eq!(row[0], Value::Text("hello".into()));
 }

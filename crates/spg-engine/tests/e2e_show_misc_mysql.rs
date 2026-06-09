@@ -17,7 +17,10 @@ fn show_indexes_lists_table_indexes() {
         .unwrap();
     e.execute("CREATE INDEX idx_t_name ON t (name)").unwrap();
     let r = rows(e.execute("SHOW INDEXES FROM t").unwrap());
-    assert!(r.iter().any(|row| row[2] == Value::Text("idx_t_name".into())));
+    assert!(
+        r.iter()
+            .any(|row| row[2] == Value::Text("idx_t_name".into()))
+    );
 }
 
 #[test]

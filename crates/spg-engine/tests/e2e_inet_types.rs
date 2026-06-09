@@ -15,7 +15,8 @@ fn inet_column_type_accepted() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE peers (id INT NOT NULL, addr INET NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO peers VALUES (1, '192.168.1.1')").unwrap();
+    e.execute("INSERT INTO peers VALUES (1, '192.168.1.1')")
+        .unwrap();
     let r = rows(e.execute("SELECT addr FROM peers").unwrap());
     assert_eq!(r[0][0], Value::Text("192.168.1.1".into()));
 }
@@ -25,7 +26,8 @@ fn cidr_column_type_accepted() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE nets (id INT NOT NULL, net CIDR NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO nets VALUES (1, '10.0.0.0/8')").unwrap();
+    e.execute("INSERT INTO nets VALUES (1, '10.0.0.0/8')")
+        .unwrap();
     let r = rows(e.execute("SELECT net FROM nets").unwrap());
     assert_eq!(r[0][0], Value::Text("10.0.0.0/8".into()));
 }

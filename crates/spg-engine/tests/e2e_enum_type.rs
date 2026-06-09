@@ -8,7 +8,8 @@ fn create_type_then_use_in_column() {
     let mut e = Engine::new();
     e.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
         .unwrap();
-    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)").unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)")
+        .unwrap();
     e.execute("INSERT INTO p VALUES (1, 'happy')").unwrap();
     e.execute("INSERT INTO p VALUES (2, 'sad')").unwrap();
     let r = e.execute("SELECT id, m FROM p ORDER BY id").unwrap();
@@ -25,7 +26,8 @@ fn insert_invalid_enum_label_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
         .unwrap();
-    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)").unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)")
+        .unwrap();
     let err = e.execute("INSERT INTO p VALUES (1, 'angry')");
     assert!(err.is_err(), "non-label value should be rejected");
 }
@@ -40,8 +42,10 @@ fn unknown_type_ident_in_create_table_rejected() {
 #[test]
 fn null_value_allowed_when_nullable() {
     let mut e = Engine::new();
-    e.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')").unwrap();
-    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)").unwrap();
+    e.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')")
+        .unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)")
+        .unwrap();
     e.execute("INSERT INTO p VALUES (1, NULL)").unwrap();
     e.execute("INSERT INTO p (id) VALUES (2)").unwrap();
 }
@@ -79,13 +83,18 @@ fn drop_type_if_exists_silent_on_missing() {
 #[test]
 fn enum_type_round_trips_catalog() {
     let mut e = Engine::new();
-    e.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')").unwrap();
-    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)").unwrap();
+    e.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')")
+        .unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)")
+        .unwrap();
     e.execute("INSERT INTO p VALUES (1, 'happy')").unwrap();
     let snapshot = e.catalog().serialize();
     let restored = spg_storage::Catalog::deserialize(&snapshot).expect("round-trip");
     let enum_def = restored.enum_types().get("mood").expect("enum persisted");
-    assert_eq!(enum_def.labels, vec!["sad".to_string(), "happy".to_string()]);
+    assert_eq!(
+        enum_def.labels,
+        vec!["sad".to_string(), "happy".to_string()]
+    );
     let table = restored.get("p").expect("table");
     let col = table
         .schema()
@@ -110,8 +119,10 @@ fn update_to_invalid_label_skipped_for_phase14() {
     // validation is deferred to Phase 1.4b). This test pins the
     // current behaviour so we notice when we tighten it.
     let mut e = Engine::new();
-    e.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')").unwrap();
-    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)").unwrap();
+    e.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+        .unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)")
+        .unwrap();
     e.execute("INSERT INTO p VALUES (1, 'happy')").unwrap();
     // UPDATE may still allow non-label values — this is a known
     // gap; the test documents it. When Phase 1.4b lands, flip the

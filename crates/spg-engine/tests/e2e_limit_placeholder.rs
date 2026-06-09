@@ -108,7 +108,9 @@ fn limit_null_unlimited() {
         "CREATE TABLE t (id INT NOT NULL)",
         "INSERT INTO t VALUES (1), (2), (3), (4), (5)",
     ]);
-    let r = eng.execute("SELECT id FROM t ORDER BY id LIMIT NULL").unwrap();
+    let r = eng
+        .execute("SELECT id FROM t ORDER BY id LIMIT NULL")
+        .unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
@@ -121,7 +123,9 @@ fn limit_all_unlimited() {
         "CREATE TABLE t (id INT NOT NULL)",
         "INSERT INTO t VALUES (1), (2), (3), (4), (5)",
     ]);
-    let r = eng.execute("SELECT id FROM t ORDER BY id LIMIT ALL").unwrap();
+    let r = eng
+        .execute("SELECT id FROM t ORDER BY id LIMIT ALL")
+        .unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
@@ -215,9 +219,7 @@ fn offset_rows_fetch_first_combined() {
         "INSERT INTO t VALUES (1), (2), (3), (4), (5)",
     ]);
     let r = eng
-        .execute(
-            "SELECT id FROM t ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY",
-        )
+        .execute("SELECT id FROM t ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY")
         .unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()

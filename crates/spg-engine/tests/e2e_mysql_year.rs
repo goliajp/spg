@@ -72,7 +72,9 @@ fn insert_text_literal_round_trip() {
         "INSERT INTO t VALUES (1, '2025')",
     ]);
     let rows = select(&mut eng, "SELECT born FROM t");
-    let Value::Year(y) = &rows[0][0] else { panic!() };
+    let Value::Year(y) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*y, 2025);
 }
 
@@ -104,8 +106,12 @@ fn year_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT born FROM c ORDER BY born");
     assert_eq!(rows.len(), 2);
-    let Value::Year(a) = &rows[0][0] else { panic!() };
-    let Value::Year(b) = &rows[1][0] else { panic!() };
+    let Value::Year(a) = &rows[0][0] else {
+        panic!()
+    };
+    let Value::Year(b) = &rows[1][0] else {
+        panic!()
+    };
     assert_eq!((*a, *b), (1985, 2007));
 }
 

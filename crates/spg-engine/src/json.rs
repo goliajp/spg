@@ -724,16 +724,19 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                     }
                     if start == i {
                         return Err(EvalError::TypeMismatch {
-                            detail: "jsonpath: only `[N]` (non-negative) or `[*]` supported in v7.17".into(),
+                            detail:
+                                "jsonpath: only `[N]` (non-negative) or `[*]` supported in v7.17"
+                                    .into(),
                         });
                     }
-                    let idx: usize = chars[start..i]
-                        .iter()
-                        .collect::<String>()
-                        .parse()
-                        .map_err(|_| EvalError::TypeMismatch {
-                            detail: "jsonpath: invalid array index".into(),
-                        })?;
+                    let idx: usize =
+                        chars[start..i]
+                            .iter()
+                            .collect::<String>()
+                            .parse()
+                            .map_err(|_| EvalError::TypeMismatch {
+                                detail: "jsonpath: invalid array index".into(),
+                            })?;
                     if i >= chars.len() || chars[i] != ']' {
                         return Err(EvalError::TypeMismatch {
                             detail: "jsonpath: expected ']' after array index".into(),
@@ -1230,18 +1233,14 @@ fn insert_at_path(
                     insert_at_path(&mut entries[pos].1, rest, new_val, insert_after)
                 } else {
                     Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "jsonb_insert(): path {step:?} does not exist"
-                        ),
+                        detail: alloc::format!("jsonb_insert(): path {step:?} does not exist"),
                     })
                 }
             }
             JsonValue::Array(items) => {
                 let Some(idx) = resolve_array_index(step, items.len()) else {
                     return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "jsonb_insert(): array index {step:?} out of range"
-                        ),
+                        detail: alloc::format!("jsonb_insert(): array index {step:?} out of range"),
                     });
                 };
                 insert_at_path(&mut items[idx], rest, new_val, insert_after)
@@ -1253,11 +1252,7 @@ fn insert_at_path(
     }
 }
 
-fn json_text_arg<'a>(
-    v: &'a Value,
-    fname: &str,
-    role: &str,
-) -> Result<&'a str, EvalError> {
+fn json_text_arg<'a>(v: &'a Value, fname: &str, role: &str) -> Result<&'a str, EvalError> {
     match v {
         Value::Json(s) | Value::Text(s) => Ok(s.as_str()),
         other => Err(EvalError::TypeMismatch {

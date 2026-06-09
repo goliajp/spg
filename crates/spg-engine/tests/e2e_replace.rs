@@ -67,19 +67,13 @@ fn replace_substring_longer_than_one_char() {
 #[test]
 fn replace_with_longer_substring() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT replace('abc', 'b', 'BBB')"),
-        "aBBBc"
-    );
+    assert_eq!(text(&mut e, "SELECT replace('abc', 'b', 'BBB')"), "aBBBc");
 }
 
 #[test]
 fn replace_with_shorter_substring() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT replace('aXXXb', 'XXX', 'Y')"),
-        "aYb"
-    );
+    assert_eq!(text(&mut e, "SELECT replace('aXXXb', 'XXX', 'Y')"), "aYb");
 }
 
 #[test]
@@ -105,10 +99,7 @@ fn replace_empty_from_passes_through_unchanged() {
 #[test]
 fn replace_no_match_passes_through() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT replace('hello', 'XYZ', 'Q')"),
-        "hello"
-    );
+    assert_eq!(text(&mut e, "SELECT replace('hello', 'XYZ', 'Q')"), "hello");
 }
 
 #[test]
@@ -231,9 +222,7 @@ fn replace_over_column() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (n TEXT NOT NULL)").unwrap();
     e.execute("INSERT INTO u VALUES ('foo bar baz')").unwrap();
-    let row = one_row(
-        e.execute("SELECT replace(n, ' ', '-') FROM u").unwrap(),
-    );
+    let row = one_row(e.execute("SELECT replace(n, ' ', '-') FROM u").unwrap());
     assert_eq!(row[0], Value::Text("foo-bar-baz".into()));
 }
 
@@ -245,9 +234,7 @@ fn replace_inside_where() {
     e.execute("INSERT INTO u VALUES (1, '/users/alice'), (2, '/users/bob')")
         .unwrap();
     let r = e
-        .execute(
-            "SELECT id FROM u WHERE replace(p, '/users/', '') = 'alice'",
-        )
+        .execute("SELECT id FROM u WHERE replace(p, '/users/', '') = 'alice'")
         .unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()

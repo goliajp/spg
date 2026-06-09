@@ -90,7 +90,9 @@ fn read_lenenc(buf: &[u8], pos: usize) -> (u64, usize) {
     let first = buf[pos];
     match first {
         0xfc => (
-            u64::from(u16::from_le_bytes(buf[pos + 1..pos + 3].try_into().unwrap())),
+            u64::from(u16::from_le_bytes(
+                buf[pos + 1..pos + 3].try_into().unwrap(),
+            )),
             3,
         ),
         0xfd => {
@@ -148,7 +150,10 @@ fn com_init_db_empty_name_returns_err() {
 fn com_field_list_returns_column_defs_for_existing_table() {
     let (_guard, addr) = spawn();
     let mut s = auth_open(&addr);
-    send_query(&mut s, "CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)");
+    send_query(
+        &mut s,
+        "CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)",
+    );
     let (_seq, _ok) = read_packet(&mut s);
 
     // COM_FIELD_LIST = 0x04 + table\0

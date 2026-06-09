@@ -78,7 +78,11 @@ fn caching_sha2_response(scramble: &[u8], password: &str) -> Vec<u8> {
     buf.extend_from_slice(scramble);
     buf.extend_from_slice(&sha_sha_pwd);
     let mask = sha2::Sha256::digest(&buf);
-    sha_pwd.iter().zip(mask.iter()).map(|(a, b)| a ^ b).collect()
+    sha_pwd
+        .iter()
+        .zip(mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect()
 }
 
 /// SHA1(password) XOR SHA1(scramble || SHA1(SHA1(password)))
@@ -90,14 +94,14 @@ fn mysql_native_response(scramble: &[u8], password: &str) -> Vec<u8> {
     buf.extend_from_slice(scramble);
     buf.extend_from_slice(&sha_sha_pwd);
     let mask = sha1::Sha1::digest(&buf);
-    sha_pwd.iter().zip(mask.iter()).map(|(a, b)| a ^ b).collect()
+    sha_pwd
+        .iter()
+        .zip(mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect()
 }
 
-fn build_handshake_response(
-    username: &str,
-    auth_response: &[u8],
-    plugin: &str,
-) -> Vec<u8> {
+fn build_handshake_response(username: &str, auth_response: &[u8], plugin: &str) -> Vec<u8> {
     let caps: u32 = 0x0000_0200 | 0x0000_8000 | 0x0008_0000;
     let mut payload = Vec::new();
     payload.extend_from_slice(&caps.to_le_bytes());
@@ -113,12 +117,7 @@ fn build_handshake_response(
     payload
 }
 
-fn run_handshake(
-    addr: &str,
-    username: &str,
-    plugin: &str,
-    response: &[u8],
-) -> Vec<(u8, Vec<u8>)> {
+fn run_handshake(addr: &str, username: &str, plugin: &str, response: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut s = common::connect_to(addr);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let (_seqno, _greeting) = read_packet(&mut s);
@@ -245,7 +244,10 @@ fn same_user_can_auth_via_either_plugin() {
         let resp = build_handshake_response("carol", &auth, "mysql_native_password");
         write_packet(&mut s, 1, &resp);
         let (_seq, ok) = read_packet(&mut s);
-        assert_eq!(ok[0], 0x00, "mysql_native auth also passes for the same user");
+        assert_eq!(
+            ok[0], 0x00,
+            "mysql_native auth also passes for the same user"
+        );
     }
 }
 

@@ -52,7 +52,10 @@ fn interval_literal_in_expression_position() {
 #[test]
 fn interval_with_compound_units() {
     let mut e = Engine::new();
-    let r = rows(e.execute("SELECT '1 day 2 hours 3 minutes'::INTERVAL").unwrap());
+    let r = rows(
+        e.execute("SELECT '1 day 2 hours 3 minutes'::INTERVAL")
+            .unwrap(),
+    );
     let Value::Interval { months, micros } = r[0][0] else {
         panic!();
     };
@@ -88,11 +91,13 @@ fn timestamp_plus_interval_via_cast() {
     // mailrs's reputation.rs shape — `NOW() - INTERVAL '30 days'`
     // generalised to `ts ± interval`.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (when_ TIMESTAMP NOT NULL)").unwrap();
+    e.execute("CREATE TABLE t (when_ TIMESTAMP NOT NULL)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES ('2024-01-01 12:00:00'::TIMESTAMP)")
         .unwrap();
     let r = rows(
-        e.execute("SELECT when_ + '1 day'::INTERVAL FROM t").unwrap(),
+        e.execute("SELECT when_ + '1 day'::INTERVAL FROM t")
+            .unwrap(),
     );
     let Value::Timestamp(t) = r[0][0] else {
         panic!();

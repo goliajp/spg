@@ -63,7 +63,8 @@ fn refresh_with_no_data_truncates() {
     e.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t")
         .unwrap();
     assert_eq!(rows(e.execute("SELECT id FROM mv").unwrap()).len(), 2);
-    e.execute("REFRESH MATERIALIZED VIEW mv WITH NO DATA").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv WITH NO DATA")
+        .unwrap();
     assert_eq!(rows(e.execute("SELECT id FROM mv").unwrap()).len(), 0);
 }
 
@@ -96,7 +97,8 @@ fn drop_materialized_view_removes_backing_table_and_source() {
 #[test]
 fn drop_materialized_view_if_exists_silent() {
     let mut e = Engine::new();
-    e.execute("DROP MATERIALIZED VIEW IF EXISTS missing").unwrap();
+    e.execute("DROP MATERIALIZED VIEW IF EXISTS missing")
+        .unwrap();
 }
 
 #[test]
@@ -128,10 +130,8 @@ fn create_if_not_exists_is_noop_on_existing() {
     e.execute("INSERT INTO t VALUES (1)").unwrap();
     e.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t")
         .unwrap();
-    e.execute(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 999 AS id FROM t",
-    )
-    .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 999 AS id FROM t")
+        .unwrap();
     let r = rows(e.execute("SELECT id FROM mv").unwrap());
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], spg_storage::Value::Int(1));

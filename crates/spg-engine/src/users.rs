@@ -151,11 +151,7 @@ impl UserRecord {
     /// v7.18 carve-out — clients connecting over plaintext
     /// without a cached entry will see Access Denied from the
     /// shim until that lands.
-    pub fn verify_caching_sha2_password(
-        &self,
-        scramble: &[u8],
-        client_response: &[u8],
-    ) -> bool {
+    pub fn verify_caching_sha2_password(&self, scramble: &[u8], client_response: &[u8]) -> bool {
         let Some(stored) = self.caching_sha2 else {
             return false;
         };
@@ -188,11 +184,7 @@ impl UserRecord {
     /// stored_hash`. Returns false if the user has no stored
     /// hash (loaded from a pre-v7.17 snapshot — the operator
     /// has to reset the password to re-populate it).
-    pub fn verify_mysql_native_password(
-        &self,
-        scramble: &[u8],
-        client_response: &[u8],
-    ) -> bool {
+    pub fn verify_mysql_native_password(&self, scramble: &[u8], client_response: &[u8]) -> bool {
         let Some(stored) = self.mysql_native else {
             return false;
         };
@@ -423,10 +415,7 @@ fn constant_time_eq(a: &[u8; HASH_LEN], b: &[u8; HASH_LEN]) -> bool {
 
 /// v7.17.0 Phase 3.P0-71 — same idea, sized for the SHA-1 digest
 /// used by `mysql_native_password`.
-fn constant_time_eq_sha1(
-    a: &[u8; MYSQL_NATIVE_HASH_LEN],
-    b: &[u8; MYSQL_NATIVE_HASH_LEN],
-) -> bool {
+fn constant_time_eq_sha1(a: &[u8; MYSQL_NATIVE_HASH_LEN], b: &[u8; MYSQL_NATIVE_HASH_LEN]) -> bool {
     let mut diff: u8 = 0;
     for i in 0..MYSQL_NATIVE_HASH_LEN {
         diff |= a[i] ^ b[i];
@@ -762,7 +751,8 @@ mod p0_71_tests {
     fn verify_mysql_native_password_accepts_correct_response() {
         // Build a fake scramble + the canonical client response.
         let mut s = UserStore::new();
-        s.create("bob", "secret", Role::Admin, [3u8; SALT_LEN]).unwrap();
+        s.create("bob", "secret", Role::Admin, [3u8; SALT_LEN])
+            .unwrap();
         let rec = s.get("bob").unwrap();
         let scramble: [u8; 20] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
         // Compute the same response the client would.
@@ -772,8 +762,7 @@ mod p0_71_tests {
         concat[..20].copy_from_slice(&scramble);
         concat[20..].copy_from_slice(&sha1_sha1_pwd);
         let mask = sha1_bytes(&concat);
-        let response: [u8; MYSQL_NATIVE_HASH_LEN] =
-            core::array::from_fn(|i| sha1_pwd[i] ^ mask[i]);
+        let response: [u8; MYSQL_NATIVE_HASH_LEN] = core::array::from_fn(|i| sha1_pwd[i] ^ mask[i]);
         assert!(rec.verify_mysql_native_password(&scramble, &response));
         // Tamper with one byte → rejected.
         let mut bad = response;
@@ -823,7 +812,8 @@ mod p0_71_tests {
     #[test]
     fn verify_caching_sha2_password_accepts_correct_response() {
         let mut s = UserStore::new();
-        s.create("bob", "secret", Role::Admin, [3u8; SALT_LEN]).unwrap();
+        s.create("bob", "secret", Role::Admin, [3u8; SALT_LEN])
+            .unwrap();
         let rec = s.get("bob").unwrap();
         let scramble: [u8; 20] = core::array::from_fn(|i| (i as u8).wrapping_mul(11));
         let sha_pwd = sha256_bytes(b"secret");
@@ -832,8 +822,7 @@ mod p0_71_tests {
         concat[..20].copy_from_slice(&scramble);
         concat[20..].copy_from_slice(&sha_sha_pwd);
         let mask = sha256_bytes(&concat);
-        let response: [u8; CACHING_SHA2_HASH_LEN] =
-            core::array::from_fn(|i| sha_pwd[i] ^ mask[i]);
+        let response: [u8; CACHING_SHA2_HASH_LEN] = core::array::from_fn(|i| sha_pwd[i] ^ mask[i]);
         assert!(rec.verify_caching_sha2_password(&scramble, &response));
         let mut bad = response;
         bad[0] ^= 1;

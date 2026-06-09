@@ -28,7 +28,10 @@ fn setup(e: &mut Engine) {
 fn for_update_basic() {
     let mut e = Engine::new();
     setup(&mut e);
-    let r = rows(e.execute("SELECT id, name FROM t WHERE id = 2 FOR UPDATE").unwrap());
+    let r = rows(
+        e.execute("SELECT id, name FROM t WHERE id = 2 FOR UPDATE")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int(2));
     assert_eq!(r[0][1], Value::Text("b".into()));
@@ -38,7 +41,10 @@ fn for_update_basic() {
 fn for_share_basic() {
     let mut e = Engine::new();
     setup(&mut e);
-    let r = rows(e.execute("SELECT id FROM t WHERE id = 1 FOR SHARE").unwrap());
+    let r = rows(
+        e.execute("SELECT id FROM t WHERE id = 1 FOR SHARE")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int(1));
 }
@@ -63,7 +69,10 @@ fn for_key_share_pg_form() {
 fn for_update_nowait() {
     let mut e = Engine::new();
     setup(&mut e);
-    let r = rows(e.execute("SELECT id FROM t WHERE id = 3 FOR UPDATE NOWAIT").unwrap());
+    let r = rows(
+        e.execute("SELECT id FROM t WHERE id = 3 FOR UPDATE NOWAIT")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
 }
 
@@ -71,7 +80,10 @@ fn for_update_nowait() {
 fn for_update_skip_locked() {
     let mut e = Engine::new();
     setup(&mut e);
-    let r = rows(e.execute("SELECT id FROM t FOR UPDATE SKIP LOCKED").unwrap());
+    let r = rows(
+        e.execute("SELECT id FROM t FOR UPDATE SKIP LOCKED")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 3);
 }
 

@@ -2593,7 +2593,10 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Self::CreateSchema { name, if_not_exists } => {
+            Self::CreateSchema {
+                name,
+                if_not_exists,
+            } => {
                 f.write_str("CREATE SCHEMA ")?;
                 if *if_not_exists {
                     f.write_str("IF NOT EXISTS ")?;
@@ -2619,7 +2622,12 @@ impl fmt::Display for Statement {
 
 impl fmt::Display for CreateDomainStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE DOMAIN {} AS {}", quote_ident(&self.name), self.base_type)?;
+        write!(
+            f,
+            "CREATE DOMAIN {} AS {}",
+            quote_ident(&self.name),
+            self.base_type
+        )?;
         if let Some(d) = &self.default {
             write!(f, " DEFAULT {d}")?;
         }
@@ -2777,7 +2785,12 @@ fn write_sequence_options(f: &mut fmt::Formatter<'_>, o: &SequenceOptions) -> fm
         match ob {
             SequenceOwnedBy::None => f.write_str(" OWNED BY NONE")?,
             SequenceOwnedBy::Column { table, column } => {
-                write!(f, " OWNED BY {}.{}", quote_ident(table), quote_ident(column))?;
+                write!(
+                    f,
+                    " OWNED BY {}.{}",
+                    quote_ident(table),
+                    quote_ident(column)
+                )?;
             }
         }
     }

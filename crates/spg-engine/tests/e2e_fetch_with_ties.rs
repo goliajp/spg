@@ -46,10 +46,8 @@ fn fetch_first_3_with_ties_extends_through_ties() {
     let mut e = Engine::new();
     seed_scores(&mut e);
     let mut r = rows(
-        e.execute(
-            "SELECT id FROM t ORDER BY score DESC FETCH FIRST 3 ROWS WITH TIES",
-        )
-        .unwrap(),
+        e.execute("SELECT id FROM t ORDER BY score DESC FETCH FIRST 3 ROWS WITH TIES")
+            .unwrap(),
     );
     r.sort_by_key(|row| match row[0] {
         Value::Int(n) => n,
@@ -102,10 +100,8 @@ fn with_ties_no_tie_at_cutoff_keeps_exactly_n() {
     let mut e = Engine::new();
     seed_scores(&mut e);
     let r = rows(
-        e.execute(
-            "SELECT id FROM t ORDER BY score DESC FETCH FIRST 2 ROWS WITH TIES",
-        )
-        .unwrap(),
+        e.execute("SELECT id FROM t ORDER BY score DESC FETCH FIRST 2 ROWS WITH TIES")
+            .unwrap(),
     );
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Int(1));

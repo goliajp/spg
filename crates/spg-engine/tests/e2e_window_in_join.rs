@@ -20,18 +20,19 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 }
 
 fn setup(e: &mut Engine) {
-    e.execute("CREATE TABLE orders (id INT NOT NULL, customer_id INT NOT NULL, amount INT NOT NULL)")
+    e.execute(
+        "CREATE TABLE orders (id INT NOT NULL, customer_id INT NOT NULL, amount INT NOT NULL)",
+    )
+    .unwrap();
+    e.execute("CREATE TABLE customers (id INT NOT NULL, name TEXT NOT NULL)")
         .unwrap();
-    e.execute("CREATE TABLE customers (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
     e.execute(
         "INSERT INTO orders VALUES \
             (1, 1, 100), (2, 1, 200), (3, 2, 50), (4, 2, 80), (5, 2, 30)",
     )
     .unwrap();
-    e.execute(
-        "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob')",
-    )
-    .unwrap();
+    e.execute("INSERT INTO customers VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
 }
 
 #[test]
@@ -97,10 +98,8 @@ fn bare_window_over_single_table_still_works() {
     let mut e = Engine::new();
     setup(&mut e);
     let r = rows(
-        e.execute(
-            "SELECT amount, row_number() OVER (ORDER BY amount) FROM orders",
-        )
-        .unwrap(),
+        e.execute("SELECT amount, row_number() OVER (ORDER BY amount) FROM orders")
+            .unwrap(),
     );
     assert_eq!(r.len(), 5);
 }

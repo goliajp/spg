@@ -77,7 +77,9 @@ fn insert_quoted_values() {
         r#"INSERT INTO t VALUES (1, 'name=>"alice", city=>"new york"')"#,
     ]);
     let rows = select(&mut eng, "SELECT props FROM t");
-    let Value::Hstore(pairs) = &rows[0][0] else { panic!() };
+    let Value::Hstore(pairs) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(pairs.len(), 2);
     assert_eq!(pairs[0].1.as_deref(), Some("alice"));
     assert_eq!(pairs[1].1.as_deref(), Some("new york"));
@@ -90,7 +92,9 @@ fn insert_null_value() {
         "INSERT INTO t VALUES (1, 'a=>NULL, b=>2')",
     ]);
     let rows = select(&mut eng, "SELECT props FROM t");
-    let Value::Hstore(pairs) = &rows[0][0] else { panic!() };
+    let Value::Hstore(pairs) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(pairs[0], ("a".to_string(), None));
     assert_eq!(pairs[1], ("b".to_string(), Some("2".to_string())));
 }
@@ -102,7 +106,9 @@ fn insert_empty_hstore() {
         "INSERT INTO t VALUES (1, '')",
     ]);
     let rows = select(&mut eng, "SELECT props FROM t");
-    let Value::Hstore(pairs) = &rows[0][0] else { panic!() };
+    let Value::Hstore(pairs) = &rows[0][0] else {
+        panic!()
+    };
     assert!(pairs.is_empty());
 }
 
@@ -113,7 +119,9 @@ fn duplicate_keys_last_wins() {
         "INSERT INTO t VALUES (1, 'a=>1, a=>2, b=>3')",
     ]);
     let rows = select(&mut eng, "SELECT props FROM t");
-    let Value::Hstore(pairs) = &rows[0][0] else { panic!() };
+    let Value::Hstore(pairs) = &rows[0][0] else {
+        panic!()
+    };
     // After dedup: a=>2 (last wins) and b=>3.
     assert_eq!(pairs.len(), 2);
     let a = pairs.iter().find(|(k, _)| k == "a").unwrap();
@@ -141,8 +149,12 @@ fn hstore_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, props FROM config ORDER BY id");
     assert_eq!(rows.len(), 2);
-    let Value::Hstore(p1) = &rows[0][1] else { panic!() };
-    let Value::Hstore(p2) = &rows[1][1] else { panic!() };
+    let Value::Hstore(p1) = &rows[0][1] else {
+        panic!()
+    };
+    let Value::Hstore(p2) = &rows[1][1] else {
+        panic!()
+    };
     assert_eq!(p1.len(), 2);
     assert_eq!(p2.len(), 1);
 }
@@ -157,7 +169,9 @@ fn hstore_display_canonical_quotes_keys_and_values() {
     let r = eng.execute("SELECT props::text FROM t").unwrap();
     match r {
         QueryResult::Rows { rows, .. } => {
-            let Value::Text(s) = &rows[0].values[0] else { panic!() };
+            let Value::Text(s) = &rows[0].values[0] else {
+                panic!()
+            };
             assert_eq!(s, r#""a"=>"1", "b"=>"2""#);
         }
         _ => panic!(),

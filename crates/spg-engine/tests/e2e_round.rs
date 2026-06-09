@@ -36,14 +36,15 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn float_result(e: &mut Engine, sql: &str) -> f64 {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Float(x) => *x,
         Value::Int(n) => f64::from(*n),
         Value::BigInt(n) => *n as f64,
-        Value::Numeric { scaled, scale } => {
-            (*scaled as f64) / 10f64.powi(i32::from(*scale))
-        }
+        Value::Numeric { scaled, scale } => (*scaled as f64) / 10f64.powi(i32::from(*scale)),
         other => panic!("expected numeric, got {other:?}"),
     }
 }
@@ -236,7 +237,8 @@ fn round_inside_where() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (id INT NOT NULL, x FLOAT NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO u VALUES (1, 2.4), (2, 2.6)").unwrap();
+    e.execute("INSERT INTO u VALUES (1, 2.4), (2, 2.6)")
+        .unwrap();
     let r = e.execute("SELECT id FROM u WHERE round(x) = 3").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()

@@ -138,7 +138,8 @@ fn nullif_for_divide_by_zero_protection() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE rate (num INT NOT NULL, denom INT NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO rate VALUES (10, 2), (5, 0)").unwrap();
+    e.execute("INSERT INTO rate VALUES (10, 2), (5, 0)")
+        .unwrap();
     let r = e
         .execute("SELECT num::FLOAT / nullif(denom, 0) FROM rate ORDER BY num DESC")
         .unwrap();

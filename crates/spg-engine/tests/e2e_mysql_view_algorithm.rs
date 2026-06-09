@@ -17,7 +17,8 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE t (id INT NOT NULL, label TEXT NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+    e.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
 }
 
 #[test]

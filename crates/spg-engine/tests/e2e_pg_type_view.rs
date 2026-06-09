@@ -46,10 +46,8 @@ fn pg_type_resolves_jsonb_array() {
     // array companion (`_jsonb` = 3807, element = 3802).
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT typname, typelem FROM pg_catalog.pg_type WHERE oid = 3807",
-        )
-        .unwrap(),
+        e.execute("SELECT typname, typelem FROM pg_catalog.pg_type WHERE oid = 3807")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("_jsonb".into()));

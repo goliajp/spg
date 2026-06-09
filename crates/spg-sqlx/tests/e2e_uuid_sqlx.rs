@@ -24,11 +24,10 @@ async fn uuid_column_round_trips_through_bind() {
         .execute(&mut conn)
         .await
         .unwrap();
-    let rows: Vec<(Uuid, String)> =
-        sqlx::query_as("SELECT id, name FROM accounts ORDER BY name")
-            .fetch_all(&mut conn)
-            .await
-            .unwrap();
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, name FROM accounts ORDER BY name")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, u1);
     assert_eq!(rows[0].1, "a");
@@ -160,5 +159,9 @@ async fn gen_random_uuid_returns_real_uuid_through_sqlx() {
         .fetch_one(&mut conn)
         .await
         .unwrap();
-    assert_ne!(got, Uuid::nil(), "gen_random_uuid() must not be the nil UUID");
+    assert_ne!(
+        got,
+        Uuid::nil(),
+        "gen_random_uuid() must not be the nil UUID"
+    );
 }

@@ -148,9 +148,10 @@ fn window_over_left_join_keeps_null_extended_row() {
     );
     // Empty dept appears with NULL emp_name and rn = 1 (single
     // row partition with all-NULL key sorts as one group).
-    assert!(r.iter().any(|row| {
-        row[0] == Value::Text("Empty".into()) && row[1] == Value::Null
-    }));
+    assert!(
+        r.iter()
+            .any(|row| { row[0] == Value::Text("Empty".into()) && row[1] == Value::Null })
+    );
 }
 
 #[test]

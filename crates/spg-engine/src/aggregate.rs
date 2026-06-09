@@ -416,10 +416,7 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 && args.len() != want
             {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "{lower}() takes {want} arg(s), got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("{lower}() takes {want} arg(s), got {}", args.len()),
                 });
             }
             for a in args {
@@ -428,7 +425,9 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
         } else if let Expr::Binary { lhs, rhs, .. } = e {
             walk(lhs)?;
             walk(rhs)?;
-        } else if let Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } = e
+        } else if let Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. } = e
         {
             walk(expr)?;
         }
@@ -628,10 +627,7 @@ fn update_state(
                 st.count += 1;
             } else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "string_agg requires text value, got {:?}",
-                        v.data_type()
-                    ),
+                    detail: format!("string_agg requires text value, got {:?}", v.data_type()),
                 });
             }
         }
@@ -655,10 +651,7 @@ fn update_state(
                 Value::Bool(b) => *b,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "bool_and requires bool, got {:?}",
-                            other.data_type()
-                        ),
+                        detail: format!("bool_and requires bool, got {:?}", other.data_type()),
                     });
                 }
             };
@@ -674,10 +667,7 @@ fn update_state(
                 Value::Bool(b) => *b,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "bool_or requires bool, got {:?}",
-                            other.data_type()
-                        ),
+                        detail: format!("bool_or requires bool, got {:?}", other.data_type()),
                     });
                 }
             };

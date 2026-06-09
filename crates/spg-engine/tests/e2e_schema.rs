@@ -83,7 +83,8 @@ fn schema_qualified_table_strips_prefix_at_lookup() {
     // state.
     let mut e = Engine::new();
     e.execute("CREATE SCHEMA app").unwrap();
-    e.execute("CREATE TABLE app.users (id INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE app.users (id INT NOT NULL)")
+        .unwrap();
     e.execute("INSERT INTO app.users VALUES (1)").unwrap();
     // Bare-name lookup works (prefix stripped at CREATE).
     let r = e.execute("SELECT id FROM users").unwrap();
@@ -104,7 +105,8 @@ fn schema_qualified_table_strips_prefix_at_lookup() {
 #[test]
 fn schema_with_authorization_clause_accepted() {
     let mut e = Engine::new();
-    e.execute("CREATE SCHEMA app AUTHORIZATION someuser").unwrap();
+    e.execute("CREATE SCHEMA app AUTHORIZATION someuser")
+        .unwrap();
     assert!(e.catalog().schema_exists("app"));
 }
 

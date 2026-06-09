@@ -14,7 +14,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn float_result(e: &mut Engine, sql: &str) -> f64 {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Float(x) => *x,
         other => panic!("expected Float, got {other:?}"),
@@ -171,9 +174,7 @@ fn ceil_inside_where() {
         .unwrap();
     e.execute("INSERT INTO u VALUES (1, 1.1), (2, 2.1), (3, 3.1)")
         .unwrap();
-    let r = e
-        .execute("SELECT id FROM u WHERE ceil(x) = 3")
-        .unwrap();
+    let r = e.execute("SELECT id FROM u WHERE ceil(x) = 3").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };

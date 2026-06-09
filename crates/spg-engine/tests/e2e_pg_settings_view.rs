@@ -14,10 +14,8 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 fn pg_settings_exposes_server_version() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'server_version'",
-        )
-        .unwrap(),
+        e.execute("SELECT setting FROM pg_catalog.pg_settings WHERE name = 'server_version'")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     let s = match &r[0][0] {

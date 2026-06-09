@@ -121,7 +121,9 @@ fn read_lenenc(buf: &[u8], pos: usize) -> (u64, usize) {
     let first = buf[pos];
     match first {
         0xfc => (
-            u64::from(u16::from_le_bytes(buf[pos + 1..pos + 3].try_into().unwrap())),
+            u64::from(u16::from_le_bytes(
+                buf[pos + 1..pos + 3].try_into().unwrap(),
+            )),
             3,
         ),
         0xfd => {
@@ -285,7 +287,10 @@ fn binary_row_multi_column_packs_in_declared_order() {
         "CREATE TABLE t (id INT NOT NULL, label TEXT, weight BIGINT)",
     );
     let _ = read_packet(&mut s);
-    send_query(&mut s, "INSERT INTO t VALUES (1, 'first', 100), (2, NULL, 200)");
+    send_query(
+        &mut s,
+        "INSERT INTO t VALUES (1, 'first', 100), (2, NULL, 200)",
+    );
     let _ = read_packet(&mut s);
     send_prepare(&mut s, "SELECT id, label, weight FROM t ORDER BY id");
     let (stmt_id, num_columns, _np) = read_prepare_ok(&mut s);

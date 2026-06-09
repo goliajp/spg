@@ -82,10 +82,7 @@ fn to_json_bigint_renders_bare_number() {
 #[test]
 fn to_json_text_quotes_and_escapes() {
     let mut e = Engine::new();
-    let s = json_text(one_cell(
-        &mut e,
-        "SELECT to_json('hi\"there'::text)",
-    ));
+    let s = json_text(one_cell(&mut e, "SELECT to_json('hi\"there'::text)"));
     assert_eq!(s, r#""hi\"there""#);
 }
 
@@ -102,7 +99,10 @@ fn to_json_text_escapes_newline_and_backslash() {
 fn to_json_bool_renders_lowercase() {
     let mut e = Engine::new();
     assert_eq!(json_text(one_cell(&mut e, "SELECT to_json(true)")), "true");
-    assert_eq!(json_text(one_cell(&mut e, "SELECT to_json(false)")), "false");
+    assert_eq!(
+        json_text(one_cell(&mut e, "SELECT to_json(false)")),
+        "false"
+    );
 }
 
 #[test]
@@ -115,10 +115,7 @@ fn to_json_null_renders_json_null_literal() {
 #[test]
 fn to_json_json_passes_through() {
     let mut e = Engine::new();
-    let s = json_text(one_cell(
-        &mut e,
-        r#"SELECT to_jsonb('{"a":1}'::json)"#,
-    ));
+    let s = json_text(one_cell(&mut e, r#"SELECT to_jsonb('{"a":1}'::json)"#));
     assert_eq!(s, r#"{"a":1}"#);
 }
 

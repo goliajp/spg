@@ -68,12 +68,30 @@ fn ddl_accepts_all_six_range_keywords() {
     let bytes = eng.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let schema = cat.get("t").unwrap().schema();
-    assert!(matches!(schema.columns[1].ty, DataType::Range(RangeKind::Int4)));
-    assert!(matches!(schema.columns[2].ty, DataType::Range(RangeKind::Int8)));
-    assert!(matches!(schema.columns[3].ty, DataType::Range(RangeKind::Num)));
-    assert!(matches!(schema.columns[4].ty, DataType::Range(RangeKind::Ts)));
-    assert!(matches!(schema.columns[5].ty, DataType::Range(RangeKind::TsTz)));
-    assert!(matches!(schema.columns[6].ty, DataType::Range(RangeKind::Date)));
+    assert!(matches!(
+        schema.columns[1].ty,
+        DataType::Range(RangeKind::Int4)
+    ));
+    assert!(matches!(
+        schema.columns[2].ty,
+        DataType::Range(RangeKind::Int8)
+    ));
+    assert!(matches!(
+        schema.columns[3].ty,
+        DataType::Range(RangeKind::Num)
+    ));
+    assert!(matches!(
+        schema.columns[4].ty,
+        DataType::Range(RangeKind::Ts)
+    ));
+    assert!(matches!(
+        schema.columns[5].ty,
+        DataType::Range(RangeKind::TsTz)
+    ));
+    assert!(matches!(
+        schema.columns[6].ty,
+        DataType::Range(RangeKind::Date)
+    ));
 }
 
 #[test]
@@ -83,7 +101,15 @@ fn insert_int4range_half_open_round_trips() {
         "INSERT INTO t VALUES (1, '[1,10)')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } = &rows[0][0] else {
+    let Value::Range {
+        kind,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+        empty,
+    } = &rows[0][0]
+    else {
         panic!("expected Range, got {:?}", rows[0][0]);
     };
     assert!(matches!(kind, RangeKind::Int4));
@@ -101,7 +127,14 @@ fn insert_int4range_closed_round_trips() {
         "INSERT INTO t VALUES (1, '[1,10]')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { lower_inc, upper_inc, .. } = &rows[0][0] else { panic!() };
+    let Value::Range {
+        lower_inc,
+        upper_inc,
+        ..
+    } = &rows[0][0]
+    else {
+        panic!()
+    };
     assert!(*lower_inc);
     assert!(*upper_inc);
 }
@@ -113,7 +146,9 @@ fn insert_int4range_unbounded_lower() {
         "INSERT INTO t VALUES (1, '(,10]')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { lower, upper, .. } = &rows[0][0] else { panic!() };
+    let Value::Range { lower, upper, .. } = &rows[0][0] else {
+        panic!()
+    };
     assert!(lower.is_none());
     assert_eq!(upper.as_deref(), Some(&Value::Int(10)));
 }
@@ -125,7 +160,9 @@ fn insert_int4range_unbounded_upper() {
         "INSERT INTO t VALUES (1, '[1,)')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { lower, upper, .. } = &rows[0][0] else { panic!() };
+    let Value::Range { lower, upper, .. } = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(lower.as_deref(), Some(&Value::Int(1)));
     assert!(upper.is_none());
 }
@@ -137,7 +174,9 @@ fn insert_empty_range() {
         "INSERT INTO t VALUES (1, 'empty')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { empty, .. } = &rows[0][0] else { panic!() };
+    let Value::Range { empty, .. } = &rows[0][0] else {
+        panic!()
+    };
     assert!(*empty);
 }
 
@@ -148,7 +187,12 @@ fn insert_int8range_round_trips() {
         "INSERT INTO t VALUES (1, '[9999999999,99999999999)')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { kind, lower, upper, .. } = &rows[0][0] else { panic!() };
+    let Value::Range {
+        kind, lower, upper, ..
+    } = &rows[0][0]
+    else {
+        panic!()
+    };
     assert!(matches!(kind, RangeKind::Int8));
     assert_eq!(lower.as_deref(), Some(&Value::BigInt(9_999_999_999)));
     assert_eq!(upper.as_deref(), Some(&Value::BigInt(99_999_999_999)));
@@ -161,7 +205,12 @@ fn insert_daterange_round_trips() {
         "INSERT INTO t VALUES (1, '[2025-01-01,2025-12-31)')",
     ]);
     let rows = select(&mut eng, "SELECT r FROM t");
-    let Value::Range { kind, lower, upper, .. } = &rows[0][0] else { panic!() };
+    let Value::Range {
+        kind, lower, upper, ..
+    } = &rows[0][0]
+    else {
+        panic!()
+    };
     assert!(matches!(kind, RangeKind::Date));
     // Date stored as i32 days since 1970-01-01.
     assert!(matches!(lower.as_deref(), Some(Value::Date(_))));
@@ -191,7 +240,9 @@ fn range_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, period FROM bookings ORDER BY id");
     assert_eq!(rows.len(), 2);
-    let Value::Range { kind, empty, .. } = &rows[1][1] else { panic!() };
+    let Value::Range { kind, empty, .. } = &rows[1][1] else {
+        panic!()
+    };
     assert!(matches!(kind, RangeKind::Ts));
     assert!(*empty);
 }
@@ -215,7 +266,9 @@ fn range_display_round_trips_canonical_text() {
     let r = eng.execute("SELECT r::text FROM t").unwrap();
     match r {
         QueryResult::Rows { rows, .. } => {
-            let Value::Text(s) = &rows[0].values[0] else { panic!() };
+            let Value::Text(s) = &rows[0].values[0] else {
+                panic!()
+            };
             assert_eq!(s, "[1,10)");
         }
         _ => panic!(),

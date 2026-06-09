@@ -62,8 +62,10 @@ fn unique_constraint_collation_documented_gap() {
     // case-insensitive uniqueness should wrap in a generated
     // column or apply LOWER() pre-index.
     let mut e = Engine::new();
-    e.execute(r#"CREATE TABLE t (id INT NOT NULL, name TEXT COLLATE "case_insensitive" UNIQUE NOT NULL)"#)
-        .unwrap();
+    e.execute(
+        r#"CREATE TABLE t (id INT NOT NULL, name TEXT COLLATE "case_insensitive" UNIQUE NOT NULL)"#,
+    )
+    .unwrap();
     e.execute("INSERT INTO t VALUES (1, 'foo')").unwrap();
     // 'Foo' (different case) currently inserts because the BTree
     // sees a different byte sequence. With full Phase 2.5c this
@@ -78,9 +80,7 @@ fn group_by_case_insensitive_column() {
         .unwrap();
     e.execute("INSERT INTO t VALUES (1, 'Foo'), (2, 'foo'), (3, 'FOO'), (4, 'Bar')")
         .unwrap();
-    let r = rows(
-        e.execute("SELECT count(*) FROM t GROUP BY name").unwrap(),
-    );
+    let r = rows(e.execute("SELECT count(*) FROM t GROUP BY name").unwrap());
     // case_insensitive: 'Foo'/'foo'/'FOO' all collide → 2 groups.
     assert_eq!(r.len(), 2);
 }

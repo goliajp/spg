@@ -29,7 +29,8 @@ fn domain_check_rejects_bad_value_at_insert() {
 #[test]
 fn domain_not_null_propagates_to_column() {
     let mut e = Engine::new();
-    e.execute("CREATE DOMAIN required_text AS TEXT NOT NULL").unwrap();
+    e.execute("CREATE DOMAIN required_text AS TEXT NOT NULL")
+        .unwrap();
     e.execute("CREATE TABLE t (id INT NOT NULL, label required_text)")
         .unwrap();
     // Domain's NOT NULL makes the column non-nullable.
@@ -40,10 +41,8 @@ fn domain_not_null_propagates_to_column() {
 #[test]
 fn domain_multiple_checks_all_enforced() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE DOMAIN small_pos AS INT CHECK (value > 0) CHECK (value < 100)",
-    )
-    .unwrap();
+    e.execute("CREATE DOMAIN small_pos AS INT CHECK (value > 0) CHECK (value < 100)")
+        .unwrap();
     e.execute("CREATE TABLE t (id INT NOT NULL, n small_pos)")
         .unwrap();
     e.execute("INSERT INTO t VALUES (1, 50)").unwrap();
@@ -56,7 +55,8 @@ fn domain_multiple_checks_all_enforced() {
 #[test]
 fn drop_domain_removes_it() {
     let mut e = Engine::new();
-    e.execute("CREATE DOMAIN d AS INT CHECK (value > 0)").unwrap();
+    e.execute("CREATE DOMAIN d AS INT CHECK (value > 0)")
+        .unwrap();
     e.execute("DROP DOMAIN d").unwrap();
     // Re-create allowed.
     e.execute("CREATE DOMAIN d AS INT").unwrap();
@@ -81,7 +81,8 @@ fn null_passes_domain_check_per_pg() {
     // PG semantics: NULL passes a CHECK constraint (rejects only
     // on definite-false). The DOMAIN's CHECK should follow.
     let mut e = Engine::new();
-    e.execute("CREATE DOMAIN d AS INT CHECK (value > 0)").unwrap();
+    e.execute("CREATE DOMAIN d AS INT CHECK (value > 0)")
+        .unwrap();
     e.execute("CREATE TABLE t (id INT NOT NULL, n d)").unwrap();
     e.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
 }

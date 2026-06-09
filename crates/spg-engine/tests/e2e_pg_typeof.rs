@@ -47,10 +47,7 @@ fn pg_typeof_int_literal() {
 fn pg_typeof_bigint_overflow_into_bigint() {
     let mut e = Engine::new();
     // 9_999_999_999 > i32::MAX → parser puts it into BigInt.
-    assert_eq!(
-        one_text(&mut e, "SELECT pg_typeof(9999999999)"),
-        "bigint"
-    );
+    assert_eq!(one_text(&mut e, "SELECT pg_typeof(9999999999)"), "bigint");
 }
 
 #[test]
@@ -115,10 +112,7 @@ fn pg_typeof_json_returns_json() {
     // returns "json" for both — disambiguation lives at column
     // level (see e2e_jsonb.rs for the catalog-level distinction).
     let mut e = Engine::new();
-    assert_eq!(
-        one_text(&mut e, "SELECT pg_typeof('{}'::json)"),
-        "json"
-    );
+    assert_eq!(one_text(&mut e, "SELECT pg_typeof('{}'::json)"), "json");
 }
 
 #[test]

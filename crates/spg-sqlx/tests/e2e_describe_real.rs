@@ -86,10 +86,7 @@ async fn describe_non_select_yields_empty_describe() {
         .execute(&mut conn)
         .await
         .unwrap();
-    let d = conn
-        .describe("INSERT INTO t VALUES ($1)")
-        .await
-        .unwrap();
+    let d = conn.describe("INSERT INTO t VALUES ($1)").await.unwrap();
     assert!(d.columns.is_empty(), "INSERT has no row description");
     // INSERT carries one placeholder → 1 parameter visible to
     // PG's ParameterDescription frame.

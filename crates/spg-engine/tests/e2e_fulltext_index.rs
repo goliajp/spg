@@ -185,8 +185,10 @@ fn match_against_multi_column_or_folds() {
     e.execute("INSERT INTO posts VALUES (2, 'Rivers', 'mountains nearby')")
         .unwrap();
     let out = rows(
-        e.execute("SELECT id FROM posts WHERE MATCH(title, body) AGAINST ('mountains') ORDER BY id")
-            .unwrap(),
+        e.execute(
+            "SELECT id FROM posts WHERE MATCH(title, body) AGAINST ('mountains') ORDER BY id",
+        )
+        .unwrap(),
     );
     let ids: Vec<i32> = out
         .iter()

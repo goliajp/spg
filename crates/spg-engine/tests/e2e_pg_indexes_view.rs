@@ -13,8 +13,10 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE users (id INT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
         .unwrap();
-    e.execute("CREATE INDEX idx_users_name ON users (name)").unwrap();
-    e.execute("CREATE UNIQUE INDEX uq_users_name ON users (name)").unwrap();
+    e.execute("CREATE INDEX idx_users_name ON users (name)")
+        .unwrap();
+    e.execute("CREATE UNIQUE INDEX uq_users_name ON users (name)")
+        .unwrap();
 }
 
 #[test]

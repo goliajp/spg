@@ -77,10 +77,8 @@ fn multi_col_match_against_unions_both_indexes() {
     let mut e = Engine::new();
     seed_articles_with_fulltext(&mut e);
     let mut r = rows(
-        e.execute(
-            "SELECT id FROM articles WHERE MATCH(title, body) AGAINST ('PostgreSQL')",
-        )
-        .unwrap(),
+        e.execute("SELECT id FROM articles WHERE MATCH(title, body) AGAINST ('PostgreSQL')")
+            .unwrap(),
     );
     r.sort_by_key(|row| match row[0] {
         Value::Int(n) => n,
@@ -98,10 +96,8 @@ fn match_against_combined_with_simple_predicate() {
     let mut e = Engine::new();
     seed_articles_with_fulltext(&mut e);
     let r = rows(
-        e.execute(
-            "SELECT id FROM articles WHERE MATCH(body) AGAINST ('quick fox') AND id = 4",
-        )
-        .unwrap(),
+        e.execute("SELECT id FROM articles WHERE MATCH(body) AGAINST ('quick fox') AND id = 4")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int(4));
@@ -124,10 +120,8 @@ fn match_against_when_no_fulltext_index_falls_through() {
     // correctness path (full-scan @@ rewrite) must still return
     // the right rows.
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE plain (id INT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE plain (id INT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL)")
+        .unwrap();
     e.execute(
         "INSERT INTO plain VALUES \
             (1, 'PostgreSQL guide', 'A friendly tour of PG'), \
@@ -179,10 +173,8 @@ fn match_against_or_with_unrelated_predicate_falls_through() {
     let mut e = Engine::new();
     seed_articles_with_fulltext(&mut e);
     let mut r = rows(
-        e.execute(
-            "SELECT id FROM articles WHERE MATCH(title) AGAINST ('PostgreSQL') OR id = 3",
-        )
-        .unwrap(),
+        e.execute("SELECT id FROM articles WHERE MATCH(title) AGAINST ('PostgreSQL') OR id = 3")
+            .unwrap(),
     );
     r.sort_by_key(|row| match row[0] {
         Value::Int(n) => n,

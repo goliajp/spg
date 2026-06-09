@@ -81,7 +81,10 @@ fn database_in_select_list_alongside_table_column() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (1)").unwrap();
-    let row = one_row(e.execute("SELECT id, current_database() AS db FROM t").unwrap());
+    let row = one_row(
+        e.execute("SELECT id, current_database() AS db FROM t")
+            .unwrap(),
+    );
     assert_eq!(row.len(), 2);
     assert!(matches!(row[0], Value::Int(1)));
     assert!(matches!(&row[1], Value::Text(s) if s == "spg"));

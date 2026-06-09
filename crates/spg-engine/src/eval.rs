@@ -84,10 +84,7 @@ impl<'a> EvalContext<'a> {
     /// `&mut Catalog` in a closure that performs the requested
     /// SequenceOp.
     #[must_use]
-    pub const fn with_sequence_resolver(
-        mut self,
-        resolver: &'a SequenceResolver<'a>,
-    ) -> Self {
+    pub const fn with_sequence_resolver(mut self, resolver: &'a SequenceResolver<'a>) -> Self {
         self.sequence_resolver = Some(resolver);
         self
     }
@@ -622,9 +619,11 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     });
                 }
             };
-            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
-                detail: "nextval() requires a sequence resolver (read-only context)".into(),
-            })?;
+            let resolver = ctx
+                .sequence_resolver
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: "nextval() requires a sequence resolver (read-only context)".into(),
+                })?;
             let v = resolver(SequenceOp::Next(seq_name))?;
             Ok(Value::BigInt(v))
         }
@@ -646,9 +645,11 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     });
                 }
             };
-            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
-                detail: "currval() requires a sequence resolver (read-only context)".into(),
-            })?;
+            let resolver = ctx
+                .sequence_resolver
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: "currval() requires a sequence resolver (read-only context)".into(),
+                })?;
             let v = resolver(SequenceOp::Curr(seq_name))?;
             Ok(Value::BigInt(v))
         }
@@ -700,9 +701,11 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             } else {
                 true
             };
-            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
-                detail: "setval() requires a sequence resolver (read-only context)".into(),
-            })?;
+            let resolver = ctx
+                .sequence_resolver
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: "setval() requires a sequence resolver (read-only context)".into(),
+                })?;
             let v = resolver(SequenceOp::Set {
                 name: seq_name,
                 value,
@@ -1284,10 +1287,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "random" => {
             if !args.is_empty() {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "random() takes 0 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("random() takes 0 args, got {}", args.len()),
                 });
             }
             Ok(Value::Float(prng_next_f64()))
@@ -1301,10 +1301,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "gen_random_uuid" | "uuid_generate_v4" => {
             if !args.is_empty() {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "{name}() takes 0 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("{name}() takes 0 args, got {}", args.len()),
                 });
             }
             Ok(Value::Uuid(gen_random_uuid_bytes()))
@@ -1312,10 +1309,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "sign" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "sign() takes 1 arg, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("sign() takes 1 arg, got {}", args.len()),
                 });
             }
             match &args[0] {
@@ -1341,30 +1335,21 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     })
                 }
                 other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "sign() needs numeric, got {:?}",
-                        other.data_type()
-                    ),
+                    detail: alloc::format!("sign() needs numeric, got {:?}", other.data_type()),
                 }),
             }
         }
         "sqrt" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "sqrt() takes 1 arg, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("sqrt() takes 1 arg, got {}", args.len()),
                 });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "sqrt() needs numeric, got {:?}",
-                            v.data_type()
-                        ),
+                        detail: alloc::format!("sqrt() needs numeric, got {:?}", v.data_type()),
                     })?;
                     if x < 0.0 {
                         return Err(EvalError::TypeMismatch {
@@ -1381,24 +1366,17 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "power" | "pow" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "power() takes 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("power() takes 2 args, got {}", args.len()),
                 });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
-            let x = value_to_f64(&args[0]).ok_or_else(|| {
-                EvalError::TypeMismatch {
-                    detail: "power() needs numeric x".into(),
-                }
+            let x = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "power() needs numeric x".into(),
             })?;
-            let y = value_to_f64(&args[1]).ok_or_else(|| {
-                EvalError::TypeMismatch {
-                    detail: "power() needs numeric y".into(),
-                }
+            let y = value_to_f64(&args[1]).ok_or_else(|| EvalError::TypeMismatch {
+                detail: "power() needs numeric y".into(),
             })?;
             // Integer-exponent fast path.
             let y_int = y as i32;
@@ -1411,7 +1389,8 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             // complex; reject cleanly.
             if x < 0.0 {
                 return Err(EvalError::TypeMismatch {
-                    detail: "power(): negative base with fractional exponent yields complex result".into(),
+                    detail: "power(): negative base with fractional exponent yields complex result"
+                        .into(),
                 });
             }
             if x == 0.0 && y < 0.0 {
@@ -1427,10 +1406,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "mod" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "mod() takes 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("mod() takes 2 args, got {}", args.len()),
                 });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -1442,10 +1418,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     Value::Int(x) => Ok(i64::from(*x)),
                     Value::BigInt(x) => Ok(*x),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "mod() needs integer, got {:?}",
-                            other.data_type()
-                        ),
+                        detail: alloc::format!("mod() needs integer, got {:?}", other.data_type()),
                     }),
                 }
             };
@@ -1461,16 +1434,12 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             let result = y % x;
             // Pick the narrowest type that holds the result.
             if let Ok(small) = i16::try_from(result) {
-                if matches!(args[0], Value::SmallInt(_))
-                    && matches!(args[1], Value::SmallInt(_))
-                {
+                if matches!(args[0], Value::SmallInt(_)) && matches!(args[1], Value::SmallInt(_)) {
                     return Ok(Value::SmallInt(small));
                 }
             }
             if let Ok(int_) = i32::try_from(result) {
-                if !matches!(args[0], Value::BigInt(_))
-                    && !matches!(args[1], Value::BigInt(_))
-                {
+                if !matches!(args[0], Value::BigInt(_)) && !matches!(args[1], Value::BigInt(_)) {
                     return Ok(Value::Int(int_));
                 }
             }
@@ -1481,7 +1450,11 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "{lc}() takes at least 1 arg",
-                        lc = if name.eq_ignore_ascii_case("greatest") { "greatest" } else { "least" }
+                        lc = if name.eq_ignore_ascii_case("greatest") {
+                            "greatest"
+                        } else {
+                            "least"
+                        }
                     ),
                 });
             }
@@ -1511,10 +1484,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "ifnull" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "ifnull() takes 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("ifnull() takes 2 args, got {}", args.len()),
                 });
             }
             for v in args {
@@ -1555,10 +1525,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "nullif" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "nullif() takes 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("nullif() takes 2 args, got {}", args.len()),
                 });
             }
             match (&args[0], &args[1]) {
@@ -1580,9 +1547,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
-                        Ok(args[0].clone())
-                    }
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
                     Value::Float(x) => Ok(Value::Float(f64_trunc(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
@@ -1607,11 +1572,11 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     let n = match &args[1] {
                         Value::SmallInt(x) => i32::from(*x),
                         Value::Int(x) => *x,
-                        Value::BigInt(x) => i32::try_from(*x).map_err(|_| {
-                            EvalError::TypeMismatch {
+                        Value::BigInt(x) => {
+                            i32::try_from(*x).map_err(|_| EvalError::TypeMismatch {
                                 detail: "trunc(): scale must fit in i32".into(),
-                            }
-                        })?,
+                            })?
+                        }
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: alloc::format!(
@@ -1648,10 +1613,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     Ok(Value::Float(result))
                 }
                 _ => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "trunc() takes 1 or 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("trunc() takes 1 or 2 args, got {}", args.len()),
                 }),
             }
         }
@@ -1659,20 +1621,14 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             match args.len() {
                 1 => match &args[0] {
                     Value::Null => Ok(Value::Null),
-                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
-                        Ok(args[0].clone())
-                    }
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
                     Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
                     Value::Numeric { scaled, scale } => {
                         let factor = pow10_i128(*scale);
                         let q = scaled.div_euclid(factor);
                         let r = scaled.rem_euclid(factor);
                         // Half-away-from-zero: if 2*r >= factor → round up.
-                        let result = if 2 * r >= factor {
-                            q + 1
-                        } else {
-                            q
-                        };
+                        let result = if 2 * r >= factor { q + 1 } else { q };
                         Ok(Value::Numeric {
                             scaled: result * factor,
                             scale: *scale,
@@ -1692,11 +1648,11 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     let n = match &args[1] {
                         Value::SmallInt(x) => i32::from(*x),
                         Value::Int(x) => *x,
-                        Value::BigInt(x) => i32::try_from(*x).map_err(|_| {
-                            EvalError::TypeMismatch {
+                        Value::BigInt(x) => {
+                            i32::try_from(*x).map_err(|_| EvalError::TypeMismatch {
                                 detail: "round(): scale must fit in i32".into(),
-                            }
-                        })?,
+                            })?
+                        }
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: alloc::format!(
@@ -1742,27 +1698,19 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     Ok(Value::Float(result))
                 }
                 _ => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "round() takes 1 or 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("round() takes 1 or 2 args, got {}", args.len()),
                 }),
             }
         }
         "ceil" | "ceiling" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "ceil() takes 1 arg, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("ceil() takes 1 arg, got {}", args.len()),
                 });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
-                    Ok(args[0].clone())
-                }
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
                 Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1775,27 +1723,19 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     })
                 }
                 other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "ceil() needs numeric, got {:?}",
-                        other.data_type()
-                    ),
+                    detail: alloc::format!("ceil() needs numeric, got {:?}", other.data_type()),
                 }),
             }
         }
         "floor" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "floor() takes 1 arg, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("floor() takes 1 arg, got {}", args.len()),
                 });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
-                    Ok(args[0].clone())
-                }
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => Ok(args[0].clone()),
                 Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
                 Value::Numeric { scaled, scale } => {
                     let factor = pow10_i128(*scale);
@@ -1809,10 +1749,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
                     })
                 }
                 other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "floor() needs numeric, got {:?}",
-                        other.data_type()
-                    ),
+                    detail: alloc::format!("floor() needs numeric, got {:?}", other.data_type()),
                 }),
             }
         }
@@ -1852,10 +1789,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "repeat" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "repeat() takes 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("repeat() takes 2 args, got {}", args.len()),
                 });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -1882,11 +1816,12 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             // terabytes. PG itself enforces a similar cap via
             // work_mem; SPG inherits a defensive 64MiB cap.
             const MAX_REPEAT_BYTES: usize = 64 * 1024 * 1024;
-            let needed = s.len().checked_mul(n as usize).ok_or_else(|| {
-                EvalError::TypeMismatch {
-                    detail: "repeat(): result size overflows usize".into(),
-                }
-            })?;
+            let needed =
+                s.len()
+                    .checked_mul(n as usize)
+                    .ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "repeat(): result size overflows usize".into(),
+                    })?;
             if needed > MAX_REPEAT_BYTES {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
@@ -1955,10 +1890,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "translate" => {
             if args.len() != 3 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "translate() takes 3 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("translate() takes 3 args, got {}", args.len()),
                 });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -2052,10 +1984,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "to_json" | "to_jsonb" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "to_json() takes 1 arg, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("to_json() takes 1 arg, got {}", args.len()),
                 });
             }
             // Json input passes through verbatim — PG identity.
@@ -2072,10 +2001,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "jsonb_path_query" | "json_path_query" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "jsonb_path_query() takes 2 args, got {}",
-                        args.len()
-                    ),
+                    detail: alloc::format!("jsonb_path_query() takes 2 args, got {}", args.len()),
                 });
             }
             crate::json::path_query(&args[0], &args[1])
@@ -2155,10 +2081,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "pg_typeof" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_typeof() takes 1 arg, got {}",
-                        args.len()
-                    ),
+                    detail: format!("pg_typeof() takes 1 arg, got {}", args.len()),
                 });
             }
             Ok(Value::Text(pg_typeof_name(&args[0]).into()))
@@ -2798,10 +2721,7 @@ fn inet_host(args: &[Value]) -> Result<Value, EvalError> {
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "host() takes one TEXT arg, got {} args",
-                    args.len()
-                ),
+                detail: alloc::format!("host() takes one TEXT arg, got {} args", args.len()),
             });
         }
     };
@@ -2815,10 +2735,7 @@ fn inet_network(args: &[Value]) -> Result<Value, EvalError> {
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "network() takes one TEXT arg, got {} args",
-                    args.len()
-                ),
+                detail: alloc::format!("network() takes one TEXT arg, got {} args", args.len()),
             });
         }
     };
@@ -2827,10 +2744,7 @@ fn inet_network(args: &[Value]) -> Result<Value, EvalError> {
     // for IPv4; full bit-level masking is out of v7.17 scope.
     let mut split = s.splitn(2, '/');
     let host = split.next().unwrap_or("").to_string();
-    let mask: u32 = split
-        .next()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(32);
+    let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
     if !host.contains('.') {
         // IPv6 / MACADDR — return the input unmasked.
         return Ok(Value::Text(s));
@@ -2862,10 +2776,7 @@ fn inet_masklen(args: &[Value]) -> Result<Value, EvalError> {
         [Value::Null] => return Ok(Value::Null),
         _ => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "masklen() takes one TEXT arg, got {} args",
-                    args.len()
-                ),
+                detail: alloc::format!("masklen() takes one TEXT arg, got {} args", args.len()),
             });
         }
     };
@@ -2915,7 +2826,11 @@ fn parse_inet_text(s: &str) -> Option<InetNet> {
         };
         let mut out = [0u8; 16];
         out.copy_from_slice(&bytes);
-        Some(InetNet { bytes: out, family_bytes: 16, prefix_bits })
+        Some(InetNet {
+            bytes: out,
+            family_bytes: 16,
+            prefix_bits,
+        })
     } else {
         let bytes = parse_ipv4(host)?;
         let prefix_bits = match mask_str {
@@ -2924,7 +2839,11 @@ fn parse_inet_text(s: &str) -> Option<InetNet> {
         };
         let mut out = [0u8; 16];
         out[..4].copy_from_slice(&bytes);
-        Some(InetNet { bytes: out, family_bytes: 4, prefix_bits })
+        Some(InetNet {
+            bytes: out,
+            family_bytes: 4,
+            prefix_bits,
+        })
     }
 }
 
@@ -3091,7 +3010,10 @@ enum ReNode {
     /// Any single character.
     AnyChar,
     /// Character class: (positive members list, negated flag).
-    Class { members: Vec<ClassMember>, negated: bool },
+    Class {
+        members: Vec<ClassMember>,
+        negated: bool,
+    },
     /// Anchor start.
     Start,
     /// Anchor end.
@@ -3344,11 +3266,7 @@ fn re_match_at(node: &ReNode, s: &[char], pos: usize) -> Option<usize> {
         ReNode::Class { members, negated } => {
             let c = *s.get(pos)?;
             let hit = members.iter().any(|m| class_matches(m, c));
-            if hit ^ negated {
-                Some(pos + 1)
-            } else {
-                None
-            }
+            if hit ^ negated { Some(pos + 1) } else { None }
         }
         ReNode::Start => {
             if pos == 0 {
@@ -3441,14 +3359,16 @@ fn regexp_matches(args: &[Value]) -> Result<Value, EvalError> {
         }
         n => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "regexp_matches() takes 2 or 3 args, got {n}"
-                ),
+                detail: alloc::format!("regexp_matches() takes 2 or 3 args, got {n}"),
             });
         }
     };
-    let Some(text) = text else { return Ok(Value::Null) };
-    let Some(pat) = pat else { return Ok(Value::Null) };
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
     let node = re_compile(&pat)?;
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Option<String>> = Vec::new();
@@ -3491,15 +3411,19 @@ fn regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
         ),
         n => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "regexp_replace() takes 3 or 4 args, got {n}"
-                ),
+                detail: alloc::format!("regexp_replace() takes 3 or 4 args, got {n}"),
             });
         }
     };
-    let Some(text) = text else { return Ok(Value::Null) };
-    let Some(pat) = pat else { return Ok(Value::Null) };
-    let Some(repl) = repl else { return Ok(Value::Null) };
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
+    let Some(repl) = repl else {
+        return Ok(Value::Null);
+    };
     let global = flags.contains('g');
     let node = re_compile(&pat)?;
     let chars: Vec<char> = text.chars().collect();
@@ -3536,16 +3460,17 @@ fn regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
 fn regexp_split_to_array(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "regexp_split_to_array() takes 2 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("regexp_split_to_array() takes 2 args, got {}", args.len()),
         });
     }
     let text = text_arg(&args[0])?;
     let pat = text_arg(&args[1])?;
-    let Some(text) = text else { return Ok(Value::Null) };
-    let Some(pat) = pat else { return Ok(Value::Null) };
+    let Some(text) = text else {
+        return Ok(Value::Null);
+    };
+    let Some(pat) = pat else {
+        return Ok(Value::Null);
+    };
     let node = re_compile(&pat)?;
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Option<String>> = Vec::new();
@@ -3602,10 +3527,7 @@ enum TrimSide {
 fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "{fn_name}() takes 2 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("{fn_name}() takes 2 args, got {}", args.len()),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -3790,12 +3712,7 @@ fn prng_next_u64() -> u64 {
         next ^= next << 13;
         next ^= next >> 7;
         next ^= next << 17;
-        match PRNG_STATE.compare_exchange_weak(
-            x,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match PRNG_STATE.compare_exchange_weak(x, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(seen) => x = seen,
         }
@@ -4012,10 +3929,7 @@ fn f64_floor(x: f64) -> f64 {
 fn string_pad(args: &[Value], is_left: bool, fn_name: &str) -> Result<Value, EvalError> {
     if args.len() != 2 && args.len() != 3 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "{fn_name}() takes 2 or 3 args, got {}",
-                args.len()
-            ),
+            detail: alloc::format!("{fn_name}() takes 2 or 3 args, got {}", args.len()),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -4083,10 +3997,7 @@ fn string_trim(args: &[Value], side: TrimSide, fn_name: &str) -> Result<Value, E
         }),
         _ => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "{fn_name}() takes 1 or 2 args, got {}",
-                    args.len()
-                ),
+                detail: alloc::format!("{fn_name}() takes 1 or 2 args, got {}", args.len()),
             });
         }
     };
@@ -4165,11 +4076,14 @@ fn format_string(args: &[Value]) -> Result<Value, EvalError> {
         }
         if !digit_buf.is_empty() && matches!(chars.peek(), Some(&'$')) {
             chars.next(); // consume `$`
-            explicit_pos = Some(digit_buf.parse::<usize>().map_err(|_| {
-                EvalError::TypeMismatch {
-                    detail: format!("format(): invalid arg position {digit_buf:?}"),
-                }
-            })?);
+            explicit_pos =
+                Some(
+                    digit_buf
+                        .parse::<usize>()
+                        .map_err(|_| EvalError::TypeMismatch {
+                            detail: format!("format(): invalid arg position {digit_buf:?}"),
+                        })?,
+                );
             digit_buf.clear();
         }
         // Specifier character.
@@ -4307,7 +4221,13 @@ fn value_to_format_text(v: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => format!("{x}"),
-        Value::Bool(b) => if *b { "t".into() } else { "f".into() },
+        Value::Bool(b) => {
+            if *b {
+                "t".into()
+            } else {
+                "f".into()
+            }
+        }
         Value::Null => String::new(),
         other => format!("{other:?}"),
     }
@@ -6289,10 +6209,7 @@ fn literal_to_value(l: &Literal) -> Value {
 /// expression is not a column reference (e.g. literal / function
 /// call) or the column can't be resolved (caller falls back to
 /// `Collation::Binary` semantics).
-pub(crate) fn column_collation(
-    e: &Expr,
-    ctx: &EvalContext<'_>,
-) -> Option<spg_storage::Collation> {
+pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_storage::Collation> {
     let Expr::Column(c) = e else {
         return None;
     };

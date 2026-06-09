@@ -66,7 +66,9 @@ fn insert_subset_round_trips() {
         "INSERT INTO t VALUES (1, 'read,write')",
     ]);
     let rows = select(&mut eng, "SELECT perms FROM t");
-    let Value::Text(s) = &rows[0][0] else { panic!() };
+    let Value::Text(s) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(s, "read,write");
 }
 
@@ -78,7 +80,9 @@ fn insert_canonicalises_to_definition_order() {
         "INSERT INTO t VALUES (1, 'admin,read')",
     ]);
     let rows = select(&mut eng, "SELECT perms FROM t");
-    let Value::Text(s) = &rows[0][0] else { panic!() };
+    let Value::Text(s) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(s, "read,admin");
 }
 
@@ -89,7 +93,9 @@ fn insert_dedups_repeated_tokens() {
         "INSERT INTO t VALUES (1, 'read,read,write,write')",
     ]);
     let rows = select(&mut eng, "SELECT perms FROM t");
-    let Value::Text(s) = &rows[0][0] else { panic!() };
+    let Value::Text(s) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(s, "read,write");
 }
 
@@ -100,7 +106,9 @@ fn insert_empty_string_means_no_flags() {
         "INSERT INTO t VALUES (1, '')",
     ]);
     let rows = select(&mut eng, "SELECT perms FROM t");
-    let Value::Text(s) = &rows[0][0] else { panic!() };
+    let Value::Text(s) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(s, "");
 }
 
@@ -111,15 +119,16 @@ fn insert_single_value_round_trips() {
         "INSERT INTO t VALUES (1, 'admin')",
     ]);
     let rows = select(&mut eng, "SELECT perms FROM t");
-    let Value::Text(s) = &rows[0][0] else { panic!() };
+    let Value::Text(s) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(s, "admin");
 }
 
 #[test]
 fn insert_unlisted_token_is_error() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (id INT NOT NULL, perms SET('read','write','admin'))",
-    ]);
+    let mut eng =
+        engine_with(&["CREATE TABLE t (id INT NOT NULL, perms SET('read','write','admin'))"]);
     let r = eng.execute("INSERT INTO t VALUES (1, 'read,superpower')");
     assert!(r.is_err(), "non-listed SET token must error");
 }
@@ -145,9 +154,15 @@ fn set_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, perms FROM files ORDER BY id");
     assert_eq!(rows.len(), 3);
-    let Value::Text(a) = &rows[0][1] else { panic!() };
-    let Value::Text(b) = &rows[1][1] else { panic!() };
-    let Value::Text(c) = &rows[2][1] else { panic!() };
+    let Value::Text(a) = &rows[0][1] else {
+        panic!()
+    };
+    let Value::Text(b) = &rows[1][1] else {
+        panic!()
+    };
+    let Value::Text(c) = &rows[2][1] else {
+        panic!()
+    };
     assert_eq!(a, "r,w");
     assert_eq!(b, "r,w,x");
     assert_eq!(c, "");
