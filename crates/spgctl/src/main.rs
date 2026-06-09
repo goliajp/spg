@@ -80,6 +80,42 @@ fn main() {
         // STABILITY § "Out of v6.10" — the v6.10.7 ship freezes
         // the CLI shape so the future revisit drops in the audit
         // lookup without changing the operator surface.
+        // v7.18 PITR P4 — `spg backup-pitr --src <db_path>
+        // --dst <backup_dir>` copies the catalog snapshot + the
+        // current WAL into a layout pitr-restore can consume:
+        //   <dst>/snapshot.spg
+        //   <dst>/wal/<unix_us>_<max_lsn>.wal
+        // The dst directory is created if absent. Live-daemon
+        // safety is the caller's responsibility for v7.18 — P6
+        // wires chunk rotation + atomic snapshot capture into
+        // the engine so backups stay self-consistent under
+        // concurrent writes; P4 just ships the file-copy layer
+        // the rest of the PITR sub-epic builds on.
+        Some("backup-pitr") => {
+            let mut src: Option<String> = None;
+            let mut dst: Option<String> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--src" => src = args.next(),
+                    "--dst" => dst = args.next(),
+                    other => {
+                        die(&format!("unknown backup-pitr arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let (Some(src), Some(dst)) = (src, dst) else {
+                die(
+                    "usage: spg backup-pitr --src <db_path> --dst <backup_dir>",
+                    2,
+                );
+                return;
+            };
+            match backup_pitr(&src, &dst) {
+                Ok(report) => println!("{report}"),
+                Err(e) => die(&format!("backup-pitr failed: {e}"), 1),
+            }
+        }
         // v7.18 PITR P3 — `spg pitr-restore --snapshot <file>
         // --wal <file> --to <timestamp> --target <out_path>`.
         // Replays WAL records up to <timestamp> (or LSN, when
@@ -216,6 +252,89 @@ fn main() {
 /// snapshot to `out_path`. `to_seq == 0` is a special case
 /// meaning "replay no records" — the snapshot is the empty
 /// catalog. Returns the count of records applied.
+/// v7.18 PITR P4 — copy a SPG database's catalog snapshot + WAL
+/// into a backup directory layout `pitr-restore` can consume.
+///
+/// Output layout:
+///
+///   <dst>/snapshot.spg                 — bit-for-bit copy of <src>
+///   <dst>/wal/<unix_us>_<max_lsn>.wal  — bit-for-bit copy of <src>.wal
+///
+/// The directory and the `wal/` subdir are created if absent.
+/// Returns a human-readable summary line for stdout.
+///
+/// Live-daemon coordination is not enforced here — callers either
+/// pause the daemon, accept the WAL chunk being a snapshot of a
+/// concurrently-growing file (the chunk will deserialize cleanly
+/// to whichever record boundary the read happens to catch),
+/// or wait for the P6 atomic-snapshot capture path.
+fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
+    use spg_embedded::{WalRecord, parse_wal_records};
+    let src_path = std::path::PathBuf::from(src);
+    let dst_dir = std::path::PathBuf::from(dst);
+    fs::create_dir_all(&dst_dir).map_err(|e| format!("create dst dir {dst}: {e}"))?;
+    let wal_dir = dst_dir.join("wal");
+    fs::create_dir_all(&wal_dir).map_err(|e| format!("create wal dir: {e}"))?;
+
+    // 1) Snapshot — required.
+    let snap_bytes = fs::read(&src_path).map_err(|e| format!("read snapshot {src}: {e}"))?;
+    let snap_target = dst_dir.join("snapshot.spg");
+    fs::write(&snap_target, &snap_bytes)
+        .map_err(|e| format!("write snapshot {}: {e}", snap_target.display()))?;
+
+    // 2) WAL — may be empty / absent (fresh database). Allow
+    //    missing files but error on read failures.
+    let src_wal = {
+        let mut p = src_path.clone();
+        let mut name = p
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(".wal");
+        p.set_file_name(name);
+        p
+    };
+    let (wal_bytes, wal_present) = match fs::read(&src_wal) {
+        Ok(b) => (b, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+        Err(e) => return Err(format!("read wal {}: {e}", src_wal.display())),
+    };
+
+    let mut max_lsn: u64 = 0;
+    if !wal_bytes.is_empty() {
+        let recs: Vec<WalRecord<'_>> = parse_wal_records(&wal_bytes)
+            .map_err(|e| format!("parse wal for naming: {e}"))?;
+        for r in &recs {
+            if let Some(l) = r.commit_lsn {
+                if l > max_lsn {
+                    max_lsn = l;
+                }
+            }
+        }
+    }
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros());
+    let chunk_name = format!("{now_us}_{max_lsn}.wal");
+    let chunk_path = wal_dir.join(&chunk_name);
+    if !wal_bytes.is_empty() {
+        fs::write(&chunk_path, &wal_bytes)
+            .map_err(|e| format!("write chunk {}: {e}", chunk_path.display()))?;
+    }
+
+    Ok(format!(
+        "OK snapshot={} wal_present={} chunk={} max_lsn={}",
+        snap_target.display(),
+        wal_present,
+        if wal_bytes.is_empty() {
+            "(empty)".to_string()
+        } else {
+            chunk_path.display().to_string()
+        },
+        max_lsn,
+    ))
+}
+
 /// v7.18 PITR P3 — point-in-time restore.
 ///
 /// Loads the catalog snapshot at `snapshot_path` into a fresh
@@ -905,6 +1024,132 @@ mod tests {
         assert!(parse_restore_target("yesterday").is_err());
         assert!(parse_restore_target("-1").is_err());
         assert!(parse_restore_target("2026-13-01 00:00:00").is_ok()); // we don't bounds-check fields
+    }
+
+    #[test]
+    fn backup_pitr_round_trips_with_pitr_restore() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("bk-src-db");
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        // Apply writes, then checkpoint() so the snapshot file
+        // is materialised on disk. checkpoint() truncates the
+        // WAL — so the data lives entirely in the snapshot for
+        // this round-trip test.
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+
+        // Backup → backup_dir.
+        let backup_dir = tmp_path("bk-dst-dir");
+        let summary = backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(summary.starts_with("OK "), "bad summary: {summary}");
+        let snap = backup_dir.join("snapshot.spg");
+        let wal_dir = backup_dir.join("wal");
+        assert!(snap.exists(), "snapshot.spg missing");
+        assert!(wal_dir.exists(), "wal/ subdir missing");
+        let chunks: Vec<_> = fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        // checkpoint() truncated the WAL to 0 bytes before the
+        // backup snapshot was read, so the chunk directory ends
+        // up empty — all data lives in snapshot.spg. Empty WAL
+        // chunks would clutter the backup dir without information
+        // and would still need verifier special-casing later, so
+        // backup_pitr skips them.
+        assert!(chunks.is_empty(), "expected 0 chunks after checkpoint, got {chunks:?}");
+
+        // Restore: feed pitr_restore an empty WAL file to confirm
+        // the snapshot-only path also works. Use the source WAL
+        // path (currently empty) for that.
+        let empty_wal = tmp_path("bk-empty-wal");
+        fs::write(&empty_wal, b"").unwrap();
+        let target_path = tmp_path("bk-restore-target");
+        let (applied, _) = pitr_restore(
+            snap.to_str().unwrap(),
+            empty_wal.to_str().unwrap(),
+            "999",
+            target_path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied, 0, "empty WAL → nothing to replay");
+
+        // Verify rows survived in the snapshot itself.
+        let mut restored = Database::restore(&fs::read(&target_path).unwrap()).unwrap();
+        let rows = restored.query("SELECT COUNT(*) FROM t").unwrap();
+        let count = match &rows[0][0] {
+            spg_embedded::Value::Int(n) => i64::from(*n),
+            spg_embedded::Value::BigInt(n) => *n,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(count, 2);
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_file(&empty_wal);
+    }
+
+    #[test]
+    fn backup_pitr_handles_missing_wal() {
+        use spg_embedded::Database;
+        let db_path = tmp_path("bk-no-wal-db");
+        // Touch a snapshot file but never run any writes that
+        // would create the WAL.
+        let mut db = Database::open_path(&db_path).unwrap();
+        // No execute() — Drop will checkpoint an empty engine.
+        drop(db);
+        // Wipe the .wal file (Drop's empty-checkpoint may have
+        // created it; nuke explicitly to exercise the missing-
+        // WAL branch).
+        let wal_path = {
+            let mut p = db_path.clone();
+            let mut name = p
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".wal");
+            p.set_file_name(name);
+            p
+        };
+        let _ = fs::remove_file(&wal_path);
+
+        let backup_dir = tmp_path("bk-no-wal-dst");
+        let summary = backup_pitr(
+            db_path.to_str().unwrap(),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(summary.contains("wal_present=false"), "summary: {summary}");
+        let wal_dir = backup_dir.join("wal");
+        // wal/ subdir created but empty.
+        assert!(wal_dir.exists());
+        let chunks: Vec<_> = fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(chunks.is_empty(), "should have produced no chunks");
+
+        let _ = fs::remove_dir_all(&backup_dir);
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]
