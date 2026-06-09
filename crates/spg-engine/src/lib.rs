@@ -1556,6 +1556,7 @@ impl Engine {
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowDatabases => Ok(self.exec_show_databases()),
+            Statement::ShowCreateTable(name) => self.exec_show_create_table(&name),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
@@ -1847,6 +1848,7 @@ impl Engine {
             Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(&name),
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowDatabases => Ok(self.exec_show_databases()),
+            Statement::ShowCreateTable(name) => self.exec_show_create_table(&name),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
@@ -4691,6 +4693,94 @@ impl Engine {
             .map(|n| Row::new(alloc::vec![Value::Text(n)]))
             .collect();
         QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.17.0 Phase 3.P0-59 — `SHOW CREATE TABLE <t>`. Synthesise
+    /// a minimal MySQL-flavoured CREATE TABLE DDL from the
+    /// catalog's TableSchema so mysqldump round-trips load against
+    /// SPG without splitting init scripts.
+    fn exec_show_create_table(&self, name: &str) -> Result<QueryResult, EngineError> {
+        let t = self.active_catalog().get(name).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: name.into() })
+        })?;
+        let cols: Vec<String> = t
+            .schema()
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = render_data_type(c.ty);
+                let nullable = if c.nullable { "" } else { " NOT NULL" };
+                alloc::format!("  `{}` {}{}", c.name, ty, nullable)
+            })
+            .collect();
+        let mut body = cols.join(",\n");
+        // Append UNIQUE / PRIMARY KEY clauses.
+        for uc in &t.schema().uniqueness_constraints {
+            let col_names: Vec<String> = uc
+                .columns
+                .iter()
+                .map(|&p| {
+                    t.schema()
+                        .columns
+                        .get(p)
+                        .map_or_else(|| alloc::format!("col{p}"), |c| alloc::format!("`{}`", c.name))
+                })
+                .collect();
+            let kw = if uc.is_primary_key { "PRIMARY KEY" } else { "UNIQUE KEY" };
+            body.push_str(",\n  ");
+            body.push_str(&alloc::format!("{kw} ({})", col_names.join(", ")));
+        }
+        // Foreign keys.
+        for fk in &t.schema().foreign_keys {
+            let local: Vec<String> = fk
+                .local_columns
+                .iter()
+                .map(|&p| {
+                    t.schema()
+                        .columns
+                        .get(p)
+                        .map_or_else(|| alloc::format!("col{p}"), |c| alloc::format!("`{}`", c.name))
+                })
+                .collect();
+            let parent_cols: Vec<String> = if let Some(parent) = self.active_catalog().get(&fk.parent_table) {
+                fk.parent_columns
+                    .iter()
+                    .map(|&p| {
+                        parent
+                            .schema()
+                            .columns
+                            .get(p)
+                            .map_or_else(|| alloc::format!("col{p}"), |c| alloc::format!("`{}`", c.name))
+                    })
+                    .collect()
+            } else {
+                fk.parent_columns
+                    .iter()
+                    .map(|p| alloc::format!("col{p}"))
+                    .collect()
+            };
+            body.push_str(",\n  ");
+            body.push_str(&alloc::format!(
+                "FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                local.join(", "),
+                fk.parent_table,
+                parent_cols.join(", ")
+            ));
+        }
+        let ddl = alloc::format!(
+            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            name,
+            body
+        );
+        let columns = alloc::vec![
+            ColumnSchema::new("Table", DataType::Text, false),
+            ColumnSchema::new("Create Table", DataType::Text, false),
+        ];
+        let rows = alloc::vec![Row::new(alloc::vec![
+            Value::Text(name.into()),
+            Value::Text(ddl),
+        ])];
+        Ok(QueryResult::Rows { columns, rows })
     }
 
     /// v7.17.0 Phase 3.P0-58 — `SHOW DATABASES` / `SHOW SCHEMAS`.

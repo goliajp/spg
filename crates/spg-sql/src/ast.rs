@@ -88,6 +88,11 @@ pub enum Statement {
     /// returns the canonical MySQL set so the mysql / MariaDB
     /// client populates its database selector.
     ShowDatabases,
+    /// v7.17.0 Phase 3.P0-59 — MySQL `SHOW CREATE TABLE <t>`
+    /// returns a 2-column row `(Table, "Create Table")` carrying
+    /// the synthesized DDL. mysqldump emits this for every
+    /// table at scrape time.
+    ShowCreateTable(String),
     /// `SHOW COLUMNS FROM <table>` — return one row per column with
     /// its declared name / type / nullability.
     ShowColumns(String),
@@ -2342,6 +2347,7 @@ impl fmt::Display for Statement {
             Self::ReleaseSavepoint(n) => write!(f, "RELEASE SAVEPOINT {}", quote_ident(n)),
             Self::ShowTables => f.write_str("SHOW TABLES"),
             Self::ShowDatabases => f.write_str("SHOW DATABASES"),
+            Self::ShowCreateTable(t) => write!(f, "SHOW CREATE TABLE {}", quote_ident(t)),
             Self::ShowColumns(t) => write!(f, "SHOW COLUMNS FROM {}", quote_ident(t)),
             Self::CreateUser(s) => write!(
                 f,
