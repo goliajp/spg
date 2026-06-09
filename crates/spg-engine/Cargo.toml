@@ -19,6 +19,9 @@ spg-storage = { workspace = true }
 # the smallest dep that lands a no_std-friendly SHA-1 in the
 # workspace.
 sha1        = { version = "0.10", default-features = false }
+# v7.17.0 Phase 3.P0-72 — `caching_sha2_password` auth verifier
+# stores SHA256(SHA256(password)) per user.
+sha2        = { version = "0.10", default-features = false }
 
 [lints]
 workspace = true

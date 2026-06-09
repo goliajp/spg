@@ -98,10 +98,12 @@ const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 
 /// Auth plugin name advertised in the initial HandshakeV10. We
 /// pick `mysql_native_password` since it's the simplest and
-/// every client speaks it; clients that want `caching_sha2`
-/// will send AuthSwitchRequest after seeing this — handled in
-/// P0-72.
+/// every client speaks it. v7.17.0 Phase 3.P0-72 also accepts
+/// `caching_sha2_password` in the client's HandshakeResponse —
+/// see `verify_native_password` / `verify_caching_sha2`.
 pub(crate) const AUTH_PLUGIN_NATIVE: &str = "mysql_native_password";
+/// v7.17.0 Phase 3.P0-72 — MySQL 8.0+ default plugin name.
+pub(crate) const AUTH_PLUGIN_CACHING_SHA2: &str = "caching_sha2_password";
 
 // ---- listener bootstrap -------------------------------------
 
@@ -196,25 +198,29 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
         }
     };
 
-    // v7.17.0 Phase 3.P0-71 — verify the mysql_native_password
-    // response against the user table. Open mode (engine has no
-    // users) accepts any client and sends OK; users-present
-    // mode verifies SHA1(SHA1(pwd)) per the protocol. A user
-    // loaded from a pre-v7.17 snapshot has no stored hash —
-    // verify_mysql_native_password returns false and we reply
-    // with Access Denied (the operator has to reset the
-    // password to re-populate the field).
-    //
-    // Greeting state is kept by reference (for the scramble we
-    // sent at the top of the handshake); the next handshake
-    // step (AuthSwitchRequest for caching_sha2 etc.) lands in
-    // P0-72 and will need to re-read this value.
+    // v7.17.0 Phase 3.P0-71 / P0-72 — verify the auth response.
+    // Open mode (engine has no users) accepts any client and
+    // sends OK; users-present mode dispatches on the plugin
+    // name the client claimed:
+    //   * `mysql_native_password` → SHA1(SHA1(pw)) proof
+    //   * `caching_sha2_password` → SHA256(SHA256(pw)) fast path,
+    //     followed by an Auth More Data (0x01 + 0x03 fast auth
+    //     success) packet then OK. RSA full-auth is a v7.18
+    //     carve-out — fast-path failures surface as Access
+    //     Denied here.
     let scramble = std::mem::take(&mut greeting.scramble);
-    let auth_outcome = verify_native_password(state, &parsed, &scramble);
+    let auth_outcome = verify_handshake_response(state, &parsed, &scramble);
     let reply_seqno = seqno_in.wrapping_add(1);
     match auth_outcome {
         AuthOutcome::Ok => {
             write_packet(&mut stream, reply_seqno, &encode_ok_packet())?;
+        }
+        AuthOutcome::CachingSha2FastAuthOk => {
+            // Auth More Data packet: header byte 0x01 + status
+            // byte 0x03 ("fast auth success"). Client expects
+            // this, then OK on the next seqno.
+            write_packet(&mut stream, reply_seqno, &[0x01, 0x03])?;
+            write_packet(&mut stream, reply_seqno.wrapping_add(1), &encode_ok_packet())?;
         }
         AuthOutcome::AccessDenied(msg) => {
             write_packet(
@@ -224,10 +230,6 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             )?;
         }
         AuthOutcome::PluginMismatch(plugin) => {
-            // The client asked for a plugin we don't yet
-            // implement (e.g. caching_sha2_password). P0-72
-            // handles the AuthSwitchRequest follow-up; until
-            // then surface an explicit error message.
             write_packet(
                 &mut stream,
                 reply_seqno,
@@ -235,7 +237,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                     1251,
                     "08004",
                     &format!(
-                        "auth plugin {plugin:?} not yet supported — P0-72 lands caching_sha2_password",
+                        "auth plugin {plugin:?} not yet supported — Segment G covers mysql_native_password and caching_sha2_password (fast path)",
                     ),
                 ),
             )?;
@@ -249,23 +251,25 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
 #[derive(Debug)]
 enum AuthOutcome {
     Ok,
+    /// v7.17.0 Phase 3.P0-72 — caching_sha2_password fast-path
+    /// success. Different from `Ok` because the protocol
+    /// requires an Auth More Data (0x01 0x03) packet ahead of
+    /// the OK so the client knows the cache hit happened
+    /// without an RSA exchange.
+    CachingSha2FastAuthOk,
     AccessDenied(String),
     PluginMismatch(String),
 }
 
-fn verify_native_password(
+fn verify_handshake_response(
     state: &Arc<ServerState>,
     response: &HandshakeResponse41,
     scramble: &[u8],
 ) -> AuthOutcome {
-    // Only mysql_native_password lands here. caching_sha2 needs
-    // its own AuthSwitchRequest handshake step which P0-72
-    // implements.
-    if let Some(plugin) = &response.auth_plugin_name
-        && plugin != AUTH_PLUGIN_NATIVE
-    {
-        return AuthOutcome::PluginMismatch(plugin.clone());
-    }
+    let plugin = response
+        .auth_plugin_name
+        .as_deref()
+        .unwrap_or(AUTH_PLUGIN_NATIVE);
     let engine = match state.engine.read() {
         Ok(e) => e,
         Err(_) => {
@@ -274,10 +278,13 @@ fn verify_native_password(
             );
         }
     };
-    // Open mode — no users registered → accept anyone. Mirrors
-    // the pgwire shim's behaviour.
+    // Open mode — no users registered → accept any plugin.
     if engine.users().is_empty() {
-        return AuthOutcome::Ok;
+        return match plugin {
+            AUTH_PLUGIN_NATIVE => AuthOutcome::Ok,
+            AUTH_PLUGIN_CACHING_SHA2 => AuthOutcome::CachingSha2FastAuthOk,
+            other => AuthOutcome::PluginMismatch(other.to_string()),
+        };
     }
     let user = &response.username;
     let Some(record) = engine.users().get(user) else {
@@ -285,19 +292,33 @@ fn verify_native_password(
             "Access denied for user '{user}'"
         ));
     };
-    // Empty client response = "no password supplied". Match
-    // MySQL: only the user with empty stored hash can pass.
     if response.auth_response.is_empty() {
         return AuthOutcome::AccessDenied(format!(
             "Access denied for user '{user}' (empty password)"
         ));
     }
-    if record.verify_mysql_native_password(scramble, &response.auth_response) {
-        AuthOutcome::Ok
-    } else {
-        AuthOutcome::AccessDenied(format!(
-            "Access denied for user '{user}' (using mysql_native_password)"
-        ))
+    match plugin {
+        AUTH_PLUGIN_NATIVE => {
+            if record.verify_mysql_native_password(scramble, &response.auth_response) {
+                AuthOutcome::Ok
+            } else {
+                AuthOutcome::AccessDenied(format!(
+                    "Access denied for user '{user}' (using mysql_native_password)"
+                ))
+            }
+        }
+        AUTH_PLUGIN_CACHING_SHA2 => {
+            if record.verify_caching_sha2_password(scramble, &response.auth_response) {
+                AuthOutcome::CachingSha2FastAuthOk
+            } else {
+                // RSA full-auth fallback is a v7.18 carve-out —
+                // surface as Access Denied with a hint.
+                AuthOutcome::AccessDenied(format!(
+                    "Access denied for user '{user}' (caching_sha2_password fast path failed; RSA full-auth fallback not yet implemented)"
+                ))
+            }
+        }
+        other => AuthOutcome::PluginMismatch(other.to_string()),
     }
 }
 
