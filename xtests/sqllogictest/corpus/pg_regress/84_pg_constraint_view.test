@@ -1,0 +1,27 @@
+# v7.17.0 Phase 3.P0-54 — pg_catalog.pg_constraint virtual view.
+
+statement ok
+CREATE TABLE parents (id INT NOT NULL, PRIMARY KEY (id))
+
+statement ok
+CREATE TABLE children (id INT NOT NULL, parent_id INT NOT NULL,
+    FOREIGN KEY (parent_id) REFERENCES parents (id))
+
+# Primary key on parents.
+query TT
+SELECT contype, conkey FROM pg_catalog.pg_constraint
+WHERE conrelid = 'parents' AND contype = 'p'
+----
+p
+id
+
+# Foreign key on children referencing parents.
+query TTTTT
+SELECT contype, conrelid, confrelid, conkey, confkey
+FROM pg_catalog.pg_constraint WHERE contype = 'f'
+----
+f
+children
+parents
+parent_id
+id

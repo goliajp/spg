@@ -9178,12 +9178,45 @@ impl Engine {
                     let (schema, rows) = synth_pg_index_raw(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.17.0 Phase 3.P0-54 — pg_catalog.pg_constraint
+                // for FK / UNIQUE / PK / CHECK introspection.
+                "__spg_pg_constraint" => {
+                    let (schema, rows) = synth_pg_constraint(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-55 — pg_catalog.pg_database /
+                // pg_roles / pg_user. SPG is single-database so
+                // pg_database surfaces just `postgres`; pg_roles
+                // / pg_user walk the engine's UserStore.
+                "__spg_pg_database" => {
+                    let (schema, rows) = synth_pg_database(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_roles" | "__spg_pg_user" => {
+                    let (schema, rows) = synth_pg_roles(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_views /
+                // pg_matviews. SPG has no materialised views yet so
+                // pg_matviews shares the pg_views shape (always
+                // empty).
+                "__spg_pg_views" | "__spg_pg_matviews" => {
+                    let (schema, rows) = synth_pg_views(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-57 — pg_catalog.pg_settings.
+                "__spg_pg_settings" => {
+                    let (schema, rows) = synth_pg_settings(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "meta view {view:?} is not yet materialisable; \
                          v7.16.2 covers information_schema.columns / .tables \
                          and pg_catalog.pg_class / pg_attribute; \
-                         v7.17.0 P0-50..P0-53 add pg_type / pg_proc / pg_namespace / pg_indexes / pg_index"
+                         v7.17.0 P0-50..P0-57 add pg_type / pg_proc / pg_namespace / \
+                         pg_indexes / pg_index / pg_constraint / pg_database / pg_roles / \
+                         pg_user / pg_views / pg_matviews / pg_settings"
                     )));
                 }
             }
@@ -10314,6 +10347,252 @@ fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
             Value::Int(nargs),
             Value::BigInt(rettype),
         ]));
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-54 — synthesise `pg_catalog.pg_constraint`.
+/// ORM compilers (Diesel, sea-orm) and admin tools probe this for
+/// FK / UNIQUE / PK / CHECK definitions to surface relationship
+/// graphs and validation rules. SPG ships one row per
+/// uniqueness constraint + foreign key declared in the catalog.
+///
+/// Schema columns exposed:
+///   * conname (Text) — constraint name (synthetic when anonymous)
+///   * contype (Text) — `p` PK, `u` UNIQUE, `f` FK, `c` CHECK
+///   * conrelid (Text) — owner table name
+///   * confrelid (Text) — referenced parent table (FK only;
+///     empty string otherwise)
+///   * conkey (Text) — comma-separated column names
+///   * confkey (Text) — comma-separated parent column names (FK only)
+fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("conname", DataType::Text, false),
+        ColumnSchema::new("contype", DataType::Text, false),
+        ColumnSchema::new("conrelid", DataType::Text, false),
+        ColumnSchema::new("confrelid", DataType::Text, false),
+        ColumnSchema::new("conkey", DataType::Text, false),
+        ColumnSchema::new("confkey", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let cols = &t.schema().columns;
+        let col_name_at = |pos: usize| -> String {
+            cols.get(pos)
+                .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
+        };
+        // Uniqueness constraints (composite UNIQUE / PRIMARY KEY).
+        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let kind = if uc.is_primary_key { "p" } else { "u" };
+            let conname = if uc.is_primary_key {
+                alloc::format!("{}_pkey", tname)
+            } else {
+                alloc::format!("{}_uniq{ci}", tname)
+            };
+            let conkey: Vec<String> = uc.columns.iter().map(|&p| col_name_at(p)).collect();
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text(kind.into()),
+                Value::Text(tname.clone()),
+                Value::Text(String::new()),
+                Value::Text(conkey.join(",")),
+                Value::Text(String::new()),
+            ]));
+        }
+        // Single-column PK / UNIQUE indexes that have no
+        // matching entry in `uniqueness_constraints` (the engine
+        // creates only the BTree index for the bare-column case;
+        // composite forms ride the UC path above).
+        for idx in t.indices() {
+            if !idx.is_unique {
+                continue;
+            }
+            let is_primary = idx.name.ends_with("_pkey");
+            let conname = idx.name.clone();
+            let kind = if is_primary { "p" } else { "u" };
+            let col_name = col_name_at(idx.column_position);
+            // Skip if already emitted via the UC loop above (same
+            // tuple shape — single-column).
+            let already = t.schema().uniqueness_constraints.iter().any(|uc| {
+                uc.columns.len() == 1 && uc.columns[0] == idx.column_position
+            });
+            if already {
+                continue;
+            }
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text(kind.into()),
+                Value::Text(tname.clone()),
+                Value::Text(String::new()),
+                Value::Text(col_name),
+                Value::Text(String::new()),
+            ]));
+        }
+        // Foreign keys.
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+            let conkey: Vec<String> =
+                fk.local_columns.iter().map(|&p| col_name_at(p)).collect();
+            // Parent column names: look up the parent table's
+            // schema if it exists; otherwise emit positions.
+            let confkey: Vec<String> = if let Some(parent) = cat.get(&fk.parent_table) {
+                fk.parent_columns
+                    .iter()
+                    .map(|&p| {
+                        parent
+                            .schema()
+                            .columns
+                            .get(p)
+                            .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+                    })
+                    .collect()
+            } else {
+                fk.parent_columns
+                    .iter()
+                    .map(|p| alloc::format!("col{p}"))
+                    .collect()
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text("f".into()),
+                Value::Text(tname.clone()),
+                Value::Text(fk.parent_table.clone()),
+                Value::Text(conkey.join(",")),
+                Value::Text(confkey.join(",")),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-55 — synthesise `pg_catalog.pg_database`.
+/// SPG is single-database so we surface a single row keyed on the
+/// canonical `postgres` database name (matching what every PG
+/// admin tool's startup screen expects to find).
+fn synth_pg_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("datname", DataType::Text, false),
+        ColumnSchema::new("datdba", DataType::BigInt, false),
+        ColumnSchema::new("encoding", DataType::Int, false),
+        ColumnSchema::new("datcollate", DataType::Text, false),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(16384),
+        Value::Text("postgres".into()),
+        Value::BigInt(10),
+        Value::Int(6), // UTF8
+        Value::Text("en_US.UTF-8".into()),
+    ])];
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-55 — synthesise `pg_catalog.pg_roles`. PG's
+/// pg_roles is a view over pg_authid showing all roles. SPG ships
+/// one row per declared user from the engine's UserStore so admin
+/// tool startup screens can populate.
+fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("rolname", DataType::Text, false),
+        ColumnSchema::new("rolsuper", DataType::Bool, false),
+        ColumnSchema::new("rolinherit", DataType::Bool, false),
+        ColumnSchema::new("rolcanlogin", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    let oid: i64 = 10;
+    for (i, (name, _)) in engine.users.iter().enumerate() {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid + (i as i64) + 1),
+            Value::Text(name.to_string()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]));
+    }
+    // Always include `postgres` as the bootstrap superuser if not
+    // already present — admin tools probe for it.
+    if !rows
+        .iter()
+        .any(|r| matches!(&r.values[1], Value::Text(s) if s == "postgres"))
+    {
+        rows.insert(
+            0,
+            Row::new(alloc::vec![
+                Value::BigInt(10),
+                Value::Text("postgres".into()),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(true),
+            ]),
+        );
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-56 — synthesise `pg_catalog.pg_views`. PG's
+/// pg_views is a view listing every catalog view; SPG ships one
+/// row per declared view + its definition text.
+fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("viewname", DataType::Text, false),
+        ColumnSchema::new("definition", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for (name, def) in cat.views() {
+        rows.push(Row::new(alloc::vec![
+            Value::Text("public".into()),
+            Value::Text(name.clone()),
+            Value::Text(def.body.clone()),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-57 — synthesise `pg_catalog.pg_settings`. ORM
+/// connection-checkers (sqlx pre-flight, Diesel migrator) and admin
+/// tools read `pg_settings` to discover server-side configuration.
+/// SPG surfaces every session_param + a small set of canonical PG
+/// defaults so the pre-flight queries match.
+fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("name", DataType::Text, false),
+        ColumnSchema::new("setting", DataType::Text, false),
+        ColumnSchema::new("category", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    // Canonical defaults every admin tool expects to find.
+    let defaults: &[(&str, &str, &str)] = &[
+        ("server_version", "16.0 (spg)", "Preset Options"),
+        ("server_encoding", "UTF8", "Client Connection Defaults"),
+        ("client_encoding", "UTF8", "Client Connection Defaults"),
+        ("DateStyle", "ISO, MDY", "Client Connection Defaults"),
+        ("TimeZone", "UTC", "Client Connection Defaults"),
+        ("standard_conforming_strings", "on", "Compatibility"),
+        ("integer_datetimes", "on", "Compatibility"),
+        ("max_connections", "100", "Connections and Authentication"),
+    ];
+    for &(name, val, cat) in defaults {
+        rows.push(Row::new(alloc::vec![
+            Value::Text(name.into()),
+            Value::Text(val.into()),
+            Value::Text(cat.into()),
+        ]));
+    }
+    // Session-set params override the static defaults.
+    for (k, v) in &engine.session_params {
+        if !defaults.iter().any(|(n, _, _)| (*n).eq_ignore_ascii_case(k)) {
+            rows.push(Row::new(alloc::vec![
+                Value::Text(k.clone()),
+                Value::Text(v.clone()),
+                Value::Text("Session".into()),
+            ]));
+        }
     }
     (schema, rows)
 }
