@@ -51,7 +51,7 @@ spg-embedded-tokio = { path = "crates/spg-embedded-tokio", version = "7.10" }
 # v7.16.0 — sqlx 0.8 adapter for spg-embedded. Lets mailrs-shape
 # in-process callers use sqlx::query / query_as / pool.begin against
 # an in-process SPG (no TCP listener).
-spg-sqlx = { path = "crates/spg-sqlx", version = "7.16" }
+spg-sqlx = { path = "crates/spg-sqlx", version = "7.17" }
 
 [workspace.lints.rust]
 # v3.0.4: relaxed from `forbid` to `deny` so spg-crypto can drop into
