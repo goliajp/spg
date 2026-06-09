@@ -83,6 +83,11 @@ pub enum Statement {
     ReleaseSavepoint(String),
     /// `SHOW TABLES` — return the list of tables in the catalog.
     ShowTables,
+    /// v7.17.0 Phase 3.P0-58 — MySQL `SHOW DATABASES` /
+    /// `SHOW SCHEMAS`. SPG is single-database; the executor
+    /// returns the canonical MySQL set so the mysql / MariaDB
+    /// client populates its database selector.
+    ShowDatabases,
     /// `SHOW COLUMNS FROM <table>` — return one row per column with
     /// its declared name / type / nullability.
     ShowColumns(String),
@@ -2336,6 +2341,7 @@ impl fmt::Display for Statement {
             Self::RollbackToSavepoint(n) => write!(f, "ROLLBACK TO SAVEPOINT {}", quote_ident(n)),
             Self::ReleaseSavepoint(n) => write!(f, "RELEASE SAVEPOINT {}", quote_ident(n)),
             Self::ShowTables => f.write_str("SHOW TABLES"),
+            Self::ShowDatabases => f.write_str("SHOW DATABASES"),
             Self::ShowColumns(t) => write!(f, "SHOW COLUMNS FROM {}", quote_ident(t)),
             Self::CreateUser(s) => write!(
                 f,

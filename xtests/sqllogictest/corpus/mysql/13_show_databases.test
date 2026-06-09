@@ -1,0 +1,20 @@
+# v7.17.0 Phase 3.P0-58 — MySQL SHOW DATABASES / SHOW SCHEMAS.
+
+query T rowsort
+SHOW DATABASES
+----
+information_schema
+mysql
+performance_schema
+postgres
+sys
+
+# SHOW SCHEMAS is an alias for SHOW DATABASES.
+query T rowsort
+SHOW SCHEMAS
+----
+information_schema
+mysql
+performance_schema
+postgres
+sys
