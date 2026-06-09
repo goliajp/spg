@@ -38,6 +38,12 @@ serde_json = { version = "1",   optional = true }
 bigdecimal = { version = "0.4", default-features = false, optional = true }
 num-bigint = { version = "0.4", default-features = false, optional = true }
 num-traits = { version = "0.2", default-features = false, optional = true }
+# v7.17.0 Phase 3.P0-69 — Encode/Decode for `uuid::Uuid` against
+# SPG's `UUID` column. P0-25 already ships `gen_random_uuid()` /
+# `uuid_generate_v4()` and the storage / pgwire layers carry the
+# canonical hyphenated form; the sqlx bridge here closes the
+# typed end-to-end loop.
+uuid       = { version = "1", default-features = false, optional = true }
 # Standard async machinery.
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -51,9 +57,10 @@ sqlx         = { version = "0.8", default-features = false, features = ["runtime
 chrono       = { version = "0.4", features = ["clock", "std"] }
 serde_json   = "1"
 bigdecimal   = "0.4"
+uuid         = { version = "1", features = ["v4"] }
 
 [features]
-default = ["chrono", "json", "bigdecimal"]
+default = ["chrono", "json", "bigdecimal", "uuid"]
 # `chrono` — Encode/Decode for chrono::DateTime<Utc> against
 # SPG's TIMESTAMPTZ (post-v7.15.0 offset literal round-trip).
 chrono  = ["dep:chrono"]
@@ -64,3 +71,6 @@ json    = ["dep:serde_json"]
 # against SPG's `NUMERIC(p, s)`. Opt-in: only consumers using
 # arbitrary-precision math pay the dep cost.
 bigdecimal = ["dep:bigdecimal", "dep:num-bigint", "dep:num-traits"]
+# v7.17.0 Phase 3.P0-69 — Encode/Decode for `uuid::Uuid` against
+# SPG's `UUID` column.
+uuid       = ["dep:uuid"]

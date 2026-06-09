@@ -116,6 +116,9 @@ pub fn engine_value_kind(v: &EngineValue) -> Kind {
         EngineValue::Date(_) => Kind::Date,
         EngineValue::Timestamp(_) => Kind::Timestamp,
         EngineValue::Json(_) => Kind::Json,
+        // v7.17.0 Phase 3.P0-69 — UUID bridges to uuid::Uuid /
+        // String.
+        EngineValue::Uuid(_) => Kind::Uuid,
         // v7.17.0 Phase 3.P0-67 — NUMERIC bridges to bigdecimal /
         // String.
         EngineValue::Numeric { .. } => Kind::Numeric,
