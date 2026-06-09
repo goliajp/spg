@@ -255,10 +255,30 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     command_loop(&mut stream, state)
 }
 
+/// v7.17.0 Phase 3.P0-74 — per-session prepared-statement
+/// state. `stmt_id` is server-assigned, 1-based; we never
+/// recycle slots within one session so a stale id from a
+/// long-running connector never lands on a fresh statement.
+#[derive(Default)]
+struct PreparedState {
+    next_id: u32,
+    by_id: std::collections::HashMap<u32, PreparedEntry>,
+}
+
+struct PreparedEntry {
+    sql: String,
+    /// Output column schemas captured at PREPARE so EXECUTE
+    /// returns the same column shape without re-describing.
+    columns: Vec<ColumnSchema>,
+    /// Number of `$N` / `?` placeholders the SQL declares.
+    param_count: u16,
+}
+
 fn command_loop(
     stream: &mut TcpStream,
     state: &Arc<ServerState>,
 ) -> std::io::Result<()> {
+    let mut prepared = PreparedState::default();
     loop {
         let (seqno_in, payload) = match read_packet(stream) {
             Ok(t) => t,
@@ -307,6 +327,36 @@ fn command_loop(
             CMD_FIELD_LIST => {
                 handle_com_field_list(stream, state, &payload[1..], reply_seqno)?;
             }
+            CMD_STMT_PREPARE => {
+                let sql = std::str::from_utf8(&payload[1..])
+                    .unwrap_or("")
+                    .to_string();
+                handle_com_stmt_prepare(stream, state, &mut prepared, &sql, reply_seqno)?;
+            }
+            CMD_STMT_EXECUTE => {
+                handle_com_stmt_execute(
+                    stream,
+                    state,
+                    &mut prepared,
+                    &payload[1..],
+                    reply_seqno,
+                )?;
+            }
+            CMD_STMT_CLOSE => {
+                // COM_STMT_CLOSE has no response — server just
+                // forgets the statement. Stale ids are ignored.
+                if payload.len() >= 5 {
+                    let id = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+                    prepared.by_id.remove(&id);
+                }
+            }
+            CMD_STMT_RESET => {
+                // COM_STMT_RESET: clear long-data buffers. SPG
+                // doesn't support COM_STMT_SEND_LONG_DATA yet, so
+                // this is effectively a no-op — but we still
+                // reply OK so the client doesn't error.
+                write_packet(stream, reply_seqno, &encode_ok_packet())?;
+            }
             _ => {
                 // Unknown command. P0-74 / P0-75 add binary-protocol
                 // commands (STMT_PREPARE / EXECUTE / RESET / CLOSE,
@@ -341,6 +391,11 @@ pub(crate) const CMD_QUERY: u8 = 0x03;
 pub(crate) const CMD_FIELD_LIST: u8 = 0x04;
 /// v7.17.0 Phase 3.P0-75 — `mysqladmin ping` / connector keepalive.
 pub(crate) const CMD_PING: u8 = 0x0e;
+/// v7.17.0 Phase 3.P0-74 — binary prepared protocol.
+pub(crate) const CMD_STMT_PREPARE: u8 = 0x16;
+pub(crate) const CMD_STMT_EXECUTE: u8 = 0x17;
+pub(crate) const CMD_STMT_CLOSE: u8 = 0x19;
+pub(crate) const CMD_STMT_RESET: u8 = 0x1a;
 
 fn handle_com_query(
     stream: &mut TcpStream,
@@ -393,6 +448,368 @@ fn handle_com_query(
         }
     }
     Ok(())
+}
+
+// ---- COM_STMT_PREPARE / EXECUTE ----------------------------
+
+fn handle_com_stmt_prepare(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    prepared: &mut PreparedState,
+    sql: &str,
+    start_seqno: u8,
+) -> std::io::Result<()> {
+    let (param_count, columns) = {
+        let Ok(mut engine) = state.engine.write() else {
+            return write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(1815, "HY000", "engine lock poisoned"),
+            );
+        };
+        match engine.prepare(sql) {
+            Ok(stmt) => {
+                let (param_oids, cols) = engine.describe_prepared(&stmt);
+                (param_oids.len() as u16, cols)
+            }
+            Err(e) => {
+                let msg = format!("{e:?}");
+                return write_packet(
+                    stream,
+                    start_seqno,
+                    &encode_err_packet(1064, "42000", &msg),
+                );
+            }
+        }
+    };
+    let id = prepared.next_id.wrapping_add(1);
+    prepared.next_id = id;
+    let num_columns = columns.len() as u16;
+    let entry = PreparedEntry {
+        sql: sql.to_string(),
+        columns: columns.clone(),
+        param_count,
+    };
+    prepared.by_id.insert(id, entry);
+
+    // ---- COM_STMT_PREPARE_OK packet ----
+    // status(1) + stmt_id(4) + num_columns(2) + num_params(2)
+    // + reserved(1) + warning_count(2)
+    let mut payload = Vec::with_capacity(12);
+    payload.push(0x00);
+    payload.extend_from_slice(&id.to_le_bytes());
+    payload.extend_from_slice(&num_columns.to_le_bytes());
+    payload.extend_from_slice(&param_count.to_le_bytes());
+    payload.push(0x00); // reserved
+    payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
+    let mut seq = start_seqno;
+    write_packet(stream, seq, &payload)?;
+    seq = seq.wrapping_add(1);
+    // ---- parameter definitions ----
+    if param_count > 0 {
+        for _ in 0..param_count {
+            // SPG describe_prepared doesn't surface per-parameter
+            // type info today — we hand back a generic
+            // VAR_STRING column_def so the bind path remains
+            // wire-correct. EXECUTE then dispatches on the
+            // type byte the client sent.
+            let placeholder = ColumnSchema {
+                name: "?".to_string(),
+                ty: DataType::Text,
+                nullable: true,
+                auto_increment: false,
+                default: None,
+                runtime_default: None,
+                user_enum_type: None,
+                user_domain_type: None,
+                on_update_runtime: None,
+                collation: spg_storage::Collation::Binary,
+                is_unsigned: false,
+                inline_enum_variants: None,
+                inline_set_variants: None,
+            };
+            let buf = encode_column_def_41(&placeholder);
+            write_packet(stream, seq, &buf)?;
+            seq = seq.wrapping_add(1);
+        }
+        // Intermediate marker (CLIENT_DEPRECATE_EOF → OK).
+        write_packet(stream, seq, &encode_ok_packet())?;
+        seq = seq.wrapping_add(1);
+    }
+    // ---- result column definitions ----
+    if num_columns > 0 {
+        for c in &columns {
+            let buf = encode_column_def_41(c);
+            write_packet(stream, seq, &buf)?;
+            seq = seq.wrapping_add(1);
+        }
+        write_packet(stream, seq, &encode_ok_packet())?;
+    }
+    Ok(())
+}
+
+fn handle_com_stmt_execute(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    prepared: &mut PreparedState,
+    payload: &[u8],
+    start_seqno: u8,
+) -> std::io::Result<()> {
+    if payload.len() < 9 {
+        return write_packet(
+            stream,
+            start_seqno,
+            &encode_err_packet(1064, "42000", "COM_STMT_EXECUTE payload truncated"),
+        );
+    }
+    let stmt_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+    let _flags = payload[4];
+    let _iteration = u32::from_le_bytes(payload[5..9].try_into().unwrap());
+
+    let entry = match prepared.by_id.get(&stmt_id) {
+        Some(e) => e.clone_for_exec(),
+        None => {
+            return write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(
+                    1243,
+                    "HY000",
+                    &format!("Unknown prepared statement handler ({stmt_id})"),
+                ),
+            );
+        }
+    };
+
+    // Parse parameters per the binary protocol.
+    let params = match parse_execute_params(&entry, &payload[9..]) {
+        Ok(p) => p,
+        Err(msg) => {
+            return write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(1064, "42000", &msg),
+            );
+        }
+    };
+
+    // Bind + execute via engine.
+    let outcome = {
+        let Ok(mut engine) = state.engine.write() else {
+            return write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(1815, "HY000", "engine lock poisoned"),
+            );
+        };
+        let stmt = match engine.prepare(&entry.sql) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("{e:?}");
+                return write_packet(
+                    stream,
+                    start_seqno,
+                    &encode_err_packet(1064, "42000", &msg),
+                );
+            }
+        };
+        engine.execute_prepared(stmt, &params)
+    };
+    match outcome {
+        Err(e) => {
+            let msg = format!("{e}");
+            write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg))?;
+        }
+        Ok(QueryResult::CommandOk { affected, .. }) => {
+            write_packet(
+                stream,
+                start_seqno,
+                &encode_ok_with_affected(affected as u64),
+            )?;
+        }
+        Ok(QueryResult::Rows { columns, rows }) => {
+            // v7.17.0 Phase 3.P0-74 — SELECT through EXECUTE
+            // currently falls through to the text result-set
+            // shape so the client still gets the row data even
+            // though the column type bytes say VAR_STRING. P0-76
+            // lifts this to true binary result rows.
+            encode_text_result_set(stream, &columns, &rows, start_seqno)?;
+        }
+        Ok(_) => {
+            write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(
+                    1815,
+                    "HY000",
+                    "engine returned a QueryResult variant the binary EXECUTE path doesn't yet encode",
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl PreparedEntry {
+    fn clone_for_exec(&self) -> Self {
+        Self {
+            sql: self.sql.clone(),
+            columns: self.columns.clone(),
+            param_count: self.param_count,
+        }
+    }
+}
+
+/// Parse the bind-time payload of COM_STMT_EXECUTE.
+///
+/// Layout (after the 9-byte header the caller consumed):
+///   * `(num_params + 7) / 8` bytes — NULL bitmap
+///   * 1 byte `new_params_bound_flag`
+///     * == 1: `2 * num_params` bytes (1 byte type, 1 byte
+///       signed) + per-value encoded data
+///     * == 0: reuse last bound types (we don't cache, so this
+///       surfaces as an error)
+fn parse_execute_params(
+    entry: &PreparedEntry,
+    payload: &[u8],
+) -> Result<Vec<Value>, String> {
+    let n = entry.param_count as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let null_bitmap_len = (n + 7) / 8;
+    if payload.len() < null_bitmap_len + 1 {
+        return Err("EXECUTE payload truncated (null bitmap)".to_string());
+    }
+    let null_bitmap = &payload[..null_bitmap_len];
+    let mut pos = null_bitmap_len;
+    let new_params_bound = payload[pos];
+    pos += 1;
+    if new_params_bound != 1 {
+        return Err(
+            "EXECUTE without re-bound types (new_params_bound_flag = 0) is not yet supported"
+                .to_string(),
+        );
+    }
+    if payload.len() < pos + 2 * n {
+        return Err("EXECUTE payload truncated (param types)".to_string());
+    }
+    let types_start = pos;
+    let mut values_pos = types_start + 2 * n;
+    pos += 2 * n;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+        if is_null {
+            out.push(Value::Null);
+            continue;
+        }
+        let ty_byte = payload[types_start + 2 * i];
+        let unsigned_flag = payload[types_start + 2 * i + 1] & 0x80 != 0;
+        let (value, consumed) = decode_binary_param(ty_byte, unsigned_flag, &payload[values_pos..])
+            .map_err(|e| format!("param {i}: {e}"))?;
+        out.push(value);
+        values_pos += consumed;
+        let _ = pos;
+    }
+    Ok(out)
+}
+
+fn decode_binary_param(ty: u8, unsigned: bool, buf: &[u8]) -> Result<(Value, usize), String> {
+    match ty {
+        // MYSQL_TYPE_TINY
+        0x01 => {
+            if buf.is_empty() {
+                return Err("truncated TINY".to_string());
+            }
+            let v = if unsigned {
+                i16::from(buf[0])
+            } else {
+                i16::from(buf[0] as i8)
+            };
+            Ok((Value::SmallInt(v), 1))
+        }
+        // MYSQL_TYPE_SHORT / YEAR
+        0x02 | 0x0d => {
+            if buf.len() < 2 {
+                return Err("truncated SHORT".to_string());
+            }
+            let v = if unsigned {
+                i32::from(u16::from_le_bytes([buf[0], buf[1]]))
+            } else {
+                i32::from(i16::from_le_bytes([buf[0], buf[1]]))
+            };
+            Ok((Value::Int(v), 2))
+        }
+        // MYSQL_TYPE_LONG / INT24
+        0x03 | 0x09 => {
+            if buf.len() < 4 {
+                return Err("truncated LONG".to_string());
+            }
+            let v = if unsigned {
+                i64::from(u32::from_le_bytes(buf[..4].try_into().unwrap()))
+            } else {
+                i64::from(i32::from_le_bytes(buf[..4].try_into().unwrap()))
+            };
+            if let Ok(small) = i32::try_from(v) {
+                Ok((Value::Int(small), 4))
+            } else {
+                Ok((Value::BigInt(v), 4))
+            }
+        }
+        // MYSQL_TYPE_LONGLONG
+        0x08 => {
+            if buf.len() < 8 {
+                return Err("truncated LONGLONG".to_string());
+            }
+            let v = if unsigned {
+                i64::try_from(u64::from_le_bytes(buf[..8].try_into().unwrap()))
+                    .map_err(|e| e.to_string())?
+            } else {
+                i64::from_le_bytes(buf[..8].try_into().unwrap())
+            };
+            Ok((Value::BigInt(v), 8))
+        }
+        // MYSQL_TYPE_FLOAT
+        0x04 => {
+            if buf.len() < 4 {
+                return Err("truncated FLOAT".to_string());
+            }
+            let v = f32::from_le_bytes(buf[..4].try_into().unwrap());
+            Ok((Value::Float(f64::from(v)), 4))
+        }
+        // MYSQL_TYPE_DOUBLE
+        0x05 => {
+            if buf.len() < 8 {
+                return Err("truncated DOUBLE".to_string());
+            }
+            let v = f64::from_le_bytes(buf[..8].try_into().unwrap());
+            Ok((Value::Float(v), 8))
+        }
+        // MYSQL_TYPE_NULL
+        0x06 => Ok((Value::Null, 0)),
+        // String-shaped: VAR_STRING / STRING / VARCHAR / BLOB /
+        // TINY_BLOB / MEDIUM_BLOB / LONG_BLOB / TEXT / GEOMETRY /
+        // DECIMAL / NEWDECIMAL / JSON / BIT
+        0xfd | 0xfe | 0x0f | 0xfc | 0xfb | 0xfa | 0xf9 | 0xf8 | 0xf5 | 0xf6 | 0x00 | 0x10 => {
+            let mut cursor = Cursor::new(buf);
+            let n = cursor.lenenc_int().ok_or_else(|| "truncated string lenenc".to_string())?;
+            let bytes = cursor
+                .bytes(n as usize)
+                .ok_or_else(|| "truncated string body".to_string())?;
+            let consumed = (n as usize)
+                + match buf.first() {
+                    Some(b) if *b < 0xfb => 1,
+                    Some(0xfc) => 3,
+                    Some(0xfd) => 4,
+                    Some(0xfe) => 9,
+                    _ => 1,
+                };
+            let s = String::from_utf8_lossy(&bytes).into_owned();
+            Ok((Value::Text(s), consumed))
+        }
+        other => Err(format!("unsupported binary param type 0x{other:02x}")),
+    }
 }
 
 // ---- COM_FIELD_LIST -----------------------------------------
