@@ -1,17 +1,15 @@
-//! v7.17.0 Phase 3.6 — Window functions in queries with JOIN.
+//! v7.17.0 Phase 3.6 → P0-43 — Window functions in queries with JOIN.
 //!
-//! Status: SPG's `exec_select_with_window` currently materialises
-//! over a single-table FROM only — joins-with-windows hits a
-//! hard `Unsupported("JOIN with window functions not yet
-//! supported")` guard. The structural fix routes the joined
-//! result through a synthetic (schema, rows) materialiser
-//! before the window pipeline runs; this is a planner refactor
-//! (~ 8h) carved out for v7.18.
-//!
-//! Customer workaround: wrap the join in a CTE/subquery and
-//! apply the window in the outer SELECT.
+//! Status: Phase 3.6 carved this out (window over JOIN hit a hard
+//! `Unsupported("JOIN with window functions not yet supported")`
+//! guard). v7.17.0 Phase 3.P0-43 lands the structural fix:
+//! `exec_select_with_window` materialises the join + WHERE through
+//! the shared `build_joined_filtered_rows` helper and runs the
+//! window pipeline over the joined row stream with the composite
+//! `alias.col` schema. The CTE/subquery workaround still works
+//! but is no longer required.
 
-use spg_engine::{Engine, EngineError, QueryResult};
+use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn rows(r: QueryResult) -> Vec<Vec<Value>> {
@@ -37,22 +35,33 @@ fn setup(e: &mut Engine) {
 }
 
 #[test]
-fn join_with_window_is_documented_gap() {
-    // Pin the current behavior: SPG rejects with a clear
-    // unsupported-feature error rather than silently producing
-    // wrong results.
+fn join_with_window_returns_correct_rows() {
+    // v7.17.0 Phase 3.P0-43 — window over JOIN is now real.
+    // PARTITION BY customer + ORDER BY amount assigns row_number
+    // within each customer's orders sorted ascending.
     let mut e = Engine::new();
     setup(&mut e);
-    let r = e.execute(
-        "SELECT c.name, row_number() OVER (PARTITION BY c.id ORDER BY o.amount) \
-         FROM orders o JOIN customers c ON c.id = o.customer_id",
+    let r = rows(
+        e.execute(
+            "SELECT c.name, row_number() OVER (PARTITION BY c.id ORDER BY o.amount) AS rn \
+             FROM orders o JOIN customers c ON c.id = o.customer_id \
+             ORDER BY c.id, rn",
+        )
+        .unwrap(),
     );
-    match r {
-        Err(EngineError::Unsupported(msg)) => {
-            assert!(msg.contains("JOIN") && msg.contains("window"));
-        }
-        other => panic!("expected clean Unsupported error, got {other:?}"),
-    }
+    // alice has 2 orders (100, 200) → rn 1, 2.
+    // bob has 3 orders (30, 50, 80) → rn 1, 2, 3.
+    assert_eq!(r.len(), 5);
+    assert_eq!(r[0][0], Value::Text("alice".into()));
+    assert_eq!(r[0][1], Value::BigInt(1));
+    assert_eq!(r[1][0], Value::Text("alice".into()));
+    assert_eq!(r[1][1], Value::BigInt(2));
+    assert_eq!(r[2][0], Value::Text("bob".into()));
+    assert_eq!(r[2][1], Value::BigInt(1));
+    assert_eq!(r[3][0], Value::Text("bob".into()));
+    assert_eq!(r[3][1], Value::BigInt(2));
+    assert_eq!(r[4][0], Value::Text("bob".into()));
+    assert_eq!(r[4][1], Value::BigInt(3));
 }
 
 #[test]

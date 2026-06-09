@@ -70,7 +70,7 @@
         { "file": "12_unique_collation.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1179, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1188, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -223,6 +223,8 @@
         { "file": "75_fetch_with_ties.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "76_setof_aggregate.test", "pass": 9, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "77_window_join.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,

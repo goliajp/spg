@@ -7337,6 +7337,112 @@ impl Engine {
         Ok((rows, cols))
     }
 
+    /// v7.17.0 Phase 3.P0-43 — materialise a `FROM` with one or more
+    /// JOINs into `(combined_schema, filtered_rows)`. The combined
+    /// schema uses composite `alias.col` column names so the
+    /// qualifier-aware column resolver finds every join peer by
+    /// exact match; the filtered rows are the join cross-product
+    /// after the optional WHERE clause is applied.
+    ///
+    /// Shared by `exec_joined_select` and the JOIN branch of
+    /// `exec_select_with_window`; both paths used to inline the
+    /// same nested-loop logic and the window path rejected JOIN
+    /// outright.
+    fn build_joined_filtered_rows(
+        &self,
+        from: &FromClause,
+        where_: Option<&Expr>,
+    ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
+        let (primary_rows, primary_cols) = self.materialise_table_ref(&from.primary)?;
+        let primary_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str())
+            .to_string();
+        #[allow(clippy::type_complexity)]
+        let mut joined: Vec<(
+            Vec<Row>,
+            Vec<ColumnSchema>,
+            String,
+            JoinKind,
+            Option<&Expr>,
+        )> = Vec::new();
+        for j in &from.joins {
+            let (rows, cols) = self.materialise_table_ref(&j.table)?;
+            let a = j
+                .table
+                .alias
+                .as_deref()
+                .unwrap_or(j.table.name.as_str())
+                .to_string();
+            joined.push((rows, cols, a, j.kind, j.on.as_ref()));
+        }
+        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &primary_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{primary_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for (_, cols, a, _, _) in &joined {
+            for col in cols {
+                combined_schema.push(ColumnSchema::new(
+                    alloc::format!("{a}.{}", col.name),
+                    col.ty,
+                    col.nullable,
+                ));
+            }
+        }
+        let ctx = EvalContext::new(&combined_schema, None);
+        let mut working: Vec<Row> = primary_rows;
+        let mut produced_len = primary_cols.len();
+        for (rrows, rcols, _, kind, on) in &joined {
+            let right_arity = rcols.len();
+            let mut next: Vec<Row> = Vec::new();
+            for left in &working {
+                let mut left_matched = false;
+                for right in rrows {
+                    let mut combined_vals = left.values.clone();
+                    combined_vals.extend(right.values.iter().cloned());
+                    let combined = Row::new(combined_vals);
+                    let keep = if let Some(on_expr) = on {
+                        let cond = eval::eval_expr(on_expr, &combined, &ctx)?;
+                        matches!(cond, Value::Bool(true))
+                    } else {
+                        true
+                    };
+                    if keep {
+                        next.push(combined);
+                        left_matched = true;
+                    }
+                }
+                if !left_matched && matches!(kind, JoinKind::Left) {
+                    let mut combined_vals = left.values.clone();
+                    for _ in 0..right_arity {
+                        combined_vals.push(Value::Null);
+                    }
+                    next.push(Row::new(combined_vals));
+                }
+            }
+            working = next;
+            produced_len += right_arity;
+            debug_assert!(produced_len <= combined_schema.len());
+        }
+        let mut filtered: Vec<Row> = Vec::new();
+        for row in working {
+            if let Some(where_expr) = where_ {
+                let cond = eval::eval_expr(where_expr, &row, &ctx)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            filtered.push(row);
+        }
+        Ok((combined_schema, filtered))
+    }
+
     fn exec_joined_select(
         &self,
         stmt: &SelectStatement,
@@ -8517,38 +8623,60 @@ impl Engine {
         let from = stmt.from.as_ref().ok_or_else(|| {
             EngineError::Unsupported("window functions require a FROM clause".into())
         })?;
-        // For v4.12 we only support a single-table FROM. Joins +
-        // windows is queued for v5.x.
-        if !from.joins.is_empty() {
-            return Err(EngineError::Unsupported(
-                "JOIN with window functions not yet supported".into(),
-            ));
-        }
-        let primary = &from.primary;
-        let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
-            StorageError::TableNotFound {
-                name: primary.name.clone(),
-            }
-        })?;
-        let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
-        let schema_cols = &table.schema().columns;
-        let ctx = self.ev_ctx(schema_cols, Some(alias));
-
-        // 1) Filter pass.
-        let mut filtered: Vec<&Row> = Vec::new();
-        for (i, row) in table.rows().iter().enumerate() {
-            if i.is_multiple_of(256) {
-                cancel.check()?;
-            }
-            if let Some(w) = &stmt.where_ {
-                let cond = eval::eval_expr(w, row, &ctx)?;
-                if !matches!(cond, Value::Bool(true)) {
-                    continue;
+        // v7.17.0 Phase 3.P0-43 — JOIN + window functions. Phase
+        // 3.6 rejected this combination outright ("queued for
+        // v5.x"); P0-43 materialises the join + WHERE through the
+        // existing nested-loop helper and runs the window pipeline
+        // on the joined row set with the combined `alias.col`
+        // schema. The window expressions resolve through the
+        // qualifier-aware column resolver same as the aggregate /
+        // projection paths on JOIN.
+        let (schema_cols_owned, alias_opt): (Vec<ColumnSchema>, Option<&str>);
+        let filtered: Vec<Row>;
+        if from.joins.is_empty() {
+            let primary = &from.primary;
+            let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
+                StorageError::TableNotFound {
+                    name: primary.name.clone(),
                 }
+            })?;
+            let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
+            schema_cols_owned = table.schema().columns.clone();
+            alias_opt = Some(alias);
+            // Materialise WHERE-filtered rows owned so the JOIN
+            // and single-table paths share a single downstream
+            // shape. The clone is cheap relative to the window
+            // computation that follows.
+            let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
+            let mut owned: Vec<Row> = Vec::new();
+            for (i, row) in table.rows().iter().enumerate() {
+                if i.is_multiple_of(256) {
+                    cancel.check()?;
+                }
+                if let Some(w) = &stmt.where_ {
+                    let cond = eval::eval_expr(w, row, &ctx)?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                owned.push(row.clone());
             }
-            filtered.push(row);
+            filtered = owned;
+        } else {
+            let (combined_schema, rows) =
+                self.build_joined_filtered_rows(from, stmt.where_.as_ref())?;
+            schema_cols_owned = combined_schema;
+            alias_opt = None;
+            filtered = rows;
         }
+        let schema_cols = &schema_cols_owned;
+        let ctx = self.ev_ctx(schema_cols, alias_opt);
+        let alias = alias_opt.unwrap_or("");
         let n_rows = filtered.len();
+        // Borrow refs into the owned row vec once so the downstream
+        // `compute_window_partition` call (which takes `&[&Row]`) and
+        // the per-row eval loops share a single backing buffer.
+        let filtered_refs: Vec<&Row> = filtered.iter().collect();
 
         // 2) Collect unique window function nodes from projection.
         let mut window_nodes: Vec<Expr> = Vec::new();
@@ -8615,7 +8743,7 @@ impl Engine {
                     frame.as_ref(),
                     *null_treatment,
                     &indexed[p_start..p_end],
-                    &filtered,
+                    &filtered_refs,
                     &ctx,
                     &mut out_vals,
                 )?;
@@ -8659,8 +8787,12 @@ impl Engine {
             rewritten_items.push(new_item);
         }
 
-        // 7) Project into final rows.
-        let ext_ctx = EvalContext::new(&ext_cols, Some(alias));
+        // 7) Project into final rows. JOIN case uses None so the
+        // qualifier check in `resolve_column` falls through to the
+        // composite `alias.col` schema lookup; single-table case
+        // keeps the bare alias so `bare_col` resolution still
+        // works for the projection's per-row column references.
+        let ext_ctx = EvalContext::new(&ext_cols, alias_opt);
         let projection = build_projection(&rewritten_items, &ext_cols, alias)?;
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::with_capacity(n_rows);
         for (i, row) in ext_rows.iter().enumerate() {
