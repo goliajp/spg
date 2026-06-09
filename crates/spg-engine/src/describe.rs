@@ -186,6 +186,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 CastTarget::TsVector => DataType::TsVector,
                 CastTarget::TsQuery => DataType::TsQuery,
                 CastTarget::Uuid => DataType::Uuid,
+                CastTarget::Bytea => DataType::Bytes,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),

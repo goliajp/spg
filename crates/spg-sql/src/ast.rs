@@ -2131,6 +2131,12 @@ pub enum CastTarget {
     /// unhyphenated, uppercase, and brace-wrapped forms); malformed
     /// input is a SQL error.
     Uuid,
+    /// v7.18 — `::bytea`. Decodes the LHS Text via PG's hex form
+    /// (`'\xdeadbeef'`) or escape form (`'\x05\x00'`); Bytes
+    /// inputs pass through unchanged. Closes the mailrs D-pre #3
+    /// reverse-acceptance gap — anywhere a PG schema writes
+    /// `expr::bytea`, SPG now matches.
+    Bytea,
 }
 
 impl fmt::Display for CastTarget {
@@ -2156,6 +2162,7 @@ impl fmt::Display for CastTarget {
             Self::TsVector => "tsvector",
             Self::TsQuery => "tsquery",
             Self::Uuid => "uuid",
+            Self::Bytea => "bytea",
         })
     }
 }

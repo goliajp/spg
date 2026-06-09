@@ -4752,6 +4752,26 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                 ),
             }),
         },
+        // v7.18 — `::bytea`. Identity for `Bytes → Bytes`; decode
+        // Text via the engine's PG-format bytea decoder (`\x`
+        // hex form + `\NNN` escape form). Anything else is a type
+        // mismatch — same shape as PG's contract. Closes the
+        // mailrs D-pre #3 reverse-acceptance gap.
+        CastTarget::Bytea => match v {
+            Value::Bytes(b) => Ok(Value::Bytes(b)),
+            Value::Text(s) => match crate::decode_bytea_literal(&s) {
+                Ok(b) => Ok(Value::Bytes(b)),
+                Err(msg) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for type bytea: {msg}"),
+                }),
+            },
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::bytea only accepts TEXT / bytea inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
     }
 }
 
