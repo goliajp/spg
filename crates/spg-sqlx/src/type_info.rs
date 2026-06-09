@@ -70,6 +70,12 @@ pub enum Kind {
     /// or `HashMap<String, Option<String>>` (in the language
     /// dialect that ships the hstore feature).
     Hstore,
+    /// v7.17.0 Phase 3.P0-67 — PG `NUMERIC(p, s)` / `DECIMAL(p, s)`
+    /// — exact-decimal fixed-point. Stored engine-side as
+    /// `(scaled: i128, scale: u8)`. Bridges decode into
+    /// `bigdecimal::BigDecimal` (under the `bigdecimal`
+    /// feature) or `String` (canonical PG decimal text).
+    Numeric,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -119,6 +125,8 @@ impl SpgTypeInfo {
             DataType::Money => Kind::Money,
             DataType::Range(_) => Kind::Range,
             DataType::Hstore => Kind::Hstore,
+            // v7.17.0 Phase 3.P0-67 — NUMERIC(p, s) → exact-decimal.
+            DataType::Numeric { .. } => Kind::Numeric,
             // v7.17.0 Phase 3.P0-40 — 2D arrays decode as TEXT
             // on the sqlx side (canonical PG nested external form).
             DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => Kind::Text,
@@ -157,6 +165,7 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Money => "MONEY",
             Kind::Range => "RANGE",
             Kind::Hstore => "HSTORE",
+            Kind::Numeric => "NUMERIC",
             Kind::Null => "NULL",
         }
     }
