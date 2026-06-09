@@ -1,4 +1,13 @@
 //! v7.16.0 — `SpgPool` type alias + convenience constructors.
+//!
+//! v7.18 — pool concurrency is full-PG-parity. Each
+//! `SpgConnection` lazily attaches a per-connection
+//! `AsyncReadHandle` and refreshes it per statement, so a pool
+//! of N connections runs N concurrent SELECTs against the
+//! engine's snapshot path with read-committed semantics. The
+//! convenience constructors no longer pin `max_connections(1)`
+//! — they fall through to sqlx-core's default pool size, same
+//! as `PgPool::connect()`.
 
 use sqlx_core::error::Error;
 use sqlx_core::pool::{Pool, PoolOptions};
@@ -20,9 +29,11 @@ pub type SpgPoolOptions = PoolOptions<Spg>;
 /// extension trait on [`SpgPool`] so consumers can write
 /// `SpgPool::connect_in_memory().await` directly.
 pub trait SpgPoolExt: Sized {
-    /// In-memory pool — single connection, no persistence.
+    /// In-memory pool — no persistence. Uses sqlx-core's
+    /// default `max_connections` (10), matching `PgPool::connect`.
     fn connect_in_memory() -> futures_core::future::BoxFuture<'static, Result<SpgPool, Error>>;
-    /// File-backed pool at `path`.
+    /// File-backed pool at `path`. Uses sqlx-core's default
+    /// `max_connections` (10), matching `PgPool::connect`.
     fn connect_path(
         path: std::path::PathBuf,
     ) -> futures_core::future::BoxFuture<'static, Result<SpgPool, Error>>;
@@ -32,7 +43,6 @@ impl SpgPoolExt for SpgPool {
     fn connect_in_memory() -> futures_core::future::BoxFuture<'static, Result<SpgPool, Error>> {
         Box::pin(async {
             SpgPoolOptions::new()
-                .max_connections(1)
                 .connect_with(SpgConnectOptions::in_memory())
                 .await
         })
@@ -43,7 +53,6 @@ impl SpgPoolExt for SpgPool {
     ) -> futures_core::future::BoxFuture<'static, Result<SpgPool, Error>> {
         Box::pin(async move {
             SpgPoolOptions::new()
-                .max_connections(1)
                 .connect_with(SpgConnectOptions::file(path))
                 .await
         })
