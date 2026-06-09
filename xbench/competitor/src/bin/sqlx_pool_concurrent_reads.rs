@@ -25,6 +25,7 @@
 
 #![allow(
     clippy::cast_lossless,
+    clippy::duration_suboptimal_units,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss,

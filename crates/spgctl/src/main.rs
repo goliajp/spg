@@ -1440,7 +1440,7 @@ mod tests {
     fn parse_restore_target_accepts_lsn() {
         match parse_restore_target("42").unwrap() {
             RestoreTarget::Lsn(n) => assert_eq!(n, 42),
-            other => panic!("expected Lsn, got {other:?}"),
+            t @ RestoreTarget::UnixMicros(_) => panic!("expected Lsn, got {t:?}"),
         }
     }
 
@@ -1448,7 +1448,7 @@ mod tests {
     fn parse_restore_target_accepts_unix_seconds() {
         match parse_restore_target("1750000000s").unwrap() {
             RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_000_000),
-            other => panic!("expected UnixMicros, got {other:?}"),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
         }
     }
 
@@ -1456,7 +1456,7 @@ mod tests {
     fn parse_restore_target_accepts_unix_millis() {
         match parse_restore_target("1750000000123ms").unwrap() {
             RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_123_000),
-            other => panic!("expected UnixMicros, got {other:?}"),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
         }
     }
 
@@ -1464,7 +1464,7 @@ mod tests {
     fn parse_restore_target_accepts_unix_micros() {
         match parse_restore_target("1750000000123456us").unwrap() {
             RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_750_000_000_123_456),
-            other => panic!("expected UnixMicros, got {other:?}"),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
         }
     }
 
@@ -1476,13 +1476,13 @@ mod tests {
             RestoreTarget::UnixMicros(us) => {
                 assert_eq!(us, 1_767_225_600 * 1_000_000);
             }
-            other => panic!("expected UnixMicros, got {other:?}"),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
         }
         // T separator works too.
         let t = parse_restore_target("2026-01-01T00:00:00").unwrap();
         match t {
             RestoreTarget::UnixMicros(us) => assert_eq!(us, 1_767_225_600 * 1_000_000),
-            other => panic!("{other:?}"),
+            t @ RestoreTarget::Lsn(_) => panic!("expected UnixMicros, got {t:?}"),
         }
     }
 
