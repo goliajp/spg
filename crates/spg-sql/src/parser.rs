@@ -1910,6 +1910,7 @@ impl Parser {
     ) -> Result<crate::ast::SequenceOptions, ParseError> {
         use crate::ast::{SeqBound, SequenceOptions, SequenceOwnedBy};
         let mut opts = SequenceOptions::default();
+        #[allow(clippy::while_let_loop)]
         loop {
             // Match an ident; stop at any non-ident token (sentinel,
             // semicolon, end of statement).
@@ -4396,6 +4397,7 @@ impl Parser {
                 if s.eq_ignore_ascii_case("of"))
             {
                 self.advance(); // OF
+                #[allow(clippy::while_let_loop)]
                 loop {
                     match self.peek() {
                         Token::Ident(_) | Token::QuotedIdent(_) => {
@@ -5662,6 +5664,7 @@ impl Parser {
         Ok(ty)
     }
 
+    #[allow(clippy::type_complexity)]
     fn parse_type_with_implied_flags(
         &mut self,
     ) -> Result<

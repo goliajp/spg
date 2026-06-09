@@ -73,7 +73,7 @@ fn extract_scramble(payload: &[u8]) -> Vec<u8> {
 fn caching_sha2_response(scramble: &[u8], password: &str) -> Vec<u8> {
     use sha2::Digest;
     let sha_pwd = sha2::Sha256::digest(password.as_bytes());
-    let sha_sha_pwd = sha2::Sha256::digest(&sha_pwd);
+    let sha_sha_pwd = sha2::Sha256::digest(sha_pwd);
     let mut buf = Vec::with_capacity(20 + 32);
     buf.extend_from_slice(scramble);
     buf.extend_from_slice(&sha_sha_pwd);
@@ -89,7 +89,7 @@ fn caching_sha2_response(scramble: &[u8], password: &str) -> Vec<u8> {
 fn mysql_native_response(scramble: &[u8], password: &str) -> Vec<u8> {
     use sha1::Digest;
     let sha_pwd = sha1::Sha1::digest(password.as_bytes());
-    let sha_sha_pwd = sha1::Sha1::digest(&sha_pwd);
+    let sha_sha_pwd = sha1::Sha1::digest(sha_pwd);
     let mut buf = Vec::with_capacity(20 + 20);
     buf.extend_from_slice(scramble);
     buf.extend_from_slice(&sha_sha_pwd);

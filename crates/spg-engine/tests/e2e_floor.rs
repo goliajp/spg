@@ -35,7 +35,7 @@ fn floor_positive_fraction() {
     match &row[0] {
         Value::Float(x) => assert_eq!(*x, 1.0),
         Value::Numeric { scaled, scale } => {
-            assert_eq!(*scaled, 1 * 10_i128.pow(u32::from(*scale)));
+            assert_eq!(*scaled, 10_i128.pow(u32::from(*scale)));
         }
         other => panic!("expected numeric, got {other:?}"),
     }

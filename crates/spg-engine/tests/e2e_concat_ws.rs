@@ -44,7 +44,7 @@ fn separator_only_returns_empty_string() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',')"),
-        Value::Text("".into())
+        Value::Text(String::new())
     );
 }
 
@@ -132,7 +132,7 @@ fn all_data_args_null_returns_empty_string() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', NULL, NULL)"),
-        Value::Text("".into())
+        Value::Text(String::new())
     );
 }
 
@@ -142,7 +142,7 @@ fn one_null_data_arg_returns_empty_string() {
     let mut e = Engine::new();
     assert_eq!(
         first_text(&mut e, "SELECT concat_ws(',', NULL)"),
-        Value::Text("".into())
+        Value::Text(String::new())
     );
 }
 
@@ -275,7 +275,7 @@ fn concat_ws_full_name_with_all_null_returns_empty() {
         e.execute("SELECT concat_ws(' ', first, last) FROM p")
             .unwrap(),
     );
-    assert_eq!(row[0], Value::Text("".into()));
+    assert_eq!(row[0], Value::Text(String::new()));
 }
 
 // ── INSERT + COMPOSITION ──────────────────────────────────────────
