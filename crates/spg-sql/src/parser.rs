@@ -415,6 +415,10 @@ impl Parser {
                 // USERS / COLUMNS remain bare idents.
                 let target = match self.advance() {
                     Token::Tables => "tables".to_string(),
+                    // v7.17.0 Phase 3.P0-59 — CREATE is a reserved
+                    // keyword token; recognise it as the SHOW CREATE
+                    // dispatch keyword too.
+                    Token::Create => "create".to_string(),
                     Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
                     other => {
                         return Err(self.err(format!(
@@ -425,6 +429,31 @@ impl Parser {
                 match target.as_str() {
                     "tables" => Ok(Statement::ShowTables),
                     "users" => Ok(Statement::ShowUsers),
+                    // v7.17.0 Phase 3.P0-59 — MySQL `SHOW CREATE
+                    // TABLE <t>` returns a 2-column row: (Table,
+                    // Create Table). mysqldump emits this for every
+                    // table at scrape time; without it the dump
+                    // round-trip stalls.
+                    "create" => {
+                        // SHOW CREATE TABLE / VIEW / DATABASE — only
+                        // TABLE is supported in v7.17.
+                        let kind = match self.advance() {
+                            Token::Ident(s) | Token::QuotedIdent(s) => s,
+                            Token::Table => "table".to_string(),
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected TABLE after SHOW CREATE, got {other:?}"
+                                )));
+                            }
+                        };
+                        if !kind.eq_ignore_ascii_case("table") {
+                            return Err(self.err(format!(
+                                "unsupported SHOW CREATE {kind:?}; v7.17 supports TABLE only"
+                            )));
+                        }
+                        let name = self.expect_ident_like()?;
+                        Ok(Statement::ShowCreateTable(name))
+                    }
                     // v7.17.0 Phase 3.P0-58 — MySQL `SHOW DATABASES`
                     // (and `SHOW SCHEMAS` alias). The mysql client uses
                     // it to populate the database selector at connect
