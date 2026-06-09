@@ -13521,6 +13521,12 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Numeric { scaled, scale } => Literal::String(eval::format_numeric(scaled, scale)),
         Value::Date(d) => Literal::String(eval::format_date(d)),
         Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
+        // v7.17.0 Phase 3.P0-69 — UUID round-trips via canonical
+        // hyphenated text. Without this arm the fallback below
+        // renders `Debug` form ("Uuid([85, …])") which the
+        // engine's Text → Uuid coerce can't parse, breaking
+        // prepared-bind round-trip from the spg-sqlx adapter.
+        Value::Uuid(b) => Literal::String(spg_storage::format_uuid(&b)),
         // v7.16.0 — BYTEA round-trip for the spg-sqlx Bind path.
         // PG-canonical text rep is `\x` + lowercase hex; the
         // engine's coerce_value already accepts that on the
