@@ -1399,6 +1399,7 @@ version = "7.16.2"
 dependencies = [
  "criterion",
  "sha1",
+ "sha2",
  "spg-crypto",
  "spg-sql",
  "spg-storage",
@@ -1417,6 +1418,7 @@ version = "7.16.2"
 dependencies = [
  "libc",
  "sha1",
+ "sha2",
  "spg-audit",
  "spg-crypto",
  "spg-engine",

@@ -184,18 +184,18 @@ fn unknown_user_yields_access_denied() {
 }
 
 #[test]
-fn caching_sha2_plugin_name_yields_plugin_mismatch() {
+fn unknown_plugin_name_yields_plugin_mismatch() {
+    // P0-72 now accepts caching_sha2_password; any plugin we
+    // still don't speak (caching_sha2 RSA fallback, sha256, ...)
+    // surfaces as the 1251 plugin-mismatch error.
     let (_guard, addr) = spawn_open_mode("plugin");
     let mut s = common::connect_to(&addr);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let (_seqno, _greeting) = read_packet(&mut s);
-    let resp =
-        build_handshake_response("user", &[0xab; 20], "caching_sha2_password");
+    let resp = build_handshake_response("user", &[0u8; 20], "no_such_plugin");
     write_packet(&mut s, 1, &resp);
     let (_seqno, payload) = read_packet(&mut s);
     assert_eq!(payload[0], 0xff);
     let errno = u16::from_le_bytes(payload[1..3].try_into().unwrap());
-    assert_eq!(errno, 1251, "expected ER_NOT_SUPPORTED_AUTH_MODE");
-    let msg = std::str::from_utf8(&payload[9..]).unwrap();
-    assert!(msg.contains("P0-72"));
+    assert_eq!(errno, 1251);
 }

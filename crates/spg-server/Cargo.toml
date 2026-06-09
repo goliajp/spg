@@ -54,6 +54,9 @@ libc        = "0.2"
 # need to compute the client's auth_response (SHA1-based) to
 # verify the server validates it correctly.
 sha1        = { version = "0.10", default-features = false }
+# v7.17.0 Phase 3.P0-72 — same shape for caching_sha2_password
+# (SHA256-based fast path).
+sha2        = { version = "0.10", default-features = false }
 
 [lints]
 workspace = true
