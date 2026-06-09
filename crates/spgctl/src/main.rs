@@ -80,6 +80,38 @@ fn main() {
         // STABILITY § "Out of v6.10" — the v6.10.7 ship freezes
         // the CLI shape so the future revisit drops in the audit
         // lookup without changing the operator surface.
+        // v7.18 PITR P6 — `spg prune-pitr --dir <backup_dir>
+        // --retention-hours <N>` walks <dir>/wal/, removes any
+        // chunk whose filename prefix (unix_us) is older than
+        // `now - N hours`, plus the matching <chunk>.checksum.
+        // Reports how many chunks were kept / removed.
+        Some("prune-pitr") => {
+            let mut dir: Option<String> = None;
+            let mut retention_hours: Option<u64> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--dir" => dir = args.next(),
+                    "--retention-hours" => {
+                        retention_hours = args.next().and_then(|s| s.parse::<u64>().ok());
+                    }
+                    other => {
+                        die(&format!("unknown prune-pitr arg: {other}"), 2);
+                        return;
+                    }
+                }
+            }
+            let (Some(dir), Some(retention_hours)) = (dir, retention_hours) else {
+                die(
+                    "usage: spg prune-pitr --dir <backup_dir> --retention-hours <N>",
+                    2,
+                );
+                return;
+            };
+            match prune_pitr(&dir, retention_hours) {
+                Ok(report) => println!("{report}"),
+                Err(e) => die(&format!("prune-pitr failed: {e}"), 1),
+            }
+        }
         // v7.18 PITR P5 — `spg verify-pitr --dir <backup_dir>
         // [--write-missing-checksums]` walks the backup layout
         // backup-pitr produces:
@@ -623,8 +655,20 @@ fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
             .map_err(|e| format!("write chunk {}: {e}", chunk_path.display()))?;
     }
 
+    // v7.18 PITR P6 — if SPG_PITR_ARCHIVE_CMD is set, fork it
+    // with the chunk path as $1 so external archival (rclone /
+    // aws s3 cp / restic backup / whatever the operator wires)
+    // happens synchronously inside backup-pitr. Nonzero exit
+    // means archival failed and we report that on the summary
+    // line — same loud failure mode PG's archive_command has.
+    let archive_status = if !wal_bytes.is_empty() {
+        archive_chunk(&chunk_path)?
+    } else {
+        ArchiveStatus::NotInvoked
+    };
+
     Ok(format!(
-        "OK snapshot={} wal_present={} chunk={} max_lsn={}",
+        "OK snapshot={} wal_present={} chunk={} max_lsn={} archive={}",
         snap_target.display(),
         wal_present,
         if wal_bytes.is_empty() {
@@ -633,6 +677,128 @@ fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
             chunk_path.display().to_string()
         },
         max_lsn,
+        archive_status.describe(),
+    ))
+}
+
+/// v7.18 PITR P6 — fork the SPG_PITR_ARCHIVE_CMD external
+/// archival command with `chunk_path` as `$1`. Returns:
+///
+///   ArchiveStatus::NotInvoked   — env unset (operator opted out).
+///   ArchiveStatus::Ok           — command exited 0.
+///   ArchiveStatus::Failed { exit_code, stderr_snippet }
+///                                — command produced a nonzero exit.
+///                                  backup-pitr surfaces this as a
+///                                  loud line on stdout but does
+///                                  NOT delete the chunk — the
+///                                  WAL data stays local even when
+///                                  archival is down, mirroring PG.
+fn archive_chunk(chunk_path: &std::path::Path) -> Result<ArchiveStatus, String> {
+    let Ok(cmd) = std::env::var("SPG_PITR_ARCHIVE_CMD") else {
+        return Ok(ArchiveStatus::NotInvoked);
+    };
+    if cmd.is_empty() {
+        return Ok(ArchiveStatus::NotInvoked);
+    }
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .arg("--") // shell positional arg shim — $0 swallowed
+        .arg(chunk_path)
+        .output()
+        .map_err(|e| format!("spawn archive cmd {cmd:?}: {e}"))?;
+    if output.status.success() {
+        Ok(ArchiveStatus::Ok)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = stderr.lines().next().unwrap_or("").chars().take(200).collect();
+        Ok(ArchiveStatus::Failed {
+            exit_code: output.status.code().unwrap_or(-1),
+            stderr_snippet: snippet,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum ArchiveStatus {
+    NotInvoked,
+    Ok,
+    Failed {
+        exit_code: i32,
+        stderr_snippet: String,
+    },
+}
+
+impl ArchiveStatus {
+    fn describe(&self) -> String {
+        match self {
+            ArchiveStatus::NotInvoked => "skipped (SPG_PITR_ARCHIVE_CMD unset)".into(),
+            ArchiveStatus::Ok => "ok".into(),
+            ArchiveStatus::Failed {
+                exit_code,
+                stderr_snippet,
+            } => format!("FAILED exit={exit_code} stderr={stderr_snippet:?}"),
+        }
+    }
+}
+
+/// v7.18 PITR P6 — delete WAL chunks older than the retention
+/// window. Walks `<dir>/wal/`, parses the unix_us prefix off each
+/// `<unix_us>_<max_lsn>.wal`, removes the chunk + its
+/// `<chunk>.checksum` sibling when `prefix_us / 1_000_000 +
+/// retention_hours * 3600 < now`. Returns a summary line.
+fn prune_pitr(dir: &str, retention_hours: u64) -> Result<String, String> {
+    let wal_dir = std::path::PathBuf::from(dir).join("wal");
+    if !wal_dir.exists() {
+        return Ok(format!(
+            "no wal/ subdir at {} — nothing to prune",
+            wal_dir.display()
+        ));
+    }
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let cutoff_s = now_s.saturating_sub(retention_hours * 3_600);
+    let mut kept = 0u64;
+    let mut removed = 0u64;
+    for entry in fs::read_dir(&wal_dir).map_err(|e| format!("read wal dir: {e}"))? {
+        let entry = entry.map_err(|e| format!("read entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wal") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let prefix_us: u128 = stem
+            .split_once('_')
+            .and_then(|(prefix, _)| prefix.parse().ok())
+            .unwrap_or(0);
+        let prefix_s = (prefix_us / 1_000_000) as u64;
+        if prefix_s < cutoff_s {
+            // Drop the chunk + its checksum sidecar.
+            fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+            let cs = {
+                let mut p = path.clone();
+                let mut name = p
+                    .file_name()
+                    .map(std::ffi::OsStr::to_os_string)
+                    .unwrap_or_default();
+                name.push(".checksum");
+                p.set_file_name(name);
+                p
+            };
+            if cs.exists() {
+                fs::remove_file(&cs).map_err(|e| format!("remove {}: {e}", cs.display()))?;
+            }
+            removed += 1;
+        } else {
+            kept += 1;
+        }
+    }
+    Ok(format!(
+        "OK retention_hours={retention_hours} kept={kept} removed={removed}"
     ))
 }
 
@@ -1532,6 +1698,52 @@ mod tests {
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(&wal_path);
     }
+
+    #[test]
+    fn prune_pitr_removes_chunks_past_retention() {
+        // Lay down two chunks: one timestamped "10 hours ago",
+        // one "1 minute ago". Retention=1h must keep the recent
+        // chunk and drop the old one (plus its checksum sibling).
+        let backup_dir = tmp_path("prune-dir");
+        let wal_dir = backup_dir.join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        let old_us = now_us.saturating_sub(10 * 3_600 * 1_000_000);
+        let recent_us = now_us.saturating_sub(60 * 1_000_000);
+        let old_chunk = wal_dir.join(format!("{old_us}_42.wal"));
+        let old_cs = wal_dir.join(format!("{old_us}_42.wal.checksum"));
+        let recent_chunk = wal_dir.join(format!("{recent_us}_43.wal"));
+        fs::write(&old_chunk, b"old").unwrap();
+        fs::write(&old_cs, b"abc\n").unwrap();
+        fs::write(&recent_chunk, b"recent").unwrap();
+
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), 1).unwrap();
+        assert!(summary.contains("removed=1"), "summary: {summary}");
+        assert!(summary.contains("kept=1"), "summary: {summary}");
+        assert!(!old_chunk.exists(), "old chunk should have been removed");
+        assert!(!old_cs.exists(), "old checksum should have been removed");
+        assert!(recent_chunk.exists(), "recent chunk should still exist");
+
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+
+    #[test]
+    fn prune_pitr_no_wal_dir_is_noop() {
+        let backup_dir = tmp_path("prune-empty");
+        // backup_dir doesn't exist at all — prune should treat as
+        // a noop, not error.
+        let summary = prune_pitr(backup_dir.to_str().unwrap(), 24).unwrap();
+        assert!(summary.contains("nothing to prune"), "summary: {summary}");
+    }
+
+    // NOTE: archive_chunk end-to-end (SPG_PITR_ARCHIVE_CMD set /
+    // unset / failing) is exercised by the P7 CI suite where the
+    // test process can mutate its own env without racing the other
+    // unit tests in this binary. Inline env mutation here would
+    // need `unsafe` on the 2024 edition, which the workspace lint
+    // forbids — so we lean on integration coverage.
 
     #[test]
     fn backup_pitr_handles_missing_wal() {
