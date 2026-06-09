@@ -39,15 +39,17 @@ fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSch
     let Statement::Select(s) = stmt else {
         return Vec::new();
     };
-    // Only handle single-table FROM. JOIN + subquery + multi-arm UNION
-    // fall through to NoData (drivers tolerate this).
-    let Some(from) = &s.from else {
-        return Vec::new();
-    };
-    if !from.joins.is_empty() {
+    // Multi-arm UNION falls through to NoData (drivers tolerate).
+    if !s.unions.is_empty() {
         return Vec::new();
     }
-    if !s.unions.is_empty() {
+    // No FROM (`SELECT 1::INT AS one`) → describe items against an
+    // empty schema; literal / cast / function items still resolve.
+    let Some(from) = &s.from else {
+        return describe_select_items(&s.items, &[]);
+    };
+    // JOIN / subquery FROM falls through to NoData.
+    if !from.joins.is_empty() {
         return Vec::new();
     }
     let Some(table) = catalog.get(&from.primary.name) else {
@@ -78,6 +80,13 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     auto_increment: false,
                     default: None,
                     runtime_default: None,
+                    user_enum_type: None,
+                    user_domain_type: None,
+                    on_update_runtime: None,
+                    collation: spg_storage::Collation::Binary,
+                    is_unsigned: false,
+                    inline_enum_variants: None,
+                    inline_set_variants: None,
                 });
             }
         }
@@ -85,13 +94,13 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
     out
 }
 
-struct ExprShape {
-    name: String,
-    ty: DataType,
-    nullable: bool,
+pub(crate) struct ExprShape {
+    pub(crate) name: String,
+    pub(crate) ty: DataType,
+    pub(crate) nullable: bool,
 }
 
-fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
+pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
     match e {
         Expr::Column(c) => {
             // Mirror resolve_projection_column's lookup: bare name first,
@@ -122,7 +131,23 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
             use spg_sql::ast::Literal as L;
             let (ty, nullable) = match lit {
                 L::Null => (DataType::Text, true),
-                L::Integer(_) => (DataType::BigInt, false),
+                // PG-canonical literal-int typing: `pg_typeof(1) =
+                // integer`, `pg_typeof(2147483648) = bigint`. The
+                // engine's runtime Value::Int(i32) flows naturally
+                // into INT columns; widening to BIGINT happens in
+                // coerce_value only when the column type asks for
+                // it. Bisected to P0-4: pre-fix every literal was
+                // BigInt, which let `WITH RECURSIVE t(n) AS (SELECT
+                // 1 …)` infer the working table column as BIGINT
+                // while the second-iteration INSERT path produced a
+                // Value::Int(1) — type mismatch.
+                L::Integer(n) => {
+                    if i32::try_from(*n).is_ok() {
+                        (DataType::Int, false)
+                    } else {
+                        (DataType::BigInt, false)
+                    }
+                }
                 L::Float(_) => (DataType::Float, false),
                 L::String(_) => (DataType::Text, false),
                 L::Bool(_) => (DataType::Bool, false),
@@ -160,6 +185,7 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
                 // v7.12.0 — `::tsvector` / `::tsquery`.
                 CastTarget::TsVector => DataType::TsVector,
                 CastTarget::TsQuery => DataType::TsQuery,
+                CastTarget::Uuid => DataType::Uuid,
             };
             Some(ExprShape {
                 name: "?column?".to_string(),
@@ -179,8 +205,119 @@ fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
                 nullable: inner.nullable,
             })
         }
+        // Function call — dispatch on name to recover the column
+        // type that the wire layer (and sqlx::Column type_info)
+        // advertises. Without this entry build_projection falls
+        // back to `Text` for every non-trivial expression, which
+        // breaks `sqlx::query_as::<_, (chrono::NaiveDateTime,)>(
+        // "SELECT now()")` and every similar typed-decode pattern.
+        Expr::FunctionCall { name, args } => {
+            function_return_shape(name, args, schema_cols)
+        }
         _ => None,
     }
+}
+
+/// Static return-type map for the SQL function library. Returns
+/// None for functions whose return type genuinely depends on
+/// runtime values in a way the planner can't statically resolve
+/// (e.g. `coalesce(arg1, arg2)` where arg1 is NULL literal — the
+/// caller's type-inference cascade handles those).
+fn function_return_shape(
+    name: &str,
+    args: &[Expr],
+    schema_cols: &[ColumnSchema],
+) -> Option<ExprShape> {
+    let lc = name.to_ascii_lowercase();
+    let (ty, nullable) = match lc.as_str() {
+        // Time-of-now → engine clock literals.
+        "now" | "current_timestamp" | "localtimestamp" | "transaction_timestamp"
+        | "statement_timestamp" | "clock_timestamp" => (DataType::Timestamptz, false),
+        "current_date" => (DataType::Date, false),
+        "current_time" | "localtime" => (DataType::Timestamp, false), // approx — SPG lacks TIME
+        // Text-returning library — every fn that produces a string.
+        "concat" | "concat_ws" | "format" | "lower" | "upper" | "trim"
+        | "ltrim" | "rtrim" | "substring" | "substr" | "replace"
+        | "split_part" | "repeat" | "lpad" | "rpad" | "left" | "right"
+        | "translate" | "regexp_replace" | "to_char" | "encode"
+        | "host" | "network" | "version" | "database" | "current_database"
+        | "current_schema" | "current_user"
+        | "session_user" | "user" | "pg_get_serial_sequence"
+        | "pg_get_constraintdef" | "pg_get_indexdef"
+        | "date_format" | "pg_typeof" => (DataType::Text, true),
+        // Bytes-returning.
+        "decode" | "hex" => (DataType::Bytes, true),
+        // Integer-returning length / position helpers.
+        "length" | "char_length" | "character_length" | "octet_length"
+        | "bit_length" | "position" | "strpos" | "ascii" | "masklen" => (DataType::Int, true),
+        // BigInt-returning.
+        "count" | "count_star" | "nextval" | "currval" | "lastval"
+        | "unix_timestamp" => (DataType::BigInt, true),
+        // Float / double-precision returns.
+        "random" | "ts_rank" | "ts_rank_cd" | "similarity" | "ln"
+        | "log" | "log2" | "exp" | "sin" | "cos" | "tan" | "asin"
+        | "acos" | "atan" | "atan2" | "degrees" | "radians" | "pi" => (DataType::Float, true),
+        // Boolean predicate-returning.
+        "starts_with" => (DataType::Bool, true),
+        // Arrays.
+        "regexp_matches" | "regexp_split_to_array" | "show_trgm"
+        | "string_to_array" | "array_remove" | "array_append"
+        | "array_cat" => (DataType::TextArray, true),
+        // JSON.
+        "to_json" | "to_jsonb" | "json_build_object" | "jsonb_build_object"
+        | "json_build_array" | "jsonb_build_array" | "json_object"
+        | "jsonb_object" | "jsonb_set" | "jsonb_insert"
+        | "jsonb_path_query" | "jsonb_path_query_first"
+        | "jsonb_path_query_array" | "json_path_query" => (DataType::Json, true),
+        // FTS types.
+        "to_tsvector" => (DataType::TsVector, true),
+        "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery"
+        | "websearch_to_tsquery" => (DataType::TsQuery, true),
+        // v7.17.0 — UUID generators. `gen_random_uuid()` is the
+        // PG built-in; `uuid_generate_v4()` is the historical
+        // uuid-ossp alias. Both return a NOT NULL UUID — non-
+        // nullable since neither takes args and neither can fail.
+        "gen_random_uuid" | "uuid_generate_v4" => (DataType::Uuid, false),
+        // Interval.
+        "age" => (DataType::Interval, true),
+        // Timestamp-returning. `from_unixtime` switches to TEXT
+        // when called with a format-string second arg — handled
+        // below via arity check.
+        "date_trunc" | "make_timestamp" => (DataType::Timestamp, true),
+        "from_unixtime" => {
+            if args.len() >= 2 {
+                (DataType::Text, true)
+            } else {
+                (DataType::Timestamp, true)
+            }
+        }
+        "make_date" | "to_date" => (DataType::Date, true),
+        "date_part" | "extract" => (DataType::Float, true),
+        // Pass-through aggregates / conditionals: derive the type
+        // from the first arg.
+        "sum" | "avg" | "max" | "min" | "abs" | "floor" | "ceil"
+        | "ceiling" | "round" | "trunc" | "mod" | "power" | "pow"
+        | "sqrt" | "sign" | "coalesce" | "nullif" | "greatest"
+        | "least" | "ifnull" | "isnull" => {
+            // Use the first arg's shape; fall back to Float for math
+            // that can promote (e.g. mod(2, 3) → Float? No — keep
+            // Int. The caller's coerce_value handles promotion at
+            // INSERT time.)
+            let first = args.first()?;
+            let inner = describe_expr(first, schema_cols)?;
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty: inner.ty,
+                nullable: true, // arithmetic / coalesce can produce NULL on bad input
+            });
+        }
+        _ => return None,
+    };
+    Some(ExprShape {
+        name: "?column?".to_string(),
+        ty,
+        nullable,
+    })
 }
 
 fn collect_parameter_oids(stmt: &Statement) -> Vec<u32> {

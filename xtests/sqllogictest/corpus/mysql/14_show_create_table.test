@@ -1,0 +1,11 @@
+# v7.17.0 Phase 3.P0-59 — SHOW CREATE TABLE.
+
+statement ok
+CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (id))
+
+# SHOW CREATE TABLE returns 1 row (Table, Create Table). The
+# sqllogictest harness doesn't parse 2-column tagged output for
+# admin statements, so we just verify the statement returns OK
+# at execute time.
+statement ok
+SHOW CREATE TABLE users

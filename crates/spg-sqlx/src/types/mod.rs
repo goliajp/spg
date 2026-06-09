@@ -9,8 +9,11 @@ mod bool;
 mod bytes;
 #[cfg(feature = "chrono")]
 mod chrono;
+pub(crate) mod decimal;
 mod float;
 mod int;
 #[cfg(feature = "json")]
 mod json;
 mod text;
+pub(crate) mod uuid;
+pub(crate) mod vector;

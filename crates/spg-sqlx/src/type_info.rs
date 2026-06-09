@@ -40,6 +40,57 @@ pub enum Kind {
     Timestamptz,
     /// `JSON` / `JSONB` (text-backed JSON).
     Json,
+    /// v7.17.0 — `UUID` (128-bit identifier, RFC 4122 byte order).
+    /// Bridges decode into `uuid::Uuid` or `String` (canonical
+    /// hyphenated lowercase form).
+    Uuid,
+    /// v7.17.0 Phase 3.P0-32 — `TIME` (without time zone). i64
+    /// microseconds since 00:00:00. Bridges decode into `String`
+    /// (canonical `HH:MM:SS[.ffffff]` form).
+    Time,
+    /// v7.17.0 Phase 3.P0-33 — MySQL `YEAR`. u16 in 1901..=2155
+    /// plus zero-year sentinel. Bridges decode into `i32` (wire
+    /// shape collapses to INT4) or `String` (4-digit zero-pad).
+    Year,
+    /// v7.17.0 Phase 3.P0-34 — PG `TIMETZ` (TIME WITH TIME
+    /// ZONE). i64 us since 00:00:00 local + i32 offset_secs.
+    /// Bridges decode into `String` (canonical
+    /// `HH:MM:SS[.ffffff]±HH[:MM]`).
+    TimeTz,
+    /// v7.17.0 Phase 3.P0-35 — PG `MONEY` — i64 cents.
+    /// Bridges decode into `String` (canonical en_US
+    /// `$N,NNN.CC`) or `i64` (raw cents).
+    Money,
+    /// v7.17.0 Phase 3.P0-38 — PG range types (int4range /
+    /// int8range / numrange / tsrange / tstzrange / daterange).
+    /// Bridges decode into `String` (canonical `[a,b)`).
+    Range,
+    /// v7.17.0 Phase 3.P0-39 — PG `hstore` extension type.
+    /// Bridges decode into `String` (canonical `"k"=>"v"`)
+    /// or `HashMap<String, Option<String>>` (in the language
+    /// dialect that ships the hstore feature).
+    Hstore,
+    /// v7.17.0 Phase 3.P0-67 — PG `NUMERIC(p, s)` / `DECIMAL(p, s)`
+    /// — exact-decimal fixed-point. Stored engine-side as
+    /// `(scaled: i128, scale: u8)`. Bridges decode into
+    /// `bigdecimal::BigDecimal` (under the `bigdecimal`
+    /// feature) or `String` (canonical PG decimal text).
+    Numeric,
+    /// v7.17.0 Phase 3.P0-68 — pgvector `VECTOR(N)` (any of the
+    /// three storage encodings: default f32, `USING SQ8`,
+    /// `USING HALF`). Bridges decode into `Vec<f32>` or
+    /// `String` (canonical pgvector external form
+    /// `'[1, 2.5, -3]'`). Quantised storage variants
+    /// (`Sq8Vector` / `HalfVector`) dequantise to f32 at the
+    /// adapter boundary.
+    Vector,
+    /// v7.17.0 Phase 3.P0-68 — PG `TSVECTOR` (full-text search
+    /// document representation). Bridges decode into `String`
+    /// (canonical PG external form
+    /// `'word1':1 'word2':2,3A'`). Encode is intentionally not
+    /// supported — clients build `tsvector` via the `to_tsvector`
+    /// SQL function, not by binding raw lexeme lists.
+    TsVector,
     /// Unknown / type-erased — used for parameters that the
     /// adapter binds without a fixed column-side type yet (e.g.
     /// the first bind of a fresh parameter index).
@@ -80,6 +131,23 @@ impl SpgTypeInfo {
             DataType::Timestamp => Kind::Timestamp,
             DataType::Timestamptz => Kind::Timestamptz,
             DataType::Json => Kind::Json,
+            // v7.17.0 — UUID bridges to `uuid::Uuid` (when the
+            // `uuid` feature is enabled on sqlx) or to `String`.
+            DataType::Uuid => Kind::Uuid,
+            DataType::Time => Kind::Time,
+            DataType::Year => Kind::Year,
+            DataType::TimeTz => Kind::TimeTz,
+            DataType::Money => Kind::Money,
+            DataType::Range(_) => Kind::Range,
+            DataType::Hstore => Kind::Hstore,
+            // v7.17.0 Phase 3.P0-67 — NUMERIC(p, s) → exact-decimal.
+            DataType::Numeric { .. } => Kind::Numeric,
+            // v7.17.0 Phase 3.P0-68 — pgvector + tsvector.
+            DataType::Vector { .. } => Kind::Vector,
+            DataType::TsVector => Kind::TsVector,
+            // v7.17.0 Phase 3.P0-40 — 2D arrays decode as TEXT
+            // on the sqlx side (canonical PG nested external form).
+            DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => Kind::Text,
             // v7.16.0 — DataType is #[non_exhaustive]; any
             // variant we haven't bridged yet decodes to Null
             // (so Decode impls see "compatible? no" instead of
@@ -108,6 +176,16 @@ impl TypeInfo for SpgTypeInfo {
             Kind::Timestamp => "TIMESTAMP",
             Kind::Timestamptz => "TIMESTAMPTZ",
             Kind::Json => "JSON",
+            Kind::Uuid => "UUID",
+            Kind::Time => "TIME",
+            Kind::Year => "YEAR",
+            Kind::TimeTz => "TIMETZ",
+            Kind::Money => "MONEY",
+            Kind::Range => "RANGE",
+            Kind::Hstore => "HSTORE",
+            Kind::Numeric => "NUMERIC",
+            Kind::Vector => "VECTOR",
+            Kind::TsVector => "TSVECTOR",
             Kind::Null => "NULL",
         }
     }

@@ -59,6 +59,14 @@ pub enum Statement {
     Update(UpdateStatement),
     /// v4.4 — `DELETE FROM <table> [WHERE cond]`.
     Delete(DeleteStatement),
+    /// v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ `MERGE` statement.
+    /// `MERGE INTO target [alias] USING source [alias] ON cond
+    /// WHEN MATCHED [AND cond] THEN { UPDATE SET … | DELETE | DO NOTHING }
+    /// WHEN NOT MATCHED [AND cond] THEN { INSERT (cols) VALUES (vals) | DO NOTHING }
+    /// [WHEN …]`. SPG v7.17 supports table-based source (subquery
+    /// source is a follow-up); BY SOURCE / BY TARGET and RETURNING
+    /// are also follow-ups.
+    Merge(MergeStatement),
     Begin,
     Commit,
     Rollback,
@@ -75,6 +83,25 @@ pub enum Statement {
     ReleaseSavepoint(String),
     /// `SHOW TABLES` — return the list of tables in the catalog.
     ShowTables,
+    /// v7.17.0 Phase 3.P0-58 — MySQL `SHOW DATABASES` /
+    /// `SHOW SCHEMAS`. SPG is single-database; the executor
+    /// returns the canonical MySQL set so the mysql / MariaDB
+    /// client populates its database selector.
+    ShowDatabases,
+    /// v7.17.0 Phase 3.P0-59 — MySQL `SHOW CREATE TABLE <t>`
+    /// returns a 2-column row `(Table, "Create Table")` carrying
+    /// the synthesized DDL. mysqldump emits this for every
+    /// table at scrape time.
+    ShowCreateTable(String),
+    /// v7.17.0 Phase 3.P0-60 — MySQL `SHOW INDEXES FROM <t>`
+    /// (also `SHOW INDEX`, `SHOW KEYS`).
+    ShowIndexes(String),
+    /// v7.17.0 Phase 3.P0-61 — MySQL `SHOW STATUS`.
+    ShowStatus,
+    /// v7.17.0 Phase 3.P0-61 — MySQL `SHOW VARIABLES`.
+    ShowVariables,
+    /// v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
+    ShowProcesslist,
     /// `SHOW COLUMNS FROM <table>` — return one row per column with
     /// its declared name / type / nullability.
     ShowColumns(String),
@@ -204,6 +231,159 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    /// v7.17.0 — `CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] name
+    /// [AS data_type]
+    /// [INCREMENT [BY] n]
+    /// [MINVALUE n | NO MINVALUE]
+    /// [MAXVALUE n | NO MAXVALUE]
+    /// [START [WITH] n]
+    /// [CACHE n]
+    /// [[NO] CYCLE]
+    /// [OWNED BY {table.col | NONE}]`.
+    /// Closes the round-7+ silent-no-op SEQUENCE story so pg_dump
+    /// emits + nextval/currval/setval downstream all work.
+    CreateSequence(CreateSequenceStatement),
+    /// v7.17.0 — `ALTER SEQUENCE [IF EXISTS] name <options>` with
+    /// the same option grammar as CREATE SEQUENCE, plus
+    /// `RESTART [WITH n]` and `OWNED BY ...` re-attach.
+    AlterSequence(AlterSequenceStatement),
+    /// v7.17.0 — `DROP SEQUENCE [IF EXISTS] name [, name…]
+    /// [CASCADE | RESTRICT]`. CASCADE / RESTRICT trailers parsed
+    /// silently (no FK on sequences).
+    DropSequence {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// v7.17.0 Phase 1.2 — `CREATE [OR REPLACE] [TEMPORARY] VIEW
+    /// [IF NOT EXISTS] name [(col, …)] AS <SELECT …>`. Closes the
+    /// silent-no-op VIEW story from the v7.17 customer-readiness
+    /// audit: pre-v7.17 SPG parsed CREATE VIEW as Statement::Empty
+    /// so any downstream `SELECT FROM v` errored with table-not-
+    /// found. The view body is stored verbatim; SELECT FROM <v>
+    /// rewrites at exec-time by prepending the view body as a
+    /// synthetic CTE.
+    CreateView(CreateViewStatement),
+    /// v7.17.0 Phase 1.2 — `DROP VIEW [IF EXISTS] name [, name…]
+    /// [CASCADE | RESTRICT]`. Removes the matching view from the
+    /// catalog; CASCADE/RESTRICT parsed silently.
+    DropView {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW [IF NOT
+    /// EXISTS] name [(col, …)] AS <SELECT …> [WITH [NO] DATA]`.
+    /// Closes the silent-no-op MATERIALIZED VIEW story. Storage
+    /// model: the materialised result lives as a regular table
+    /// with the matching name + a parallel
+    /// `materialized_views` registry mapping name → body source
+    /// (used by REFRESH).
+    CreateMaterializedView(CreateMaterializedViewStatement),
+    /// v7.17.0 Phase 1.3 — `REFRESH MATERIALIZED VIEW name [WITH
+    /// [NO] DATA]`. Re-runs the stored body and replaces the
+    /// cached rows. `WITH NO DATA` truncates without re-running.
+    RefreshMaterializedView {
+        name: String,
+        with_data: bool,
+    },
+    /// v7.17.0 Phase 1.3 — `DROP MATERIALIZED VIEW [IF EXISTS]
+    /// name [, name…] [CASCADE | RESTRICT]`. Drops both the
+    /// backing table and the source registry entry.
+    DropMaterializedView {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// v7.17.0 Phase 1.4 — `CREATE TYPE name AS ENUM ('a', 'b',
+    /// …)`. Closes the silent-no-op CREATE TYPE story so PG
+    /// dumps that declare enum types load with real constraints
+    /// instead of becoming free-form TEXT. Future kinds
+    /// (composite / range / domain) extend the inner `kind`
+    /// enum.
+    CreateType(CreateTypeStatement),
+    /// v7.17.0 Phase 1.4 — `DROP TYPE [IF EXISTS] name [, name…]
+    /// [CASCADE | RESTRICT]`. Removes the matching enum/domain
+    /// from the catalog.
+    DropType {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// v7.17.0 Phase 1.5 — `CREATE DOMAIN name AS base_type
+    /// [DEFAULT expr] [NOT NULL | NULL] [CHECK (expr)]*`.
+    /// A DOMAIN is a named CHECK-constrained alias over a built-
+    /// in type. The CHECK + NOT NULL + DEFAULT clauses apply to
+    /// every column declared with the domain. Closes the
+    /// silent-no-op CREATE DOMAIN story so PG dumps that ship
+    /// validated identifier types (email, positive_int, …) keep
+    /// their guarantees.
+    CreateDomain(CreateDomainStatement),
+    /// v7.17.0 Phase 1.5 — `DROP DOMAIN [IF EXISTS] name
+    /// [, name…] [CASCADE | RESTRICT]`. Removes the matching
+    /// domain from the catalog.
+    DropDomain {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// v7.17.0 Phase 1.6 — `CREATE SCHEMA [IF NOT EXISTS]
+    /// name [AUTHORIZATION user]`. SPG is single-database;
+    /// schemas are tracked as a namespace registry so pg_dump
+    /// multi-schema declarations land cleanly and `SELECT *
+    /// FROM information_schema.schemata` returns real entries.
+    /// Schema-qualified `schema.table` references still strip
+    /// the prefix at lookup time per PG (schemas are not
+    /// isolation boundaries in v7.17 — see project-next-docket
+    /// for the v7.18+ isolation tracking).
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// v7.17.0 Phase 1.6 — `DROP SCHEMA [IF EXISTS] name
+    /// [, name…] [CASCADE | RESTRICT]`. Removes the schema
+    /// from the registry; built-in `public` / `pg_catalog` /
+    /// `information_schema` cannot be dropped.
+    DropSchema {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+}
+
+/// v7.17.0 Phase 1.5 — `CREATE DOMAIN` AST.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateDomainStatement {
+    pub name: String,
+    /// Base type for the domain (one of the built-in
+    /// `ColumnTypeName` variants). User-defined enum / domain
+    /// bases are deferred to Phase 1.5b.
+    pub base_type: ColumnTypeName,
+    /// Optional `DEFAULT <expr>`. Resolved at engine-side
+    /// CREATE TABLE time when a column is bound to this domain.
+    pub default: Option<Expr>,
+    /// `NOT NULL` from the domain definition. Engine ORs this
+    /// with the column-level nullability so the strictest of the
+    /// two wins (i.e. the column is non-nullable if either side
+    /// says so).
+    pub not_null: bool,
+    /// Zero-or-more `CHECK (expr)` predicates. Each one is
+    /// enforced as part of the column's CHECK list at INSERT /
+    /// UPDATE time, with `VALUE` substituted for the column's
+    /// current cell value.
+    pub checks: Vec<Expr>,
+}
+
+/// v7.17.0 Phase 1.4 — `CREATE TYPE` AST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTypeStatement {
+    pub name: String,
+    pub kind: TypeKind,
+}
+
+/// v7.17.0 Phase 1.4 — flavour of the new type. Only ENUM is
+/// implemented; the variant set is open so Phase 1.5 (DOMAIN)
+/// and later (COMPOSITE, RANGE) can land without an AST shape
+/// migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeKind {
+    /// `AS ENUM ('a', 'b', …)`. Order is preserved (PG enum
+    /// labels are ordered).
+    Enum { labels: Vec<String> },
 }
 
 /// v7.12.1 — payload of a SET right-hand side. PG syntax accepts
@@ -235,6 +415,97 @@ pub struct CreateSubscriptionStatement {
     /// in this order. v6.1.4 records the list; v6.1.5
     /// publisher-side filtering enforces it.
     pub publications: Vec<String>,
+}
+
+/// v7.17.0 — `CREATE SEQUENCE` AST node. See [`Statement::CreateSequence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSequenceStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub temporary: bool,
+    /// Optional `AS data_type`. Default in PG is BIGINT; SPG matches.
+    pub data_type: Option<SequenceDataType>,
+    pub options: SequenceOptions,
+}
+
+/// v7.17.0 — narrow type for `AS` clause of CREATE SEQUENCE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceDataType {
+    SmallInt,
+    Int,
+    BigInt,
+}
+
+/// v7.17.0 — option grammar shared by CREATE / ALTER SEQUENCE.
+/// All fields are optional. `min_value`/`max_value` carry
+/// `Some(SeqBound::NoBound)` for `NO MINVALUE` / `NO MAXVALUE`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SequenceOptions {
+    pub increment: Option<i64>,
+    pub min_value: Option<SeqBound>,
+    pub max_value: Option<SeqBound>,
+    pub start: Option<i64>,
+    /// `RESTART [WITH n]` — ALTER-only. `Some(None)` = bare
+    /// RESTART, `Some(Some(n))` = RESTART WITH n.
+    pub restart: Option<Option<i64>>,
+    pub cache: Option<i64>,
+    pub cycle: Option<bool>,
+    pub owned_by: Option<SequenceOwnedBy>,
+}
+
+/// v7.17.0 — `MINVALUE n` / `NO MINVALUE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqBound {
+    Value(i64),
+    NoBound,
+}
+
+/// v7.17.0 — `OWNED BY {table.col | NONE}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceOwnedBy {
+    None,
+    Column { table: String, column: String },
+}
+
+/// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW` AST node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateMaterializedViewStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    /// Optional `(col, col, …)` rename list. Applies to the
+    /// backing table at CREATE / REFRESH time.
+    pub columns: Vec<String>,
+    /// Underlying SELECT. Re-parsed at REFRESH time to rebuild
+    /// the cached rows.
+    pub body: SelectStatement,
+    /// `WITH DATA` (default) = materialise the rows at CREATE
+    /// time. `WITH NO DATA` = create an empty backing table;
+    /// callers must REFRESH before SELECT returns rows.
+    pub with_data: bool,
+}
+
+/// v7.17.0 Phase 1.2 — `CREATE VIEW` AST node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStatement {
+    pub name: String,
+    pub or_replace: bool,
+    pub if_not_exists: bool,
+    pub temporary: bool,
+    /// Optional `(col, col, …)` rename list. When non-empty,
+    /// these override the body's projected column names per-
+    /// position at SELECT-from-view time.
+    pub columns: Vec<String>,
+    /// Underlying SELECT. Re-parsed lazily at SELECT-from-view
+    /// time to materialise the view as a synthetic CTE.
+    pub body: SelectStatement,
+}
+
+/// v7.17.0 — `ALTER SEQUENCE` AST node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterSequenceStatement {
+    pub name: String,
+    pub if_exists: bool,
+    pub options: SequenceOptions,
 }
 
 /// v6.1.2 — `CREATE PUBLICATION` AST node. The `scope` field uses
@@ -853,6 +1124,19 @@ pub enum TableConstraint {
         name: Option<String>,
         columns: Vec<String>,
     },
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY/INDEX [name]
+    /// (cols)` inline declaration. Pre-v7.17 the parser
+    /// silently dropped these so MyISAM-imported FULLTEXT
+    /// indexes vanished; v7.17 routes them through the
+    /// existing tsvector-GIN engine path so MATCH AGAINST
+    /// queries get a real inverted index instead of falling
+    /// back to a full scan. Multi-column FULLTEXT KEYs build
+    /// one GIN per column at v7.17 (per-column posting lists);
+    /// the leading column drives query planning.
+    FulltextIndex {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -886,6 +1170,111 @@ pub struct ColumnDef {
     /// CHECK constraints. Multiple inline CHECKs on the same
     /// column are concatenated with AND at the table level.
     pub check: Option<Expr>,
+    /// v7.17.0 Phase 1.4 — user-defined type reference. When the
+    /// parser sees an unknown column-type ident (anything not in
+    /// the built-in `parse_column_type_name` table), it sets
+    /// `ty = ColumnTypeName::Text` and records the original name
+    /// here. The engine resolves at CREATE TABLE time: if a
+    /// catalog enum/domain with this name exists, the column is
+    /// bound to it (label-checked on INSERT for enums; CHECK-
+    /// constrained for domains); otherwise the CREATE TABLE
+    /// errors with "unknown type".
+    pub user_type_ref: Option<String>,
+    /// v7.17.0 Phase 2.1 — MySQL-style `ON UPDATE
+    /// CURRENT_TIMESTAMP` column attribute. When set, an
+    /// UPDATE that does NOT explicitly bind this column
+    /// overrides the new value with `now()` (engine clock).
+    /// Pre-v7.17 SPG silently accepted the syntax and never
+    /// fired the override — `updated_at` columns from mysqldump
+    /// stayed pinned at their initial DEFAULT forever, an
+    /// audit Tier-S silent-failure. Generalised as a stored
+    /// expression source so future shapes (`ON UPDATE
+    /// CURRENT_TIMESTAMP(6)`, `ON UPDATE LOCALTIMESTAMP`) reuse
+    /// the same field; v7.17 only accepts CURRENT_TIMESTAMP.
+    pub on_update_runtime: Option<Expr>,
+    /// v7.17.0 Phase 2.5 — text collation derived from the
+    /// post-fix `COLLATE <name>` clause (and / or the table-level
+    /// `COLLATE=<name>` for MySQL dumps that don't repeat it
+    /// per column). Pre-2.5 SPG accepted the clause and
+    /// discarded the name, leaving every column byte-compared
+    /// — a Tier-S silent failure when the customer expected
+    /// `_ci` / `case_insensitive` semantics. Parser normalises
+    /// the raw collation name into the variants in `Collation`.
+    /// Default `Binary` preserves the legacy compare path.
+    pub collation: Collation,
+    /// v7.17.0 Phase 4.4 — MySQL `UNSIGNED` modifier flag. Pre-
+    /// 4.4 SPG accepted and discarded the keyword, leaving
+    /// negative values silently accepted on a column the
+    /// customer declared `INT UNSIGNED NOT NULL`. Now: the engine
+    /// rejects negative INSERT / UPDATE values on UNSIGNED int
+    /// columns. SPG widening to `u64`-shaped storage is out of
+    /// v7.17 scope; the upper bound remains the signed-type max
+    /// (i64::MAX for BIGINT UNSIGNED), which still strictly
+    /// exceeds what every mailrs / Rails app actually uses.
+    pub is_unsigned: bool,
+    /// v7.17.0 Phase 3.P0-36 — MySQL inline `ENUM('a','b','c')`
+    /// value list captured at parse time. When `Some`, the parser
+    /// recognised `ENUM(...)` in the type slot; the engine
+    /// validates INSERT cells against this list at
+    /// column_def_to_schema time and persists the variants on
+    /// `ColumnSchema.inline_enum_variants`. None for all
+    /// non-ENUM columns.
+    pub inline_enum_variants: Option<Vec<String>>,
+    /// v7.17.0 Phase 3.P0-37 — MySQL inline `SET('a','b','c')`
+    /// value list. Distinct from ENUM (subset semantics rather
+    /// than pick-one). None for all non-SET columns.
+    pub inline_set_variants: Option<Vec<String>>,
+}
+
+/// v7.17.0 Phase 2.5 — text collation classification surfaced
+/// from the SQL parser. Mirrors `spg_storage::Collation`; the
+/// engine bridges between the two at CREATE TABLE time.
+///
+/// Recognised collation-name patterns (case-insensitive):
+///   * `case_insensitive`, `*_ci`, `*_ai_ci`, `nocase`         → CaseInsensitive
+///   * Everything else (`C`, `POSIX`, `default`,
+///     `pg_catalog.default`, `*_cs`, `*_bin`, unknown names)   → Binary
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collation {
+    Binary,
+    CaseInsensitive,
+}
+
+impl Default for Collation {
+    fn default() -> Self {
+        Self::Binary
+    }
+}
+
+impl Collation {
+    /// Classify a `COLLATE <name>` ident into one of the supported
+    /// variants. Empty / unknown names fall back to `Binary` —
+    /// matches the pre-2.5 silent-accept behaviour for snapshots
+    /// that load through but don't actually depend on the
+    /// collation semantics.
+    #[must_use]
+    pub fn from_collation_name(name: &str) -> Self {
+        let lc = name.trim().to_ascii_lowercase();
+        // Strip any quotes / schema-qualifier the parser left on
+        // (e.g. `pg_catalog.default`).
+        let bare = lc
+            .trim_matches(|c: char| c == '"' || c == '\'')
+            .rsplit('.')
+            .next()
+            .unwrap_or("");
+        if bare.is_empty() {
+            return Self::Binary;
+        }
+        if bare == "case_insensitive" || bare == "nocase" {
+            return Self::CaseInsensitive;
+        }
+        // MySQL `_ci` suffix (covers `utf8mb4_general_ci`,
+        // `utf8mb4_unicode_ci`, `utf8mb4_0900_ai_ci`, …).
+        if bare.ends_with("_ci") {
+            return Self::CaseInsensitive;
+        }
+        Self::Binary
+    }
 }
 
 /// v7.6.0 — A single FOREIGN KEY constraint. Both column-level
@@ -1038,6 +1427,58 @@ pub enum ColumnTypeName {
     /// v7.12.0 `tsquery` — PG full-text search parse tree. PG
     /// wire OID 3615.
     TsQuery,
+    /// v7.17.0 `UUID` — 128-bit identifier. PG wire OID 2950.
+    /// Literal input accepts canonical hyphenated, unhyphenated,
+    /// uppercase, and `{...}`-braced forms; display normalises to
+    /// canonical lowercase 8-4-4-4-12. The drop-in PG surface for
+    /// Django / Rails / Hibernate `id UUID PRIMARY KEY DEFAULT
+    /// gen_random_uuid()`.
+    Uuid,
+    /// v7.17.0 Phase 3.P0-32 `TIME` (without time zone) — i64
+    /// microseconds since 00:00:00. PG wire OID 1083. Literal
+    /// input is `'HH:MM:SS'` with an optional `.fraction` suffix
+    /// (6-digit microsecond precision). Display normalises to
+    /// the canonical `HH:MM:SS[.ffffff]`.
+    Time,
+    /// v7.17.0 Phase 3.P0-33 MySQL `YEAR` — u16 in range
+    /// 1901..=2155 plus the zero-year sentinel 0. No dedicated
+    /// PG OID; advertised as INT4 on the wire. Display always
+    /// 4 digits zero-padded.
+    Year,
+    /// v7.17.0 Phase 3.P0-34 PG `TIME WITH TIME ZONE` (TIMETZ) —
+    /// i64 us since 00:00:00 (local) + i32 offset_secs from UTC.
+    /// Wire OID 1266. Literal input is `'HH:MM:SS[.ffffff]±HH[:MM]'`.
+    /// Offset range: ±14 hours.
+    TimeTz,
+    /// v7.17.0 Phase 3.P0-35 PG `MONEY` — i64 cents
+    /// (locale-independent storage). Wire OID 790. Literal input
+    /// accepts `$N.NN`, `$N,NNN.NN`, bare integer (treated as
+    /// major units), optional leading `-`. Display: en_US locale.
+    Money,
+    /// v7.17.0 Phase 3.P0-38 PG range types. Pair stores the
+    /// element kind tag (Int4 / Int8 / Num / Ts / TsTz / Date)
+    /// — the engine bridges to `DataType::Range(RangeKind)`.
+    Range(RangeKindAst),
+    /// v7.17.0 Phase 3.P0-39 PG `hstore` extension type — flat
+    /// `text => text` map with NULL value support.
+    Hstore,
+    /// v7.17.0 Phase 3.P0-40 — 2D arrays for INT / TEXT / BIGINT.
+    IntArray2D,
+    BigIntArray2D,
+    TextArray2D,
+}
+
+/// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
+/// `spg_storage::RangeKind`; we keep it spg-sql-local so the AST
+/// crate doesn't depend on storage. Bridged at engine boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RangeKindAst {
+    Int4,
+    Int8,
+    Num,
+    Ts,
+    TsTz,
+    Date,
 }
 
 impl fmt::Display for ColumnTypeName {
@@ -1064,6 +1505,7 @@ impl fmt::Display for ColumnTypeName {
             Self::BigIntArray => f.write_str("BIGINT[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
+            Self::Uuid => f.write_str("UUID"),
             Self::Numeric(p, s) => {
                 if *s == 0 {
                     write!(f, "NUMERIC({p})")
@@ -1074,6 +1516,22 @@ impl fmt::Display for ColumnTypeName {
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
+            Self::Time => f.write_str("TIME"),
+            Self::Year => f.write_str("YEAR"),
+            Self::TimeTz => f.write_str("TIMETZ"),
+            Self::Money => f.write_str("MONEY"),
+            Self::Range(k) => f.write_str(match k {
+                RangeKindAst::Int4 => "INT4RANGE",
+                RangeKindAst::Int8 => "INT8RANGE",
+                RangeKindAst::Num => "NUMRANGE",
+                RangeKindAst::Ts => "TSRANGE",
+                RangeKindAst::TsTz => "TSTZRANGE",
+                RangeKindAst::Date => "DATERANGE",
+            }),
+            Self::Hstore => f.write_str("HSTORE"),
+            Self::IntArray2D => f.write_str("INT[][]"),
+            Self::BigIntArray2D => f.write_str("BIGINT[][]"),
+            Self::TextArray2D => f.write_str("TEXT[][]"),
         }
     }
 }
@@ -1102,6 +1560,57 @@ pub struct DeleteStatement {
     pub where_: Option<Expr>,
     /// v7.9.4 — `RETURNING <projection>`.
     pub returning: Option<Vec<SelectItem>>,
+}
+
+/// v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ MERGE statement.
+/// One WHEN clause fires per source row depending on whether the
+/// `on` condition matched any target row(s); the executor walks
+/// `clauses` in declaration order and fires the first whose
+/// `matched` kind and optional `condition` are both satisfied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeStatement {
+    pub target: String,
+    pub target_alias: Option<String>,
+    pub source: String,
+    pub source_alias: Option<String>,
+    pub on: Expr,
+    pub clauses: Vec<MergeWhenClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeWhenClause {
+    pub matched: MergeMatched,
+    /// Optional `AND <expr>` filter — when present, the clause
+    /// only fires for the source rows whose match-pair satisfies
+    /// the predicate.
+    pub condition: Option<Expr>,
+    pub action: MergeAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMatched {
+    Matched,
+    NotMatched,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeAction {
+    /// `INSERT (cols) VALUES (vals)`. SPG v7.17 requires the
+    /// explicit column list (the bare `INSERT VALUES (vals)`
+    /// shape lands later).
+    Insert {
+        columns: Vec<String>,
+        values: Vec<Expr>,
+    },
+    /// `UPDATE SET col = expr [, …]` — applied to every matched
+    /// target row for the firing source row.
+    Update { assignments: Vec<(String, Expr)> },
+    /// `DELETE` — drop every matched target row.
+    Delete,
+    /// `DO NOTHING` — explicit no-op (the SQL standard accepts
+    /// the clause and SPG mirrors so a customer-side MERGE that
+    /// uses it for branch-control doesn't error).
+    DoNothing,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1197,6 +1706,15 @@ pub struct SelectStatement {
     /// `OFFSET <n>` — drop the first `n` rows after ORDER BY but
     /// before LIMIT (so `LIMIT 10 OFFSET 5` keeps rows 6..=15).
     pub offset: Option<LimitExpr>,
+    /// v7.17.0 Phase 3.P0-49 — `FETCH FIRST <n> ROWS WITH TIES`
+    /// (SQL:2008). When true and an ORDER BY is present, the
+    /// executor extends past the LIMIT-truncated tail to include
+    /// every row whose ORDER BY key equals the last-kept row's
+    /// key. Requires an ORDER BY; the executor errors otherwise
+    /// (matching PG's `WITH TIES` rule). The parser was already
+    /// accepting `WITH TIES` since Phase 5.1; this field captures
+    /// the choice so the executor can act on it.
+    pub limit_with_ties: bool,
 }
 
 /// v7.9.24 — LIMIT / OFFSET value. Integer literal at parse
@@ -1313,6 +1831,27 @@ pub struct TableRef {
     /// column name for the unnested column. Empty = fall back to
     /// the table alias (pre-v7.13.2 behaviour).
     pub unnest_column_aliases: Vec<String>,
+    /// v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
+    /// [, step])` set-returning source. When `Some`, the engine
+    /// materialises a single-column virtual table by stepping
+    /// `start` to `stop` inclusive. Args are the literal arg list
+    /// (2 for default-step, 3 for explicit-step). Supports:
+    ///   * SmallInt / Int / BigInt with integer step (default = 1)
+    ///   * Timestamp with INTERVAL step (PG date-range pattern)
+    /// Mutually exclusive with `unnest_expr` — both populate the
+    /// same downstream dispatch slot. `name` defaults to
+    /// `"generate_series"` when no alias is provided.
+    pub generate_series_args: Option<Vec<Expr>>,
+    /// v7.17.0 Phase 3.P0-41 — `LATERAL ( SELECT … )` derived
+    /// table. When `Some`, the TableRef is a parenthesised SELECT
+    /// that may reference columns from the preceding FROM items
+    /// (correlated derived table). The executor materialises the
+    /// subquery per left-row, substituting outer-column references
+    /// against the current join row's values before running the
+    /// inner SELECT, then cross-joins the result back.
+    /// Mutually exclusive with `name` / `unnest_expr` /
+    /// `generate_series_args`.
+    pub lateral_subquery: Option<Box<SelectStatement>>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -1585,6 +2124,11 @@ pub enum CastTarget {
     /// and by `WHERE col @@ 'term'::tsquery` literal patterns.
     TsVector,
     TsQuery,
+    /// v7.17.0 — `::uuid`. Decodes the LHS Text via
+    /// `spg_storage::parse_uuid_str` (accepts canonical hyphenated,
+    /// unhyphenated, uppercase, and brace-wrapped forms); malformed
+    /// input is a SQL error.
+    Uuid,
 }
 
 impl fmt::Display for CastTarget {
@@ -1609,6 +2153,7 @@ impl fmt::Display for CastTarget {
             Self::BigIntArray => "BIGINT[]",
             Self::TsVector => "tsvector",
             Self::TsQuery => "tsquery",
+            Self::Uuid => "uuid",
         })
     }
 }
@@ -1690,6 +2235,21 @@ pub enum BinOp {
     /// 3VL on NULL. Symmetric: PG also accepts `tsquery @@
     /// tsvector` and engine eval normalises either ordering.
     TsMatch,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contained-in
+    /// `<<`. LHS network is strictly inside RHS network (no equality).
+    InetContainedBy,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contained-in-or-equal
+    /// `<<=`. LHS network ⊆ RHS network.
+    InetContainedByEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contains `>>`.
+    /// LHS network strictly contains RHS network.
+    InetContains,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contains-or-equal `>>=`.
+    /// LHS network ⊇ RHS network.
+    InetContainsEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR network overlap `&&`.
+    /// True iff either network contains any address of the other.
+    InetOverlap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1730,6 +2290,64 @@ impl fmt::Display for Statement {
             Self::Insert(s) => s.fmt(f),
             Self::Update(s) => s.fmt(f),
             Self::Delete(s) => s.fmt(f),
+            Self::Merge(s) => {
+                // v7.17.0 Phase 3.P0-42 — MERGE display is approximate
+                // (it round-trips for the cases tests cover, not for
+                // round-tripping every edge of the surface).
+                f.write_str("MERGE INTO ")?;
+                write!(f, "{}", quote_ident(&s.target))?;
+                if let Some(a) = &s.target_alias {
+                    write!(f, " {}", quote_ident(a))?;
+                }
+                f.write_str(" USING ")?;
+                write!(f, "{}", quote_ident(&s.source))?;
+                if let Some(a) = &s.source_alias {
+                    write!(f, " {}", quote_ident(a))?;
+                }
+                write!(f, " ON {}", s.on)?;
+                for clause in &s.clauses {
+                    f.write_str(" WHEN ")?;
+                    f.write_str(match clause.matched {
+                        MergeMatched::Matched => "MATCHED",
+                        MergeMatched::NotMatched => "NOT MATCHED",
+                    })?;
+                    if let Some(c) = &clause.condition {
+                        write!(f, " AND {c}")?;
+                    }
+                    f.write_str(" THEN ")?;
+                    match &clause.action {
+                        MergeAction::Insert { columns, values } => {
+                            f.write_str("INSERT (")?;
+                            for (i, c) in columns.iter().enumerate() {
+                                if i > 0 {
+                                    f.write_str(", ")?;
+                                }
+                                write!(f, "{}", quote_ident(c))?;
+                            }
+                            f.write_str(") VALUES (")?;
+                            for (i, v) in values.iter().enumerate() {
+                                if i > 0 {
+                                    f.write_str(", ")?;
+                                }
+                                write!(f, "{v}")?;
+                            }
+                            f.write_str(")")?;
+                        }
+                        MergeAction::Update { assignments } => {
+                            f.write_str("UPDATE SET ")?;
+                            for (i, (c, e)) in assignments.iter().enumerate() {
+                                if i > 0 {
+                                    f.write_str(", ")?;
+                                }
+                                write!(f, "{} = {e}", quote_ident(c))?;
+                            }
+                        }
+                        MergeAction::Delete => f.write_str("DELETE")?,
+                        MergeAction::DoNothing => f.write_str("DO NOTHING")?,
+                    }
+                }
+                Ok(())
+            }
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
@@ -1737,6 +2355,12 @@ impl fmt::Display for Statement {
             Self::RollbackToSavepoint(n) => write!(f, "ROLLBACK TO SAVEPOINT {}", quote_ident(n)),
             Self::ReleaseSavepoint(n) => write!(f, "RELEASE SAVEPOINT {}", quote_ident(n)),
             Self::ShowTables => f.write_str("SHOW TABLES"),
+            Self::ShowDatabases => f.write_str("SHOW DATABASES"),
+            Self::ShowCreateTable(t) => write!(f, "SHOW CREATE TABLE {}", quote_ident(t)),
+            Self::ShowIndexes(t) => write!(f, "SHOW INDEXES FROM {}", quote_ident(t)),
+            Self::ShowStatus => f.write_str("SHOW STATUS"),
+            Self::ShowVariables => f.write_str("SHOW VARIABLES"),
+            Self::ShowProcesslist => f.write_str("SHOW PROCESSLIST"),
             Self::ShowColumns(t) => write!(f, "SHOW COLUMNS FROM {}", quote_ident(t)),
             Self::CreateUser(s) => write!(
                 f,
@@ -1891,8 +2515,273 @@ impl fmt::Display for Statement {
                 }
                 write!(f, "{}", quote_ident(name))
             }
+            Self::CreateSequence(s) => s.fmt(f),
+            Self::AlterSequence(s) => s.fmt(f),
+            Self::DropSequence { names, if_exists } => {
+                f.write_str("DROP SEQUENCE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+            Self::CreateView(v) => v.fmt(f),
+            Self::DropView { names, if_exists } => {
+                f.write_str("DROP VIEW ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+            Self::CreateMaterializedView(v) => v.fmt(f),
+            Self::RefreshMaterializedView { name, with_data } => {
+                write!(f, "REFRESH MATERIALIZED VIEW {}", quote_ident(name))?;
+                if !*with_data {
+                    f.write_str(" WITH NO DATA")?;
+                }
+                Ok(())
+            }
+            Self::DropMaterializedView { names, if_exists } => {
+                f.write_str("DROP MATERIALIZED VIEW ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+            Self::CreateType(t) => t.fmt(f),
+            Self::DropType { names, if_exists } => {
+                f.write_str("DROP TYPE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+            Self::CreateDomain(d) => d.fmt(f),
+            Self::DropDomain { names, if_exists } => {
+                f.write_str("DROP DOMAIN ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
+            Self::CreateSchema { name, if_not_exists } => {
+                f.write_str("CREATE SCHEMA ")?;
+                if *if_not_exists {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                write!(f, "{}", quote_ident(name))
+            }
+            Self::DropSchema { names, if_exists } => {
+                f.write_str("DROP SCHEMA ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", quote_ident(n))?;
+                }
+                Ok(())
+            }
         }
     }
+}
+
+impl fmt::Display for CreateDomainStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE DOMAIN {} AS {}", quote_ident(&self.name), self.base_type)?;
+        if let Some(d) = &self.default {
+            write!(f, " DEFAULT {d}")?;
+        }
+        if self.not_null {
+            f.write_str(" NOT NULL")?;
+        }
+        for c in &self.checks {
+            write!(f, " CHECK ({c})")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for CreateTypeStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE TYPE {} AS ", quote_ident(&self.name))?;
+        match &self.kind {
+            TypeKind::Enum { labels } => {
+                f.write_str("ENUM (")?;
+                for (i, l) in labels.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "'{}'", l.replace('\'', "''"))?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+impl fmt::Display for CreateMaterializedViewStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE MATERIALIZED VIEW ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        if !self.columns.is_empty() {
+            f.write_str(" (")?;
+            for (i, c) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        write!(f, " AS {}", self.body)?;
+        if !self.with_data {
+            f.write_str(" WITH NO DATA")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for CreateViewStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.or_replace {
+            f.write_str("OR REPLACE ")?;
+        }
+        if self.temporary {
+            f.write_str("TEMPORARY ")?;
+        }
+        f.write_str("VIEW ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        if !self.columns.is_empty() {
+            f.write_str(" (")?;
+            for (i, c) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        write!(f, " AS {}", self.body)
+    }
+}
+
+impl fmt::Display for CreateSequenceStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.temporary {
+            f.write_str("TEMPORARY ")?;
+        }
+        f.write_str("SEQUENCE ")?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        if let Some(dt) = self.data_type {
+            write!(f, " AS {dt}")?;
+        }
+        write_sequence_options(f, &self.options)
+    }
+}
+
+impl fmt::Display for AlterSequenceStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ALTER SEQUENCE ")?;
+        if self.if_exists {
+            f.write_str("IF EXISTS ")?;
+        }
+        write!(f, "{}", quote_ident(&self.name))?;
+        write_sequence_options(f, &self.options)
+    }
+}
+
+impl fmt::Display for SequenceDataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SmallInt => "smallint",
+            Self::Int => "integer",
+            Self::BigInt => "bigint",
+        })
+    }
+}
+
+fn write_sequence_options(f: &mut fmt::Formatter<'_>, o: &SequenceOptions) -> fmt::Result {
+    if let Some(n) = o.increment {
+        write!(f, " INCREMENT BY {n}")?;
+    }
+    match o.min_value {
+        Some(SeqBound::Value(n)) => write!(f, " MINVALUE {n}")?,
+        Some(SeqBound::NoBound) => f.write_str(" NO MINVALUE")?,
+        None => {}
+    }
+    match o.max_value {
+        Some(SeqBound::Value(n)) => write!(f, " MAXVALUE {n}")?,
+        Some(SeqBound::NoBound) => f.write_str(" NO MAXVALUE")?,
+        None => {}
+    }
+    if let Some(n) = o.start {
+        write!(f, " START WITH {n}")?;
+    }
+    match o.restart {
+        Some(Some(n)) => write!(f, " RESTART WITH {n}")?,
+        Some(None) => f.write_str(" RESTART")?,
+        None => {}
+    }
+    if let Some(n) = o.cache {
+        write!(f, " CACHE {n}")?;
+    }
+    match o.cycle {
+        Some(true) => f.write_str(" CYCLE")?,
+        Some(false) => f.write_str(" NO CYCLE")?,
+        None => {}
+    }
+    if let Some(ob) = &o.owned_by {
+        match ob {
+            SequenceOwnedBy::None => f.write_str(" OWNED BY NONE")?,
+            SequenceOwnedBy::Column { table, column } => {
+                write!(f, " OWNED BY {}.{}", quote_ident(table), quote_ident(column))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for CreateFunctionStatement {
@@ -2318,6 +3207,23 @@ impl fmt::Display for TableConstraint {
                 }
                 f.write_str(")")
             }
+            Self::FulltextIndex { name, columns } => {
+                // Mysqldump emits `FULLTEXT KEY name (cols)` —
+                // Display rounds back to that shape so dump
+                // replay reproduces the input verbatim.
+                f.write_str("FULLTEXT KEY ")?;
+                if let Some(n) = name {
+                    write!(f, "{} ", quote_ident(n))?;
+                }
+                f.write_str("(")?;
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&quote_ident(c))?;
+                }
+                f.write_str(")")
+            }
         }
     }
 }
@@ -2373,6 +3279,13 @@ impl fmt::Display for FkAction {
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", quote_ident(&self.name), self.ty)?;
+        // v7.17.0 Phase 2.5 — render COLLATE for round-trippable
+        // DDL. Only emits when non-default so the typical output
+        // stays unchanged.
+        match self.collation {
+            Collation::Binary => {}
+            Collation::CaseInsensitive => f.write_str(" COLLATE \"case_insensitive\"")?,
+        }
         if let Some(d) = &self.default {
             write!(f, " DEFAULT {d}")?;
         }
@@ -2813,6 +3726,11 @@ impl fmt::Display for BinOp {
             Self::JsonGetPathText => "#>>",
             Self::JsonContains => "@>",
             Self::TsMatch => "@@",
+            Self::InetContainedBy => "<<",
+            Self::InetContainedByEq => "<<=",
+            Self::InetContains => ">>",
+            Self::InetContainsEq => ">>=",
+            Self::InetOverlap => "&&",
         })
     }
 }
@@ -2947,6 +3865,8 @@ mod tests {
                     as_of_segment: None,
                     unnest_expr: None,
                     unnest_column_aliases: Vec::new(),
+                    generate_series_args: None,
+                    lateral_subquery: None,
                 },
                 joins: vec![],
             }),
@@ -2958,6 +3878,7 @@ mod tests {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            limit_with_ties: false,
             distinct: false,
             ctes: vec![],
         };

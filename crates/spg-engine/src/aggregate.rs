@@ -105,7 +105,23 @@ pub fn contains_aggregate(e: &Expr) -> bool {
 pub fn is_aggregate_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "count_star" | "sum" | "min" | "max" | "avg"
+        "count"
+            | "count_star"
+            | "sum"
+            | "min"
+            | "max"
+            | "avg"
+            // v7.17.0 — variadic / collection aggregates. ORM
+            // reports (Hibernate / Rails / Django) emit these in
+            // GROUP BY rollups; pre-7.17 SPG hit "unknown
+            // aggregate".
+            | "string_agg"
+            | "array_agg"
+            // v7.17.0 — boolean aggregates. `every` is SQL-standard
+            // alias for `bool_and`.
+            | "bool_and"
+            | "bool_or"
+            | "every"
     )
 }
 
@@ -117,13 +133,37 @@ struct AggState {
     sum_float: f64,
     extreme: Option<Value>,
     use_float: bool,
+    /// v7.17.0 — running collection for string_agg / array_agg.
+    /// Each entry is one row's contribution (NULL preserved as
+    /// `Value::Null`; string_agg's finalize step drops them, but
+    /// array_agg keeps them). Pushing in insertion order matches
+    /// PG behaviour when no `ORDER BY` is given inside the
+    /// aggregate call.
+    items: Vec<Value>,
+    /// v7.17.0 — captured separator for string_agg. PG accepts a
+    /// non-constant separator expression but in practice every
+    /// caller passes a literal; the engine snapshots the last
+    /// non-NULL text it sees, which matches PG's "use the latest
+    /// row's value" behaviour.
+    separator: Option<String>,
+    /// v7.17.0 — running boolean accumulator for bool_and /
+    /// bool_or / every. `None` until the first non-NULL input;
+    /// at finalize None → SQL NULL.
+    bool_acc: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 struct AggSpec {
     name: String, // lowercased
-    /// Argument for sum/min/max/avg/count. `None` for `count(*)`.
+    /// First argument (value expression) for every aggregate
+    /// except `count(*)`. `None` for `count_star`.
     arg: Option<Expr>,
+    /// v7.17.0 — second argument. Only `string_agg(value, sep)`
+    /// uses it today. `None` for every other aggregate (or for
+    /// `array_agg`, which is single-arg). Carried in the spec so
+    /// per-row evaluation can re-use the same separator
+    /// expression across calls.
+    arg2: Option<Expr>,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -159,6 +199,12 @@ pub fn run(
     if let Some(h) = &stmt.having {
         collect_aggregates(h, &mut agg_specs);
     }
+    // v7.17.0 — arity validation. The collector tolerates an
+    // arbitrary positional-arg count; here we enforce the
+    // per-aggregate contract so a malformed call (e.g.
+    // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
+    // rather than silently coercing to a degenerate aggregate.
+    validate_agg_arities(stmt, &agg_specs)?;
 
     // Map group key (vec of values, encoded as canonical string) -> group state.
     // Order of insertion is preserved via a parallel Vec of keys.
@@ -178,7 +224,23 @@ pub fn run(
             .iter()
             .map(|g| eval::eval_expr(g, row, &ctx))
             .collect::<Result<_, _>>()?;
-        let key = encode_key(&group_vals);
+        // v7.17.0 Phase 2.5b — case-insensitive group keying.
+        // For each group_expr that's a column reference on a
+        // CaseInsensitive text column, fold the corresponding
+        // value before encoding the key. Display value
+        // (`group_vals`) stays original — only the key folds.
+        let mut key_vals = group_vals.clone();
+        for (i, g) in group_exprs.iter().enumerate() {
+            if matches!(
+                eval::column_collation(g, &ctx),
+                Some(spg_storage::Collation::CaseInsensitive)
+            ) {
+                if let Value::Text(s) = &key_vals[i] {
+                    key_vals[i] = Value::Text(s.to_ascii_lowercase());
+                }
+            }
+        }
+        let key = encode_key(&key_vals);
         let entry = groups.entry(key.clone()).or_insert_with(|| {
             key_order.push(key.clone());
             let init: Vec<AggState> = (0..agg_specs.len()).map(|_| AggState::default()).collect();
@@ -189,7 +251,16 @@ pub fn run(
                 None => Value::Bool(true), // count_star: sentinel non-null
                 Some(e) => eval::eval_expr(e, row, &ctx)?,
             };
-            update_state(&mut entry.1[i], &spec.name, &arg_val)?;
+            // v7.17.0 — `string_agg(value, separator)` evaluates the
+            // separator per row but PG treats it as constant; we
+            // pass the per-row value into update_state so a future
+            // varying-separator caller still sees correct output,
+            // even though SPG (like PG) only uses the most recent.
+            let arg2_val = match &spec.arg2 {
+                None => None,
+                Some(e) => Some(eval::eval_expr(e, row, &ctx)?),
+            };
+            update_state(&mut entry.1[i], &spec.name, &arg_val, arg2_val.as_ref())?;
         }
     }
 
@@ -322,6 +393,61 @@ pub fn run(
     })
 }
 
+/// v7.17.0 — walk the statement again to validate the positional
+/// arity of every aggregate call site. Done after AST collection
+/// rather than inside `collect_aggregates` so the collector stays
+/// infallible; callers in `run()` can do a single early-error
+/// exit before any per-row work.
+fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<(), EvalError> {
+    fn walk(e: &Expr) -> Result<(), EvalError> {
+        if let Expr::FunctionCall { name, args } = e {
+            let lower = name.to_ascii_lowercase();
+            let expected: Option<usize> = match lower.as_str() {
+                "count_star" => Some(0),
+                "count" | "sum" | "avg" | "min" | "max" | "array_agg"
+                // v7.17.0 — boolean aggregates also take exactly
+                // one arg. `every` is an alias normalised inside
+                // collect_aggregates / rewrite_expr.
+                | "bool_and" | "bool_or" | "every" => Some(1),
+                "string_agg" => Some(2),
+                _ => None,
+            };
+            if let Some(want) = expected
+                && args.len() != want
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{lower}() takes {want} arg(s), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            for a in args {
+                walk(a)?;
+            }
+        } else if let Expr::Binary { lhs, rhs, .. } = e {
+            walk(lhs)?;
+            walk(rhs)?;
+        } else if let Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } = e
+        {
+            walk(expr)?;
+        }
+        Ok(())
+    }
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr)?;
+        }
+    }
+    for o in &stmt.order_by {
+        walk(&o.expr)?;
+    }
+    if let Some(h) = &stmt.having {
+        walk(h)?;
+    }
+    Ok(())
+}
+
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
         Expr::FunctionCall { name, args } => {
@@ -332,11 +458,31 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                 } else {
                     args.first().cloned()
                 };
-                let spec = AggSpec {
-                    name: lower,
-                    arg: arg.clone(),
+                // v7.17.0 — second positional arg for
+                // `string_agg(value, separator)`. Everything else
+                // ignores it.
+                let arg2 = if lower == "string_agg" {
+                    args.get(1).cloned()
+                } else {
+                    None
                 };
-                if !out.iter().any(|s| s.name == spec.name && s.arg == spec.arg) {
+                // v7.17.0 — `every` is the SQL-standard alias for
+                // `bool_and`; collapse at collection time so
+                // update_state / finalize need only one arm.
+                let canonical = if lower == "every" {
+                    "bool_and".to_string()
+                } else {
+                    lower
+                };
+                let spec = AggSpec {
+                    name: canonical,
+                    arg: arg.clone(),
+                    arg2: arg2.clone(),
+                };
+                if !out
+                    .iter()
+                    .any(|s| s.name == spec.name && s.arg == spec.arg && s.arg2 == spec.arg2)
+                {
                     out.push(spec);
                 }
                 // Don't recurse into the arg — nested aggregates are
@@ -402,7 +548,12 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     }
 }
 
-fn update_state(st: &mut AggState, name: &str, v: &Value) -> Result<(), EvalError> {
+fn update_state(
+    st: &mut AggState,
+    name: &str,
+    v: &Value,
+    arg2: Option<&Value>,
+) -> Result<(), EvalError> {
     let is_null = matches!(v, Value::Null);
     match name {
         "count_star" => st.count += 1,
@@ -456,6 +607,82 @@ fn update_state(st: &mut AggState, name: &str, v: &Value) -> Result<(), EvalErro
                 }
             }
         }
+        // v7.17.0 — string_agg(value, separator). NULL value is
+        // skipped (PG aggregate-skip-null). Separator captured
+        // from the latest row that flows through; matches PG's
+        // semantics of evaluating the separator per row but using
+        // the last value at finalize time (in practice it's
+        // constant). count is bumped so we can distinguish "empty
+        // group → NULL" from "all-NULL group → NULL".
+        "string_agg" => {
+            if let Some(sep) = arg2
+                && let Value::Text(s) = sep
+            {
+                st.separator = Some(s.clone());
+            }
+            if is_null {
+                return Ok(());
+            }
+            if let Value::Text(s) = v {
+                st.items.push(Value::Text(s.clone()));
+                st.count += 1;
+            } else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "string_agg requires text value, got {:?}",
+                        v.data_type()
+                    ),
+                });
+            }
+        }
+        // v7.17.0 — array_agg(value). Unlike string_agg, NULL
+        // elements are KEPT in the array (PG behaviour); the
+        // result is NULL only when ZERO rows fed in. Element type
+        // is locked from the first row's value type; subsequent
+        // rows must match (PG also rejects mixed-type array_agg).
+        "array_agg" => {
+            st.items.push(v.clone());
+            st.count += 1;
+        }
+        // v7.17.0 — bool_and(p): TRUE iff every non-NULL input is
+        // TRUE. NULL skipped; running accumulator stays at TRUE
+        // until the first non-NULL FALSE.
+        "bool_and" => {
+            if is_null {
+                return Ok(());
+            }
+            let b = match v {
+                Value::Bool(b) => *b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "bool_and requires bool, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            st.bool_acc = Some(st.bool_acc.map_or(b, |acc| acc && b));
+        }
+        // v7.17.0 — bool_or(p): TRUE iff any non-NULL input is
+        // TRUE. NULL skipped.
+        "bool_or" => {
+            if is_null {
+                return Ok(());
+            }
+            let b = match v {
+                Value::Bool(b) => *b,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "bool_or requires bool, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            st.bool_acc = Some(st.bool_acc.map_or(b, |acc| acc || b));
+        }
         _ => unreachable!("non-aggregate {name} in update_state"),
     }
     Ok(())
@@ -487,6 +714,78 @@ fn finalize(name: &str, st: &AggState) -> Value {
             }
         }
         "min" | "max" => st.extreme.clone().unwrap_or(Value::Null),
+        // v7.17.0 — string_agg: join all collected text items with
+        // the captured separator. Empty / all-NULL group → NULL
+        // (PG semantics).
+        "string_agg" => {
+            if st.items.is_empty() {
+                return Value::Null;
+            }
+            let sep = st.separator.clone().unwrap_or_default();
+            let mut out = String::new();
+            for (i, item) in st.items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(&sep);
+                }
+                if let Value::Text(s) = item {
+                    out.push_str(s);
+                }
+            }
+            Value::Text(out)
+        }
+        // v7.17.0 — array_agg: collect into a typed array. NULL
+        // elements are preserved per PG. Result type is decided
+        // by the first non-NULL element seen (or Text fallback
+        // when the whole group is NULL — PG would surface the
+        // declared input type, but SPG hasn't yet wired the
+        // aggregate's static input-type from `describe`).
+        "array_agg" => {
+            if st.items.is_empty() {
+                return Value::Null;
+            }
+            let probe = st.items.iter().find(|v| !v.is_null());
+            match probe.and_then(spg_storage::Value::data_type) {
+                Some(DataType::Int) | Some(DataType::SmallInt) => {
+                    let items: Vec<Option<i32>> = st
+                        .items
+                        .iter()
+                        .map(|v| match v {
+                            Value::Int(n) => Some(*n),
+                            Value::SmallInt(n) => Some(i32::from(*n)),
+                            _ => None,
+                        })
+                        .collect();
+                    Value::IntArray(items)
+                }
+                Some(DataType::BigInt) => {
+                    let items: Vec<Option<i64>> = st
+                        .items
+                        .iter()
+                        .map(|v| match v {
+                            Value::BigInt(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect();
+                    Value::BigIntArray(items)
+                }
+                _ => {
+                    let items: Vec<Option<String>> = st
+                        .items
+                        .iter()
+                        .map(|v| match v {
+                            Value::Text(s) => Some(s.clone()),
+                            Value::Null => None,
+                            other => Some(format!("{other:?}")),
+                        })
+                        .collect();
+                    Value::TextArray(items)
+                }
+            }
+        }
+        // v7.17.0 — bool_and / bool_or finalize: lazy-init pattern
+        // means `None` is exactly "empty group or all-NULL", which
+        // PG surfaces as SQL NULL.
+        "bool_and" | "bool_or" => st.bool_acc.map_or(Value::Null, Value::Bool),
         _ => unreachable!(),
     }
 }
@@ -498,6 +797,18 @@ fn infer_agg_type(spec: &AggSpec) -> DataType {
         // nullable so the wire layer surfaces the Float at runtime).
         "count" | "count_star" | "sum" => DataType::BigInt,
         "avg" => DataType::Float,
+        // v7.17.0 — string_agg always returns TEXT.
+        "string_agg" => DataType::Text,
+        // v7.17.0 — array_agg's declared output type can't be
+        // known without inspecting the argument's expression
+        // shape. Default to TextArray; finalize widens to
+        // IntArray / BigIntArray when the actual elements are
+        // numeric. Downstream column metadata reports TextArray
+        // which is the lowest common denominator.
+        "array_agg" => DataType::TextArray,
+        // v7.17.0 — boolean aggregates always return BOOL (nullable
+        // — empty / all-NULL group → NULL).
+        "bool_and" | "bool_or" => DataType::Bool,
         // min/max: we don't know the input type without probing — default
         // to Text and let downstream rendering coerce.
         _ => DataType::Text,
@@ -525,8 +836,23 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             } else {
                 args.first().cloned()
             };
+            // v7.17.0 — match the spec we registered for
+            // string_agg(value, separator) on the full pair.
+            let arg2 = if lower == "string_agg" {
+                args.get(1).cloned()
+            } else {
+                None
+            };
+            // v7.17.0 — `every` collapses into `bool_and` at
+            // collection; mirror that here so the rewrite finds
+            // the matching synth column.
+            let canonical: &str = if lower == "every" {
+                "bool_and"
+            } else {
+                lower.as_str()
+            };
             for (i, spec) in aggs.iter().enumerate() {
-                if spec.name == lower && spec.arg == arg {
+                if spec.name == canonical && spec.arg == arg && spec.arg2 == arg2 {
                     return Expr::Column(spg_sql::ast::ColumnName {
                         qualifier: None,
                         name: format!("__agg_{i}"),

@@ -68,6 +68,21 @@ pub enum Token {
     LtEq,
     Gt,
     GtEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contained-in
+    /// `<<`. LHS is strictly inside RHS (no equality).
+    InetContainedBy,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contained-in-or-equal
+    /// `<<=`. LHS network ⊆ RHS network.
+    InetContainedByEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR strict contains `>>`.
+    /// LHS strictly contains RHS.
+    InetContains,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR contains-or-equal `>>=`.
+    /// LHS network ⊇ RHS network.
+    InetContainsEq,
+    /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR network overlap `&&`.
+    /// Either side contains any address of the other.
+    InetOverlap,
 
     // Punctuation
     LParen,
@@ -77,6 +92,15 @@ pub enum Token {
     Comma,
     Semicolon,
     Dot,
+    /// v7.17.0 Phase 2.6 — standalone `@` punctuation. Emitted when
+    /// `@` is NOT followed by an ident-start byte (i.e. the
+    /// `@VAR` / `@@VAR` SessionVar path doesn't match). Lets the
+    /// parser stitch the MySQL `'user'@'host'` DEFINER form back
+    /// together as String + At + String. Pre-2.6 this same shape
+    /// surfaced as a `LexErrorKind::UnknownChar('@')` and broke
+    /// every mysqldump CREATE VIEW with a DEFINER clause at lex
+    /// time.
+    At,
     /// pgvector L2 distance operator `<->`. Lexed as one token so the
     /// parser can give it its own precedence rung.
     /// v4.14 `->` — JSON object/array element access, returns json.
@@ -383,10 +407,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                         end += 1;
                     }
                     if end == prefix_end {
-                        return Err(LexError {
-                            kind: LexErrorKind::UnknownChar('@'),
-                            pos: i,
-                        });
+                        // v7.17.0 Phase 2.6 — `@` not followed by an
+                        // ident-shaped tail. mysqldump's DEFINER
+                        // form `'user'@'host'` lands here (next
+                        // byte is `'`). Emit as Token::At so the
+                        // parser can stitch the surrounding String
+                        // tokens. Single `@@` already short-circuits
+                        // to Token::TsMatch above, so this only
+                        // fires for a true lone `@`.
+                        out.push(Token::At);
+                        i = prefix_end;
+                        continue;
                     }
                     out.push(Token::SessionVar(input[i..end].to_string()));
                     i = end;
@@ -412,6 +443,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 } else if peek_eq(bytes, i + 1, b'-') && peek_eq(bytes, i + 2, b'>') {
                     out.push(Token::L2Distance);
                     i += 3;
+                } else if peek_eq(bytes, i + 1, b'<') && peek_eq(bytes, i + 2, b'=') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `<<=` contained-or-equal.
+                    out.push(Token::InetContainedByEq);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'<') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `<<` strict contained.
+                    out.push(Token::InetContainedBy);
+                    i += 2;
                 } else if peek_eq(bytes, i + 1, b'=') {
                     out.push(Token::LtEq);
                     i += 2;
@@ -444,13 +483,26 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 i += 2;
             }
             b'>' => {
-                if peek_eq(bytes, i + 1, b'=') {
+                if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `>>=` contains-or-equal.
+                    out.push(Token::InetContainsEq);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'>') {
+                    // v7.17.0 Phase 3.P0-47 — PG INET `>>` strict contains.
+                    out.push(Token::InetContains);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'=') {
                     out.push(Token::GtEq);
                     i += 2;
                 } else {
                     out.push(Token::Gt);
                     i += 1;
                 }
+            }
+            b'&' if peek_eq(bytes, i + 1, b'&') => {
+                // v7.17.0 Phase 3.P0-47 — PG INET network overlap `&&`.
+                out.push(Token::InetOverlap);
+                i += 2;
             }
             b'!' if peek_eq(bytes, i + 1, b'=') => {
                 out.push(Token::NotEq);
@@ -1116,8 +1168,28 @@ mod tests {
 
     #[test]
     fn unknown_char_errors() {
-        let err = tokenize("@").unwrap_err();
-        assert!(matches!(err.kind, LexErrorKind::UnknownChar('@')));
+        // v7.17.0 Phase 2.6 — `@` standalone now lexes as
+        // Token::At (mysqldump `'user'@'host'` DEFINER stitching).
+        // Use `?` for the unknown-char regression; PG `?` operator
+        // family is parsed as JSON ops in the prefix `?` shape
+        // would land in lex paths; bare `?` is unknown.
+        let err = tokenize("\x07").unwrap_err();
+        assert!(matches!(err.kind, LexErrorKind::UnknownChar(_)));
+    }
+
+    #[test]
+    fn at_alone_lexes_as_punctuation() {
+        // v7.17.0 Phase 2.6 — the `'user'@'host'` MySQL DEFINER
+        // form needs `@` to lex as a standalone token.
+        assert_eq!(
+            lex("'u'@'h'"),
+            vec![
+                Token::String("u".into()),
+                Token::At,
+                Token::String("h".into()),
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]

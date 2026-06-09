@@ -18,14 +18,15 @@ use core::fmt;
 use core::mem;
 
 use crate::ast::{
-    AssignTarget, BinOp, CastTarget, ColumnDef, ColumnName, ColumnTypeName,
+    AssignTarget, BinOp, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameKind, FromClause, FromJoin, FunctionArg,
     FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
     JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
-    PublicationScope, RaiseLevel, ReturnTarget, SelectItem, SelectStatement, Statement, TableRef,
-    TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
+    PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
+    Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind,
+    VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -57,6 +58,15 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // PG-wire sees them as raw text.
             | "\\restrict"
             | "\\unrestrict"
+            // v7.17.0 Phase 4.1 — MySQL `DELIMITER //` and
+            // `DELIMITER ;` directives. Technically client-side
+            // (the `mysql` CLI uses them to set the statement
+            // terminator), not SQL — but mysqldump and stored-
+            // procedure scripts emit them inline. SPG's parser
+            // sees one statement at a time and doesn't care
+            // about the terminator, so consume DELIMITER lines
+            // as Empty.
+            | "delimiter"
     )
 }
 
@@ -405,6 +415,13 @@ impl Parser {
                 // USERS / COLUMNS remain bare idents.
                 let target = match self.advance() {
                     Token::Tables => "tables".to_string(),
+                    // v7.17.0 Phase 3.P0-59 — CREATE is a reserved
+                    // keyword token; recognise it as the SHOW CREATE
+                    // dispatch keyword too.
+                    Token::Create => "create".to_string(),
+                    // v7.17.0 Phase 3.P0-60 — INDEX is a reserved
+                    // keyword too; let SHOW INDEX FROM parse.
+                    Token::Index => "index".to_string(),
                     Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
                     other => {
                         return Err(self.err(format!(
@@ -415,6 +432,60 @@ impl Parser {
                 match target.as_str() {
                     "tables" => Ok(Statement::ShowTables),
                     "users" => Ok(Statement::ShowUsers),
+                    // v7.17.0 Phase 3.P0-59 — MySQL `SHOW CREATE
+                    // TABLE <t>` returns a 2-column row: (Table,
+                    // Create Table). mysqldump emits this for every
+                    // table at scrape time; without it the dump
+                    // round-trip stalls.
+                    // v7.17.0 Phase 3.P0-60 — MySQL `SHOW INDEXES
+                    // FROM <t>` (also spelled `SHOW INDEX` and
+                    // `SHOW KEYS`). admin / mysqldump probes use
+                    // it to list per-table indexes.
+                    "indexes" | "index" | "keys" => {
+                        if !matches!(self.peek(), Token::From) {
+                            return Err(self.err(format!(
+                                "expected FROM after SHOW INDEXES, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let table = self.expect_ident_like()?;
+                        Ok(Statement::ShowIndexes(table))
+                    }
+                    // v7.17.0 Phase 3.P0-61 — MySQL `SHOW STATUS` /
+                    // `SHOW VARIABLES`. Both return a 2-column row
+                    // set listing server-side state; clients probe
+                    // them at connect time.
+                    "status" => Ok(Statement::ShowStatus),
+                    "variables" => Ok(Statement::ShowVariables),
+                    // v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
+                    "processlist" => Ok(Statement::ShowProcesslist),
+                    "create" => {
+                        // SHOW CREATE TABLE / VIEW / DATABASE — only
+                        // TABLE is supported in v7.17.
+                        let kind = match self.advance() {
+                            Token::Ident(s) | Token::QuotedIdent(s) => s,
+                            Token::Table => "table".to_string(),
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected TABLE after SHOW CREATE, got {other:?}"
+                                )));
+                            }
+                        };
+                        if !kind.eq_ignore_ascii_case("table") {
+                            return Err(self.err(format!(
+                                "unsupported SHOW CREATE {kind:?}; v7.17 supports TABLE only"
+                            )));
+                        }
+                        let name = self.expect_ident_like()?;
+                        Ok(Statement::ShowCreateTable(name))
+                    }
+                    // v7.17.0 Phase 3.P0-58 — MySQL `SHOW DATABASES`
+                    // (and `SHOW SCHEMAS` alias). The mysql client uses
+                    // it to populate the database selector at connect
+                    // time; without it `mysql -p` errors before the
+                    // first user query.
+                    "databases" | "schemas" => Ok(Statement::ShowDatabases),
                     // v6.1.3 — PUBLICATIONS plural is NOT a reserved
                     // keyword on its own; it lands here as a bare
                     // ident. Returning all publications + their
@@ -557,12 +628,17 @@ impl Parser {
                     }
                     // v7.14.0 — DROP SCHEMA [IF EXISTS] name
                     // [CASCADE|RESTRICT]. SPG is single-database;
-                    // schemas are accepted as no-ops (any name
-                    // resolves to the single catalog).
+                    // v7.17.0 Phase 1.6 — DROP SCHEMA [IF EXISTS]
+                    // name [, name…] [CASCADE | RESTRICT]. Real
+                    // unregister (was silent no-op pre-v7.17).
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("schema") => {
                         self.advance();
-                        let _ = self.consume_if_exists();
-                        let _ = self.expect_ident_like()?;
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
                         if matches!(
                             self.peek(),
                             Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
@@ -570,17 +646,109 @@ impl Parser {
                         ) {
                             self.advance();
                         }
-                        Ok(Statement::Empty)
+                        Ok(Statement::DropSchema { names, if_exists })
                     }
-                    // v7.14.0 — DROP SEQUENCE [IF EXISTS] name
-                    // [CASCADE|RESTRICT]. SPG has no separate
-                    // sequence object — SERIAL/BIGSERIAL is column-
-                    // local AUTO_INCREMENT — so DROP SEQUENCE
-                    // resolves as a no-op.
+                    // v7.17.0 Phase 1.4 — DROP TYPE [IF EXISTS]
+                    // name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("type") =>
+                    {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropType { names, if_exists })
+                    }
+                    // v7.17.0 Phase 1.5 — DROP DOMAIN [IF EXISTS]
+                    // name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("domain") =>
+                    {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropDomain { names, if_exists })
+                    }
+                    // v7.17.0 Phase 1.3 — DROP MATERIALIZED VIEW
+                    // [IF EXISTS] name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("materialized") =>
+                    {
+                        self.advance();
+                        let nxt = self.peek().clone();
+                        if !matches!(&nxt, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                        {
+                            return Err(self.err(alloc::format!(
+                                "expected VIEW after DROP MATERIALIZED, got {nxt:?}"
+                            )));
+                        }
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropMaterializedView { names, if_exists })
+                    }
+                    // v7.17.0 Phase 1.2 — DROP VIEW [IF EXISTS]
+                    // name [, name…] [CASCADE|RESTRICT].
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("view") => {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict")
+                        ) {
+                            self.advance();
+                        }
+                        Ok(Statement::DropView { names, if_exists })
+                    }
+                    // v7.17.0 — DROP SEQUENCE [IF EXISTS] name [,name…]
+                    // [CASCADE|RESTRICT]. Real removal from catalog
+                    // (was a silent no-op pre-v7.17).
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
                         self.advance();
-                        let _ = self.consume_if_exists();
-                        let _ = self.expect_ident_like()?;
+                        let if_exists = self.consume_if_exists();
+                        let mut names = vec![self.expect_ident_like()?];
+                        while matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            names.push(self.expect_ident_like()?);
+                        }
                         if matches!(
                             self.peek(),
                             Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
@@ -588,13 +756,36 @@ impl Parser {
                         ) {
                             self.advance();
                         }
-                        Ok(Statement::Empty)
+                        Ok(Statement::DropSequence { names, if_exists })
                     }
                     other => Err(self.err(format!(
                         "expected TABLE / INDEX / SCHEMA / SEQUENCE / USER / PUBLICATION / \
                          SUBSCRIPTION / TRIGGER / FUNCTION after DROP, got {other:?}"
                     ))),
                 }
+            }
+            // v7.17.0 Phase 1.3 — REFRESH MATERIALIZED VIEW name [WITH [NO] DATA].
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("refresh") => {
+                self.advance();
+                let nxt = self.peek().clone();
+                if !matches!(&nxt, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("materialized"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected MATERIALIZED after REFRESH, got {nxt:?}"
+                    )));
+                }
+                self.advance();
+                let nxt2 = self.peek().clone();
+                if !matches!(&nxt2, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected VIEW after REFRESH MATERIALIZED, got {nxt2:?}"
+                    )));
+                }
+                self.advance();
+                let name = self.expect_ident_like()?;
+                let with_data = self.parse_optional_with_data(true)?;
+                Ok(Statement::RefreshMaterializedView { name, with_data })
             }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
                 self.advance();
@@ -660,6 +851,16 @@ impl Parser {
                 }
                 self.advance();
                 Ok(Statement::CompactColdSegments)
+            }
+            // v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ MERGE.
+            // Parsed as a case-insensitive identifier since MERGE
+            // isn't a reserved lexer keyword (collides with the
+            // mysqldump `ALGORITHM = MERGE` view clause if it
+            // were); the inner parser drives the rest of the
+            // surface (USING / ON / WHEN [NOT] MATCHED / THEN).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("merge") => {
+                self.advance();
+                self.parse_merge_after_keyword()
             }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("analyze") => {
                 self.advance();
@@ -907,21 +1108,140 @@ impl Parser {
                 self.advance();
                 self.parse_create_trigger_after_keyword(false)
             }
+            // v7.17.0 — CREATE [TEMPORARY] SEQUENCE …
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
+                self.advance();
+                self.parse_create_sequence_after_keyword(false)
+            }
+            // v7.17.0 Phase 1.2 — CREATE [TEMPORARY] VIEW …
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("view") => {
+                self.advance();
+                self.parse_create_view_after_keyword(false, false, false)
+            }
+            // v7.17.0 Phase 2.6 — MySQL view prefix clauses
+            // `ALGORITHM = {UNDEFINED|MERGE|TEMPTABLE}` /
+            // `DEFINER = <user>` / `SQL SECURITY {DEFINER|INVOKER}`
+            // appear (in any order) between `CREATE` and `VIEW` in
+            // every mysqldump-emitted view. Pre-2.6 the parser
+            // rejected the prefix and the customer's whole view
+            // backup failed on the first view. The hints are pure
+            // planner / permission metadata; SPG's view-rewrite
+            // path is semantically equivalent for all three
+            // algorithms in v7.17 (TEMPTABLE differs only in
+            // perf for huge views — out of v7.17 scope), and
+            // DEFINER / SQL SECURITY are pure single-user
+            // permissioning that SPG ignores by design.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("algorithm")
+                    || s.eq_ignore_ascii_case("definer")
+                    || s.eq_ignore_ascii_case("sql") =>
+            {
+                self.consume_mysql_view_prefix()?;
+                // After absorbing ALGORITHM / DEFINER / SQL SECURITY
+                // (in any order, in any combination), the next
+                // keyword must be VIEW. mysqldump never emits these
+                // prefixes on non-view statements.
+                let next = self.peek().clone();
+                if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2)
+                    if s2.eq_ignore_ascii_case("view"))
+                {
+                    self.advance();
+                    self.parse_create_view_after_keyword(false, false, false)
+                } else {
+                    Err(self.err(alloc::format!(
+                        "expected VIEW after MySQL view prefix (ALGORITHM/DEFINER/SQL SECURITY), got {next:?}"
+                    )))
+                }
+            }
+            // v7.17.0 Phase 1.4 — CREATE TYPE name AS ENUM (…).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("type") => {
+                self.advance();
+                self.parse_create_type_after_keyword()
+            }
+            // v7.17.0 Phase 1.5 — CREATE DOMAIN name AS base
+            // [DEFAULT expr] [NOT NULL] [CHECK (expr)]*.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("domain") => {
+                self.advance();
+                self.parse_create_domain_after_keyword()
+            }
+            // v7.17.0 Phase 1.6 — CREATE SCHEMA [IF NOT EXISTS]
+            // name [AUTHORIZATION user]. Real catalog registry
+            // (was silent-no-op'd pre-v7.17).
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("schema") => {
+                self.advance();
+                let if_not_exists = self.parse_if_not_exists();
+                let name = self.expect_ident_like()?;
+                // Optional `AUTHORIZATION <user>` trailer — accepted,
+                // ignored (single-user catalog).
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("authorization"))
+                {
+                    self.advance();
+                    let _ = self.expect_ident_like()?;
+                }
+                Ok(Statement::CreateSchema { name, if_not_exists })
+            }
+            // v7.17.0 Phase 1.3 — CREATE MATERIALIZED VIEW …
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("materialized") => {
+                self.advance();
+                let next = self.peek().clone();
+                if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                {
+                    self.advance();
+                    self.parse_create_materialized_view_after_keyword()
+                } else {
+                    Err(self.err(alloc::format!(
+                        "expected VIEW after CREATE MATERIALIZED, got {next:?}"
+                    )))
+                }
+            }
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") =>
+            {
+                self.advance();
+                // TEMPORARY/TEMP followed by SEQUENCE / VIEW.
+                let next = self.peek().clone();
+                if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("sequence"))
+                {
+                    self.advance();
+                    self.parse_create_sequence_after_keyword(true)
+                } else if matches!(&next, Token::Ident(s2) | Token::QuotedIdent(s2) if s2.eq_ignore_ascii_case("view"))
+                {
+                    self.advance();
+                    self.parse_create_view_after_keyword(false, false, true)
+                } else {
+                    // TEMP TABLE etc — consume to boundary as noop for now.
+                    self.consume_until_statement_boundary();
+                    Ok(Statement::Empty)
+                }
+            }
+            // v7.17.0 Phase 4.2 — MySQL `CREATE PROCEDURE name (…)
+            // BEGIN <body> END`. The body may reference `@var`
+            // session variables, SET statements, internal `;`
+            // terminators, etc. SPG has no procedure runtime, so
+            // consume the whole `CREATE PROCEDURE … END` block as
+            // a no-op so mysqldump scripts that include stored
+            // routines load through. The matching-END consumer
+            // tracks BEGIN/END nesting depth to handle nested
+            // BEGIN blocks correctly.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("procedure") => {
+                self.consume_mysql_routine_body();
+                Ok(Statement::Empty)
+            }
             // v7.14.0 — pg_dump / mysqldump emit
-            // `CREATE SEQUENCE / SCHEMA / VIEW / MATERIALIZED VIEW
-            // / TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
+            // `CREATE SCHEMA / VIEW / MATERIALIZED VIEW /
+            // TYPE / DOMAIN / DATABASE / ROLE / POLICY / OPERATOR`.
             // SPG is single-schema / single-database; these have
             // no behavioural effect, so consume + return Empty.
+            // v7.17.0 NOTE: SEQUENCE / VIEW / MATERIALIZED VIEW /
+            // TYPE / DOMAIN / SCHEMA were here pre-v7.17; all
+            // moved up to real parser branches. DATABASE / ROLE /
+            // POLICY / OPERATOR stay no-op forever
+            // (single-database, hardcoded roles).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
-                    "sequence"
-                        | "schema"
-                        | "view"
-                        | "materialized"
-                        | "type"
-                        | "domain"
-                        | "database"
+                    "database"
                         | "role"
                         | "policy"
                         | "operator"
@@ -931,6 +1251,16 @@ impl Parser {
                         | "language"
                         | "collation"
                         | "conversion"
+                        // v7.17.0 Phase 8 (audit N6) — rarely-
+                        // emitted pg_dump shapes that should
+                        // load through without a parser error.
+                        // SPG has no planner statistics catalog,
+                        // no event-trigger hooks, no foreign-
+                        // data-wrapper infrastructure; consume
+                        // + return Empty.
+                        | "statistics"
+                        | "event"
+                        | "foreign"
                 ) =>
             {
                 self.consume_until_statement_boundary();
@@ -953,7 +1283,7 @@ impl Parser {
         let tok = self.peek();
         let (Token::Ident(s) | Token::QuotedIdent(s)) = tok else {
             return Err(self.err(alloc::format!(
-                "expected FUNCTION / TRIGGER after CREATE OR REPLACE, got {tok:?}"
+                "expected FUNCTION / TRIGGER / VIEW after CREATE OR REPLACE, got {tok:?}"
             )));
         };
         if s.eq_ignore_ascii_case("function") {
@@ -962,9 +1292,26 @@ impl Parser {
         } else if s.eq_ignore_ascii_case("trigger") {
             self.advance();
             self.parse_create_trigger_after_keyword(or_replace)
+        } else if s.eq_ignore_ascii_case("view") {
+            // v7.17.0 Phase 1.2 — CREATE OR REPLACE VIEW name AS SELECT …
+            self.advance();
+            self.parse_create_view_after_keyword(or_replace, false, false)
+        } else if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") {
+            // CREATE OR REPLACE TEMPORARY VIEW … (rare but legal).
+            self.advance();
+            let nxt = self.peek().clone();
+            if matches!(&nxt, Token::Ident(n) | Token::QuotedIdent(n) if n.eq_ignore_ascii_case("view"))
+            {
+                self.advance();
+                self.parse_create_view_after_keyword(or_replace, false, true)
+            } else {
+                Err(self.err(alloc::format!(
+                    "expected VIEW after CREATE OR REPLACE TEMPORARY, got {nxt:?}"
+                )))
+            }
         } else {
             Err(self.err(alloc::format!(
-                "expected FUNCTION / TRIGGER after CREATE OR REPLACE, got {s:?}"
+                "expected FUNCTION / TRIGGER / VIEW after CREATE OR REPLACE, got {s:?}"
             )))
         }
     }
@@ -1199,6 +1546,805 @@ impl Parser {
             }
             _ => Ok(None),
         }
+    }
+
+    /// v7.17.0 Phase 1.5 — body of `CREATE DOMAIN name AS
+    /// base_type [DEFAULT expr] [NOT NULL | NULL] [CHECK
+    /// (expr)]*`. The `DOMAIN` keyword has already been
+    /// consumed. PG allows the trailing constraints in any
+    /// order; we approximate with a small loop.
+    fn parse_create_domain_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        // Optional `AS`.
+        if matches!(self.peek(), Token::As) {
+            self.advance();
+        }
+        let base_type = self.parse_column_type_name()?;
+        let mut default: Option<Expr> = None;
+        let mut not_null = false;
+        let mut checks: Vec<Expr> = Vec::new();
+        loop {
+            match self.peek() {
+                Token::Default => {
+                    if default.is_some() {
+                        return Err(self.err("DOMAIN DEFAULT specified twice".into()));
+                    }
+                    self.advance();
+                    default = Some(self.parse_expr(0)?);
+                }
+                Token::Not => {
+                    self.advance();
+                    if !matches!(self.peek(), Token::Null) {
+                        return Err(self.err(alloc::format!(
+                            "expected NULL after NOT in DOMAIN, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    not_null = true;
+                }
+                Token::Null => {
+                    self.advance();
+                    // NULL after a NOT NULL is contradictory, but
+                    // PG accepts bare NULL as the default-nullable
+                    // marker. No-op.
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("check") => {
+                    self.advance();
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected '(' after CHECK in DOMAIN, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let expr = self.parse_expr(0)?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected ')' after CHECK expr, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    checks.push(expr);
+                }
+                // CONSTRAINT <name> CHECK (…) — PG accepts a name
+                // prefix on the constraint; we drop the name and
+                // recurse into the constraint parsing.
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("constraint") => {
+                    self.advance();
+                    let _ = self.expect_ident_like()?;
+                }
+                _ => break,
+            }
+        }
+        Ok(Statement::CreateDomain(crate::ast::CreateDomainStatement {
+            name,
+            base_type,
+            default,
+            not_null,
+            checks,
+        }))
+    }
+
+    /// v7.17.0 Phase 1.4 — body of `CREATE TYPE name AS ENUM
+    /// ('a', 'b', …)`. The `TYPE` keyword has already been
+    /// consumed.
+    fn parse_create_type_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        // Required `AS`.
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS after CREATE TYPE {name:?}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Required `ENUM` ident.
+        let kind_ident = match self.peek().clone() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s,
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected ENUM after CREATE TYPE {name:?} AS, got {other:?}"
+                )));
+            }
+        };
+        if !kind_ident.eq_ignore_ascii_case("enum") {
+            return Err(self.err(alloc::format!(
+                "Phase 1.4 only supports ENUM; got {kind_ident:?}"
+            )));
+        }
+        self.advance();
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after ENUM, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut labels: Vec<String> = Vec::new();
+        loop {
+            match self.peek().clone() {
+                Token::String(s) => {
+                    self.advance();
+                    labels.push(s);
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected enum label string, got {other:?}"
+                    )));
+                }
+            }
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            if matches!(self.peek(), Token::RParen) {
+                self.advance();
+                break;
+            }
+            return Err(self.err(alloc::format!(
+                "expected , or ) in ENUM label list, got {:?}",
+                self.peek()
+            )));
+        }
+        if labels.is_empty() {
+            return Err(self.err(
+                "CREATE TYPE … AS ENUM must declare at least one label".into(),
+            ));
+        }
+        Ok(Statement::CreateType(crate::ast::CreateTypeStatement {
+            name,
+            kind: crate::ast::TypeKind::Enum { labels },
+        }))
+    }
+
+    /// v7.17.0 Phase 1.3 — body of `CREATE MATERIALIZED VIEW
+    /// [IF NOT EXISTS] name [(col, …)] AS <SELECT …> [WITH [NO] DATA]`.
+    /// The `CREATE MATERIALIZED VIEW` keywords have already been
+    /// consumed.
+    fn parse_create_materialized_view_after_keyword(
+        &mut self,
+    ) -> Result<Statement, ParseError> {
+        let if_not_exists = self.parse_if_not_exists();
+        let name = self.expect_ident_like()?;
+        let mut columns: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                let c = self.expect_ident_like()?;
+                columns.push(c);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                return Err(self.err(alloc::format!(
+                    "expected , or ) in MATERIALIZED VIEW column list, got {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS <SELECT …> after CREATE MATERIALIZED VIEW {name:?}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let body_stmt = self.parse_select_stmt()?;
+        let Statement::Select(body) = body_stmt else {
+            return Err(self.err(alloc::format!(
+                "CREATE MATERIALIZED VIEW body must be a SELECT, got {body_stmt:?}"
+            )));
+        };
+        // Optional trailing `WITH [NO] DATA`.
+        let with_data = self.parse_optional_with_data(true)?;
+        Ok(Statement::CreateMaterializedView(
+            crate::ast::CreateMaterializedViewStatement {
+                name,
+                if_not_exists,
+                columns,
+                body,
+                with_data,
+            },
+        ))
+    }
+
+    /// v7.17.0 Phase 1.3 — `WITH [NO] DATA` trailer.
+    /// `default_when_absent` is what to return if the tail is
+    /// missing (CREATE defaults to WITH DATA, REFRESH defaults to
+    /// WITH DATA).
+    fn parse_optional_with_data(
+        &mut self,
+        default_when_absent: bool,
+    ) -> Result<bool, ParseError> {
+        let save = self.pos;
+        // `WITH` is an Ident (not reserved in the lexer).
+        let is_with = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case("with"),
+            _ => false,
+        };
+        if !is_with {
+            return Ok(default_when_absent);
+        }
+        self.advance();
+        // Optional `NO`.
+        let mut with_data = true;
+        let is_no = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case("no"),
+            _ => false,
+        };
+        if is_no {
+            self.advance();
+            with_data = false;
+        }
+        // Required `DATA` ident.
+        let is_data = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case("data"),
+            _ => false,
+        };
+        if is_data {
+            self.advance();
+            Ok(with_data)
+        } else {
+            // Caller's WITH wasn't WITH-DATA — rewind so the outer
+            // parser can interpret it.
+            self.pos = save;
+            Ok(default_when_absent)
+        }
+    }
+
+    /// v7.17.0 Phase 1.2 — body of `CREATE [OR REPLACE]
+    /// [TEMPORARY] VIEW [IF NOT EXISTS] name [(col, …)] AS <SELECT>`.
+    /// All keyword prefixes have already been consumed; the flags
+    /// say which were present.
+    fn parse_create_view_after_keyword(
+        &mut self,
+        or_replace: bool,
+        _materialized_unused: bool,
+        temporary: bool,
+    ) -> Result<Statement, ParseError> {
+        let if_not_exists = self.parse_if_not_exists();
+        let name = self.expect_ident_like()?;
+        // Optional `(col, col, …)` rename list.
+        let mut columns: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                let c = self.expect_ident_like()?;
+                columns.push(c);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                return Err(self.err(alloc::format!(
+                    "expected , or ) in VIEW column list, got {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        // Required `AS`.
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS <SELECT …> after CREATE VIEW {name:?}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Body: a regular SELECT statement.
+        let body_stmt = self.parse_select_stmt()?;
+        let Statement::Select(body) = body_stmt else {
+            return Err(self.err(alloc::format!(
+                "CREATE VIEW body must be a SELECT statement, got {body_stmt:?}"
+            )));
+        };
+        Ok(Statement::CreateView(crate::ast::CreateViewStatement {
+            name,
+            or_replace,
+            if_not_exists,
+            temporary,
+            columns,
+            body,
+        }))
+    }
+
+    /// v7.17.0 — body of `CREATE [TEMPORARY] SEQUENCE`. The
+    /// `[TEMPORARY]` and `SEQUENCE` tokens have already been
+    /// consumed; `temporary` carries whether TEMPORARY was seen.
+    fn parse_create_sequence_after_keyword(
+        &mut self,
+        temporary: bool,
+    ) -> Result<Statement, ParseError> {
+        let if_not_exists = self.parse_if_not_exists();
+        let name = self.expect_ident_like()?;
+        // Optional `AS data_type`.
+        let data_type = if matches!(self.peek(), Token::As) {
+            self.advance();
+            Some(self.parse_sequence_data_type()?)
+        } else {
+            None
+        };
+        let options = self.parse_sequence_options(/* allow_restart = */ false)?;
+        Ok(Statement::CreateSequence(crate::ast::CreateSequenceStatement {
+            name,
+            if_not_exists,
+            temporary,
+            data_type,
+            options,
+        }))
+    }
+
+    /// v7.17.0 — body of `ALTER SEQUENCE`. The `ALTER` keyword has
+    /// already been consumed; this is reached after `SEQUENCE`.
+    fn parse_alter_sequence_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        let if_exists = self.parse_if_exists();
+        let name = self.expect_ident_like()?;
+        let options = self.parse_sequence_options(/* allow_restart = */ true)?;
+        Ok(Statement::AlterSequence(crate::ast::AlterSequenceStatement {
+            name,
+            if_exists,
+            options,
+        }))
+    }
+
+    fn parse_sequence_data_type(&mut self) -> Result<crate::ast::SequenceDataType, ParseError> {
+        let kw = self.expect_ident_like()?;
+        match kw.to_ascii_lowercase().as_str() {
+            "smallint" | "int2" => Ok(crate::ast::SequenceDataType::SmallInt),
+            "integer" | "int" | "int4" => Ok(crate::ast::SequenceDataType::Int),
+            "bigint" | "int8" => Ok(crate::ast::SequenceDataType::BigInt),
+            other => Err(self.err(alloc::format!(
+                "expected SMALLINT / INTEGER / BIGINT after SEQUENCE AS, got {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_sequence_options(
+        &mut self,
+        allow_restart: bool,
+    ) -> Result<crate::ast::SequenceOptions, ParseError> {
+        use crate::ast::{SeqBound, SequenceOptions, SequenceOwnedBy};
+        let mut opts = SequenceOptions::default();
+        loop {
+            // Match an ident; stop at any non-ident token (sentinel,
+            // semicolon, end of statement).
+            let kw_lc = match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                _ => break,
+            };
+            match kw_lc.as_str() {
+                "increment" => {
+                    self.advance();
+                    // Optional BY.
+                    if matches!(self.peek(), Token::By) {
+                        self.advance();
+                    }
+                    opts.increment = Some(self.expect_signed_int()?);
+                }
+                "minvalue" => {
+                    self.advance();
+                    opts.min_value = Some(SeqBound::Value(self.expect_signed_int()?));
+                }
+                "maxvalue" => {
+                    self.advance();
+                    opts.max_value = Some(SeqBound::Value(self.expect_signed_int()?));
+                }
+                "no" => {
+                    self.advance();
+                    let what = self.expect_ident_like()?;
+                    match what.to_ascii_lowercase().as_str() {
+                        "minvalue" => opts.min_value = Some(SeqBound::NoBound),
+                        "maxvalue" => opts.max_value = Some(SeqBound::NoBound),
+                        "cycle" => opts.cycle = Some(false),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected MINVALUE / MAXVALUE / CYCLE after NO, got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                "start" => {
+                    self.advance();
+                    // Optional WITH.
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("with"))
+                    {
+                        self.advance();
+                    }
+                    opts.start = Some(self.expect_signed_int()?);
+                }
+                "restart" if allow_restart => {
+                    self.advance();
+                    // Optional WITH n; bare RESTART means restart at START.
+                    let mut with_val: Option<i64> = None;
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("with"))
+                    {
+                        self.advance();
+                        with_val = Some(self.expect_signed_int()?);
+                    } else if matches!(self.peek(), Token::Integer(_) | Token::Minus) {
+                        with_val = Some(self.expect_signed_int()?);
+                    }
+                    opts.restart = Some(with_val);
+                }
+                "cache" => {
+                    self.advance();
+                    opts.cache = Some(self.expect_signed_int()?);
+                }
+                "cycle" => {
+                    self.advance();
+                    opts.cycle = Some(true);
+                }
+                "owned" => {
+                    self.advance();
+                    // BY is a reserved Token::By; accept either form.
+                    match self.peek() {
+                        Token::By => {
+                            self.advance();
+                        }
+                        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("by") => {
+                            self.advance();
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected BY after OWNED, got {other:?}"
+                            )));
+                        }
+                    }
+                    // OWNED BY {NONE | tab.col}. Read just one ident
+                    // (NOT expect_ident_like which would auto-strip
+                    // a schema prefix and consume the `.col` we need).
+                    let first = match self.advance() {
+                        Token::Ident(s) | Token::QuotedIdent(s) => s,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected identifier or NONE after OWNED BY, got {other:?}"
+                            )));
+                        }
+                    };
+                    if first.eq_ignore_ascii_case("none") {
+                        opts.owned_by = Some(SequenceOwnedBy::None);
+                    } else if matches!(self.peek(), Token::Dot) {
+                        self.advance();
+                        let second = match self.advance() {
+                            Token::Ident(s) | Token::QuotedIdent(s) => s,
+                            other => {
+                                return Err(self.err(alloc::format!(
+                                    "expected column name after OWNED BY {first}., got {other:?}"
+                                )));
+                            }
+                        };
+                        // v7.17 dump-compat fix — pg_dump emits
+                        // OWNED BY clauses as
+                        // `schema.table.column` (three segments).
+                        // If a third `.<ident>` follows, treat the
+                        // first ident as schema (drop it; SPG is
+                        // single-schema) and the middle / last
+                        // pair as table.column. Otherwise it's
+                        // the two-segment form table.column.
+                        if matches!(self.peek(), Token::Dot) {
+                            self.advance();
+                            let third = match self.advance() {
+                                Token::Ident(s) | Token::QuotedIdent(s) => s,
+                                other => {
+                                    return Err(self.err(alloc::format!(
+                                        "expected column name after OWNED BY {first}.{second}., got {other:?}"
+                                    )));
+                                }
+                            };
+                            let _ = first; // schema prefix discarded
+                            opts.owned_by = Some(SequenceOwnedBy::Column {
+                                table: second,
+                                column: third,
+                            });
+                        } else {
+                            opts.owned_by = Some(SequenceOwnedBy::Column {
+                                table: first,
+                                column: second,
+                            });
+                        }
+                    } else {
+                        return Err(self.err(alloc::format!(
+                            "expected table.column or NONE after OWNED BY, got {first:?}"
+                        )));
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(opts)
+    }
+
+    fn expect_signed_int(&mut self) -> Result<i64, ParseError> {
+        let neg = if matches!(self.peek(), Token::Minus) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        match self.peek() {
+            Token::Integer(n) => {
+                let v = *n;
+                self.advance();
+                Ok(if neg { -v } else { v })
+            }
+            other => Err(self.err(alloc::format!(
+                "expected signed integer, got {other:?}"
+            ))),
+        }
+    }
+
+    /// v7.17.0 Phase 3.1 — absorb `[NOT] DEFERRABLE [INITIALLY
+    /// {DEFERRED | IMMEDIATE}]` constraint-timing clauses. Each
+    /// clause is fully accepted and discarded — SPG always runs
+    /// constraint checks immediately (single-writer model). The
+    /// loop allows DEFERRABLE and the INITIALLY suffix to appear
+    /// in either order (per the SQL spec they're independent),
+    /// though pg_dump always emits them in the canonical
+    /// `[NOT] DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE}` shape.
+    /// Stops at the first token that isn't part of the clause.
+    fn consume_optional_deferrable_clauses(&mut self) -> Result<(), ParseError> {
+        loop {
+            // Bare `DEFERRABLE` (Phase 3.1 — was hard-error pre-3.1).
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable")) {
+                self.advance();
+                self.consume_optional_initially_clause()?;
+                continue;
+            }
+            // `NOT DEFERRABLE` — already worked pre-3.1.
+            if matches!(self.peek(), Token::Not) {
+                let look = self.tokens.get(self.pos + 1);
+                if matches!(look, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")) {
+                    self.advance(); // NOT
+                    self.advance(); // DEFERRABLE
+                    self.consume_optional_initially_clause()?;
+                    continue;
+                }
+                break;
+            }
+            // Standalone `INITIALLY {DEFERRED|IMMEDIATE}` — PG
+            // accepts this without a leading [NOT] DEFERRABLE
+            // (the timing keyword alone). pg_dump occasionally
+            // emits it on FK constraints that inherit timing.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially")) {
+                self.consume_optional_initially_clause()?;
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    /// Helper for [`consume_optional_deferrable_clauses`]. When the
+    /// next token is `INITIALLY`, consume it plus the required
+    /// `DEFERRED` | `IMMEDIATE` trailer. No-op otherwise.
+    fn consume_optional_initially_clause(&mut self) -> Result<(), ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially")) {
+            return Ok(());
+        }
+        self.advance(); // INITIALLY
+        match self.advance() {
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("deferred") || s.eq_ignore_ascii_case("immediate") =>
+            {
+                Ok(())
+            }
+            other => Err(self.err(alloc::format!(
+                "expected DEFERRED or IMMEDIATE after INITIALLY, got {other:?}"
+            ))),
+        }
+    }
+
+    /// v7.17.0 Phase 4.2 — consume a MySQL `CREATE PROCEDURE` body
+    /// in its entirety so the parser returns Empty without
+    /// touching the runtime. The CREATE+PROCEDURE keywords are
+    /// already consumed; this swallows everything from the
+    /// procedure name through the matching `END`, including
+    /// nested `BEGIN`/`END` blocks, internal `;` terminators
+    /// (DELIMITER `//` makes the script splitter forward the
+    /// whole block as one statement), `@var` session-variable
+    /// references, and the trailing terminator.
+    ///
+    /// Tracks nesting depth so:
+    ///   BEGIN
+    ///     IF cond THEN
+    ///       BEGIN ... END;
+    ///     END IF;
+    ///   END
+    /// terminates at the outer END.
+    fn consume_mysql_routine_body(&mut self) {
+        // Outer skeleton: name, (...), optional clauses, BEGIN
+        // <body> END [;]. Scan for the first BEGIN — anything
+        // before it is signature decoration we don't care about.
+        // Once inside BEGIN, count up on BEGIN, down on END.
+        let mut depth: i32 = 0;
+        let mut started = false;
+        loop {
+            match self.peek().clone() {
+                Token::Begin => {
+                    self.advance();
+                    depth += 1;
+                    started = true;
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end") => {
+                    self.advance();
+                    if started {
+                        depth -= 1;
+                        if depth <= 0 {
+                            // Optional trailing ident (`END IF`,
+                            // `END LOOP`, `END WHILE`, `END CASE`,
+                            // `END label_name`) — eat the next
+                            // ident if present so we don't
+                            // mistake `END IF;` for the outer
+                            // close.
+                            if matches!(
+                                self.peek(),
+                                Token::Ident(_) | Token::QuotedIdent(_)
+                            ) {
+                                // If the next token is one of the
+                                // PL/SQL block-closer keywords,
+                                // the END belongs to an inner
+                                // block; bump depth back up.
+                                let is_inner_close = matches!(
+                                    self.peek(),
+                                    Token::Ident(s) | Token::QuotedIdent(s)
+                                        if matches!(
+                                            s.to_ascii_lowercase().as_str(),
+                                            "if" | "loop" | "while" | "case" | "repeat"
+                                        )
+                                );
+                                if is_inner_close {
+                                    self.advance();
+                                    depth += 1;
+                                    continue;
+                                }
+                            }
+                            // Eat optional trailing `;`.
+                            if matches!(self.peek(), Token::Semicolon) {
+                                self.advance();
+                            }
+                            return;
+                        }
+                    }
+                }
+                Token::Eof => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    /// v7.17.0 Phase 2.6 — absorb the MySQL view-prefix clauses
+    /// that appear between `CREATE` and `VIEW` in mysqldump output:
+    ///
+    /// * `ALGORITHM = {UNDEFINED|MERGE|TEMPTABLE}`
+    /// * `DEFINER = <user>`  (user may be a quoted string, a bare
+    ///   ident, or `ident @ ident-or-quoted-string` host form)
+    /// * `SQL SECURITY {DEFINER|INVOKER}`
+    ///
+    /// Each clause may appear at most once but in any order.
+    /// The hints are pure planner / permission metadata that
+    /// SPG's view-rewrite engine handles uniformly; we accept
+    /// and discard. Returns `Ok(())` once a non-clause token is
+    /// peeked (the caller then checks for the `VIEW` keyword).
+    fn consume_mysql_view_prefix(&mut self) -> Result<(), ParseError> {
+        loop {
+            match self.peek().clone() {
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("algorithm") =>
+                {
+                    self.advance(); // ALGORITHM
+                    // Optional `=`. MySQL spec requires it but be
+                    // generous.
+                    if matches!(self.peek(), Token::Eq) {
+                        self.advance();
+                    }
+                    // UNDEFINED / MERGE / TEMPTABLE — accept any
+                    // bare ident; unknown values still parse so
+                    // future MySQL versions don't break.
+                    if matches!(
+                        self.peek(),
+                        Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                    ) {
+                        self.advance();
+                    }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("definer") =>
+                {
+                    self.advance(); // DEFINER
+                    if matches!(self.peek(), Token::Eq) {
+                        self.advance();
+                    }
+                    // User: quoted string, ident, OR ident @ host
+                    // (host may itself be quoted or bare).
+                    match self.peek().clone() {
+                        Token::String(_) | Token::Ident(_) | Token::QuotedIdent(_) => {
+                            self.advance();
+                            // Optional `@host`.
+                            if matches!(self.peek(), Token::At) {
+                                self.advance();
+                                if matches!(
+                                    self.peek(),
+                                    Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
+                                ) {
+                                    self.advance();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sql") => {
+                    // `SQL SECURITY {DEFINER|INVOKER}`. Only honoured
+                    // when followed by SECURITY — the dispatcher must
+                    // not consume a bare `SQL` token (it's not a
+                    // legal CREATE prefix on its own).
+                    let save = self.pos;
+                    self.advance(); // SQL
+                    if matches!(self.peek(), Token::Ident(s2) | Token::QuotedIdent(s2)
+                        if s2.eq_ignore_ascii_case("security"))
+                    {
+                        self.advance(); // SECURITY
+                        // DEFINER / INVOKER trailing ident.
+                        if matches!(
+                            self.peek(),
+                            Token::Ident(_) | Token::QuotedIdent(_)
+                        ) {
+                            self.advance();
+                        }
+                    } else {
+                        // Not a SQL SECURITY clause — roll back and
+                        // bail; the caller will error out cleanly.
+                        self.pos = save;
+                        return Ok(());
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn parse_if_not_exists(&mut self) -> bool {
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("if"))
+        {
+            let save = self.pos;
+            self.advance();
+            if matches!(self.peek(), Token::Not) {
+                self.advance();
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exists"))
+                {
+                    self.advance();
+                    return true;
+                }
+            }
+            self.pos = save;
+        }
+        false
+    }
+
+    fn parse_if_exists(&mut self) -> bool {
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("if"))
+        {
+            let save = self.pos;
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exists"))
+            {
+                self.advance();
+                return true;
+            }
+            self.pos = save;
+        }
+        false
     }
 
     /// v7.12.4 — body of `CREATE [OR REPLACE] TRIGGER`. The
@@ -2152,6 +3298,255 @@ impl Parser {
         }))
     }
 
+    /// v7.17.0 Phase 3.P0-42 — parse `MERGE INTO <target> [alias]
+    /// USING <source> [alias] ON <expr> WHEN [NOT] MATCHED [AND
+    /// <expr>] THEN <action> [WHEN …]` after the leading `MERGE`
+    /// keyword. v7.17 surface:
+    ///   * source: table reference (subquery source is a follow-up)
+    ///   * actions: UPDATE SET / DELETE / DO NOTHING (matched);
+    ///     INSERT (cols) VALUES (vals) / DO NOTHING (not matched)
+    ///   * AND-conditioned WHEN clauses; clauses tried in declaration
+    ///     order
+    fn parse_merge_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        // INTO
+        let is_into_kw = matches!(self.peek(), Token::Into)
+            || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("into"));
+        if !is_into_kw {
+            return Err(self.err(format!("expected INTO after MERGE, got {:?}", self.peek())));
+        }
+        self.advance();
+        let target = self.expect_ident_like()?;
+        // Optional alias — bare ident before USING.
+        let target_alias = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("using") => {
+                Some(self.expect_ident_like()?)
+            }
+            _ => None,
+        };
+        // USING
+        let is_using_kw = matches!(
+            self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("using")
+        );
+        if !is_using_kw {
+            return Err(self.err(format!(
+                "expected USING after MERGE INTO target, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let source = self.expect_ident_like()?;
+        let source_alias = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("on") => {
+                Some(self.expect_ident_like()?)
+            }
+            _ => None,
+        };
+        // ON
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(format!(
+                "expected ON after MERGE … USING source, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let on = self.parse_expr(0)?;
+        // One or more WHEN clauses.
+        let mut clauses: Vec<crate::ast::MergeWhenClause> = Vec::new();
+        loop {
+            let is_when_kw = matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("when")
+            );
+            if !is_when_kw {
+                break;
+            }
+            self.advance(); // WHEN
+            // [NOT] MATCHED
+            let matched = if matches!(self.peek(), Token::Not) {
+                self.advance();
+                crate::ast::MergeMatched::NotMatched
+            } else {
+                crate::ast::MergeMatched::Matched
+            };
+            let is_matched_kw = matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("matched")
+            );
+            if !is_matched_kw {
+                return Err(self.err(format!(
+                    "expected MATCHED in WHEN clause, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            // Optional AND <expr>
+            let condition = if matches!(self.peek(), Token::And) {
+                self.advance();
+                Some(self.parse_expr(0)?)
+            } else {
+                None
+            };
+            // THEN
+            let is_then_kw = matches!(
+                self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("then")
+            );
+            if !is_then_kw {
+                return Err(self.err(format!(
+                    "expected THEN in WHEN clause, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            // Action: INSERT / UPDATE / DELETE / DO NOTHING
+            let action = match self.peek().clone() {
+                Token::Insert => {
+                    self.advance();
+                    // (cols)
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(format!(
+                            "expected '(' after INSERT in MERGE, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut columns: Vec<String> = Vec::new();
+                    loop {
+                        columns.push(self.expect_ident_like()?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after INSERT column list, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    // VALUES (...)
+                    if !matches!(self.peek(), Token::Values) {
+                        return Err(self.err(format!(
+                            "expected VALUES in MERGE INSERT, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(format!(
+                            "expected '(' after VALUES in MERGE INSERT, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut values: Vec<crate::ast::Expr> = Vec::new();
+                    loop {
+                        values.push(self.parse_expr(0)?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(format!(
+                            "expected ')' after MERGE INSERT values, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    if columns.len() != values.len() {
+                        return Err(self.err(format!(
+                            "MERGE INSERT column count ({}) ≠ value count ({})",
+                            columns.len(),
+                            values.len()
+                        )));
+                    }
+                    crate::ast::MergeAction::Insert { columns, values }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
+                    self.advance();
+                    // SET
+                    let is_set_kw = matches!(
+                        self.peek(),
+                        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("set")
+                    );
+                    if !is_set_kw {
+                        return Err(self.err(format!(
+                            "expected SET after UPDATE in MERGE, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut assignments: Vec<(String, crate::ast::Expr)> = Vec::new();
+                    loop {
+                        let col = self.expect_ident_like()?;
+                        if !matches!(self.peek(), Token::Eq) {
+                            return Err(self.err(format!(
+                                "expected '=' in MERGE UPDATE assignment, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let expr = self.parse_expr(0)?;
+                        assignments.push((col, expr));
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    crate::ast::MergeAction::Update { assignments }
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete") => {
+                    self.advance();
+                    crate::ast::MergeAction::Delete
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do") => {
+                    self.advance();
+                    let is_nothing_kw = matches!(
+                        self.peek(),
+                        Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("nothing")
+                    );
+                    if !is_nothing_kw {
+                        return Err(self.err(format!(
+                            "expected NOTHING after DO in MERGE clause, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    crate::ast::MergeAction::DoNothing
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "expected INSERT / UPDATE / DELETE / DO NOTHING in MERGE clause, got {other:?}"
+                    )));
+                }
+            };
+            clauses.push(crate::ast::MergeWhenClause {
+                matched,
+                condition,
+                action,
+            });
+        }
+        if clauses.is_empty() {
+            return Err(self.err(String::from(
+                "MERGE requires at least one WHEN clause",
+            )));
+        }
+        Ok(Statement::Merge(crate::ast::MergeStatement {
+            target,
+            target_alias,
+            source,
+            source_alias,
+            on,
+            clauses,
+        }))
+    }
+
     /// v7.9.4 — parse the optional trailing `RETURNING <projection>`
     /// clause on INSERT / UPDATE / DELETE. Same projection grammar
     /// as SELECT, so `RETURNING *`, `RETURNING col`,
@@ -2210,16 +3605,20 @@ impl Parser {
                 }
                 return self.parse_alter_table_after_keyword();
             }
-            // v7.14.0 — ALTER SEQUENCE / ALTER VIEW / ALTER
-            // FUNCTION / ALTER TYPE / ALTER DOMAIN / ALTER
-            // DATABASE / ALTER USER / ALTER ROLE / ALTER SCHEMA
-            // / ALTER OWNER / ALTER DEFAULT PRIVILEGES — accept
-            // as no-op so pg_dump's tail loads.
+            // v7.17.0 — ALTER SEQUENCE name <options>. Moved out
+            // of the silent-noop tail.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
+                return self.parse_alter_sequence_after_keyword();
+            }
+            // v7.14.0 — ALTER VIEW / ALTER FUNCTION / ALTER TYPE /
+            // ALTER DOMAIN / ALTER DATABASE / ALTER USER / ALTER
+            // ROLE / ALTER SCHEMA / ALTER OWNER / ALTER DEFAULT
+            // PRIVILEGES — accept as no-op so pg_dump's tail loads.
+            // v7.17.0 NOTE: ALTER SEQUENCE moved out (above).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
-                    "sequence"
-                        | "view"
+                    "view"
                         | "function"
                         | "type"
                         | "domain"
@@ -2774,6 +4173,11 @@ impl Parser {
                 .map(alloc::string::String::from)
                 .unwrap_or_else(|| tbl.to_ascii_lowercase());
             ("__spg_pg_", bare)
+        } else if schema.eq_ignore_ascii_case("mysql") {
+            // v7.17.0 Phase 3.P0-65 — MySQL system schema
+            // (`mysql.user`, `mysql.db`). Same synthetic-name
+            // shape as pg_catalog.
+            ("__spg_mysql_", tbl.to_ascii_lowercase())
         } else {
             return None;
         };
@@ -2867,23 +4271,222 @@ impl Parser {
         };
         head.limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
-            Some(self.parse_limit_expr("LIMIT")?)
+            // v7.17.0 Phase 5.1 — `LIMIT NULL` / `LIMIT ALL` are
+            // PG synonyms for "no limit". Treat both as None
+            // (no head.limit set) so the engine's existing
+            // unlimited-result path takes over. Reject was the
+            // pre-5.1 behaviour and broke pg_dump-flavoured
+            // tooling that occasionally emits LIMIT NULL.
+            if self.consume_limit_unbounded_sentinel() {
+                None
+            } else {
+                Some(self.parse_limit_expr("LIMIT")?)
+            }
         } else {
             None
         };
         head.offset = if matches!(self.peek(), Token::Offset) {
             self.advance();
-            Some(self.parse_limit_expr("OFFSET")?)
+            // PG also accepts an optional `ROW` / `ROWS` trailer
+            // after the offset value (`OFFSET 10 ROWS`). The
+            // FETCH-FIRST branch below relies on the same.
+            let off = self.parse_limit_expr("OFFSET")?;
+            self.consume_optional_rows_keyword();
+            Some(off)
         } else {
             None
         };
+        // v7.17.0 Phase 5.1 — `FETCH FIRST <int|$N> ROWS ONLY` is
+        // the SQL-standard alias for LIMIT. PG accepts both
+        // spellings interchangeably; pg_dump emits FETCH FIRST in
+        // newer versions. We map it onto `head.limit` so the
+        // engine path is unified.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("fetch"))
+        {
+            self.advance(); // FETCH
+            // `FIRST` or `NEXT` (both legal per SQL standard).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("first") || s.eq_ignore_ascii_case("next"))
+            {
+                self.advance();
+            }
+            // Count (optional in the bare `FETCH FIRST ROW ONLY` —
+            // implicit 1 — but we always consume one if present).
+            let count = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("row") || s.eq_ignore_ascii_case("rows"))
+            {
+                // Bare `FETCH FIRST ROW ONLY` = LIMIT 1.
+                crate::ast::LimitExpr::Literal(1)
+            } else {
+                self.parse_limit_expr("FETCH FIRST")?
+            };
+            // Eat `ROW` / `ROWS` if not already consumed above.
+            self.consume_optional_rows_keyword();
+            // Optional `ONLY` (the spec form) — or the SQL:2008
+            // `WITH TIES` form. v7.17.0 Phase 3.P0-49: the executor
+            // now honours WITH TIES by extending past the LIMIT
+            // truncation point through every row that shares the
+            // last-kept row's ORDER BY key.
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("only"))
+            {
+                self.advance();
+            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("with"))
+            {
+                self.advance(); // WITH
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("ties"))
+                {
+                    self.advance();
+                    head.limit_with_ties = true;
+                }
+            }
+            head.limit = Some(count);
+        }
+        // v7.17.0 Phase 3.4 — trailing row-lock clauses:
+        //   FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
+        //       [ OF table_name [, …] ]
+        //       [ NOWAIT | SKIP LOCKED ]
+        // Multiple FOR clauses may stack (PG: `FOR UPDATE OF t1
+        // FOR SHARE OF t2`). SPG is a single-writer engine — every
+        // SELECT already returns a consistent snapshot — so these
+        // are accept-and-discard: the parser absorbs them so
+        // mailrs / Rails / Django code paths that emit `SELECT
+        // … FOR UPDATE` for advisory pessimistic locking load
+        // without a parser error. The on-disk locking model is
+        // unchanged; callers that rely on FOR UPDATE for read-
+        // through-write ordering still get the right answer
+        // because SPG serialises writes anyway.
+        self.consume_optional_for_lock_clauses();
         Ok(Statement::Select(head))
+    }
+
+    /// v7.17.0 Phase 3.4 — eat zero or more `FOR { UPDATE | NO KEY
+    /// UPDATE | SHARE | KEY SHARE } [ OF tbl[, …] ] [ NOWAIT | SKIP
+    /// LOCKED ]` trailers. Each clause is fully accepted and
+    /// discarded — SPG's single-writer model already satisfies the
+    /// callers' implicit ordering requirement. Stops at the first
+    /// token that isn't `FOR`.
+    fn consume_optional_for_lock_clauses(&mut self) {
+        while matches!(self.peek(), Token::For) {
+            self.advance(); // FOR
+            // `NO KEY` prefix (PG) — `NO` is reserved-keyword-shaped
+            // (`Token::Not` isn't it; PG `NO` lexes as Token::Ident).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("no"))
+            {
+                self.advance(); // NO
+                // The next ident should be KEY but be generous;
+                // anything followed by UPDATE/SHARE is accepted.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("key"))
+                {
+                    self.advance(); // KEY
+                }
+            }
+            // `KEY` prefix (PG `FOR KEY SHARE`).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("key"))
+            {
+                self.advance(); // KEY
+            }
+            // Lock-strength keyword: UPDATE / SHARE. Required, but
+            // we're lenient — an unexpected token here just bails
+            // (we already consumed FOR; caller's downstream
+            // dispatch will error if anything actually depends on
+            // the trailing tokens).
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("update") || s.eq_ignore_ascii_case("share"))
+            {
+                self.advance();
+            } else {
+                // FOR by itself (or `FOR KEY` with nothing after) —
+                // give up on the lock-clause path. We've already
+                // advanced past FOR; further attempts to parse
+                // here would clobber state.
+                return;
+            }
+            // Optional `OF tbl[, tbl …]`. mailrs emits this when
+            // joining and locking only a subset of tables.
+            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("of"))
+            {
+                self.advance(); // OF
+                loop {
+                    match self.peek() {
+                        Token::Ident(_) | Token::QuotedIdent(_) => {
+                            self.advance();
+                            // Optional schema-qualified `schema.table`.
+                            if matches!(self.peek(), Token::Dot) {
+                                self.advance();
+                                if matches!(
+                                    self.peek(),
+                                    Token::Ident(_) | Token::QuotedIdent(_)
+                                ) {
+                                    self.advance();
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            // Optional `NOWAIT` | `SKIP LOCKED`.
+            match self.peek().clone() {
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("nowait") => {
+                    self.advance();
+                }
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("skip") => {
+                    self.advance(); // SKIP
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("locked"))
+                    {
+                        self.advance(); // LOCKED
+                    }
+                }
+                _ => {}
+            }
+            // Loop: PG allows multiple FOR clauses chained.
+        }
     }
 
     /// v7.9.24 — accept `LIMIT <int>` or `LIMIT $N`. mailrs H2.
     /// Bind value gets resolved during prepared-statement Execute;
     /// the Pratt expression parser would over-accept here (e.g.
     /// `LIMIT 5 + 5`), so we narrowly accept only the two PG forms.
+    /// v7.17.0 Phase 5.1 — consume the `LIMIT NULL` / `LIMIT ALL`
+    /// sentinel tokens (PG synonyms for "no limit"). Returns true
+    /// when one was consumed; caller skips the regular
+    /// limit-value parse and leaves `head.limit` at None.
+    fn consume_limit_unbounded_sentinel(&mut self) -> bool {
+        if matches!(self.peek(), Token::Null) {
+            self.advance();
+            return true;
+        }
+        if matches!(self.peek(), Token::All) {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    /// v7.17.0 Phase 5.1 — eat an optional trailing `ROW` / `ROWS`
+    /// keyword after a LIMIT / OFFSET / FETCH FIRST value, the
+    /// SQL-standard shape. No-op when missing.
+    fn consume_optional_rows_keyword(&mut self) {
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+            if s.eq_ignore_ascii_case("row") || s.eq_ignore_ascii_case("rows"))
+        {
+            self.advance();
+        }
+    }
+
     fn parse_limit_expr(&mut self, label: &str) -> Result<crate::ast::LimitExpr, ParseError> {
         match self.advance() {
             Token::Integer(n) if n >= 0 => u32::try_from(n)
@@ -2980,6 +4583,7 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            limit_with_ties: false,
         })
     }
 
@@ -3163,19 +4767,22 @@ impl Parser {
         } else {
             false
         };
-        // Consume FULLTEXT / SPATIAL prefix and record it. SPG
-        // has no native FULLTEXT / SPATIAL AM, so we still
-        // accept-as-no-op for those (return None below); plain
-        // KEY/INDEX builds a real BTree.
-        let is_fulltext_or_spatial = if matches!(
-            self.peek(),
-            Token::Ident(s) if s.eq_ignore_ascii_case("fulltext") || s.eq_ignore_ascii_case("spatial")
-        ) {
-            self.advance();
-            true
-        } else {
-            false
-        };
+        // Consume FULLTEXT / SPATIAL prefix and record which one
+        // it was. v7.17.0 Phase 2.2 — FULLTEXT routes through a
+        // dedicated TableConstraint variant so the engine can
+        // build a tsvector-GIN; SPATIAL still has no matching
+        // AM, so it falls back to accept-as-no-op.
+        let mut is_fulltext = false;
+        let mut is_spatial = false;
+        if let Token::Ident(s) = self.peek().clone() {
+            if s.eq_ignore_ascii_case("fulltext") {
+                self.advance();
+                is_fulltext = true;
+            } else if s.eq_ignore_ascii_case("spatial") {
+                self.advance();
+                is_spatial = true;
+            }
+        }
         // KEY / INDEX keyword. `INDEX` lexes as Token::Index
         // (reserved); accept either token shape.
         match self.peek() {
@@ -3270,8 +4877,19 @@ impl Parser {
                 columns: cols,
                 nulls_not_distinct: false,
             }))
-        } else if is_fulltext_or_spatial {
-            // SPG has no FULLTEXT / SPATIAL AM. Accept-as-no-op.
+        } else if is_fulltext {
+            // v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` now
+            // routes through `TableConstraint::FulltextIndex`;
+            // the engine builds a tsvector-GIN over each named
+            // column so MATCH AGAINST gets a real inverted
+            // index instead of a silently-dropped declaration.
+            Ok(Some(crate::ast::TableConstraint::FulltextIndex {
+                name: idx_name,
+                columns: cols,
+            }))
+        } else if is_spatial {
+            // SPG has no native SPATIAL AM. Accept-as-no-op
+            // (declaration is parsed, but no index is built).
             Ok(None)
         } else {
             // v7.15.0 — plain KEY / INDEX builds a real BTree
@@ -3611,53 +5229,30 @@ impl Parser {
                 parent_columns.len()
             )));
         }
-        // v7.6.7 — accept and reject `[NOT] DEFERRABLE [INITIALLY
-        // {DEFERRED | IMMEDIATE}]` so existing PG dumps don't fail
-        // at parse time. SPG's single-writer model has no deferred
-        // constraint window, so we surface this as a clean
-        // unsupported-feature error rather than a syntax error.
-        loop {
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable")) {
-                return Err(self.err(
-                    "DEFERRABLE constraints are not supported (SPG is single-writer; \
-                     constraints are always evaluated immediately at commit)"
-                        .into(),
-                ));
-            }
-            if matches!(self.peek(), Token::Not) {
-                let look = self.tokens.get(self.pos + 1);
-                if matches!(look, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")) {
-                    // NOT DEFERRABLE — accept as the SPG default
-                    // and consume both tokens silently.
-                    self.advance();
-                    self.advance();
-                    // Optional `INITIALLY IMMEDIATE` clause.
-                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially"))
-                    {
-                        self.advance();
-                        match self.advance() {
-                            Token::Ident(s) if s.eq_ignore_ascii_case("immediate") => {}
-                            other => {
-                                return Err(self.err(format!(
-                                    "expected IMMEDIATE after INITIALLY for NOT DEFERRABLE, \
-                                     got {other:?}"
-                                )));
-                            }
-                        }
-                    }
-                    continue;
-                }
-                break;
-            }
-            break;
-        }
-        // Optional `ON DELETE <action>` and `ON UPDATE <action>` in
-        // either order, each at most once.
+        // v7.6.7 / v7.17.0 Phase 3.1 — interleave `[NOT] DEFERRABLE
+        // [INITIALLY {DEFERRED | IMMEDIATE}]` and `ON DELETE
+        // <action>` / `ON UPDATE <action>` in either order. PG /
+        // pg_dump emits the timing clause AFTER the ON clauses
+        // (`ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED`),
+        // but the SQL spec allows either order. We loop over
+        // every possible trailer and dispatch on the next token,
+        // stopping when nothing matches. Phase 3.1 changes the
+        // bare DEFERRABLE form from hard-error to accept-as-
+        // immediate; SPG is single-writer with no deferred-
+        // constraint window so the runtime semantics are always
+        // immediate even when INITIALLY DEFERRED is requested.
         let mut on_delete = FkAction::Restrict;
         let mut on_update = FkAction::Restrict;
         let mut seen_on_delete = false;
         let mut seen_on_update = false;
         loop {
+            // DEFERRABLE / NOT DEFERRABLE / INITIALLY shapes.
+            let before = self.pos;
+            self.consume_optional_deferrable_clauses()?;
+            if self.pos != before {
+                continue;
+            }
+            // ON DELETE / ON UPDATE.
             if !matches!(self.peek(), Token::On) {
                 break;
             }
@@ -4083,13 +5678,30 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
     fn parse_type_with_implied_flags(
         &mut self,
-    ) -> Result<(ColumnTypeName, bool, bool), ParseError> {
+    ) -> Result<
+        (
+            ColumnTypeName,
+            bool,
+            bool,
+            Option<String>,
+            Collation,
+            bool,
+            // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant
+            // list captured at type-parse time. None for all
+            // non-ENUM types.
+            Option<Vec<String>>,
+            // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant
+            // list. Distinct from ENUM (subset semantics).
+            Option<Vec<String>>,
+        ),
+        ParseError,
+    > {
         let ty_ident = match self.advance() {
             Token::Ident(s) => s,
             other => {
@@ -4101,6 +5713,14 @@ impl Parser {
         };
         let mut implied_auto_increment = false;
         let mut implied_not_null = false;
+        let mut user_type_ref: Option<String> = None;
+        // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM('a','b','c')
+        // value list, captured here and bubbled up through the
+        // ColumnDef so the engine can attach it to the column
+        // schema (and validate INSERT cells against it).
+        let mut inline_enum_variants: Option<Vec<String>> = None;
+        // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant list.
+        let mut inline_set_variants: Option<Vec<String>> = None;
         let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
@@ -4123,13 +5743,32 @@ impl Parser {
             // since SPG doesn't have a dedicated i8. MEDIUMINT (MySQL
             // 24-bit) → INT. UNSIGNED modifiers are consumed below
             // without semantic effect.
-            "smallint" | "tinyint" => {
+            "smallint" => {
                 // v7.14.0 — MySQL display-width on integers
-                // (`TINYINT(1)`, `INT(11)`, `BIGINT(20)`). The
+                // (`SMALLINT(5)`, `INT(11)`, `BIGINT(20)`). The
                 // parenthesised number is purely cosmetic — it
                 // doesn't change storage. Accept + discard.
                 self.consume_optional_paren_size();
                 ColumnTypeName::SmallInt
+            }
+            // v7.17.0 Phase 4.3 — MySQL `TINYINT(1)` is the
+            // canonical encoding for BOOLEAN. Every MySQL driver
+            // (JDBC `tinyInt1isBit=true`, PHP `mysql_field_type`,
+            // .NET `MySqlConnection`, sqlx) maps it to bit. Pre-
+            // 4.3 SPG classified TINYINT(1) as SmallInt, which
+            // gave the customer i16-shaped values where the app
+            // expected bool — a Tier-A silent type drift on
+            // mysqldump restores. Now: `TINYINT(1)` → Bool;
+            // `TINYINT` (no width) and `TINYINT(N)` for N ≠ 1
+            // stay SmallInt (the legacy width-agnostic path).
+            "tinyint" => {
+                let width = self.peek_optional_paren_size_value();
+                self.consume_optional_paren_size();
+                if width == Some(1) {
+                    ColumnTypeName::Bool
+                } else {
+                    ColumnTypeName::SmallInt
+                }
             }
             "int" | "integer" | "mediumint" => {
                 self.consume_optional_paren_size();
@@ -4215,31 +5854,184 @@ impl Parser {
             // resolver. Literal forms are handled at coerce_value
             // time so the lexer stays untouched.
             "bytea" | "bytes" => ColumnTypeName::Bytes,
+            // v7.17.0 Phase 7 — PG network address types
+            // (`inet`, `cidr`, `macaddr`). pg_dump / Django ORM
+            // emit these for IP-address columns; pre-7 SPG
+            // errored with "unknown type", breaking schema
+            // restores. Accept as Text-backed (no new storage
+            // shape): the customer's data round-trips, and the
+            // host() / network() helpers added in the same
+            // phase work textually. Containment operators
+            // `<<=` / `>>=` are out of v7.17 scope.
+            "inet" | "cidr" | "macaddr" => ColumnTypeName::Text,
             // v7.12.0 — PG full-text search types. mailrs G-CRIT-3.
             // The actual `to_tsvector` / `@@` / `ts_rank` surface
             // arrives in v7.12.1+; the type itself loads here so
             // mailrs's `scripts/init-schema.sql` runs unmodified.
             "tsvector" => ColumnTypeName::TsVector,
             "tsquery" => ColumnTypeName::TsQuery,
-            other => {
-                return Err(ParseError {
-                    message: format!("unsupported column type {other:?}"),
-                    token_pos: self.pos.saturating_sub(1),
-                });
+            // v7.17.0 — PG `UUID`. Wire OID 2950. The drop-in PG
+            // surface for Django / Rails / Hibernate's default
+            // PK pattern.
+            "uuid" => ColumnTypeName::Uuid,
+            // v7.17.0 Phase 3.P0-32 — PG `TIME` (without time zone).
+            // i64 microseconds since 00:00:00. Wire OID 1083.
+            "time" => ColumnTypeName::Time,
+            // v7.17.0 Phase 3.P0-33 — MySQL `YEAR`. u16 in
+            // 1901..=2155 + zero-year sentinel 0. Wire = INT4.
+            "year" => ColumnTypeName::Year,
+            // v7.17.0 Phase 3.P0-34 — PG `TIMETZ` / `TIME WITH
+            // TIME ZONE`. i64 us + i32 offset_secs. Wire OID 1266.
+            "timetz" => ColumnTypeName::TimeTz,
+            // v7.17.0 Phase 3.P0-35 — PG `MONEY` — i64 cents.
+            // Wire OID 790.
+            "money" => ColumnTypeName::Money,
+            // v7.17.0 Phase 3.P0-38 — PG range types.
+            "int4range" => ColumnTypeName::Range(RangeKindAst::Int4),
+            "int8range" => ColumnTypeName::Range(RangeKindAst::Int8),
+            "numrange" => ColumnTypeName::Range(RangeKindAst::Num),
+            "tsrange" => ColumnTypeName::Range(RangeKindAst::Ts),
+            "tstzrange" => ColumnTypeName::Range(RangeKindAst::TsTz),
+            "daterange" => ColumnTypeName::Range(RangeKindAst::Date),
+            // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
+            "hstore" => ColumnTypeName::Hstore,
+            // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
+            // `ENUM('a','b','c')`. Storage is TEXT; the value
+            // list lands on `inline_enum_variants` for the
+            // engine to validate INSERT cells against. Empty
+            // value list is a parse error (matches MySQL).
+            "enum" => {
+                // Expect the opening `(`.
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after ENUM, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut variants: Vec<String> = Vec::new();
+                loop {
+                    match self.advance() {
+                        Token::String(s) => variants.push(s),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "ENUM(...) expects string literal variants, got {other:?}"
+                            )));
+                        }
+                    }
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                            continue;
+                        }
+                        Token::RParen => {
+                            self.advance();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected ',' or ')' in ENUM(...), got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                if variants.is_empty() {
+                    return Err(self.err(
+                        "ENUM(...) must declare at least one variant".into(),
+                    ));
+                }
+                inline_enum_variants = Some(variants);
+                // Storage is plain TEXT; the variant list lives on
+                // the ColumnSchema side.
+                ColumnTypeName::Text
+            }
+            // v7.17.0 Phase 3.P0-37 — MySQL inline SET
+            // `SET('a','b','c')`. Same parse shape as ENUM;
+            // semantics differ (subset rather than pick-one).
+            "set" => {
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after SET, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let mut variants: Vec<String> = Vec::new();
+                loop {
+                    match self.advance() {
+                        Token::String(s) => variants.push(s),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "SET(...) expects string literal variants, got {other:?}"
+                            )));
+                        }
+                    }
+                    match self.peek() {
+                        Token::Comma => {
+                            self.advance();
+                            continue;
+                        }
+                        Token::RParen => {
+                            self.advance();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected ',' or ')' in SET(...), got {other:?}"
+                            )));
+                        }
+                    }
+                }
+                if variants.is_empty() {
+                    return Err(self.err(
+                        "SET(...) must declare at least one variant".into(),
+                    ));
+                }
+                inline_set_variants = Some(variants);
+                ColumnTypeName::Text
+            }
+            _other => {
+                // v7.17.0 Phase 1.4 — unknown ident → defer
+                // resolution to the engine. Stored as Text in
+                // ColumnTypeName + the original name carried as
+                // `user_type_ref` so CREATE TABLE can look up
+                // user-defined enum / domain types.
+                user_type_ref = Some(ty_ident.clone());
+                ColumnTypeName::Text
             }
         };
-        // MySQL's `UNSIGNED` modifier sits right after the type
-        // keyword. SPG doesn't carry a separate unsigned variant —
-        // accepting the keyword keeps existing schemas compatible
-        // without changing semantics. Drop it silently.
-        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unsigned")) {
+        // v7.17.0 Phase 4.4 — MySQL's `UNSIGNED` modifier sits
+        // right after the type keyword. Pre-4.4 SPG consumed +
+        // discarded the keyword, leaving a customer column
+        // declared `id INT UNSIGNED NOT NULL` silently accepting
+        // negative values — a Tier-A correctness drift where
+        // application invariants (auto-increment-IDs never
+        // negative) silently broke on cutover. Now: capture as
+        // a column flag, persist on the schema, enforce at
+        // INSERT / UPDATE time.
+        let is_unsigned = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unsigned"))
+        {
             self.advance();
-        }
+            true
+        } else {
+            false
+        };
         // v7.14.0 — mysqldump emits `<type> CHARACTER SET <name>` and
         // `<type> COLLATE <name>` post-fixes on text columns. SPG
-        // stores text as UTF-8 always and orders bytewise; charset /
-        // collate are accepted as no-ops so PG / MySQL / MariaDB
-        // dumps load without parser noise.
+        // stores text as UTF-8 always so CHARACTER SET is still a
+        // no-op. v7.17.0 Phase 2.5 — COLLATE no longer drops the
+        // name: it gets classified into a `Collation` variant the
+        // engine consults at WHERE-eval time. PG `default` /
+        // `pg_catalog.default` / `C` / `POSIX` collations all
+        // resolve to `Binary` (the prior behaviour); `_ci` /
+        // `case_insensitive` / `nocase` shift to CaseInsensitive.
+        // The schema-qualifier form (`pg_catalog.default`) lexes
+        // as `Ident '.' Ident` — peek for the `.` and consume both
+        // halves so it's treated as one collation name. PG's
+        // `IDENT.IDENT` collation form (which can appear here) is
+        // resolved by Collation::from_collation_name on the bare
+        // identifier after the dot.
+        let mut collation = Collation::Binary;
         loop {
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("character"))
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("set"))
@@ -4256,11 +6048,46 @@ impl Parser {
             }
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate")) {
                 self.advance(); // COLLATE
-                if matches!(
-                    self.peek(),
-                    Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
-                ) {
-                    self.advance();
+                // Accept Ident / QuotedIdent / String AND the
+                // keyword-tokenised `Default` (PG `pg_catalog.default`
+                // and bare `DEFAULT` collation names — `default` is a
+                // reserved word so the lexer hands back Token::Default
+                // not Token::Ident).
+                let read_collation_atom = |this: &mut Self| -> Option<alloc::string::String> {
+                    match this.peek().clone() {
+                        Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => {
+                            this.advance();
+                            Some(s)
+                        }
+                        Token::Default => {
+                            this.advance();
+                            Some(alloc::string::String::from("default"))
+                        }
+                        _ => None,
+                    }
+                };
+                let raw = if let Some(head) = read_collation_atom(self) {
+                    // Schema-qualified PG form: `pg_catalog.default`.
+                    if matches!(self.peek(), Token::Dot) {
+                        self.advance();
+                        let tail = read_collation_atom(self).unwrap_or_default();
+                        alloc::format!("{head}.{tail}")
+                    } else {
+                        head
+                    }
+                } else {
+                    alloc::string::String::new()
+                };
+                if !raw.is_empty() {
+                    let parsed = Collation::from_collation_name(&raw);
+                    // Last COLLATE clause wins, but `Binary` from a
+                    // bare keyword like `default` should not
+                    // silently downgrade a stronger one set earlier
+                    // on the same column. v7.17 only ships one
+                    // non-Binary variant so a simple OR is enough.
+                    if parsed != Collation::Binary {
+                        collation = parsed;
+                    }
                 }
                 continue;
             }
@@ -4292,14 +6119,54 @@ impl Parser {
                     )));
                 }
             };
+            // v7.17.0 Phase 3.P0-40 — second `[]` widens 1D → 2D
+            // for INT/TEXT/BIGINT. Anything else is an error.
+            if matches!(self.peek(), Token::LBracket) {
+                self.advance();
+                if !matches!(self.peek(), Token::RBracket) {
+                    return Err(self.err(alloc::format!(
+                        "TYPE[][] second dimension takes no size; got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                ty = match ty {
+                    ColumnTypeName::IntArray => ColumnTypeName::IntArray2D,
+                    ColumnTypeName::BigIntArray => ColumnTypeName::BigIntArray2D,
+                    ColumnTypeName::TextArray => ColumnTypeName::TextArray2D,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "v7.17 2D arrays support INT[][] / BIGINT[][] / \
+                             TEXT[][] only; got {other:?}"
+                        )));
+                    }
+                };
+            }
         }
-        Ok((ty, implied_auto_increment, implied_not_null))
+        Ok((
+            ty,
+            implied_auto_increment,
+            implied_not_null,
+            user_type_ref,
+            collation,
+            is_unsigned,
+            inline_enum_variants,
+            inline_set_variants,
+        ))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
         let name = self.expect_ident_like()?;
-        let (ty, implied_auto_increment, implied_not_null) =
-            self.parse_type_with_implied_flags()?;
+        let (
+            ty,
+            implied_auto_increment,
+            implied_not_null,
+            user_type_ref,
+            collation,
+            is_unsigned,
+            inline_enum_variants,
+            inline_set_variants,
+        ) = self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
         // each at most once.
@@ -4310,7 +6177,53 @@ impl Parser {
         let mut is_primary_key = false;
         let mut is_unique = false;
         let mut check: Option<Expr> = None;
+        let mut on_update_runtime: Option<Expr> = None;
         loop {
+            // v7.17.0 Phase 2.1 — MySQL `ON UPDATE
+            // CURRENT_TIMESTAMP[(N)]`. Only CURRENT_TIMESTAMP
+            // is accepted today. The "ON" token is an Ident
+            // (not reserved) — peek before consuming.
+            if matches!(self.peek(), Token::On)
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("update"))
+            {
+                self.advance(); // ON
+                self.advance(); // update
+                // Accept CURRENT_TIMESTAMP / CURRENT_TIMESTAMP(N).
+                let next = self.peek().clone();
+                match next {
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("current_timestamp") =>
+                    {
+                        self.advance();
+                        // Optional `(N)` precision.
+                        if matches!(self.peek(), Token::LParen) {
+                            self.advance();
+                            if !matches!(self.peek(), Token::Integer(_)) {
+                                return Err(self.err(alloc::format!(
+                                    "expected integer precision inside CURRENT_TIMESTAMP(…), got {:?}",
+                                    self.peek()
+                                )));
+                            }
+                            self.advance();
+                            if !matches!(self.peek(), Token::RParen) {
+                                return Err(self.err(alloc::format!(
+                                    "expected ')' after CURRENT_TIMESTAMP precision, got {:?}",
+                                    self.peek()
+                                )));
+                            }
+                            self.advance();
+                        }
+                        on_update_runtime =
+                            Some(Expr::FunctionCall { name: "now".into(), args: Vec::new() });
+                        continue;
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "v7.17 only supports ON UPDATE CURRENT_TIMESTAMP, got {other:?}"
+                        )));
+                    }
+                }
+            }
             if matches!(self.peek(), Token::Default) {
                 if default.is_some() {
                     return Err(self.err("DEFAULT specified twice".into()));
@@ -4453,6 +6366,12 @@ impl Parser {
             is_primary_key,
             is_unique,
             check,
+            user_type_ref,
+            on_update_runtime,
+            collation,
+            is_unsigned,
+            inline_enum_variants,
+            inline_set_variants,
         })
     }
 
@@ -4549,6 +6468,26 @@ impl Parser {
                 "unknown vector encoding {other:?}; supported: SQ8, HALF"
             ))),
         }
+    }
+
+    /// v7.17.0 Phase 4.3 — peek at the MySQL display-width
+    /// without consuming it. Returns `Some(N)` when the next
+    /// tokens are `( <int> )`; None otherwise. Used by the
+    /// TINYINT classifier to decide whether to map to Bool or
+    /// SmallInt.
+    fn peek_optional_paren_size_value(&self) -> Option<i64> {
+        if !matches!(self.peek(), Token::LParen) {
+            return None;
+        }
+        let next = self.tokens.get(self.pos + 1)?;
+        let n = match next {
+            Token::Integer(n) => *n,
+            _ => return None,
+        };
+        if !matches!(self.tokens.get(self.pos + 2), Some(Token::RParen)) {
+            return None;
+        }
+        Some(n)
     }
 
     /// v7.14.0 — consume an optional MySQL display-width
@@ -4856,6 +6795,44 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+        // v7.17.0 Phase 3.P0-41 — `LATERAL ( SELECT … )` derived
+        // table. Detect at the head so it claims precedence over
+        // every other table-ref shape (unnest / generate_series /
+        // bare ident); the lateral subquery itself follows the
+        // regular SELECT grammar.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // LATERAL
+            self.advance(); // (
+            // Parse the inner SELECT.
+            let inner = match self.parse_one_statement()? {
+                Statement::Select(s) => s,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected SELECT inside LATERAL ( … ), got {other:?}"
+                    )));
+                }
+            };
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after LATERAL subquery, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let alias_ident = self.parse_optional_alias();
+            let name = alias_ident.clone().unwrap_or_else(|| "lateral".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: Some(Box::new(inner)),
+            });
+        }
         // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>` set-returning
         // source. Detect at the head before the bare-ident fallback;
         // unnest is not a reserved token.
@@ -4880,6 +6857,58 @@ impl Parser {
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(expr)),
                 unnest_column_aliases,
+                generate_series_args: None,
+                lateral_subquery: None,
+            });
+        }
+        // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
+        // [, step])` set-returning source. Same shape as unnest:
+        // detect at the head, parse the comma-separated arg list,
+        // dispatch downstream through the engine's set-returning
+        // path. Supports integer triplets (mailrs's `WITH row_no AS
+        // (SELECT * FROM generate_series(1, N))` pattern) and
+        // TIMESTAMP + INTERVAL triplets (the Tier-A audit's
+        // date-range iteration pattern, which pre-3.10 had no
+        // direct equivalent in SPG).
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("generate_series"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // generate_series
+            self.advance(); // (
+            let mut args: Vec<Expr> = Vec::new();
+            loop {
+                args.push(self.parse_expr(0)?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after generate_series() arguments, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if args.len() < 2 || args.len() > 3 {
+                return Err(self.err(alloc::format!(
+                    "generate_series() expects 2 or 3 arguments (start, stop [, step]); got {}",
+                    args.len()
+                )));
+            }
+            let (alias_ident, _column_aliases) = self.parse_optional_alias_with_columns();
+            let name = alias_ident
+                .clone()
+                .unwrap_or_else(|| "generate_series".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: Some(args),
+                lateral_subquery: None,
             });
         }
         // v7.16.2 — preserve information_schema / pg_catalog
@@ -4942,6 +6971,8 @@ impl Parser {
             as_of_segment,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
+            generate_series_args: None,
+            lateral_subquery: None,
         })
     }
 
@@ -5069,7 +7100,17 @@ impl Parser {
             }
             return None;
         }
-        if let Token::Ident(_) | Token::QuotedIdent(_) = self.peek() {
+        // v7.17.0 Phase 1.3 — implicit alias (no `AS`). PG's
+        // grammar reserves a long list of follow-keywords from the
+        // alias slot. SPG's bareword approximation: skip a small
+        // set of idents that would otherwise be swallowed as the
+        // table alias and break trailing clauses like CREATE
+        // MATERIALIZED VIEW … WITH [NO] DATA or future ON
+        // CONFLICT WHERE shapes.
+        if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek() {
+            if is_alias_stopword(s) {
+                return None;
+            }
             return self.expect_ident_like().ok();
         }
         None
@@ -5199,6 +7240,37 @@ impl Parser {
             Token::LBracket => self.parse_vector_literal_body(),
             Token::Extract => self.parse_extract_atom(),
             Token::Interval => self.parse_interval_atom(),
+            // `LEFT` is a reserved-keyword token because the
+            // grammar dedicates an arm for `LEFT [OUTER] JOIN`.
+            // When `left` is followed by `(` we're in expression
+            // position calling the PG `left(string, n)` function;
+            // rebuild the AST as a regular function call so the
+            // engine's apply_function dispatch picks it up.
+            Token::Left if matches!(self.peek(), Token::LParen) => {
+                self.advance(); // (
+                let mut args = Vec::new();
+                if !matches!(self.peek(), Token::RParen) {
+                    loop {
+                        args.push(self.parse_expr(0)?);
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RParen => break,
+                            other => {
+                                return Err(self.err(alloc::format!(
+                                    "expected ',' or ')' in left() args, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                self.advance(); // )
+                Ok(Expr::FunctionCall {
+                    name: "left".into(),
+                    args,
+                })
+            }
             // v4.10: EXISTS / NOT EXISTS. EXISTS isn't a reserved
             // token; we match on the bare ident. NOT is a token
             // (consumed in the comparison rung), but `EXISTS (...)`
@@ -5238,6 +7310,25 @@ impl Parser {
                 }
                 self.advance(); // consume `]`
                 Ok(Expr::Array(items))
+            }
+            // v7.17.0 Phase 2.2 — MySQL `MATCH(col, ...) AGAINST
+            // ('term' [IN BOOLEAN MODE | IN NATURAL LANGUAGE MODE])`.
+            // We special-case before the generic ident dispatch so
+            // the AGAINST clause never reaches the function-call
+            // loop (which would mis-read `(cols) AGAINST` as a
+            // call with no trailing modifier). The shape is
+            // rewritten to a Boolean OR over per-column
+            // `to_tsvector('simple', col) @@ plainto_tsquery('simple',
+            // term)` so the existing FTS evaluator handles
+            // semantics — the fulltext-GIN built at CREATE TABLE
+            // time is currently a "real index that survives dump
+            // round-trip"; the planner hook that actually uses
+            // it for posting-list intersection lands in a later
+            // sub-phase (Phase 2.2b) without touching this surface.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("match") && matches!(self.peek(), Token::LParen) =>
+            {
+                self.parse_match_against_atom()
             }
             Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
             other => Err(ParseError {
@@ -5311,6 +7402,14 @@ impl Parser {
                         // external form parser.
                         "tsvector" => CastTarget::TsVector,
                         "tsquery" => CastTarget::TsQuery,
+                        // v7.17.0 — `::uuid`. Engine decodes the LHS
+                        // text via `spg_storage::parse_uuid_str`.
+                        "uuid" => CastTarget::Uuid,
+                        // v7.17.0 Phase 3.P0-47 — `::inet` / `::cidr` /
+                        // `::macaddr`. SPG stores these as Text (Phase 7);
+                        // the cast is a no-op passthrough so containment
+                        // and overlap operators can read the textual form.
+                        "inet" | "cidr" | "macaddr" => CastTarget::Text,
                         other => {
                             return Err(ParseError {
                                 message: format!("unsupported cast target `::{other}`"),
@@ -5735,6 +7834,153 @@ impl Parser {
     /// `EXTRACT(<field> FROM <source>)`. The dispatching `parse_atom`
     /// has already consumed the `EXTRACT` token before calling us —
     /// we pick up at the opening `(`.
+    /// v7.17.0 Phase 2.2 — MySQL `MATCH(col [, col ...]) AGAINST
+    /// (expr [IN BOOLEAN MODE | IN NATURAL LANGUAGE MODE
+    /// [WITH QUERY EXPANSION]])`. Rewritten in-place to a
+    /// per-column OR-fold of
+    /// `to_tsvector('simple', col) @@ plainto_tsquery('simple',
+    /// term)` so the existing FTS evaluator handles semantics.
+    ///
+    /// The mode modifier is accepted-and-ignored at v7.17 — all
+    /// modes map to the same `plainto_tsquery` rewrite. Boolean-
+    /// mode operators (`+foo -bar`) would need their own parser
+    /// (Phase 2.2c); customers who hit them today already get a
+    /// correct lexeme-match against the bare term, only without
+    /// the +/- precedence the customer asked for.
+    fn parse_match_against_atom(&mut self) -> Result<Expr, ParseError> {
+        // Already at `MATCH`-consumed position; the dispatcher
+        // confirmed the next token is `(`.
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after MATCH, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut cols: Vec<Expr> = Vec::new();
+        loop {
+            cols.push(self.parse_expr(0)?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => break,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected ',' or ')' in MATCH column list, got {other:?}"
+                    )));
+                }
+            }
+        }
+        self.advance(); // ')'
+        // Expect AGAINST.
+        match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("against") => {
+                self.advance();
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected AGAINST after MATCH column list, got {other:?}"
+                )));
+            }
+        }
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after AGAINST, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Read AGAINST's argument as a single primary token —
+        // string literal, placeholder, or column-ref ident. We
+        // can't call `parse_expr` / `parse_unary` here because
+        // the postfix chain inside `parse_atom` would greedily
+        // fold a trailing `IN BOOLEAN MODE` as `expr IN (...)`
+        // and fail at "expected '(' after IN". Customers always
+        // write a literal or bound parameter in AGAINST, so this
+        // restriction is non-blocking; the error path explains
+        // the limit if a more complex expression shows up.
+        let term = match self.advance() {
+            Token::String(s) => Expr::Literal(crate::ast::Literal::String(s)),
+            Token::Placeholder(n) => Expr::Placeholder(n),
+            Token::Ident(s) | Token::QuotedIdent(s) => Expr::Column(crate::ast::ColumnName {
+                qualifier: None,
+                name: s,
+            }),
+            other => {
+                return Err(self.err(alloc::format!(
+                    "MATCH ... AGAINST(<term>) expects a string literal, \
+                     bound parameter, or column ref, got {other:?}"
+                )));
+            }
+        };
+        // Optional mode tail — accept-and-ignore at v7.17:
+        //   IN NATURAL LANGUAGE MODE [WITH QUERY EXPANSION]
+        //   IN BOOLEAN MODE
+        //   WITH QUERY EXPANSION
+        loop {
+            match self.peek() {
+                // IN lexes as a reserved Token::In, not an ident,
+                // so it gets its own arm.
+                Token::In => {
+                    self.advance();
+                }
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("natural")
+                        || s.eq_ignore_ascii_case("language")
+                        || s.eq_ignore_ascii_case("boolean")
+                        || s.eq_ignore_ascii_case("mode")
+                        || s.eq_ignore_ascii_case("with")
+                        || s.eq_ignore_ascii_case("query")
+                        || s.eq_ignore_ascii_case("expansion") =>
+                {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close AGAINST, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // Build per-column `to_tsvector('simple', col) @@
+        // plainto_tsquery('simple', term)` and OR-fold.
+        let simple_lit = || Expr::Literal(crate::ast::Literal::String(String::from("simple")));
+        let plainto = Expr::FunctionCall {
+            name: String::from("plainto_tsquery"),
+            args: alloc::vec![simple_lit(), term.clone()],
+        };
+        let mut folded: Option<Expr> = None;
+        for col in cols {
+            let to_tsv = Expr::FunctionCall {
+                name: String::from("to_tsvector"),
+                args: alloc::vec![simple_lit(), col],
+            };
+            let leaf = Expr::Binary {
+                lhs: Box::new(to_tsv),
+                op: crate::ast::BinOp::TsMatch,
+                rhs: Box::new(plainto.clone()),
+            };
+            folded = Some(match folded {
+                None => leaf,
+                Some(prev) => Expr::Binary {
+                    lhs: Box::new(prev),
+                    op: crate::ast::BinOp::Or,
+                    rhs: Box::new(leaf),
+                },
+            });
+        }
+        match folded {
+            Some(e) => Ok(e),
+            None => Err(self.err(String::from(
+                "MATCH(...) AGAINST(...) requires at least one column",
+            ))),
+        }
+    }
+
     fn parse_extract_atom(&mut self) -> Result<Expr, ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after EXTRACT, got {:?}", self.peek())));
@@ -6208,6 +8454,14 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // arithmetic, tighter than AND / OR). PG places `@@` at
         // the same precedence as `=` / `<`, so we follow.
         Token::TsMatch => (BinOp::TsMatch, 4),
+        // v7.17.0 Phase 3.P0-47 — PG INET / CIDR containment + overlap.
+        // PG places these at the comparison rung (same level as `=`),
+        // so we follow.
+        Token::InetContainedBy => (BinOp::InetContainedBy, 4),
+        Token::InetContainedByEq => (BinOp::InetContainedByEq, 4),
+        Token::InetContains => (BinOp::InetContains, 4),
+        Token::InetContainsEq => (BinOp::InetContainsEq, 4),
+        Token::InetOverlap => (BinOp::InetOverlap, 4),
         _ => return None,
     };
     Some(pair)
@@ -6218,6 +8472,45 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
 // purpose. i64 → f32 loses precision past 2^24, f64 → f32 loses precision
 // past ~15 decimal digits — both are acceptable for a fixed-precision
 // pgvector column.
+/// v7.17.0 Phase 1.3 — words that would otherwise be eaten as an
+/// implicit table alias and break trailing clauses. WITH lands
+/// here so `… FROM t WITH NO DATA` doesn't consume WITH as the
+/// alias for `t`; same for ON / WHERE / HAVING / GROUP / ORDER /
+/// LIMIT / OFFSET / UNION / EXCEPT / INTERSECT / RETURNING / SET
+/// / VALUES / FOR / LATERAL — all of which would otherwise be
+/// silently swallowed by `parse_optional_alias`.
+fn is_alias_stopword(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "with"
+            | "on"
+            | "where"
+            | "having"
+            | "group"
+            | "order"
+            | "limit"
+            | "offset"
+            | "union"
+            | "except"
+            | "intersect"
+            | "returning"
+            | "set"
+            | "values"
+            | "for"
+            | "lateral"
+            | "left"
+            | "right"
+            | "inner"
+            | "outer"
+            | "full"
+            | "cross"
+            | "join"
+            | "natural"
+            | "using"
+            | "fetch"
+    )
+}
+
 fn extract_numeric_literal(e: &Expr) -> Option<f32> {
     match e {
         Expr::Literal(Literal::Integer(n)) => Some(*n as f32),
@@ -6298,6 +8591,11 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "bytea" | "bytes" => ColumnTypeName::Bytes,
         "tsvector" => ColumnTypeName::TsVector,
         "tsquery" => ColumnTypeName::TsQuery,
+        "uuid" => ColumnTypeName::Uuid,
+        "time" => ColumnTypeName::Time,
+        "year" => ColumnTypeName::Year,
+        "timetz" => ColumnTypeName::TimeTz,
+        "money" => ColumnTypeName::Money,
         _ => return None,
     })
 }

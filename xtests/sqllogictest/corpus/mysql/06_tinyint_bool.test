@@ -1,0 +1,44 @@
+# v7.17.0 Phase 4.3 — MySQL TINYINT(1) → BOOL classification.
+# Every MySQL driver (JDBC tinyInt1isBit=true, PHP, .NET, sqlx)
+# maps TINYINT(1) to bit/bool. Pre-4.3 SPG classified it as
+# SmallInt (i16); now it classifies as BOOL.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, active TINYINT(1) NOT NULL)
+
+statement ok
+INSERT INTO t VALUES (1, true), (2, false)
+
+query II rowsort
+SELECT id, active::INT FROM t
+----
+1
+1
+2
+0
+
+# TINYINT with no width stays SmallInt (legacy semantics).
+statement ok
+CREATE TABLE small (id INT NOT NULL, count TINYINT NOT NULL)
+
+statement ok
+INSERT INTO small VALUES (1, 42)
+
+query II
+SELECT id, count FROM small
+----
+1
+42
+
+# TINYINT(N) for N ≠ 1 stays SmallInt.
+statement ok
+CREATE TABLE level (id INT NOT NULL, lvl TINYINT(3) NOT NULL)
+
+statement ok
+INSERT INTO level VALUES (1, 5)
+
+query II
+SELECT id, lvl FROM level
+----
+1
+5

@@ -170,26 +170,79 @@ pub type SaltFn = fn() -> [u8; 16];
 /// `CancelToken::none()` is a no-op — used by the legacy `execute`
 /// and `execute_readonly` entry points so existing callers don't
 /// change.
+/// v7.17.0 Phase 2.3 — monotonic time source for deadline-aware
+/// cancellation (PG `statement_timeout`). Returns microseconds
+/// since some host-stable monotonic origin (typically the first
+/// call into `Instant::now()` on the server). The engine never
+/// calls `Instant::now()` directly so the crate stays `#![no_std]`.
+pub type MonotonicNowFn = fn() -> u64;
+
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    now_fn: MonotonicNowFn,
+    /// Absolute deadline in `now_fn()` units (microseconds).
+    deadline_us: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CancelToken<'a> {
     flag: Option<&'a core::sync::atomic::AtomicBool>,
+    // v7.17.0 Phase 2.3 — when set, every existing `cancel.check()`
+    // checkpoint also fires `EngineError::Cancelled` once
+    // `(now_fn)() >= deadline_us`. No new check sites, no thread
+    // spawn per query — the monotonic now-fn read is a vDSO
+    // `clock_gettime(CLOCK_MONOTONIC)` (~20ns) and only runs when
+    // the host actually wired a deadline (statement_timeout > 0).
+    deadline: Option<Deadline>,
 }
 
 impl<'a> CancelToken<'a> {
     #[must_use]
     pub const fn none() -> Self {
-        Self { flag: None }
+        Self {
+            flag: None,
+            deadline: None,
+        }
     }
 
     #[must_use]
     pub const fn from_flag(f: &'a core::sync::atomic::AtomicBool) -> Self {
-        Self { flag: Some(f) }
+        Self {
+            flag: Some(f),
+            deadline: None,
+        }
+    }
+
+    /// v7.17.0 Phase 2.3 — attach a monotonic deadline. `now_fn`
+    /// must return microseconds since a stable origin; the token
+    /// trips when `now_fn() >= deadline_us`. Compose with
+    /// `from_flag(...)` when both a watchdog flag and a per-statement
+    /// timeout are in play (e.g. server-wide `SPG_QUERY_TIMEOUT_MS`
+    /// plus session `statement_timeout`); the tighter of the two
+    /// wins by virtue of either signaling first.
+    #[must_use]
+    pub const fn with_deadline(mut self, now_fn: MonotonicNowFn, deadline_us: u64) -> Self {
+        self.deadline = Some(Deadline { now_fn, deadline_us });
+        self
     }
 
     #[must_use]
     pub fn is_cancelled(self) -> bool {
-        self.flag
+        if self
+            .flag
             .is_some_and(|f| f.load(core::sync::atomic::Ordering::Relaxed))
+        {
+            return true;
+        }
+        // Deadline check is the second branch so the "no timeout"
+        // hot path (`deadline: None`) elides the now-fn call —
+        // predicted-not-taken on the SLO INSERT loop.
+        if let Some(d) = self.deadline
+            && (d.now_fn)() >= d.deadline_us
+        {
+            return true;
+        }
+        false
     }
 
     /// Returns `Err(Cancelled)` if the token has been tripped.
@@ -716,6 +769,16 @@ fn render_data_type(ty: DataType) -> String {
         DataType::BigIntArray => "BIGINT[]".into(),
         DataType::TsVector => "TSVECTOR".into(),
         DataType::TsQuery => "TSQUERY".into(),
+        DataType::Uuid => "UUID".into(),
+        DataType::Time => "TIME".into(),
+        DataType::Year => "YEAR".into(),
+        DataType::TimeTz => "TIMETZ".into(),
+        DataType::Money => "MONEY".into(),
+        DataType::Range(k) => k.keyword().into(),
+        DataType::Hstore => "HSTORE".into(),
+        DataType::IntArray2D => "INT[][]".into(),
+        DataType::BigIntArray2D => "BIGINT[][]".into(),
+        DataType::TextArray2D => "TEXT[][]".into(),
     }
 }
 
@@ -731,6 +794,10 @@ pub struct ActivityRow {
     pub wait_event: String,
     pub elapsed_us: i64,
     pub in_transaction: bool,
+    /// v7.17 Phase 2.4 — startup-param `application_name` (or the
+    /// last value the client sent via `SET application_name = '...'`).
+    /// Empty when the client never declared one.
+    pub application_name: String,
 }
 
 /// v6.5.2 — provider callback type. Fresh snapshot returned each
@@ -1488,6 +1555,12 @@ impl Engine {
         let result = match stmt {
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::ShowTables => Ok(self.exec_show_tables()),
+            Statement::ShowDatabases => Ok(self.exec_show_databases()),
+            Statement::ShowCreateTable(name) => self.exec_show_create_table(&name),
+            Statement::ShowIndexes(name) => self.exec_show_indexes(&name),
+            Statement::ShowStatus => Ok(self.exec_show_status()),
+            Statement::ShowVariables => Ok(self.exec_show_variables()),
+            Statement::ShowProcesslist => Ok(self.exec_show_processlist()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
@@ -1652,8 +1725,21 @@ impl Engine {
     /// Pgwire's `Execute` (E) message after a `Bind` (B) lands here.
     pub fn execute_prepared(
         &mut self,
+        stmt: Statement,
+        params: &[Value],
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_prepared_with_cancel(stmt, params, CancelToken::none())
+    }
+
+    /// v7.17.0 Phase 2.3 — prepared-statement entry that honors a
+    /// caller-supplied `CancelToken`. Mirrors `execute_prepared`'s
+    /// `current_tx` save/restore so the extended-query path stays
+    /// transactionally consistent with the simple-query path.
+    pub fn execute_prepared_with_cancel(
+        &mut self,
         mut stmt: Statement,
         params: &[Value],
+        cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         substitute_placeholders(&mut stmt, params)?;
         // v7.16.0 — set `current_tx` for the duration of the
@@ -1668,7 +1754,7 @@ impl Engine {
         // first transaction-visibility test.
         let saved = self.current_tx;
         self.current_tx = Some(IMPLICIT_TX);
-        let result = self.execute_stmt_with_cancel(stmt, CancelToken::none());
+        let result = self.execute_stmt_with_cancel(stmt, cancel);
         self.current_tx = saved;
         result
     }
@@ -1707,6 +1793,29 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.17.0 Phase 1.1 — pre-resolve nextval / currval /
+        // setval calls in the statement tree. Walks SELECT
+        // projection, INSERT VALUES, UPDATE SET, DELETE WHERE,
+        // and DEFAULT exprs; replaces sequence FunctionCall
+        // nodes with concrete Literal values minted against the
+        // catalog. This is the only place that mutates sequence
+        // state from a SELECT-shaped path (exec_select_cancel is
+        // `&self` and can't reach the catalog mutably).
+        //
+        // Fast-path: when no sequences exist anywhere in the
+        // catalog (the typical hot-path INSERT load), skip the
+        // walker entirely. Single map-emptiness check on the
+        // catalog beats walking every expression on every call.
+        let mut stmt = stmt;
+        // v7.17 dump-compat — the fast-path check
+        // `sequences().is_empty()` skips pre-resolve when no
+        // sequence exists in the *currently active* catalog
+        // snapshot. The committed catalog or the implicit-TX
+        // catalog may legitimately disagree on this between
+        // CREATE SEQUENCE and a later setval(): always run the
+        // resolver — the walk is O(expr-count) and dwarfed by
+        // the parse cost we just paid.
+        self.pre_resolve_sequence_calls_in_statement(&mut stmt)?;
         let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             // v7.9.15 — CREATE EXTENSION is a no-op on SPG. Returns
@@ -1739,6 +1848,7 @@ impl Engine {
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Update(s) => self.exec_update_cancel(&s, cancel),
             Statement::Delete(s) => self.exec_delete_cancel(&s, cancel),
+            Statement::Merge(s) => self.exec_merge_cancel(&s, cancel),
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
@@ -1747,6 +1857,12 @@ impl Engine {
             Statement::RollbackToSavepoint(name) => self.exec_rollback_to_savepoint(&name),
             Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(&name),
             Statement::ShowTables => Ok(self.exec_show_tables()),
+            Statement::ShowDatabases => Ok(self.exec_show_databases()),
+            Statement::ShowCreateTable(name) => self.exec_show_create_table(&name),
+            Statement::ShowIndexes(name) => self.exec_show_indexes(&name),
+            Statement::ShowStatus => Ok(self.exec_show_status()),
+            Statement::ShowVariables => Ok(self.exec_show_variables()),
+            Statement::ShowProcesslist => Ok(self.exec_show_processlist()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
@@ -1810,6 +1926,36 @@ impl Engine {
             } => self.exec_drop_trigger(&name, &table, if_exists),
             Statement::DropFunction { name, if_exists } => {
                 self.exec_drop_function(&name, if_exists)
+            }
+            Statement::CreateSequence(s) => self.exec_create_sequence(s),
+            Statement::AlterSequence(s) => self.exec_alter_sequence(s),
+            Statement::DropSequence { names, if_exists } => {
+                self.exec_drop_sequence(&names, if_exists)
+            }
+            Statement::CreateView(s) => self.exec_create_view(s),
+            Statement::DropView { names, if_exists } => {
+                self.exec_drop_view(&names, if_exists)
+            }
+            Statement::CreateMaterializedView(s) => self.exec_create_materialized_view(s),
+            Statement::RefreshMaterializedView { name, with_data } => {
+                self.exec_refresh_materialized_view(&name, with_data)
+            }
+            Statement::DropMaterializedView { names, if_exists } => {
+                self.exec_drop_materialized_view(&names, if_exists)
+            }
+            Statement::CreateType(s) => self.exec_create_type(s),
+            Statement::DropType { names, if_exists } => {
+                self.exec_drop_type(&names, if_exists)
+            }
+            Statement::CreateDomain(s) => self.exec_create_domain(s),
+            Statement::DropDomain { names, if_exists } => {
+                self.exec_drop_domain(&names, if_exists)
+            }
+            Statement::CreateSchema { name, if_not_exists } => {
+                self.exec_create_schema(name, if_not_exists)
+            }
+            Statement::DropSchema { names, if_exists } => {
+                self.exec_drop_schema(&names, if_exists)
             }
             Statement::ResetParameter(target) => {
                 match target {
@@ -2183,6 +2329,7 @@ impl Engine {
             ColumnSchema::new("wait_event", DataType::Text, false),
             ColumnSchema::new("elapsed_us", DataType::BigInt, false),
             ColumnSchema::new("in_transaction", DataType::Bool, false),
+            ColumnSchema::new("application_name", DataType::Text, false),
         ];
         let rows: Vec<Row> = self
             .activity_provider
@@ -2198,6 +2345,7 @@ impl Engine {
                     Value::Text(r.wait_event),
                     Value::BigInt(r.elapsed_us),
                     Value::Bool(r.in_transaction),
+                    Value::Text(r.application_name),
                 ])
             })
             .collect();
@@ -2877,6 +3025,873 @@ impl Engine {
         })
     }
 
+    /// v7.17.0 — `CREATE SEQUENCE` engine path. Resolves
+    /// `min_value` / `max_value` / `start` against PG defaults
+    /// when omitted, then installs the SequenceDef in the catalog.
+    fn exec_create_sequence(
+        &mut self,
+        s: spg_sql::ast::CreateSequenceStatement,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::{SeqBound, SequenceDataType as AstDt};
+        use spg_storage::{SequenceDataType, SequenceDef};
+        let dt = match s.data_type {
+            None => SequenceDataType::BigInt,
+            Some(AstDt::SmallInt) => SequenceDataType::SmallInt,
+            Some(AstDt::Int) => SequenceDataType::Int,
+            Some(AstDt::BigInt) => SequenceDataType::BigInt,
+        };
+        let increment = s.options.increment.unwrap_or(1);
+        if increment == 0 {
+            return Err(EngineError::Unsupported(
+                "INCREMENT must not be zero".into(),
+            ));
+        }
+        let (def_min, def_max) = dt.default_bounds(increment > 0);
+        let min_value = match s.options.min_value {
+            None | Some(SeqBound::NoBound) => def_min,
+            Some(SeqBound::Value(n)) => n,
+        };
+        let max_value = match s.options.max_value {
+            None | Some(SeqBound::NoBound) => def_max,
+            Some(SeqBound::Value(n)) => n,
+        };
+        if min_value > max_value {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "MINVALUE ({min_value}) must be <= MAXVALUE ({max_value})"
+            )));
+        }
+        let start = s
+            .options
+            .start
+            .unwrap_or(if increment > 0 { min_value } else { max_value });
+        if start < min_value || start > max_value {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "START WITH ({start}) is outside MINVALUE..MAXVALUE ({min_value}..{max_value})"
+            )));
+        }
+        let cache = s.options.cache.unwrap_or(1);
+        if cache < 1 {
+            return Err(EngineError::Unsupported(
+                "CACHE must be >= 1".into(),
+            ));
+        }
+        let cycle = s.options.cycle.unwrap_or(false);
+        let owned_by = match s.options.owned_by {
+            None | Some(spg_sql::ast::SequenceOwnedBy::None) => None,
+            Some(spg_sql::ast::SequenceOwnedBy::Column { table, column }) => {
+                Some((table, column))
+            }
+        };
+        let def = SequenceDef {
+            name: s.name.clone(),
+            data_type: dt,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cache,
+            cycle,
+            owned_by,
+            last_value: start,
+            is_called: false,
+        };
+        self.active_catalog_mut()
+            .create_sequence(def, s.if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 — `ALTER SEQUENCE` engine path. Re-uses the catalog
+    /// `alter_sequence` merge helper.
+    fn exec_alter_sequence(
+        &mut self,
+        s: spg_sql::ast::AlterSequenceStatement,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::SeqBound;
+        let cat = self.active_catalog_mut();
+        if !cat.sequences().contains_key(&s.name) {
+            if s.if_exists {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("sequence {:?} does not exist", s.name),
+            )));
+        }
+        let min_value = match s.options.min_value {
+            None => None,
+            Some(SeqBound::NoBound) => None, // NO MINVALUE → keep current
+            Some(SeqBound::Value(n)) => Some(n),
+        };
+        let max_value = match s.options.max_value {
+            None => None,
+            Some(SeqBound::NoBound) => None,
+            Some(SeqBound::Value(n)) => Some(n),
+        };
+        let owned_by = s.options.owned_by.map(|ob| match ob {
+            spg_sql::ast::SequenceOwnedBy::None => None,
+            spg_sql::ast::SequenceOwnedBy::Column { table, column } => {
+                Some((table, column))
+            }
+        });
+        cat.alter_sequence(
+            &s.name,
+            s.options.increment,
+            min_value,
+            max_value,
+            s.options.start,
+            s.options.restart,
+            s.options.cache,
+            s.options.cycle,
+            owned_by,
+        )
+        .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.1 — walk a Statement tree and pre-resolve
+    /// any sequence FunctionCall nodes inside its Expr slots.
+    /// Delegates per-statement-kind: SELECT projection +
+    /// WHERE, INSERT VALUES, UPDATE SET, DELETE WHERE.
+    fn pre_resolve_sequence_calls_in_statement(
+        &mut self,
+        stmt: &mut Statement,
+    ) -> Result<(), EngineError> {
+        match stmt {
+            Statement::Select(s) => self.pre_resolve_sequence_calls_in_select(s),
+            Statement::Insert(s) => {
+                for tuple in &mut s.rows {
+                    for cell in tuple.iter_mut() {
+                        self.resolve_sequence_calls_in_expr(cell)?;
+                    }
+                }
+                Ok(())
+            }
+            Statement::Update(s) => {
+                for (_col, expr) in &mut s.assignments {
+                    self.resolve_sequence_calls_in_expr(expr)?;
+                }
+                if let Some(w) = &mut s.where_ {
+                    self.resolve_sequence_calls_in_expr(w)?;
+                }
+                Ok(())
+            }
+            Statement::Delete(s) => {
+                if let Some(w) = &mut s.where_ {
+                    self.resolve_sequence_calls_in_expr(w)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn pre_resolve_sequence_calls_in_select(
+        &mut self,
+        s: &mut spg_sql::ast::SelectStatement,
+    ) -> Result<(), EngineError> {
+        for item in &mut s.items {
+            match item {
+                spg_sql::ast::SelectItem::Expr { expr, .. } => {
+                    self.resolve_sequence_calls_in_expr(expr)?;
+                }
+                spg_sql::ast::SelectItem::Wildcard => {}
+            }
+        }
+        if let Some(w) = &mut s.where_ {
+            self.resolve_sequence_calls_in_expr(w)?;
+        }
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.1 — walk an Expr tree and pre-resolve any
+    /// `nextval(name)` / `currval(name)` / `setval(name, value[,
+    /// is_called])` FunctionCall nodes by calling the catalog and
+    /// replacing the node with the resulting `Expr::Literal`.
+    /// Used by INSERT VALUES / UPDATE SET / DEFAULT eval so the
+    /// row-eval path sees pre-computed sequence values instead of
+    /// needing mutable catalog access mid-eval.
+    #[allow(clippy::too_many_lines)]
+    fn resolve_sequence_calls_in_expr(
+        &mut self,
+        expr: &mut Expr,
+    ) -> Result<(), EngineError> {
+        match expr {
+            Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => Ok(()),
+            Expr::FunctionCall { name, args } => {
+                // Descend first so nested calls — e.g.
+                // setval('seq', currval('other')) — resolve
+                // innermost-first.
+                for a in args.iter_mut() {
+                    self.resolve_sequence_calls_in_expr(a)?;
+                }
+                let lc = name.to_ascii_lowercase();
+                if lc == "nextval" || lc == "currval" || lc == "setval" {
+                    let v = self.eval_sequence_call(&lc, args)?;
+                    *expr = Expr::Literal(value_to_literal(v));
+                }
+                Ok(())
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.resolve_sequence_calls_in_expr(lhs)?;
+                self.resolve_sequence_calls_in_expr(rhs)
+            }
+            Expr::Unary { expr, .. } => self.resolve_sequence_calls_in_expr(expr),
+            Expr::Cast { expr, .. } => self.resolve_sequence_calls_in_expr(expr),
+            Expr::IsNull { expr, .. } => self.resolve_sequence_calls_in_expr(expr),
+            Expr::Like { expr, pattern, .. } => {
+                self.resolve_sequence_calls_in_expr(expr)?;
+                self.resolve_sequence_calls_in_expr(pattern)
+            }
+            Expr::Extract { source, .. } => self.resolve_sequence_calls_in_expr(source),
+            Expr::Array(items) => {
+                for it in items.iter_mut() {
+                    self.resolve_sequence_calls_in_expr(it)?;
+                }
+                Ok(())
+            }
+            // Window / subquery / etc — sequence calls inside these
+            // are uncommon and require separate row-eval; leave
+            // untouched for now and rely on the eval-time error
+            // (no sequence_resolver attached).
+            _ => Ok(()),
+        }
+    }
+
+    /// v7.17.0 Phase 1.1 — evaluate a single nextval/currval/
+    /// setval call. `args` are already pre-resolved Expr nodes
+    /// (literals) — we extract their constant values.
+    fn eval_sequence_call(
+        &mut self,
+        op: &str,
+        args: &[Expr],
+    ) -> Result<Value, EngineError> {
+        if args.is_empty() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "{op}() takes at least one argument"
+            )));
+        }
+        let seq_name = match &args[0] {
+            Expr::Literal(spg_sql::ast::Literal::String(s)) => {
+                // v7.17 dump-compat — pg_dump emits sequence
+                // names schema-qualified (`'public.posts_id_seq'`).
+                // SPG is single-schema; strip a leading
+                // `public.` / `pg_catalog.` so the catalog lookup
+                // matches the bare-name CREATE SEQUENCE used.
+                let trimmed = s
+                    .strip_prefix("public.")
+                    .or_else(|| s.strip_prefix("pg_catalog."))
+                    .unwrap_or(s);
+                trimmed.to_string()
+            }
+            // v7.17 dump-compat — pg_dump also emits
+            // `nextval('public.posts_id_seq'::regclass)`
+            // where the cast wraps the literal. Peel the cast
+            // and continue.
+            Expr::Cast { expr, .. } => {
+                if let Expr::Literal(spg_sql::ast::Literal::String(s)) = expr.as_ref() {
+                    let trimmed = s
+                        .strip_prefix("public.")
+                        .or_else(|| s.strip_prefix("pg_catalog."))
+                        .unwrap_or(s);
+                    trimmed.to_string()
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "{op}() first argument must be a literal sequence name"
+                    )));
+                }
+            }
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "{op}() first argument must be a literal sequence name, got {other:?}"
+                )));
+            }
+        };
+        match op {
+            "nextval" => {
+                let v = self
+                    .active_catalog_mut()
+                    .sequence_next_value(&seq_name)
+                    .map_err(EngineError::Storage)?;
+                Ok(Value::BigInt(v))
+            }
+            "currval" => {
+                let v = self
+                    .active_catalog()
+                    .sequence_current_value(&seq_name)
+                    .map_err(EngineError::Storage)?;
+                Ok(Value::BigInt(v))
+            }
+            "setval" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "setval() takes 2 or 3 arguments, got {}",
+                        args.len()
+                    )));
+                }
+                let value = match &args[1] {
+                    Expr::Literal(spg_sql::ast::Literal::Integer(n)) => *n,
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "setval() value argument must be a literal integer, got {other:?}"
+                        )));
+                    }
+                };
+                let is_called = if args.len() == 3 {
+                    match &args[2] {
+                        Expr::Literal(spg_sql::ast::Literal::Bool(b)) => *b,
+                        other => {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "setval() is_called argument must be a literal BOOL, got {other:?}"
+                            )));
+                        }
+                    }
+                } else {
+                    true
+                };
+                let v = self
+                    .active_catalog_mut()
+                    .sequence_set_value(&seq_name, value, is_called)
+                    .map_err(EngineError::Storage)?;
+                Ok(Value::BigInt(v))
+            }
+            other => Err(EngineError::Unsupported(alloc::format!(
+                "unknown sequence op {other:?}"
+            ))),
+        }
+    }
+
+    /// v7.17.0 Phase 1.2 — find every catalog VIEW referenced in
+    /// the SELECT's FROM / JOIN graph, re-parse each view's body
+    /// source, and prepend it as a synthetic CTE on the
+    /// returned SelectStatement. Returns `None` when no view
+    /// references are found (caller proceeds with the original
+    /// statement); returns `Some(rewritten)` otherwise (caller
+    /// re-runs exec_select_cancel on the rewritten form so the
+    /// regular CTE materialiser handles it).
+    fn expand_views_in_select(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<SelectStatement>, EngineError> {
+        let cat = self.active_catalog();
+        let mut referenced: Vec<String> = Vec::new();
+        if let Some(from) = &stmt.from {
+            collect_view_refs(&from.primary, cat, &mut referenced);
+            for j in &from.joins {
+                collect_view_refs(&j.table, cat, &mut referenced);
+            }
+        }
+        // Don't expand a view name that's already shadowed by a
+        // CTE on the same SELECT — the CTE wins per PG.
+        referenced.retain(|n| !stmt.ctes.iter().any(|c| c.name == *n));
+        if referenced.is_empty() {
+            return Ok(None);
+        }
+        let mut new_ctes: Vec<spg_sql::ast::Cte> = Vec::with_capacity(referenced.len());
+        for name in &referenced {
+            let view = cat.views().get(name).ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "view {name:?} disappeared mid-expansion"
+                )))
+            })?;
+            let parsed = spg_sql::parser::parse_statement(&view.body).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "view {name:?} body re-parse failed: {e}"
+                ))
+            })?;
+            let Statement::Select(body) = parsed else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "view {name:?} body is not a SELECT (catalog corruption)"
+                )));
+            };
+            new_ctes.push(spg_sql::ast::Cte {
+                name: name.clone(),
+                body,
+                recursive: false,
+                column_overrides: view.columns.clone(),
+            });
+        }
+        let mut out = stmt.clone();
+        // Prepend so view CTEs are visible to caller-supplied CTEs.
+        new_ctes.extend(out.ctes.into_iter());
+        out.ctes = new_ctes;
+        Ok(Some(out))
+    }
+
+    /// v7.17.0 Phase 1.2 — `CREATE VIEW` engine path. Stores the
+    /// Display-rendered body verbatim in the catalog; SELECT-from-
+    /// view at exec time re-parses + prepends as a synthetic CTE.
+    fn exec_create_view(
+        &mut self,
+        s: spg_sql::ast::CreateViewStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Render the SELECT body to canonical form so the catalog
+        // round-trips a deterministic source (no whitespace /
+        // comment surprises in the on-disk snapshot).
+        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body));
+        let def = spg_storage::ViewDef {
+            name: s.name.clone(),
+            columns: s.columns,
+            body: body_repr,
+        };
+        self.active_catalog_mut()
+            .create_view(def, s.or_replace, s.if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.4 — `CREATE TYPE name AS ENUM (…)` engine
+    /// path. Registers the enum in the catalog with order-
+    /// preserving labels. PG semantics: CREATE TYPE errors if the
+    /// name is taken (no IF NOT EXISTS).
+    fn exec_create_type(
+        &mut self,
+        s: spg_sql::ast::CreateTypeStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Name-collision check against tables / sequences / views /
+        // materialized views.
+        let cat = self.active_catalog();
+        if cat.get(&s.name).is_some() {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing table", s.name),
+            )));
+        }
+        if cat.sequences().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing sequence", s.name),
+            )));
+        }
+        if cat.views().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing view", s.name),
+            )));
+        }
+        let def = match s.kind {
+            spg_sql::ast::TypeKind::Enum { labels } => {
+                if labels.is_empty() {
+                    return Err(EngineError::Unsupported(
+                        "CREATE TYPE … AS ENUM requires at least one label".into(),
+                    ));
+                }
+                // Reject duplicate labels per PG.
+                for i in 0..labels.len() {
+                    for j in (i + 1)..labels.len() {
+                        if labels[i] == labels[j] {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "CREATE TYPE {:?}: duplicate ENUM label {:?}",
+                                s.name,
+                                labels[i]
+                            )));
+                        }
+                    }
+                }
+                spg_storage::EnumDef {
+                    name: s.name.clone(),
+                    labels,
+                }
+            }
+        };
+        self.active_catalog_mut()
+            .create_enum_type(def)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.5 — `CREATE DOMAIN name AS base [DEFAULT
+    /// expr] [NOT NULL] [CHECK (expr)]*` engine path. Stores the
+    /// base type + Display-rendered CHECK / DEFAULT sources so
+    /// INSERT/UPDATE on bound columns can re-eval the checks.
+    fn exec_create_domain(
+        &mut self,
+        s: spg_sql::ast::CreateDomainStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let cat = self.active_catalog();
+        if cat.domain_types().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("domain {:?} already exists", s.name),
+            )));
+        }
+        if cat.get(&s.name).is_some()
+            || cat.sequences().contains_key(&s.name)
+            || cat.views().contains_key(&s.name)
+            || cat.enum_types().contains_key(&s.name)
+        {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "domain {:?} would shadow an existing object",
+                    s.name
+                ),
+            )));
+        }
+        let base_type = column_type_to_data_type(s.base_type);
+        let default = s.default.as_ref().map(|e| alloc::format!("{e}"));
+        let checks = s
+            .checks
+            .iter()
+            .map(|e| alloc::format!("{e}"))
+            .collect::<Vec<_>>();
+        let def = spg_storage::DomainDef {
+            name: s.name.clone(),
+            base_type,
+            nullable: !s.not_null,
+            default,
+            checks,
+        };
+        self.active_catalog_mut()
+            .create_domain_type(def)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.5 — `DROP DOMAIN [IF EXISTS] names`.
+    fn exec_drop_domain(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_domain_type(name);
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("domain {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.6 — `CREATE SCHEMA [IF NOT EXISTS] name`.
+    /// Registers the schema in the catalog. Schema-qualified
+    /// table references continue to strip the prefix at lookup
+    /// time (prefix routing, not isolation — see project-next-
+    /// docket for the v7.18+ real-isolation tracking).
+    fn exec_create_schema(
+        &mut self,
+        name: String,
+        if_not_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        self.active_catalog_mut()
+            .create_schema(name, if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.6 — `DROP SCHEMA [IF EXISTS] names`.
+    /// Built-in schemas always reject the drop with a clear
+    /// error.
+    fn exec_drop_schema(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self
+                .active_catalog_mut()
+                .drop_schema(name)
+                .map_err(EngineError::Storage)?;
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("schema {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.4 — `DROP TYPE [IF EXISTS] names`. Only
+    /// ENUM types are catalogued today; other types silently
+    /// no-op even outside IF EXISTS to mirror the prior
+    /// "everything's text" lax stance.
+    fn exec_drop_type(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_enum_type(name);
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("type {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW` engine path.
+    /// Materialises the body at CREATE time (unless WITH NO DATA),
+    /// stores the result as a regular `Table`, and registers the
+    /// body source in the catalog so REFRESH can re-run it.
+    fn exec_create_materialized_view(
+        &mut self,
+        s: spg_sql::ast::CreateMaterializedViewStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Name-collision check (table / view / sequence / mat-view).
+        let cat = self.active_catalog();
+        if cat.materialized_views().contains_key(&s.name) || cat.get(&s.name).is_some() {
+            if s.if_not_exists {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} already exists",
+                    s.name
+                ),
+            )));
+        }
+        if cat.views().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} would shadow an existing view",
+                    s.name
+                ),
+            )));
+        }
+        if cat.sequences().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} would shadow an existing sequence",
+                    s.name
+                ),
+            )));
+        }
+        // Render the body to canonical form for the registry.
+        let body_repr = alloc::format!(
+            "{}",
+            spg_sql::ast::Statement::Select(s.body.clone())
+        );
+        // Execute the body to learn the columns. With WITH DATA we
+        // also materialise the rows; with WITH NO DATA we only need
+        // the schema, so re-use a LIMIT 0 wrap to keep the column
+        // inference path uniform without paying for the rows.
+        let result = self.exec_select_cancel(&s.body, CancelToken::none())?;
+        let (mut cols, rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CREATE MATERIALIZED VIEW body did not return rows: {other:?}"
+                )));
+            }
+        };
+        // Apply the column-rename list per PG semantics.
+        if !s.columns.is_empty() {
+            if s.columns.len() != cols.len() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CREATE MATERIALIZED VIEW {:?}: column list has {} names but body returns {}",
+                    s.name,
+                    s.columns.len(),
+                    cols.len()
+                )));
+            }
+            for (c, name) in cols.iter_mut().zip(s.columns.iter()) {
+                c.name.clone_from(name);
+            }
+        }
+        // Promote any synthetic-Text projections to their actual
+        // observed types so the backing table accepts the rows.
+        cols = infer_column_types(&cols, &rows);
+        let schema = spg_storage::TableSchema::new(s.name.clone(), cols);
+        let cat = self.active_catalog_mut();
+        cat.create_table(schema).map_err(EngineError::Storage)?;
+        if s.with_data {
+            let table = cat
+                .get_mut(&s.name)
+                .expect("just-created materialized-view backing table must exist");
+            for row in rows {
+                table.insert(row).map_err(EngineError::Storage)?;
+            }
+        }
+        cat.register_materialized_view(s.name.clone(), body_repr);
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `REFRESH MATERIALIZED VIEW name [WITH
+    /// [NO] DATA]`. Looks up the source, re-runs it, replaces the
+    /// backing table's rows.
+    fn exec_refresh_materialized_view(
+        &mut self,
+        name: &str,
+        with_data: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let source = self
+            .active_catalog()
+            .materialized_views()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "materialized view {name:?} does not exist"
+                )))
+            })?;
+        // Wipe the existing rows first (PG truncates the matview
+        // and rebuilds; we approximate with an empty INSERT loop).
+        {
+            let cat = self.active_catalog_mut();
+            let table = cat.get_mut(name).ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "materialized view {name:?} backing table missing"
+                )))
+            })?;
+            table.truncate();
+        }
+        if !with_data {
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: !self.in_transaction(),
+            });
+        }
+        let parsed = spg_sql::parser::parse_statement(&source).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body re-parse failed: {e}"
+            ))
+        })?;
+        let Statement::Select(body) = parsed else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body is not a SELECT (catalog corruption)"
+            )));
+        };
+        let rows = match self.exec_select_cancel(&body, CancelToken::none())? {
+            QueryResult::Rows { rows, .. } => rows,
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "REFRESH MATERIALIZED VIEW {name:?} body did not return rows: {other:?}"
+                )));
+            }
+        };
+        let cat = self.active_catalog_mut();
+        let table = cat
+            .get_mut(name)
+            .expect("backing table verified above");
+        let affected = rows.len();
+        for row in rows {
+            table.insert(row).map_err(EngineError::Storage)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `DROP MATERIALIZED VIEW [IF EXISTS]
+    /// names`. Drops the backing table + unregisters the source.
+    fn exec_drop_materialized_view(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self
+                .active_catalog_mut()
+                .drop_materialized_view_source(name);
+            if was_present {
+                // Drop the backing table too.
+                self.active_catalog_mut().drop_table(name);
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("materialized view {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.2 — `DROP VIEW [IF EXISTS] name [, name…]`.
+    fn exec_drop_view(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_view(name);
+            if !was_present && !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("view {name:?} does not exist"),
+                )));
+            }
+            if was_present {
+                removed += 1;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 — `DROP SEQUENCE [IF EXISTS] name [, name…]`.
+    fn exec_drop_sequence(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_sequence(name);
+            if !was_present && !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("sequence {name:?} does not exist"),
+                )));
+            }
+            if was_present {
+                removed += 1;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
     /// v4.4 `UPDATE <table> SET col = expr [, ...] [WHERE cond]`.
     /// Filter pass uses the same WHERE eval as `exec_select`. Per
     /// matched row, evaluate each RHS expression against the *old*
@@ -2941,6 +3956,10 @@ impl Engine {
         let ts_cfg: Option<String> = self
             .session_param("default_text_search_config")
             .map(String::from);
+        // v7.17.0 Phase 2.1 — snapshot the clock pointer before
+        // we hold the catalog mutably so ON UPDATE runtime
+        // overrides see the engine wall clock.
+        let clock_for_on_update = self.clock;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -2962,6 +3981,22 @@ impl Engine {
                     EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
                 })?;
             targets.push((pos, expr));
+        }
+        // v7.17.0 Phase 2.1 — for every column with an
+        // `ON UPDATE CURRENT_TIMESTAMP` binding that the caller
+        // did NOT explicitly set, schedule an automatic override.
+        // Reuses `eval_runtime_default_free` so the same
+        // canonical runtime-expression whitelist (now /
+        // current_timestamp / current_date / …) governs both
+        // DEFAULT and ON UPDATE.
+        let mut on_update_overrides: Vec<(usize, String)> = Vec::new();
+        for (i, col) in schema_cols.iter().enumerate() {
+            if targets.iter().any(|(p, _)| *p == i) {
+                continue;
+            }
+            if let Some(src) = &col.on_update_runtime {
+                on_update_overrides.push((i, src.clone()));
+            }
         }
         let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
             .with_default_text_search_config(ts_cfg.as_deref());
@@ -2987,8 +4022,20 @@ impl Engine {
             let mut new_vals = row.values.clone();
             for (pos, expr) in &targets {
                 let v = eval::eval_expr(expr, row, &ctx)?;
-                new_vals[*pos] =
+                let coerced =
                     coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
+                check_unsigned_range(&coerced, &schema_cols[*pos], *pos)?;
+                new_vals[*pos] = coerced;
+            }
+            // v7.17.0 Phase 2.1 — apply ON UPDATE overrides for
+            // any column the SET clause didn't touch.
+            for (pos, src) in &on_update_overrides {
+                let v = eval_runtime_default_free(
+                    src,
+                    schema_cols[*pos].ty,
+                    clock_for_on_update,
+                )?;
+                new_vals[*pos] = v;
             }
             planned.push((i, new_vals));
         }
@@ -3150,6 +4197,255 @@ impl Engine {
     /// v4.4 `DELETE FROM <table> [WHERE cond]`. Collects matching
     /// positions then delegates to `Table::delete_rows` (single index
     /// rebuild for the batch).
+    /// v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ `MERGE` execution.
+    ///
+    /// Semantics:
+    ///   * Resolve `target` and `source` tables (catalog reads).
+    ///   * Build a combined `(target_alias.col, source_alias.col)`
+    ///     schema so the ON / WHEN AND / SET / VALUES expressions
+    ///     resolve through the standard qualifier-aware resolver.
+    ///   * Pass 1: walk every source row × every target hot row,
+    ///     evaluate ON, then pick the first WHEN clause that fits
+    ///     (`Matched` if any target row matched, `NotMatched`
+    ///     otherwise; AND-condition must hold). Collect the action
+    ///     plan as `(deletes, updates, inserts)` so the apply pass
+    ///     reads the original target row state.
+    ///   * Pass 2: apply the plan against the target's mutable row
+    ///     vector. Deletes execute by index in descending order so
+    ///     earlier indices remain stable; updates next; inserts
+    ///     last (matching PG's "INSERT branch sees the post-delete
+    ///     state" behaviour for the common upsert shape).
+    ///
+    /// v7.17 simplifications (documented limitations):
+    ///   * No triggers / WAL plumbing (MVP); MERGE rows don't fire
+    ///     INSERT / UPDATE / DELETE row triggers in v7.17.
+    ///   * No cardinality check (PG-canonical: "MERGE command
+    ///     cannot affect row a second time" — SPG silently applies
+    ///     the last action for a target row covered twice).
+    ///   * Source must be a catalog-resolvable table (no subquery
+    ///     source); RETURNING / BY SOURCE / BY TARGET unsupported.
+    fn exec_merge_cancel(
+        &mut self,
+        stmt: &spg_sql::ast::MergeStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let target_alias = stmt
+            .target_alias
+            .clone()
+            .unwrap_or_else(|| stmt.target.clone());
+        let source_alias = stmt
+            .source_alias
+            .clone()
+            .unwrap_or_else(|| stmt.source.clone());
+        let (target_cols, target_rows_snapshot) = {
+            let t = self.active_catalog().get(&stmt.target).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.target.clone(),
+                })
+            })?;
+            (t.schema().columns.clone(), t.rows().iter().cloned().collect::<Vec<Row>>())
+        };
+        let (source_cols, source_rows) = {
+            let s = self.active_catalog().get(&stmt.source).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.source.clone(),
+                })
+            })?;
+            (s.schema().columns.clone(), s.rows().iter().cloned().collect::<Vec<Row>>())
+        };
+        // Composite schema: target_alias.col ... source_alias.col ...
+        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &target_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{target_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for col in &source_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{source_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        let combined_ctx = EvalContext::new(&combined_schema, None);
+        // Source-only context for WHEN NOT MATCHED actions (no
+        // matched target row exists — the source-side qualified
+        // columns must still resolve).
+        let mut source_only_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &target_cols {
+            source_only_schema.push(ColumnSchema::new(
+                alloc::format!("{target_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for col in &source_cols {
+            source_only_schema.push(ColumnSchema::new(
+                alloc::format!("{source_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        let source_only_ctx = EvalContext::new(&source_only_schema, None);
+        let target_arity = target_cols.len();
+        let source_arity = source_cols.len();
+
+        // Resolve INSERT column positions once (validate names).
+        // For each clause that's an INSERT, map column names → target positions.
+        let mut delete_indices: Vec<usize> = Vec::new();
+        let mut updates: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut inserts: Vec<Vec<Value>> = Vec::new();
+        let mut affected: usize = 0;
+
+        for (src_idx, src_row) in source_rows.iter().enumerate() {
+            if src_idx.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            // Find every matched target index (per the ON predicate).
+            let mut matched_targets: Vec<usize> = Vec::new();
+            for (t_idx, t_row) in target_rows_snapshot.iter().enumerate() {
+                let mut combined_vals = t_row.values.clone();
+                combined_vals.extend(src_row.values.iter().cloned());
+                let combined_row = Row::new(combined_vals);
+                let cond = eval::eval_expr(&stmt.on, &combined_row, &combined_ctx)?;
+                if matches!(cond, Value::Bool(true)) {
+                    matched_targets.push(t_idx);
+                }
+            }
+            let is_matched = !matched_targets.is_empty();
+            // Pick the first WHEN clause whose kind agrees with
+            // `is_matched` and whose AND condition (if any) holds.
+            // AND condition for MATCHED: evaluated against the
+            // first matched target row × source. For NOT MATCHED:
+            // evaluated with target side NULL-padded.
+            let fired_clause = stmt.clauses.iter().find(|c| {
+                let kind_ok = match c.matched {
+                    spg_sql::ast::MergeMatched::Matched => is_matched,
+                    spg_sql::ast::MergeMatched::NotMatched => !is_matched,
+                };
+                if !kind_ok {
+                    return false;
+                }
+                let Some(cond_expr) = &c.condition else {
+                    return true;
+                };
+                let row = if is_matched {
+                    let t = &target_rows_snapshot[matched_targets[0]];
+                    let mut vals = t.values.clone();
+                    vals.extend(src_row.values.iter().cloned());
+                    Row::new(vals)
+                } else {
+                    let mut vals: Vec<Value> = (0..target_arity).map(|_| Value::Null).collect();
+                    vals.extend(src_row.values.iter().cloned());
+                    Row::new(vals)
+                };
+                let ctx_ref = if is_matched { &combined_ctx } else { &source_only_ctx };
+                match eval::eval_expr(cond_expr, &row, ctx_ref) {
+                    Ok(Value::Bool(true)) => true,
+                    _ => false,
+                }
+            });
+            let Some(clause) = fired_clause else { continue };
+            match &clause.action {
+                spg_sql::ast::MergeAction::DoNothing => {}
+                spg_sql::ast::MergeAction::Delete => {
+                    for &t_idx in &matched_targets {
+                        if !delete_indices.contains(&t_idx) {
+                            delete_indices.push(t_idx);
+                            affected += 1;
+                        }
+                    }
+                }
+                spg_sql::ast::MergeAction::Update { assignments } => {
+                    // Pre-resolve SET targets to target column positions.
+                    let mut planned_sets: Vec<(usize, &Expr)> =
+                        Vec::with_capacity(assignments.len());
+                    for (col, expr) in assignments {
+                        let pos =
+                            target_cols.iter().position(|c| c.name == *col).ok_or_else(|| {
+                                EngineError::Eval(EvalError::ColumnNotFound {
+                                    name: col.clone(),
+                                })
+                            })?;
+                        planned_sets.push((pos, expr));
+                    }
+                    for &t_idx in &matched_targets {
+                        let t_row = &target_rows_snapshot[t_idx];
+                        let mut new_values = t_row.values.clone();
+                        let mut combined_vals = t_row.values.clone();
+                        combined_vals.extend(src_row.values.iter().cloned());
+                        let combined_row = Row::new(combined_vals);
+                        for (pos, expr) in &planned_sets {
+                            let raw = eval::eval_expr(expr, &combined_row, &combined_ctx)?;
+                            let coerced = coerce_value(
+                                raw,
+                                target_cols[*pos].ty,
+                                &target_cols[*pos].name,
+                                *pos,
+                            )?;
+                            new_values[*pos] = coerced;
+                        }
+                        updates.push((t_idx, new_values));
+                        affected += 1;
+                    }
+                }
+                spg_sql::ast::MergeAction::Insert { columns, values } => {
+                    // For INSERT NOT MATCHED, target side is NULL-padded.
+                    let mut vals: Vec<Value> = (0..target_arity).map(|_| Value::Null).collect();
+                    vals.extend(src_row.values.iter().cloned());
+                    let synth_row = Row::new(vals);
+                    let mut new_row_values: Vec<Value> =
+                        (0..target_arity).map(|_| Value::Null).collect();
+                    for (col, expr) in columns.iter().zip(values.iter()) {
+                        let pos =
+                            target_cols.iter().position(|c| c.name == *col).ok_or_else(|| {
+                                EngineError::Eval(EvalError::ColumnNotFound {
+                                    name: col.clone(),
+                                })
+                            })?;
+                        let raw = eval::eval_expr(expr, &synth_row, &source_only_ctx)?;
+                        let coerced =
+                            coerce_value(raw, target_cols[pos].ty, &target_cols[pos].name, pos)?;
+                        new_row_values[pos] = coerced;
+                    }
+                    inserts.push(new_row_values);
+                    affected += 1;
+                }
+            }
+        }
+        let _ = source_arity; // captured for symmetry; cancellation cost negligible.
+
+        // Apply the plan to the target table.
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.target)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.target.clone(),
+                })
+            })?;
+        // Apply updates first (in-place), then deletes (one batch),
+        // then inserts. The storage API uses `update_row(pos,
+        // new_values)`, `delete_rows(&[positions])`, and `insert(row)`.
+        for (idx, new_vals) in &updates {
+            table
+                .update_row(*idx, new_vals.clone())
+                .map_err(EngineError::Storage)?;
+        }
+        if !delete_indices.is_empty() {
+            table.delete_rows(&delete_indices);
+        }
+        for vals in inserts {
+            table.insert(Row::new(vals)).map_err(EngineError::Storage)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: affected > 0,
+        })
+    }
+
     fn exec_delete_cancel(
         &mut self,
         stmt: &spg_sql::ast::DeleteStatement,
@@ -3437,6 +4733,244 @@ impl Engine {
             .table_names()
             .into_iter()
             .map(|n| Row::new(alloc::vec![Value::Text(n)]))
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.17.0 Phase 3.P0-59 — `SHOW CREATE TABLE <t>`. Synthesise
+    /// a minimal MySQL-flavoured CREATE TABLE DDL from the
+    /// catalog's TableSchema so mysqldump round-trips load against
+    /// SPG without splitting init scripts.
+    fn exec_show_create_table(&self, name: &str) -> Result<QueryResult, EngineError> {
+        let t = self.active_catalog().get(name).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: name.into() })
+        })?;
+        let cols: Vec<String> = t
+            .schema()
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = render_data_type(c.ty);
+                let nullable = if c.nullable { "" } else { " NOT NULL" };
+                alloc::format!("  `{}` {}{}", c.name, ty, nullable)
+            })
+            .collect();
+        let mut body = cols.join(",\n");
+        // Append UNIQUE / PRIMARY KEY clauses.
+        for uc in &t.schema().uniqueness_constraints {
+            let col_names: Vec<String> = uc
+                .columns
+                .iter()
+                .map(|&p| {
+                    t.schema()
+                        .columns
+                        .get(p)
+                        .map_or_else(|| alloc::format!("col{p}"), |c| alloc::format!("`{}`", c.name))
+                })
+                .collect();
+            let kw = if uc.is_primary_key { "PRIMARY KEY" } else { "UNIQUE KEY" };
+            body.push_str(",\n  ");
+            body.push_str(&alloc::format!("{kw} ({})", col_names.join(", ")));
+        }
+        // Foreign keys.
+        for fk in &t.schema().foreign_keys {
+            let local: Vec<String> = fk
+                .local_columns
+                .iter()
+                .map(|&p| {
+                    t.schema()
+                        .columns
+                        .get(p)
+                        .map_or_else(|| alloc::format!("col{p}"), |c| alloc::format!("`{}`", c.name))
+                })
+                .collect();
+            let parent_cols: Vec<String> = if let Some(parent) = self.active_catalog().get(&fk.parent_table) {
+                fk.parent_columns
+                    .iter()
+                    .map(|&p| {
+                        parent
+                            .schema()
+                            .columns
+                            .get(p)
+                            .map_or_else(|| alloc::format!("col{p}"), |c| alloc::format!("`{}`", c.name))
+                    })
+                    .collect()
+            } else {
+                fk.parent_columns
+                    .iter()
+                    .map(|p| alloc::format!("col{p}"))
+                    .collect()
+            };
+            body.push_str(",\n  ");
+            body.push_str(&alloc::format!(
+                "FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                local.join(", "),
+                fk.parent_table,
+                parent_cols.join(", ")
+            ));
+        }
+        let ddl = alloc::format!(
+            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            name,
+            body
+        );
+        let columns = alloc::vec![
+            ColumnSchema::new("Table", DataType::Text, false),
+            ColumnSchema::new("Create Table", DataType::Text, false),
+        ];
+        let rows = alloc::vec![Row::new(alloc::vec![
+            Value::Text(name.into()),
+            Value::Text(ddl),
+        ])];
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
+    /// v7.17.0 Phase 3.P0-60 — `SHOW INDEXES FROM <t>`. MySQL
+    /// surface returns one row per (index × column) with 14
+    /// columns; v7.17 ships the columns admin probes actually
+    /// filter on: Table, Non_unique, Key_name, Seq_in_index,
+    /// Column_name, Null, Index_type.
+    fn exec_show_indexes(&self, name: &str) -> Result<QueryResult, EngineError> {
+        let t = self.active_catalog().get(name).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: name.into() })
+        })?;
+        let columns = alloc::vec![
+            ColumnSchema::new("Table", DataType::Text, false),
+            ColumnSchema::new("Non_unique", DataType::Int, false),
+            ColumnSchema::new("Key_name", DataType::Text, false),
+            ColumnSchema::new("Seq_in_index", DataType::Int, false),
+            ColumnSchema::new("Column_name", DataType::Text, false),
+            ColumnSchema::new("Null", DataType::Text, false),
+            ColumnSchema::new("Index_type", DataType::Text, false),
+        ];
+        let mut rows: Vec<Row> = Vec::new();
+        for idx in t.indices() {
+            let col = t
+                .schema()
+                .columns
+                .get(idx.column_position)
+                .map_or("?".into(), |c| c.name.clone());
+            let nullable = t
+                .schema()
+                .columns
+                .get(idx.column_position)
+                .map_or(true, |c| c.nullable);
+            rows.push(Row::new(alloc::vec![
+                Value::Text(name.into()),
+                Value::Int(i32::from(!idx.is_unique)),
+                Value::Text(idx.name.clone()),
+                Value::Int(1),
+                Value::Text(col),
+                Value::Text(if nullable { "YES".into() } else { String::new() }),
+                Value::Text("BTREE".into()),
+            ]));
+        }
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
+    /// v7.17.0 Phase 3.P0-61 — `SHOW STATUS`. Returns canonical
+    /// MySQL server-status counters (2-column `(Variable_name,
+    /// Value)`).
+    fn exec_show_status(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("Variable_name", DataType::Text, false),
+            ColumnSchema::new("Value", DataType::Text, false),
+        ];
+        let pairs: &[(&str, &str)] = &[
+            ("Uptime", "0"),
+            ("Threads_connected", "1"),
+            ("Threads_running", "1"),
+            ("Questions", "0"),
+            ("Slow_queries", "0"),
+            ("Opened_tables", "0"),
+            ("Innodb_buffer_pool_pages_total", "0"),
+        ];
+        let rows: Vec<Row> = pairs
+            .iter()
+            .map(|(k, v)| {
+                Row::new(alloc::vec![Value::Text((*k).into()), Value::Text((*v).into())])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.17.0 Phase 3.P0-61 — `SHOW VARIABLES`. Returns server-side
+    /// variables MySQL/MariaDB clients probe at connect time.
+    fn exec_show_variables(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("Variable_name", DataType::Text, false),
+            ColumnSchema::new("Value", DataType::Text, false),
+        ];
+        let mut rows: Vec<Row> = Vec::new();
+        let canonical: &[(&str, &str)] = &[
+            ("version", "8.0.35-spg"),
+            ("version_comment", "SPG dual-stack engine"),
+            ("character_set_server", "utf8mb4"),
+            ("collation_server", "utf8mb4_0900_ai_ci"),
+            ("max_allowed_packet", "67108864"),
+            ("autocommit", "ON"),
+            ("sql_mode", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
+            ("time_zone", "SYSTEM"),
+            ("transaction_isolation", "REPEATABLE-READ"),
+        ];
+        for &(k, v) in canonical {
+            rows.push(Row::new(alloc::vec![
+                Value::Text(k.into()),
+                Value::Text(v.into()),
+            ]));
+        }
+        // Session-set parameters surface here too.
+        for (k, v) in &self.session_params {
+            if !canonical.iter().any(|(n, _)| (*n).eq_ignore_ascii_case(k)) {
+                rows.push(Row::new(alloc::vec![
+                    Value::Text(k.clone()),
+                    Value::Text(v.clone()),
+                ]));
+            }
+        }
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.17.0 Phase 3.P0-62 — `SHOW PROCESSLIST`. SPG is
+    /// single-process so the surface returns one synthetic row
+    /// describing the current connection (Id, User, Host, db,
+    /// Command, Time, State, Info).
+    fn exec_show_processlist(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("Id", DataType::Int, false),
+            ColumnSchema::new("User", DataType::Text, false),
+            ColumnSchema::new("Host", DataType::Text, false),
+            ColumnSchema::new("db", DataType::Text, true),
+            ColumnSchema::new("Command", DataType::Text, false),
+            ColumnSchema::new("Time", DataType::Int, false),
+            ColumnSchema::new("State", DataType::Text, true),
+            ColumnSchema::new("Info", DataType::Text, true),
+        ];
+        let rows = alloc::vec![Row::new(alloc::vec![
+            Value::Int(1),
+            Value::Text("postgres".into()),
+            Value::Text("localhost".into()),
+            Value::Text("postgres".into()),
+            Value::Text("Query".into()),
+            Value::Int(0),
+            Value::Text("executing".into()),
+            Value::Text("SHOW PROCESSLIST".into()),
+        ])];
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.17.0 Phase 3.P0-58 — `SHOW DATABASES` / `SHOW SCHEMAS`.
+    /// SPG is single-database so the result is the canonical MySQL
+    /// set every mysql/MariaDB client expects at connect time:
+    /// `information_schema`, `mysql`, `performance_schema`, `sys`,
+    /// plus a `postgres` slot so dual-stack callers find their
+    /// PG-compatible database too.
+    fn exec_show_databases(&self) -> QueryResult {
+        let columns = alloc::vec![ColumnSchema::new("Database", DataType::Text, false)];
+        let names = ["information_schema", "mysql", "performance_schema", "sys", "postgres"];
+        let rows: Vec<Row> = names
+            .iter()
+            .map(|n| Row::new(alloc::vec![Value::Text((*n).into())]))
             .collect();
         QueryResult::Rows { columns, rows }
     }
@@ -3895,6 +5429,32 @@ impl Engine {
                                 .clone()
                                 .unwrap_or_else(|| alloc::format!("{}_{leading}_idx", s.name));
                             let _ = table.add_index(idx_name, leading);
+                        }
+                    }
+                    spg_sql::ast::TableConstraint::FulltextIndex { name, columns } => {
+                        // v7.17.0 Phase 2.2 — ALTER TABLE ADD
+                        // FULLTEXT KEY (cols). Builds one
+                        // fulltext-GIN per named column so MATCH
+                        // AGAINST gets a real inverted index.
+                        // Multi-column declarations expand to
+                        // per-column GINs (the leading column
+                        // drives MATCH AGAINST planning).
+                        for (k, col) in columns.iter().enumerate() {
+                            let already_idx = table.indices().iter().any(|idx| {
+                                matches!(idx.kind, spg_storage::IndexKind::GinFulltext(_))
+                                    && table.schema().columns[idx.column_position].name == *col
+                            });
+                            if already_idx {
+                                continue;
+                            }
+                            let idx_name = match (&name, columns.len(), k) {
+                                (Some(n), 1, _) => n.clone(),
+                                (Some(n), _, k) => alloc::format!("{n}_{k}"),
+                                (None, _, _) => {
+                                    alloc::format!("{}_{col}_ftidx", s.name)
+                                }
+                            };
+                            let _ = table.add_gin_fulltext_index(idx_name, col);
                         }
                     }
                 }
@@ -4599,8 +6159,38 @@ impl Engine {
             .into_iter()
             .map(column_def_to_schema)
             .collect::<Result<Vec<_>, _>>()?;
-        // Composite NOT-NULL implication for PRIMARY KEY columns.
+        // v7.17.0 Phase 1.4 + 1.5 — classify every raw
+        // user_type_ref (parked as user_enum_type by
+        // column_def_to_schema) into either an enum binding or a
+        // domain binding. For domains, also rewrite the column's
+        // base DataType from the placeholder Text to the domain's
+        // declared base. Unknown idents are still a hard error
+        // here (same as Phase 1.4) so silent acceptance never
+        // happens.
         let mut cols = cols;
+        for col in cols.iter_mut() {
+            let Some(name) = col.user_enum_type.take() else {
+                continue;
+            };
+            let cat = self.active_catalog();
+            if cat.enum_types().contains_key(&name) {
+                col.user_enum_type = Some(name);
+                continue;
+            }
+            if let Some(dom) = cat.domain_types().get(&name) {
+                col.ty = dom.base_type;
+                col.user_domain_type = Some(name);
+                if !dom.nullable {
+                    col.nullable = false;
+                }
+                continue;
+            }
+            return Err(EngineError::Unsupported(alloc::format!(
+                "column {:?}: unknown column type {:?} (not a built-in, ENUM, or DOMAIN)",
+                col.name,
+                name
+            )));
+        }
         for tc in &stmt.table_constraints {
             if let spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } = tc {
                 for col_name in columns {
@@ -4669,6 +6259,10 @@ impl Engine {
                 // the post-create loop below alongside the PK/UQ
                 // implicit indexes.
                 spg_sql::ast::TableConstraint::Index { .. } => continue,
+                // v7.17.0 Phase 2.2 — MySQL FULLTEXT KEY is not
+                // a uniqueness constraint either; its GIN gets
+                // built in the post-create loop below.
+                spg_sql::ast::TableConstraint::FulltextIndex { .. } => continue,
             };
             let mut positions = Vec::with_capacity(names.len());
             for n in &names {
@@ -4710,6 +6304,32 @@ impl Engine {
             }
         }
         for (i, tc) in stmt.table_constraints.iter().enumerate() {
+            // v7.17.0 Phase 2.2 — FULLTEXT KEY lands a real
+            // tsvector-GIN per declared column instead of the
+            // BTree the PK / UQ / KEY paths build. Branch early
+            // so the BTree loop never sees the FULLTEXT shape.
+            if let spg_sql::ast::TableConstraint::FulltextIndex { name, columns } = tc {
+                for (k, col) in columns.iter().enumerate() {
+                    let already = table.indices().iter().any(|idx| {
+                        matches!(idx.kind, spg_storage::IndexKind::GinFulltext(_))
+                            && table.schema().columns[idx.column_position].name == *col
+                    });
+                    if already {
+                        continue;
+                    }
+                    let idx_name = match (name.as_ref(), columns.len(), k) {
+                        (Some(n), 1, _) => n.clone(),
+                        (Some(n), _, k) => alloc::format!("{n}_{k}"),
+                        (None, _, _) => {
+                            alloc::format!("{table_name}_{col}_ftidx")
+                        }
+                    };
+                    if let Err(e) = table.add_gin_fulltext_index(idx_name, col) {
+                        return Err(EngineError::Storage(e));
+                    }
+                }
+                continue;
+            }
             // v7.15.0 — plain KEY/INDEX rides this same loop so
             // the implicit BTree gets built. It carries its own
             // user-supplied name; PK/UQ still synthesise.
@@ -4722,6 +6342,8 @@ impl Engine {
                     ("idx", columns, name.as_ref())
                 }
                 spg_sql::ast::TableConstraint::Check { .. } => continue,
+                // Handled by the early-branch above.
+                spg_sql::ast::TableConstraint::FulltextIndex { .. } => continue,
             };
             let leading = &names[0];
             // Skip if a same-column BTree already exists (e.g.
@@ -4750,7 +6372,19 @@ impl Engine {
         })
     }
 
-    fn exec_insert(&mut self, stmt: InsertStatement) -> Result<QueryResult, EngineError> {
+    fn exec_insert(&mut self, mut stmt: InsertStatement) -> Result<QueryResult, EngineError> {
+        // v7.17.0 Phase 1.1 — pre-resolve any nextval / currval /
+        // setval calls against the catalog before the row loop. We
+        // walk each tuple expression and replace matching
+        // FunctionCall nodes with their concrete Literal. This
+        // keeps `literal_expr_to_value` free of `&mut self` and
+        // lets multi-row INSERT VALUES (… nextval('seq') …)
+        // mint a separate sequence value per row.
+        for tuple in &mut stmt.rows {
+            for cell in tuple.iter_mut() {
+                self.resolve_sequence_calls_in_expr(cell)?;
+            }
+        }
         // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
         // round-5 G4). Execute the inner SELECT first, then route
         // back through the regular VALUES code path with the
@@ -4798,6 +6432,53 @@ impl Engine {
             .session_params
             .get("default_text_search_config")
             .cloned();
+        // v7.17.0 Phase 1.4 — snapshot the enum label lookup BEFORE
+        // opening the mutable borrow on the table below. We need
+        // catalog-level read access (enum_types lives at the
+        // catalog level, not the table) and the upcoming mutable
+        // borrow shadows it.
+        let pre_borrow_column_meta: Vec<ColumnSchema> = {
+            let preview_table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
+            preview_table.schema().columns.clone()
+        };
+        let enum_label_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
+            pre_borrow_column_meta
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| {
+                    // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
+                    // variant lists take priority over the PG
+                    // catalog enum_types lookup (they're
+                    // column-local and authoritative when set).
+                    if let Some(inline) = &col.inline_enum_variants {
+                        return Some((i, inline.clone()));
+                    }
+                    col.user_enum_type.as_ref().and_then(|ename| {
+                        self.active_catalog()
+                            .enum_types()
+                            .get(ename)
+                            .map(|e| (i, e.labels.clone()))
+                    })
+                })
+                .collect();
+        // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant lists.
+        // Distinct from enum_label_lookup: SET validates that
+        // every comma-separated token is in the variant list, and
+        // canonicalises the cell to definition-order de-duped text.
+        let set_variant_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
+            pre_borrow_column_meta
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| {
+                    col.inline_set_variants
+                        .as_ref()
+                        .map(|vs| (i, vs.clone()))
+                })
+                .collect();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -4895,7 +6576,16 @@ impl Engine {
                         })?;
                         raw = Value::BigInt(next);
                     }
-                    out.push(coerce_value(raw, col.ty, &col.name, i)?);
+                    let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                    enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    let coerced = canonicalize_set_value(
+                        &set_variant_lookup,
+                        i,
+                        &col.name,
+                        coerced,
+                    )?;
+                    check_unsigned_range(&coerced, col, i)?;
+                    out.push(coerced);
                 }
                 out
             } else {
@@ -4912,7 +6602,16 @@ impl Engine {
                         })?;
                         raw = Value::BigInt(next);
                     }
-                    out.push(coerce_value(raw, col.ty, &col.name, i)?);
+                    let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                    enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                    let coerced = canonicalize_set_value(
+                        &set_variant_lookup,
+                        i,
+                        &col.name,
+                        coerced,
+                    )?;
+                    check_unsigned_range(&coerced, col, i)?;
+                    out.push(coerced);
                 }
                 out
             };
@@ -5318,6 +7017,17 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.17.0 Phase 1.2 — user-defined VIEW expansion. If the
+        // FROM / JOIN graph references any catalogued view name,
+        // re-parse the view body and prepend it as a synthetic
+        // CTE. Recurses on views-in-views via the regular CTE
+        // dispatch below. Fast-path: skip the walker entirely when
+        // the catalog has no views (the typical OLTP load).
+        if !self.active_catalog().views().is_empty() {
+            if let Some(rewritten) = self.expand_views_in_select(stmt)? {
+                return self.exec_select_cancel(&rewritten, cancel);
+            }
+        }
         // v7.16.2 — information_schema / pg_catalog virtual
         // views (mailrs round-10 A.3). If the SELECT touches a
         // synthetic meta-table name (`__spg_info_*` /
@@ -5552,6 +7262,20 @@ impl Engine {
         } else {
             rows
         };
+        // v7.17.0 Phase 3.P0-48 — aggregate dispatch over the
+        // unnest source. Same routing the relational scan path
+        // already takes — without it `SELECT COUNT(*) FROM
+        // unnest(ARRAY[…])` either errored at projection time or
+        // returned the wrong shape.
+        if aggregate::uses_aggregate(stmt) {
+            let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
+            let mut agg = aggregate::run(stmt, &filtered_refs, &schema_cols, Some(&alias))?;
+            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
+            return Ok(QueryResult::Rows {
+                columns: agg.columns,
+                rows: agg.rows,
+            });
+        }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
         let mut projected_rows: alloc::vec::Vec<Row> =
@@ -5617,11 +7341,187 @@ impl Engine {
         })
     }
 
+    /// v7.17.0 Phase 3.10 — `FROM generate_series(start, stop [,
+    /// step])` set-returning source. Mirrors `exec_select_unnest`'s
+    /// shape: evaluate the arg list once against an empty row,
+    /// materialise the row stream by stepping start → stop, then
+    /// route through the standard WHERE / projection / ORDER BY /
+    /// LIMIT pipeline. Two arg-type combos in v7.17:
+    ///   * integer / integer [/ integer] — SmallInt, Int, BigInt
+    ///     (widened to BigInt internally; step defaults to 1)
+    ///   * timestamp / timestamp / interval — date-range
+    ///     iteration (mailrs's daily-report pattern)
+    fn exec_select_generate_series(
+        &self,
+        stmt: &SelectStatement,
+        primary: &TableRef,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let args = primary
+            .generate_series_args
+            .as_ref()
+            .expect("caller guards generate_series_args.is_some()");
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = EvalContext::new(&empty_schema, None);
+        let dummy_row = Row::new(alloc::vec::Vec::new());
+        let mut arg_values: alloc::vec::Vec<Value> = alloc::vec::Vec::with_capacity(args.len());
+        for a in args {
+            arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
+        }
+        // Dispatch on the start value's shape. Reject mixed-shape
+        // calls early (e.g. start = timestamp, stop = integer) so
+        // the caller gets a clean error rather than a panic.
+        let (elem_dtype, rows) = match arg_values.as_slice() {
+            [Value::Timestamp(start), Value::Timestamp(stop), step] => {
+                let interval_step = match step {
+                    Value::Interval { .. } => step.clone(),
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "generate_series(timestamp, timestamp, …): \
+                             step must be INTERVAL, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                };
+                let rows = generate_series_timestamps(*start, *stop, interval_step, &cancel)?;
+                (DataType::Timestamp, rows)
+            }
+            [start, stop, step]
+                if value_is_integer(start)
+                    && value_is_integer(stop)
+                    && value_is_integer(step) =>
+            {
+                let s = value_to_i64(start);
+                let e = value_to_i64(stop);
+                let st = value_to_i64(step);
+                let rows = generate_series_integers(s, e, st, &cancel)?;
+                (DataType::BigInt, rows)
+            }
+            [start, stop] if value_is_integer(start) && value_is_integer(stop) => {
+                let s = value_to_i64(start);
+                let e = value_to_i64(stop);
+                let rows = generate_series_integers(s, e, 1, &cancel)?;
+                (DataType::BigInt, rows)
+            }
+            _ => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
+                     argument shapes; got {:?}",
+                    arg_values.iter().map(|v| v.data_type()).collect::<alloc::vec::Vec<_>>()
+                )));
+            }
+        };
+        let alias = primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| "generate_series".to_string());
+        let col_name = alias.clone();
+        let col_schema = ColumnSchema::new(col_name, elem_dtype, true);
+        let schema_cols = alloc::vec![col_schema.clone()];
+        let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
+        // WHERE.
+        let filtered: alloc::vec::Vec<Row> = if let Some(w) = &stmt.where_ {
+            let mut out = alloc::vec::Vec::with_capacity(rows.len());
+            for row in rows {
+                cancel.check()?;
+                let v = eval::eval_expr(w, &row, &scan_ctx).map_err(EngineError::Eval)?;
+                if matches!(v, Value::Bool(true)) {
+                    out.push(row);
+                }
+            }
+            out
+        } else {
+            rows
+        };
+        // v7.17.0 Phase 3.P0-48 — aggregate dispatch for set-
+        // returning sources. When the SELECT projection contains
+        // aggregate functions (COUNT/SUM/MIN/MAX/AVG/string_agg/
+        // …) we route the filtered row stream through the same
+        // aggregate executor the relational scan path uses, so
+        // `SELECT COUNT(*) FROM generate_series(1, 100)` returns
+        // a single 100 row instead of erroring at projection
+        // time. GROUP BY / HAVING / ORDER BY over the aggregate
+        // output all ride through `aggregate::run`.
+        if aggregate::uses_aggregate(stmt) {
+            let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
+            let mut agg = aggregate::run(stmt, &filtered_refs, &schema_cols, Some(&alias))?;
+            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
+            return Ok(QueryResult::Rows {
+                columns: agg.columns,
+                rows: agg.rows,
+            });
+        }
+        // Projection.
+        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let mut projected_rows: alloc::vec::Vec<Row> =
+            alloc::vec::Vec::with_capacity(filtered.len());
+        for row in &filtered {
+            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+            for p in &projection {
+                vals.push(eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?);
+            }
+            projected_rows.push(Row::new(vals));
+        }
+        let columns: alloc::vec::Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+        // ORDER BY against the source schema.
+        if !stmt.order_by.is_empty() {
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value>)> = filtered
+                .iter()
+                .enumerate()
+                .map(|(i, r)| -> Result<_, EngineError> {
+                    let keys: Result<Vec<Value>, EngineError> = stmt
+                        .order_by
+                        .iter()
+                        .map(|ob| {
+                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
+                        })
+                        .collect();
+                    Ok((i, keys?))
+                })
+                .collect::<Result<_, _>>()?;
+            indexed.sort_by(|a, b| {
+                for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
+                    let mut cmp = value_cmp(ka, kb);
+                    if stmt.order_by[idx].desc {
+                        cmp = cmp.reverse();
+                    }
+                    if cmp != core::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            projected_rows = indexed
+                .into_iter()
+                .map(|(i, _)| projected_rows[i].clone())
+                .collect();
+        }
+        if let Some(offset) = stmt.offset_literal() {
+            let off = (offset as usize).min(projected_rows.len());
+            projected_rows.drain(..off);
+        }
+        if let Some(limit) = stmt.limit_literal() {
+            projected_rows.truncate(limit as usize);
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: projected_rows,
+        })
+    }
+
     fn exec_bare_select_cancel(
         &self,
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.17.0 Phase 3.P0-49 — `FETCH FIRST N ROWS WITH TIES`
+        // is meaningless without an ORDER BY; PG raises a hard
+        // error and SPG mirrors the surface so the same DDL/app
+        // path behaves identically on cutover.
+        check_with_ties_requires_order_by(stmt)?;
         // v7.16.2 — same meta-view dispatch as
         // `exec_select_cancel`, applied here too because
         // `subquery_replacement` enters this function directly
@@ -5675,6 +7575,14 @@ impl Engine {
         // catalog, then route to the regular scan path.
         if from.primary.unnest_expr.is_some() {
             return self.exec_select_unnest(stmt, &from.primary, cancel);
+        }
+        // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
+        // [, step])` set-returning source. Dispatch mirrors UNNEST:
+        // materialise the row stream from a single eval pass, then
+        // run the regular projection / WHERE / ORDER BY / LIMIT
+        // pipeline over the synthetic single-column table.
+        if from.primary.generate_series_args.is_some() {
+            return self.exec_select_generate_series(stmt, &from.primary, cancel);
         }
         let primary = &from.primary;
         let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
@@ -5823,7 +7731,10 @@ impl Engine {
             // the row count, select_nth_unstable + sort just the
             // prefix is O(n + k log k) instead of O(n log n). DISTINCT
             // requires the full sort because de-dup happens after.
-            let keep = if stmt.distinct {
+            // WITH TIES likewise needs the full sort so the tie
+            // extension can scan past `limit` to find rows that
+            // share the last-kept row's key.
+            let keep = if stmt.distinct || stmt.limit_with_ties {
                 None
             } else {
                 stmt.limit_literal()
@@ -5833,15 +7744,35 @@ impl Engine {
             partial_sort_tagged(&mut tagged, keep, &descs);
         }
 
-        let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
-        if stmt.distinct {
-            output_rows = dedup_rows(output_rows);
-        }
-        apply_offset_and_limit(
-            &mut output_rows,
-            stmt.offset_literal(),
-            stmt.limit_literal(),
-        );
+        // v7.17.0 Phase 3.P0-49 — `FETCH FIRST … WITH TIES` extends
+        // past the truncated tail through every row that shares the
+        // last-kept row's ORDER BY key. The tie check uses the
+        // already-computed `(order_keys, row)` pairs so it matches
+        // the sort comparator exactly. DISTINCT + WITH TIES falls
+        // through to the no-ties path (PG also disallows their
+        // combination; SPG silently drops the tie extension here so
+        // the customer doesn't see a hard error mid-query — the
+        // user-visible result is still correct, just narrower).
+        let output_rows: Vec<Row> = if stmt.limit_with_ties && !stmt.distinct {
+            apply_offset_and_limit_tagged(
+                &mut tagged,
+                stmt.offset_literal(),
+                stmt.limit_literal(),
+                true,
+            );
+            tagged.into_iter().map(|(_, r)| r).collect()
+        } else {
+            let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+            if stmt.distinct {
+                output_rows = dedup_rows(output_rows);
+            }
+            apply_offset_and_limit(
+                &mut output_rows,
+                stmt.offset_literal(),
+                stmt.limit_literal(),
+            );
+            output_rows
+        };
 
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
@@ -5940,16 +7871,22 @@ impl Engine {
         Ok((rows, cols))
     }
 
-    fn exec_joined_select(
+    /// v7.17.0 Phase 3.P0-43 — materialise a `FROM` with one or more
+    /// JOINs into `(combined_schema, filtered_rows)`. The combined
+    /// schema uses composite `alias.col` column names so the
+    /// qualifier-aware column resolver finds every join peer by
+    /// exact match; the filtered rows are the join cross-product
+    /// after the optional WHERE clause is applied.
+    ///
+    /// Shared by `exec_joined_select` and the JOIN branch of
+    /// `exec_select_with_window`; both paths used to inline the
+    /// same nested-loop logic and the window path rejected JOIN
+    /// outright.
+    fn build_joined_filtered_rows(
         &self,
-        stmt: &SelectStatement,
         from: &FromClause,
-    ) -> Result<QueryResult, EngineError> {
-        // v7.13.2 — mailrs round-6 S5. UNNEST peers materialise
-        // into virtual (rows, schema) sources alongside catalog
-        // tables, so `FROM t, UNNEST(arr) AS p(col)` works in
-        // any join-list position. The lookup helper handles both
-        // shapes uniformly.
+        where_: Option<&Expr>,
+    ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
         let (primary_rows, primary_cols) = self.materialise_table_ref(&from.primary)?;
         let primary_alias = from
             .primary
@@ -5957,29 +7894,47 @@ impl Engine {
             .as_deref()
             .unwrap_or(from.primary.name.as_str())
             .to_string();
-        // Owned (rows, schema) per peer — borrows from the catalog
-        // would not survive UNNEST-side materialisation.
+        // v7.17.0 Phase 3.P0-41 — LATERAL peers can't be
+        // pre-materialised because their rows depend on outer
+        // columns. For each peer, build either an eager
+        // (rows, schema) pair or a "lateral" sentinel carrying
+        // just the schema and the inner SELECT to re-run per
+        // outer row.
         #[allow(clippy::type_complexity)]
-        let mut joined: Vec<(
-            Vec<Row>,
-            Vec<ColumnSchema>,
-            String,
-            JoinKind,
-            Option<&Expr>,
-        )> = Vec::new();
+        let mut joined: Vec<JoinedPeer<'_>> = Vec::new();
         for j in &from.joins {
-            let (rows, cols) = self.materialise_table_ref(&j.table)?;
             let a = j
                 .table
                 .alias
                 .as_deref()
                 .unwrap_or(j.table.name.as_str())
                 .to_string();
-            joined.push((rows, cols, a, j.kind, j.on.as_ref()));
+            if let Some(inner_box) = &j.table.lateral_subquery {
+                // Probe schema by running the inner SELECT against a
+                // NULL-padded outer context. The probe gives us the
+                // projection's column shape; rows materialise per
+                // left-row below.
+                let schema = self.lateral_probe_schema(inner_box)?;
+                joined.push(JoinedPeer {
+                    eager_rows: None,
+                    cols: schema,
+                    alias: a,
+                    kind: j.kind,
+                    on: j.on.as_ref(),
+                    lateral: Some(inner_box.as_ref()),
+                });
+            } else {
+                let (rows, cols) = self.materialise_table_ref(&j.table)?;
+                joined.push(JoinedPeer {
+                    eager_rows: Some(rows),
+                    cols,
+                    alias: a,
+                    kind: j.kind,
+                    on: j.on.as_ref(),
+                    lateral: None,
+                });
+            }
         }
-
-        // Build the combined schema: composite "alias.col" names so the
-        // qualified-column resolver can find anything by exact match.
         let mut combined_schema: Vec<ColumnSchema> = Vec::new();
         for col in &primary_cols {
             combined_schema.push(ColumnSchema::new(
@@ -5988,36 +7943,48 @@ impl Engine {
                 col.nullable,
             ));
         }
-        for (_, cols, a, _, _) in &joined {
-            for col in cols {
+        for peer in &joined {
+            for col in &peer.cols {
                 combined_schema.push(ColumnSchema::new(
-                    alloc::format!("{a}.{}", col.name),
+                    alloc::format!("{}.{}", peer.alias, col.name),
                     col.ty,
                     col.nullable,
                 ));
             }
         }
         let ctx = EvalContext::new(&combined_schema, None);
-
-        // Nested-loop join.
         let mut working: Vec<Row> = primary_rows;
-        let mut produced_len = primary_cols.len();
-        for (rrows, rcols, _, kind, on) in &joined {
-            let right_arity = rcols.len();
+        // Track the per-row width consumed by the outer left side so
+        // each lateral evaluation sees the correct schema slice.
+        let mut consumed_cols = primary_cols.len();
+        for peer in &joined {
+            let right_arity = peer.cols.len();
             let mut next: Vec<Row> = Vec::new();
             for left in &working {
                 let mut left_matched = false;
-                for right in rrows {
+                let per_left_rrows: alloc::borrow::Cow<'_, [Row]> = match peer.lateral {
+                    Some(inner) => {
+                        // Substitute outer columns and run the inner
+                        // SELECT against the current left row's slice
+                        // of the combined schema.
+                        let outer_schema = &combined_schema[..consumed_cols];
+                        let rows =
+                            self.materialise_lateral_for_outer(inner, outer_schema, left)?;
+                        alloc::borrow::Cow::Owned(rows)
+                    }
+                    None => {
+                        let r = peer.eager_rows.as_ref().expect("non-lateral peer eager");
+                        alloc::borrow::Cow::Borrowed(r.as_slice())
+                    }
+                };
+                for right in per_left_rrows.as_ref() {
                     let mut combined_vals = left.values.clone();
                     combined_vals.extend(right.values.iter().cloned());
-                    // Pad combined to the eventual full width so the
-                    // partial schema still matches positions used by ON.
                     let combined = Row::new(combined_vals);
-                    let keep = if let Some(on_expr) = on {
+                    let keep = if let Some(on_expr) = peer.on {
                         let cond = eval::eval_expr(on_expr, &combined, &ctx)?;
                         matches!(cond, Value::Bool(true))
                     } else {
-                        // CROSS / comma-list: every pair survives.
                         true
                     };
                     if keep {
@@ -6025,9 +7992,7 @@ impl Engine {
                         left_matched = true;
                     }
                 }
-                if !left_matched && matches!(kind, JoinKind::Left) {
-                    // LEFT OUTER JOIN: emit the left row with NULLs on
-                    // the right side when no peer matched.
+                if !left_matched && matches!(peer.kind, JoinKind::Left) {
                     let mut combined_vals = left.values.clone();
                     for _ in 0..right_arity {
                         combined_vals.push(Value::Null);
@@ -6036,14 +8001,12 @@ impl Engine {
                 }
             }
             working = next;
-            produced_len += right_arity;
-            debug_assert!(produced_len <= combined_schema.len());
+            consumed_cols += right_arity;
+            debug_assert!(consumed_cols <= combined_schema.len());
         }
-
-        // WHERE filter against combined rows.
         let mut filtered: Vec<Row> = Vec::new();
         for row in working {
-            if let Some(where_expr) = &stmt.where_ {
+            if let Some(where_expr) = where_ {
                 let cond = eval::eval_expr(where_expr, &row, &ctx)?;
                 if !matches!(cond, Value::Bool(true)) {
                     continue;
@@ -6051,7 +8014,100 @@ impl Engine {
             }
             filtered.push(row);
         }
+        Ok((combined_schema, filtered))
+    }
 
+    /// v7.17.0 Phase 3.P0-41 — probe a LATERAL subquery's projection
+    /// schema by running it once with a NULL-padded outer context.
+    /// The probe never materialises real outer rows; it just executes
+    /// the inner SELECT with `outer_alias.col` references substituted
+    /// to NULL so the projection's type inference is exercised.
+    fn lateral_probe_schema(
+        &self,
+        inner: &SelectStatement,
+    ) -> Result<Vec<ColumnSchema>, EngineError> {
+        // Substitute every qualified column reference whose qualifier
+        // does NOT match an in-subquery FROM alias with NULL. The
+        // safest probe is to walk the inner SELECT and replace any
+        // `<qual>.<col>` whose qual isn't bound inside the subquery
+        // with a Null literal. For the v7.17 probe we just run the
+        // unmodified subquery and surface the columns; if it fails
+        // (e.g. references an outer column the probe can't resolve),
+        // we synthesise a best-effort schema from the SELECT items
+        // by inferring a single Text-typed column per projection.
+        match self.execute_readonly_select_for_lateral_probe(inner) {
+            Ok(QueryResult::Rows { columns, .. }) => Ok(columns),
+            // Best-effort fallback: each SELECT item becomes a TEXT
+            // column. Real schemas only differ when the inner SELECT
+            // references outer columns at projection-time; those
+            // queries surface via the substitution path during
+            // per-row execution and still return the right values.
+            _ => {
+                let mut out: Vec<ColumnSchema> = Vec::new();
+                for (i, item) in inner.items.iter().enumerate() {
+                    let name = match item {
+                        SelectItem::Expr {
+                            alias: Some(a), ..
+                        } => a.clone(),
+                        SelectItem::Expr { expr, .. } => synth_lateral_col_name(expr, i),
+                        SelectItem::Wildcard => alloc::format!("col{i}"),
+                    };
+                    out.push(ColumnSchema::new(name, DataType::Text, true));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// v7.17.0 Phase 3.P0-41 — try the inner LATERAL subquery against
+    /// the engine in read-only mode for schema-probe purposes. Failure
+    /// is expected when the subquery references an outer column the
+    /// probe can't resolve; the caller falls back to a best-effort
+    /// schema based on the SELECT items.
+    fn execute_readonly_select_for_lateral_probe(
+        &self,
+        inner: &SelectStatement,
+    ) -> Result<QueryResult, EngineError> {
+        self.exec_bare_select_cancel(inner, CancelToken::none())
+    }
+
+    /// v7.17.0 Phase 3.P0-41 — materialise a LATERAL subquery's rows
+    /// for one outer-row context. Walks the inner SELECT, replaces
+    /// every `<outer_alias>.<col>` reference whose alias appears in
+    /// the outer schema with the literal value from the outer row,
+    /// then runs the rewritten SELECT against the engine.
+    fn materialise_lateral_for_outer(
+        &self,
+        inner: &SelectStatement,
+        outer_schema: &[ColumnSchema],
+        outer_row: &Row,
+    ) -> Result<Vec<Row>, EngineError> {
+        let mut substituted = inner.clone();
+        substitute_outer_columns_multi(&mut substituted, outer_row, outer_schema);
+        let result = self.exec_bare_select_cancel(&substituted, CancelToken::none())?;
+        match result {
+            QueryResult::Rows { rows, .. } => Ok(rows),
+            _ => Err(EngineError::Unsupported(
+                "LATERAL subquery must be a SELECT (cannot be a write statement)".into(),
+            )),
+        }
+    }
+
+    fn exec_joined_select(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+    ) -> Result<QueryResult, EngineError> {
+        // v7.17.0 Phase 3.P0-43 + P0-41 — delegate the join +
+        // WHERE materialisation to the shared helper so the LATERAL
+        // / UNNEST / regular-catalog paths route through one place.
+        // (`build_joined_filtered_rows` carries LATERAL support as
+        // of Phase 3.P0-41.) Downstream we still handle aggregate /
+        // projection / ORDER BY / DISTINCT / LIMIT inline because
+        // those depend on the SelectStatement's items list.
+        let (combined_schema, filtered) =
+            self.build_joined_filtered_rows(from, stmt.where_.as_ref())?;
+        let ctx = EvalContext::new(&combined_schema, None);
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
         if aggregate::uses_aggregate(stmt) {
@@ -6144,6 +8200,40 @@ fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
         Value::Date(d) => Ok(f64::from(*d)),
         #[allow(clippy::cast_precision_loss)]
         Value::Timestamp(t) => Ok(*t as f64),
+        // v7.17.0 Phase 3.P0-32 — PG TIME ordered by underlying
+        // i64 microseconds (matches wall-clock ordering).
+        #[allow(clippy::cast_precision_loss)]
+        Value::Time(us) => Ok(*us as f64),
+        // v7.17.0 Phase 3.P0-33 — MySQL YEAR ordered by underlying
+        // u16 (matches calendar ordering; zero-year sentinel
+        // sorts before 1901).
+        Value::Year(y) => Ok(f64::from(*y)),
+        // v7.17.0 Phase 3.P0-34 — PG TIMETZ ordered by the
+        // UTC-equivalent microseconds (local wall - offset). Two
+        // values for the same physical instant in different zones
+        // sort equal — matches PG TIMETZ index behaviour.
+        #[allow(clippy::cast_precision_loss)]
+        Value::TimeTz { us, offset_secs } => {
+            Ok((us - i64::from(*offset_secs) * 1_000_000) as f64)
+        }
+        // v7.17.0 Phase 3.P0-35 — PG MONEY ordered by i64 cents.
+        #[allow(clippy::cast_precision_loss)]
+        Value::Money(c) => Ok(*c as f64),
+        // v7.17.0 Phase 3.P0-38 — range ordering is not supported
+        // in v7.17.0 (needs lex-then-inclusivity tiebreak).
+        Value::Range { .. } => Err(EngineError::Unsupported(
+            "ORDER BY of a range value is not supported in v7.17.0".into(),
+        )),
+        // v7.17.0 Phase 3.P0-39 — hstore is not orderable.
+        Value::Hstore(_) => Err(EngineError::Unsupported(
+            "ORDER BY of a hstore value is not supported".into(),
+        )),
+        // v7.17.0 Phase 3.P0-40 — 2D arrays not orderable.
+        Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => {
+            Err(EngineError::Unsupported(
+                "ORDER BY of a 2D array is not supported in v7.17.0".into(),
+            ))
+        }
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale } => {
             // Scaled integer / 10^scale, computed via f64 for sort
@@ -6435,6 +8525,27 @@ fn try_gin_seek<'a>(
         }
         return try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx);
     }
+    // v7.17.0 Phase 3.P0-44 — MySQL `MATCH(col1, col2) AGAINST (...)`
+    // desugars into `(to_tsvector(col1) @@ q) OR (to_tsvector(col2) @@ q)`
+    // in the parser. To accelerate the multi-column case, walk OR the same
+    // way we walk AND: only emit a candidate set if BOTH sides can seek
+    // (otherwise the OR result is unbounded and we must fall through to
+    // the full scan). Candidates are union'd; the caller's WHERE re-eval
+    // verifies the full predicate per row, so duplicates / supersets stay
+    // semantically safe.
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::Or,
+        rhs,
+    } = where_expr
+    {
+        let left = try_gin_seek(lhs, schema_cols, catalog, table, table_alias, ctx)?;
+        let right = try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx)?;
+        let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(left.len() + right.len());
+        out.extend(left);
+        out.extend(right);
+        return Some(out);
+    }
     let Expr::Binary {
         lhs,
         op: BinOp::TsMatch,
@@ -6449,10 +8560,16 @@ fn try_gin_seek<'a>(
     // tables resolve `q` to a Column too.
     let (col_pos, query) = resolve_gin_col_query(lhs, rhs, schema_cols, table_alias, ctx)
         .or_else(|| resolve_gin_col_query(rhs, lhs, schema_cols, table_alias, ctx))?;
+    // v7.17.0 Phase 3.P0-44 — MySQL `FULLTEXT KEY` builds a
+    // `IndexKind::GinFulltext` posting list (Phase 2.2). It shares
+    // the same `gin_lookup_word` shape as the tsvector-typed GIN,
+    // so the MATCH-AGAINST `@@` predicate (desugared by the parser
+    // into `to_tsvector(col) @@ plainto_tsquery('term')`) routes
+    // through the same candidate-set seek.
     let idx = table
         .indices()
         .iter()
-        .find(|i| i.column_position == col_pos && i.is_gin())?;
+        .find(|i| i.column_position == col_pos && (i.is_gin() || i.is_gin_fulltext()))?;
     let candidates = gin_query_candidates(idx, &query)?;
     let _ = catalog; // cold-tier row resolution unused in MVP; see below.
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(candidates.len());
@@ -6599,9 +8716,27 @@ fn resolve_gin_col_query(
     table_alias: &str,
     ctx: &eval::EvalContext<'_>,
 ) -> Option<(usize, spg_storage::TsQueryAst)> {
-    let Expr::Column(c) = col_side else {
-        return None;
+    // v7.17.0 Phase 3.P0-44 — the MATCH AGAINST desugar wraps the
+    // column in `to_tsvector('simple', col)`, so we peel that wrapper
+    // before the column lookup. Direct `col @@ tsquery` paths (the
+    // tsvector-typed v7.12 surface) skip the wrapper entirely.
+    let column = match col_side {
+        Expr::Column(c) => c,
+        Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("to_tsvector") && !args.is_empty() =>
+        {
+            // PG `to_tsvector` accepts either `to_tsvector(col)` or
+            // `to_tsvector(config, col)`. In both shapes the column
+            // we care about is the final argument.
+            if let Expr::Column(c) = args.last().unwrap() {
+                c
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
     };
+    let c = column;
     if let Some(q) = &c.qualifier
         && q != table_alias
     {
@@ -6835,9 +8970,11 @@ fn build_projection(
             }
             SelectItem::Expr { expr, alias } => {
                 // Plain column ref keeps full schema info (real type +
-                // nullability). Compound expressions evaluate fine but have
-                // no static type — surface them as nullable TEXT, which is
-                // what most clients render anyway.
+                // nullability). For compound expressions try the
+                // describe-side function-return-type table first
+                // (e.g. `SELECT now()` → Timestamptz, `SELECT
+                // concat(…)` → Text). Falls back to nullable Text
+                // for shapes the describe path can't resolve.
                 if let Expr::Column(c) = expr {
                     let sch = resolve_projection_column(c, schema_cols, table_alias)?;
                     let output_name = alias.clone().unwrap_or_else(|| c.name.clone());
@@ -6846,6 +8983,14 @@ fn build_projection(
                         output_name,
                         ty: sch.ty,
                         nullable: sch.nullable,
+                    });
+                } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
+                    let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
+                    out.push(ProjectedItem {
+                        expr: expr.clone(),
+                        output_name,
+                        ty: shape.ty,
+                        nullable: shape.nullable,
                     });
                 } else {
                     let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
@@ -6919,6 +9064,67 @@ fn numeric_from_float(
     let scaled = biased as i128;
     check_precision(scaled, precision, col_name)?;
     Ok(Value::Numeric { scaled, scale })
+}
+
+/// v7.17.0 Phase 3.P0-67 — parse PG-canonical decimal text into
+/// `(mantissa: i128, source_scale: u8)`. Accepts optional sign,
+/// optional integer part, optional fractional part. Rejects
+/// scientific notation, embedded spaces, locale-specific
+/// thousand separators. Returns None on bad input — coerce_value
+/// turns that into a TypeMismatch error.
+fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (negative, rest) = match s.as_bytes()[0] {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    // Reject scientific notation — bigdecimal collapses it before
+    // hitting the wire, and we want a clear error if a stray `e`
+    // sneaks in.
+    if rest.bytes().any(|b| b == b'e' || b == b'E') {
+        return None;
+    }
+    let (int_part, frac_part) = match rest.find('.') {
+        Some(idx) => (&rest[..idx], &rest[idx + 1..]),
+        None => (rest, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if int_part.bytes().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    if frac_part.bytes().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    let scale_u32 = u32::try_from(frac_part.len()).ok()?;
+    if scale_u32 > u32::from(u8::MAX) {
+        return None;
+    }
+    let scale = scale_u32 as u8;
+    let mut digits = alloc::string::String::with_capacity(int_part.len() + frac_part.len() + 1);
+    if negative {
+        digits.push('-');
+    }
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    // Strip a leading "+0..0" so parse doesn't choke on "00" etc.
+    let digits = if digits == "-" {
+        return None;
+    } else if digits.is_empty() {
+        "0"
+    } else {
+        digits.as_str()
+    };
+    let mantissa: i128 = digits.parse().ok()?;
+    Some((mantissa, scale))
 }
 
 /// Move a Numeric value from `src_scale` to `dst_scale`. Going up
@@ -7031,38 +9237,60 @@ impl Engine {
         let from = stmt.from.as_ref().ok_or_else(|| {
             EngineError::Unsupported("window functions require a FROM clause".into())
         })?;
-        // For v4.12 we only support a single-table FROM. Joins +
-        // windows is queued for v5.x.
-        if !from.joins.is_empty() {
-            return Err(EngineError::Unsupported(
-                "JOIN with window functions not yet supported".into(),
-            ));
-        }
-        let primary = &from.primary;
-        let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
-            StorageError::TableNotFound {
-                name: primary.name.clone(),
-            }
-        })?;
-        let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
-        let schema_cols = &table.schema().columns;
-        let ctx = self.ev_ctx(schema_cols, Some(alias));
-
-        // 1) Filter pass.
-        let mut filtered: Vec<&Row> = Vec::new();
-        for (i, row) in table.rows().iter().enumerate() {
-            if i.is_multiple_of(256) {
-                cancel.check()?;
-            }
-            if let Some(w) = &stmt.where_ {
-                let cond = eval::eval_expr(w, row, &ctx)?;
-                if !matches!(cond, Value::Bool(true)) {
-                    continue;
+        // v7.17.0 Phase 3.P0-43 — JOIN + window functions. Phase
+        // 3.6 rejected this combination outright ("queued for
+        // v5.x"); P0-43 materialises the join + WHERE through the
+        // existing nested-loop helper and runs the window pipeline
+        // on the joined row set with the combined `alias.col`
+        // schema. The window expressions resolve through the
+        // qualifier-aware column resolver same as the aggregate /
+        // projection paths on JOIN.
+        let (schema_cols_owned, alias_opt): (Vec<ColumnSchema>, Option<&str>);
+        let filtered: Vec<Row>;
+        if from.joins.is_empty() {
+            let primary = &from.primary;
+            let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
+                StorageError::TableNotFound {
+                    name: primary.name.clone(),
                 }
+            })?;
+            let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
+            schema_cols_owned = table.schema().columns.clone();
+            alias_opt = Some(alias);
+            // Materialise WHERE-filtered rows owned so the JOIN
+            // and single-table paths share a single downstream
+            // shape. The clone is cheap relative to the window
+            // computation that follows.
+            let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
+            let mut owned: Vec<Row> = Vec::new();
+            for (i, row) in table.rows().iter().enumerate() {
+                if i.is_multiple_of(256) {
+                    cancel.check()?;
+                }
+                if let Some(w) = &stmt.where_ {
+                    let cond = eval::eval_expr(w, row, &ctx)?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                owned.push(row.clone());
             }
-            filtered.push(row);
+            filtered = owned;
+        } else {
+            let (combined_schema, rows) =
+                self.build_joined_filtered_rows(from, stmt.where_.as_ref())?;
+            schema_cols_owned = combined_schema;
+            alias_opt = None;
+            filtered = rows;
         }
+        let schema_cols = &schema_cols_owned;
+        let ctx = self.ev_ctx(schema_cols, alias_opt);
+        let alias = alias_opt.unwrap_or("");
         let n_rows = filtered.len();
+        // Borrow refs into the owned row vec once so the downstream
+        // `compute_window_partition` call (which takes `&[&Row]`) and
+        // the per-row eval loops share a single backing buffer.
+        let filtered_refs: Vec<&Row> = filtered.iter().collect();
 
         // 2) Collect unique window function nodes from projection.
         let mut window_nodes: Vec<Expr> = Vec::new();
@@ -7129,7 +9357,7 @@ impl Engine {
                     frame.as_ref(),
                     *null_treatment,
                     &indexed[p_start..p_end],
-                    &filtered,
+                    &filtered_refs,
                     &ctx,
                     &mut out_vals,
                 )?;
@@ -7173,8 +9401,12 @@ impl Engine {
             rewritten_items.push(new_item);
         }
 
-        // 7) Project into final rows.
-        let ext_ctx = EvalContext::new(&ext_cols, Some(alias));
+        // 7) Project into final rows. JOIN case uses None so the
+        // qualifier check in `resolve_column` falls through to the
+        // composite `alias.col` schema lookup; single-table case
+        // keeps the bare alias so `bare_col` resolution still
+        // works for the projection's per-row column references.
+        let ext_ctx = EvalContext::new(&ext_cols, alias_opt);
         let projection = build_projection(&rewritten_items, &ext_cols, alias)?;
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::with_capacity(n_rows);
         for (i, row) in ext_rows.iter().enumerate() {
@@ -7261,11 +9493,111 @@ impl Engine {
                     let (schema, rows) = synth_pg_attribute(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.17.0 Phase 3.P0-50 — pg_catalog.pg_type for
+                // sqlx / SQLAlchemy / Diesel / pgAdmin lookups.
+                "__spg_pg_type" => {
+                    let (schema, rows) = synth_pg_type(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-51 — pg_catalog.pg_proc for
+                // function-name introspection (ORM / pgAdmin).
+                "__spg_pg_proc" => {
+                    let (schema, rows) = synth_pg_proc(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-52 — pg_catalog.pg_namespace
+                // (schema list for admin tools' tree views).
+                "__spg_pg_namespace" => {
+                    let (schema, rows) = synth_pg_namespace(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
+                // for pgAdmin / DataGrip "indexes per table" listings.
+                "__spg_pg_indexes" => {
+                    let (schema, rows) = synth_pg_indexes(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_index (raw)
+                // for index introspection by ORM compilers.
+                "__spg_pg_index" => {
+                    let (schema, rows) = synth_pg_index_raw(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-54 — pg_catalog.pg_constraint
+                // for FK / UNIQUE / PK / CHECK introspection.
+                "__spg_pg_constraint" => {
+                    let (schema, rows) = synth_pg_constraint(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-55 — pg_catalog.pg_database /
+                // pg_roles / pg_user. SPG is single-database so
+                // pg_database surfaces just `postgres`; pg_roles
+                // / pg_user walk the engine's UserStore.
+                "__spg_pg_database" => {
+                    let (schema, rows) = synth_pg_database(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_roles" | "__spg_pg_user" => {
+                    let (schema, rows) = synth_pg_roles(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_views. PG's
+                // pg_views surfaces every CREATE VIEW result; SPG
+                // ships one row per declared view from the catalog.
+                "__spg_pg_views" => {
+                    let (schema, rows) = synth_pg_views(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_matviews.
+                // SPG has no materialised view surface yet so the
+                // table shares pg_views's schema but stays empty.
+                "__spg_pg_matviews" => {
+                    let (schema, _) = synth_pg_views(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, Vec::new())?;
+                }
+                // v7.17.0 Phase 3.P0-57 — pg_catalog.pg_settings.
+                "__spg_pg_settings" => {
+                    let (schema, rows) = synth_pg_settings(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-63 — information_schema.KEY_COLUMN_USAGE.
+                "__spg_info_key_column_usage" => {
+                    let (schema, rows) = synth_info_key_column_usage(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-64 — information_schema.REFERENTIAL_CONSTRAINTS.
+                "__spg_info_referential_constraints" => {
+                    let (schema, rows) =
+                        synth_info_referential_constraints(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-64 — information_schema.STATISTICS.
+                "__spg_info_statistics" => {
+                    let (schema, rows) = synth_info_statistics(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-64 — information_schema.ROUTINES.
+                "__spg_info_routines" => {
+                    let (schema, rows) = synth_info_routines();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-65 — mysql.user / mysql.db.
+                "__spg_mysql_user" => {
+                    let (schema, rows) = synth_mysql_user(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_mysql_db" => {
+                    let (schema, rows) = synth_mysql_db();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "meta view {view:?} is not yet materialisable; \
                          v7.16.2 covers information_schema.columns / .tables \
-                         and pg_catalog.pg_class / pg_attribute"
+                         and pg_catalog.pg_class / pg_attribute; \
+                         v7.17.0 P0-50..P0-57 add pg_type / pg_proc / pg_namespace / \
+                         pg_indexes / pg_index / pg_constraint / pg_database / pg_roles / \
+                         pg_user / pg_views / pg_matviews / pg_settings"
                     )));
                 }
             }
@@ -8152,6 +10484,831 @@ fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
     (schema, rows)
 }
 
+/// v7.17.0 Phase 3.P0-50 — synthesise `pg_catalog.pg_type`. The
+/// returned rows cover every built-in scalar / array type sqlx,
+/// SQLAlchemy, Diesel and pgAdmin look up at compile / connect
+/// time. PG-canonical schema columns we expose:
+///   * oid           — type OID (the lookup key sqlx uses)
+///   * typname       — canonical type name (`int4`, `text`, …)
+///   * typlen        — width in bytes (-1 for var-length)
+///   * typtype       — `b`ase / `c`omposite / `e`num / etc.
+///   * typcategory   — PG type category single-char
+///   * typelem       — element OID for arrays (0 otherwise)
+///   * typarray      — array-type OID (0 if no array type)
+///   * typnamespace  — schema OID (always `public` = 2200)
+///
+/// Other pg_type columns (typowner, typinput/typoutput, etc.)
+/// land in follow-up work — sqlx encoders don't query them at
+/// connect time.
+fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("typname", DataType::Text, false),
+        ColumnSchema::new("typlen", DataType::SmallInt, false),
+        ColumnSchema::new("typtype", DataType::Text, false),
+        ColumnSchema::new("typcategory", DataType::Text, false),
+        ColumnSchema::new("typelem", DataType::BigInt, false),
+        ColumnSchema::new("typarray", DataType::BigInt, false),
+        ColumnSchema::new("typnamespace", DataType::BigInt, false),
+    ];
+    // (oid, name, len, type, cat, elem, array_oid). PG OID
+    // numbers come straight from `pg_type.dat`.
+    let scalars: &[(i64, &str, i16, &str, &str, i64, i64)] = &[
+        // bool
+        (16, "bool", 1, "b", "B", 0, 1000),
+        (17, "bytea", -1, "b", "U", 0, 1001),
+        (18, "char", 1, "b", "S", 0, 1002),
+        (19, "name", 64, "b", "S", 0, 1003),
+        (20, "int8", 8, "b", "N", 0, 1016),
+        (21, "int2", 2, "b", "N", 0, 1005),
+        (23, "int4", 4, "b", "N", 0, 1007),
+        (24, "regproc", 4, "b", "N", 0, 1008),
+        (25, "text", -1, "b", "S", 0, 1009),
+        (26, "oid", 4, "b", "N", 0, 1028),
+        (114, "json", -1, "b", "U", 0, 199),
+        (142, "xml", -1, "b", "U", 0, 143),
+        (700, "float4", 4, "b", "N", 0, 1021),
+        (701, "float8", 8, "b", "N", 0, 1022),
+        (650, "cidr", -1, "b", "I", 0, 651),
+        (869, "inet", -1, "b", "I", 0, 1041),
+        (829, "macaddr", 6, "b", "U", 0, 1040),
+        (1042, "bpchar", -1, "b", "S", 0, 1014),
+        (1043, "varchar", -1, "b", "S", 0, 1015),
+        (1082, "date", 4, "b", "D", 0, 1182),
+        (1083, "time", 8, "b", "D", 0, 1183),
+        (1114, "timestamp", 8, "b", "D", 0, 1115),
+        (1184, "timestamptz", 8, "b", "D", 0, 1185),
+        (1186, "interval", 16, "b", "T", 0, 1187),
+        (1266, "timetz", 12, "b", "D", 0, 1270),
+        (1700, "numeric", -1, "b", "N", 0, 1231),
+        (790, "money", 8, "b", "N", 0, 791),
+        (2950, "uuid", 16, "b", "U", 0, 2951),
+        (3802, "jsonb", -1, "b", "U", 0, 3807),
+        (3614, "tsvector", -1, "b", "U", 0, 3643),
+        (3615, "tsquery", -1, "b", "U", 0, 3645),
+        // hstore + range types — typcategory 'U' (user) / 'R' (range).
+        (3908, "tstzrange", -1, "r", "R", 0, 3909),
+        (3910, "tsrange", -1, "r", "R", 0, 3911),
+        (3904, "int4range", -1, "r", "R", 0, 3905),
+        (3926, "int8range", -1, "r", "R", 0, 3927),
+        (3906, "numrange", -1, "r", "R", 0, 3907),
+        (3912, "daterange", -1, "r", "R", 0, 3913),
+    ];
+    // Array companion types share the typelem / typcategory='A'.
+    // We emit just the array OIDs the scalars reference.
+    let arrays: &[(i64, &str, i64)] = &[
+        (1000, "_bool", 16),
+        (1001, "_bytea", 17),
+        (1002, "_char", 18),
+        (1003, "_name", 19),
+        (1016, "_int8", 20),
+        (1005, "_int2", 21),
+        (1007, "_int4", 23),
+        (1008, "_regproc", 24),
+        (1009, "_text", 25),
+        (1028, "_oid", 26),
+        (199, "_json", 114),
+        (143, "_xml", 142),
+        (1021, "_float4", 700),
+        (1022, "_float8", 701),
+        (651, "_cidr", 650),
+        (1041, "_inet", 869),
+        (1040, "_macaddr", 829),
+        (1014, "_bpchar", 1042),
+        (1015, "_varchar", 1043),
+        (1182, "_date", 1082),
+        (1183, "_time", 1083),
+        (1115, "_timestamp", 1114),
+        (1185, "_timestamptz", 1184),
+        (1187, "_interval", 1186),
+        (1270, "_timetz", 1266),
+        (1231, "_numeric", 1700),
+        (791, "_money", 790),
+        (2951, "_uuid", 2950),
+        (3807, "_jsonb", 3802),
+        (3643, "_tsvector", 3614),
+        (3645, "_tsquery", 3615),
+    ];
+    let mut rows: Vec<Row> = Vec::with_capacity(scalars.len() + arrays.len());
+    for &(oid, name, len, ty, cat, elem, arr) in scalars {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::Text(name.into()),
+            Value::SmallInt(len),
+            Value::Text(ty.into()),
+            Value::Text(cat.into()),
+            Value::BigInt(elem),
+            Value::BigInt(arr),
+            Value::BigInt(2200),
+        ]));
+    }
+    for &(oid, name, elem) in arrays {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::Text(name.into()),
+            Value::SmallInt(-1),
+            Value::Text("b".into()),
+            Value::Text("A".into()),
+            Value::BigInt(elem),
+            Value::BigInt(0),
+            Value::BigInt(2200),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-51 — synthesise `pg_catalog.pg_proc`. ORM /
+/// pgAdmin probes look up functions by name; SPG synthesises rows
+/// for the built-in scalar functions / aggregates / window funcs
+/// the engine actually dispatches. SPG has no user-defined
+/// functions yet so the table is a stable static list.
+///
+/// Schema columns exposed:
+///   * oid (BigInt) — function OID from PG's pg_proc.dat
+///   * proname (Text) — function name (lowercase)
+///   * pronamespace (BigInt) — 11 (`pg_catalog`)
+///   * prokind (Text) — 'f' function, 'a' aggregate, 'w' window
+///   * pronargs (SmallInt) — declared arg count (-1 for variadic)
+///   * prorettype (BigInt) — return type OID (matches synth_pg_type)
+fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("proname", DataType::Text, false),
+        ColumnSchema::new("pronamespace", DataType::BigInt, false),
+        ColumnSchema::new("prokind", DataType::Text, false),
+        ColumnSchema::new("pronargs", DataType::Int, false),
+        ColumnSchema::new("prorettype", DataType::BigInt, false),
+    ];
+    // (oid, name, kind, nargs, rettype). OIDs taken from PG's
+    // pg_proc.dat for the common subset.
+    let funcs: &[(i64, &str, &str, i32, i64)] = &[
+        // Scalar functions.
+        (1318, "length", "f", 1, 23),
+        (871, "upper", "f", 1, 25),
+        (870, "lower", "f", 1, 25),
+        (936, "substring", "f", 3, 25),
+        (937, "substring", "f", 2, 25),
+        (3055, "btrim", "f", 1, 25),
+        (885, "btrim", "f", 2, 25),
+        (3056, "ltrim", "f", 1, 25),
+        (875, "ltrim", "f", 2, 25),
+        (3057, "rtrim", "f", 1, 25),
+        (876, "rtrim", "f", 2, 25),
+        (1397, "abs", "f", 1, 23),
+        (1396, "abs", "f", 1, 20),
+        (1606, "round", "f", 1, 1700),
+        (1707, "round", "f", 2, 1700),
+        (2308, "ceil", "f", 1, 701),
+        (2309, "ceiling", "f", 1, 701),
+        (2310, "floor", "f", 1, 701),
+        (1376, "sqrt", "f", 1, 701),
+        (1369, "ln", "f", 1, 701),
+        (1373, "exp", "f", 1, 701),
+        (1368, "power", "f", 2, 701),
+        (2228, "random", "f", 0, 701),
+        // Date / time.
+        (1299, "now", "f", 0, 1184),
+        (1274, "current_timestamp", "f", 0, 1184),
+        (1140, "current_date", "f", 0, 1082),
+        (2050, "current_time", "f", 0, 1083),
+        (1158, "date_trunc", "f", 2, 1184),
+        (1171, "date_part", "f", 2, 701),
+        (1172, "age", "f", 1, 1186),
+        (936, "to_char", "f", 2, 25),
+        // Session / introspection.
+        (861, "current_database", "f", 0, 19),
+        (745, "current_user", "f", 0, 19),
+        (745, "session_user", "f", 0, 19),
+        (1402, "current_schema", "f", 0, 19),
+        // String concat / format.
+        (3058, "concat", "f", -1, 25),
+        (3059, "concat_ws", "f", -1, 25),
+        (3539, "format", "f", -1, 25),
+        // Type introspection.
+        (2877, "pg_typeof", "f", 1, 2206),
+        // JSON.
+        (3198, "json_build_object", "f", -1, 114),
+        (3199, "jsonb_build_object", "f", -1, 3802),
+        (3271, "json_build_array", "f", -1, 114),
+        (3272, "jsonb_build_array", "f", -1, 3802),
+        // UUID.
+        (3253, "gen_random_uuid", "f", 0, 2950),
+        (3252, "uuid_generate_v4", "f", 0, 2950),
+        // Aggregates.
+        (2147, "count", "a", 0, 20),
+        (2803, "count", "a", -1, 20),
+        (2116, "max", "a", 1, 23),
+        (2132, "min", "a", 1, 23),
+        (2108, "sum", "a", 1, 20),
+        (2100, "avg", "a", 1, 1700),
+        (2517, "string_agg", "a", 2, 25),
+        (2747, "array_agg", "a", 1, 1009),
+        (2517, "bool_and", "a", 1, 16),
+        (2518, "bool_or", "a", 1, 16),
+        (2519, "every", "a", 1, 16),
+        // Window functions.
+        (3100, "row_number", "w", 0, 20),
+        (3101, "rank", "w", 0, 20),
+        (3102, "dense_rank", "w", 0, 20),
+        (3103, "percent_rank", "w", 0, 701),
+        (3104, "cume_dist", "w", 0, 701),
+        (3105, "lag", "w", -1, 2283),
+        (3106, "lead", "w", -1, 2283),
+        (3107, "first_value", "w", 1, 2283),
+        (3108, "last_value", "w", 1, 2283),
+        (3109, "nth_value", "w", 2, 2283),
+    ];
+    let mut rows: Vec<Row> = Vec::with_capacity(funcs.len());
+    for &(oid, name, kind, nargs, rettype) in funcs {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::Text(name.into()),
+            Value::BigInt(11),
+            Value::Text(kind.into()),
+            Value::Int(nargs),
+            Value::BigInt(rettype),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-65 — synthesise `mysql.user`. MySQL admin
+/// queries (`SELECT user, host FROM mysql.user`) probe this at
+/// connect time to list accounts. SPG ships one row per
+/// UserStore entry plus a synthetic `root` superuser row for
+/// MySQL bootstrap compat.
+fn synth_mysql_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("user", DataType::Text, false),
+        ColumnSchema::new("host", DataType::Text, false),
+        ColumnSchema::new("select_priv", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    rows.push(Row::new(alloc::vec![
+        Value::Text("root".into()),
+        Value::Text("localhost".into()),
+        Value::Text("Y".into()),
+    ]));
+    for (name, _) in engine.users.iter() {
+        if name != "root" {
+            rows.push(Row::new(alloc::vec![
+                Value::Text(name.to_string()),
+                Value::Text("%".into()),
+                Value::Text("Y".into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-65 — synthesise `mysql.db`. The
+/// per-database privileges table. SPG is single-database so the
+/// table surfaces one row per declared user with full privileges
+/// on the canonical `postgres` database.
+fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("host", DataType::Text, false),
+        ColumnSchema::new("db", DataType::Text, false),
+        ColumnSchema::new("user", DataType::Text, false),
+        ColumnSchema::new("select_priv", DataType::Text, false),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::Text("localhost".into()),
+        Value::Text("postgres".into()),
+        Value::Text("root".into()),
+        Value::Text("Y".into()),
+    ])];
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-63 — synthesise
+/// `information_schema.KEY_COLUMN_USAGE`. ORM migration tools
+/// (Alembic, Sequelize, TypeORM) walk this view to discover FK
+/// relationships in MySQL-flavoured introspection queries.
+///
+/// Schema columns exposed:
+///   * CONSTRAINT_NAME (Text)
+///   * TABLE_NAME (Text)
+///   * COLUMN_NAME (Text)
+///   * ORDINAL_POSITION (Int)
+///   * REFERENCED_TABLE_NAME (Text) — empty for non-FK rows
+///   * REFERENCED_COLUMN_NAME (Text) — empty for non-FK rows
+fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("constraint_name", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("ordinal_position", DataType::Int, false),
+        ColumnSchema::new("referenced_table_name", DataType::Text, false),
+        ColumnSchema::new("referenced_column_name", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let cols = &t.schema().columns;
+        let col_name_at = |pos: usize| -> String {
+            cols.get(pos)
+                .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
+        };
+        // FKs.
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+            for (i, (&local, &parent)) in fk
+                .local_columns
+                .iter()
+                .zip(fk.parent_columns.iter())
+                .enumerate()
+            {
+                let parent_name = cat
+                    .get(&fk.parent_table)
+                    .and_then(|pt| pt.schema().columns.get(parent).map(|c| c.name.clone()))
+                    .unwrap_or_else(|| alloc::format!("col{parent}"));
+                #[allow(clippy::cast_possible_wrap)]
+                let ordinal = (i + 1) as i32;
+                rows.push(Row::new(alloc::vec![
+                    Value::Text(conname.clone()),
+                    Value::Text(tname.clone()),
+                    Value::Text(col_name_at(local)),
+                    Value::Int(ordinal),
+                    Value::Text(fk.parent_table.clone()),
+                    Value::Text(parent_name),
+                ]));
+            }
+        }
+        // PK / composite UC entries.
+        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let conname = if uc.is_primary_key {
+                alloc::format!("{}_pkey", tname)
+            } else {
+                alloc::format!("{}_uniq{ci}", tname)
+            };
+            for (i, &local) in uc.columns.iter().enumerate() {
+                #[allow(clippy::cast_possible_wrap)]
+                let ordinal = (i + 1) as i32;
+                rows.push(Row::new(alloc::vec![
+                    Value::Text(conname.clone()),
+                    Value::Text(tname.clone()),
+                    Value::Text(col_name_at(local)),
+                    Value::Int(ordinal),
+                    Value::Text(String::new()),
+                    Value::Text(String::new()),
+                ]));
+            }
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-64 — synthesise
+/// `information_schema.REFERENTIAL_CONSTRAINTS`. One row per FK.
+fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("constraint_name", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("referenced_table_name", DataType::Text, false),
+        ColumnSchema::new("update_rule", DataType::Text, false),
+        ColumnSchema::new("delete_rule", DataType::Text, false),
+    ];
+    fn rule_name(a: spg_storage::FkAction) -> &'static str {
+        match a {
+            spg_storage::FkAction::Cascade => "CASCADE",
+            spg_storage::FkAction::SetNull => "SET NULL",
+            spg_storage::FkAction::SetDefault => "SET DEFAULT",
+            spg_storage::FkAction::Restrict => "RESTRICT",
+            spg_storage::FkAction::NoAction => "NO ACTION",
+        }
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text(tname.clone()),
+                Value::Text(fk.parent_table.clone()),
+                Value::Text(rule_name(fk.on_update).into()),
+                Value::Text(rule_name(fk.on_delete).into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-64 — synthesise `information_schema.STATISTICS`.
+/// One row per (index × column) — admin tools walk this to
+/// surface index-cardinality estimates.
+fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("index_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("seq_in_index", DataType::Int, false),
+        ColumnSchema::new("non_unique", DataType::Int, false),
+        ColumnSchema::new("index_type", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            let col = t
+                .schema()
+                .columns
+                .get(idx.column_position)
+                .map_or("?".into(), |c| c.name.clone());
+            rows.push(Row::new(alloc::vec![
+                Value::Text(tname.clone()),
+                Value::Text(idx.name.clone()),
+                Value::Text(col),
+                Value::Int(1),
+                Value::Int(i32::from(!idx.is_unique)),
+                Value::Text("BTREE".into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-64 — synthesise `information_schema.ROUTINES`.
+/// SPG has no user-defined functions in v7.17 so the surface is
+/// always empty; admin tools just need the table to exist.
+fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("routine_name", DataType::Text, false),
+        ColumnSchema::new("routine_type", DataType::Text, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+    ];
+    (schema, Vec::new())
+}
+
+/// v7.17.0 Phase 3.P0-54 — synthesise `pg_catalog.pg_constraint`.
+/// ORM compilers (Diesel, sea-orm) and admin tools probe this for
+/// FK / UNIQUE / PK / CHECK definitions to surface relationship
+/// graphs and validation rules. SPG ships one row per
+/// uniqueness constraint + foreign key declared in the catalog.
+///
+/// Schema columns exposed:
+///   * conname (Text) — constraint name (synthetic when anonymous)
+///   * contype (Text) — `p` PK, `u` UNIQUE, `f` FK, `c` CHECK
+///   * conrelid (Text) — owner table name
+///   * confrelid (Text) — referenced parent table (FK only;
+///     empty string otherwise)
+///   * conkey (Text) — comma-separated column names
+///   * confkey (Text) — comma-separated parent column names (FK only)
+fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("conname", DataType::Text, false),
+        ColumnSchema::new("contype", DataType::Text, false),
+        ColumnSchema::new("conrelid", DataType::Text, false),
+        ColumnSchema::new("confrelid", DataType::Text, false),
+        ColumnSchema::new("conkey", DataType::Text, false),
+        ColumnSchema::new("confkey", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let cols = &t.schema().columns;
+        let col_name_at = |pos: usize| -> String {
+            cols.get(pos)
+                .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
+        };
+        // Uniqueness constraints (composite UNIQUE / PRIMARY KEY).
+        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let kind = if uc.is_primary_key { "p" } else { "u" };
+            let conname = if uc.is_primary_key {
+                alloc::format!("{}_pkey", tname)
+            } else {
+                alloc::format!("{}_uniq{ci}", tname)
+            };
+            let conkey: Vec<String> = uc.columns.iter().map(|&p| col_name_at(p)).collect();
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text(kind.into()),
+                Value::Text(tname.clone()),
+                Value::Text(String::new()),
+                Value::Text(conkey.join(",")),
+                Value::Text(String::new()),
+            ]));
+        }
+        // Single-column PK / UNIQUE indexes that have no
+        // matching entry in `uniqueness_constraints` (the engine
+        // creates only the BTree index for the bare-column case;
+        // composite forms ride the UC path above).
+        for idx in t.indices() {
+            if !idx.is_unique {
+                continue;
+            }
+            let is_primary = idx.name.ends_with("_pkey");
+            let conname = idx.name.clone();
+            let kind = if is_primary { "p" } else { "u" };
+            let col_name = col_name_at(idx.column_position);
+            // Skip if already emitted via the UC loop above (same
+            // tuple shape — single-column).
+            let already = t.schema().uniqueness_constraints.iter().any(|uc| {
+                uc.columns.len() == 1 && uc.columns[0] == idx.column_position
+            });
+            if already {
+                continue;
+            }
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text(kind.into()),
+                Value::Text(tname.clone()),
+                Value::Text(String::new()),
+                Value::Text(col_name),
+                Value::Text(String::new()),
+            ]));
+        }
+        // Foreign keys.
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+            let conkey: Vec<String> =
+                fk.local_columns.iter().map(|&p| col_name_at(p)).collect();
+            // Parent column names: look up the parent table's
+            // schema if it exists; otherwise emit positions.
+            let confkey: Vec<String> = if let Some(parent) = cat.get(&fk.parent_table) {
+                fk.parent_columns
+                    .iter()
+                    .map(|&p| {
+                        parent
+                            .schema()
+                            .columns
+                            .get(p)
+                            .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+                    })
+                    .collect()
+            } else {
+                fk.parent_columns
+                    .iter()
+                    .map(|p| alloc::format!("col{p}"))
+                    .collect()
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text("f".into()),
+                Value::Text(tname.clone()),
+                Value::Text(fk.parent_table.clone()),
+                Value::Text(conkey.join(",")),
+                Value::Text(confkey.join(",")),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-55 — synthesise `pg_catalog.pg_database`.
+/// SPG is single-database so we surface a single row keyed on the
+/// canonical `postgres` database name (matching what every PG
+/// admin tool's startup screen expects to find).
+fn synth_pg_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("datname", DataType::Text, false),
+        ColumnSchema::new("datdba", DataType::BigInt, false),
+        ColumnSchema::new("encoding", DataType::Int, false),
+        ColumnSchema::new("datcollate", DataType::Text, false),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(16384),
+        Value::Text("postgres".into()),
+        Value::BigInt(10),
+        Value::Int(6), // UTF8
+        Value::Text("en_US.UTF-8".into()),
+    ])];
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-55 — synthesise `pg_catalog.pg_roles`. PG's
+/// pg_roles is a view over pg_authid showing all roles. SPG ships
+/// one row per declared user from the engine's UserStore so admin
+/// tool startup screens can populate.
+fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("rolname", DataType::Text, false),
+        ColumnSchema::new("rolsuper", DataType::Bool, false),
+        ColumnSchema::new("rolinherit", DataType::Bool, false),
+        ColumnSchema::new("rolcanlogin", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    let oid: i64 = 10;
+    for (i, (name, _)) in engine.users.iter().enumerate() {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid + (i as i64) + 1),
+            Value::Text(name.to_string()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]));
+    }
+    // Always include `postgres` as the bootstrap superuser if not
+    // already present — admin tools probe for it.
+    if !rows
+        .iter()
+        .any(|r| matches!(&r.values[1], Value::Text(s) if s == "postgres"))
+    {
+        rows.insert(
+            0,
+            Row::new(alloc::vec![
+                Value::BigInt(10),
+                Value::Text("postgres".into()),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(true),
+            ]),
+        );
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-56 — synthesise `pg_catalog.pg_views`. PG's
+/// pg_views is a view listing every catalog view; SPG ships one
+/// row per declared view + its definition text.
+fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("viewname", DataType::Text, false),
+        ColumnSchema::new("definition", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for (name, def) in cat.views() {
+        rows.push(Row::new(alloc::vec![
+            Value::Text("public".into()),
+            Value::Text(name.clone()),
+            Value::Text(def.body.clone()),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-57 — synthesise `pg_catalog.pg_settings`. ORM
+/// connection-checkers (sqlx pre-flight, Diesel migrator) and admin
+/// tools read `pg_settings` to discover server-side configuration.
+/// SPG surfaces every session_param + a small set of canonical PG
+/// defaults so the pre-flight queries match.
+fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("name", DataType::Text, false),
+        ColumnSchema::new("setting", DataType::Text, false),
+        ColumnSchema::new("category", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    // Canonical defaults every admin tool expects to find.
+    let defaults: &[(&str, &str, &str)] = &[
+        ("server_version", "16.0 (spg)", "Preset Options"),
+        ("server_encoding", "UTF8", "Client Connection Defaults"),
+        ("client_encoding", "UTF8", "Client Connection Defaults"),
+        ("DateStyle", "ISO, MDY", "Client Connection Defaults"),
+        ("TimeZone", "UTC", "Client Connection Defaults"),
+        ("standard_conforming_strings", "on", "Compatibility"),
+        ("integer_datetimes", "on", "Compatibility"),
+        ("max_connections", "100", "Connections and Authentication"),
+    ];
+    for &(name, val, cat) in defaults {
+        rows.push(Row::new(alloc::vec![
+            Value::Text(name.into()),
+            Value::Text(val.into()),
+            Value::Text(cat.into()),
+        ]));
+    }
+    // Session-set params override the static defaults.
+    for (k, v) in &engine.session_params {
+        if !defaults.iter().any(|(n, _, _)| (*n).eq_ignore_ascii_case(k)) {
+            rows.push(Row::new(alloc::vec![
+                Value::Text(k.clone()),
+                Value::Text(v.clone()),
+                Value::Text("Session".into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-53 — synthesise `pg_catalog.pg_indexes`.
+/// PG's pg_indexes is a real view on pg_index + pg_class + pg_attribute.
+/// SPG ships it as a synthesised flat table so admin tools (pgAdmin,
+/// DataGrip) can list indexes by tablename without joining four catalogs.
+///
+/// Schema columns exposed:
+///   * schemaname (Text) — always `public`
+///   * tablename (Text)
+///   * indexname (Text)
+///   * indexdef (Text) — best-effort CREATE INDEX DDL
+fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("tablename", DataType::Text, false),
+        ColumnSchema::new("indexname", DataType::Text, false),
+        ColumnSchema::new("indexdef", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            let col_name = t
+                .schema()
+                .columns
+                .get(idx.column_position)
+                .map_or("?".into(), |c| c.name.clone());
+            let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+            let indexdef = alloc::format!(
+                "CREATE {unique_kw}INDEX {} ON public.{} ({})",
+                idx.name,
+                tname,
+                col_name
+            );
+            rows.push(Row::new(alloc::vec![
+                Value::Text("public".into()),
+                Value::Text(tname.clone()),
+                Value::Text(idx.name.clone()),
+                Value::Text(indexdef),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-53 — synthesise `pg_catalog.pg_index`. The
+/// "raw" pg_index catalog used by PG-internal tooling for index
+/// flags and ordinal information. SPG ships the columns ORM probes
+/// actually filter on.
+///
+/// Schema columns exposed:
+///   * indexrelid (BigInt) — index OID (synthetic = position+1)
+///   * indrelid (BigInt) — table OID (synthetic = position+1)
+///   * indnatts (Int) — number of indexed columns
+///   * indisunique (Bool)
+///   * indisprimary (Bool)
+fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("indexrelid", DataType::BigInt, false),
+        ColumnSchema::new("indrelid", DataType::BigInt, false),
+        ColumnSchema::new("indnatts", DataType::Int, false),
+        ColumnSchema::new("indisunique", DataType::Bool, false),
+        ColumnSchema::new("indisprimary", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    let mut idx_oid: i64 = 100_000;
+    for (table_idx, tname) in cat.table_names().iter().enumerate() {
+        let Some(t) = cat.get(tname) else { continue };
+        for idx in t.indices() {
+            idx_oid += 1;
+            #[allow(clippy::cast_possible_wrap)]
+            let nattrs = (1 + idx.extra_column_positions.len()) as i32;
+            // is_primary: SPG / PG flag the primary via the
+            // index name convention `<table>_pkey`.
+            let is_primary = idx.name.ends_with("_pkey");
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(idx_oid),
+                Value::BigInt((table_idx + 1) as i64),
+                Value::Int(nattrs),
+                Value::Bool(idx.is_unique),
+                Value::Bool(is_primary),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-52 — synthesise `pg_catalog.pg_namespace`.
+/// SPG is single-schema so we expose the canonical PG schemas:
+/// `public` (user-facing), `pg_catalog` (built-in), and
+/// `information_schema` (PG meta).
+fn synth_pg_namespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("nspname", DataType::Text, false),
+        ColumnSchema::new("nspowner", DataType::BigInt, false),
+    ];
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(11),
+            Value::Text("pg_catalog".into()),
+            Value::BigInt(10),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(2200),
+            Value::Text("public".into()),
+            Value::BigInt(10),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(13000),
+            Value::Text("information_schema".into()),
+            Value::BigInt(10),
+        ]),
+    ];
+    (schema, rows)
+}
+
 /// v7.16.2 — drop the synthesised meta view into the enriched
 /// catalog so the regular FROM-resolution path can see it.
 fn materialise_meta_view(
@@ -8176,9 +11333,31 @@ fn materialise_meta_view(
 /// parser produces these for `information_schema.X` /
 /// `pg_catalog.X`). Used by `exec_select_cancel` to short-
 /// circuit into the meta-view materialisation path.
+/// v7.17.0 Phase 1.2 — append the names of any catalog-known
+/// views referenced by `tref` to `into`. Helper for
+/// `Engine::expand_views_in_select`. A view that's been already
+/// materialised as a table (e.g. via the synthetic CTE pass for
+/// SELECT FROM v) is skipped — the table form wins so the
+/// recursive exec_select_cancel call inside exec_with_ctes
+/// doesn't re-expand and trigger the CTE-shadow guard.
+fn collect_view_refs(
+    tref: &spg_sql::ast::TableRef,
+    cat: &spg_storage::Catalog,
+    into: &mut Vec<String>,
+) {
+    if cat.views().contains_key(&tref.name)
+        && cat.get(&tref.name).is_none()
+        && !into.iter().any(|n| n == &tref.name)
+    {
+        into.push(tref.name.clone());
+    }
+}
+
 fn select_references_meta_view(stmt: &SelectStatement) -> bool {
     fn is_meta(name: &str) -> bool {
-        name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")
+        name.starts_with("__spg_info_")
+            || name.starts_with("__spg_pg_")
+            || name.starts_with("__spg_mysql_")
     }
     if let Some(from) = &stmt.from {
         if is_meta(&from.primary.name) {
@@ -8207,7 +11386,9 @@ fn collect_meta_view_names(
     into: &mut alloc::collections::BTreeSet<String>,
 ) {
     fn is_meta(name: &str) -> bool {
-        name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")
+        name.starts_with("__spg_info_")
+            || name.starts_with("__spg_pg_")
+            || name.starts_with("__spg_mysql_")
     }
     if let Some(from) = &stmt.from {
         if is_meta(&from.primary.name) {
@@ -8592,6 +11773,137 @@ fn is_correlation_error(e: &EngineError) -> bool {
 /// must write `outer_alias.col` to reference an outer column. This
 /// matches PG's lexical scoping for correlated subqueries and
 /// avoids accidentally rebinding inner columns of the same name.
+/// v7.17.0 Phase 3.P0-41 — LATERAL peer descriptor. Either eagerly
+/// materialised (every regular table / unnest / generate_series) or
+/// lateral (subquery re-evaluated per outer row).
+struct JoinedPeer<'a> {
+    eager_rows: Option<Vec<Row>>,
+    cols: Vec<ColumnSchema>,
+    alias: String,
+    kind: JoinKind,
+    on: Option<&'a Expr>,
+    lateral: Option<&'a SelectStatement>,
+}
+
+/// v7.17.0 Phase 3.P0-41 — synthesise a column name for a LATERAL
+/// projection item that has no explicit alias. PG names anonymous
+/// projection items by the function call's name or by `column<i>`.
+/// SPG mirrors the latter (lower-overhead than walking arbitrary
+/// Expr shapes) so the probe-schema fallback path produces stable
+/// names for the lateral peer's columns.
+fn synth_lateral_col_name(expr: &Expr, idx: usize) -> String {
+    match expr {
+        // Bare column reference — use the column's own name.
+        Expr::Column(c) => c.name.clone(),
+        // Function call — use the function name (PG canonical:
+        // `count` / `max` / `lower` …).
+        Expr::FunctionCall { name, .. } => name.clone(),
+        // Cast — drill into the inner expression.
+        Expr::Cast { expr: inner, .. } => synth_lateral_col_name(inner, idx),
+        // Everything else falls back to PG's `column<N>` placeholder.
+        _ => alloc::format!("column{}", idx + 1),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-41 — substitute every `<alias>.<col>` Expr
+/// reference whose `<alias>.<col>` exists in the outer composite
+/// schema with the matching value from the outer row. Walks the
+/// entire SELECT body (items, WHERE, GROUP BY, HAVING, ORDER BY,
+/// UNION peers) so any depth of outer reference inside the
+/// LATERAL subquery resolves before execution.
+fn substitute_outer_columns_multi(
+    stmt: &mut SelectStatement,
+    outer_row: &Row,
+    outer_schema: &[ColumnSchema],
+) {
+    substitute_outer_in_select(stmt, outer_row, outer_schema);
+}
+
+fn substitute_outer_in_select(
+    stmt: &mut SelectStatement,
+    outer_row: &Row,
+    outer_schema: &[ColumnSchema],
+) {
+    for item in &mut stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            substitute_outer_in_expr(expr, outer_row, outer_schema);
+        }
+    }
+    if let Some(w) = &mut stmt.where_ {
+        substitute_outer_in_expr(w, outer_row, outer_schema);
+    }
+    if let Some(gs) = &mut stmt.group_by {
+        for g in gs {
+            substitute_outer_in_expr(g, outer_row, outer_schema);
+        }
+    }
+    if let Some(h) = &mut stmt.having {
+        substitute_outer_in_expr(h, outer_row, outer_schema);
+    }
+    for o in &mut stmt.order_by {
+        substitute_outer_in_expr(&mut o.expr, outer_row, outer_schema);
+    }
+    for (_, peer) in &mut stmt.unions {
+        substitute_outer_in_select(peer, outer_row, outer_schema);
+    }
+}
+
+fn substitute_outer_in_expr(
+    e: &mut Expr,
+    outer_row: &Row,
+    outer_schema: &[ColumnSchema],
+) {
+    if let Expr::Column(c) = e
+        && let Some(qual) = &c.qualifier
+    {
+        let composite = alloc::format!("{qual}.{}", c.name);
+        if let Some(idx) = outer_schema
+            .iter()
+            .position(|sc| sc.name.eq_ignore_ascii_case(&composite))
+        {
+            let v = outer_row.values.get(idx).cloned().unwrap_or(Value::Null);
+            if let Ok(lit) = value_to_literal_expr(v) {
+                *e = lit;
+                return;
+            }
+        }
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            substitute_outer_in_expr(lhs, outer_row, outer_schema);
+            substitute_outer_in_expr(rhs, outer_row, outer_schema);
+        }
+        Expr::Unary { expr: inner, .. } => {
+            substitute_outer_in_expr(inner, outer_row, outer_schema);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                substitute_outer_in_expr(a, outer_row, outer_schema);
+            }
+        }
+        Expr::Cast { expr: inner, .. } => {
+            substitute_outer_in_expr(inner, outer_row, outer_schema);
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                substitute_outer_in_expr(op, outer_row, outer_schema);
+            }
+            for (cond, val) in branches {
+                substitute_outer_in_expr(cond, outer_row, outer_schema);
+                substitute_outer_in_expr(val, outer_row, outer_schema);
+            }
+            if let Some(e) = else_branch {
+                substitute_outer_in_expr(e, outer_row, outer_schema);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row, ctx: &EvalContext<'_>) {
     let Some(outer_alias) = ctx.table_alias else {
         return;
@@ -8863,6 +12175,128 @@ fn order_key_cmp(a: &[(Value, bool)], b: &[(Value, bool)]) -> core::cmp::Orderin
         }
     }
     a.len().cmp(&b.len())
+}
+
+/// v7.17.0 Phase 3.10 — true when the Value is one of the
+/// integer-shaped variants `generate_series` accepts as a start
+/// / stop / step component. Float / NUMERIC are rejected — PG's
+/// `generate_series(numeric, numeric)` overload is out of v7.17
+/// scope.
+const fn value_is_integer(v: &Value) -> bool {
+    matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
+}
+
+/// v7.17.0 Phase 3.10 — widen any integer-shaped Value to i64 for
+/// the generate_series iteration loop. Non-integer inputs panic;
+/// caller guards via `value_is_integer`.
+const fn value_to_i64(v: &Value) -> i64 {
+    match v {
+        Value::SmallInt(n) => *n as i64,
+        Value::Int(n) => *n as i64,
+        Value::BigInt(n) => *n,
+        _ => panic!("value_to_i64 called on non-integer Value"),
+    }
+}
+
+/// v7.17.0 Phase 3.10 — integer-mode generate_series materialiser.
+/// Step direction follows the sign: positive step iterates upward
+/// (stops when current > stop); negative iterates downward; zero
+/// errors. Caller-facing row stream is `BigInt`-typed so a single
+/// projection schema covers SmallInt / Int / BigInt callers.
+fn generate_series_integers(
+    start: i64,
+    stop: i64,
+    step: i64,
+    cancel: &CancelToken<'_>,
+) -> Result<alloc::vec::Vec<Row>, EngineError> {
+    if step == 0 {
+        return Err(EngineError::Unsupported(
+            "generate_series(): step argument cannot be zero".into(),
+        ));
+    }
+    let mut out = alloc::vec::Vec::new();
+    let mut cur = start;
+    // Hard cap to keep a runaway call from eating all memory. PG
+    // has no such cap but does honour query timeout; SPG's cancel
+    // token will fire too — this is a defense-in-depth backstop.
+    const MAX_ROWS: usize = 10_000_000;
+    loop {
+        cancel.check()?;
+        if step > 0 && cur > stop {
+            break;
+        }
+        if step < 0 && cur < stop {
+            break;
+        }
+        out.push(Row::new(alloc::vec![Value::BigInt(cur)]));
+        if out.len() > MAX_ROWS {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "generate_series(): exceeded {MAX_ROWS} rows; \
+                 narrow start/stop or use a larger step"
+            )));
+        }
+        cur = match cur.checked_add(step) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+    Ok(out)
+}
+
+/// v7.17.0 Phase 3.10 — timestamp-mode generate_series. step is a
+/// `Value::Interval { months, micros }` per the caller's guard;
+/// each iteration adds the interval via `apply_binary_interval`
+/// so month-shifting handles short-month rollover (PG semantics).
+fn generate_series_timestamps(
+    start: i64,
+    stop: i64,
+    step: Value,
+    cancel: &CancelToken<'_>,
+) -> Result<alloc::vec::Vec<Row>, EngineError> {
+    let (months, micros) = match &step {
+        Value::Interval { months, micros } => (*months, *micros),
+        _ => unreachable!("caller guards step.is_interval"),
+    };
+    if months == 0 && micros == 0 {
+        return Err(EngineError::Unsupported(
+            "generate_series(): INTERVAL step cannot be zero".into(),
+        ));
+    }
+    let ascending = months > 0 || micros > 0;
+    let mut out = alloc::vec::Vec::new();
+    let mut cur = Value::Timestamp(start);
+    const MAX_ROWS: usize = 10_000_000;
+    loop {
+        cancel.check()?;
+        let cur_t = match cur {
+            Value::Timestamp(t) => t,
+            _ => unreachable!("loop invariant: cur is Timestamp"),
+        };
+        if ascending && cur_t > stop {
+            break;
+        }
+        if !ascending && cur_t < stop {
+            break;
+        }
+        out.push(Row::new(alloc::vec![Value::Timestamp(cur_t)]));
+        if out.len() > MAX_ROWS {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "generate_series(): exceeded {MAX_ROWS} rows; \
+                 narrow start/stop or use a larger step"
+            )));
+        }
+        let next = eval::apply_binary_interval(
+            spg_sql::ast::BinOp::Add,
+            &cur,
+            &Value::Interval { months, micros },
+        )
+        .map_err(EngineError::Eval)?;
+        cur = match next {
+            Some(v) => v,
+            None => break,
+        };
+    }
+    Ok(out)
 }
 
 #[allow(clippy::match_same_arms)] // explicit arms per type document the supported pairs
@@ -10067,6 +13501,22 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
         Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
         Value::Date(d) => eval::format_date(*d),
         Value::Timestamp(t) => eval::format_timestamp(*t),
+        // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.
+        Value::Time(us) => eval::format_time(*us),
+        // v7.17.0 Phase 3.P0-33 — MySQL YEAR 4-digit zero-padded.
+        Value::Year(y) => alloc::format!("{y:04}"),
+        // v7.17.0 Phase 3.P0-34 — PG TIMETZ canonical text form.
+        Value::TimeTz { us, offset_secs } => eval::format_timetz(*us, *offset_secs),
+        // v7.17.0 Phase 3.P0-35 — PG MONEY canonical en_US text form.
+        Value::Money(c) => eval::format_money(*c),
+        // v7.17.0 Phase 3.P0-38 — PG range canonical text form.
+        v @ Value::Range { .. } => format_range_str(v),
+        // v7.17.0 Phase 3.P0-39 — PG hstore canonical text form.
+        Value::Hstore(pairs) => format_hstore_str(pairs),
+        // v7.17.0 Phase 3.P0-40 — 2D array canonical text form.
+        Value::IntArray2D(rows) => format_int_2d_text(rows),
+        Value::BigIntArray2D(rows) => format_bigint_2d_text(rows),
+        Value::TextArray2D(rows) => format_text_2d_text(rows),
         Value::Interval { months, micros } => eval::format_interval(*months, *micros),
         Value::Numeric { scaled, scale } => eval::format_numeric(*scaled, *scale),
         Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
@@ -10105,6 +13555,12 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Numeric { scaled, scale } => Literal::String(eval::format_numeric(scaled, scale)),
         Value::Date(d) => Literal::String(eval::format_date(d)),
         Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
+        // v7.17.0 Phase 3.P0-69 — UUID round-trips via canonical
+        // hyphenated text. Without this arm the fallback below
+        // renders `Debug` form ("Uuid([85, …])") which the
+        // engine's Text → Uuid coerce can't parse, breaking
+        // prepared-bind round-trip from the spg-sqlx adapter.
+        Value::Uuid(b) => Literal::String(spg_storage::format_uuid(&b)),
         // v7.16.0 — BYTEA round-trip for the spg-sqlx Bind path.
         // PG-canonical text rep is `\x` + lowercase hex; the
         // engine's coerce_value already accepts that on the
@@ -10280,24 +13736,37 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
         Expr::Column(c) if c.qualifier.is_none() => (ClockSite::BareIdent, c.name.as_str()),
         _ => return None,
     };
-    // ASCII case-insensitive name match. Limited to the three keywords
-    // that actually need rewriting.
-    let matched = match name.len() {
-        3 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("now") => Some(true),
-        12 if name.eq_ignore_ascii_case("current_date") => Some(false),
-        17 if name.eq_ignore_ascii_case("current_timestamp") => Some(true),
+    // ASCII case-insensitive name match. Each entry decides what
+    // synthetic literal the call expands to.
+    //
+    // v7.17.0 Phase 3.P0-29 — `unix_timestamp` (no args) joins this
+    // table as MySQL's epoch-seconds equivalent of `now()`. Folded
+    // to a BigInt literal here so apply_function never needs a
+    // clock dependency.
+    enum ClockShape {
+        Timestamp,
+        Date,
+        UnixSeconds,
+    }
+    let shape = match name.len() {
+        3 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("now") => Some(ClockShape::Timestamp),
+        12 if name.eq_ignore_ascii_case("current_date") => Some(ClockShape::Date),
+        14 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("unix_timestamp") => {
+            Some(ClockShape::UnixSeconds)
+        }
+        17 if name.eq_ignore_ascii_case("current_timestamp") => Some(ClockShape::Timestamp),
         _ => None,
     };
-    let is_timestamp = matched?;
-    let payload = if is_timestamp {
-        now
-    } else {
-        now.div_euclid(86_400_000_000)
+    let shape = shape?;
+    let payload = match shape {
+        ClockShape::Timestamp => now,
+        ClockShape::Date => now.div_euclid(86_400_000_000),
+        ClockShape::UnixSeconds => now.div_euclid(1_000_000),
     };
-    let target = if is_timestamp {
-        spg_sql::ast::CastTarget::Timestamp
-    } else {
-        spg_sql::ast::CastTarget::Date
+    let target = match shape {
+        ClockShape::Timestamp => spg_sql::ast::CastTarget::Timestamp,
+        ClockShape::Date => spg_sql::ast::CastTarget::Date,
+        ClockShape::UnixSeconds => spg_sql::ast::CastTarget::BigInt,
     };
     Some(Expr::Cast {
         expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(payload))),
@@ -10462,6 +13931,59 @@ fn apply_offset_and_limit(rows: &mut Vec<Row>, offset: Option<u32>, limit: Optio
     if let Some(n) = limit {
         rows.truncate(n as usize);
     }
+}
+
+/// v7.17.0 Phase 3.P0-49 — offset + limit applied to a tagged
+/// `(order_keys, row)` sequence, with optional SQL:2008 `WITH
+/// TIES` extension. When `with_ties` is set, the truncated tail
+/// is extended through every subsequent row whose order keys
+/// equal the last-kept row's keys (so a "top 3 by score" with
+/// WITH TIES emits row 4 too when row 4 ties row 3 on `score`).
+///
+/// The order-key vector is the per-row sort key the caller already
+/// computed via `build_order_keys`; equal-key detection therefore
+/// matches the sort comparator exactly.
+fn apply_offset_and_limit_tagged(
+    tagged: &mut Vec<(Vec<f64>, Row)>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    with_ties: bool,
+) {
+    if let Some(off) = offset {
+        let off = off as usize;
+        if off >= tagged.len() {
+            tagged.clear();
+        } else {
+            tagged.drain(..off);
+        }
+    }
+    if let Some(n) = limit {
+        let n = n as usize;
+        if with_ties && n > 0 && n < tagged.len() {
+            let cutoff_key = tagged[n - 1].0.clone();
+            let mut end = n;
+            while end < tagged.len() && tagged[end].0 == cutoff_key {
+                end += 1;
+            }
+            tagged.truncate(end);
+        } else {
+            tagged.truncate(n);
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-49 — PG-canonical: `FETCH FIRST <n> ROWS
+/// WITH TIES` requires an `ORDER BY`. Without one, there's no
+/// way to identify "ties" deterministically, so PG errors at
+/// plan time. SPG mirrors that surface so the same DDL / app
+/// behaviour holds on cutover.
+fn check_with_ties_requires_order_by(stmt: &SelectStatement) -> Result<(), EngineError> {
+    if stmt.limit_with_ties && stmt.order_by.is_empty() {
+        return Err(EngineError::Unsupported(alloc::string::String::from(
+            "FETCH FIRST … ROWS WITH TIES requires an ORDER BY clause",
+        )));
+    }
+    Ok(())
 }
 
 /// v7.6.1 — resolve a parser-level `ForeignKeyConstraint` (column
@@ -10823,7 +14345,10 @@ fn apply_on_conflict_assignments(
             })?;
         let sub = substitute_excluded_refs(expr.clone(), &schema_cols, incoming);
         let v = eval::eval_expr(&sub, &existing, &ctx)?;
-        new_values[target_idx] = coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
+        let coerced =
+            coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
+        check_unsigned_range(&coerced, &schema_cols[target_idx], target_idx)?;
+        new_values[target_idx] = coerced;
     }
     Ok(Some(new_values))
 }
@@ -10906,9 +14431,22 @@ fn enforce_uniqueness_inserts(
             name: child_table.into(),
         })
     })?;
+    let schema = table.schema();
     for uc in constraints {
         for (batch_idx, row_values) in rows.iter().enumerate() {
-            let key: Vec<&Value> = uc.columns.iter().map(|&i| &row_values[i]).collect();
+            // v7.17.0 Phase 3.P0-45 — fold each key cell by its
+            // column's declared Collation before comparing. Phase
+            // 2.5b wired Collation into GROUP BY / ORDER BY / `=`
+            // but the UNIQUE-constraint enforcement still compared
+            // Text byte-wise; a `*_ci` column would let
+            // `('Foo')` and `('FOO')` coexist when MySQL would
+            // reject the second. Owned Values so the fold and
+            // the borrow live in the same scope.
+            let key: Vec<Value> = uc
+                .columns
+                .iter()
+                .map(|&i| collated_key_cell(&row_values[i], i, schema))
+                .collect();
             let has_null = key.iter().any(|v| matches!(v, Value::Null));
             // v7.13.0 — `NULLS NOT DISTINCT` (mailrs round-5 G10,
             // PG 15+): two rows whose constrained columns are all
@@ -10919,17 +14457,19 @@ fn enforce_uniqueness_inserts(
             }
             // Table-side collision: scan existing rows.
             let collides_in_table = table.rows().iter().any(|prow| {
-                uc.columns
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &p)| prow.values.get(p) == Some(key[i]))
+                uc.columns.iter().enumerate().all(|(i, &p)| {
+                    prow.values
+                        .get(p)
+                        .is_some_and(|v| collated_key_cell(v, p, schema) == key[i])
+                })
             });
             // Batch-side collision: earlier rows in the same INSERT.
             let collides_in_batch = rows[..batch_idx].iter().any(|earlier| {
-                uc.columns
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &p)| earlier.get(p) == Some(key[i]))
+                uc.columns.iter().enumerate().all(|(i, &p)| {
+                    earlier
+                        .get(p)
+                        .is_some_and(|v| collated_key_cell(v, p, schema) == key[i])
+                })
             });
             if collides_in_table || collides_in_batch {
                 let kind = if uc.is_primary_key {
@@ -10950,6 +14490,25 @@ fn enforce_uniqueness_inserts(
         }
     }
     Ok(())
+}
+
+/// v7.17.0 Phase 3.P0-45 — return a key cell folded by its column's
+/// declared `Collation`. For `CaseInsensitive`, fold Text payloads to
+/// ASCII lowercase (matches Phase 2.5's `*_ci` semantics: ASCII case-
+/// fold only, non-ASCII bytes stay byte-wise). For `Binary` or non-Text
+/// values, the cell passes through unchanged. The caller compares the
+/// folded values with `==`.
+fn collated_key_cell(
+    v: &spg_storage::Value,
+    column_position: usize,
+    schema: &spg_storage::TableSchema,
+) -> spg_storage::Value {
+    match (v, schema.columns.get(column_position).map(|c| c.collation)) {
+        (spg_storage::Value::Text(s), Some(spg_storage::Collation::CaseInsensitive)) => {
+            spg_storage::Value::Text(s.to_ascii_lowercase())
+        }
+        _ => v.clone(),
+    }
 }
 
 /// v7.9.29 — `true` iff `v` counts as a truthy SQL value for a
@@ -11004,10 +14563,12 @@ fn check_existing_unique_violation(
         let key: alloc::vec::Vec<spg_storage::Value> = key_positions
             .iter()
             .map(|&p| {
-                row.values
+                let v = row
+                    .values
                     .get(p)
                     .cloned()
-                    .unwrap_or(spg_storage::Value::Null)
+                    .unwrap_or(spg_storage::Value::Null);
+                collated_key_cell(&v, p, schema)
             })
             .collect();
         if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
@@ -11069,9 +14630,15 @@ fn enforce_unique_index_inserts(
         };
         let key_positions = unique_key_positions(idx);
         let key_of = |values: &[spg_storage::Value]| -> alloc::vec::Vec<spg_storage::Value> {
+            // v7.17.0 Phase 3.P0-45 — fold per-column collation
+            // before building the comparison key so a `*_ci`
+            // column treats `'Foo'` and `'FOO'` as equal.
             key_positions
                 .iter()
-                .map(|&p| values.get(p).cloned().unwrap_or(spg_storage::Value::Null))
+                .map(|&p| {
+                    let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
+                    collated_key_cell(&v, p, schema)
+                })
                 .collect()
         };
         // Helper: does `values` participate in this index? (predicate
@@ -11175,7 +14742,33 @@ fn enforce_check_constraints(
         })
     })?;
     let schema = table.schema();
-    if schema.checks.is_empty() {
+    // v7.17.0 Phase 1.5 — domain-level CHECKs are enforced in
+    // parallel with table-level CHECKs. Collect both lists up
+    // front; if neither exists we early-out.
+    let mut domain_checks_per_col: alloc::vec::Vec<(usize, alloc::vec::Vec<Expr>)> =
+        alloc::vec::Vec::new();
+    for (idx, col) in schema.columns.iter().enumerate() {
+        let Some(dname) = &col.user_domain_type else {
+            continue;
+        };
+        let Some(dom) = catalog.domain_types().get(dname) else {
+            continue;
+        };
+        let mut parsed_for_col: alloc::vec::Vec<Expr> = alloc::vec::Vec::with_capacity(dom.checks.len());
+        for src in &dom.checks {
+            let expr = spg_sql::parser::parse_expression(src).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "DOMAIN {dname:?} CHECK ({src:?}) on column {:?}: re-parse failed: {e:?}",
+                    col.name
+                ))
+            })?;
+            parsed_for_col.push(expr);
+        }
+        if !parsed_for_col.is_empty() {
+            domain_checks_per_col.push((idx, parsed_for_col));
+        }
+    }
+    if schema.checks.is_empty() && domain_checks_per_col.is_empty() {
         return Ok(());
     }
     let ctx = eval::EvalContext::new(&schema.columns, None);
@@ -11204,6 +14797,37 @@ fn enforce_check_constraints(
                     "CHECK constraint violation on {table_name:?} (row #{batch_idx}): {:?}",
                     schema.checks[*i]
                 )));
+            }
+        }
+        // v7.17.0 Phase 1.5 — domain-level CHECKs. Each CHECK
+        // expression references VALUE as a column-name; we
+        // substitute the per-row cell into the eval context by
+        // synthesising a single-column row of just that value
+        // under a temporary `value` column schema.
+        for (col_idx, checks) in &domain_checks_per_col {
+            let cell = row_values.get(*col_idx).cloned().unwrap_or(spg_storage::Value::Null);
+            let synth_cols = alloc::vec![spg_storage::ColumnSchema::new(
+                "value",
+                schema.columns[*col_idx].ty,
+                schema.columns[*col_idx].nullable,
+            )];
+            let synth_ctx = eval::EvalContext::new(&synth_cols, None);
+            let synth_row = spg_storage::Row {
+                values: alloc::vec![cell],
+            };
+            for (ci, expr) in checks.iter().enumerate() {
+                let v = eval::eval_expr(expr, &synth_row, &synth_ctx).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "DOMAIN CHECK #{ci} on column {:?} eval at row #{batch_idx}: {e:?}",
+                        schema.columns[*col_idx].name
+                    ))
+                })?;
+                if matches!(v, spg_storage::Value::Bool(false)) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "DOMAIN CHECK violation on column {:?} (row #{batch_idx})",
+                        schema.columns[*col_idx].name
+                    )));
+                }
             }
         }
     }
@@ -11796,7 +15420,21 @@ fn eval_runtime_default_free(
     clock_fn: Option<ClockFn>,
 ) -> Result<Value, EngineError> {
     let s = rt.trim().to_ascii_lowercase();
-    let canonical = s.trim_end_matches("()");
+    // v7.17.0 Phase 2.1 — also strip `(N)` precision suffix
+    // so MySQL `CURRENT_TIMESTAMP(6)` resolves the same as
+    // bare `CURRENT_TIMESTAMP`. SPG stores TIMESTAMP at fixed
+    // microsecond resolution; the precision modifier is
+    // parser-only.
+    let with_no_parens = s.trim_end_matches("()");
+    let canonical: &str = if let Some(open_idx) = with_no_parens.find('(') {
+        if with_no_parens.ends_with(')') {
+            &with_no_parens[..open_idx]
+        } else {
+            with_no_parens
+        }
+    } else {
+        with_no_parens
+    };
     let now_us = match clock_fn {
         Some(f) => f(),
         None => 0,
@@ -11805,12 +15443,21 @@ fn eval_runtime_default_free(
         "now" | "current_timestamp" | "localtimestamp" => Value::Timestamp(now_us),
         "current_date" => Value::Date((now_us / 86_400_000_000) as i32),
         "current_time" | "localtime" => Value::Timestamp(now_us),
+        // v7.17.0 — UUID generators in DEFAULT clauses. Required
+        // for the canonical Django / Rails / Hibernate `id UUID
+        // PRIMARY KEY DEFAULT gen_random_uuid()` pattern. Each
+        // INSERT evaluates the function fresh; the per-row UUID
+        // is the storage value, not a cached literal.
+        "gen_random_uuid" | "uuid_generate_v4" => {
+            Value::Uuid(eval::gen_random_uuid_bytes())
+        }
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
                 "runtime DEFAULT expression {other:?} not supported \
-                 (v7.9.21 whitelist: now() / current_timestamp / \
+                 (v7.17.0 whitelist: now() / current_timestamp / \
                  current_date / current_time / localtimestamp / \
-                 localtime)"
+                 localtime / gen_random_uuid() / \
+                 uuid_generate_v4())"
             )));
         }
     };
@@ -11830,9 +15477,134 @@ fn is_runtime_default_expr(expr: &Expr) -> bool {
     }
 }
 
+/// v7.17.0 Phase 1.4 — INSERT/UPDATE-time enum label check. When
+/// `col_idx` has a registered label list, the cell value must be
+/// NULL or one of the labels (case-sensitive per PG).
+/// v7.17.0 Phase 3.P0-37 — validate + canonicalise a MySQL inline
+/// SET cell. For non-SET columns this is a no-op pass-through.
+///
+/// Semantics:
+///   * NULL preserved.
+///   * Empty string → `''` (zero flags).
+///   * Otherwise split on ',', trim each token, validate every
+///     token against the column's variant list (error on miss),
+///     de-dup, then re-emit in DEFINITION order joined by ','.
+fn canonicalize_set_value(
+    lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    col_idx: usize,
+    col_name: &str,
+    value: Value,
+) -> Result<Value, EngineError> {
+    let Some(variants) = lookup.get(&col_idx) else {
+        return Ok(value);
+    };
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Text(s) => {
+            if s.is_empty() {
+                return Ok(Value::Text(alloc::string::String::new()));
+            }
+            // Collect a presence-set of variant indices to keep
+            // definition order + handle de-dup in one pass.
+            let mut present = alloc::vec![false; variants.len()];
+            for raw in s.split(',') {
+                let tok = raw.trim();
+                if tok.is_empty() {
+                    continue;
+                }
+                let idx = variants.iter().position(|v| v == tok).ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "column {col_name:?}: invalid SET token {tok:?}; \
+                         allowed: {variants:?}"
+                    ))
+                })?;
+                present[idx] = true;
+            }
+            // Re-emit in definition order.
+            let mut out = alloc::string::String::new();
+            let mut first = true;
+            for (i, keep) in present.iter().enumerate() {
+                if !keep {
+                    continue;
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&variants[i]);
+            }
+            Ok(Value::Text(out))
+        }
+        other => Err(EngineError::Unsupported(alloc::format!(
+            "column {col_name:?}: SET-typed column expects TEXT, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn enforce_enum_label(
+    lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    col_idx: usize,
+    col_name: &str,
+    value: &Value,
+) -> Result<(), EngineError> {
+    if let Some(labels) = lookup.get(&col_idx) {
+        match value {
+            Value::Null => Ok(()),
+            Value::Text(s) => {
+                if labels.iter().any(|l| l == s) {
+                    Ok(())
+                } else {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "column {col_name:?}: invalid enum label {s:?}; allowed: {labels:?}"
+                    )))
+                }
+            }
+            other => Err(EngineError::Unsupported(alloc::format!(
+                "column {col_name:?}: enum-typed column expects TEXT, got {:?}",
+                other.data_type()
+            ))),
+        }
+    } else {
+        Ok(())
+    }
+}
+
 fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
+    // user_type_ref is the raw ident the parser couldn't resolve
+    // to a built-in; classification into enum vs domain happens
+    // at exec_create_table where we have catalog access. We
+    // park it temporarily as user_enum_type and the engine
+    // promotes domain bindings to user_domain_type before the
+    // table is stored.
+    if let Some(name) = c.user_type_ref {
+        schema.user_enum_type = Some(name);
+    }
+    // v7.17.0 Phase 2.1 — render the ON UPDATE expression to
+    // canonical text (the engine re-parses at UPDATE time).
+    if let Some(expr) = c.on_update_runtime {
+        schema.on_update_runtime = Some(alloc::format!("{expr}"));
+    }
+    // v7.17.0 Phase 2.5 — bridge the AST `Collation` enum to the
+    // storage one. Same variants, different crates (spg-storage
+    // owns no dep on spg-sql).
+    schema.collation = match c.collation {
+        spg_sql::ast::Collation::Binary => spg_storage::Collation::Binary,
+        spg_sql::ast::Collation::CaseInsensitive => spg_storage::Collation::CaseInsensitive,
+    };
+    // v7.17.0 Phase 4.4 — MySQL `UNSIGNED` flag propagates to
+    // storage so engine INSERT / UPDATE can range-check.
+    schema.is_unsigned = c.is_unsigned;
+    // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant list.
+    // INSERT validation lives in coerce_value (Text → Text path
+    // with the column's variant list as the accept-set).
+    schema.inline_enum_variants = c.inline_enum_variants;
+    // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant list.
+    // INSERT canonicalisation (de-dup + sort by definition order)
+    // lives in the exec_insert path next to the ENUM check.
+    schema.inline_set_variants = c.inline_set_variants;
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to
@@ -12111,6 +15883,607 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
+/// v7.17.0 Phase 3.P0-39 — parse a PG `hstore` text literal into
+/// a flat key→value map. Empty string → empty map. Duplicate
+/// keys take last-write-wins (matches PG `hstore_in`).
+///
+/// Accepted shapes (minimal subset):
+///   * `'a=>1, b=>2'`            — bareword keys/values
+///   * `'"a"=>"1", "b"=>"2"'`    — quoted keys/values
+///   * `'a=>NULL'`               — case-insensitive NULL token
+///     surfaces as `None` (no quotes around NULL)
+///
+/// Returns None on parse failure → caller surfaces as hard error.
+fn parse_hstore_str(s: &str) -> Option<Vec<(alloc::string::String, Option<alloc::string::String>)>> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut out: Vec<(alloc::string::String, Option<alloc::string::String>)> = Vec::new();
+    let skip_ws = |bytes: &[u8], i: &mut usize| {
+        while *i < bytes.len() && matches!(bytes[*i], b' ' | b'\t' | b'\n' | b'\r') {
+            *i += 1;
+        }
+    };
+    let parse_token = |bytes: &[u8], i: &mut usize| -> Option<alloc::string::String> {
+        if *i >= bytes.len() {
+            return None;
+        }
+        if bytes[*i] == b'"' {
+            *i += 1;
+            let mut out = alloc::string::String::new();
+            while *i < bytes.len() {
+                match bytes[*i] {
+                    b'"' => {
+                        *i += 1;
+                        return Some(out);
+                    }
+                    b'\\' if *i + 1 < bytes.len() => {
+                        out.push(bytes[*i + 1] as char);
+                        *i += 2;
+                    }
+                    c => {
+                        out.push(c as char);
+                        *i += 1;
+                    }
+                }
+            }
+            None
+        } else {
+            let start = *i;
+            while *i < bytes.len()
+                && !matches!(bytes[*i], b' ' | b'\t' | b'\n' | b'\r' | b',' | b'=')
+            {
+                *i += 1;
+            }
+            if *i == start {
+                return None;
+            }
+            Some(alloc::str::from_utf8(&bytes[start..*i]).ok()?.to_string())
+        }
+    };
+    skip_ws(bytes, &mut i);
+    while i < bytes.len() {
+        let key = parse_token(bytes, &mut i)?;
+        skip_ws(bytes, &mut i);
+        if i + 1 >= bytes.len() || bytes[i] != b'=' || bytes[i + 1] != b'>' {
+            return None;
+        }
+        i += 2;
+        skip_ws(bytes, &mut i);
+        // Check for unquoted NULL token (case-insensitive).
+        let val_token = if i + 4 <= bytes.len()
+            && bytes[i..i + 4].eq_ignore_ascii_case(b"NULL")
+            && (i + 4 == bytes.len()
+                || matches!(bytes[i + 4], b' ' | b'\t' | b',' | b'\n' | b'\r'))
+        {
+            i += 4;
+            None
+        } else {
+            Some(parse_token(bytes, &mut i)?)
+        };
+        // Replace any existing entry with the same key (last-wins).
+        if let Some(pos) = out.iter().position(|(k, _)| k == &key) {
+            out[pos] = (key, val_token);
+        } else {
+            out.push((key, val_token));
+        }
+        skip_ws(bytes, &mut i);
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+            skip_ws(bytes, &mut i);
+            continue;
+        }
+        return None;
+    }
+    Some(out)
+}
+
+/// v7.17.0 Phase 3.P0-39 — render a hstore as canonical PG text
+/// form `"k"=>"v"` (keys and non-NULL values always quoted;
+/// NULL token is bare).
+fn format_hstore_str(pairs: &[(alloc::string::String, Option<alloc::string::String>)]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push('"');
+        out.push_str(k);
+        out.push_str("\"=>");
+        match v {
+            None => out.push_str("NULL"),
+            Some(val) => {
+                out.push('"');
+                out.push_str(val);
+                out.push('"');
+            }
+        }
+    }
+    out
+}
+
+/// v7.17.0 Phase 3.P0-39 — pub re-export so pgwire + sqllogictest
+/// share the single hstore renderer.
+pub fn format_hstore_text(pairs: &[(alloc::string::String, Option<alloc::string::String>)]) -> alloc::string::String {
+    format_hstore_str(pairs)
+}
+
+// ─── v7.17.0 Phase 3.P0-40 — 2D array parse + display ─────────
+
+/// Split a PG external 2D-array literal `'{{a,b},{c,d}}'` into
+/// per-row token lists. Returns Err on shape mismatch.
+fn split_2d_literal(s: &str) -> Result<Vec<Vec<alloc::string::String>>, &'static str> {
+    let s = s.trim();
+    let outer = s
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or("missing outer '{...}' braces")?;
+    let trimmed = outer.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows: Vec<Vec<alloc::string::String>> = Vec::new();
+    let mut i = 0;
+    let bytes = trimmed.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'{' {
+            return Err("expected '{' opening a row");
+        }
+        i += 1;
+        let row_start = i;
+        let mut depth = 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                i += 1;
+            }
+        }
+        if depth != 0 {
+            return Err("unbalanced '{...}' in row");
+        }
+        let row_text = &trimmed[row_start..i];
+        i += 1;
+        let cells: Vec<alloc::string::String> = if row_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            row_text
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .collect()
+        };
+        rows.push(cells);
+    }
+    if let Some(first) = rows.first() {
+        let cols = first.len();
+        for r in &rows {
+            if r.len() != cols {
+                return Err("ragged 2D array (rows have different column counts)");
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_int_2d_literal(s: &str) -> Result<Vec<Vec<Option<i32>>>, &'static str> {
+    let raw = split_2d_literal(s)?;
+    raw.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    if cell.eq_ignore_ascii_case("NULL") {
+                        Ok(None)
+                    } else {
+                        cell.parse::<i32>().map(Some).map_err(|_| "invalid int element")
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn parse_bigint_2d_literal(s: &str) -> Result<Vec<Vec<Option<i64>>>, &'static str> {
+    let raw = split_2d_literal(s)?;
+    raw.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    if cell.eq_ignore_ascii_case("NULL") {
+                        Ok(None)
+                    } else {
+                        cell.parse::<i64>().map(Some).map_err(|_| "invalid bigint element")
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn parse_text_2d_literal(s: &str) -> Result<Vec<Vec<Option<alloc::string::String>>>, &'static str> {
+    let raw = split_2d_literal(s)?;
+    Ok(raw
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    if cell.eq_ignore_ascii_case("NULL") {
+                        None
+                    } else {
+                        Some(cell.trim_matches('"').to_string())
+                    }
+                })
+                .collect()
+        })
+        .collect())
+}
+
+fn format_int_2d_text(rows: &[Vec<Option<i32>>]) -> alloc::string::String {
+    let mut out = alloc::string::String::from("{");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            match cell {
+                None => out.push_str("NULL"),
+                Some(n) => out.push_str(&alloc::format!("{n}")),
+            }
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
+}
+
+fn format_bigint_2d_text(rows: &[Vec<Option<i64>>]) -> alloc::string::String {
+    let mut out = alloc::string::String::from("{");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            match cell {
+                None => out.push_str("NULL"),
+                Some(n) => out.push_str(&alloc::format!("{n}")),
+            }
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
+}
+
+fn format_text_2d_text(rows: &[Vec<Option<alloc::string::String>>]) -> alloc::string::String {
+    let mut out = alloc::string::String::from("{");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            match cell {
+                None => out.push_str("NULL"),
+                Some(s) => out.push_str(s),
+            }
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
+}
+
+/// v7.17.0 Phase 3.P0-40 — pub re-exports so pgwire + sqllogictest
+/// share the single 2D-array renderer.
+pub fn format_int_2d_text_pub(rows: &[Vec<Option<i32>>]) -> alloc::string::String {
+    format_int_2d_text(rows)
+}
+pub fn format_bigint_2d_text_pub(rows: &[Vec<Option<i64>>]) -> alloc::string::String {
+    format_bigint_2d_text(rows)
+}
+pub fn format_text_2d_text_pub(rows: &[Vec<Option<alloc::string::String>>]) -> alloc::string::String {
+    format_text_2d_text(rows)
+}
+
+/// v7.17.0 Phase 3.P0-38 — parse a PG range literal of the form
+/// `'[lo,up)'` / `'(lo,up]'` / `'[lo,up]'` / `'(lo,up)'` /
+/// `'empty'`. Lower / upper may be empty (unbounded). Returns
+/// `None` on any parse failure; caller surfaces as hard error.
+fn parse_range_str(s: &str, kind: spg_storage::RangeKind) -> Option<Value> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("empty") {
+        return Some(Value::Range {
+            kind,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+            empty: true,
+        });
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 {
+        return None;
+    }
+    let lower_inc = match bytes[0] {
+        b'[' => true,
+        b'(' => false,
+        _ => return None,
+    };
+    let upper_inc = match bytes[bytes.len() - 1] {
+        b']' => true,
+        b')' => false,
+        _ => return None,
+    };
+    let inner = &s[1..s.len() - 1];
+    let (lo_text, up_text) = inner.split_once(',')?;
+    let lower = if lo_text.is_empty() {
+        None
+    } else {
+        Some(alloc::boxed::Box::new(parse_range_element(lo_text, kind)?))
+    };
+    let upper = if up_text.is_empty() {
+        None
+    } else {
+        Some(alloc::boxed::Box::new(parse_range_element(up_text, kind)?))
+    };
+    Some(Value::Range {
+        kind,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+        empty: false,
+    })
+}
+
+/// v7.17.0 Phase 3.P0-38 — parse a single range bound text into
+/// the matching element Value for the RangeKind.
+fn parse_range_element(text: &str, kind: spg_storage::RangeKind) -> Option<Value> {
+    let text = text.trim().trim_matches('"');
+    use spg_storage::RangeKind as K;
+    match kind {
+        K::Int4 => text.parse::<i32>().ok().map(Value::Int),
+        K::Int8 => text.parse::<i64>().ok().map(Value::BigInt),
+        K::Num => {
+            // Reuse the Numeric parse via the engine's text-coercion
+            // path; bail to None on failure.
+            let dot = text.find('.');
+            let scale: u8 = dot.map_or(0, |p| (text.len() - p - 1) as u8);
+            let digits: alloc::string::String =
+                text.chars().filter(|c| *c == '-' || c.is_ascii_digit()).collect();
+            let scaled: i128 = digits.parse().ok()?;
+            Some(Value::Numeric { scaled, scale })
+        }
+        K::Ts | K::TsTz => {
+            // Reuse the existing timestamp parse path. v7.17.0
+            // expects `'YYYY-MM-DD HH:MM:SS[.ffffff]'` in range
+            // bounds (TZ offset on TsTz is OOS for the initial
+            // P0-38; ship plain Timestamp shape).
+            crate::eval::parse_timestamp_literal(text).map(Value::Timestamp)
+        }
+        K::Date => crate::eval::parse_date_literal(text).map(Value::Date),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-38 — render a Range value as its canonical
+/// PG text form. Re-exported via [`format_range_text`] for use
+/// from spg-server's pgwire layer.
+pub fn format_range_text(v: &Value) -> alloc::string::String {
+    format_range_str(v)
+}
+
+fn format_range_str(v: &Value) -> alloc::string::String {
+    let Value::Range { lower, upper, lower_inc, upper_inc, empty, .. } = v else {
+        return alloc::string::String::new();
+    };
+    if *empty {
+        return "empty".into();
+    }
+    let mut out = alloc::string::String::new();
+    out.push(if *lower_inc { '[' } else { '(' });
+    if let Some(l) = lower {
+        out.push_str(&format_range_element(l));
+    }
+    out.push(',');
+    if let Some(u) = upper {
+        out.push_str(&format_range_element(u));
+    }
+    out.push(if *upper_inc { ']' } else { ')' });
+    out
+}
+
+fn format_range_element(v: &Value) -> alloc::string::String {
+    match v {
+        Value::Int(n) => alloc::format!("{n}"),
+        Value::BigInt(n) => alloc::format!("{n}"),
+        Value::Date(d) => crate::eval::format_date(*d),
+        Value::Timestamp(t) => crate::eval::format_timestamp(*t),
+        Value::Numeric { scaled, scale } => crate::eval::format_numeric(*scaled, *scale),
+        other => alloc::format!("{other:?}"),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-35 — parse a PG `money` literal into i64
+/// cents. Accepts:
+///   * Optional leading `-` (negative)
+///   * Optional `$` prefix
+///   * Integer portion with optional `,` thousands separators
+///   * Optional `.` followed by 1-2 digits (cents); 1 digit
+///     auto-pads to 2 (`.5` → 50 cents).
+///
+/// Returns None on any parse failure — caller surfaces as hard
+/// SQL error.
+fn parse_money_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r.trim_start()),
+        None => (false, s),
+    };
+    let rest = rest.strip_prefix('$').unwrap_or(rest).trim_start();
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (rest, None),
+    };
+    if int_part.is_empty() {
+        return None;
+    }
+    // Validate + strip commas from the integer portion.
+    let mut int_digits = alloc::string::String::with_capacity(int_part.len());
+    for b in int_part.bytes() {
+        match b {
+            b',' => {}
+            b'0'..=b'9' => int_digits.push(b as char),
+            _ => return None,
+        }
+    }
+    if int_digits.is_empty() {
+        return None;
+    }
+    let dollars: i64 = int_digits.parse().ok()?;
+    let cents: i64 = match frac_part {
+        None => 0,
+        Some(f) => {
+            if f.is_empty() || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let padded = if f.len() == 1 {
+                alloc::format!("{f}0")
+            } else {
+                f.to_string()
+            };
+            padded.parse().ok()?
+        }
+    };
+    let total = dollars.checked_mul(100)?.checked_add(cents)?;
+    Some(if neg { -total } else { total })
+}
+
+/// v7.17.0 Phase 3.P0-34 — parse a PG `timetz` literal
+/// `HH:MM:SS[.fraction]±HH[:MM]` into (us, offset_secs).
+///
+/// The offset suffix is MANDATORY: SPG doesn't have a session TZ
+/// wired into eval, so a bare `HH:MM:SS` literal would be
+/// ambiguous. Returns None for any parse failure or out-of-range
+/// component — caller surfaces as a hard SQL error.
+///
+/// Offset range: ±14 hours (±50400 seconds), matching PG's
+/// internal limit.
+fn parse_timetz_str(s: &str) -> Option<(i64, i32)> {
+    let s = s.trim();
+    // Find the offset sign — scan from right since the time part
+    // never contains '+' / '-' (after the optional fractional dot
+    // it's all digits and ':').
+    let bytes = s.as_bytes();
+    let sign_pos = bytes
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|&(_, &b)| b == b'+' || b == b'-')
+        .map(|(i, _)| i)?;
+    if sign_pos == 0 {
+        return None; // bare sign — no time component
+    }
+    let time_part = &s[..sign_pos];
+    let offset_part = &s[sign_pos..];
+    let us = parse_time_str(time_part)?;
+    let sign: i32 = if offset_part.starts_with('+') { 1 } else { -1 };
+    let offset_body = &offset_part[1..];
+    let (hh_str, mm_str) = match offset_body.split_once(':') {
+        Some((h, m)) => (h, m),
+        None => (offset_body, "0"),
+    };
+    let hh: i32 = hh_str.parse().ok()?;
+    let mm: i32 = mm_str.parse().ok()?;
+    if !(0..=14).contains(&hh) || !(0..=59).contains(&mm) {
+        return None;
+    }
+    let total = sign * (hh * 3600 + mm * 60);
+    if total.abs() > 50_400 {
+        return None;
+    }
+    Some((us, total))
+}
+
+/// v7.17.0 Phase 3.P0-33 — funnel an integer literal through MySQL
+/// YEAR range validation: 0 sentinel or 1901..=2155. Out-of-range
+/// surfaces as a hard SQL error (no silent truncation, mirrors PG
+/// `time_in` / `uuid_in` discipline).
+fn coerce_int_to_year(n: i64, col_name: &str) -> Result<Value, EngineError> {
+    if n == 0 || (1901..=2155).contains(&n) {
+        // u16::try_from cannot fail in this range; the cast also
+        // covers the 0 sentinel.
+        return Ok(Value::Year(n as u16));
+    }
+    Err(EngineError::Eval(EvalError::TypeMismatch {
+        detail: alloc::format!(
+            "year value out of range: {n} (column `{col_name}`; \
+             MySQL accepts 0 or 1901..=2155)"
+        ),
+    }))
+}
+
+/// v7.17.0 Phase 3.P0-32 — parse a PG `time` literal
+/// `HH:MM:SS[.fraction]` into microseconds since 00:00:00.
+///
+/// Accepts:
+///   * `HH:MM:SS`            — exact-second precision
+///   * `HH:MM:SS.f` .. `.ffffff` — 1-6 fractional digits, right-padded
+///     with zeros to microseconds
+///
+/// Range: hour 0..=23, minute 0..=59, second 0..=59. Anything else
+/// returns None — caller surfaces as a hard SQL error (no silent
+/// truncation, matches PG's `time_in` behaviour).
+fn parse_time_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (s, None),
+    };
+    let mut parts = hms.split(':');
+    let hh: u32 = parts.next()?.parse().ok()?;
+    let mm: u32 = parts.next()?.parse().ok()?;
+    let ss: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let frac_us: i64 = match frac {
+        None => 0,
+        Some(f) => {
+            if f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // Right-pad with zeros so '.5' = 500000 µsec.
+            let mut padded = alloc::string::String::with_capacity(6);
+            padded.push_str(f);
+            while padded.len() < 6 {
+                padded.push('0');
+            }
+            padded.parse().ok()?
+        }
+    };
+    Some(
+        i64::from(hh) * 3_600_000_000
+            + i64::from(mm) * 60_000_000
+            + i64::from(ss) * 1_000_000
+            + frac_us,
+    )
+}
+
+
+
 const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
     match t {
         ColumnTypeName::SmallInt => DataType::SmallInt,
@@ -12141,6 +16514,23 @@ const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::BigIntArray => DataType::BigIntArray,
         ColumnTypeName::TsVector => DataType::TsVector,
         ColumnTypeName::TsQuery => DataType::TsQuery,
+        ColumnTypeName::Uuid => DataType::Uuid,
+        ColumnTypeName::Time => DataType::Time,
+        ColumnTypeName::Year => DataType::Year,
+        ColumnTypeName::TimeTz => DataType::TimeTz,
+        ColumnTypeName::Money => DataType::Money,
+        ColumnTypeName::Range(k) => DataType::Range(match k {
+            spg_sql::ast::RangeKindAst::Int4 => spg_storage::RangeKind::Int4,
+            spg_sql::ast::RangeKindAst::Int8 => spg_storage::RangeKind::Int8,
+            spg_sql::ast::RangeKindAst::Num => spg_storage::RangeKind::Num,
+            spg_sql::ast::RangeKindAst::Ts => spg_storage::RangeKind::Ts,
+            spg_sql::ast::RangeKindAst::TsTz => spg_storage::RangeKind::TsTz,
+            spg_sql::ast::RangeKindAst::Date => spg_storage::RangeKind::Date,
+        }),
+        ColumnTypeName::Hstore => DataType::Hstore,
+        ColumnTypeName::IntArray2D => DataType::IntArray2D,
+        ColumnTypeName::BigIntArray2D => DataType::BigIntArray2D,
+        ColumnTypeName::TextArray2D => DataType::TextArray2D,
     }
 }
 
@@ -12186,9 +16576,24 @@ fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
             }
             Ok(array_literal_widen(materialised))
         }
-        other => Err(EngineError::Unsupported(alloc::format!(
-            "non-literal INSERT value expression: {other:?}"
-        ))),
+        // Any other Expr shape — fall back to a general evaluation
+        // against an empty row + empty schema. This unblocks the
+        // app-common patterns where INSERT VALUES carries a
+        // non-correlated function call:
+        //   INSERT INTO t VALUES (concat('U-', 42))
+        //   INSERT INTO t VALUES (now())
+        //   INSERT INTO t VALUES (format('%s-%s', 'a', 'b'))
+        // Any expression that references a column or `$N`
+        // placeholder fails cleanly inside `eval_expr` with a
+        // descriptive error; literals + casts + ARRAY[…] continue
+        // to take the fast paths above so the hot INSERT path is
+        // unchanged on the common case.
+        other => {
+            let empty_schema: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
+            let ctx = EvalContext::new(&empty_schema, None);
+            let empty_row = spg_storage::Row::new(alloc::vec::Vec::new());
+            crate::eval::eval_expr(&other, &empty_row, &ctx).map_err(EngineError::Eval)
+        }
     }
 }
 
@@ -12221,6 +16626,33 @@ fn int_value_for(n: i64) -> Value {
 /// else returns `TypeMismatch` carrying the column name for caller diagnostics.
 /// `NULL` is always permitted; the nullability check happens later in storage.
 #[allow(clippy::too_many_lines)]
+/// v7.17.0 Phase 4.4 — reject negative integer values on UNSIGNED
+/// columns. Called after `coerce_value` at each INSERT / UPDATE
+/// site that has ColumnSchema context. NULL passes through (a
+/// nullable UNSIGNED column can legitimately hold NULL).
+fn check_unsigned_range(
+    v: &Value,
+    schema: &ColumnSchema,
+    position: usize,
+) -> Result<(), EngineError> {
+    if !schema.is_unsigned {
+        return Ok(());
+    }
+    let n = match v {
+        Value::SmallInt(x) => i64::from(*x),
+        Value::Int(x) => i64::from(*x),
+        Value::BigInt(x) => *x,
+        _ => return Ok(()), // non-integer cells (NULL, default) skip
+    };
+    if n < 0 {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "column {:?} is UNSIGNED but got negative value {n} at position {position}",
+            schema.name
+        )));
+    }
+    Ok(())
+}
+
 fn coerce_value(
     v: Value,
     expected: DataType,
@@ -12266,6 +16698,26 @@ fn coerce_value(
         (Value::Float(x), DataType::Numeric { precision, scale }) => {
             Some(numeric_from_float(x, precision, scale, col_name)?)
         }
+        // v7.17.0 Phase 3.P0-67 — Text → NUMERIC. Parse a
+        // canonical decimal text (`"-1234.56"` / `"42"` /
+        // `"0.0001"`) into `(mantissa, source_scale)` and rescale
+        // to the column's declared scale. Required for prepared
+        // binds: `value_to_literal` flattens a Value::Numeric
+        // into a TEXT literal because Literal carries no native
+        // Numeric variant, so the placeholder substitution path
+        // reaches coerce_value as Text → Numeric. Without this
+        // arm the round-trip surfaces a TypeMismatch even though
+        // the cell already left the engine as a valid Numeric.
+        (Value::Text(s), DataType::Numeric { precision, scale }) => {
+            let Some((mantissa, src_scale)) = parse_numeric_text(&s) else {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as NUMERIC for column `{col_name}`"
+                    ),
+                }));
+            };
+            Some(numeric_rescale(mantissa, src_scale, precision, scale, col_name)?)
+        }
         // Text → DATE / TIMESTAMP: parse canonical text forms.
         (Value::Text(s), DataType::Date) => {
             let d = eval::parse_date_literal(&s).ok_or_else(|| {
@@ -12290,6 +16742,17 @@ fn coerce_value(
             "1" | "true" | "t" | "yes" | "on" => Some(Value::Bool(true)),
             _ => None,
         },
+        // v7.17.0 Phase 3.P0-46 — MySQL TINYINT(1) (which Phase 4.3
+        // classifies as DataType::Bool) is the storage shape every
+        // mysqldump-restored boolean column lands in. mysqldump emits
+        // the values as integer `0` / `1` literals, so int → bool
+        // coerce on INSERT is required for a 0-change cutover. MySQL's
+        // rule is "any non-zero is truthy"; we follow that for all
+        // signed int widths so the same coerce path serves an
+        // explicit `BOOLEAN` column too.
+        (Value::Int(n), DataType::Bool) => Some(Value::Bool(n != 0)),
+        (Value::SmallInt(n), DataType::Bool) => Some(Value::Bool(n != 0)),
+        (Value::BigInt(n), DataType::Bool) => Some(Value::Bool(n != 0)),
         // v4.9: Text ↔ JSON coercion. No structural validation —
         // any text literal is accepted; the responsibility for
         // valid JSON lies with the producer.
@@ -12323,6 +16786,203 @@ fn coerce_value(
         // output (lowercase, `\x` prefix). Important when a
         // SELECT pulls a bytea cell through a Text column path.
         (Value::Bytes(b), DataType::Text) => Some(Value::Text(encode_bytea_hex(&b))),
+        // v7.17.0 — Text → UUID. PG accepts canonical hyphenated,
+        // unhyphenated, uppercase, and `{...}`-braced forms; we
+        // funnel all four through `spg_storage::parse_uuid_str`.
+        // A malformed literal surfaces as a SQL TypeMismatch
+        // rather than silently inserting garbage — `0-change
+        // cutover` requires that an app inserting bad UUID text
+        // sees the same hard error PG would raise.
+        (Value::Text(s), DataType::Uuid) => match spg_storage::parse_uuid_str(&s) {
+            Some(b) => Some(Value::Uuid(b)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type uuid: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // v7.17.0 — UUID → Text canonical 8-4-4-4-12 lowercase.
+        // Surfaces when a SELECT plucks a uuid cell through a
+        // Text column path (e.g. INSERT INTO log SELECT id::text
+        // FROM other_table).
+        (Value::Uuid(b), DataType::Text) => Some(Value::Text(spg_storage::format_uuid(&b))),
+        // v7.17.0 Phase 3.P0-32 — Text → TIME. Accepts
+        // `HH:MM:SS` and `HH:MM:SS.ffffff` (1-6 fractional digits).
+        // Out-of-range hour/min/sec is a hard SQL error (no
+        // silent truncation — same 0-change-cutover discipline
+        // we apply to UUID).
+        (Value::Text(s), DataType::Time) => match parse_time_str(&s) {
+            Some(us) => Some(Value::Time(us)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type time: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // v7.17.0 Phase 3.P0-32 — TIME → Text canonical `HH:MM:SS[.ffffff]`.
+        (Value::Time(us), DataType::Text) => Some(Value::Text(eval::format_time(us))),
+        // v7.17.0 Phase 3.P0-33 — int / bigint → YEAR. Range
+        // check enforces the MySQL canonical 1901..=2155 + 0
+        // sentinel; out-of-range is a hard SQL error (no silent
+        // truncation, mirrors P0-32 / P0-25 discipline).
+        (Value::SmallInt(n), DataType::Year) => Some(coerce_int_to_year(i64::from(n), col_name)?),
+        (Value::Int(n), DataType::Year) => Some(coerce_int_to_year(i64::from(n), col_name)?),
+        (Value::BigInt(n), DataType::Year) => Some(coerce_int_to_year(n, col_name)?),
+        // Text → YEAR. Accepts the 4-digit decimal form only;
+        // two-digit YEAR (`'99'` → 1999) was deprecated in MySQL
+        // 5.7 and is out of scope for v7.17.0.
+        (Value::Text(s), DataType::Year) => match s.trim().parse::<i64>() {
+            Ok(n) => Some(coerce_int_to_year(n, col_name)?),
+            Err(_) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type year: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // YEAR → Text 4-digit zero-padded.
+        (Value::Year(y), DataType::Text) => Some(Value::Text(alloc::format!("{y:04}"))),
+        // v7.17.0 Phase 3.P0-34 — Text → TIMETZ. Mandatory
+        // signed offset suffix; missing offset is a hard error
+        // (SPG has no session TZ wired into eval, unlike PG).
+        (Value::Text(s), DataType::TimeTz) => match parse_timetz_str(&s) {
+            Some((us, offset_secs)) => Some(Value::TimeTz { us, offset_secs }),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type time with time zone: \
+                         {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // TIMETZ → Text canonical `HH:MM:SS[.ffffff]±HH[:MM]`.
+        (Value::TimeTz { us, offset_secs }, DataType::Text) => {
+            Some(Value::Text(eval::format_timetz(us, offset_secs)))
+        }
+        // v7.17.0 Phase 3.P0-35 — Text → MONEY. Accepts `$N.NN`,
+        // `$N,NNN.NN`, optional leading `-`. Bare numeric literals
+        // arrive via the Int/BigInt/Float/Numeric arms below.
+        (Value::Text(s), DataType::Money) => match parse_money_str(&s) {
+            Some(c) => Some(Value::Money(c)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type money: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // Int / BigInt / SmallInt / Float / Numeric → MONEY.
+        // Bare numeric literal is interpreted as a major-unit
+        // amount (matches PG: `100`::money → $100.00 = 10000 cents).
+        (Value::SmallInt(n), DataType::Money) => Some(Value::Money(i64::from(n).saturating_mul(100))),
+        (Value::Int(n), DataType::Money) => Some(Value::Money(i64::from(n).saturating_mul(100))),
+        (Value::BigInt(n), DataType::Money) => Some(Value::Money(n.saturating_mul(100))),
+        (Value::Float(x), DataType::Money) => {
+            // Round half-away-from-zero to cents (no_std — no
+            // `f64::round`, so hand-roll via biased truncation).
+            let scaled = x * 100.0;
+            let cents = if scaled >= 0.0 {
+                (scaled + 0.5) as i64
+            } else {
+                (scaled - 0.5) as i64
+            };
+            Some(Value::Money(cents))
+        }
+        (Value::Numeric { scaled, scale }, DataType::Money) => {
+            // Convert exact decimal to cents (scale 2). If scale > 2,
+            // round half-away-from-zero. If scale < 2, multiply up.
+            let cents = if scale == 2 {
+                scaled
+            } else if scale < 2 {
+                let mult = 10_i128.pow(u32::from(2 - scale));
+                scaled.saturating_mul(mult)
+            } else {
+                let div = 10_i128.pow(u32::from(scale - 2));
+                let half = div / 2;
+                let bias = if scaled >= 0 { half } else { -half };
+                (scaled + bias) / div
+            };
+            Some(Value::Money(i64::try_from(cents).unwrap_or(i64::MAX)))
+        }
+        // MONEY → Text canonical `$N,NNN.CC`.
+        (Value::Money(c), DataType::Text) => Some(Value::Text(eval::format_money(c))),
+        // v7.17.0 Phase 3.P0-38 — Text → Range. Accepts canonical
+        // PG forms: `'empty'`, `'[a,b)'`, `'(a,b]'`, `'[a,b]'`,
+        // `'(a,b)'`, with empty lower or upper for unbounded.
+        (Value::Text(s), DataType::Range(kind)) => match parse_range_str(&s, kind) {
+            Some(v) => Some(v),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for range type: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // Range → Text canonical form (`[a,b)`, `'empty'`, etc).
+        (v @ Value::Range { .. }, DataType::Text) => {
+            Some(Value::Text(format_range_str(&v)))
+        }
+        // v7.17.0 Phase 3.P0-39 — Text → Hstore.
+        (Value::Text(s), DataType::Hstore) => match parse_hstore_str(&s) {
+            Some(pairs) => Some(Value::Hstore(pairs)),
+            None => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type hstore: {s:?} (column `{col_name}`)"
+                    ),
+                }));
+            }
+        },
+        // Hstore → Text canonical `"k"=>"v"` form.
+        (Value::Hstore(pairs), DataType::Text) => Some(Value::Text(format_hstore_str(&pairs))),
+        // v7.17.0 Phase 3.P0-40 — Text → 2D arrays via PG
+        // external `'{{a,b},{c,d}}'` literal.
+        (Value::Text(s), DataType::IntArray2D) => match parse_int_2d_literal(&s) {
+            Ok(m) => Some(Value::IntArray2D(m)),
+            Err(e) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for INT[][]: {s:?} (column `{col_name}`): {e}"
+                    ),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::BigIntArray2D) => match parse_bigint_2d_literal(&s) {
+            Ok(m) => Some(Value::BigIntArray2D(m)),
+            Err(e) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for BIGINT[][]: {s:?} (column `{col_name}`): {e}"
+                    ),
+                }));
+            }
+        },
+        (Value::Text(s), DataType::TextArray2D) => match parse_text_2d_literal(&s) {
+            Ok(m) => Some(Value::TextArray2D(m)),
+            Err(e) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for TEXT[][]: {s:?} (column `{col_name}`): {e}"
+                    ),
+                }));
+            }
+        },
+        // 2D arrays → Text canonical nested form.
+        (Value::IntArray2D(rows), DataType::Text) => Some(Value::Text(format_int_2d_text(&rows))),
+        (Value::BigIntArray2D(rows), DataType::Text) => {
+            Some(Value::Text(format_bigint_2d_text(&rows)))
+        }
+        (Value::TextArray2D(rows), DataType::Text) => {
+            Some(Value::Text(format_text_2d_text(&rows)))
+        }
         // v7.10.11 — Text → TEXT[]. Decode PG's external array
         // form `'{a,b,NULL}'`. NULL element token (case-insensitive)
         // is the literal `NULL`; everything else is a quoted or
@@ -12398,6 +17058,38 @@ fn coerce_value(
         // external array form (`{a,b,NULL}`). Lets a SELECT
         // pull an array column through any Text-side codepath.
         (Value::TextArray(items), DataType::Text) => Some(Value::Text(encode_text_array(&items))),
+        // v7.17.0 Phase 3.P0-68 — Text → VECTOR auto-coerce.
+        // Matches the existing Text → TsVector arm and the
+        // `::vector` cast: PG-canonical pgvector external form
+        // (`'[1, 2, -3]'`) becomes a typed Vector value at the
+        // column boundary. Dim mismatch surfaces as TypeMismatch.
+        // For SQ8 / HALF encodings we chain through the standard
+        // quantise helpers so the storage shape matches the
+        // declared encoding without a second coerce pass.
+        (Value::Text(s), DataType::Vector { dim, encoding }) => {
+            let parsed = eval::parse_vector_text(&s).ok_or_else(|| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as VECTOR for column `{col_name}`"
+                    ),
+                })
+            })?;
+            if parsed.len() != dim as usize {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "VECTOR({dim}) column `{col_name}` rejects literal of length {}",
+                        parsed.len()
+                    ),
+                }));
+            }
+            Some(match encoding {
+                VecEncoding::F32 => Value::Vector(parsed),
+                VecEncoding::Sq8 => Value::Sq8Vector(spg_storage::quantize::quantize(&parsed)),
+                VecEncoding::F16 => Value::HalfVector(
+                    spg_storage::halfvec::HalfVector::from_f32_slice(&parsed),
+                ),
+            })
+        }
         // v7.16.1 — Text → TSVECTOR auto-coerce for the
         // INSERT-side wire path (mailrs round-9 A.2.a). PG
         // implicitly promotes the TEXT literal at INSERT into a
@@ -12903,11 +17595,16 @@ mod tests {
     }
 
     #[test]
-    fn insert_non_literal_expr_unsupported() {
+    fn insert_expression_evaluated_against_empty_context() {
+        // PG-canonical: INSERT VALUES accepts an arbitrary scalar
+        // expression. The engine evaluates against an empty row
+        // context — column references would error, but pure
+        // arithmetic / function calls are fine.
         let mut e = Engine::new();
         e.execute("CREATE TABLE foo (a INT NOT NULL)").unwrap();
-        let err = e.execute("INSERT INTO foo VALUES (1 + 2)").unwrap_err();
-        assert!(matches!(err, EngineError::Unsupported(_)));
+        e.execute("INSERT INTO foo VALUES (1 + 2)").unwrap();
+        let rows = e.catalog().get("foo").unwrap().rows();
+        assert_eq!(rows[0].values[0], Value::Int(3));
     }
 
     #[test]

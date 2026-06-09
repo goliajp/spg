@@ -594,6 +594,25 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // tsquery rarely persists as a column (usually a
                 // literal); rough sizing matches a small AST.
                 DataType::TsQuery => 64,
+                // v7.17.0 — UUID is fixed 16 bytes (RFC 4122).
+                DataType::Uuid => 16,
+                // v7.17.0 Phase 3.P0-32 — TIME is fixed i64 (8 bytes).
+                DataType::Time => 8,
+                // v7.17.0 Phase 3.P0-33 — YEAR is fixed u16 (2 bytes).
+                DataType::Year => 2,
+                // v7.17.0 Phase 3.P0-34 — TIMETZ is i64 + i32 (12 bytes).
+                DataType::TimeTz => 12,
+                // v7.17.0 Phase 3.P0-35 — MONEY is fixed i64 (8 bytes).
+                DataType::Money => 8,
+                // v7.17.0 Phase 3.P0-38 — range cells avg ~24 bytes
+                // (flags + two element values).
+                DataType::Range(_) => 24,
+                // v7.17.0 Phase 3.P0-39 — hstore avg ~64 bytes
+                // (k=>v map, varlena).
+                DataType::Hstore => 64,
+                // v7.17.0 Phase 3.P0-40 — 2D arrays avg ~96 bytes
+                // (4×3 matrix × per-element cost).
+                DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => 96,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

@@ -37,6 +37,7 @@ thread_local! {
     /// .cold_prefetch_hits` after the state is built.
     static PREFETCH_HITS_BOOT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+mod mysqlwire;
 mod pgwire;
 mod replication;
 mod scram;
@@ -351,6 +352,11 @@ pub(crate) struct ConnState {
     pub(crate) wait_event: AtomicU8,
     pub(crate) last_query_start_us: AtomicI64,
     pub(crate) in_transaction: AtomicBool,
+    /// v7.17 Phase 2.4 — startup-param `application_name` (or the
+    /// last value the client sent via `SET application_name = '...'`).
+    /// Session-scoped per PG semantics; SET LOCAL is not honored
+    /// because PG itself treats this GUC as session-only.
+    pub(crate) application_name: RwLock<String>,
 }
 
 impl ConnState {
@@ -463,6 +469,11 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
         .iter()
         .map(|c| {
             let current_sql = c.current_sql.read().map(|g| g.clone()).unwrap_or_default();
+            let application_name = c
+                .application_name
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
             spg_engine::ActivityRow {
                 pid: c.pid,
                 user: c.user.clone(),
@@ -471,6 +482,7 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
                 wait_event: c.wait_event_str().to_string(),
                 elapsed_us: c.elapsed_us(),
                 in_transaction: c.in_transaction.load(Ordering::Relaxed),
+                application_name,
             }
         })
         .collect()
@@ -1281,6 +1293,20 @@ fn run(
         match pgwire::spawn_listener(&pg_addr, Arc::clone(&state)) {
             Ok(pg_local) => eprintln!("spg-server: pg-wire listening on {pg_local}"),
             Err(e) => eprintln!("spg-server: pg-wire failed to start on {pg_addr}: {e}"),
+        }
+    }
+
+    // v7.17.0 Phase 3.P0-70 — optional MySQL-wire compatibility
+    // listener. Opt-in via env so existing deployments don't
+    // suddenly grow a third bound port. Plumbed through Segment
+    // G as auth (P0-71/P0-72), commands (P0-73..P0-75), binary
+    // result rows (P0-76), and SSL upgrade (P0-77) land.
+    if let Ok(my_addr) = env::var("SPG_MYSQLWIRE_ADDR")
+        && !my_addr.is_empty()
+    {
+        match mysqlwire::spawn_listener(&my_addr, Arc::clone(&state)) {
+            Ok(my_local) => eprintln!("spg-server: mysql-wire listening on {my_local}"),
+            Err(e) => eprintln!("spg-server: mysql-wire failed to start on {my_addr}: {e}"),
         }
     }
 
@@ -4200,7 +4226,41 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // v7.12.0 — tsvector / tsquery collapse to Text on the
         // wire; OIDs 3614 / 3615 advertised via `pg_type_oid`.
         | DataType::TsVector
-        | DataType::TsQuery => WireType::Text,
+        | DataType::TsQuery
+        // v7.17.0 — UUID collapses to Text on the wire as the
+        // canonical 8-4-4-4-12 lowercase hyphenated form. PG
+        // OID 2950 is advertised via `pg_type_oid`; binary
+        // 16-byte format lands when binary-format clients
+        // arrive.
+        | DataType::Uuid
+        // v7.17.0 Phase 3.P0-32 — TIME collapses to Text on the
+        // wire as canonical `HH:MM:SS[.ffffff]`. PG OID 1083
+        // advertised via `pg_type_oid`.
+        | DataType::Time
+        // v7.17.0 Phase 3.P0-33 — YEAR collapses to Text on the
+        // wire as 4-digit zero-padded. Pgwire advertises as
+        // INT4 OID; integer clients still parse it cleanly.
+        | DataType::Year
+        // v7.17.0 Phase 3.P0-34 — TIMETZ collapses to Text on
+        // the wire as `HH:MM:SS[.ffffff]±HH[:MM]`. PG OID 1266
+        // advertised via `pg_type_oid`.
+        | DataType::TimeTz
+        // v7.17.0 Phase 3.P0-35 — MONEY collapses to Text on
+        // the wire as canonical `$N,NNN.CC`. PG OID 790
+        // advertised via `pg_type_oid`.
+        | DataType::Money
+        // v7.17.0 Phase 3.P0-38 — range types collapse to Text
+        // on the wire as canonical `[a,b)` / `(a,b]` form. PG
+        // OIDs (3904/3926/...) advertised via `pg_type_oid`.
+        | DataType::Range(_)
+        // v7.17.0 Phase 3.P0-39 — hstore collapses to Text on
+        // the wire as canonical `"k"=>"v"` form.
+        | DataType::Hstore
+        // v7.17.0 Phase 3.P0-40 — 2D arrays collapse to Text on
+        // the wire as nested `'{{a,b},{c,d}}'` form.
+        | DataType::IntArray2D
+        | DataType::BigIntArray2D
+        | DataType::TextArray2D => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.

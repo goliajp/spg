@@ -218,6 +218,24 @@ fn render_cell(v: &Value, ty: char) -> String {
         Value::Numeric { scaled, scale } => spg_engine::eval::format_numeric(*scaled, *scale),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
+        // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.
+        Value::Time(us) => spg_engine::eval::format_time(*us),
+        // v7.17.0 Phase 3.P0-33 — MySQL YEAR 4-digit zero-padded.
+        Value::Year(y) => format!("{y:04}"),
+        // v7.17.0 Phase 3.P0-34 — PG TIMETZ canonical text form.
+        Value::TimeTz { us, offset_secs } => {
+            spg_engine::eval::format_timetz(*us, *offset_secs)
+        }
+        // v7.17.0 Phase 3.P0-35 — PG MONEY canonical en_US text form.
+        Value::Money(c) => spg_engine::eval::format_money(*c),
+        // v7.17.0 Phase 3.P0-38 — PG range canonical text form.
+        v @ Value::Range { .. } => spg_engine::format_range_text(v),
+        // v7.17.0 Phase 3.P0-39 — PG hstore canonical text form.
+        Value::Hstore(pairs) => spg_engine::format_hstore_text(pairs),
+        // v7.17.0 Phase 3.P0-40 — 2D array canonical text form.
+        Value::IntArray2D(rows) => spg_engine::format_int_2d_text_pub(rows),
+        Value::BigIntArray2D(rows) => spg_engine::format_bigint_2d_text_pub(rows),
+        Value::TextArray2D(rows) => spg_engine::format_text_2d_text_pub(rows),
         Value::Interval { months, micros } => spg_engine::eval::format_interval(*months, *micros),
         Value::Json(s) => s.clone(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side

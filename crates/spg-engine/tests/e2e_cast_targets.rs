@@ -2,7 +2,7 @@
 //! targets. v7.9.26 — `::regtype` / `::regclass` accept-then-fail
 //! cleanly. mailrs migration follow-up H3.
 
-use spg_engine::{Engine, EngineError, QueryResult};
+use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
 
 fn engine_with(sqls: &[&str]) -> Engine {
@@ -77,12 +77,16 @@ fn timestamptz_cast_works_like_timestamp() {
 }
 
 #[test]
-fn regtype_cast_surfaces_clear_unsupported_error() {
+fn regclass_cast_strips_schema_prefix() {
+    // v7.17.0 Phase 5.3 — `::regclass` accepts TEXT and returns
+    // the bare table name (search_path-aware rendering); SPG is
+    // single-schema so the `public.` prefix is always droppable.
     let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL)"]);
-    // Parses cleanly, errors at eval with a hint pointing to SPG
-    // alternatives.
-    let r = eng.execute("SELECT 'public.t'::REGCLASS AS oid");
-    assert!(matches!(r, Err(EngineError::Eval(_))));
+    let r = eng.execute("SELECT 'public.t'::REGCLASS AS oid").unwrap();
+    let spg_engine::QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
+    assert_eq!(rows[0].values[0], Value::Text("t".into()));
 }
 
 #[test]
@@ -93,4 +97,36 @@ fn regtype_cast_does_not_lex_fail() {
     let mut eng = Engine::new();
     let stmt = eng.prepare("SELECT 'x'::REGTYPE");
     assert!(stmt.is_ok(), "regtype must parse cleanly");
+}
+
+#[test]
+fn regtype_text_in_text_out() {
+    let mut eng = Engine::new();
+    let r = eng.execute("SELECT 'int4'::REGTYPE").unwrap();
+    let spg_engine::QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
+    assert_eq!(rows[0].values[0], Value::Text("int4".into()));
+}
+
+#[test]
+fn regclass_passes_unqualified_name_through() {
+    let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL)"]);
+    let r = eng.execute("SELECT 't'::REGCLASS").unwrap();
+    let spg_engine::QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
+    assert_eq!(rows[0].values[0], Value::Text("t".into()));
+}
+
+#[test]
+fn regclass_integer_oid_renders_as_text() {
+    // PG path: `SELECT 16384::regclass` — integer rendered as
+    // textual OID. SPG mirrors the textual contract.
+    let mut eng = Engine::new();
+    let r = eng.execute("SELECT 16384::REGCLASS").unwrap();
+    let spg_engine::QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
+    assert_eq!(rows[0].values[0], Value::Text("16384".into()));
 }
