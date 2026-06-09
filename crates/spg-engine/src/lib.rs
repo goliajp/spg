@@ -1555,6 +1555,7 @@ impl Engine {
         let result = match stmt {
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::ShowTables => Ok(self.exec_show_tables()),
+            Statement::ShowDatabases => Ok(self.exec_show_databases()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
@@ -1845,6 +1846,7 @@ impl Engine {
             Statement::RollbackToSavepoint(name) => self.exec_rollback_to_savepoint(&name),
             Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(&name),
             Statement::ShowTables => Ok(self.exec_show_tables()),
+            Statement::ShowDatabases => Ok(self.exec_show_databases()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
@@ -4687,6 +4689,22 @@ impl Engine {
             .table_names()
             .into_iter()
             .map(|n| Row::new(alloc::vec![Value::Text(n)]))
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v7.17.0 Phase 3.P0-58 — `SHOW DATABASES` / `SHOW SCHEMAS`.
+    /// SPG is single-database so the result is the canonical MySQL
+    /// set every mysql/MariaDB client expects at connect time:
+    /// `information_schema`, `mysql`, `performance_schema`, `sys`,
+    /// plus a `postgres` slot so dual-stack callers find their
+    /// PG-compatible database too.
+    fn exec_show_databases(&self) -> QueryResult {
+        let columns = alloc::vec![ColumnSchema::new("Database", DataType::Text, false)];
+        let names = ["information_schema", "mysql", "performance_schema", "sys", "postgres"];
+        let rows: Vec<Row> = names
+            .iter()
+            .map(|n| Row::new(alloc::vec![Value::Text((*n).into())]))
             .collect();
         QueryResult::Rows { columns, rows }
     }

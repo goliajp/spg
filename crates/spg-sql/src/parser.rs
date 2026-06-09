@@ -425,6 +425,12 @@ impl Parser {
                 match target.as_str() {
                     "tables" => Ok(Statement::ShowTables),
                     "users" => Ok(Statement::ShowUsers),
+                    // v7.17.0 Phase 3.P0-58 — MySQL `SHOW DATABASES`
+                    // (and `SHOW SCHEMAS` alias). The mysql client uses
+                    // it to populate the database selector at connect
+                    // time; without it `mysql -p` errors before the
+                    // first user query.
+                    "databases" | "schemas" => Ok(Statement::ShowDatabases),
                     // v6.1.3 — PUBLICATIONS plural is NOT a reserved
                     // keyword on its own; it lands here as a bare
                     // ident. Returning all publications + their
