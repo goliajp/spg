@@ -93,6 +93,15 @@ pub enum Statement {
     /// the synthesized DDL. mysqldump emits this for every
     /// table at scrape time.
     ShowCreateTable(String),
+    /// v7.17.0 Phase 3.P0-60 — MySQL `SHOW INDEXES FROM <t>`
+    /// (also `SHOW INDEX`, `SHOW KEYS`).
+    ShowIndexes(String),
+    /// v7.17.0 Phase 3.P0-61 — MySQL `SHOW STATUS`.
+    ShowStatus,
+    /// v7.17.0 Phase 3.P0-61 — MySQL `SHOW VARIABLES`.
+    ShowVariables,
+    /// v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
+    ShowProcesslist,
     /// `SHOW COLUMNS FROM <table>` — return one row per column with
     /// its declared name / type / nullability.
     ShowColumns(String),
@@ -2348,6 +2357,10 @@ impl fmt::Display for Statement {
             Self::ShowTables => f.write_str("SHOW TABLES"),
             Self::ShowDatabases => f.write_str("SHOW DATABASES"),
             Self::ShowCreateTable(t) => write!(f, "SHOW CREATE TABLE {}", quote_ident(t)),
+            Self::ShowIndexes(t) => write!(f, "SHOW INDEXES FROM {}", quote_ident(t)),
+            Self::ShowStatus => f.write_str("SHOW STATUS"),
+            Self::ShowVariables => f.write_str("SHOW VARIABLES"),
+            Self::ShowProcesslist => f.write_str("SHOW PROCESSLIST"),
             Self::ShowColumns(t) => write!(f, "SHOW COLUMNS FROM {}", quote_ident(t)),
             Self::CreateUser(s) => write!(
                 f,

@@ -419,6 +419,9 @@ impl Parser {
                     // keyword token; recognise it as the SHOW CREATE
                     // dispatch keyword too.
                     Token::Create => "create".to_string(),
+                    // v7.17.0 Phase 3.P0-60 — INDEX is a reserved
+                    // keyword too; let SHOW INDEX FROM parse.
+                    Token::Index => "index".to_string(),
                     Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
                     other => {
                         return Err(self.err(format!(
@@ -434,6 +437,29 @@ impl Parser {
                     // Create Table). mysqldump emits this for every
                     // table at scrape time; without it the dump
                     // round-trip stalls.
+                    // v7.17.0 Phase 3.P0-60 — MySQL `SHOW INDEXES
+                    // FROM <t>` (also spelled `SHOW INDEX` and
+                    // `SHOW KEYS`). admin / mysqldump probes use
+                    // it to list per-table indexes.
+                    "indexes" | "index" | "keys" => {
+                        if !matches!(self.peek(), Token::From) {
+                            return Err(self.err(format!(
+                                "expected FROM after SHOW INDEXES, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let table = self.expect_ident_like()?;
+                        Ok(Statement::ShowIndexes(table))
+                    }
+                    // v7.17.0 Phase 3.P0-61 — MySQL `SHOW STATUS` /
+                    // `SHOW VARIABLES`. Both return a 2-column row
+                    // set listing server-side state; clients probe
+                    // them at connect time.
+                    "status" => Ok(Statement::ShowStatus),
+                    "variables" => Ok(Statement::ShowVariables),
+                    // v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
+                    "processlist" => Ok(Statement::ShowProcesslist),
                     "create" => {
                         // SHOW CREATE TABLE / VIEW / DATABASE — only
                         // TABLE is supported in v7.17.
