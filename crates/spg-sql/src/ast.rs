@@ -2262,6 +2262,103 @@ pub enum UnOp {
 
 // --- Display impls (round-trip-safe) --------------------------------------
 
+impl Statement {
+    /// v7.18 — classify whether the statement is read-only at
+    /// engine level. Used by `spg-sqlx`'s `SpgConnection` to
+    /// route SELECT-shaped traffic through the fan-out
+    /// `AsyncReadHandle` (no writer-lock contention) while
+    /// keeping DML / DDL / TX-control on the single-writer path.
+    ///
+    /// The classification matches what
+    /// `Engine::execute_readonly_with_cancel` accepts: anything
+    /// that does NOT mutate catalog, statistics, session state,
+    /// or transaction state. WaitForWalPosition is included
+    /// (engine returns `Unsupported`, but the classification is
+    /// semantically read-only — no mutation). Empty is excluded
+    /// out of an abundance of caution — the no-op routes
+    /// through the writer so any future side effect lands
+    /// uniformly.
+    ///
+    /// **Not connection-state aware**. `SET LOCAL` / `RESET`
+    /// affect session parameters and must run on the writer
+    /// engine that owns the session state; they classify as
+    /// writer-path here. Same for `BEGIN` / `COMMIT` /
+    /// `ROLLBACK` / `SAVEPOINT` — transaction control is
+    /// always writer-path.
+    #[must_use]
+    pub fn is_readonly(&self) -> bool {
+        match self {
+            Statement::Select(_)
+            | Statement::Explain(_)
+            | Statement::ShowTables
+            | Statement::ShowDatabases
+            | Statement::ShowCreateTable(_)
+            | Statement::ShowIndexes(_)
+            | Statement::ShowStatus
+            | Statement::ShowVariables
+            | Statement::ShowProcesslist
+            | Statement::ShowColumns(_)
+            | Statement::ShowUsers
+            | Statement::ShowPublications
+            | Statement::ShowSubscriptions
+            | Statement::WaitForWalPosition { .. } => true,
+            // Everything else mutates catalog, statistics,
+            // session state, or transaction state — writer path.
+            // Listed explicitly so a new Statement variant fails
+            // the match exhaustiveness check and forces a
+            // classification decision at add-site.
+            Statement::Empty
+            | Statement::DropTable { .. }
+            | Statement::DropIndex { .. }
+            | Statement::CreateTable(_)
+            | Statement::CreateExtension(_)
+            | Statement::DoBlock(_)
+            | Statement::CreateIndex(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Merge(_)
+            | Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::Savepoint(_)
+            | Statement::RollbackToSavepoint(_)
+            | Statement::ReleaseSavepoint(_)
+            | Statement::CreateUser(_)
+            | Statement::DropUser(_)
+            | Statement::AlterIndex(_)
+            | Statement::AlterTable(_)
+            | Statement::CreatePublication(_)
+            | Statement::DropPublication(_)
+            | Statement::CreateSubscription(_)
+            | Statement::DropSubscription(_)
+            | Statement::Analyze(_)
+            | Statement::CompactColdSegments
+            | Statement::SetParameter { .. }
+            | Statement::SetParameterList(_)
+            | Statement::ResetParameter(_)
+            | Statement::CreateFunction(_)
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger { .. }
+            | Statement::DropFunction { .. }
+            | Statement::CreateSequence(_)
+            | Statement::AlterSequence(_)
+            | Statement::DropSequence { .. }
+            | Statement::CreateView(_)
+            | Statement::DropView { .. }
+            | Statement::CreateMaterializedView(_)
+            | Statement::RefreshMaterializedView { .. }
+            | Statement::DropMaterializedView { .. }
+            | Statement::CreateType(_)
+            | Statement::DropType { .. }
+            | Statement::CreateDomain(_)
+            | Statement::DropDomain { .. }
+            | Statement::CreateSchema { .. }
+            | Statement::DropSchema { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
