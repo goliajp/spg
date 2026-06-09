@@ -1,0 +1,84 @@
+# MySQL `ifnull(a, b)` (alias for COALESCE 2-arg) and
+# `if(cond, then, else)` (alias for CASE WHEN).
+# Required for Hibernate / Laravel / Sequelize 0-change cutover.
+
+query T
+SELECT ifnull('alice', 'default')
+----
+alice
+
+query T
+SELECT ifnull(NULL, 'default')
+----
+default
+
+query T
+SELECT ifnull(NULL, NULL)
+----
+NULL
+
+query I
+SELECT ifnull(NULL, 42)
+----
+42
+
+# if(cond, then, else).
+query T
+SELECT if(1=1, 'yes', 'no')
+----
+yes
+
+query T
+SELECT if(1=2, 'yes', 'no')
+----
+no
+
+query T
+SELECT if(true, 'a', 'b')
+----
+a
+
+query T
+SELECT if(false, 'a', 'b')
+----
+b
+
+# NULL cond → else.
+query T
+SELECT if(NULL, 'a', 'b')
+----
+b
+
+# Integer cond: nonzero is true.
+query T
+SELECT if(1, 'a', 'b')
+----
+a
+
+query T
+SELECT if(0, 'a', 'b')
+----
+b
+
+# Returns integer values.
+query I
+SELECT if(1=1, 100, 200)
+----
+100
+
+# Realistic: big/small classifier.
+statement ok
+CREATE TABLE u (id INT NOT NULL, n INT NOT NULL)
+
+statement ok
+INSERT INTO u VALUES (1, 5), (2, 15), (3, 25)
+
+query IT nosort
+SELECT id, if(n > 10, 'big', 'small') FROM u ORDER BY id
+----
+1
+small
+2
+big
+3
+big

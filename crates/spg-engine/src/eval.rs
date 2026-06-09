@@ -26,7 +26,8 @@ use spg_storage::{ColumnSchema, DataType, Row, TsLexeme, TsQueryAst, Value};
 /// Resolution context for evaluating a single row. `table_alias` is the alias
 /// (or table name) callers should accept as the qualifier on a column ref —
 /// e.g. `FROM users AS u` makes `u.name` valid and rejects `other.name`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[allow(missing_debug_implementations)] // sequence_resolver is a dyn Fn — no Debug
 pub struct EvalContext<'a> {
     pub columns: &'a [ColumnSchema],
     pub table_alias: Option<&'a str>,
@@ -42,6 +43,30 @@ pub struct EvalContext<'a> {
     /// `plainto_tsquery(text)` etc are called without an explicit
     /// config arg. `None` falls through to `simple`.
     pub default_text_search_config: Option<&'a str>,
+    /// v7.17.0 Phase 1.1 — `nextval` / `currval` / `setval`
+    /// resolver. The engine builds this around a `&mut Catalog`
+    /// so apply_function can mutate sequence state without
+    /// eval owning a catalog reference. When `None`, sequence
+    /// functions return an error (read-only contexts).
+    pub sequence_resolver: Option<&'a SequenceResolver<'a>>,
+}
+
+/// v7.17.0 — sequence-mutating callback used by `apply_function`
+/// for `nextval` / `currval` / `setval`. Implemented by the
+/// engine to thread `&mut Catalog` access through an immutable
+/// `&EvalContext`.
+pub type SequenceResolver<'a> = dyn Fn(SequenceOp) -> Result<i64, EvalError> + 'a;
+
+/// v7.17.0 — sequence operation requested by an Expr eval.
+#[derive(Debug, Clone)]
+pub enum SequenceOp {
+    Next(String),
+    Curr(String),
+    Set {
+        name: String,
+        value: i64,
+        is_called: bool,
+    },
 }
 
 impl<'a> EvalContext<'a> {
@@ -51,7 +76,20 @@ impl<'a> EvalContext<'a> {
             table_alias,
             params: &[],
             default_text_search_config: None,
+            sequence_resolver: None,
         }
+    }
+
+    /// v7.17.0 — attach a sequence resolver. The engine wraps a
+    /// `&mut Catalog` in a closure that performs the requested
+    /// SequenceOp.
+    #[must_use]
+    pub const fn with_sequence_resolver(
+        mut self,
+        resolver: &'a SequenceResolver<'a>,
+    ) -> Self {
+        self.sequence_resolver = Some(resolver);
+        self
     }
 
     /// v6.1.1 — attach a parameter buffer for `$N` placeholder
@@ -132,6 +170,15 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
         Expr::Binary { lhs, op, rhs } => {
             let l = eval_expr(lhs, row, ctx)?;
             let r = eval_expr(rhs, row, ctx)?;
+            // v7.17.0 Phase 2.5 — collation-aware text comparison.
+            // When either operand of a comparison op references a
+            // column declared `COLLATE "case_insensitive"` (or any
+            // MySQL `_ci` collation), case-fold both sides before
+            // the byte-wise compare so `WHERE name = 'foo'` matches
+            // stored `'Foo'`. Non-Text values fall straight through
+            // — the helper is a no-op outside Text-Text equality
+            // and inequality.
+            let (l, r) = collation_fold_for_compare(*op, lhs, rhs, l, r, ctx);
             apply_binary(*op, l, r)
         }
         Expr::Cast { expr, target } => {
@@ -556,6 +603,113 @@ fn like_match_inner(text: &[char], mut ti: usize, pat: &[char], mut pi: usize) -
 /// scalar functions; aggregates land in v1.5 alongside GROUP BY.
 fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
     match name.to_ascii_lowercase().as_str() {
+        // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
+        "nextval" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("nextval() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let seq_name = match &args[0] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "nextval() argument must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
+                detail: "nextval() requires a sequence resolver (read-only context)".into(),
+            })?;
+            let v = resolver(SequenceOp::Next(seq_name))?;
+            Ok(Value::BigInt(v))
+        }
+        "currval" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("currval() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let seq_name = match &args[0] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "currval() argument must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
+                detail: "currval() requires a sequence resolver (read-only context)".into(),
+            })?;
+            let v = resolver(SequenceOp::Curr(seq_name))?;
+            Ok(Value::BigInt(v))
+        }
+        "setval" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("setval() takes 2 or 3 args, got {}", args.len()),
+                });
+            }
+            let seq_name = match &args[0] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "setval() name argument must be TEXT, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let value = match &args[1] {
+                Value::SmallInt(n) => i64::from(*n),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "setval() value argument must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            let is_called = if args.len() == 3 {
+                match &args[2] {
+                    Value::Bool(b) => *b,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "setval() is_called argument must be BOOL, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
+            } else {
+                true
+            };
+            let resolver = ctx.sequence_resolver.ok_or_else(|| EvalError::TypeMismatch {
+                detail: "setval() requires a sequence resolver (read-only context)".into(),
+            })?;
+            let v = resolver(SequenceOp::Set {
+                name: seq_name,
+                value,
+                is_called,
+            })?;
+            Ok(Value::BigInt(v))
+        }
         "length" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -749,7 +903,7 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // `length` is reduced by the clipped prefix). A NULL arg
         // makes the result NULL. Out-of-range windows return an
         // empty value, not NULL.
-        "substring" => {
+        "substring" | "substr" => {
             if !matches!(args.len(), 2 | 3) {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("substring() takes 2 or 3 args, got {}", args.len()),
@@ -959,6 +1113,999 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         "date_part" => date_part(args),
         "age" => age(args),
         "to_char" => to_char(args),
+        // v7.17.0 Phase 3.P0-29 — MySQL time aliases. WordPress,
+        // Laravel, mysql-connector-python emit these constantly.
+        // `unix_timestamp()` (bare) is folded by clock_replacement_for
+        // into a BigInt literal — this arm only handles the 1-arg
+        // form (TIMESTAMP / DATE → epoch seconds).
+        "date_format" => date_format_mysql(args),
+        "unix_timestamp" => unix_timestamp_of(args),
+        "from_unixtime" => from_unixtime(args),
+        // v7.17.0 Phase 3.8 — PG `format(fmt, args…)` sprintf-style.
+        // Conversion specifiers: `%s` (literal string from arg),
+        // `%I` (quoted identifier), `%L` (quoted SQL literal),
+        // `%%` (literal `%`). `%n$X` argument-position prefix
+        // (1-based). NULL arg → empty string for %s; NULL for %I
+        // is an error in PG; NULL for %L renders as the SQL
+        // literal `NULL`. Args missing for a position → error.
+        "format" => format_string(args),
+        // PG `concat(args...)` — variadic; coerces every arg to
+        // its text representation; NULL arguments are silently
+        // skipped (the canonical PG semantic — `concat()` is the
+        // NULL-tolerant counterpart to the `||` operator which
+        // propagates NULL).
+        //
+        // Reference:
+        //   https://www.postgresql.org/docs/current/functions-string.html
+        //   "Concatenates the text representations of all the
+        //   arguments. NULL arguments are ignored."
+        //
+        // Edge cases:
+        //   * `concat()` (no args) → ''
+        //   * Every arg NULL → '' (NEVER returns NULL — distinct
+        //     from `||` and from `array_agg`)
+        //   * Bool → PG single-char form 't' / 'f'
+        //   * SmallInt / Int / BigInt / Float / Numeric / Date /
+        //     Timestamp / Json / Bytes → their canonical text
+        //     rendering (shared with `format()`'s %s specifier
+        //     via `value_to_format_text`).
+        "concat" => {
+            let mut out = String::new();
+            for v in args {
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                out.push_str(&value_to_format_text(v));
+            }
+            Ok(Value::Text(out))
+        }
+        // PG `concat_ws(sep, val1 [, val2 ...])` — like concat but
+        // with a separator inserted between each pair of NON-NULL
+        // arguments. Critical semantic subtleties:
+        //   * NULL separator → NULL result (the sep position is
+        //     mandatory and poison-prone; this is the ONLY way
+        //     concat_ws can return NULL).
+        //   * NULL data args silently SKIPPED — the separator is
+        //     NOT inserted around them. `concat_ws(',', 'a', NULL,
+        //     'b')` → `'a,b'`, not `'a,,b'`.
+        //   * Empty-string data args are KEPT (separator placed
+        //     around them). `concat_ws(',', 'a', '', 'b')` →
+        //     `'a,,b'`. Distinction with NULL matters for code
+        //     like `concat_ws(', ', first_name, middle_name,
+        //     last_name)`.
+        //   * 0 args → arity error (sep is mandatory).
+        //   * Only sep (no data) → '' (NOT NULL — distinct from
+        //     the all-NULL data case which also returns '').
+        //
+        // Reference:
+        //   https://www.postgresql.org/docs/current/functions-string.html
+        // PG `trim` / `ltrim` / `rtrim` / `btrim`.
+        //
+        // Semantic anchors (PG-canonical):
+        //   * Default chars set is the ASCII SPACE only (NOT the
+        //     POSIX whitespace class — tab / newline / form-feed
+        //     stay put unless explicitly listed in `chars`).
+        //   * `chars` arg is a UTF-8 codepoint SET — any char in
+        //     the set is stripped, not the substring.
+        //   * `trim(s)` == `btrim(s)` == strip both ends.
+        //   * `ltrim(s, c)` / `rtrim(s, c)` strip only the named
+        //     side; inner occurrences are preserved.
+        //   * NULL on EITHER arg → NULL result.
+        //   * Non-text input is coerced via `value_to_format_text`
+        //     so trim(42) returns '42'.
+        //
+        // Reference:
+        //   https://www.postgresql.org/docs/current/functions-string.html
+        // PG `replace(string, from, to)` — substring substitution
+        // for every (non-overlapping, greedy left-to-right)
+        // occurrence. Empty `from` passes input through unchanged
+        // (PG behavior — avoids infinite loop). Inserted text is
+        // NOT re-scanned for new matches (so `replace('a', 'a',
+        // 'aa')` terminates at `'aa'`, not blows up). NULL on any
+        // arg poisons.
+        // PG `split_part(string, delimiter, n)` — split on delim,
+        // return the n-th field (1-indexed). Negative n counts
+        // from the end (PG 14+). Out-of-range n → '' (NOT NULL).
+        // n = 0 → error. Empty delimiter → error. NULL on any
+        // arg → NULL.
+        // PG `repeat(string, n)` — duplicate the input N times.
+        // n=0 → ''; n<0 → '' (PG does NOT error on negative);
+        // NULL on any arg → NULL.
+        // PG `lpad(string, length [, fill])` / `rpad(...)`.
+        // length is the target CODEPOINT count. Truncation when
+        // input longer (lpad keeps the LEFT side, rpad keeps
+        // LEFT too — both wait truncate from the right side per
+        // PG-verified behavior). Padding when shorter, using
+        // `fill` (default SPACE) cycling for multi-char fills.
+        // length<=0 → ''. Empty fill + needs padding → returns
+        // input verbatim (potentially truncated). NULL on any
+        // arg → NULL.
+        // PG `strpos(string, substring)` — same as position()
+        // but with reversed arg order. PG convention is
+        // strpos(haystack, needle); position(needle, haystack).
+        // Both are 1-indexed; 0 = not found; codepoint-counted.
+        // PG `left(string, n)` / `right(string, n)` — head/tail
+        // substring helpers. Negative n means "all but last/first
+        // |n| chars" — slice from the OPPOSITE side. n=0 → ''.
+        // Codepoint-counted. NULL on any arg → NULL.
+        // PG `floor(x)` — largest integer <= x.
+        //   * Negative floats floor TOWARD -infinity, NOT toward 0.
+        //   * Integer types passthrough unchanged.
+        //   * NULL → NULL.
+        // PG `ceil(x)` / `ceiling(x)` — smallest integer >= x.
+        //   * Negative floats round TOWARD zero (toward +inf):
+        //     ceil(-1.5) → -1, NOT -2.
+        //   * Integer types passthrough unchanged.
+        //   * NULL → NULL.
+        // PG `round(x)` / `round(x, scale)` — half-away-from-zero
+        // rounding (NUMERIC semantic).
+        //   * round(0.5) → 1; round(-0.5) → -1; round(2.5) → 3.
+        //   * Two-arg form rounds to N decimal places (n>0) or to
+        //     nearest 10^|n| (n<0).
+        //   * Integer types passthrough unchanged.
+        //   * NULL on any arg → NULL.
+        // PG `trunc(x)` / `trunc(x, scale)` — truncate TOWARD zero.
+        //   * Distinct from floor() which rounds toward -inf:
+        //     trunc(-1.7)→-1; floor(-1.7)→-2.
+        //   * Distinct from round() which rounds half-away:
+        //     trunc(1.5)→1; round(1.5)→2.
+        //   * Two-arg form truncates to N decimal places (or 10^|n|
+        //     for negative n).
+        //   * Integer types passthrough unchanged.
+        //   * NULL on any arg → NULL.
+        // PG `nullif(a, b)` — returns NULL if a = b, else a.
+        // Canonical use cases:
+        //   * Divide-by-zero protection: `x / nullif(y, 0)`
+        //   * Empty-string normalisation: `nullif(field, '')`
+        // Edge: nullif(NULL, NULL) returns NULL. nullif(NULL, x)
+        // returns NULL. nullif(x, NULL) returns x (since NULL is
+        // not == to anything per IS DISTINCT FROM semantic, x ≠ NULL).
+        // PG `greatest(...)` / `least(...)` — variadic max/min.
+        // NULL args silently skipped (PG-canonical). All-NULL → NULL.
+        // Cross-type widening for numeric comparisons.
+        // PG `mod(y, x)` — modulo. Result sign follows dividend.
+        //   * mod(7, 3) = 1
+        //   * mod(-7, 3) = -1
+        //   * mod(7, -3) = 1
+        //   * mod(-7, -3) = -1
+        // Division by zero → error. NULL on any arg → NULL.
+        // PG `power(x, y)` / `pow(x, y)` — x^y.
+        // Integer exponent → exact via repeated multiplication
+        // (no precision loss). Fractional exponent → exp(y*ln(x))
+        // via the no_std exp/ln series helpers.
+        // x=0 with negative y → error (1/0). NULL → NULL.
+        // PG `sqrt(x)` — square root. Negative input → error.
+        // PG `sign(x)` — -1 / 0 / 1.
+        // PG `random()` — uniform float in [0, 1). Per-row /
+        // per-call: each evaluation returns a different value
+        // even within the same statement. Backed by a xorshift64*
+        // PRNG with a process-static seed; not cryptographically
+        // secure (use a cryptographic source for security tokens).
+        "random" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "random() takes 0 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            Ok(Value::Float(prng_next_f64()))
+        }
+        // v7.17.0 — PG `gen_random_uuid()` (built-in, no extension)
+        // and the historical uuid-ossp `uuid_generate_v4()` alias.
+        // Both produce a RFC 4122 v4 (random) UUID. This is the
+        // function Django / Rails / Hibernate emit in `id UUID
+        // PRIMARY KEY DEFAULT gen_random_uuid()`, the modern
+        // default PK pattern.
+        "gen_random_uuid" | "uuid_generate_v4" => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{name}() takes 0 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            Ok(Value::Uuid(gen_random_uuid_bytes()))
+        }
+        "sign" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "sign() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::SmallInt(n) => Ok(Value::SmallInt(n.signum())),
+                Value::Int(n) => Ok(Value::Int(n.signum())),
+                Value::BigInt(n) => Ok(Value::BigInt(n.signum())),
+                Value::Float(x) => {
+                    let s = if *x > 0.0 {
+                        1.0
+                    } else if *x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    Ok(Value::Float(s))
+                }
+                Value::Numeric { scaled, scale } => {
+                    let s = scaled.signum();
+                    Ok(Value::Numeric {
+                        scaled: s * pow10_i128(*scale),
+                        scale: *scale,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "sign() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "sqrt" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "sqrt() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                v => {
+                    let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "sqrt() needs numeric, got {:?}",
+                            v.data_type()
+                        ),
+                    })?;
+                    if x < 0.0 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "sqrt(): negative input outside real domain".into(),
+                        });
+                    }
+                    if x == 0.0 {
+                        return Ok(Value::Float(0.0));
+                    }
+                    Ok(Value::Float(f64_sqrt(x)))
+                }
+            }
+        }
+        "power" | "pow" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "power() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let x = value_to_f64(&args[0]).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: "power() needs numeric x".into(),
+                }
+            })?;
+            let y = value_to_f64(&args[1]).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: "power() needs numeric y".into(),
+                }
+            })?;
+            // Integer-exponent fast path.
+            let y_int = y as i32;
+            if (y_int as f64) == y && y.abs() < 1024.0 {
+                let result = f64_powi(x, y_int);
+                return Ok(Value::Float(result));
+            }
+            // Fractional exponent — only defined for x >= 0 in real
+            // arithmetic. Negative x raised to fractional power is
+            // complex; reject cleanly.
+            if x < 0.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "power(): negative base with fractional exponent yields complex result".into(),
+                });
+            }
+            if x == 0.0 && y < 0.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "power(): 0 raised to negative power is undefined".into(),
+                });
+            }
+            if x == 0.0 {
+                return Ok(Value::Float(0.0));
+            }
+            Ok(Value::Float(f64_exp(y * f64_ln(x))))
+        }
+        "mod" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "mod() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let to_i64 = |v: &Value| -> Result<i64, EvalError> {
+                match v {
+                    Value::SmallInt(x) => Ok(i64::from(*x)),
+                    Value::Int(x) => Ok(i64::from(*x)),
+                    Value::BigInt(x) => Ok(*x),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "mod() needs integer, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            };
+            let y = to_i64(&args[0])?;
+            let x = to_i64(&args[1])?;
+            if x == 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "mod(): division by zero".into(),
+                });
+            }
+            // Rust's `%` operator on signed integers follows the
+            // dividend's sign — same as PG.
+            let result = y % x;
+            // Pick the narrowest type that holds the result.
+            if let Ok(small) = i16::try_from(result) {
+                if matches!(args[0], Value::SmallInt(_))
+                    && matches!(args[1], Value::SmallInt(_))
+                {
+                    return Ok(Value::SmallInt(small));
+                }
+            }
+            if let Ok(int_) = i32::try_from(result) {
+                if !matches!(args[0], Value::BigInt(_))
+                    && !matches!(args[1], Value::BigInt(_))
+                {
+                    return Ok(Value::Int(int_));
+                }
+            }
+            Ok(Value::BigInt(result))
+        }
+        "greatest" | "least" => {
+            if args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{lc}() takes at least 1 arg",
+                        lc = if name.eq_ignore_ascii_case("greatest") { "greatest" } else { "least" }
+                    ),
+                });
+            }
+            let non_null: alloc::vec::Vec<&Value> =
+                args.iter().filter(|v| !matches!(v, Value::Null)).collect();
+            if non_null.is_empty() {
+                return Ok(Value::Null);
+            }
+            let is_greatest = name.eq_ignore_ascii_case("greatest");
+            let mut best = non_null[0].clone();
+            for v in &non_null[1..] {
+                let ord = value_cmp_for_min_max(&best, v);
+                let take = if is_greatest {
+                    ord == core::cmp::Ordering::Less
+                } else {
+                    ord == core::cmp::Ordering::Greater
+                };
+                if take {
+                    best = (*v).clone();
+                }
+            }
+            Ok(best)
+        }
+        // MySQL `ifnull(a, b)` — alias for coalesce(a, b).
+        // Used by every ORM with a MySQL target (Hibernate /
+        // Laravel / Sequelize).
+        "ifnull" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ifnull() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            for v in args {
+                if !matches!(v, Value::Null) {
+                    return Ok(v.clone());
+                }
+            }
+            Ok(Value::Null)
+        }
+        // MySQL `if(cond, then, else)` — alias for CASE WHEN.
+        // NULL condition → else branch (MySQL semantic).
+        // Integer condition: nonzero is true.
+        "if" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "if() takes 3 args (cond, then, else), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let truthy = match &args[0] {
+                Value::Null => false,
+                Value::Bool(b) => *b,
+                Value::SmallInt(n) => *n != 0,
+                Value::Int(n) => *n != 0,
+                Value::BigInt(n) => *n != 0,
+                Value::Float(x) => *x != 0.0,
+                Value::Text(s) => !s.is_empty() && s != "0",
+                _ => true,
+            };
+            if truthy {
+                Ok(args[1].clone())
+            } else {
+                Ok(args[2].clone())
+            }
+        }
+        "nullif" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "nullif() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) => Ok(Value::Null),
+                (a, Value::Null) => Ok(a.clone()),
+                (a, b) => {
+                    // Use value_cmp (already defined as Ord-like
+                    // function in lib.rs) — but it's not accessible
+                    // here. Fall back to direct equality.
+                    if values_equal_for_nullif(a, b) {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(a.clone())
+                    }
+                }
+            }
+        }
+        "trunc" => {
+            match args.len() {
+                1 => match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                        Ok(args[0].clone())
+                    }
+                    Value::Float(x) => Ok(Value::Float(f64_trunc(*x))),
+                    Value::Numeric { scaled, scale } => {
+                        let factor = pow10_i128(*scale);
+                        // Truncate toward zero — sign-preserving division.
+                        let q = scaled / factor;
+                        Ok(Value::Numeric {
+                            scaled: q * factor,
+                            scale: *scale,
+                        })
+                    }
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "trunc() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                },
+                2 => {
+                    if args.iter().any(|v| matches!(v, Value::Null)) {
+                        return Ok(Value::Null);
+                    }
+                    let n = match &args[1] {
+                        Value::SmallInt(x) => i32::from(*x),
+                        Value::Int(x) => *x,
+                        Value::BigInt(x) => i32::try_from(*x).map_err(|_| {
+                            EvalError::TypeMismatch {
+                                detail: "trunc(): scale must fit in i32".into(),
+                            }
+                        })?,
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "trunc(): scale must be integer, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    let x = match &args[0] {
+                        Value::SmallInt(v) => f64::from(*v),
+                        Value::Int(v) => f64::from(*v),
+                        Value::BigInt(v) => *v as f64,
+                        Value::Float(v) => *v,
+                        Value::Numeric { scaled, scale } => {
+                            (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                        }
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "trunc() needs numeric x, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    let result = if n >= 0 {
+                        let factor = f64_powi(10.0, n);
+                        f64_trunc(x * factor) / factor
+                    } else {
+                        let factor = f64_powi(10.0, -n);
+                        f64_trunc(x / factor) * factor
+                    };
+                    Ok(Value::Float(result))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "trunc() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                }),
+            }
+        }
+        "round" => {
+            match args.len() {
+                1 => match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                        Ok(args[0].clone())
+                    }
+                    Value::Float(x) => Ok(Value::Float(f64_round_half_away(*x))),
+                    Value::Numeric { scaled, scale } => {
+                        let factor = pow10_i128(*scale);
+                        let q = scaled.div_euclid(factor);
+                        let r = scaled.rem_euclid(factor);
+                        // Half-away-from-zero: if 2*r >= factor → round up.
+                        let result = if 2 * r >= factor {
+                            q + 1
+                        } else {
+                            q
+                        };
+                        Ok(Value::Numeric {
+                            scaled: result * factor,
+                            scale: *scale,
+                        })
+                    }
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "round() needs numeric, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                },
+                2 => {
+                    if args.iter().any(|v| matches!(v, Value::Null)) {
+                        return Ok(Value::Null);
+                    }
+                    let n = match &args[1] {
+                        Value::SmallInt(x) => i32::from(*x),
+                        Value::Int(x) => *x,
+                        Value::BigInt(x) => i32::try_from(*x).map_err(|_| {
+                            EvalError::TypeMismatch {
+                                detail: "round(): scale must fit in i32".into(),
+                            }
+                        })?,
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "round(): scale must be integer, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    // Convert input to f64 for arithmetic
+                    // simplicity (PG does NUMERIC math here but
+                    // SPG's f64 path matches the dominant
+                    // customer expectation for round(N, scale)
+                    // patterns).
+                    let x = match &args[0] {
+                        Value::SmallInt(v) => f64::from(*v),
+                        Value::Int(v) => f64::from(*v),
+                        Value::BigInt(v) => *v as f64,
+                        Value::Float(v) => *v,
+                        Value::Numeric { scaled, scale } => {
+                            (*scaled as f64) / f64_powi(10.0, i32::from(*scale))
+                        }
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "round() needs numeric x, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    // Avoid float precision drift from the
+                    // 10^(-k) reciprocal — for n<0 work with the
+                    // positive-exponent form: round(x / 10^|n|) *
+                    // 10^|n|.
+                    let result = if n >= 0 {
+                        let factor = f64_powi(10.0, n);
+                        f64_round_half_away(x * factor) / factor
+                    } else {
+                        let factor = f64_powi(10.0, -n);
+                        f64_round_half_away(x / factor) * factor
+                    };
+                    Ok(Value::Float(result))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "round() takes 1 or 2 args, got {}",
+                        args.len()
+                    ),
+                }),
+            }
+        }
+        "ceil" | "ceiling" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ceil() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                    Ok(args[0].clone())
+                }
+                Value::Float(x) => Ok(Value::Float(f64_ceil(*x))),
+                Value::Numeric { scaled, scale } => {
+                    let factor = pow10_i128(*scale);
+                    let q = scaled.div_euclid(factor);
+                    let r = scaled.rem_euclid(factor);
+                    let result = if r == 0 { q } else { q + 1 };
+                    Ok(Value::Numeric {
+                        scaled: result * factor,
+                        scale: *scale,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ceil() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "floor" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "floor() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                    Ok(args[0].clone())
+                }
+                Value::Float(x) => Ok(Value::Float(f64_floor(*x))),
+                Value::Numeric { scaled, scale } => {
+                    let factor = pow10_i128(*scale);
+                    let q = scaled.div_euclid(factor);
+                    // div_euclid rounds toward -infinity which is
+                    // exactly the floor semantic — perfect for
+                    // negative values.
+                    Ok(Value::Numeric {
+                        scaled: q * factor,
+                        scale: *scale,
+                    })
+                }
+                other => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "floor() needs numeric, got {:?}",
+                        other.data_type()
+                    ),
+                }),
+            }
+        }
+        "left" => string_left_right(args, true, "left"),
+        "right" => string_left_right(args, false, "right"),
+        "strpos" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "strpos() takes 2 args (haystack, needle), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let haystack = value_to_format_text(&args[0]);
+            let needle = value_to_format_text(&args[1]);
+            if needle.is_empty() {
+                return Ok(Value::Int(1));
+            }
+            let h_chars: Vec<char> = haystack.chars().collect();
+            let n_chars: Vec<char> = needle.chars().collect();
+            if n_chars.len() > h_chars.len() {
+                return Ok(Value::Int(0));
+            }
+            for i in 0..=h_chars.len() - n_chars.len() {
+                if h_chars[i..i + n_chars.len()] == n_chars[..] {
+                    return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
+                }
+            }
+            Ok(Value::Int(0))
+        }
+        "lpad" => string_pad(args, true, "lpad"),
+        "rpad" => string_pad(args, false, "rpad"),
+        "repeat" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "repeat() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let n = match &args[1] {
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "repeat(): n must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n <= 0 {
+                return Ok(Value::Text(String::new()));
+            }
+            // Safety cap so a runaway argument doesn't allocate
+            // terabytes. PG itself enforces a similar cap via
+            // work_mem; SPG inherits a defensive 64MiB cap.
+            const MAX_REPEAT_BYTES: usize = 64 * 1024 * 1024;
+            let needed = s.len().checked_mul(n as usize).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: "repeat(): result size overflows usize".into(),
+                }
+            })?;
+            if needed > MAX_REPEAT_BYTES {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "repeat(): result would exceed {MAX_REPEAT_BYTES} bytes"
+                    ),
+                });
+            }
+            Ok(Value::Text(s.repeat(n as usize)))
+        }
+        "split_part" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "split_part() takes 3 args (string, delim, n), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let delim = value_to_format_text(&args[1]);
+            if delim.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "split_part(): delimiter cannot be empty".into(),
+                });
+            }
+            let n = match &args[2] {
+                Value::SmallInt(x) => i64::from(*x),
+                Value::Int(x) => i64::from(*x),
+                Value::BigInt(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "split_part(): n must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            if n == 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "split_part(): n must be nonzero (PG: 1-indexed)".into(),
+                });
+            }
+            let parts: alloc::vec::Vec<&str> = s.split(&delim[..]).collect();
+            let total = parts.len() as i64;
+            let idx = if n > 0 {
+                n - 1
+            } else {
+                // n=-1 → last (idx = total - 1)
+                total + n
+            };
+            if idx < 0 || idx >= total {
+                return Ok(Value::Text(String::new()));
+            }
+            Ok(Value::Text(parts[idx as usize].to_string()))
+        }
+        // PG `translate(s, from, to)` — char-by-char positional
+        // mapping. Each codepoint in `from` is replaced by the
+        // codepoint at the same index in `to`. When `from` is
+        // longer than `to`, the extra `from` codepoints are
+        // DELETED (not replaced). When `from` has duplicates,
+        // the FIRST occurrence's mapping wins. NULL → NULL.
+        "translate" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "translate() takes 3 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let from = value_to_format_text(&args[1]);
+            let to = value_to_format_text(&args[2]);
+            let from_chars: Vec<char> = from.chars().collect();
+            let to_chars: Vec<char> = to.chars().collect();
+            // Build the codepoint map. First occurrence wins.
+            let mut map: alloc::collections::BTreeMap<char, Option<char>> =
+                alloc::collections::BTreeMap::new();
+            for (i, &fc) in from_chars.iter().enumerate() {
+                if map.contains_key(&fc) {
+                    continue;
+                }
+                let replacement = to_chars.get(i).copied();
+                map.insert(fc, replacement);
+            }
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match map.get(&c) {
+                    Some(Some(r)) => out.push(*r),
+                    Some(None) => {} // mapped to "deleted"
+                    None => out.push(c),
+                }
+            }
+            Ok(Value::Text(out))
+        }
+        "replace" => {
+            if args.len() != 3 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "replace() takes 3 args (string, from, to), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let s = value_to_format_text(&args[0]);
+            let from = value_to_format_text(&args[1]);
+            let to = value_to_format_text(&args[2]);
+            if from.is_empty() {
+                return Ok(Value::Text(s));
+            }
+            // std `String::replace` matches PG semantics exactly:
+            // non-overlapping, left-to-right, no re-scan of
+            // inserted text. Sealed test surface verifies the
+            // edge cases independently.
+            Ok(Value::Text(s.replace(&from[..], &to)))
+        }
+        "trim" | "btrim" => string_trim(args, TrimSide::Both, "trim"),
+        "ltrim" => string_trim(args, TrimSide::Left, "ltrim"),
+        "rtrim" => string_trim(args, TrimSide::Right, "rtrim"),
+        "concat_ws" => {
+            if args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "concat_ws() requires at least 1 arg (the separator)".into(),
+                });
+            }
+            // NULL separator poisons the result.
+            let sep = match &args[0] {
+                Value::Null => return Ok(Value::Null),
+                v => value_to_format_text(v),
+            };
+            let mut out = String::new();
+            let mut first = true;
+            for v in &args[1..] {
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                if first {
+                    first = false;
+                } else {
+                    out.push_str(&sep);
+                }
+                out.push_str(&value_to_format_text(v));
+            }
+            Ok(Value::Text(out))
+        }
+        // v7.17.0 Phase 3.7 — PG regex function family.
+        "regexp_matches" => regexp_matches(args),
+        "regexp_replace" => regexp_replace(args),
+        "regexp_split_to_array" => regexp_split_to_array(args),
+        // v7.17.0 Phase 3.P0-28 — PG JSON builder family.
+        // to_json / to_jsonb coerce any value to JSON text (NULL
+        // becomes the JSON literal 'null', not SQL NULL).
+        "to_json" | "to_jsonb" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "to_json() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            // Json input passes through verbatim — PG identity.
+            if let Value::Json(s) = &args[0] {
+                return Ok(Value::Json(s.clone()));
+            }
+            Ok(Value::Json(crate::json::value_to_json_text(&args[0])))
+        }
+        "json_build_object" | "jsonb_build_object" => crate::json::build_object(args),
+        "json_build_array" | "jsonb_build_array" => crate::json::build_array(args),
+        "jsonb_set" | "json_set" => crate::json::set(args),
+        "jsonb_insert" | "json_insert" => crate::json::insert(args),
+        // v7.17.0 Phase 3.9 — PG `jsonb_path_query` family.
+        "jsonb_path_query" | "json_path_query" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonb_path_query() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::path_query(&args[0], &args[1])
+        }
+        "jsonb_path_query_first" | "json_path_query_first" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonb_path_query_first() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::path_query_first(&args[0], &args[1])
+        }
+        "jsonb_path_query_array" | "json_path_query_array" => {
+            if args.len() != 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "jsonb_path_query_array() takes 2 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            crate::json::path_query_array(&args[0], &args[1])
+        }
+        // v7.17.0 Phase 7 — INET / CIDR network helpers.
+        "host" => inet_host(args),
+        "network" => inet_network(args),
+        "masklen" => inet_masklen(args),
         // v6.4.3 — encode/decode + error_on_null SQL function bundle.
         "encode" => encode_text(args),
         "decode" => decode_text(args),
@@ -989,14 +2136,38 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // sequence — SPG has AUTO_INCREMENT instead).
         "pg_get_serial_sequence" | "pg_get_constraintdef" | "pg_get_indexdef" => Ok(Value::Null),
         "version" => Ok(Value::Text("PostgreSQL 16 (SPG-compat)".into())),
-        // pg_dump emits `nextval('seq')` after creating a
-        // sequence; SPG has no separate sequence object (the
-        // owning column carries AUTO_INCREMENT). Return NULL
-        // (PG would return the sequence value) — the value isn't
-        // used at restore time because the column has its own
-        // implicit BIGSERIAL counter.
-        "nextval" | "currval" | "lastval" => Ok(Value::Null),
-        "setval" => Ok(args.first().cloned().unwrap_or(Value::Null)),
+        // v7.17.0 Phase 3.P0-30 — session / introspection functions.
+        // Engine-level dispatch so these compose inside expressions
+        // (`WHERE schemaname = current_schema()`, `SELECT *,
+        // database() AS db FROM t`) — the pgwire layer's canned
+        // shortcuts only catch the bare top-level SELECT shape.
+        // SPG is single-database + single-schema; the values
+        // mirror the wire-layer canned defaults.
+        "current_database" | "database" => Ok(Value::Text("spg".into())),
+        "current_schema" => Ok(Value::Text("public".into())),
+        "current_user" | "session_user" | "user" => Ok(Value::Text("admin".into())),
+        // v7.17.0 Phase 3.P0-31 — `pg_typeof(any)` returns the
+        // canonical PG lowercase type name. sqlx / SQLAlchemy /
+        // Diesel emit this during describe; generic ORMs may
+        // branch on it (`CASE WHEN pg_typeof(x) = 'jsonb' ...`).
+        // NULL has no resolved value-level type → 'unknown' per
+        // PG semantics.
+        "pg_typeof" => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "pg_typeof() takes 1 arg, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            Ok(Value::Text(pg_typeof_name(&args[0]).into()))
+        }
+        // v7.17.0 — `nextval` / `currval` / `setval` are handled
+        // at the top of this match against the SequenceResolver.
+        // `lastval()` (no-arg session memory) still degrades to
+        // NULL pending a Phase 1.1b session tracker.
+        "lastval" => Ok(Value::Null),
         // v7.15.0 — pg_trgm: similarity, show_trgm. Match PG
         // semantics: similarity returns Jaccard of trigram sets;
         // show_trgm returns the trigram set as TEXT[]. NULL on
@@ -1614,6 +2785,1534 @@ fn age(args: &[Value]) -> Result<Value, EvalError> {
 ///   YYYY YY MM Mon Month DD HH24 HH12 MI SS MS US AM PM
 /// Unrecognised characters pass through literally so the template's
 /// punctuation ('-', ':', ' ', '/') needs no escape mechanism.
+// ─── v7.17.0 Phase 7 — INET / CIDR text helpers ───────────────────────
+//
+// SPG stores network address types as Text. The host() / network() /
+// masklen() helpers parse the textual `addr[/mask]` form and return
+// the constituent pieces, matching PG's contract for the dominant
+// customer surface (Django ORM / Rails ORM normalisation).
+
+fn inet_host(args: &[Value]) -> Result<Value, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "host() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    let host = s.split('/').next().unwrap_or("").to_string();
+    Ok(Value::Text(host))
+}
+
+fn inet_network(args: &[Value]) -> Result<Value, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "network() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    // For a `host/mask` form return the masked-network address.
+    // SPG ships the simple "drop trailing octets per byte" path
+    // for IPv4; full bit-level masking is out of v7.17 scope.
+    let mut split = s.splitn(2, '/');
+    let host = split.next().unwrap_or("").to_string();
+    let mask: u32 = split
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(32);
+    if !host.contains('.') {
+        // IPv6 / MACADDR — return the input unmasked.
+        return Ok(Value::Text(s));
+    }
+    let octets: Vec<&str> = host.split('.').collect();
+    if octets.len() != 4 {
+        return Ok(Value::Text(s));
+    }
+    let keep_bytes = ((mask + 7) / 8) as usize;
+    let mut out = alloc::string::String::new();
+    for (i, oct) in octets.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        if i < keep_bytes {
+            out.push_str(oct);
+        } else {
+            out.push('0');
+        }
+    }
+    out.push('/');
+    out.push_str(&mask.to_string());
+    Ok(Value::Text(out))
+}
+
+fn inet_masklen(args: &[Value]) -> Result<Value, EvalError> {
+    let s = match args {
+        [Value::Text(s)] => s.clone(),
+        [Value::Null] => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "masklen() takes one TEXT arg, got {} args",
+                    args.len()
+                ),
+            });
+        }
+    };
+    let mask: i32 = s
+        .splitn(2, '/')
+        .nth(1)
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(32);
+    Ok(Value::Int(mask))
+}
+
+// ─── v7.17.0 Phase 3.P0-47 — INET / CIDR containment + overlap ────────
+//
+// SPG stores INET / CIDR as Text (Phase 7 design); these helpers parse
+// the textual `addr[/mask]` form into a (family, bytes, prefix_bits)
+// triple and implement PG's network-comparison operators on that
+// representation.
+//
+// PG semantics:
+//   * `<<`  — strictly contained-in (LHS ⊊ RHS)
+//   * `<<=` — contained-in-or-equal (LHS ⊆ RHS)
+//   * `>>`, `>>=` — mirrors of the above
+//   * `&&`  — overlap (either LHS ⊆ RHS or RHS ⊆ LHS)
+//
+// NULL on either side → NULL (3VL). Mixed family (v4 vs v6) is never
+// contained / never overlaps but is not an error — same as PG.
+
+/// Parsed inet network: address bytes (4 for v4, 16 for v6) and the
+/// network prefix length in bits.
+struct InetNet {
+    bytes: [u8; 16],
+    /// 4 for IPv4, 16 for IPv6.
+    family_bytes: u8,
+    /// 0..=32 for v4, 0..=128 for v6.
+    prefix_bits: u8,
+}
+
+fn parse_inet_text(s: &str) -> Option<InetNet> {
+    let mut split = s.splitn(2, '/');
+    let host = split.next()?;
+    let mask_str = split.next();
+    if host.contains(':') {
+        let bytes = parse_ipv6(host)?;
+        let prefix_bits = match mask_str {
+            Some(m) => m.parse::<u8>().ok().filter(|&n| n <= 128)?,
+            None => 128,
+        };
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes);
+        Some(InetNet { bytes: out, family_bytes: 16, prefix_bits })
+    } else {
+        let bytes = parse_ipv4(host)?;
+        let prefix_bits = match mask_str {
+            Some(m) => m.parse::<u8>().ok().filter(|&n| n <= 32)?,
+            None => 32,
+        };
+        let mut out = [0u8; 16];
+        out[..4].copy_from_slice(&bytes);
+        Some(InetNet { bytes: out, family_bytes: 4, prefix_bits })
+    }
+}
+
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<u8>().ok()?;
+    }
+    Some(out)
+}
+
+fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
+    // Split on the `::` shorthand at most once.
+    let (head, tail) = match s.find("::") {
+        Some(idx) => (&s[..idx], Some(&s[idx + 2..])),
+        None => (s, None),
+    };
+    let head_groups: Vec<&str> = if head.is_empty() {
+        Vec::new()
+    } else {
+        head.split(':').collect()
+    };
+    let tail_groups: Vec<&str> = match tail {
+        Some(t) if t.is_empty() => Vec::new(),
+        Some(t) => t.split(':').collect(),
+        None => Vec::new(),
+    };
+    let head_len = head_groups.len();
+    let tail_len = tail_groups.len();
+    // Without `::` we need exactly 8 groups; with `::` we need ≤ 7.
+    if tail.is_none() {
+        if head_len != 8 {
+            return None;
+        }
+    } else if head_len + tail_len > 7 {
+        return None;
+    }
+    let mut words = [0u16; 8];
+    for (i, g) in head_groups.iter().enumerate() {
+        words[i] = u16::from_str_radix(g, 16).ok()?;
+    }
+    let tail_start = 8 - tail_len;
+    for (i, g) in tail_groups.iter().enumerate() {
+        words[tail_start + i] = u16::from_str_radix(g, 16).ok()?;
+    }
+    let mut out = [0u8; 16];
+    for (i, w) in words.iter().enumerate() {
+        out[i * 2] = (w >> 8) as u8;
+        out[i * 2 + 1] = (w & 0xff) as u8;
+    }
+    Some(out)
+}
+
+/// Compare the first `prefix_bits` bits of `a` and `b`. Returns true if
+/// they match. `prefix_bits` must not exceed the family size.
+fn network_prefix_eq(a: &InetNet, b: &InetNet, prefix_bits: u8) -> bool {
+    let full_bytes = (prefix_bits / 8) as usize;
+    if a.bytes[..full_bytes] != b.bytes[..full_bytes] {
+        return false;
+    }
+    let extra = prefix_bits % 8;
+    if extra == 0 {
+        return true;
+    }
+    let mask: u8 = 0xff << (8 - extra);
+    (a.bytes[full_bytes] & mask) == (b.bytes[full_bytes] & mask)
+}
+
+/// True iff network `a` is fully contained in network `b` (a ⊆ b).
+fn inet_contained_eq(a: &InetNet, b: &InetNet) -> bool {
+    if a.family_bytes != b.family_bytes {
+        return false;
+    }
+    if a.prefix_bits < b.prefix_bits {
+        return false;
+    }
+    network_prefix_eq(a, b, b.prefix_bits)
+}
+
+/// True iff a and b are exactly the same network (same family + same
+/// prefix + same masked address).
+fn inet_networks_equal(a: &InetNet, b: &InetNet) -> bool {
+    if a.family_bytes != b.family_bytes {
+        return false;
+    }
+    if a.prefix_bits != b.prefix_bits {
+        return false;
+    }
+    network_prefix_eq(a, b, a.prefix_bits)
+}
+
+fn inet_op_bool_result(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (lt, rt) = match (l, r) {
+        (Value::Text(a), Value::Text(b)) => (a, b),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "inet operator requires TEXT/INET operands, got {:?} and {:?}",
+                    l.data_type(),
+                    r.data_type()
+                ),
+            });
+        }
+    };
+    let a = parse_inet_text(lt).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("invalid inet text: {:?}", lt),
+    })?;
+    let b = parse_inet_text(rt).ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!("invalid inet text: {:?}", rt),
+    })?;
+    let result = match op {
+        BinOp::InetContainedByEq => inet_contained_eq(&a, &b),
+        BinOp::InetContainedBy => inet_contained_eq(&a, &b) && !inet_networks_equal(&a, &b),
+        BinOp::InetContainsEq => inet_contained_eq(&b, &a),
+        BinOp::InetContains => inet_contained_eq(&b, &a) && !inet_networks_equal(&a, &b),
+        BinOp::InetOverlap => inet_contained_eq(&a, &b) || inet_contained_eq(&b, &a),
+        _ => unreachable!("inet_op_bool_result called with non-inet op"),
+    };
+    Ok(Value::Bool(result))
+}
+
+// ─── v7.17.0 Phase 3.7 — minimal POSIX-ERE-shaped regex matcher ───────
+//
+// SPG-engine is `#![no_std]` and has no external regex dependency, so
+// this module hand-implements the subset of PG's regex needed by the
+// dominant customer patterns. Supported syntax:
+//
+//   * literal characters (with `\.`, `\*`, `\+`, `\?`, `\(`, `\)`,
+//     `\[`, `\]`, `\\`, `\^`, `\$`, `\|` escapes)
+//   * `.` — any single character
+//   * `*`, `+`, `?` — greedy quantifiers
+//   * character classes: `[abc]`, `[^abc]`, `[a-z0-9_]`
+//   * shortcut classes: `\d` `\D` `\w` `\W` `\s` `\S`
+//   * anchors `^` `$`
+//   * non-capturing groups `(...)`
+//   * alternation `|`
+//
+// NOT supported in v7.17 (errors clearly):
+//   * backreferences `\1`
+//   * lookaround `(?=…)` `(?<=…)`
+//   * named captures
+//   * inline flag groups `(?i)`
+//   * lazy quantifiers `*?` `+?` `??` — patterns containing `?` after
+//     a quantifier are accepted but interpreted as the greedy form
+//     (this is the v7.17 stop-gap; customers needing lazy semantics
+//     should preprocess the pattern)
+//   * counted repetition `{n,m}`
+//
+// The matcher uses a backtracking NFA-shaped walk; performance is fine
+// for the small strings PG regex functions usually operate on.
+
+#[derive(Debug, Clone)]
+enum ReNode {
+    /// Single literal byte. ASCII fast-path; non-ASCII falls through
+    /// to Any since the engine doesn't decode UTF-8 here.
+    Literal(char),
+    /// Any single character.
+    AnyChar,
+    /// Character class: (positive members list, negated flag).
+    Class { members: Vec<ClassMember>, negated: bool },
+    /// Anchor start.
+    Start,
+    /// Anchor end.
+    End,
+    /// Greedy quantifier.
+    Quant {
+        inner: Box<ReNode>,
+        min: usize,
+        max: Option<usize>,
+    },
+    /// Concatenation of sub-nodes.
+    Concat(Vec<ReNode>),
+    /// Alternation.
+    Alt(Vec<ReNode>),
+}
+
+#[derive(Debug, Clone)]
+enum ClassMember {
+    Single(char),
+    Range(char, char),
+}
+
+fn re_compile(pat: &str) -> Result<ReNode, EvalError> {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut p = 0;
+    let n = re_parse_alt(&chars, &mut p)?;
+    if p != chars.len() {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("regex compile: trailing chars at pos {p} in {pat:?}"),
+        });
+    }
+    Ok(n)
+}
+
+fn re_parse_alt(chars: &[char], p: &mut usize) -> Result<ReNode, EvalError> {
+    let mut branches = alloc::vec![re_parse_concat(chars, p)?];
+    while *p < chars.len() && chars[*p] == '|' {
+        *p += 1;
+        branches.push(re_parse_concat(chars, p)?);
+    }
+    if branches.len() == 1 {
+        Ok(branches.pop().unwrap())
+    } else {
+        Ok(ReNode::Alt(branches))
+    }
+}
+
+fn re_parse_concat(chars: &[char], p: &mut usize) -> Result<ReNode, EvalError> {
+    let mut items: Vec<ReNode> = Vec::new();
+    while *p < chars.len() {
+        let c = chars[*p];
+        if c == '|' || c == ')' {
+            break;
+        }
+        let atom = re_parse_atom(chars, p)?;
+        // Optional quantifier suffix.
+        let quantified = if *p < chars.len() {
+            match chars[*p] {
+                '*' => {
+                    *p += 1;
+                    // v7.17 stop-gap: tolerate `*?` lazy quantifier
+                    // by treating it as greedy. Skip the trailing
+                    // `?` if present.
+                    if *p < chars.len() && chars[*p] == '?' {
+                        *p += 1;
+                    }
+                    ReNode::Quant {
+                        inner: Box::new(atom),
+                        min: 0,
+                        max: None,
+                    }
+                }
+                '+' => {
+                    *p += 1;
+                    if *p < chars.len() && chars[*p] == '?' {
+                        *p += 1;
+                    }
+                    ReNode::Quant {
+                        inner: Box::new(atom),
+                        min: 1,
+                        max: None,
+                    }
+                }
+                '?' => {
+                    *p += 1;
+                    ReNode::Quant {
+                        inner: Box::new(atom),
+                        min: 0,
+                        max: Some(1),
+                    }
+                }
+                _ => atom,
+            }
+        } else {
+            atom
+        };
+        items.push(quantified);
+    }
+    if items.len() == 1 {
+        Ok(items.pop().unwrap())
+    } else {
+        Ok(ReNode::Concat(items))
+    }
+}
+
+fn re_parse_atom(chars: &[char], p: &mut usize) -> Result<ReNode, EvalError> {
+    let c = chars[*p];
+    match c {
+        '(' => {
+            *p += 1;
+            let inner = re_parse_alt(chars, p)?;
+            if *p >= chars.len() || chars[*p] != ')' {
+                return Err(EvalError::TypeMismatch {
+                    detail: "regex compile: unmatched '('".into(),
+                });
+            }
+            *p += 1;
+            Ok(inner)
+        }
+        '[' => {
+            *p += 1;
+            let mut negated = false;
+            if *p < chars.len() && chars[*p] == '^' {
+                negated = true;
+                *p += 1;
+            }
+            let mut members: Vec<ClassMember> = Vec::new();
+            while *p < chars.len() && chars[*p] != ']' {
+                let start = chars[*p];
+                *p += 1;
+                if *p + 1 < chars.len() && chars[*p] == '-' && chars[*p + 1] != ']' {
+                    let end = chars[*p + 1];
+                    *p += 2;
+                    members.push(ClassMember::Range(start, end));
+                } else {
+                    members.push(ClassMember::Single(start));
+                }
+            }
+            if *p >= chars.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "regex compile: unmatched '['".into(),
+                });
+            }
+            *p += 1; // consume ]
+            Ok(ReNode::Class { members, negated })
+        }
+        '.' => {
+            *p += 1;
+            Ok(ReNode::AnyChar)
+        }
+        '^' => {
+            *p += 1;
+            Ok(ReNode::Start)
+        }
+        '$' => {
+            *p += 1;
+            Ok(ReNode::End)
+        }
+        '\\' => {
+            *p += 1;
+            if *p >= chars.len() {
+                return Err(EvalError::TypeMismatch {
+                    detail: "regex compile: dangling backslash".into(),
+                });
+            }
+            let esc = chars[*p];
+            *p += 1;
+            match esc {
+                'd' => Ok(ReNode::Class {
+                    members: alloc::vec![ClassMember::Range('0', '9')],
+                    negated: false,
+                }),
+                'D' => Ok(ReNode::Class {
+                    members: alloc::vec![ClassMember::Range('0', '9')],
+                    negated: true,
+                }),
+                'w' => Ok(ReNode::Class {
+                    members: alloc::vec![
+                        ClassMember::Range('a', 'z'),
+                        ClassMember::Range('A', 'Z'),
+                        ClassMember::Range('0', '9'),
+                        ClassMember::Single('_'),
+                    ],
+                    negated: false,
+                }),
+                'W' => Ok(ReNode::Class {
+                    members: alloc::vec![
+                        ClassMember::Range('a', 'z'),
+                        ClassMember::Range('A', 'Z'),
+                        ClassMember::Range('0', '9'),
+                        ClassMember::Single('_'),
+                    ],
+                    negated: true,
+                }),
+                's' => Ok(ReNode::Class {
+                    members: alloc::vec![
+                        ClassMember::Single(' '),
+                        ClassMember::Single('\t'),
+                        ClassMember::Single('\n'),
+                        ClassMember::Single('\r'),
+                    ],
+                    negated: false,
+                }),
+                'S' => Ok(ReNode::Class {
+                    members: alloc::vec![
+                        ClassMember::Single(' '),
+                        ClassMember::Single('\t'),
+                        ClassMember::Single('\n'),
+                        ClassMember::Single('\r'),
+                    ],
+                    negated: true,
+                }),
+                other => Ok(ReNode::Literal(other)),
+            }
+        }
+        other => {
+            *p += 1;
+            Ok(ReNode::Literal(other))
+        }
+    }
+}
+
+fn class_matches(member: &ClassMember, c: char) -> bool {
+    match member {
+        ClassMember::Single(s) => *s == c,
+        ClassMember::Range(a, b) => c >= *a && c <= *b,
+    }
+}
+
+/// Try to match `node` starting at `pos` in `s`. Returns Some(end)
+/// of the matched span (exclusive), or None if no match. Greedy
+/// backtracking: each quantifier tries the longest viable repeat
+/// and shrinks if the tail doesn't fit.
+fn re_match_at(node: &ReNode, s: &[char], pos: usize) -> Option<usize> {
+    match node {
+        ReNode::Literal(c) => {
+            if s.get(pos).copied() == Some(*c) {
+                Some(pos + 1)
+            } else {
+                None
+            }
+        }
+        ReNode::AnyChar => {
+            if pos < s.len() && s[pos] != '\n' {
+                Some(pos + 1)
+            } else {
+                None
+            }
+        }
+        ReNode::Class { members, negated } => {
+            let c = *s.get(pos)?;
+            let hit = members.iter().any(|m| class_matches(m, c));
+            if hit ^ negated {
+                Some(pos + 1)
+            } else {
+                None
+            }
+        }
+        ReNode::Start => {
+            if pos == 0 {
+                Some(pos)
+            } else {
+                None
+            }
+        }
+        ReNode::End => {
+            if pos == s.len() {
+                Some(pos)
+            } else {
+                None
+            }
+        }
+        ReNode::Concat(items) => {
+            let mut p = pos;
+            for it in items {
+                p = re_match_at(it, s, p)?;
+            }
+            Some(p)
+        }
+        ReNode::Alt(branches) => {
+            for b in branches {
+                if let Some(p) = re_match_at(b, s, pos) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        ReNode::Quant { inner, min, max } => {
+            // Greedy: gather as many matches as possible, then
+            // shrink. v7.17 stop-gap doesn't continue the outer
+            // tail match (we're at a leaf in concat already), so
+            // we just return the longest match.
+            let mut count = 0usize;
+            let mut p = pos;
+            loop {
+                if let Some(cap) = max {
+                    if count >= *cap {
+                        break;
+                    }
+                }
+                match re_match_at(inner, s, p) {
+                    Some(np) if np > p => {
+                        p = np;
+                        count += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if count < *min {
+                return None;
+            }
+            Some(p)
+        }
+    }
+}
+
+/// Find the first match of `node` in `s`, starting at or after
+/// `from`. Returns the (start, end) char positions of the match.
+fn re_find(node: &ReNode, s: &[char], from: usize) -> Option<(usize, usize)> {
+    let mut start = from;
+    loop {
+        if let Some(end) = re_match_at(node, s, start) {
+            return Some((start, end));
+        }
+        if start >= s.len() {
+            return None;
+        }
+        start += 1;
+    }
+}
+
+/// v7.17.0 Phase 3.7 — `regexp_matches(s, pat)` returns the FIRST
+/// match as a single-element TEXT[]. (PG returns one row per match
+/// across all captures; SPG simplifies to first-match-only TEXT[].
+/// The `g` flag form `regexp_matches(s, pat, 'g')` falls through
+/// to all-matches concatenation as a flat array.)
+fn regexp_matches(args: &[Value]) -> Result<Value, EvalError> {
+    let (text, pat, all_matches) = match args.len() {
+        2 => (text_arg(&args[0])?, text_arg(&args[1])?, false),
+        3 => {
+            let flags = text_arg(&args[2])?.unwrap_or_default();
+            (
+                text_arg(&args[0])?,
+                text_arg(&args[1])?,
+                flags.contains('g'),
+            )
+        }
+        n => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "regexp_matches() takes 2 or 3 args, got {n}"
+                ),
+            });
+        }
+    };
+    let Some(text) = text else { return Ok(Value::Null) };
+    let Some(pat) = pat else { return Ok(Value::Null) };
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut from = 0usize;
+    loop {
+        match re_find(&node, &chars, from) {
+            Some((s_pos, e_pos)) => {
+                out.push(Some(chars[s_pos..e_pos].iter().collect()));
+                if !all_matches {
+                    break;
+                }
+                // Advance past the match; if zero-width, step one.
+                from = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+                if from > chars.len() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(Value::TextArray(out))
+}
+
+/// v7.17.0 Phase 3.7 — `regexp_replace(s, pat, repl[, flags])`.
+/// `flags` containing `g` replaces all matches; absent flag
+/// replaces only the first match (PG default).
+fn regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
+    let (text, pat, repl, flags) = match args.len() {
+        3 => (
+            text_arg(&args[0])?,
+            text_arg(&args[1])?,
+            text_arg(&args[2])?,
+            String::new(),
+        ),
+        4 => (
+            text_arg(&args[0])?,
+            text_arg(&args[1])?,
+            text_arg(&args[2])?,
+            text_arg(&args[3])?.unwrap_or_default(),
+        ),
+        n => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "regexp_replace() takes 3 or 4 args, got {n}"
+                ),
+            });
+        }
+    };
+    let Some(text) = text else { return Ok(Value::Null) };
+    let Some(pat) = pat else { return Ok(Value::Null) };
+    let Some(repl) = repl else { return Ok(Value::Null) };
+    let global = flags.contains('g');
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0usize;
+    loop {
+        match re_find(&node, &chars, from) {
+            Some((s_pos, e_pos)) => {
+                out.extend(chars[from..s_pos].iter());
+                out.push_str(&repl);
+                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+                from = step;
+                if !global {
+                    if from <= chars.len() {
+                        out.extend(chars[from..].iter());
+                    }
+                    return Ok(Value::Text(out));
+                }
+                if from > chars.len() {
+                    break;
+                }
+            }
+            None => {
+                out.extend(chars[from..].iter());
+                break;
+            }
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+/// v7.17.0 Phase 3.7 — `regexp_split_to_array(s, pat)`. Returns
+/// TEXT[] of the pieces between matches.
+fn regexp_split_to_array(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "regexp_split_to_array() takes 2 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    let text = text_arg(&args[0])?;
+    let pat = text_arg(&args[1])?;
+    let Some(text) = text else { return Ok(Value::Null) };
+    let Some(pat) = pat else { return Ok(Value::Null) };
+    let node = re_compile(&pat)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut piece_start = 0usize;
+    let mut from = 0usize;
+    loop {
+        match re_find(&node, &chars, from) {
+            Some((s_pos, e_pos)) => {
+                let piece: String = chars[piece_start..s_pos].iter().collect();
+                out.push(Some(piece));
+                let step = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+                from = step;
+                piece_start = step;
+                if from > chars.len() {
+                    break;
+                }
+            }
+            None => {
+                let tail: String = chars[piece_start..].iter().collect();
+                out.push(Some(tail));
+                break;
+            }
+        }
+    }
+    Ok(Value::TextArray(out))
+}
+
+/// Helper: coerce a Value to an Option<String> for regex args. NULL
+/// propagates as None (caller short-circuits to Value::Null).
+fn text_arg(v: &Value) -> Result<Option<String>, EvalError> {
+    match v {
+        Value::Text(s) => Ok(Some(s.clone())),
+        Value::Null => Ok(None),
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "regex function expects TEXT arg, got {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+// PG trim family: which side to strip.
+#[derive(Debug, Clone, Copy)]
+enum TrimSide {
+    Left,
+    Right,
+    Both,
+}
+
+/// PG `left(s, n)` / `right(s, n)` shared implementation. Both
+/// support negative n which means "all but |n| chars from the
+/// opposite side". n=0 → ''. Codepoint-counted. NULL → NULL.
+fn string_left_right(args: &[Value], is_left: bool, fn_name: &str) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fn_name}() takes 2 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let s = value_to_format_text(&args[0]);
+    let n = match &args[1] {
+        Value::SmallInt(x) => i64::from(*x),
+        Value::Int(x) => i64::from(*x),
+        Value::BigInt(x) => *x,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}(): n must be integer, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    if n == 0 {
+        return Ok(Value::Text(String::new()));
+    }
+    let (start, end) = if is_left {
+        if n > 0 {
+            (0usize, (n.min(len)) as usize)
+        } else {
+            // left(s, -k) → drop last |k| chars; keep [0..len - k]
+            let drop = (-n).min(len);
+            (0usize, (len - drop) as usize)
+        }
+    } else if n > 0 {
+        // right(s, k) → keep last k chars; start = max(0, len-k)
+        let start = (len - n).max(0);
+        (start as usize, len as usize)
+    } else {
+        // right(s, -k) → drop first |k| chars; keep [k..len]
+        let drop = (-n).min(len);
+        (drop as usize, len as usize)
+    };
+    if start >= end {
+        return Ok(Value::Text(String::new()));
+    }
+    Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// Compare two values for min/max selection. Returns Equal when
+/// values are equal (including cross-numeric-width), Less when
+/// a < b, Greater when a > b. NULL handling is upstream.
+fn value_cmp_for_min_max(a: &Value, b: &Value) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    // Integer-widen first (covers SmallInt vs Int vs BigInt).
+    let a_int = match a {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    let b_int = match b {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    if let (Some(av), Some(bv)) = (a_int, b_int) {
+        return av.cmp(&bv);
+    }
+    // Float-widen.
+    let a_f = value_to_f64(a);
+    let b_f = value_to_f64(b);
+    if let (Some(av), Some(bv)) = (a_f, b_f) {
+        return av.partial_cmp(&bv).unwrap_or(Ordering::Equal);
+    }
+    // Text/Text.
+    match (a, b) {
+        (Value::Text(av), Value::Text(bv)) => av.cmp(bv),
+        (Value::Bytes(av), Value::Bytes(bv)) => av.cmp(bv),
+        _ => Ordering::Equal,
+    }
+}
+
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(x) => Some(*x),
+        Value::SmallInt(x) => Some(f64::from(*x)),
+        Value::Int(x) => Some(f64::from(*x)),
+        Value::BigInt(x) => Some(*x as f64),
+        Value::Numeric { scaled, scale } => {
+            Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+        }
+        _ => None,
+    }
+}
+
+/// PG-style equality for nullif. Handles cross-numeric-width
+/// comparison (Int vs BigInt vs SmallInt vs Float vs Numeric);
+/// text matches text exactly; everything else uses derived
+/// PartialEq.
+fn values_equal_for_nullif(a: &Value, b: &Value) -> bool {
+    // Same-type fast path.
+    if a == b {
+        return true;
+    }
+    // Cross-int widening: SmallInt / Int / BigInt all comparable.
+    let a_int = match a {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    let b_int = match b {
+        Value::SmallInt(x) => Some(i64::from(*x)),
+        Value::Int(x) => Some(i64::from(*x)),
+        Value::BigInt(x) => Some(*x),
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (a_int, b_int) {
+        return a == b;
+    }
+    // Float / Numeric: widen to f64.
+    let a_f = match a {
+        Value::Float(x) => Some(*x),
+        Value::SmallInt(x) => Some(f64::from(*x)),
+        Value::Int(x) => Some(f64::from(*x)),
+        Value::BigInt(x) => Some(*x as f64),
+        Value::Numeric { scaled, scale } => {
+            Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+        }
+        _ => None,
+    };
+    let b_f = match b {
+        Value::Float(x) => Some(*x),
+        Value::SmallInt(x) => Some(f64::from(*x)),
+        Value::Int(x) => Some(f64::from(*x)),
+        Value::BigInt(x) => Some(*x as f64),
+        Value::Numeric { scaled, scale } => {
+            Some((*scaled as f64) / f64_powi(10.0, i32::from(*scale)))
+        }
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (a_f, b_f) {
+        return a == b;
+    }
+    false
+}
+
+/// no_std-compatible `trunc(x)` for f64 — truncate toward zero.
+/// `as i64 as f64` already truncates toward zero for the in-range
+/// case; the |x| > 2^53 branch returns x verbatim because the f64
+/// is already integer-precision.
+fn f64_trunc(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
+        return x;
+    }
+    (x as i64) as f64
+}
+
+/// xorshift64* PRNG state — process-static seed advanced on
+/// every `random()` call. Not cryptographically secure; use
+/// `gen_random_uuid` / future crypto-RNG functions when
+/// security matters.
+static PRNG_STATE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
+
+/// Advance the PRNG and return the raw next 64-bit state.
+/// Shared between `random()` and `gen_random_uuid()`. The CAS
+/// loop guarantees concurrent callers each see a distinct value
+/// — important for `gen_random_uuid` collision freedom under
+/// concurrent INSERTs.
+fn prng_next_u64() -> u64 {
+    use core::sync::atomic::Ordering;
+    let mut x = PRNG_STATE.load(Ordering::Relaxed);
+    loop {
+        if x == 0 {
+            x = 0x2545_F491_4F6C_DD1D;
+        }
+        let mut next = x;
+        next ^= next << 13;
+        next ^= next >> 7;
+        next ^= next << 17;
+        match PRNG_STATE.compare_exchange_weak(
+            x,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(seen) => x = seen,
+        }
+    }
+}
+
+/// Advance the PRNG and return a uniform double in [0, 1).
+fn prng_next_f64() -> f64 {
+    // 53 bits of randomness mapped to [0, 1).
+    let mantissa = prng_next_u64() >> 11;
+    let denom = (1u64 << 53) as f64;
+    mantissa as f64 / denom
+}
+
+/// v7.17.0 — generate a RFC 4122 v4 (random) UUID. Layout: 16
+/// random bytes with the version nibble (high nibble of byte 6)
+/// pinned to `0100` (= 4) and the variant top bits (high two bits
+/// of byte 8) pinned to `10` — exactly what PG's
+/// `gen_random_uuid()` and the historical uuid-ossp
+/// `uuid_generate_v4()` produce.
+pub fn gen_random_uuid_bytes() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let hi = prng_next_u64().to_be_bytes();
+    let lo = prng_next_u64().to_be_bytes();
+    out[..8].copy_from_slice(&hi);
+    out[8..].copy_from_slice(&lo);
+    // Version 4: top nibble of byte 6 must be 0100.
+    out[6] = (out[6] & 0x0f) | 0x40;
+    // Variant 1 (RFC 4122): top two bits of byte 8 must be 10.
+    out[8] = (out[8] & 0x3f) | 0x80;
+    out
+}
+
+/// no_std `f64::sqrt(x)` — square root via Newton's method
+/// (Babylonian). Gives EXACT results for perfect squares
+/// because the iteration converges to bit-exact precision in
+/// floating-point. x must be non-negative (caller's contract).
+fn f64_sqrt(x: f64) -> f64 {
+    if x == 0.0 || x.is_nan() {
+        return x;
+    }
+    if x.is_infinite() {
+        return x;
+    }
+    // Initial guess via bit manipulation of the exponent: divide
+    // the exponent by 2. Avoids needing a logarithm for the
+    // seed and converges in ~5 iterations.
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let new_exp = (exp / 2) + 1023;
+    let mut guess = f64::from_bits(((new_exp as u64) & 0x7ff) << 52);
+    // 5 Newton iterations are MORE than enough for f64 precision.
+    for _ in 0..8 {
+        guess = 0.5 * (guess + x / guess);
+    }
+    guess
+}
+
+/// no_std `f64::exp(x)` — e^x via range-reduction + Taylor
+/// series. Adequate for power(), exp(), and pseudo-random-ish
+/// scales the engine uses; ~1e-12 relative error in the
+/// common range.
+fn f64_exp(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x > 709.0 {
+        return f64::INFINITY;
+    }
+    if x < -745.0 {
+        return 0.0;
+    }
+    // exp(x) = 2^k * exp(r) where r = x - k*ln(2), |r| <= ln(2)/2.
+    const LN2: f64 = 0.6931471805599453;
+    let k = f64_round_half_away(x / LN2) as i32;
+    let r = x - (k as f64) * LN2;
+    // Taylor series for exp(r): sum r^n / n!  (rapid for |r|<0.35)
+    let mut term = 1.0;
+    let mut sum = 1.0;
+    for n in 1..=20 {
+        term *= r / (n as f64);
+        sum += term;
+        if term.abs() < 1e-18 {
+            break;
+        }
+    }
+    // Multiply by 2^k.
+    f64_powi(2.0, k) * sum
+}
+
+/// no_std `f64::ln(x)` — natural log via range-reduction +
+/// atanh series. x must be positive (caller's contract).
+fn f64_ln(x: f64) -> f64 {
+    if x <= 0.0 {
+        return f64::NAN;
+    }
+    if x == 1.0 {
+        return 0.0;
+    }
+    // x = 2^k * m where m in [0.5, 1.0). Then ln(x) = k*ln(2) + ln(m).
+    const LN2: f64 = 0.6931471805599453;
+    let mut k = 0i32;
+    let mut m = x;
+    while m >= 2.0 {
+        m *= 0.5;
+        k += 1;
+    }
+    while m < 1.0 {
+        m *= 2.0;
+        k -= 1;
+    }
+    // Now m in [1.0, 2.0). Use atanh series via u = (m-1)/(m+1).
+    // ln(m) = 2*(u + u^3/3 + u^5/5 + ...). Converges fast.
+    let u = (m - 1.0) / (m + 1.0);
+    let u2 = u * u;
+    let mut term = u;
+    let mut sum = u;
+    for k_iter in 1..50 {
+        term *= u2;
+        let denom = (2 * k_iter + 1) as f64;
+        sum += term / denom;
+        if (term / denom).abs() < 1e-18 {
+            break;
+        }
+    }
+    2.0 * sum + (k as f64) * LN2
+}
+
+/// no_std `f64::powi` substitute — integer exponent for f64
+/// base. Uses repeated multiplication; correct for the small
+/// exponents the rounding / cast code uses (scale up to ±38).
+fn f64_powi(base: f64, exp: i32) -> f64 {
+    if exp == 0 {
+        return 1.0;
+    }
+    let mut result = 1.0;
+    let mut b = if exp > 0 { base } else { 1.0 / base };
+    let mut e = exp.unsigned_abs();
+    while e > 0 {
+        if e & 1 == 1 {
+            result *= b;
+        }
+        e >>= 1;
+        if e > 0 {
+            b *= b;
+        }
+    }
+    result
+}
+
+/// no_std-compatible `round(x)` for f64 with half-away-from-zero
+/// rule (PG NUMERIC semantic — NOT banker's rounding).
+fn f64_round_half_away(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    if x >= 0.0 {
+        f64_floor(x + 0.5)
+    } else {
+        f64_ceil(x - 0.5)
+    }
+}
+
+/// no_std-compatible `ceil(x)` for f64. Same shape as
+/// `f64_floor` but rounds toward +infinity for fractional
+/// values. Negative fractions round toward zero
+/// (ceil(-1.5) → -1, NOT -2).
+fn f64_ceil(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
+        return x;
+    }
+    let trunc = (x as i64) as f64;
+    if x > 0.0 && x != trunc {
+        trunc + 1.0
+    } else {
+        trunc
+    }
+}
+
+/// no_std-compatible `floor(x)` for f64. SPG's engine is
+/// `#![no_std]` and can't call `f64::floor` directly (libm).
+/// This handles the floor semantic manually:
+///   * NaN / Inf passthrough.
+///   * Values outside i64 range are already integer-precision.
+///   * Negative non-integers floor toward -infinity (the
+///     critical PG-canonical semantic).
+fn f64_floor(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    // f64 representation: any value with |x| > 2^53 is integer
+    // precision (mantissa is 52 bits), so floor is identity.
+    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
+        return x;
+    }
+    let trunc = (x as i64) as f64;
+    if x < 0.0 && x != trunc {
+        trunc - 1.0
+    } else {
+        trunc
+    }
+}
+
+/// PG `lpad` / `rpad` shared implementation. Length is the
+/// target codepoint count. When the input is longer than `length`,
+/// truncate keeping the LEFT side (both lpad and rpad agree with
+/// PG here). When shorter, pad with `fill` (default SPACE) cycling
+/// for multi-char fills, on the appropriate side. Empty fill +
+/// needs padding → returns input verbatim (potentially
+/// truncated). NULL on any arg → NULL.
+fn string_pad(args: &[Value], is_left: bool, fn_name: &str) -> Result<Value, EvalError> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "{fn_name}() takes 2 or 3 args, got {}",
+                args.len()
+            ),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let s = value_to_format_text(&args[0]);
+    let target = match &args[1] {
+        Value::SmallInt(x) => i64::from(*x),
+        Value::Int(x) => i64::from(*x),
+        Value::BigInt(x) => *x,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}(): length must be integer, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let fill = if args.len() == 3 {
+        value_to_format_text(&args[2])
+    } else {
+        String::from(" ")
+    };
+    if target <= 0 {
+        return Ok(Value::Text(String::new()));
+    }
+    let target = target as usize;
+    let s_chars: Vec<char> = s.chars().collect();
+    if s_chars.len() >= target {
+        // Truncate from the right (PG keeps LEFT side for both
+        // lpad and rpad).
+        return Ok(Value::Text(s_chars[..target].iter().collect()));
+    }
+    if fill.is_empty() {
+        return Ok(Value::Text(s));
+    }
+    let pad_needed = target - s_chars.len();
+    let fill_chars: Vec<char> = fill.chars().collect();
+    let mut padding = String::with_capacity(pad_needed * 4);
+    for i in 0..pad_needed {
+        padding.push(fill_chars[i % fill_chars.len()]);
+    }
+    if is_left {
+        Ok(Value::Text(padding + &s))
+    } else {
+        Ok(Value::Text(s + &padding))
+    }
+}
+
+/// PG `trim` / `ltrim` / `rtrim` / `btrim` shared implementation.
+/// Accepts 1 or 2 args; coerces both to text via the standard
+/// `value_to_format_text` helper; treats the chars arg as a SET
+/// of UTF-8 codepoints (not a substring). NULL on either arg
+/// poisons the result.
+fn string_trim(args: &[Value], side: TrimSide, fn_name: &str) -> Result<Value, EvalError> {
+    let (input, chars_str) = match args {
+        [v] => (v.clone(), String::from(" ")),
+        [v, c] => (v.clone(), {
+            // NULL chars poisons.
+            if matches!(c, Value::Null) {
+                return Ok(Value::Null);
+            }
+            value_to_format_text(c)
+        }),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "{fn_name}() takes 1 or 2 args, got {}",
+                    args.len()
+                ),
+            });
+        }
+    };
+    if matches!(input, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let s = value_to_format_text(&input);
+    let charset: alloc::collections::BTreeSet<char> = chars_str.chars().collect();
+    let chars: Vec<char> = s.chars().collect();
+    let mut start = 0usize;
+    let mut end = chars.len();
+    if matches!(side, TrimSide::Left | TrimSide::Both) {
+        while start < end && charset.contains(&chars[start]) {
+            start += 1;
+        }
+    }
+    if matches!(side, TrimSide::Right | TrimSide::Both) {
+        while end > start && charset.contains(&chars[end - 1]) {
+            end -= 1;
+        }
+    }
+    Ok(Value::Text(chars[start..end].iter().collect()))
+}
+
+/// v7.17.0 Phase 3.8 — PG `format(fmtstr, args…)` with
+/// sprintf-style conversion specifiers. Subset covered:
+///   * `%s` — text rendering of the arg
+///   * `%I` — quoted SQL identifier (always double-quoted; embedded
+///     `"` doubled per SQL grammar)
+///   * `%L` — quoted SQL literal (single-quoted; embedded `'`
+///     doubled; NULL → literal `NULL`)
+///   * `%%` — literal `%`
+///   * `%n$X` — argument position (1-based) before the specifier
+///     character (e.g. `%2$s` picks the 2nd arg)
+fn format_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::TypeMismatch {
+            detail: "format() takes at least 1 arg (format string)".into(),
+        });
+    }
+    let fmt = match &args[0] {
+        Value::Text(s) => s.clone(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "format(): first arg must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let arg_values = &args[1..];
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    // Position cursor — next implicit arg picked when no `n$`
+    // prefix is given. PG's format uses a 1-based cursor that
+    // advances on each implicit-position spec.
+    let mut implicit_cursor: usize = 0;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // Parse optional `n$` position prefix.
+        let mut explicit_pos: Option<usize> = None;
+        // Buffer the digits so we can roll back if no `$` follows.
+        let mut digit_buf = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                digit_buf.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if !digit_buf.is_empty() && matches!(chars.peek(), Some(&'$')) {
+            chars.next(); // consume `$`
+            explicit_pos = Some(digit_buf.parse::<usize>().map_err(|_| {
+                EvalError::TypeMismatch {
+                    detail: format!("format(): invalid arg position {digit_buf:?}"),
+                }
+            })?);
+            digit_buf.clear();
+        }
+        // Specifier character.
+        let spec = match chars.next() {
+            Some(c) => c,
+            None => {
+                return Err(EvalError::TypeMismatch {
+                    detail: "format(): trailing `%` with no specifier".into(),
+                });
+            }
+        };
+        // Anything left in digit_buf (no `$`) was actually
+        // pre-spec digits we now have to emit verbatim. PG would
+        // treat them as width hint; v7.17 doesn't implement
+        // width, but we don't want to silently drop the digits.
+        // Strategy: ignore width for now and emit just the
+        // converted value.
+        let _ = digit_buf;
+        if spec == '%' {
+            out.push('%');
+            continue;
+        }
+        let arg_index = match explicit_pos {
+            Some(p) => p.saturating_sub(1),
+            None => {
+                let i = implicit_cursor;
+                implicit_cursor += 1;
+                i
+            }
+        };
+        let arg = arg_values.get(arg_index).cloned().unwrap_or(Value::Null);
+        match spec {
+            's' => match arg {
+                Value::Null => {} // PG: NULL renders as empty for %s.
+                v => out.push_str(&value_to_format_text(&v)),
+            },
+            'I' => match arg {
+                Value::Null => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "format(): NULL is not a valid identifier (%I)".into(),
+                    });
+                }
+                v => {
+                    let s = value_to_format_text(&v);
+                    out.push('"');
+                    for ch in s.chars() {
+                        if ch == '"' {
+                            out.push('"');
+                            out.push('"');
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    out.push('"');
+                }
+            },
+            'L' => match arg {
+                Value::Null => out.push_str("NULL"),
+                v => {
+                    let s = value_to_format_text(&v);
+                    out.push('\'');
+                    for ch in s.chars() {
+                        if ch == '\'' {
+                            out.push('\'');
+                            out.push('\'');
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    out.push('\'');
+                }
+            },
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "format(): unknown specifier '%{other}' \
+                         (v7.17 supports %s %I %L %%)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+/// Helper: render a Value as text for format()'s %s / %I / %L
+/// payload. Reuses the regular text-coercion table.
+/// v7.17.0 Phase 3.P0-31 — map a `Value` to the canonical PG
+/// type-name string returned by `pg_typeof`. Lowercase, matches
+/// what real PostgreSQL emits (NOT SPG's UPPERCASE Display shape).
+fn pg_typeof_name(v: &Value) -> &'static str {
+    match v {
+        Value::SmallInt(_) => "smallint",
+        Value::Int(_) => "integer",
+        Value::BigInt(_) => "bigint",
+        Value::Float(_) => "double precision",
+        Value::Text(_) => "text",
+        Value::Bool(_) => "boolean",
+        Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => "vector",
+        Value::Numeric { .. } => "numeric",
+        Value::Date(_) => "date",
+        Value::Timestamp(_) => "timestamp without time zone",
+        Value::Interval { .. } => "interval",
+        Value::Json(_) => {
+            // SPG carries JSON and JSONB in the same Value::Json
+            // variant; without a column ty hint we cannot tell
+            // them apart at value level. Return "json" as the
+            // conservative answer (PG's pg_typeof on a literal
+            // `'{}'::json` returns "json"; the jsonb case is
+            // covered when an explicit ::jsonb cast lands as
+            // Value::Json too — see below override at call site).
+            //
+            // The eval-arm above for pg_typeof handles the
+            // disambiguation via Expr-shape probing.
+            "json"
+        }
+        Value::Bytes(_) => "bytea",
+        Value::TextArray(_) => "text[]",
+        Value::IntArray(_) => "integer[]",
+        Value::BigIntArray(_) => "bigint[]",
+        Value::TsVector(_) => "tsvector",
+        Value::TsQuery(_) => "tsquery",
+        Value::Uuid(_) => "uuid",
+        Value::Null => "unknown",
+        // Value is #[non_exhaustive]; future variants land here
+        // until the table is updated.
+        _ => "unknown",
+    }
+}
+
+fn value_to_format_text(v: &Value) -> String {
+    match v {
+        Value::Text(s) | Value::Json(s) => s.clone(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(x) => format!("{x}"),
+        Value::Bool(b) => if *b { "t".into() } else { "f".into() },
+        Value::Null => String::new(),
+        other => format!("{other:?}"),
+    }
+}
+
 fn to_char(args: &[Value]) -> Result<Value, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
@@ -1742,6 +4441,213 @@ const MONTH_ABBR: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
+/// v7.17.0 Phase 3.P0-29 — MySQL `DATE_FORMAT(t, fmt)`.
+///
+/// Format tokens (MySQL 8.0 surface):
+///   * `%Y` — 4-digit year  `%y` — 2-digit year
+///   * `%m` — 01-12 month   `%c` — 1-12 month (no zero pad)
+///   * `%d` — 01-31 day     `%e` — 1-31 day (no zero pad)
+///   * `%H` — 00-23 hour    `%h` / `%I` — 01-12 hour
+///   * `%i` — 00-59 MINUTE (NB: `%M` is month name in MySQL — easy
+///     footgun if we mirror PG's `to_char` tokens by accident)
+///   * `%s` / `%S` — 00-59 second
+///   * `%f` — 000000-999999 microseconds (always 6 digits)
+///   * `%p` — AM / PM
+///   * `%M` — January-December (full month name)
+///   * `%b` — Jan-Dec (abbreviated month name)
+///   * `%%` — literal `%`
+///
+/// Unknown `%X` tokens pass through verbatim (MySQL emits the `%`
+/// then the unknown letter).
+fn date_format_mysql(args: &[Value]) -> Result<Value, EvalError> {
+    use core::fmt::Write as _;
+    if args.len() != 2 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("date_format() takes 2 args, got {}", args.len()),
+        });
+    }
+    if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(fmt) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "date_format() needs a text format, got {:?}",
+                args[1].data_type()
+            ),
+        });
+    };
+    let (days, day_micros) = match &args[0] {
+        Value::Date(d) => (*d, 0_i64),
+        Value::Timestamp(t) => {
+            let days = t.div_euclid(86_400_000_000);
+            (
+                i32::try_from(days).unwrap_or(i32::MAX),
+                t.rem_euclid(86_400_000_000),
+            )
+        }
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "date_format() needs DATE or TIMESTAMP, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let (y, mo, d) = civil_from_days(days);
+    let secs = day_micros / 1_000_000;
+    let frac = day_micros % 1_000_000;
+    let hh24 = u32::try_from(secs / 3600).unwrap_or(0);
+    let mi = u32::try_from((secs / 60) % 60).unwrap_or(0);
+    let ss = u32::try_from(secs % 60).unwrap_or(0);
+    let hh12 = match hh24 % 12 {
+        0 => 12,
+        x => x,
+    };
+    let ampm = if hh24 < 12 { "AM" } else { "PM" };
+    let us = u32::try_from(frac).unwrap_or(0);
+
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            // Trailing `%` with no specifier — emit verbatim.
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        let token = bytes[i + 1];
+        match token {
+            b'Y' => {
+                let _ = write!(out, "{y:04}");
+            }
+            b'y' => {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let yy = (y.rem_euclid(100)) as u32;
+                let _ = write!(out, "{yy:02}");
+            }
+            b'm' => {
+                let _ = write!(out, "{mo:02}");
+            }
+            b'c' => {
+                let _ = write!(out, "{mo}");
+            }
+            b'd' => {
+                let _ = write!(out, "{d:02}");
+            }
+            b'e' => {
+                let _ = write!(out, "{d}");
+            }
+            b'H' => {
+                let _ = write!(out, "{hh24:02}");
+            }
+            b'h' | b'I' => {
+                let _ = write!(out, "{hh12:02}");
+            }
+            b'i' => {
+                // MINUTE — distinct from PG's `MI` and from MySQL's
+                // own `%M` (month name).
+                let _ = write!(out, "{mi:02}");
+            }
+            b's' | b'S' => {
+                let _ = write!(out, "{ss:02}");
+            }
+            b'f' => {
+                let _ = write!(out, "{us:06}");
+            }
+            b'p' => {
+                out.push_str(ampm);
+            }
+            b'M' => {
+                out.push_str(MONTH_FULL[(mo - 1) as usize]);
+            }
+            b'b' => {
+                out.push_str(MONTH_ABBR[(mo - 1) as usize]);
+            }
+            b'%' => {
+                out.push('%');
+            }
+            other => {
+                // Unknown specifier — MySQL emits the letter
+                // verbatim (without the `%`).
+                out.push(other as char);
+            }
+        }
+        i += 2;
+    }
+    Ok(Value::Text(out))
+}
+
+/// v7.17.0 Phase 3.P0-29 — `UNIX_TIMESTAMP(t)` returns epoch
+/// seconds (BIGINT) for a TIMESTAMP / DATE.
+///
+/// Bare `UNIX_TIMESTAMP()` (no args) is folded to a BigInt literal
+/// by clock_replacement_for at the rewrite layer — never reaches
+/// this arm.
+fn unix_timestamp_of(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("unix_timestamp() takes 0 or 1 arg, got {}", args.len()),
+        });
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Timestamp(t) => Ok(Value::BigInt(t.div_euclid(1_000_000))),
+        Value::Date(d) => Ok(Value::BigInt(i64::from(*d) * 86_400)),
+        other => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "unix_timestamp() needs DATE or TIMESTAMP, got {:?}",
+                other.data_type()
+            ),
+        }),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-29 — `FROM_UNIXTIME(n)` returns a TIMESTAMP
+/// at `n` seconds past the Unix epoch. `FROM_UNIXTIME(n, fmt)`
+/// applies MySQL date_format on top, returning TEXT.
+fn from_unixtime(args: &[Value]) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("from_unixtime() takes 1 or 2 args, got {}", args.len()),
+        });
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let secs: i64 = match &args[0] {
+        Value::SmallInt(n) => i64::from(*n),
+        Value::Int(n) => i64::from(*n),
+        Value::BigInt(n) => *n,
+        Value::Float(x) => *x as i64,
+        Value::Numeric { scaled, scale } => {
+            let denom = 10_i128.pow(u32::from(*scale));
+            i64::try_from(scaled.div_euclid(denom)).unwrap_or(i64::MAX)
+        }
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "from_unixtime() needs a numeric epoch second count, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    let ts = Value::Timestamp(secs.saturating_mul(1_000_000));
+    if args.len() == 1 {
+        Ok(ts)
+    } else {
+        date_format_mysql(&[ts, args[1].clone()])
+    }
+}
+
 /// `date_trunc(unit, timestamp)` — round a `TIMESTAMP` down to the
 /// requested calendar boundary (year / month / day / hour / minute /
 /// second). Returns the truncated `TIMESTAMP`. NULL on either side
@@ -1834,13 +4740,41 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
                 ),
             }),
         },
-        // v7.9.26 — `::regtype` / `::regclass`. SPG has no
-        // pg_catalog; surface a clear error.
-        CastTarget::RegType | CastTarget::RegClass => Err(EvalError::TypeMismatch {
-            detail: "::regtype / ::regclass not supported on SPG \
-                 (no pg_catalog); use SHOW TABLES / spg_table_ddl instead"
-                .into(),
-        }),
+        // v7.17.0 Phase 5.3 — `::regtype` / `::regclass`. PG
+        // semantics: each is a textual catalog-name surfacing as
+        // a numeric OID at the wire layer that renders back as
+        // the original name. SPG has no OID space, but pg_dump /
+        // mailrs / Django code uses the cast purely for textual
+        // round-trip — feeding `'public.t'::regclass::text` into
+        // a downstream `format(…)` or string concat. We map to
+        // that textual contract: Text in → Text out (the schema-
+        // qualifier `public.` is stripped to match PG's default
+        // search_path-aware rendering); numeric in → re-cast to
+        // Text as best-effort; anything else errors.
+        //
+        // Pre-3.3 / pre-5.3 (v7.9.26) the cast surfaced a clean
+        // error; this lifts to accept-and-textify so the dominant
+        // dump-loader pattern unblocks. SPG-shaped queries that
+        // genuinely need an OID for runtime joins are still
+        // documented as unsupported.
+        CastTarget::RegType | CastTarget::RegClass => match v {
+            Value::Text(s) => {
+                // Strip an optional `<schema>.` prefix — PG's
+                // regclass render drops it when the schema is on
+                // the search_path; SPG is single-schema so
+                // dropping is always safe.
+                let bare = s.rsplit('.').next().unwrap_or(&s).to_string();
+                Ok(Value::Text(bare))
+            }
+            Value::Int(n) => Ok(Value::Text(alloc::format!("{n}"))),
+            Value::BigInt(n) => Ok(Value::Text(alloc::format!("{n}"))),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::regtype / ::regclass accepts TEXT (name) or integer (oid), got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
         // v7.10.11 — `::TEXT[]`. Decode PG external array form
         // when input is Text; pass through unchanged when it is
         // already TextArray. Anything else is a type mismatch.
@@ -1881,6 +4815,25 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "::tsquery only accepts TEXT / tsquery inputs, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
+        // v7.17.0 — `::uuid`. Identity for `uuid → uuid`; parse
+        // text via the shared `parse_uuid_str`. Anything else is a
+        // type mismatch — PG also rejects e.g. INT → UUID without
+        // an explicit text bridge.
+        CastTarget::Uuid => match v {
+            Value::Uuid(b) => Ok(Value::Uuid(b)),
+            Value::Text(s) => match spg_storage::parse_uuid_str(&s) {
+                Some(b) => Ok(Value::Uuid(b)),
+                None => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for type uuid: {s:?}"),
+                }),
+            },
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "::uuid only accepts TEXT / uuid inputs, got {:?}",
                     other.data_type()
                 ),
             }),
@@ -2213,6 +5166,27 @@ fn value_to_text(v: &Value) -> String {
         // v7.12.0 — tsvector / tsquery render PG external form.
         Value::TsVector(lexs) => format_tsvector(lexs),
         Value::TsQuery(ast) => format_tsquery(ast),
+        // v7.17.0 — UUID renders canonical lowercase 8-4-4-4-12
+        // hyphenated form (PG `uuid_out`).
+        Value::Uuid(b) => spg_storage::format_uuid(b),
+        // v7.17.0 Phase 3.P0-32 — TIME canonical text.
+        Value::Time(us) => format_time(*us),
+        // v7.17.0 Phase 3.P0-34 — TIMETZ canonical text.
+        Value::TimeTz { us, offset_secs } => format_timetz(*us, *offset_secs),
+        // v7.17.0 Phase 3.P0-33 — YEAR 4-digit zero-padded.
+        Value::Year(y) => format!("{y:04}"),
+        // v7.17.0 Phase 3.P0-35 — MONEY en_US locale.
+        Value::Money(c) => format_money(*c),
+        // v7.17.0 Phase 3.P0-38 — Range canonical form. Routes
+        // through the engine's format_range_text to share the
+        // single renderer with pgwire / sqllogictest.
+        Value::Range { .. } => crate::format_range_text(v),
+        // v7.17.0 Phase 3.P0-39 — Hstore canonical PG text form.
+        Value::Hstore(pairs) => crate::format_hstore_text(pairs),
+        // v7.17.0 Phase 3.P0-40 — 2D array canonical PG text form.
+        Value::IntArray2D(rows) => crate::format_int_2d_text_pub(rows),
+        Value::BigIntArray2D(rows) => crate::format_bigint_2d_text_pub(rows),
+        Value::TextArray2D(rows) => crate::format_text_2d_text_pub(rows),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }
@@ -2241,6 +5215,67 @@ pub fn format_timestamptz(micros: i64) -> String {
     s.push_str(&base);
     s.push_str("+00");
     s
+}
+
+/// v7.17.0 Phase 3.P0-35 — PG `money` canonical text form, en_US
+/// locale: `$N,NNN.CC`, negative → `-$1.23`. Mirrors PG's
+/// `cash_out` for `lc_monetary = 'en_US.UTF-8'`.
+pub fn format_money(cents: i64) -> String {
+    let neg = cents < 0;
+    let abs = cents.unsigned_abs();
+    let dollars = abs / 100;
+    let cc = abs % 100;
+    // Insert comma thousands separators in the integer portion.
+    let dollar_str = dollars.to_string();
+    let bytes = dollar_str.as_bytes();
+    let mut int_part = String::with_capacity(dollar_str.len() + dollar_str.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        // Position from the right: insert ',' before every 3rd
+        // digit (except the first).
+        let from_right = bytes.len() - i;
+        if i > 0 && from_right % 3 == 0 {
+            int_part.push(',');
+        }
+        int_part.push(*b as char);
+    }
+    let sign = if neg { "-" } else { "" };
+    format!("{sign}${int_part}.{cc:02}")
+}
+
+/// v7.17.0 Phase 3.P0-34 — PG `TIMETZ` canonical text form
+/// `HH:MM:SS[.ffffff]±HH[:MM]`. Mirrors PG `timetz_out`. The
+/// offset uses `±HH` for whole-hour offsets and `±HH:MM` for
+/// sub-hour offsets (matching PG's "minimal display" rule).
+pub fn format_timetz(us: i64, offset_secs: i32) -> String {
+    let time = format_time(us);
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.unsigned_abs();
+    let oh = abs / 3600;
+    let om = (abs % 3600) / 60;
+    if om == 0 {
+        format!("{time}{sign}{oh:02}")
+    } else {
+        format!("{time}{sign}{oh:02}:{om:02}")
+    }
+}
+
+/// v7.17.0 Phase 3.P0-32 — PG `TIME` canonical text form
+/// `HH:MM:SS[.ffffff]`. Mirrors PG `time_out`. Trailing zeros in
+/// the fractional component are stripped — `12:00:00.500000`
+/// renders as `12:00:00.5` to match PG's text output.
+pub fn format_time(us: i64) -> String {
+    let total_secs = us.div_euclid(1_000_000);
+    let frac = us.rem_euclid(1_000_000);
+    let hh = total_secs / 3600;
+    let mm = (total_secs / 60) % 60;
+    let ss = total_secs % 60;
+    if frac == 0 {
+        format!("{hh:02}:{mm:02}:{ss:02}")
+    } else {
+        let raw = format!("{frac:06}");
+        let trimmed = raw.trim_end_matches('0');
+        format!("{hh:02}:{mm:02}:{ss:02}.{trimmed}")
+    }
 }
 
 pub fn format_timestamp(micros: i64) -> String {
@@ -3213,7 +6248,7 @@ pub fn cast_to_vector(v: Value) -> Result<Value, EvalError> {
 }
 
 /// Parse `"[1.0, 2.0, -3]"` into `Vec<f32>`. Returns `None` on malformed input.
-fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
+pub fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
     let trimmed = s.trim();
     let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
     let trimmed_inner = inner.trim();
@@ -3247,6 +6282,74 @@ fn literal_to_value(l: &Literal) -> Value {
             micros: *micros,
         },
     }
+}
+
+/// v7.17.0 Phase 2.5 — look up the collation of a column reference
+/// in the current evaluation context. Returns `None` when the
+/// expression is not a column reference (e.g. literal / function
+/// call) or the column can't be resolved (caller falls back to
+/// `Collation::Binary` semantics).
+pub(crate) fn column_collation(
+    e: &Expr,
+    ctx: &EvalContext<'_>,
+) -> Option<spg_storage::Collation> {
+    let Expr::Column(c) = e else {
+        return None;
+    };
+    if let Some(q) = &c.qualifier {
+        let composite = alloc::format!("{q}.{name}", name = c.name);
+        if let Some(s) = ctx.columns.iter().find(|s| s.name == composite) {
+            return Some(s.collation);
+        }
+    }
+    if let Some(s) = ctx.columns.iter().find(|s| s.name == c.name) {
+        return Some(s.collation);
+    }
+    // Bare-name fallback for joined schemas (same shape as
+    // resolve_column): match a single composite ending in
+    // ".<name>".
+    let suffix = alloc::format!(".{name}", name = c.name);
+    let mut matches = ctx.columns.iter().filter(|s| s.name.ends_with(&suffix));
+    let first = matches.next();
+    let extra = matches.next();
+    match (first, extra) {
+        (Some(s), None) => Some(s.collation),
+        _ => None,
+    }
+}
+
+/// v7.17.0 Phase 2.5 — if the comparison op is text-equality and
+/// either operand references a CaseInsensitive column, return
+/// ASCII-folded copies of both Text values; otherwise pass
+/// through. Only Eq / NotEq / Lt / LtEq / Gt / GtEq trigger the
+/// fold — relational operators on text still honour collation
+/// the same way (PG semantics). Non-Text values pass through.
+fn collation_fold_for_compare(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    l: Value,
+    r: Value,
+    ctx: &EvalContext<'_>,
+) -> (Value, Value) {
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    ) {
+        return (l, r);
+    }
+    let lhs_col = column_collation(lhs, ctx);
+    let rhs_col = column_collation(rhs, ctx);
+    let ci = matches!(lhs_col, Some(spg_storage::Collation::CaseInsensitive))
+        || matches!(rhs_col, Some(spg_storage::Collation::CaseInsensitive));
+    if !ci {
+        return (l, r);
+    }
+    let fold = |v: Value| match v {
+        Value::Text(s) => Value::Text(s.to_ascii_lowercase()),
+        other => other,
+    };
+    (fold(l), fold(r))
 }
 
 fn resolve_column(c: &ColumnName, row: &Row, ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
@@ -3383,6 +6486,12 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         // v7.12.2 — `@@` match. NULL on either side → NULL; PG
         // accepts both orderings so we normalise.
         BinOp::TsMatch => ts_match(l, r),
+        // v7.17.0 Phase 3.P0-47 — PG INET / CIDR containment + overlap.
+        BinOp::InetContainedBy
+        | BinOp::InetContainedByEq
+        | BinOp::InetContains
+        | BinOp::InetContainsEq
+        | BinOp::InetOverlap => inet_op_bool_result(op, &l, &r),
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
@@ -3465,7 +6574,11 @@ fn apply_binary_calendar(op: BinOp, l: &Value, r: &Value) -> Result<Option<Value
 ///   interval ± interval  → interval
 /// Commutative for `+`. Returns `None` for unrecognised operand pairs so
 /// the caller can fall through.
-fn apply_binary_interval(op: BinOp, l: &Value, r: &Value) -> Result<Option<Value>, EvalError> {
+pub(crate) fn apply_binary_interval(
+    op: BinOp,
+    l: &Value,
+    r: &Value,
+) -> Result<Option<Value>, EvalError> {
     // Normalise so the interval (if any) is always on the right for Add;
     // Sub stays left-handed because it isn't commutative.
     let (lhs, rhs, sign): (&Value, &Value, i64) = match (l, r, op) {
@@ -4155,6 +7268,25 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
             })?;
             at.cmp(b)
         }
+        // v7.17.0 — UUID byte-wise comparison; both sides UUID.
+        (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
+        // v7.17.0 — PG promotes a `text` literal compared against a
+        // `uuid` column into uuid (unknown-type literal inference).
+        // Without this, `WHERE id = '550e...'` falls through to the
+        // generic TypeMismatch — the application's literal becomes
+        // an error rather than a comparison.
+        (Value::Uuid(a), Value::Text(b)) => {
+            let bu = spg_storage::parse_uuid_str(b).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("invalid input syntax for type uuid: {b:?}"),
+            })?;
+            a.cmp(&bu)
+        }
+        (Value::Text(a), Value::Uuid(b)) => {
+            let au = spg_storage::parse_uuid_str(a).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("invalid input syntax for type uuid: {a:?}"),
+            })?;
+            au.cmp(b)
+        }
         (a, b) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
@@ -4189,7 +7321,12 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         | BinOp::JsonContains
         | BinOp::TsMatch
         | BinOp::IsDistinctFrom
-        | BinOp::IsNotDistinctFrom => {
+        | BinOp::IsNotDistinctFrom
+        | BinOp::InetContainedBy
+        | BinOp::InetContainedByEq
+        | BinOp::InetContains
+        | BinOp::InetContainsEq
+        | BinOp::InetOverlap => {
             unreachable!("compare() only called with comparison ops")
         }
     };

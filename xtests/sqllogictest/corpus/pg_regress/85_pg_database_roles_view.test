@@ -1,0 +1,17 @@
+# v7.17.0 Phase 3.P0-55 — pg_database / pg_roles / pg_user virtual views.
+
+query T
+SELECT datname FROM pg_catalog.pg_database WHERE datname = 'postgres'
+----
+postgres
+
+query TB
+SELECT rolname, rolsuper FROM pg_catalog.pg_roles WHERE rolname = 'postgres'
+----
+postgres
+1
+
+query T
+SELECT rolname FROM pg_catalog.pg_user WHERE rolname = 'postgres'
+----
+postgres

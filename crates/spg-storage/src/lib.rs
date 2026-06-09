@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod bloom;
+pub mod fts_simple;
 pub mod halfvec;
 pub mod persistent;
 pub mod persistent_btree;
@@ -173,6 +174,129 @@ pub enum DataType {
     /// `&` `|` `!` and phrase operators. PG wire OID 3615.
     /// Catalog FILE_VERSION 20+.
     TsQuery,
+    /// v7.17.0: PG `uuid` — 128-bit identifier stored as
+    /// `Value::Uuid([u8; 16])`. PG wire OID 2950. Canonical
+    /// text form is lowercase 8-4-4-4-12 hyphenated; input
+    /// also accepts uppercase, unhyphenated, and brace-wrapped
+    /// forms (`{xxxx…}`). Catalog FILE_VERSION 36+; tag 24 on
+    /// the dense type-tag side, tag 20 on the schema-agnostic
+    /// value side. The drop-in PG/MySQL surface for Django /
+    /// Rails / Hibernate "id UUID PRIMARY KEY DEFAULT
+    /// gen_random_uuid()" default-PK pattern.
+    Uuid,
+    /// v7.17.0 Phase 3.P0-32: PG `time` (without time zone) — i64
+    /// microseconds since 00:00:00. PG wire OID 1083. Display:
+    /// canonical zero-padded `HH:MM:SS` when fractional is zero,
+    /// `HH:MM:SS.ffffff` otherwise. Catalog FILE_VERSION 37+;
+    /// tag 25 on the dense type-tag side, tag 21 on the schema-
+    /// agnostic value side. The wall-clock-of-day half of PG's
+    /// date/time triplet (date / time / timestamp).
+    Time,
+    /// v7.17.0 Phase 3.P0-33: MySQL `YEAR` — u16 in range
+    /// 1901..=2155 plus the special zero-year sentinel 0. No
+    /// dedicated PG OID (advertised as INT4 / OID 23 on the wire
+    /// — psql renders integers, MySQL CLI renders 4-digit
+    /// zero-padded text). Display always 4 digits: `0000` for the
+    /// zero-year, `1985` / `2007` / etc otherwise. Catalog
+    /// FILE_VERSION 38+; tag 26 on the dense type-tag side, tag
+    /// 22 on the schema-agnostic value side.
+    Year,
+    /// v7.17.0 Phase 3.P0-34: PG `time with time zone` (TIMETZ) —
+    /// i64 microseconds since 00:00:00 in the local wall clock
+    /// PLUS i32 offset-from-UTC in seconds. PG wire OID 1266.
+    /// Display: `HH:MM:SS[.ffffff]±HH[:MM]` (PG `timetz_out`).
+    /// Range: offset in ±50400 seconds (±14 hours). Catalog
+    /// FILE_VERSION 39+; tag 27 on the dense type-tag side, tag
+    /// 23 on the schema-agnostic value side.
+    TimeTz,
+    /// v7.17.0 Phase 3.P0-35: PG `money` — i64 cents (locale-
+    /// independent storage). PG wire OID 790. Display: en_US
+    /// locale (`$N,NNN.CC`, negative → `-$1.23`). Input accepts
+    /// `$N.NN`, `$N,NNN.NN`, bare integer (treated as major
+    /// units), optional leading `-`. Range: full i64. Catalog
+    /// FILE_VERSION 40+; tag 28 on the dense type-tag side, tag
+    /// 24 on the schema-agnostic value side.
+    Money,
+    /// v7.17.0 Phase 3.P0-38: PG range type. The same DataType
+    /// variant covers all six builtin ranges (int4range,
+    /// int8range, numrange, tsrange, tstzrange, daterange) —
+    /// `RangeKind` pins the element type so encode / decode /
+    /// display can route off one switch. Catalog FILE_VERSION
+    /// 43+; tag 29 + a 1-byte RangeKind on the dense type-tag
+    /// side, tag 25 on the schema-agnostic value side.
+    Range(RangeKind),
+    /// v7.17.0 Phase 3.P0-39: PG `hstore` extension type — flat
+    /// `text => text` map with NULL value support. Catalog
+    /// FILE_VERSION 44+; tag 30 on the dense type-tag side, tag
+    /// 26 on the schema-agnostic value side. The contrib OID is
+    /// installation-dependent in real PG; SPG advertises it via
+    /// dynamic lookup, falling back to TEXT (OID 25) on the wire
+    /// when the installed `hstore` extension hasn't claimed an
+    /// OID yet.
+    Hstore,
+    /// v7.17.0 Phase 3.P0-40: PG `int[][]` — 2-dimensional INT
+    /// matrix. Storage: row-major Vec<Vec<Option<i32>>>. All
+    /// rows must share the same column count. Wire OID 1007
+    /// (same as INT[]; the dimension count travels in the data
+    /// header, not the OID). Catalog FILE_VERSION 45+; tag 31
+    /// on the dense type-tag side, tag 27 on the schema-agnostic
+    /// value side.
+    IntArray2D,
+    /// v7.17.0 Phase 3.P0-40: PG `bigint[][]` — 2-dimensional
+    /// BIGINT matrix. Storage / OID / tags mirror IntArray2D.
+    /// Tag 32 dense, tag 28 schema-agnostic.
+    BigIntArray2D,
+    /// v7.17.0 Phase 3.P0-40: PG `text[][]` — 2-dimensional TEXT
+    /// matrix. Storage: row-major Vec<Vec<Option<String>>>.
+    /// Tag 33 dense, tag 29 schema-agnostic.
+    TextArray2D,
+}
+
+/// v7.17.0 Phase 3.P0-38 — pins the element type of a range value
+/// or column. Wire OIDs: Int4=3904, Int8=3926, Num=3906,
+/// Ts=3908, TsTz=3910, Date=3912.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RangeKind {
+    Int4,
+    Int8,
+    Num,
+    Ts,
+    TsTz,
+    Date,
+}
+
+impl RangeKind {
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Int4 => 0,
+            Self::Int8 => 1,
+            Self::Num => 2,
+            Self::Ts => 3,
+            Self::TsTz => 4,
+            Self::Date => 5,
+        }
+    }
+    pub const fn from_tag(t: u8) -> Option<Self> {
+        Some(match t {
+            0 => Self::Int4,
+            1 => Self::Int8,
+            2 => Self::Num,
+            3 => Self::Ts,
+            4 => Self::TsTz,
+            5 => Self::Date,
+            _ => return None,
+        })
+    }
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Int4 => "INT4RANGE",
+            Self::Int8 => "INT8RANGE",
+            Self::Num => "NUMRANGE",
+            Self::Ts => "TSRANGE",
+            Self::TsTz => "TSTZRANGE",
+            Self::Date => "DATERANGE",
+        }
+    }
 }
 
 impl fmt::Display for DataType {
@@ -210,6 +334,16 @@ impl fmt::Display for DataType {
             Self::BigIntArray => f.write_str("BIGINT[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
+            Self::Uuid => f.write_str("UUID"),
+            Self::Time => f.write_str("TIME"),
+            Self::Year => f.write_str("YEAR"),
+            Self::TimeTz => f.write_str("TIMETZ"),
+            Self::Money => f.write_str("MONEY"),
+            Self::Range(k) => f.write_str(k.keyword()),
+            Self::Hstore => f.write_str("HSTORE"),
+            Self::IntArray2D => f.write_str("INT[][]"),
+            Self::BigIntArray2D => f.write_str("BIGINT[][]"),
+            Self::TextArray2D => f.write_str("TEXT[][]"),
         }
     }
 }
@@ -324,6 +458,62 @@ pub enum Value {
     /// v7.12.0 `tsquery` — boolean / phrase parse tree over
     /// lexemes. Engine builds via `to_tsquery` family.
     TsQuery(TsQueryAst),
+    /// v7.17.0 `uuid` — 128-bit identifier. Stored as 16 bytes
+    /// (big-endian / network-byte order, same as RFC 4122).
+    /// Display normalises to canonical lowercase 8-4-4-4-12
+    /// hyphenated form. Equality is byte-wise.
+    Uuid([u8; 16]),
+    /// v7.17.0 Phase 3.P0-32 — PG `time` (without time zone) —
+    /// i64 microseconds since 00:00:00. Range 0..86_400_000_000.
+    /// Display: `HH:MM:SS` zero-padded, with optional `.ffffff`
+    /// suffix when fractional is non-zero.
+    Time(i64),
+    /// v7.17.0 Phase 3.P0-33 — MySQL `YEAR` — u16 in range
+    /// 1901..=2155 plus the special zero-year sentinel 0.
+    /// Display always 4 digits zero-padded (`0000` for the
+    /// sentinel; `1985`/`2007` otherwise).
+    Year(u16),
+    /// v7.17.0 Phase 3.P0-34 — PG `time with time zone` — i64
+    /// microseconds since 00:00:00 in the LOCAL wall clock PLUS
+    /// an i32 offset-from-UTC in seconds. PG preserves the
+    /// offset on output, so the wall-clock value is NOT shifted
+    /// to UTC at storage time. Offset range: ±50400 seconds
+    /// (±14 hours).
+    TimeTz {
+        us: i64,
+        offset_secs: i32,
+    },
+    /// v7.17.0 Phase 3.P0-35 — PG `money` — i64 cents
+    /// (locale-independent storage; the en_US locale renders on
+    /// display via `$N,NNN.CC`).
+    Money(i64),
+    /// v7.17.0 Phase 3.P0-39 — PG `hstore` value: flat
+    /// `text => text` map with NULL value support. Insertion
+    /// order preserved on input; duplicate keys take last-write-
+    /// wins at parse time.
+    Hstore(Vec<(String, Option<String>)>),
+    /// v7.17.0 Phase 3.P0-40 — 2D INT matrix (row-major).
+    IntArray2D(Vec<Vec<Option<i32>>>),
+    /// v7.17.0 Phase 3.P0-40 — 2D BIGINT matrix (row-major).
+    BigIntArray2D(Vec<Vec<Option<i64>>>),
+    /// v7.17.0 Phase 3.P0-40 — 2D TEXT matrix (row-major).
+    TextArray2D(Vec<Vec<Option<String>>>),
+    /// v7.17.0 Phase 3.P0-38 — PG range value. One shape covers
+    /// all six builtin range types; `kind` pins the element type
+    /// (must match the column's `DataType::Range(kind)`).
+    /// `lower` / `upper` are `None` for the unbounded sides;
+    /// `lower_inc` / `upper_inc` mirror the canonical PG
+    /// `[` / `(` / `]` / `)` bracket inclusivity. `empty=true`
+    /// supersedes all other fields (the empty range has no
+    /// bounds).
+    Range {
+        kind: RangeKind,
+        lower: Option<alloc::boxed::Box<Value>>,
+        upper: Option<alloc::boxed::Box<Value>>,
+        lower_inc: bool,
+        upper_inc: bool,
+        empty: bool,
+    },
     Null,
 }
 
@@ -369,6 +559,16 @@ impl Value {
             Self::BigIntArray(_) => Some(DataType::BigIntArray),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
+            Self::Uuid(_) => Some(DataType::Uuid),
+            Self::Time(_) => Some(DataType::Time),
+            Self::Year(_) => Some(DataType::Year),
+            Self::TimeTz { .. } => Some(DataType::TimeTz),
+            Self::Money(_) => Some(DataType::Money),
+            Self::Range { kind, .. } => Some(DataType::Range(*kind)),
+            Self::Hstore(_) => Some(DataType::Hstore),
+            Self::IntArray2D(_) => Some(DataType::IntArray2D),
+            Self::BigIntArray2D(_) => Some(DataType::BigIntArray2D),
+            Self::TextArray2D(_) => Some(DataType::TextArray2D),
             Self::Null => None,
         }
     }
@@ -421,6 +621,112 @@ pub struct ColumnSchema {
     /// this column unbound (or sets it to NULL) gets the next integer
     /// computed from the column's current max + 1.
     pub auto_increment: bool,
+    /// v7.17.0 Phase 1.4 — when the column is bound to a user-
+    /// defined ENUM type (the parser saw an unknown type ident
+    /// and the engine resolved it against `catalog.enum_types`),
+    /// this carries the enum name so INSERT/UPDATE can validate
+    /// the cell value against the enum's labels. `ty` is
+    /// `DataType::Text` in that case. Persisted in catalog
+    /// FILE_VERSION 29+; older catalogs deserialise with None.
+    pub user_enum_type: Option<String>,
+    /// v7.17.0 Phase 1.5 — when the column is bound to a user-
+    /// defined DOMAIN (the parser saw an unknown type ident and
+    /// the engine resolved it against `catalog.domain_types`),
+    /// this carries the domain name. `ty` is the domain's base
+    /// type; INSERT/UPDATE re-evaluates the domain's CHECK list
+    /// + NOT NULL against the cell value. Persisted in catalog
+    /// FILE_VERSION 30+; older catalogs deserialise with None.
+    pub user_domain_type: Option<String>,
+    /// v7.17.0 Phase 2.1 — MySQL `ON UPDATE CURRENT_TIMESTAMP`
+    /// column attribute. When `Some(expr_src)`, an UPDATE that
+    /// does NOT bind this column overrides the new value with
+    /// the engine-evaluated expression (always `now()` in
+    /// v7.17.0). Stored as Display-form source so storage
+    /// stays free of spg-sql; the engine re-parses at UPDATE
+    /// time. Persisted in catalog FILE_VERSION 32+; older
+    /// catalogs deserialise with None — preserves the existing
+    /// "silent ignore" behaviour for snapshots written before
+    /// the upgrade.
+    pub on_update_runtime: Option<String>,
+    /// v7.17.0 Phase 2.5 — text collation. Pre-2.5 SPG accepted
+    /// `COLLATE <name>` clauses but discarded the name, so a
+    /// column declared `COLLATE "case_insensitive"` (or any
+    /// MySQL `_ci` collation) still compared byte-wise — a
+    /// Tier-S silent failure where `WHERE name = 'foo'` never
+    /// matched stored `'Foo'`. This carries the parser-derived
+    /// classification so the engine's WHERE evaluator can route
+    /// text equality through a case-aware compare. `Binary` (the
+    /// default) preserves the prior byte-wise behaviour. Only
+    /// CaseInsensitive lands in the catalog appendix — Binary
+    /// columns stay implicit, keeping snapshots compact.
+    /// Persisted in catalog FILE_VERSION 34+; older catalogs
+    /// deserialise every column as `Binary`.
+    pub collation: Collation,
+    /// v7.17.0 Phase 4.4 — MySQL `UNSIGNED` modifier flag. Drives
+    /// engine-side INSERT / UPDATE range enforcement (rejects
+    /// negative values on UNSIGNED int columns). Pre-4.4 the
+    /// parser consumed and discarded the keyword silently, so
+    /// every UNSIGNED column quietly accepted negatives — a
+    /// Tier-A correctness drift. Sparse: only UNSIGNED columns
+    /// land in the catalog appendix; the default `false` keeps
+    /// snapshots compact for the common signed-int path.
+    /// Persisted in catalog FILE_VERSION 35+; older catalogs
+    /// deserialise every column as `is_unsigned = false`.
+    pub is_unsigned: bool,
+    /// v7.17.0 Phase 3.P0-36 — MySQL inline `ENUM('a','b','c')`
+    /// value list. Distinct from `user_enum_type` (which points
+    /// to a separately CREATE TYPE'd PG enum); this carries the
+    /// column-local list MySQL DDL declares inline. When `Some`,
+    /// `ty` is `DataType::Text` and INSERT/UPDATE validates the
+    /// cell value against this list. Variant ORDER is preserved
+    /// (MySQL uses it for `ORDER BY col`). Sparse: only ENUM
+    /// columns land in the catalog appendix.
+    /// Persisted in catalog FILE_VERSION 41+; older catalogs
+    /// deserialise with None — preserves silent-drop behaviour
+    /// for snapshots written before P0-36.
+    pub inline_enum_variants: Option<Vec<String>>,
+    /// v7.17.0 Phase 3.P0-37 — MySQL inline `SET('a','b','c')`
+    /// variant list. Storage is TEXT (canonical comma-joined in
+    /// definition order, de-duplicated). INSERT/UPDATE validates
+    /// every comma-separated token against this list. Sparse:
+    /// only SET columns land in the catalog appendix.
+    /// Persisted in catalog FILE_VERSION 42+; older catalogs
+    /// deserialise with None.
+    pub inline_set_variants: Option<Vec<String>>,
+}
+
+/// v7.17.0 Phase 2.5 — column-level text collation. Drives the
+/// engine's WHERE / GROUP BY equality routing for `Value::Text`.
+/// Only two variants are modelled in v7.17:
+///   * `Binary`  — byte-wise comparison (the SPG default;
+///                 matches PG `COLLATE "C"` / `pg_catalog.default`
+///                 and MySQL `*_bin`).
+///   * `CaseInsensitive` — ASCII case-folded comparison
+///                 (matches PG `COLLATE "case_insensitive"` and
+///                 MySQL `*_ci` collations). Non-ASCII bytes
+///                 still compare byte-wise; full ICU folding is
+///                 out of v7.17 scope.
+/// New variants append at the end — older catalogs read missing
+/// columns as `Binary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collation {
+    Binary,
+    CaseInsensitive,
+}
+
+impl Default for Collation {
+    fn default() -> Self {
+        Self::Binary
+    }
+}
+
+impl Collation {
+    /// Wire tag persisted in the FILE_VERSION 34+ catalog appendix.
+    /// Stable: future variants append above the recognised range
+    /// and unknown tags read back as `Binary` for forward-compat
+    /// on rollback.
+    pub const TAG_BINARY: u8 = 0;
+    pub const TAG_CASE_INSENSITIVE: u8 = 1;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -557,6 +863,10 @@ pub enum IndexKey {
     Int(i64),
     Text(String),
     Bool(bool),
+    /// v7.17.0 — `Value::Uuid` index key. Comparison is byte-wise
+    /// (RFC 4122 byte order) so PRIMARY KEY UUID lookups land on
+    /// the same fast-path as Int / Text.
+    Uuid([u8; 16]),
 }
 
 impl IndexKey {
@@ -571,6 +881,37 @@ impl IndexKey {
             // index key — same order semantics, same comparison.
             Value::Date(d) => Some(Self::Int(i64::from(*d))),
             Value::Timestamp(t) => Some(Self::Int(*t)),
+            // v7.17.0: UUID indexable via byte-wise ordering. Lookup
+            // on `id = '...'::uuid` resolves through the secondary
+            // index rather than full-scan.
+            Value::Uuid(b) => Some(Self::Uuid(*b)),
+            // v7.17.0 Phase 3.P0-32: TIME indexable via i64 — same
+            // order semantics as Date/Timestamp.
+            Value::Time(us) => Some(Self::Int(*us)),
+            // v7.17.0 Phase 3.P0-33: YEAR indexable as i64 — u16
+            // widens losslessly and gives the natural calendar
+            // ordering.
+            Value::Year(y) => Some(Self::Int(i64::from(*y))),
+            // v7.17.0 Phase 3.P0-34: TIMETZ indexable by its
+            // UTC-equivalent microseconds (local wall - offset).
+            // Without normalising, two values for the same
+            // physical instant in different zones would sort
+            // wrong. Matches PG's TIMETZ index behaviour.
+            Value::TimeTz { us, offset_secs } => {
+                Some(Self::Int(us - i64::from(*offset_secs) * 1_000_000))
+            }
+            // v7.17.0 Phase 3.P0-35: MONEY indexable as i64 cents
+            // (no scaling needed — natural numeric ordering).
+            Value::Money(c) => Some(Self::Int(*c)),
+            // v7.17.0 Phase 3.P0-38: ranges are NOT indexable in
+            // v7.17.0 — they'd need a custom comparator (PG uses
+            // SP-GiST for this). Skip.
+            Value::Range { .. } => None,
+            // v7.17.0 Phase 3.P0-39: hstore is NOT indexable in
+            // v7.17.0 — map columns need GIN with bespoke ops.
+            Value::Hstore(_) => None,
+            // v7.17.0 Phase 3.P0-40: 2D arrays aren't indexable.
+            Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this
@@ -791,6 +1132,19 @@ pub enum IndexKind {
     /// per candidate row to filter the over-approximation.
     /// Persisted via tag-4 index payload in `FILE_VERSION` 24+.
     GinTrgm(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY (col)` over a
+    /// `TEXT` / `VARCHAR` column. Posting lists map
+    /// `tsvector('simple') lexeme` to row locators. At insert /
+    /// build time the engine derives the lexemes from the cell
+    /// via the same lower-case tokenisation rule as
+    /// `to_tsvector('simple', ...)` — the column itself stays a
+    /// plain text type on disk (mysqldump round-trips would be
+    /// broken otherwise). The planner uses this index to
+    /// accelerate MySQL-shape `MATCH(col) AGAINST('term')`
+    /// queries by mapping them onto the existing tsquery `@@`
+    /// walker. Persisted via tag-5 index payload in
+    /// `FILE_VERSION` 33+.
+    GinFulltext(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
 }
 
 /// Multi-layer HNSW graph (v2.13). Each node is assigned a `top_level`;
@@ -960,6 +1314,24 @@ impl Index {
         }
     }
 
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` GIN constructor.
+    /// Same shape as `new_gin_trgm` but the posting-list keys
+    /// are lower-cased word lexemes (`to_tsvector('simple', col)`
+    /// equivalent) instead of trigrams, and the column type is
+    /// `TEXT` / `VARCHAR` (not `TSVECTOR`).
+    fn new_gin_fulltext(name: String, column_position: usize) -> Self {
+        Self {
+            name,
+            column_position,
+            kind: IndexKind::GinFulltext(PersistentBTreeMap::new()),
+            included_columns: Vec::new(),
+            partial_predicate: None,
+            expression: None,
+            is_unique: false,
+            extra_column_positions: Vec::new(),
+        }
+    }
+
     /// Look up the locators stored under `key` (B-tree only). Returns
     /// an empty slice when the key is absent or the index isn't a
     /// BTree — callers can treat both cases uniformly.
@@ -971,13 +1343,14 @@ impl Index {
     pub fn lookup_eq(&self, key: &IndexKey) -> &[RowLocator] {
         match &self.kind {
             IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
-            // BRIN / NSW / GIN / trigram-GIN have no IndexKey-keyed
-            // map; lookup is a no-op. GIN uses
+            // BRIN / NSW / GIN / trigram-GIN / fulltext-GIN have
+            // no IndexKey-keyed map; lookup is a no-op. GIN uses
             // [`Index::gin_lookup_word`] instead.
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => &[][..],
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => &[][..],
         }
     }
 
@@ -986,7 +1359,12 @@ impl Index {
     /// absent from the index or this isn't a GIN index.
     pub fn gin_lookup_word(&self, word: &str) -> &[RowLocator] {
         match &self.kind {
-            IndexKind::Gin(m) => m.get(&String::from(word)).map_or(&[][..], Vec::as_slice),
+            // v7.17.0 Phase 2.2 — fulltext-GIN shares the same
+            // lexeme-keyed posting list shape as the
+            // tsvector-typed GIN, so the same lookup applies.
+            IndexKind::Gin(m) | IndexKind::GinFulltext(m) => {
+                m.get(&String::from(word)).map_or(&[][..], Vec::as_slice)
+            }
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
@@ -1004,7 +1382,8 @@ impl Index {
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
-            | IndexKind::Gin(_) => &[][..],
+            | IndexKind::Gin(_)
+            | IndexKind::GinFulltext(_) => &[][..],
         }
     }
 
@@ -1016,7 +1395,8 @@ impl Index {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => None,
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => None,
         }
     }
 
@@ -1040,6 +1420,14 @@ impl Index {
     /// `WHERE col @@ tsquery` predicates.
     pub const fn is_gin(&self) -> bool {
         matches!(self.kind, IndexKind::Gin(_))
+    }
+
+    /// v7.17.0 Phase 2.2 — true when this index is a fulltext
+    /// GIN over a TEXT / VARCHAR column (MySQL `FULLTEXT KEY`
+    /// surface). Used by the planner to opt the FULLTEXT-indexed
+    /// column into MATCH AGAINST acceleration.
+    pub const fn is_gin_fulltext(&self) -> bool {
+        matches!(self.kind, IndexKind::GinFulltext(_))
     }
 }
 
@@ -1349,6 +1737,28 @@ impl Table {
                         }
                     }
                 }
+                IndexKind::GinFulltext(map) => {
+                    // v7.17.0 Phase 2.2 — MySQL FULLTEXT-shape
+                    // GIN over a TEXT / VARCHAR cell. Tokenise
+                    // via the storage-local `simple_lex` (same
+                    // rule as `to_tsvector('simple', text)`) and
+                    // extend each lexeme's posting list.
+                    let text_cell = match &row.values[idx.column_position] {
+                        Value::Text(s) => Some(s.as_str()),
+                        // mysqldump-style mediumtext / longtext
+                        // land as Value::Text on insert; varchar
+                        // cells likewise. Anything else (NULL,
+                        // integer, …) contributes no lexemes.
+                        _ => None,
+                    };
+                    if let Some(s) = text_cell {
+                        for lex in fts_simple::simple_lex(s) {
+                            let mut entries = map.get(&lex).cloned().unwrap_or_default();
+                            entries.push(RowLocator::Hot(new_row_idx));
+                            map.insert_mut(lex, entries);
+                        }
+                    }
+                }
                 // NSW handled below after the row push (so the new row
                 // is visible to the kNN-graph connect step). BRIN
                 // carries no per-row state.
@@ -1454,7 +1864,8 @@ impl Table {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Unsupported(format!(
                     "ALTER INDEX REBUILD on non-NSW index {name:?} — only NSW indexes can rebuild"
                 )));
@@ -1710,6 +2121,74 @@ impl Table {
         Ok(())
     }
 
+    /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` GIN over a TEXT
+    /// column. Walks every row, tokenises the cell into lower-
+    /// cased word lexemes (`fts_simple::simple_lex` — same rule
+    /// as `to_tsvector('simple', text)`), and builds the
+    /// posting-list map. NULL / non-TEXT cells contribute
+    /// nothing (no lexemes).
+    pub fn add_gin_fulltext_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        if !matches!(
+            self.schema.columns[column_position].ty,
+            DataType::Text | DataType::Varchar(_)
+        ) {
+            return Err(StorageError::Corrupt(format!(
+                "fulltext-GIN index {name:?} requires a TEXT/VARCHAR column; \
+                 {column_name:?} is {:?}",
+                self.schema.columns[column_position].ty
+            )));
+        }
+        let mut idx = Index::new_gin_fulltext(name, column_position);
+        if let IndexKind::GinFulltext(map) = &mut idx.kind {
+            for (i, row) in self.rows.iter().enumerate() {
+                if let Value::Text(s) = &row.values[column_position] {
+                    for lex in fts_simple::simple_lex(s) {
+                        let mut entries = map.get(&lex).cloned().unwrap_or_default();
+                        entries.push(RowLocator::Hot(i));
+                        map.insert_mut(lex, entries);
+                    }
+                }
+            }
+        }
+        self.indices.push(idx);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 2.2 — restore a fulltext-GIN from its
+    /// catalog snapshot payload. Mirrors
+    /// [`Self::restore_gin_trgm_index`].
+    pub fn restore_gin_fulltext_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        let mut idx = Index::new_gin_fulltext(name, column_position);
+        idx.kind = IndexKind::GinFulltext(map);
+        self.indices.push(idx);
+        Ok(())
+    }
+
     /// v5.1: register cold-tier locators on a `BTree` index. Used
     /// after [`Catalog::load_segment_bytes`] to wire every cold-
     /// tier row's PK back to its segment so
@@ -1744,7 +2223,8 @@ impl Table {
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "index {index_name:?} is not BTree; cold locators apply only to BTree indices"
                 )));
@@ -1780,7 +2260,10 @@ impl Table {
             .find(|i| i.name == index_name)
             .ok_or_else(|| StorageError::Corrupt(format!("index {index_name:?} not found")))?;
         let map = match &mut idx.kind {
-            IndexKind::Gin(map) | IndexKind::GinTrgm(map) => map,
+            // v7.17.0 Phase 2.2 — fulltext-GIN posting lists are
+            // shape-compatible with tsvector / trigram GINs, so
+            // cold-locator re-attach handles all three.
+            IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => map,
             IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
                 return Err(StorageError::Corrupt(format!(
                     "register_gin_cold_locators: index {index_name:?} is not GIN"
@@ -1825,7 +2308,8 @@ impl Table {
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "remove_cold_locators_for_key: index {index_name:?} is not BTree; \
                      cold locators apply only to BTree indices"
@@ -1973,6 +2457,16 @@ impl Table {
     /// are rebuilt from scratch (cheaper than tracking incremental
     /// shifts across both B-tree and NSW). Returns the number of
     /// rows removed.
+    /// v7.17.0 Phase 1.3 — wipe every row. Used by REFRESH
+    /// MATERIALIZED VIEW; same effect as `delete_rows((0..N).into())`
+    /// but skips the per-position bookkeeping for the all-removed
+    /// fast path. Indices are rebuilt (empty).
+    pub fn truncate(&mut self) {
+        self.rows = PersistentVec::new();
+        self.hot_bytes = 0;
+        self.rebuild_indices();
+    }
+
     pub fn delete_rows(&mut self, positions: &[usize]) -> usize {
         if positions.is_empty() {
             return 0;
@@ -2126,7 +2620,8 @@ impl Table {
                 IndexKind::Nsw(_)
                 | IndexKind::Brin { .. }
                 | IndexKind::Gin(_)
-                | IndexKind::GinTrgm(_) => None,
+                | IndexKind::GinTrgm(_)
+                | IndexKind::GinFulltext(_) => None,
             })
             .collect();
 
@@ -2141,7 +2636,11 @@ impl Table {
             .indices
             .iter()
             .filter_map(|idx| match &idx.kind {
-                IndexKind::Gin(map) | IndexKind::GinTrgm(map) => {
+                // v7.17.0 Phase 2.2 — fulltext-GIN posting lists
+                // share the `String → Vec<RowLocator>` shape, so
+                // cold preservation handles all three GIN flavours
+                // in one pass.
+                IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => {
                     let cold: Vec<(String, RowLocator)> = map
                         .iter()
                         .flat_map(|(w, locs)| {
@@ -2172,6 +2671,7 @@ impl Table {
             Brin(DataType),
             Gin,
             GinTrgm,
+            GinFulltext,
         }
         let descriptors: Vec<(String, usize, RebuildKind)> = self
             .indices
@@ -2183,6 +2683,7 @@ impl Table {
                     IndexKind::BTree(_) => RebuildKind::BTree,
                     IndexKind::Gin(_) => RebuildKind::Gin,
                     IndexKind::GinTrgm(_) => RebuildKind::GinTrgm,
+                    IndexKind::GinFulltext(_) => RebuildKind::GinFulltext,
                 };
                 (idx.name.clone(), idx.column_position, kind)
             })
@@ -2243,6 +2744,26 @@ impl Table {
                                     let mut entries = map.get(&tri).cloned().unwrap_or_default();
                                     entries.push(RowLocator::Hot(i));
                                     map.insert_mut(tri, entries);
+                                }
+                            }
+                        }
+                    }
+                    self.indices.push(idx);
+                }
+                RebuildKind::GinFulltext => {
+                    // v7.17.0 Phase 2.2 — re-derive the lexeme
+                    // posting list from each TEXT/VARCHAR cell.
+                    // Mirrors the GinTrgm rebuild shape but
+                    // tokenises via `fts_simple::simple_lex`
+                    // (same rule as `to_tsvector('simple')`).
+                    let mut idx = Index::new_gin_fulltext(name, column_position);
+                    if let IndexKind::GinFulltext(map) = &mut idx.kind {
+                        for (i, row) in self.rows.iter().enumerate() {
+                            if let Value::Text(s) = &row.values[column_position] {
+                                for lex in fts_simple::simple_lex(s) {
+                                    let mut entries = map.get(&lex).cloned().unwrap_or_default();
+                                    entries.push(RowLocator::Hot(i));
+                                    map.insert_mut(lex, entries);
                                 }
                             }
                         }
@@ -2387,7 +2908,8 @@ fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usize) {
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => {
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => {
             unreachable!("nsw_insert_at on a non-NSW index")
         }
     };
@@ -2506,7 +3028,8 @@ fn greedy_layer_walk(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => {
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => {
             return (current, current_d);
         }
     };
@@ -2562,7 +3085,8 @@ fn layer_beam_search(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => return Vec::new(),
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => return Vec::new(),
     };
     let col_pos = table.indices[idx_pos].column_position;
     let d0 = if matches!(metric, NswMetric::L2) {
@@ -2746,7 +3270,8 @@ fn connect_at_layer(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => return,
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => return,
     };
     // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
     // each) rather than usize (8 B on 64-bit). Boundary casts here
@@ -2789,7 +3314,8 @@ fn connect_at_layer(
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => false,
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => false,
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
@@ -2800,7 +3326,8 @@ fn connect_at_layer(
                 IndexKind::BTree(_)
                 | IndexKind::Brin { .. }
                 | IndexKind::Gin(_)
-                | IndexKind::GinTrgm(_) => continue,
+                | IndexKind::GinTrgm(_)
+                | IndexKind::GinFulltext(_) => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
             // heuristic receives candidates closest-first. `cell_l2_sq`
@@ -2940,7 +3467,8 @@ fn nsw_search(
         IndexKind::BTree(_)
         | IndexKind::Brin { .. }
         | IndexKind::Gin(_)
-        | IndexKind::GinTrgm(_) => return Vec::new(),
+        | IndexKind::GinTrgm(_)
+        | IndexKind::GinFulltext(_) => return Vec::new(),
     };
     let Some(entry) = entry else {
         return Vec::new();
@@ -3313,6 +3841,46 @@ pub struct Catalog {
     /// alphabetical-by-default with insertion-stable tie-break
     /// behaviour — we just keep insertion order for now).
     triggers: Vec<TriggerDef>,
+    /// v7.17.0 — catalogued SEQUENCE objects (Phase 1.1). Each
+    /// `nextval(name)` reaches in here, atomically increments
+    /// `last_value` / flips `is_called`, returns the new value.
+    /// Persisted in catalog FILE_VERSION 26+; older catalogs
+    /// deserialise with an empty map.
+    sequences: BTreeMap<String, SequenceDef>,
+    /// v7.17.0 — catalogued VIEW objects (Phase 1.2). Each
+    /// `SELECT FROM v` at engine exec-time looks up `v` here and
+    /// prepends the view body as a synthetic CTE. Persisted in
+    /// catalog FILE_VERSION 27+; older catalogs deserialise with
+    /// an empty map.
+    views: BTreeMap<String, ViewDef>,
+    /// v7.17.0 — catalogued MATERIALIZED VIEW source registry
+    /// (Phase 1.3). Maps name → SELECT source. The materialised
+    /// rows themselves live as a regular `Table` with the same
+    /// name; REFRESH re-parses + re-executes the source against
+    /// the table. Persisted in catalog FILE_VERSION 28+;
+    /// older catalogs deserialise with an empty map.
+    materialized_views: BTreeMap<String, String>,
+    /// v7.17.0 — catalogued user-defined ENUM types (Phase 1.4).
+    /// Maps name → label list. Columns reference these by name
+    /// via `ColumnSchema.user_enum_type`. Persisted in catalog
+    /// FILE_VERSION 29+; older catalogs deserialise with an empty
+    /// map.
+    enum_types: BTreeMap<String, EnumDef>,
+    /// v7.17.0 — catalogued user-defined DOMAIN types (Phase 1.5).
+    /// Maps name → base + CHECK constraints. Columns reference
+    /// these by name via `ColumnSchema.user_domain_type`.
+    /// Persisted in catalog FILE_VERSION 30+; older catalogs
+    /// deserialise with an empty map.
+    domain_types: BTreeMap<String, DomainDef>,
+    /// v7.17.0 — schema-namespace registry (Phase 1.6). Tracks
+    /// which schemas exist. `public`, `pg_catalog`, and
+    /// `information_schema` are built-in and always present.
+    /// Schema-qualified table references still strip the prefix
+    /// at lookup time per v7.16-and-earlier — full
+    /// schema-as-isolation is v7.18+ scope. Persisted in catalog
+    /// FILE_VERSION 31+; older catalogs deserialise with just
+    /// the built-ins.
+    schemas: alloc::collections::BTreeSet<String>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -3380,6 +3948,201 @@ pub struct TriggerDef {
     pub enabled: bool,
 }
 
+/// v7.17.0 — catalogued SEQUENCE. PG semantics: a counter object
+/// returning monotonically increasing values via `nextval(name)`.
+/// `last_value` is the most recent value handed out; `is_called`
+/// is false until the first `nextval`/`setval`. Stored separately
+/// from tables in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceDef {
+    pub name: String,
+    /// Data type — narrows the i64 range. PG default BIGINT.
+    pub data_type: SequenceDataType,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    /// `OWNED BY` target — `(table, column)` or NONE.
+    pub owned_by: Option<(String, String)>,
+    /// Most recently handed-out value. Meaningless when
+    /// `is_called == false`; in that case the NEXT `nextval`
+    /// will return `start`.
+    pub last_value: i64,
+    pub is_called: bool,
+}
+
+/// v7.17.0 — sequence integer width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceDataType {
+    SmallInt,
+    Int,
+    BigInt,
+}
+
+/// v7.17.0 Phase 1.6 — built-in schema names that every Catalog
+/// understands without an explicit CREATE SCHEMA. Used by
+/// [`Catalog::schema_exists`] and the engine's schema-qualified
+/// lookup path.
+#[must_use]
+pub fn is_builtin_schema(name: &str) -> bool {
+    name.eq_ignore_ascii_case("public")
+        || name.eq_ignore_ascii_case("pg_catalog")
+        || name.eq_ignore_ascii_case("information_schema")
+}
+
+/// v7.17.0 — parse a PG-canonical UUID text representation into the
+/// 16-byte network-order layout used by `Value::Uuid`. Accepted input
+/// shapes (all case-insensitive):
+///   * Canonical hyphenated 8-4-4-4-12 (`550e8400-e29b-41d4-a716-446655440000`)
+///   * Unhyphenated 32-char hex (`550e8400e29b41d4a716446655440000`)
+///   * Either form wrapped in `{ ... }`
+///
+/// Returns `None` for any malformed input (wrong length, non-hex
+/// characters, misplaced hyphens). The caller surfaces a SQL error
+/// at coercion time — silent acceptance of garbage would mask
+/// application bugs and is exactly the divergence from PG that
+/// breaks the 0-change cutover promise.
+#[must_use]
+pub fn parse_uuid_str(input: &str) -> Option<[u8; 16]> {
+    let s = input.trim();
+    // Strip surrounding braces if present.
+    let s = if let Some(inner) = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        inner
+    } else {
+        s
+    };
+    // Two valid shapes after braces are stripped: 32 hex chars or
+    // the canonical 36-char hyphenated form.
+    let hex: String = match s.len() {
+        32 => s.to_ascii_lowercase(),
+        36 => {
+            // Hyphens must be exactly at positions 8, 13, 18, 23.
+            let b = s.as_bytes();
+            if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+                return None;
+            }
+            let mut out = String::with_capacity(32);
+            out.push_str(&s[0..8]);
+            out.push_str(&s[9..13]);
+            out.push_str(&s[14..18]);
+            out.push_str(&s[19..23]);
+            out.push_str(&s[24..36]);
+            out.make_ascii_lowercase();
+            out
+        }
+        _ => return None,
+    };
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(10 + b - b'a'),
+        b'A'..=b'F' => Some(10 + b - b'A'),
+        _ => None,
+    }
+}
+
+/// v7.17.0 — render a `Value::Uuid` payload as the canonical
+/// lowercase 8-4-4-4-12 hyphenated form PG `text` cast surfaces.
+#[must_use]
+pub fn format_uuid(b: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// v7.17.0 Phase 1.5 — catalogued user-defined DOMAIN. A domain
+/// is a named CHECK-constrained alias over a built-in type;
+/// columns bound to it inherit the base type plus the CHECK
+/// predicates + NOT NULL + DEFAULT at INSERT/UPDATE time.
+/// `default` / `checks` are stored as Display-form source so
+/// `spg-storage` stays free of `spg-sql` dependency — same
+/// pattern as FunctionDef / ViewDef.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainDef {
+    pub name: String,
+    pub base_type: DataType,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub checks: Vec<String>,
+}
+
+/// v7.17.0 Phase 1.4 — catalogued user-defined ENUM type. The
+/// label vector is order-preserving (PG enum ordering follows the
+/// declared order). At INSERT/UPDATE on a column bound to this
+/// enum, the engine looks up the value against `labels` and
+/// rejects non-members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDef {
+    pub name: String,
+    pub labels: Vec<String>,
+}
+
+/// v7.17.0 Phase 1.2 — catalogued VIEW. The body is stored as the
+/// raw source text the parser saw between `AS` and the statement
+/// terminator; the engine re-parses on each invocation. Same
+/// pattern as `FunctionDef` — keeps `spg-storage` free of
+/// `spg-sql` dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    pub name: String,
+    /// Optional `(col, col, …)` rename list. Empty when the body's
+    /// projected names are used directly.
+    pub columns: Vec<String>,
+    /// Raw SELECT source. Display-rendered at storage time so the
+    /// catalog round-trips a deterministic form regardless of
+    /// whitespace / comments in the original input. Re-parsed at
+    /// SELECT-from-view time to materialise as a synthetic CTE.
+    pub body: String,
+}
+
+impl SequenceDataType {
+    /// PG default min/max per AS clause.
+    pub fn default_bounds(self, increment_positive: bool) -> (i64, i64) {
+        match self {
+            Self::SmallInt => {
+                if increment_positive {
+                    (1, i64::from(i16::MAX))
+                } else {
+                    (i64::from(i16::MIN), -1)
+                }
+            }
+            Self::Int => {
+                if increment_positive {
+                    (1, i64::from(i32::MAX))
+                } else {
+                    (i64::from(i32::MIN), -1)
+                }
+            }
+            Self::BigInt => {
+                if increment_positive {
+                    (1, i64::MAX)
+                } else {
+                    (i64::MIN, -1)
+                }
+            }
+        }
+    }
+}
+
 impl Catalog {
     pub const fn new() -> Self {
         Self {
@@ -3388,6 +4151,12 @@ impl Catalog {
             cold_segments: Vec::new(),
             functions: BTreeMap::new(),
             triggers: Vec::new(),
+            sequences: BTreeMap::new(),
+            views: BTreeMap::new(),
+            materialized_views: BTreeMap::new(),
+            enum_types: BTreeMap::new(),
+            domain_types: BTreeMap::new(),
+            schemas: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -3421,6 +4190,361 @@ impl Catalog {
     /// Caller decides whether to surface `if_exists` semantics.
     pub fn drop_function(&mut self, name: &str) -> bool {
         self.functions.remove(name).is_some()
+    }
+
+    /// v7.17.0 — read-only handle to catalogued sequences.
+    pub const fn sequences(&self) -> &BTreeMap<String, SequenceDef> {
+        &self.sequences
+    }
+
+    /// v7.17.0 — register a new SEQUENCE. Errors if `name`
+    /// collides with an existing sequence and `if_not_exists`
+    /// is false.
+    pub fn create_sequence(
+        &mut self,
+        def: SequenceDef,
+        if_not_exists: bool,
+    ) -> Result<(), StorageError> {
+        if self.sequences.contains_key(&def.name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "sequence {:?} already exists",
+                def.name
+            )));
+        }
+        self.sequences.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 — remove a SEQUENCE by name. Returns `true` if a
+    /// sequence was removed, `false` if none matched. Caller
+    /// surfaces IF EXISTS semantics.
+    pub fn drop_sequence(&mut self, name: &str) -> bool {
+        self.sequences.remove(name).is_some()
+    }
+
+    /// v7.17.0 — atomic nextval. Increments `last_value` per
+    /// `increment`, returns the new value, sets `is_called`.
+    /// Returns an error on CYCLE-less overflow.
+    pub fn sequence_next_value(&mut self, name: &str) -> Result<i64, StorageError> {
+        let Some(seq) = self.sequences.get_mut(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        // PG semantics: when !is_called (fresh sequence or
+        // setval(_, false)), the next nextval returns the stored
+        // `last_value`. When is_called, it advances by `increment`
+        // and CYCLE-wraps on overflow.
+        let candidate = if seq.is_called {
+            let next = seq.last_value.checked_add(seq.increment).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "sequence {name:?} arithmetic overflow"
+                ))
+            })?;
+            if seq.increment > 0 {
+                if next > seq.max_value {
+                    if seq.cycle {
+                        seq.min_value
+                    } else {
+                        return Err(StorageError::Corrupt(format!(
+                            "sequence {name:?} reached MAXVALUE ({})",
+                            seq.max_value
+                        )));
+                    }
+                } else {
+                    next
+                }
+            } else if next < seq.min_value {
+                if seq.cycle {
+                    seq.max_value
+                } else {
+                    return Err(StorageError::Corrupt(format!(
+                        "sequence {name:?} reached MINVALUE ({})",
+                        seq.min_value
+                    )));
+                }
+            } else {
+                next
+            }
+        } else {
+            seq.last_value
+        };
+        seq.last_value = candidate;
+        seq.is_called = true;
+        Ok(candidate)
+    }
+
+    /// v7.17.0 — currval. Errors if the session has never called
+    /// nextval on this sequence (PG semantics). At the catalog
+    /// level we approximate "session" with "is_called persisted";
+    /// the engine session-tracking layer can wrap this for the
+    /// strict per-session semantics later.
+    pub fn sequence_current_value(&self, name: &str) -> Result<i64, StorageError> {
+        let Some(seq) = self.sequences.get(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        if !seq.is_called {
+            return Err(StorageError::Corrupt(format!(
+                "currval of sequence {name:?} is not yet defined in this session"
+            )));
+        }
+        Ok(seq.last_value)
+    }
+
+    /// v7.17.0 — setval(name, value [, is_called]). PG returns
+    /// `value` regardless. `is_called=true` means the NEXT
+    /// nextval will return `value + increment`; `is_called=false`
+    /// means the next nextval will return `value`.
+    pub fn sequence_set_value(
+        &mut self,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, StorageError> {
+        let Some(seq) = self.sequences.get_mut(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        seq.last_value = value;
+        seq.is_called = is_called;
+        Ok(value)
+    }
+
+    /// v7.17.0 Phase 1.2 — read-only handle to catalogued views.
+    pub const fn views(&self) -> &BTreeMap<String, ViewDef> {
+        &self.views
+    }
+
+    /// v7.17.0 Phase 1.2 — install a VIEW. `or_replace=true`
+    /// overwrites an existing entry; `if_not_exists=true` is a
+    /// silent no-op when the name is taken. Errors if both flags
+    /// are off and the name collides.
+    pub fn create_view(
+        &mut self,
+        def: ViewDef,
+        or_replace: bool,
+        if_not_exists: bool,
+    ) -> Result<(), StorageError> {
+        if self.views.contains_key(&def.name) {
+            if or_replace {
+                self.views.insert(def.name.clone(), def);
+                return Ok(());
+            }
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "view {:?} already exists",
+                def.name
+            )));
+        }
+        // Reject name collision with tables / sequences — same
+        // namespace per PG.
+        if self.by_name.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "view {:?} would shadow an existing table",
+                def.name
+            )));
+        }
+        if self.sequences.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "view {:?} would shadow an existing sequence",
+                def.name
+            )));
+        }
+        self.views.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.2 — remove a view by name. Returns true if
+    /// a view was removed.
+    pub fn drop_view(&mut self, name: &str) -> bool {
+        self.views.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.3 — read-only handle to the materialised-
+    /// view source registry. Each entry pairs with a regular
+    /// table of the same name that holds the cached rows.
+    pub const fn materialized_views(&self) -> &BTreeMap<String, String> {
+        &self.materialized_views
+    }
+
+    /// v7.17.0 Phase 1.3 — register a source for a materialised
+    /// view. Caller has already created the backing table.
+    pub fn register_materialized_view(&mut self, name: String, body: String) {
+        self.materialized_views.insert(name, body);
+    }
+
+    /// v7.17.0 Phase 1.3 — drop the source registry entry. Returns
+    /// true if a source was unregistered. Caller separately drops
+    /// the backing table.
+    pub fn drop_materialized_view_source(&mut self, name: &str) -> bool {
+        self.materialized_views.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.4 — read-only handle to user-defined ENUM
+    /// catalog.
+    pub const fn enum_types(&self) -> &BTreeMap<String, EnumDef> {
+        &self.enum_types
+    }
+
+    /// v7.17.0 Phase 1.4 — install a new ENUM type. Errors if
+    /// `name` collides with an existing enum (no IF NOT EXISTS
+    /// per PG semantics for CREATE TYPE).
+    pub fn create_enum_type(&mut self, def: EnumDef) -> Result<(), StorageError> {
+        if self.enum_types.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "type {:?} already exists",
+                def.name
+            )));
+        }
+        self.enum_types.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.4 — drop an ENUM type by name. Returns
+    /// true if a type was removed.
+    pub fn drop_enum_type(&mut self, name: &str) -> bool {
+        self.enum_types.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.5 — read-only handle to DOMAIN catalog.
+    pub const fn domain_types(&self) -> &BTreeMap<String, DomainDef> {
+        &self.domain_types
+    }
+
+    /// v7.17.0 Phase 1.5 — install a DOMAIN. Errors on collision
+    /// with an existing domain.
+    pub fn create_domain_type(&mut self, def: DomainDef) -> Result<(), StorageError> {
+        if self.domain_types.contains_key(&def.name) {
+            return Err(StorageError::Corrupt(format!(
+                "domain {:?} already exists",
+                def.name
+            )));
+        }
+        self.domain_types.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.5 — drop a DOMAIN by name.
+    pub fn drop_domain_type(&mut self, name: &str) -> bool {
+        self.domain_types.remove(name).is_some()
+    }
+
+    /// v7.17.0 Phase 1.6 — read-only handle to the user-created
+    /// schema registry. Built-in schemas (`public`, `pg_catalog`,
+    /// `information_schema`) are NOT included here; use
+    /// [`schema_exists`](Self::schema_exists) for the full
+    /// check.
+    pub const fn user_schemas(&self) -> &alloc::collections::BTreeSet<String> {
+        &self.schemas
+    }
+
+    /// v7.17.0 Phase 1.6 — schema-name resolver. Returns true
+    /// for built-in schemas + every user-CREATEd one. Used by
+    /// CREATE SCHEMA collision checks and (future) by
+    /// information_schema.schemata.
+    pub fn schema_exists(&self, name: &str) -> bool {
+        is_builtin_schema(name) || self.schemas.contains(name)
+    }
+
+    /// v7.17.0 Phase 1.6 — register a new schema. Errors if the
+    /// name already exists and `if_not_exists=false`. Built-in
+    /// names cannot be redeclared.
+    pub fn create_schema(
+        &mut self,
+        name: String,
+        if_not_exists: bool,
+    ) -> Result<(), StorageError> {
+        if is_builtin_schema(&name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "schema {name:?} is built-in and cannot be redeclared"
+            )));
+        }
+        if self.schemas.contains(&name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(StorageError::Corrupt(format!(
+                "schema {name:?} already exists"
+            )));
+        }
+        self.schemas.insert(name);
+        Ok(())
+    }
+
+    /// v7.17.0 Phase 1.6 — drop a user-created schema. Returns
+    /// true if a schema was removed. Built-in names always
+    /// return false (cannot be dropped). Tables that previously
+    /// used the schema as a prefix keep their bare name and stay
+    /// queryable — this is the "prefix routing, not isolation"
+    /// posture documented in v7.17 Phase 1.6.
+    pub fn drop_schema(&mut self, name: &str) -> Result<bool, StorageError> {
+        if is_builtin_schema(name) {
+            return Err(StorageError::Corrupt(format!(
+                "schema {name:?} is built-in and cannot be dropped"
+            )));
+        }
+        Ok(self.schemas.remove(name))
+    }
+
+    /// v7.17.0 — ALTER SEQUENCE option merge. Caller-provided
+    /// updates overwrite the matching fields; unset fields keep
+    /// their stored values. RESTART variants update last_value
+    /// directly per PG: `RESTART` resets to current `start`;
+    /// `RESTART WITH n` resets to `n`.
+    pub fn alter_sequence(
+        &mut self,
+        name: &str,
+        increment: Option<i64>,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        start: Option<i64>,
+        restart: Option<Option<i64>>,
+        cache: Option<i64>,
+        cycle: Option<bool>,
+        owned_by: Option<Option<(String, String)>>,
+    ) -> Result<(), StorageError> {
+        let Some(seq) = self.sequences.get_mut(name) else {
+            return Err(StorageError::Corrupt(format!(
+                "sequence {name:?} does not exist"
+            )));
+        };
+        if let Some(v) = increment {
+            seq.increment = v;
+        }
+        if let Some(v) = min_value {
+            seq.min_value = v;
+        }
+        if let Some(v) = max_value {
+            seq.max_value = v;
+        }
+        if let Some(v) = start {
+            seq.start = v;
+        }
+        if let Some(restart_value) = restart {
+            seq.last_value = restart_value.unwrap_or(seq.start);
+            seq.is_called = false;
+        }
+        if let Some(v) = cache {
+            seq.cache = v;
+        }
+        if let Some(v) = cycle {
+            seq.cycle = v;
+        }
+        if let Some(v) = owned_by {
+            seq.owned_by = v;
+        }
+        Ok(())
     }
 
     /// v7.12.4 — read-only slice of all catalogued triggers.
@@ -4419,7 +5543,8 @@ impl Catalog {
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "compact_cold_segments: index {index_name:?} is not BTree; \
                      compaction applies only to BTree cold-tier indices"
@@ -4648,7 +5773,11 @@ fn index_key_as_u64(key: &IndexKey) -> Option<u64> {
         // and lookup — using cast_unsigned keeps both sides honest
         // and silences clippy::cast_sign_loss.
         IndexKey::Int(n) => Some(n.cast_unsigned()),
-        IndexKey::Text(_) | IndexKey::Bool(_) => None,
+        // Text / Bool / Uuid PKs aren't representable as u64 and so
+        // can't participate in the u64-sorted cold-tier segment
+        // PK layout. Same deferral story as Text — lookup falls
+        // through the in-memory btree.
+        IndexKey::Text(_) | IndexKey::Bool(_) | IndexKey::Uuid(_) => None,
     }
 }
 
@@ -4735,6 +5864,13 @@ impl ColumnSchema {
             default: None,
             runtime_default: None,
             auto_increment: false,
+            user_enum_type: None,
+            user_domain_type: None,
+            on_update_runtime: None,
+            collation: Collation::Binary,
+            is_unsigned: false,
+            inline_enum_variants: None,
+            inline_set_variants: None,
         }
     }
 
@@ -4874,7 +6010,93 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     round-9 A.2.b — `ALTER TABLE … { ENABLE | DISABLE }
 ///     TRIGGER …`). v24 catalogs deserialise with every trigger
 ///     `enabled = true`, matching pre-v7.16.1 behaviour.
-const FILE_VERSION: u8 = 25;
+/// v26 introduces (v7.17.0 Phase 1.1):
+///   * Trailing SEQUENCE catalog block after triggers. Encoded
+///     as `u32 count` followed by per-sequence:
+///     `name`, `data_type: u8` (0=SmallInt,1=Int,2=BigInt),
+///     `start i64`, `increment i64`, `min_value i64`,
+///     `max_value i64`, `cache i64`, `cycle u8`,
+///     `owned_by_tag u8` (0=NONE, 1=Column → `table`,`column`),
+///     `last_value i64`, `is_called u8`. v25-and-below catalogs
+///     deserialise with an empty sequences map.
+/// v27 introduces (v7.17.0 Phase 1.2):
+///   * Trailing VIEW catalog block after sequences. Encoded as
+///     `u32 count` followed by per-view:
+///     `name`, `column_count u16`, then column names, then
+///     `body` long-string. v26-and-below catalogs deserialise
+///     with an empty views map.
+/// v28 introduces (v7.17.0 Phase 1.3):
+///   * Trailing MATERIALIZED VIEW source registry block after
+///     views. Encoded as `u32 count` followed by per-entry:
+///     `name`, `body` long-string. The materialised rows live
+///     as a regular Table of the same name (already covered by
+///     the pre-existing tables block). v27-and-below catalogs
+///     deserialise with an empty map.
+/// v29 introduces (v7.17.0 Phase 1.4):
+///   * Per-table user_enum_type appendix (after the CHECK
+///     appendix). Layout: `u16 count` followed by per-binding
+///     `[u16 col_pos][str enum_name]`. Only columns whose
+///     `user_enum_type` is Some land here; the catalog stays
+///     compact for the common no-enum case.
+///   * Trailing ENUM types catalog block after materialized
+///     views. Encoded as `u32 count` followed by per-entry:
+///     `name`, `u16 label_count`, then `label_count` short
+///     strings. v28-and-below catalogs deserialise with an
+///     empty enum_types map and every column's
+///     `user_enum_type = None`.
+/// v30 introduces (v7.17.0 Phase 1.5):
+///   * Per-table user_domain_type appendix (after the
+///     user_enum_type appendix). Same shape as the enum one.
+///   * Trailing DOMAIN types catalog block after the enum
+///     block. Encoded as `u32 count` followed by per-entry:
+///     `name`, `data_type` byte, `nullable u8`,
+///     `default_present u8` + optional default string,
+///     `u16 check_count` then `check_count` Display-form
+///     CHECK strings. v29-and-below catalogs deserialise with
+///     an empty domain_types map and `user_domain_type = None`.
+/// v31 introduces (v7.17.0 Phase 1.6):
+///   * Trailing user-schemas block after the DOMAIN block.
+///     Encoded as `u32 count` followed by `count` schema-name
+///     short strings. Built-in schemas (`public`, `pg_catalog`,
+///     `information_schema`) are NOT serialised — they're
+///     hardcoded in `is_builtin_schema`. v30-and-below catalogs
+///     deserialise with an empty user-schemas set.
+/// v32 introduces (v7.17.0 Phase 2.1):
+///   * Per-table on_update_runtime appendix (after the
+///     user_domain_type appendix). Layout: `u16 count` followed
+///     by per-binding `[u16 col_pos][str expr_src]`. Only
+///     columns whose `on_update_runtime` is Some land here;
+///     the catalog stays compact when no MySQL-shaped table
+///     uses the attribute. v31-and-below catalogs deserialise
+///     with every column's `on_update_runtime = None`.
+/// v33 introduces (v7.17.0 Phase 2.2):
+///   * Index kind tag 5 = fulltext-GIN (MySQL `FULLTEXT KEY`
+///     surface over a TEXT / VARCHAR column). Payload shape is
+///     identical to tag-3 / tag-4 GIN (`String → Vec<RowLocator>`);
+///     the keys are lower-cased word lexemes (same rule as
+///     `to_tsvector('simple', text)`). v32 catalogs deserialise
+///     unchanged — no v32 writer ever emitted tag 5, and FULLTEXT
+///     KEY was silently dropped pre-v7.17 so no rebuild shim is
+///     needed for round-tripped catalogs.
+/// v34 introduces (v7.17.0 Phase 2.5):
+///   * Per-table collation appendix (after the on_update_runtime
+///     appendix). Sparse layout: only columns whose `collation`
+///     is non-Binary land here. `u16 count` then per-binding
+///     `[u16 col_pos][u8 collation_tag]` where the tag matches
+///     `Collation::TAG_*`. Snapshots written by v33-and-below
+///     readers deserialise every column with `collation =
+///     Binary`, preserving the prior byte-wise compare
+///     semantics. Unknown tags read back as Binary too — keeps
+///     a forward-compat path if a future v35 adds variants
+///     and someone rolls back to a v34 reader.
+/// v35 introduces (v7.17.0 Phase 4.4):
+///   * Per-table is_unsigned appendix (after the collation
+///     appendix). Sparse layout: only `is_unsigned = true`
+///     columns land. `u16 count` then per-binding `[u16 col_pos]`.
+///     v34-and-below catalogs deserialise every column as
+///     `is_unsigned = false`, preserving the prior silent-
+///     accept behaviour for negative inserts on UNSIGNED columns.
+const FILE_VERSION: u8 = 45;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -4886,6 +6108,10 @@ const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
 const INDEX_KEY_TAG_INT: u8 = 0;
 const INDEX_KEY_TAG_TEXT: u8 = 1;
 const INDEX_KEY_TAG_BOOL: u8 = 2;
+/// v7.17.0 — `IndexKey::Uuid([u8; 16])`. Body = raw 16 bytes
+/// (RFC 4122 byte order). Persisted only in FILE_VERSION 36+
+/// catalogs.
+const INDEX_KEY_TAG_UUID: u8 = 3;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -5025,6 +6251,32 @@ impl Catalog {
                         );
                         for (tri, locators) in map {
                             write_str(&mut out, tri);
+                            write_u32(
+                                &mut out,
+                                u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
+                            );
+                            for loc in locators {
+                                loc.write_le(&mut out);
+                            }
+                        }
+                    }
+                    IndexKind::GinFulltext(map) => {
+                        // v7.17.0 Phase 2.2 — tag byte 5 =
+                        // GinFulltext (MySQL `FULLTEXT KEY` GIN
+                        // over a TEXT/VARCHAR column). Payload
+                        // shape mirrors tag-3 / tag-4 GIN —
+                        // `String → Vec<RowLocator>` posting
+                        // lists keyed by lower-cased word
+                        // lexemes. FILE_VERSION 33+; v32 catalogs
+                        // never wrote a fulltext-GIN (FULLTEXT
+                        // KEY was silently dropped pre-v7.17).
+                        out.push(5);
+                        write_u32(
+                            &mut out,
+                            u32::try_from(map.len()).expect("≤ 4G fulltext-GIN posting lists"),
+                        );
+                        for (lex, locators) in map {
+                            write_str(&mut out, lex);
                             write_u32(
                                 &mut out,
                                 u32::try_from(locators.len()).expect("≤ 4G locators/posting list"),
@@ -5197,6 +6449,143 @@ impl Catalog {
             for c in &t.schema.checks {
                 write_str(&mut out, c.as_str());
             }
+            // v7.17.0 Phase 1.4 — per-table user_enum_type
+            // appendix. Layout: [u16 count] then
+            // [u16 col_pos][str enum_name] per binding. Only
+            // columns whose user_enum_type is Some land here.
+            let mut enum_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(e) = &c.user_enum_type {
+                    enum_bindings.push((i, e.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(enum_bindings.len()).expect("≤ 65k enum-typed columns/table"),
+            );
+            for (pos, ename) in enum_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, ename);
+            }
+            // v7.17.0 Phase 1.5 — per-table user_domain_type
+            // appendix. Same layout as the enum one. v29-and-
+            // below readers stop after the enum appendix.
+            let mut domain_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(d) = &c.user_domain_type {
+                    domain_bindings.push((i, d.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(domain_bindings.len()).expect("≤ 65k domain-typed columns/table"),
+            );
+            for (pos, dname) in domain_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, dname);
+            }
+            // v7.17.0 Phase 2.1 — per-table on_update_runtime
+            // appendix. Sparse: only ON UPDATE-bound columns.
+            let mut on_update_bindings: Vec<(usize, &str)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(e) = &c.on_update_runtime {
+                    on_update_bindings.push((i, e.as_str()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(on_update_bindings.len()).expect("≤ 65k ON UPDATE columns/table"),
+            );
+            for (pos, expr_src) in on_update_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_str(&mut out, expr_src);
+            }
+            // v7.17.0 Phase 2.5 — per-table collation appendix.
+            // Sparse: only non-Binary columns land. Layout:
+            // `[u16 count][u16 col_pos][u8 tag] × count`.
+            let mut coll_bindings: Vec<(usize, u8)> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                let tag = match c.collation {
+                    Collation::Binary => continue,
+                    Collation::CaseInsensitive => Collation::TAG_CASE_INSENSITIVE,
+                };
+                coll_bindings.push((i, tag));
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(coll_bindings.len()).expect("≤ 65k collation bindings/table"),
+            );
+            for (pos, tag) in coll_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                out.push(tag);
+            }
+            // v7.17.0 Phase 4.4 — per-table is_unsigned appendix.
+            // Sparse: only UNSIGNED columns land. Layout:
+            // `[u16 count][u16 col_pos] × count`.
+            let mut unsigned_bindings: Vec<usize> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if c.is_unsigned {
+                    unsigned_bindings.push(i);
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(unsigned_bindings.len())
+                    .expect("≤ 65k UNSIGNED columns/table"),
+            );
+            for pos in unsigned_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+            }
+            // v7.17.0 Phase 3.P0-36 — per-table inline_enum_variants
+            // appendix. Sparse: only ENUM columns land. Layout:
+            // `[u16 count] then per binding [u16 col_pos]
+            // [u16 variant_count] then variant strings`.
+            // FILE_VERSION 41+; v40 readers never reach this block.
+            let mut enum_inline_bindings: Vec<(usize, &[String])> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(vs) = &c.inline_enum_variants {
+                    enum_inline_bindings.push((i, vs.as_slice()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(enum_inline_bindings.len())
+                    .expect("≤ 65k inline-ENUM columns/table"),
+            );
+            for (pos, variants) in enum_inline_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_u16(
+                    &mut out,
+                    u16::try_from(variants.len()).expect("≤ 65k variants/ENUM"),
+                );
+                for v in variants {
+                    write_str(&mut out, v.as_str());
+                }
+            }
+            // v7.17.0 Phase 3.P0-37 — per-table inline_set_variants
+            // appendix. Same layout as the inline ENUM block.
+            // FILE_VERSION 42+; v41 readers never reach this block.
+            let mut set_inline_bindings: Vec<(usize, &[String])> = Vec::new();
+            for (i, c) in t.schema.columns.iter().enumerate() {
+                if let Some(vs) = &c.inline_set_variants {
+                    set_inline_bindings.push((i, vs.as_slice()));
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(set_inline_bindings.len())
+                    .expect("≤ 65k inline-SET columns/table"),
+            );
+            for (pos, variants) in set_inline_bindings {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_u16(
+                    &mut out,
+                    u16::try_from(variants.len()).expect("≤ 65k variants/SET"),
+                );
+                for v in variants {
+                    write_str(&mut out, v.as_str());
+                }
+            }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier
@@ -5250,6 +6639,113 @@ impl Catalog {
             }
             // v7.16.1 — TriggerDef.enabled (FILE_VERSION 25+).
             out.push(u8::from(td.enabled));
+        }
+        // v7.17.0 Phase 1.1 — SEQUENCE catalog block (FILE_VERSION 26+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.sequences.len()).expect("≤ 4G sequences"),
+        );
+        for seq in self.sequences.values() {
+            write_str(&mut out, &seq.name);
+            out.push(match seq.data_type {
+                SequenceDataType::SmallInt => 0,
+                SequenceDataType::Int => 1,
+                SequenceDataType::BigInt => 2,
+            });
+            out.extend_from_slice(&seq.start.to_le_bytes());
+            out.extend_from_slice(&seq.increment.to_le_bytes());
+            out.extend_from_slice(&seq.min_value.to_le_bytes());
+            out.extend_from_slice(&seq.max_value.to_le_bytes());
+            out.extend_from_slice(&seq.cache.to_le_bytes());
+            out.push(u8::from(seq.cycle));
+            match &seq.owned_by {
+                None => out.push(0),
+                Some((table, column)) => {
+                    out.push(1);
+                    write_str(&mut out, table);
+                    write_str(&mut out, column);
+                }
+            }
+            out.extend_from_slice(&seq.last_value.to_le_bytes());
+            out.push(u8::from(seq.is_called));
+        }
+        // v7.17.0 Phase 1.2 — VIEW catalog block (FILE_VERSION 27+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.views.len()).expect("≤ 4G views"),
+        );
+        for view in self.views.values() {
+            write_str(&mut out, &view.name);
+            write_u16(
+                &mut out,
+                u16::try_from(view.columns.len()).expect("≤ 65k cols / view"),
+            );
+            for c in &view.columns {
+                write_str(&mut out, c);
+            }
+            write_str_long(&mut out, &view.body);
+        }
+        // v7.17.0 Phase 1.3 — MATERIALIZED VIEW source registry
+        // (FILE_VERSION 28+). The backing rows live as a regular
+        // table of the same name already in the tables block.
+        write_u32(
+            &mut out,
+            u32::try_from(self.materialized_views.len()).expect("≤ 4G materialized views"),
+        );
+        for (name, body) in &self.materialized_views {
+            write_str(&mut out, name);
+            write_str_long(&mut out, body);
+        }
+        // v7.17.0 Phase 1.4 — ENUM types catalog block
+        // (FILE_VERSION 29+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.enum_types.len()).expect("≤ 4G enum types"),
+        );
+        for e in self.enum_types.values() {
+            write_str(&mut out, &e.name);
+            write_u16(
+                &mut out,
+                u16::try_from(e.labels.len()).expect("≤ 65k labels / enum"),
+            );
+            for l in &e.labels {
+                write_str(&mut out, l);
+            }
+        }
+        // v7.17.0 Phase 1.5 — DOMAIN types catalog block
+        // (FILE_VERSION 30+).
+        write_u32(
+            &mut out,
+            u32::try_from(self.domain_types.len()).expect("≤ 4G domain types"),
+        );
+        for d in self.domain_types.values() {
+            write_str(&mut out, &d.name);
+            write_data_type(&mut out, d.base_type);
+            out.push(u8::from(d.nullable));
+            match &d.default {
+                None => out.push(0),
+                Some(s) => {
+                    out.push(1);
+                    write_str(&mut out, s);
+                }
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(d.checks.len()).expect("≤ 65k CHECKs / domain"),
+            );
+            for c in &d.checks {
+                write_str(&mut out, c);
+            }
+        }
+        // v7.17.0 Phase 1.6 — user-schemas registry
+        // (FILE_VERSION 31+). Built-ins are hardcoded in
+        // `is_builtin_schema` and not persisted.
+        write_u32(
+            &mut out,
+            u32::try_from(self.schemas.len()).expect("≤ 4G schemas"),
+        );
+        for name in &self.schemas {
+            write_str(&mut out, name);
         }
         out
     }
@@ -5342,6 +6838,153 @@ impl Catalog {
                 });
             }
         }
+        // v7.17.0 Phase 1.1 — SEQUENCE block (FILE_VERSION 26+).
+        // v25-and-below catalogs omit; we leave the map empty.
+        if version >= 26 {
+            let seq_count = cur.read_u32()? as usize;
+            for _ in 0..seq_count {
+                let name = cur.read_str()?;
+                let data_type = match cur.read_u8()? {
+                    0 => SequenceDataType::SmallInt,
+                    1 => SequenceDataType::Int,
+                    2 => SequenceDataType::BigInt,
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown SEQUENCE data-type tag {other}"
+                        )));
+                    }
+                };
+                let start = cur.read_i64()?;
+                let increment = cur.read_i64()?;
+                let min_value = cur.read_i64()?;
+                let max_value = cur.read_i64()?;
+                let cache = cur.read_i64()?;
+                let cycle = cur.read_u8()? != 0;
+                let owned_by = match cur.read_u8()? {
+                    0 => None,
+                    1 => {
+                        let t = cur.read_str()?;
+                        let c = cur.read_str()?;
+                        Some((t, c))
+                    }
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown SEQUENCE owned-by tag {other}"
+                        )));
+                    }
+                };
+                let last_value = cur.read_i64()?;
+                let is_called = cur.read_u8()? != 0;
+                cat.sequences.insert(
+                    name.clone(),
+                    SequenceDef {
+                        name,
+                        data_type,
+                        start,
+                        increment,
+                        min_value,
+                        max_value,
+                        cache,
+                        cycle,
+                        owned_by,
+                        last_value,
+                        is_called,
+                    },
+                );
+            }
+        }
+        // v7.17.0 Phase 1.2 — VIEW block (FILE_VERSION 27+).
+        // v26-and-below catalogs omit; we leave the map empty.
+        if version >= 27 {
+            let view_count = cur.read_u32()? as usize;
+            for _ in 0..view_count {
+                let name = cur.read_str()?;
+                let col_count = cur.read_u16()? as usize;
+                let mut columns = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    columns.push(cur.read_str()?);
+                }
+                let body = cur.read_str_long()?;
+                cat.views.insert(
+                    name.clone(),
+                    ViewDef {
+                        name,
+                        columns,
+                        body,
+                    },
+                );
+            }
+        }
+        // v7.17.0 Phase 1.3 — MATERIALIZED VIEW source registry
+        // (FILE_VERSION 28+). v27-and-below catalogs omit.
+        if version >= 28 {
+            let mv_count = cur.read_u32()? as usize;
+            for _ in 0..mv_count {
+                let name = cur.read_str()?;
+                let body = cur.read_str_long()?;
+                cat.materialized_views.insert(name, body);
+            }
+        }
+        // v7.17.0 Phase 1.4 — ENUM types catalog block
+        // (FILE_VERSION 29+).
+        if version >= 29 {
+            let etype_count = cur.read_u32()? as usize;
+            for _ in 0..etype_count {
+                let name = cur.read_str()?;
+                let label_count = cur.read_u16()? as usize;
+                let mut labels = Vec::with_capacity(label_count);
+                for _ in 0..label_count {
+                    labels.push(cur.read_str()?);
+                }
+                cat.enum_types.insert(
+                    name.clone(),
+                    EnumDef { name, labels },
+                );
+            }
+        }
+        // v7.17.0 Phase 1.5 — DOMAIN types catalog block
+        // (FILE_VERSION 30+).
+        if version >= 30 {
+            let dtype_count = cur.read_u32()? as usize;
+            for _ in 0..dtype_count {
+                let name = cur.read_str()?;
+                let base_type = cur.read_data_type()?;
+                let nullable = cur.read_u8()? != 0;
+                let default = match cur.read_u8()? {
+                    0 => None,
+                    1 => Some(cur.read_str()?),
+                    other => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown DOMAIN default tag {other}"
+                        )));
+                    }
+                };
+                let check_count = cur.read_u16()? as usize;
+                let mut checks = Vec::with_capacity(check_count);
+                for _ in 0..check_count {
+                    checks.push(cur.read_str()?);
+                }
+                cat.domain_types.insert(
+                    name.clone(),
+                    DomainDef {
+                        name,
+                        base_type,
+                        nullable,
+                        default,
+                        checks,
+                    },
+                );
+            }
+        }
+        // v7.17.0 Phase 1.6 — user-schemas registry
+        // (FILE_VERSION 31+).
+        if version >= 31 {
+            let sch_count = cur.read_u32()? as usize;
+            for _ in 0..sch_count {
+                let name = cur.read_str()?;
+                cat.schemas.insert(name);
+            }
+        }
         if cur.pos < buf.len() {
             return Err(StorageError::Corrupt(format!(
                 "trailing bytes: {} unread",
@@ -5389,6 +7032,13 @@ fn deserialize_table(
             default,
             runtime_default: None,
             auto_increment,
+            user_enum_type: None,
+            user_domain_type: None,
+            on_update_runtime: None,
+            collation: Collation::Binary,
+            is_unsigned: false,
+            inline_enum_variants: None,
+            inline_set_variants: None,
         });
     }
     let n_cols = cols.len();
@@ -5512,6 +7162,110 @@ fn deserialize_table(
         }
         t.schema_mut().checks = checks;
     }
+    // v7.17.0 Phase 1.4 — per-table user_enum_type appendix
+    // (FILE_VERSION 29+). Layout: [u16 count] then
+    // [u16 col_pos][str enum_name] per binding.
+    if version >= 29 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let ename = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.user_enum_type = Some(ename);
+            }
+        }
+    }
+    // v7.17.0 Phase 1.5 — per-table user_domain_type appendix
+    // (FILE_VERSION 30+). Same shape as the enum one.
+    if version >= 30 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let dname = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.user_domain_type = Some(dname);
+            }
+        }
+    }
+    // v7.17.0 Phase 2.1 — per-table on_update_runtime appendix
+    // (FILE_VERSION 32+). Sparse layout matches the enum/
+    // domain bindings.
+    if version >= 32 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let expr_src = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.on_update_runtime = Some(expr_src);
+            }
+        }
+    }
+    // v7.17.0 Phase 2.5 — per-table collation appendix
+    // (FILE_VERSION 34+). Sparse: only non-Binary columns
+    // land. v33-and-below readers leave every column at its
+    // ColumnSchema::new default (Binary). Unknown tags from a
+    // forward-incompat snapshot read back as Binary.
+    if version >= 34 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let tag = cur.read_u8()?;
+            let collation = match tag {
+                Collation::TAG_CASE_INSENSITIVE => Collation::CaseInsensitive,
+                _ => Collation::Binary,
+            };
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.collation = collation;
+            }
+        }
+    }
+    // v7.17.0 Phase 4.4 — per-table is_unsigned appendix
+    // (FILE_VERSION 35+). Sparse: only UNSIGNED columns land.
+    // v34-and-below readers leave every column at
+    // `is_unsigned = false`.
+    if version >= 35 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.is_unsigned = true;
+            }
+        }
+    }
+    // v7.17.0 Phase 3.P0-36 — per-table inline_enum_variants
+    // appendix (FILE_VERSION 41+). Sparse: only ENUM columns land.
+    // v40-and-below readers leave every column at
+    // `inline_enum_variants = None`.
+    if version >= 41 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let variant_count = cur.read_u16()? as usize;
+            let mut variants = Vec::with_capacity(variant_count);
+            for _ in 0..variant_count {
+                variants.push(cur.read_str()?);
+            }
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.inline_enum_variants = Some(variants);
+            }
+        }
+    }
+    // v7.17.0 Phase 3.P0-37 — per-table inline_set_variants
+    // appendix (FILE_VERSION 42+). Sparse: only SET columns land.
+    if version >= 42 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let variant_count = cur.read_u16()? as usize;
+            let mut variants = Vec::with_capacity(variant_count);
+            for _ in 0..variant_count {
+                variants.push(cur.read_str()?);
+            }
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.inline_set_variants = Some(variants);
+            }
+        }
+    }
     let _ = table_name;
     Ok(())
 }
@@ -5613,6 +7367,20 @@ fn deserialize_indices(
                 }
                 let map = read_gin_map(cur)?;
                 t.restore_gin_trgm_index(idx_name, &column_name, map)?;
+            }
+            5 => {
+                // v7.17.0 Phase 2.2 — fulltext-GIN tag (MySQL
+                // `FULLTEXT KEY` surface). Same payload shape as
+                // tag 3 / tag 4 (String → posting list); only
+                // emitted by FILE_VERSION 33+ writers.
+                if version < 33 {
+                    return Err(StorageError::Corrupt(format!(
+                        "fulltext-GIN index tag 5 found in catalog FILE_VERSION {version}; \
+                         FILE_VERSION 33+ required (v7.17.0 Phase 2.2 introduced this tag)"
+                    )));
+                }
+                let map = read_gin_map(cur)?;
+                t.restore_gin_fulltext_index(idx_name, &column_name, map)?;
             }
             other => {
                 return Err(StorageError::Corrupt(format!(
@@ -5896,6 +7664,35 @@ fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // v7.12.0: tag 23 for `tsquery`. No body. Catalog
         // FILE_VERSION 20+.
         DataType::TsQuery => out.push(23),
+        // v7.17.0: tag 24 for `UUID`. No body — type identity
+        // alone. Catalog FILE_VERSION 36+.
+        DataType::Uuid => out.push(24),
+        // v7.17.0 Phase 3.P0-32: tag 25 for `TIME`. No body — type
+        // identity alone. Catalog FILE_VERSION 37+.
+        DataType::Time => out.push(25),
+        // v7.17.0 Phase 3.P0-33: tag 26 for `YEAR`. No body — type
+        // identity alone. Catalog FILE_VERSION 38+.
+        DataType::Year => out.push(26),
+        // v7.17.0 Phase 3.P0-34: tag 27 for `TIMETZ`. No body —
+        // type identity alone. Catalog FILE_VERSION 39+.
+        DataType::TimeTz => out.push(27),
+        // v7.17.0 Phase 3.P0-35: tag 28 for `MONEY`. No body —
+        // type identity alone. Catalog FILE_VERSION 40+.
+        DataType::Money => out.push(28),
+        // v7.17.0 Phase 3.P0-38: tag 29 for range types. Body
+        // = `[u8 RangeKind tag]`. Catalog FILE_VERSION 43+.
+        DataType::Range(k) => {
+            out.push(29);
+            out.push(k.tag());
+        }
+        // v7.17.0 Phase 3.P0-39: tag 30 for hstore. No body —
+        // type identity alone. Catalog FILE_VERSION 44+.
+        DataType::Hstore => out.push(30),
+        // v7.17.0 Phase 3.P0-40: tag 31/32/33 for 2D arrays.
+        // No body — type identity alone. Catalog FILE_VERSION 45+.
+        DataType::IntArray2D => out.push(31),
+        DataType::BigIntArray2D => out.push(32),
+        DataType::TextArray2D => out.push(33),
     }
 }
 
@@ -5953,6 +7750,34 @@ impl Cursor<'_> {
             // FILE_VERSION 20+.
             22 => Ok(DataType::TsVector),
             23 => Ok(DataType::TsQuery),
+            // v7.17.0: tag 24 — UUID. Catalog FILE_VERSION 36+.
+            24 => Ok(DataType::Uuid),
+            // v7.17.0 Phase 3.P0-32: tag 25 — TIME. Catalog
+            // FILE_VERSION 37+.
+            25 => Ok(DataType::Time),
+            // v7.17.0 Phase 3.P0-33: tag 26 — YEAR. Catalog
+            // FILE_VERSION 38+.
+            26 => Ok(DataType::Year),
+            // v7.17.0 Phase 3.P0-34: tag 27 — TIMETZ. Catalog
+            // FILE_VERSION 39+.
+            27 => Ok(DataType::TimeTz),
+            // v7.17.0 Phase 3.P0-35: tag 28 — MONEY. Catalog
+            // FILE_VERSION 40+.
+            28 => Ok(DataType::Money),
+            // v7.17.0 Phase 3.P0-38: tag 29 + RangeKind tag.
+            29 => {
+                let kt = self.read_u8()?;
+                let k = RangeKind::from_tag(kt).ok_or_else(|| {
+                    StorageError::Corrupt(format!("unknown RangeKind tag: {kt}"))
+                })?;
+                Ok(DataType::Range(k))
+            }
+            // v7.17.0 Phase 3.P0-39: tag 30 — HSTORE.
+            30 => Ok(DataType::Hstore),
+            // v7.17.0 Phase 3.P0-40: tag 31/32/33 — 2D arrays.
+            31 => Ok(DataType::IntArray2D),
+            32 => Ok(DataType::BigIntArray2D),
+            33 => Ok(DataType::TextArray2D),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -6056,6 +7881,61 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         // v7.12.0: tsquery dense body — prefix-coded tree.
         // Sizing must match `write_tsquery_body` walker.
         Value::TsQuery(ast) => tsquery_encoded_len(ast),
+        // v7.17.0: UUID dense body — fixed 16 bytes, no prefix.
+        Value::Uuid(_) => 16,
+        // v7.17.0 Phase 3.P0-32: TIME dense body — fixed i64 LE.
+        Value::Time(_) => 8,
+        // v7.17.0 Phase 3.P0-33: YEAR dense body — fixed u16 LE.
+        Value::Year(_) => 2,
+        // v7.17.0 Phase 3.P0-34: TIMETZ dense body — i64 LE + i32 LE.
+        Value::TimeTz { .. } => 12,
+        // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
+        Value::Money(_) => 8,
+        // v7.17.0 Phase 3.P0-38: range dense body — `[u8 flags]
+        // [if lower: write_value(lower)] [if upper: write_value(upper)]`.
+        // Element uses the schema-agnostic write_value codec
+        // (which carries its own tag byte). The flags byte
+        // captures empty/lower_some/upper_some/lower_inc/upper_inc.
+        Value::Range { lower, upper, .. } => {
+            1 + lower.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
+                + upper.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
+        }
+        // v7.17.0 Phase 3.P0-39: hstore dense body — `[u32 count]
+        // then per pair [u32 klen][k bytes][u8 has_val][if has_val:
+        // u32 vlen][v bytes]`.
+        Value::Hstore(pairs) => {
+            let mut n = 4;
+            for (k, v) in pairs {
+                n += 4 + k.len() + 1;
+                if let Some(val) = v {
+                    n += 4 + val.len();
+                }
+            }
+            n
+        }
+        // v7.17.0 Phase 3.P0-40: 2D arrays dense body — `[u32 rows]
+        // [u32 cols] then row-major elements with per-element
+        // `[u8 null_flag][if non-null: element body]`.
+        Value::IntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            8 + rows.len() * cols * (1 + 4)
+        }
+        Value::BigIntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            8 + rows.len() * cols * (1 + 8)
+        }
+        Value::TextArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut n = 8 + rows.len() * cols * 1;
+            for row in rows {
+                for cell in row {
+                    if let Some(s) = cell {
+                        n += 4 + s.len();
+                    }
+                }
+            }
+            n
+        }
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
         // INTERVAL has no on-disk encoding (see write_value_body).
@@ -6265,6 +8145,49 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         (Value::TsVector(lexs), DataType::TsVector) => write_tsvector_body(out, lexs),
         // v7.12.0: tsquery dense body — prefix-coded tree.
         (Value::TsQuery(ast), DataType::TsQuery) => write_tsquery_body(out, ast),
+        // v7.17.0: UUID dense body — raw 16 bytes (RFC 4122 byte
+        // order). No length prefix; the type's fixed width makes
+        // the codec stateless.
+        (Value::Uuid(b), DataType::Uuid) => out.extend_from_slice(&b[..]),
+        // v7.17.0 Phase 3.P0-32: TIME dense body — i64 LE
+        // microseconds since 00:00:00.
+        (Value::Time(us), DataType::Time) => out.extend_from_slice(&us.to_le_bytes()),
+        // v7.17.0 Phase 3.P0-33: YEAR dense body — u16 LE.
+        (Value::Year(y), DataType::Year) => out.extend_from_slice(&y.to_le_bytes()),
+        // v7.17.0 Phase 3.P0-34: TIMETZ dense body — i64 LE us +
+        // i32 LE offset_secs.
+        (Value::TimeTz { us, offset_secs }, DataType::TimeTz) => {
+            out.extend_from_slice(&us.to_le_bytes());
+            out.extend_from_slice(&offset_secs.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
+        (Value::Money(c), DataType::Money) => out.extend_from_slice(&c.to_le_bytes()),
+        // v7.17.0 Phase 3.P0-38: range dense body — see
+        // value_body_encoded_len for layout. `kind` is implicit
+        // from the column DataType.
+        (Value::Range { lower, upper, lower_inc, upper_inc, empty, .. }, DataType::Range(_)) => {
+            let mut flags: u8 = 0;
+            if *empty { flags |= 0b0000_0001; }
+            if lower.is_some() { flags |= 0b0000_0010; }
+            if upper.is_some() { flags |= 0b0000_0100; }
+            if *lower_inc { flags |= 0b0000_1000; }
+            if *upper_inc { flags |= 0b0001_0000; }
+            out.push(flags);
+            if let Some(l) = lower {
+                write_value(out, l);
+            }
+            if let Some(u) = upper {
+                write_value(out, u);
+            }
+        }
+        // v7.17.0 Phase 3.P0-39: hstore dense body — same shape
+        // as write_value_body for hstore (no leading tag — that
+        // lives on the data type).
+        (Value::Hstore(pairs), DataType::Hstore) => write_hstore_body(out, pairs),
+        // v7.17.0 Phase 3.P0-40: 2D array dense body.
+        (Value::IntArray2D(rows), DataType::IntArray2D) => write_int_2d_body(out, rows),
+        (Value::BigIntArray2D(rows), DataType::BigIntArray2D) => write_bigint_2d_body(out, rows),
+        (Value::TextArray2D(rows), DataType::TextArray2D) => write_text_2d_body(out, rows),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -6274,6 +8197,67 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
             other.data_type(),
             ty
         ),
+    }
+}
+
+/// v7.17.0 Phase 3.P0-38 — length the schema-agnostic
+/// `write_value` would emit for `v`. Used by the range codec to
+/// pre-size cells. We mirror the tag-byte + body shape from
+/// `write_value` rather than serialising to a temp Vec.
+fn write_value_encoded_len(v: &Value) -> usize {
+    match v {
+        Value::Null => 1,
+        Value::SmallInt(_) => 1 + 2,
+        Value::Int(_) | Value::Date(_) => 1 + 4,
+        Value::BigInt(_)
+        | Value::Float(_)
+        | Value::Timestamp(_)
+        | Value::Time(_)
+        | Value::Money(_) => 1 + 8,
+        Value::Bool(_) => 1 + 1,
+        Value::Year(_) => 1 + 2,
+        Value::Text(s) | Value::Json(s) => 1 + 4 + s.len(),
+        Value::Bytes(b) => 1 + 4 + b.len(),
+        Value::Numeric { .. } => 1 + 16 + 1,
+        Value::Uuid(_) => 1 + 16,
+        Value::TimeTz { .. } => 1 + 12,
+        Value::Hstore(pairs) => {
+            let mut n = 1 + 4;
+            for (k, v) in pairs {
+                n += 4 + k.len() + 1;
+                if let Some(val) = v {
+                    n += 4 + val.len();
+                }
+            }
+            n
+        }
+        Value::IntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            1 + 8 + rows.len() * cols * (1 + 4)
+        }
+        Value::BigIntArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            1 + 8 + rows.len() * cols * (1 + 8)
+        }
+        Value::TextArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut n = 1 + 8 + rows.len() * cols;
+            for row in rows {
+                for cell in row {
+                    if let Some(s) = cell {
+                        n += 4 + s.len();
+                    }
+                }
+            }
+            n
+        }
+        // Range-of-range and other nested cases — not currently
+        // representable but defensively measured via the dense
+        // body when the data_type is known.
+        other => {
+            let ty = other.data_type().unwrap_or(DataType::Int);
+            1 + value_body_encoded_len(other, ty)
+        }
     }
 }
 
@@ -6431,6 +8415,158 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.push(19);
             write_tsquery_body(out, ast);
         }
+        // v7.17.0: UUID — tag 20. Body = raw 16 bytes (RFC 4122
+        // byte order).
+        Value::Uuid(b) => {
+            out.push(20);
+            out.extend_from_slice(&b[..]);
+        }
+        // v7.17.0 Phase 3.P0-32: TIME — tag 21. Body = i64 LE
+        // microseconds since 00:00:00.
+        Value::Time(us) => {
+            out.push(21);
+            out.extend_from_slice(&us.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-33: YEAR — tag 22. Body = u16 LE.
+        Value::Year(y) => {
+            out.push(22);
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-34: TIMETZ — tag 23. Body = i64 LE
+        // us + i32 LE offset_secs.
+        Value::TimeTz { us, offset_secs } => {
+            out.push(23);
+            out.extend_from_slice(&us.to_le_bytes());
+            out.extend_from_slice(&offset_secs.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-35: MONEY — tag 24. Body = i64 LE cents.
+        Value::Money(c) => {
+            out.push(24);
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        // v7.17.0 Phase 3.P0-38: range — tag 25. Body =
+        // [u8 RangeKind tag][u8 flags][if lower: write_value(lower)]
+        // [if upper: write_value(upper)].
+        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
+            out.push(25);
+            out.push(kind.tag());
+            let mut flags: u8 = 0;
+            if *empty { flags |= 0b0000_0001; }
+            if lower.is_some() { flags |= 0b0000_0010; }
+            if upper.is_some() { flags |= 0b0000_0100; }
+            if *lower_inc { flags |= 0b0000_1000; }
+            if *upper_inc { flags |= 0b0001_0000; }
+            out.push(flags);
+            if let Some(l) = lower {
+                write_value(out, l);
+            }
+            if let Some(u) = upper {
+                write_value(out, u);
+            }
+        }
+        // v7.17.0 Phase 3.P0-39: hstore — tag 26. Body =
+        // [u32 count] then per pair `[u32 klen][k bytes][u8 has_val]
+        // [if has_val: u32 vlen][v bytes]`.
+        Value::Hstore(pairs) => {
+            out.push(26);
+            write_hstore_body(out, pairs);
+        }
+        // v7.17.0 Phase 3.P0-40: 2D arrays — tag 27/28/29.
+        Value::IntArray2D(rows) => {
+            out.push(27);
+            write_int_2d_body(out, rows);
+        }
+        Value::BigIntArray2D(rows) => {
+            out.push(28);
+            write_bigint_2d_body(out, rows);
+        }
+        Value::TextArray2D(rows) => {
+            out.push(29);
+            write_text_2d_body(out, rows);
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-40 — shared 2D INT writer.
+fn write_int_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i32>>]) {
+    let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
+        .expect("≤ 4G cols");
+    out.extend_from_slice(&nrows.to_le_bytes());
+    out.extend_from_slice(&ncols.to_le_bytes());
+    for row in rows {
+        for cell in row {
+            match cell {
+                None => out.push(1),
+                Some(n) => {
+                    out.push(0);
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-40 — shared 2D BIGINT writer.
+fn write_bigint_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i64>>]) {
+    let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
+        .expect("≤ 4G cols");
+    out.extend_from_slice(&nrows.to_le_bytes());
+    out.extend_from_slice(&ncols.to_le_bytes());
+    for row in rows {
+        for cell in row {
+            match cell {
+                None => out.push(1),
+                Some(n) => {
+                    out.push(0);
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-40 — shared 2D TEXT writer. Cells use
+/// `[u8 null_flag][if non-null: u32 len][utf-8 bytes]` layout.
+fn write_text_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<String>>]) {
+    let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
+        .expect("≤ 4G cols");
+    out.extend_from_slice(&nrows.to_le_bytes());
+    out.extend_from_slice(&ncols.to_le_bytes());
+    for row in rows {
+        for cell in row {
+            match cell {
+                None => out.push(1),
+                Some(s) => {
+                    out.push(0);
+                    let l = u32::try_from(s.len()).expect("≤ 4 GiB cell");
+                    out.extend_from_slice(&l.to_le_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-39 — shared hstore body writer.
+fn write_hstore_body(out: &mut Vec<u8>, pairs: &[(String, Option<String>)]) {
+    let count = u32::try_from(pairs.len()).expect("hstore ≤ u32::MAX pairs");
+    out.extend_from_slice(&count.to_le_bytes());
+    for (k, v) in pairs {
+        let klen = u32::try_from(k.len()).expect("hstore key ≤ 4 GiB");
+        out.extend_from_slice(&klen.to_le_bytes());
+        out.extend_from_slice(k.as_bytes());
+        match v {
+            None => out.push(0),
+            Some(val) => {
+                out.push(1);
+                let vlen = u32::try_from(val.len()).expect("hstore val ≤ 4 GiB");
+                out.extend_from_slice(&vlen.to_le_bytes());
+                out.extend_from_slice(val.as_bytes());
+            }
+        }
     }
 }
 
@@ -6544,6 +8680,10 @@ fn write_index_key(out: &mut Vec<u8>, key: &IndexKey) {
             out.push(INDEX_KEY_TAG_BOOL);
             out.push(u8::from(*b));
         }
+        IndexKey::Uuid(b) => {
+            out.push(INDEX_KEY_TAG_UUID);
+            out.extend_from_slice(&b[..]);
+        }
     }
 }
 
@@ -6638,6 +8778,12 @@ impl<'a> Cursor<'a> {
             INDEX_KEY_TAG_INT => Ok(IndexKey::Int(self.read_i64()?)),
             INDEX_KEY_TAG_TEXT => Ok(IndexKey::Text(self.read_str()?)),
             INDEX_KEY_TAG_BOOL => Ok(IndexKey::Bool(self.read_u8()? != 0)),
+            INDEX_KEY_TAG_UUID => {
+                let s = self.take(16)?;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(s);
+                Ok(IndexKey::Uuid(b))
+            }
             other => Err(StorageError::Corrupt(format!(
                 "unknown index key tag: {other}"
             ))),
@@ -6775,7 +8921,147 @@ impl<'a> Cursor<'a> {
             // + (u16 LE * pos_count) + u8 weight].
             DataType::TsVector => Ok(Value::TsVector(self.read_tsvector_body()?)),
             DataType::TsQuery => Ok(Value::TsQuery(self.read_tsquery_body()?)),
+            // v7.17.0: UUID dense body — raw 16 bytes.
+            DataType::Uuid => {
+                let s = self.take(16)?;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(s);
+                Ok(Value::Uuid(b))
+            }
+            // v7.17.0 Phase 3.P0-32: TIME dense body — i64 LE.
+            DataType::Time => Ok(Value::Time(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-33: YEAR dense body — u16 LE.
+            DataType::Year => Ok(Value::Year(self.read_u16()?)),
+            // v7.17.0 Phase 3.P0-34: TIMETZ dense body —
+            // i64 LE us + i32 LE offset_secs.
+            DataType::TimeTz => {
+                let us = self.read_i64()?;
+                let offset_secs = self.read_i32()?;
+                Ok(Value::TimeTz { us, offset_secs })
+            }
+            // v7.17.0 Phase 3.P0-35: MONEY dense body — i64 LE cents.
+            DataType::Money => Ok(Value::Money(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-39: hstore dense body. Body
+            // shape == read_hstore_body.
+            DataType::Hstore => Ok(Value::Hstore(self.read_hstore_body()?)),
+            // v7.17.0 Phase 3.P0-40: 2D arrays dense body.
+            DataType::IntArray2D => Ok(Value::IntArray2D(self.read_int_2d_body()?)),
+            DataType::BigIntArray2D => Ok(Value::BigIntArray2D(self.read_bigint_2d_body()?)),
+            DataType::TextArray2D => Ok(Value::TextArray2D(self.read_text_2d_body()?)),
+            // v7.17.0 Phase 3.P0-38: range dense body. Element
+            // type is determined by the surrounding RangeKind.
+            DataType::Range(kind) => {
+                let flags = self.read_u8()?;
+                let empty = flags & 0b0000_0001 != 0;
+                let has_lower = flags & 0b0000_0010 != 0;
+                let has_upper = flags & 0b0000_0100 != 0;
+                let lower_inc = flags & 0b0000_1000 != 0;
+                let upper_inc = flags & 0b0001_0000 != 0;
+                let lower = if has_lower {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                let upper = if has_upper {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                Ok(Value::Range {
+                    kind,
+                    lower,
+                    upper,
+                    lower_inc,
+                    upper_inc,
+                    empty,
+                })
+            }
         }
+    }
+
+    /// v7.17.0 Phase 3.P0-40 — read a 2D INT array body emitted
+    /// by `write_int_2d_body`.
+    fn read_int_2d_body(&mut self) -> Result<Vec<Vec<Option<i32>>>, StorageError> {
+        let nrows = self.read_u32()? as usize;
+        let ncols = self.read_u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                let null = self.read_u8()?;
+                row.push(if null == 1 { None } else { Some(self.read_i32()?) });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// v7.17.0 Phase 3.P0-40 — read a 2D BIGINT array body.
+    fn read_bigint_2d_body(&mut self) -> Result<Vec<Vec<Option<i64>>>, StorageError> {
+        let nrows = self.read_u32()? as usize;
+        let ncols = self.read_u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                let null = self.read_u8()?;
+                row.push(if null == 1 { None } else { Some(self.read_i64()?) });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// v7.17.0 Phase 3.P0-40 — read a 2D TEXT array body. Each
+    /// cell is `[u8 null_flag][if non-null: u32 len + utf-8 bytes]`.
+    fn read_text_2d_body(&mut self) -> Result<Vec<Vec<Option<String>>>, StorageError> {
+        let nrows = self.read_u32()? as usize;
+        let ncols = self.read_u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                let null = self.read_u8()?;
+                if null == 1 {
+                    row.push(None);
+                } else {
+                    let l = self.read_u32()? as usize;
+                    let bytes = self.take(l)?.to_vec();
+                    let s = String::from_utf8(bytes).map_err(|_| {
+                        StorageError::Corrupt("2D TEXT cell is not valid UTF-8".into())
+                    })?;
+                    row.push(Some(s));
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// v7.17.0 Phase 3.P0-39 — read a hstore body emitted by
+    /// `write_hstore_body`.
+    fn read_hstore_body(&mut self) -> Result<Vec<(String, Option<String>)>, StorageError> {
+        let count = self.read_u32()? as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let klen = self.read_u32()? as usize;
+            let k_bytes = self.take(klen)?.to_vec();
+            let k = String::from_utf8(k_bytes).map_err(|_| {
+                StorageError::Corrupt("hstore key is not valid UTF-8".into())
+            })?;
+            let has_val = self.read_u8()? != 0;
+            let v = if has_val {
+                let vlen = self.read_u32()? as usize;
+                let v_bytes = self.take(vlen)?.to_vec();
+                Some(String::from_utf8(v_bytes).map_err(|_| {
+                    StorageError::Corrupt("hstore value is not valid UTF-8".into())
+                })?)
+            } else {
+                None
+            };
+            out.push((k, v));
+        }
+        Ok(out)
     }
 
     /// v7.12.0 — read a tsvector body emitted by `write_tsvector_body`.
@@ -6949,6 +9235,65 @@ impl<'a> Cursor<'a> {
             18 => Ok(Value::TsVector(self.read_tsvector_body()?)),
             // v7.12.0: tag 19 — tsquery.
             19 => Ok(Value::TsQuery(self.read_tsquery_body()?)),
+            // v7.17.0: tag 20 — UUID. Raw 16 bytes.
+            20 => {
+                let s = self.take(16)?;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(s);
+                Ok(Value::Uuid(b))
+            }
+            // v7.17.0 Phase 3.P0-32: tag 21 — TIME. i64 LE.
+            21 => Ok(Value::Time(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-33: tag 22 — YEAR. u16 LE.
+            22 => Ok(Value::Year(self.read_u16()?)),
+            // v7.17.0 Phase 3.P0-34: tag 23 — TIMETZ. i64 LE us +
+            // i32 LE offset_secs.
+            23 => {
+                let us = self.read_i64()?;
+                let offset_secs = self.read_i32()?;
+                Ok(Value::TimeTz { us, offset_secs })
+            }
+            // v7.17.0 Phase 3.P0-35: tag 24 — MONEY. i64 LE cents.
+            24 => Ok(Value::Money(self.read_i64()?)),
+            // v7.17.0 Phase 3.P0-39: tag 26 — Hstore. Body shape
+            // == read_hstore_body.
+            26 => Ok(Value::Hstore(self.read_hstore_body()?)),
+            // v7.17.0 Phase 3.P0-40: tag 27/28/29 — 2D arrays.
+            27 => Ok(Value::IntArray2D(self.read_int_2d_body()?)),
+            28 => Ok(Value::BigIntArray2D(self.read_bigint_2d_body()?)),
+            29 => Ok(Value::TextArray2D(self.read_text_2d_body()?)),
+            // v7.17.0 Phase 3.P0-38: tag 25 — Range.
+            // [u8 RangeKind tag][u8 flags][opt lower][opt upper].
+            25 => {
+                let kt = self.read_u8()?;
+                let kind = RangeKind::from_tag(kt).ok_or_else(|| {
+                    StorageError::Corrupt(format!("unknown RangeKind tag: {kt}"))
+                })?;
+                let flags = self.read_u8()?;
+                let empty = flags & 0b0000_0001 != 0;
+                let has_lower = flags & 0b0000_0010 != 0;
+                let has_upper = flags & 0b0000_0100 != 0;
+                let lower_inc = flags & 0b0000_1000 != 0;
+                let upper_inc = flags & 0b0001_0000 != 0;
+                let lower = if has_lower {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                let upper = if has_upper {
+                    Some(alloc::boxed::Box::new(self.read_value()?))
+                } else {
+                    None
+                };
+                Ok(Value::Range {
+                    kind,
+                    lower,
+                    upper,
+                    lower_inc,
+                    upper_inc,
+                    empty,
+                })
+            }
             other => Err(StorageError::Corrupt(format!("unknown value tag: {other}"))),
         }
     }
@@ -7385,7 +9730,8 @@ mod tests {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 panic!("expected NSW")
             }
         };
@@ -7750,7 +10096,8 @@ mod tests {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 panic!("expected NSW")
             }
         };
@@ -7761,7 +10108,8 @@ mod tests {
             IndexKind::BTree(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
-            | IndexKind::GinTrgm(_) => {
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => {
                 panic!("expected NSW")
             }
         };
@@ -8507,6 +10855,10 @@ mod tests {
                     IndexKind::GinTrgm(_) => panic!(
                         "v8 catalog writer cannot serialise trigram-GIN — \
                          tests with trgm indices must use the current writer"
+                    ),
+                    IndexKind::GinFulltext(_) => panic!(
+                        "v8 catalog writer cannot serialise fulltext-GIN — \
+                         tests with FULLTEXT KEY must use the current writer"
                     ),
                 }
             }

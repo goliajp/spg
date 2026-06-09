@@ -20,6 +20,13 @@ use alloc::vec::Vec;
 
 const SALT_LEN: usize = 16;
 const HASH_LEN: usize = 32;
+/// v7.17.0 Phase 3.P0-71 — length of SHA1(SHA1(password)) stored
+/// per user for `mysql_native_password` auth verification.
+pub const MYSQL_NATIVE_HASH_LEN: usize = 20;
+/// v7.17.0 Phase 3.P0-72 — length of SHA256(SHA256(password))
+/// stored per user for `caching_sha2_password` auth
+/// verification (the MySQL 8.0 default plugin).
+pub const CACHING_SHA2_HASH_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -74,6 +81,22 @@ pub struct UserRecord {
     /// snapshot); the PG-wire layer falls back to
     /// `CleartextPassword` for those users.
     scram: Option<ScramSecrets>,
+    /// v7.17.0 Phase 3.P0-71: SHA1(SHA1(password)) — the
+    /// `mysql.user.authentication_string` shape for the
+    /// `mysql_native_password` plugin. Computed at create /
+    /// set_password time alongside the BLAKE3 hash and the
+    /// SCRAM verifier so the MySQL-wire shim doesn't need
+    /// plaintext to verify. `None` for users loaded from a
+    /// pre-v7.17.0 snapshot — the MySQL-wire shim rejects
+    /// those with Access Denied until the password is reset.
+    mysql_native: Option<[u8; MYSQL_NATIVE_HASH_LEN]>,
+    /// v7.17.0 Phase 3.P0-72: SHA256(SHA256(password)) — the
+    /// `mysql.user.authentication_string` shape for MySQL 8.0+'s
+    /// default `caching_sha2_password` plugin. Computed at the
+    /// same time as `mysql_native`. The MySQL-wire shim's fast
+    /// path uses this for the SHA256-XOR proof verification —
+    /// the public-key-RSA full-auth path is a v7.18 carve-out.
+    caching_sha2: Option<[u8; CACHING_SHA2_HASH_LEN]>,
 }
 
 /// SCRAM-SHA-256 stored credentials per RFC 5802 §5.
@@ -100,6 +123,130 @@ impl UserRecord {
     pub const fn scram(&self) -> Option<&ScramSecrets> {
         self.scram.as_ref()
     }
+
+    /// v7.17.0 Phase 3.P0-71: borrow the stored
+    /// `mysql_native_password` verifier (SHA1(SHA1(password)))
+    /// for the MySQL-wire shim.
+    pub const fn mysql_native(&self) -> Option<&[u8; MYSQL_NATIVE_HASH_LEN]> {
+        self.mysql_native.as_ref()
+    }
+
+    /// v7.17.0 Phase 3.P0-72: borrow the stored
+    /// `caching_sha2_password` verifier (SHA256(SHA256(password)))
+    /// for the MySQL-wire shim's fast-path auth.
+    pub const fn caching_sha2(&self) -> Option<&[u8; CACHING_SHA2_HASH_LEN]> {
+        self.caching_sha2.as_ref()
+    }
+
+    /// v7.17.0 Phase 3.P0-72 — verify a client
+    /// `caching_sha2_password` fast-path response.
+    ///
+    /// Protocol: same XOR shape as `mysql_native_password` but
+    /// with SHA-256 instead of SHA-1:
+    /// `client_response = SHA256(password) XOR SHA256(scramble
+    /// || SHA256(SHA256(password)))`. Server reconstructs and
+    /// checks `SHA256(reconstructed) == stored_hash`.
+    ///
+    /// Full-auth RSA fallback (when the cache misses) is a
+    /// v7.18 carve-out — clients connecting over plaintext
+    /// without a cached entry will see Access Denied from the
+    /// shim until that lands.
+    pub fn verify_caching_sha2_password(
+        &self,
+        scramble: &[u8],
+        client_response: &[u8],
+    ) -> bool {
+        let Some(stored) = self.caching_sha2 else {
+            return false;
+        };
+        if client_response.len() != CACHING_SHA2_HASH_LEN {
+            return false;
+        }
+        if scramble.len() != 20 {
+            return false;
+        }
+        let mut buf = [0u8; 20 + CACHING_SHA2_HASH_LEN];
+        buf[..20].copy_from_slice(scramble);
+        buf[20..].copy_from_slice(&stored);
+        let mask = sha256_bytes(&buf);
+        let mut recovered = [0u8; CACHING_SHA2_HASH_LEN];
+        for i in 0..CACHING_SHA2_HASH_LEN {
+            recovered[i] = client_response[i] ^ mask[i];
+        }
+        let candidate = sha256_bytes(&recovered);
+        constant_time_eq(&candidate, &stored)
+    }
+
+    /// v7.17.0 Phase 3.P0-71 — verify a client
+    /// `mysql_native_password` auth response.
+    ///
+    /// Protocol: the client sends a 20-byte response
+    /// `client_proof = SHA1(password) XOR SHA1(scramble ||
+    /// SHA1(SHA1(password)))`. The server reconstructs
+    /// `SHA1(password) = client_proof XOR SHA1(scramble ||
+    /// stored_hash)` and verifies `SHA1(reconstructed) ==
+    /// stored_hash`. Returns false if the user has no stored
+    /// hash (loaded from a pre-v7.17 snapshot — the operator
+    /// has to reset the password to re-populate it).
+    pub fn verify_mysql_native_password(
+        &self,
+        scramble: &[u8],
+        client_response: &[u8],
+    ) -> bool {
+        let Some(stored) = self.mysql_native else {
+            return false;
+        };
+        if client_response.len() != MYSQL_NATIVE_HASH_LEN {
+            return false;
+        }
+        if scramble.len() != 20 {
+            return false;
+        }
+        let mut buf = [0u8; 40];
+        buf[..20].copy_from_slice(scramble);
+        buf[20..].copy_from_slice(&stored);
+        let mask = sha1_bytes(&buf);
+        let mut recovered = [0u8; MYSQL_NATIVE_HASH_LEN];
+        for i in 0..MYSQL_NATIVE_HASH_LEN {
+            recovered[i] = client_response[i] ^ mask[i];
+        }
+        let candidate = sha1_bytes(&recovered);
+        constant_time_eq_sha1(&candidate, &stored)
+    }
+}
+
+/// Compute the `mysql_native_password` stored hash =
+/// SHA1(SHA1(password)). Public so user-creation paths can
+/// populate the field at the same moment they have cleartext.
+#[must_use]
+pub fn compute_mysql_native_hash(password: &str) -> [u8; MYSQL_NATIVE_HASH_LEN] {
+    let inner = sha1_bytes(password.as_bytes());
+    sha1_bytes(&inner)
+}
+
+/// v7.17.0 Phase 3.P0-72 — compute the `caching_sha2_password`
+/// stored hash = SHA256(SHA256(password)). Public for the same
+/// reason as the mysql_native variant.
+#[must_use]
+pub fn compute_caching_sha2_hash(password: &str) -> [u8; CACHING_SHA2_HASH_LEN] {
+    let inner = sha256_bytes(password.as_bytes());
+    sha256_bytes(&inner)
+}
+
+fn sha1_bytes(input: &[u8]) -> [u8; MYSQL_NATIVE_HASH_LEN] {
+    use sha1::Digest;
+    let digest = sha1::Sha1::digest(input);
+    let mut out = [0u8; MYSQL_NATIVE_HASH_LEN];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn sha256_bytes(input: &[u8]) -> [u8; CACHING_SHA2_HASH_LEN] {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(input);
+    let mut out = [0u8; CACHING_SHA2_HASH_LEN];
+    out.copy_from_slice(&digest);
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +296,16 @@ impl UserStore {
 
     /// Stable iteration in name order — used by SHOW USERS and the
     /// snapshot writer.
+    /// v7.17.0 Phase 3.P0-71: look up a user by name. Returns
+    /// `None` for unknown names; the caller decides whether to
+    /// surface "Access Denied" or "User not found" (the
+    /// MySQL-wire shim picks the former to avoid leaking user
+    /// existence to unauthenticated clients).
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&UserRecord> {
+        self.users.get(name)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&str, &UserRecord)> {
         self.users.iter().map(|(k, v)| (k.as_str(), v))
     }
@@ -170,6 +327,8 @@ impl UserStore {
             return Err(UserError::Exists);
         }
         let hash = derive_hash(&salt, password);
+        let mysql_native = Some(compute_mysql_native_hash(password));
+        let caching_sha2 = Some(compute_caching_sha2_hash(password));
         self.users.insert(
             name.to_string(),
             UserRecord {
@@ -177,6 +336,8 @@ impl UserStore {
                 salt,
                 hash,
                 scram: None,
+                mysql_native,
+                caching_sha2,
             },
         );
         Ok(())
@@ -260,6 +421,19 @@ fn constant_time_eq(a: &[u8; HASH_LEN], b: &[u8; HASH_LEN]) -> bool {
     diff == 0
 }
 
+/// v7.17.0 Phase 3.P0-71 — same idea, sized for the SHA-1 digest
+/// used by `mysql_native_password`.
+fn constant_time_eq_sha1(
+    a: &[u8; MYSQL_NATIVE_HASH_LEN],
+    b: &[u8; MYSQL_NATIVE_HASH_LEN],
+) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..MYSQL_NATIVE_HASH_LEN {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 // ---- snapshot encoding ----
 //
 // Layout (after a magic + version envelope handled at Engine level):
@@ -285,11 +459,23 @@ fn constant_time_eq(a: &[u8; HASH_LEN], b: &[u8; HASH_LEN]) -> bool {
 // switch is unambiguous.
 
 const SCRAM_FORMAT_MARKER: u8 = 0xff;
+/// v7.17.0 Phase 3.P0-71 — v3 format marker. v3 extends v2 by
+/// appending an optional `mysql_native_password` SHA1(SHA1(pwd))
+/// per user.
+const MYSQL_NATIVE_FORMAT_MARKER: u8 = 0xfe;
+/// v7.17.0 Phase 3.P0-72 — v4 format marker. v4 extends v3 by
+/// also appending an optional `caching_sha2_password`
+/// SHA256(SHA256(pwd)) per user. Writer always emits v4;
+/// reader understands v1 / v2 / v3 / v4.
+const CACHING_SHA2_FORMAT_MARKER: u8 = 0xfd;
 
 pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
-    let per_user_floor = 2 + 16 + 1 + SALT_LEN + HASH_LEN + 1;
+    let per_user_floor = 2 + 16 + 1 + SALT_LEN + HASH_LEN + 1 + 1;
     let mut out = Vec::with_capacity(1 + 4 + store.len() * per_user_floor);
-    out.push(SCRAM_FORMAT_MARKER);
+    // v7.17.0 Phase 3.P0-72 — bump on-disk format to v4 so the
+    // per-user `caching_sha2_password` hash trails the
+    // mysql_native block.
+    out.push(CACHING_SHA2_FORMAT_MARKER);
     out.extend_from_slice(
         &u32::try_from(store.users.len())
             .expect("≤ 4G users")
@@ -314,6 +500,20 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
                 out.extend_from_slice(&s.salt);
                 out.extend_from_slice(&s.stored_key);
                 out.extend_from_slice(&s.server_key);
+            }
+        }
+        match &rec.mysql_native {
+            None => out.push(0),
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(h);
+            }
+        }
+        match &rec.caching_sha2 {
+            None => out.push(0),
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(h);
             }
         }
     }
@@ -348,16 +548,29 @@ fn take<'a>(p: &mut usize, n: usize, buf: &'a [u8]) -> Result<&'a [u8], UserDese
 
 pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserializeError> {
     let mut p = 0usize;
-    // v1 → starts with a u32 user_count (LO byte rarely 0xff in
-    // practice). v2 → starts with the 0xff marker, then u32 count.
-    // Probing the first byte before advancing keeps the v1 path
-    // intact for old snapshots.
-    let scram_present_inline = if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
-        p += 1;
-        true
-    } else {
-        false
-    };
+    // v1 → starts with a u32 user_count (LO byte rarely 0xfd /
+    // 0xfe / 0xff in practice).
+    // v2 → 0xff marker (SCRAM_FORMAT_MARKER) then u32 count.
+    // v3 → 0xfe marker (MYSQL_NATIVE_FORMAT_MARKER) then u32
+    //      count; per-user payload adds a 1-byte flag + 20-byte
+    //      SHA1(SHA1(pwd)) tail for `mysql_native_password`.
+    // v4 → 0xfd marker (CACHING_SHA2_FORMAT_MARKER) then u32
+    //      count; per-user payload further adds 1-byte flag +
+    //      32-byte SHA256(SHA256(pwd)) tail for
+    //      `caching_sha2_password`.
+    let (scram_present_inline, mysql_native_present_inline, caching_sha2_present_inline) =
+        if !buf.is_empty() && buf[0] == CACHING_SHA2_FORMAT_MARKER {
+            p += 1;
+            (true, true, true)
+        } else if !buf.is_empty() && buf[0] == MYSQL_NATIVE_FORMAT_MARKER {
+            p += 1;
+            (true, true, false)
+        } else if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
+            p += 1;
+            (true, false, false)
+        } else {
+            (false, false, false)
+        };
     let count_bytes = take(&mut p, 4, buf)?;
     let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
     let mut store = UserStore::new();
@@ -402,6 +615,30 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         } else {
             None
         };
+        let mysql_native = if mysql_native_present_inline {
+            let flag = take(&mut p, 1, buf)?[0];
+            if flag == 1 {
+                let mut h = [0u8; MYSQL_NATIVE_HASH_LEN];
+                h.copy_from_slice(take(&mut p, MYSQL_NATIVE_HASH_LEN, buf)?);
+                Some(h)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let caching_sha2 = if caching_sha2_present_inline {
+            let flag = take(&mut p, 1, buf)?[0];
+            if flag == 1 {
+                let mut h = [0u8; CACHING_SHA2_HASH_LEN];
+                h.copy_from_slice(take(&mut p, CACHING_SHA2_HASH_LEN, buf)?);
+                Some(h)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         store.users.insert(
             name,
             UserRecord {
@@ -409,6 +646,8 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
                 salt,
                 hash,
                 scram,
+                mysql_native,
+                caching_sha2,
             },
         );
     }
@@ -476,12 +715,129 @@ mod tests {
 
     #[test]
     fn empty_store_round_trip() {
-        // v4.8: format prefix byte (0xff) + zero u32 count.
+        // v7.17.0 Phase 3.P0-72: writer flipped to v4 marker (0xfd).
         let s = UserStore::new();
         let bytes = serialize_users(&s);
-        assert_eq!(bytes, [0xff, 0, 0, 0, 0]);
+        assert_eq!(bytes, [0xfd, 0, 0, 0, 0]);
         let s2 = deserialize_users(&bytes).unwrap();
         assert!(s2.is_empty());
+    }
+
+    #[test]
+    fn v2_blob_still_loads_with_mysql_native_none() {
+        // v7.17.0 Phase 3.P0-71: cross-version compat — readers
+        // must still parse v2-shaped blobs written before the v3
+        // bump and surface `mysql_native = None` for those
+        // users so the operator knows to reset the password.
+        let mut buf = Vec::new();
+        buf.push(0xff); // v2 marker
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&3u16.to_le_bytes());
+        buf.extend_from_slice(b"old");
+        buf.push(0); // role = admin
+        buf.extend_from_slice(&[1u8; SALT_LEN]);
+        buf.extend_from_slice(&[2u8; HASH_LEN]);
+        buf.push(0); // no SCRAM
+        let s = deserialize_users(&buf).unwrap();
+        let rec = s.get("old").expect("v2 user loads");
+        assert!(rec.mysql_native().is_none());
+    }
+}
+
+#[cfg(test)]
+mod p0_71_tests {
+    use super::*;
+
+    #[test]
+    fn create_populates_mysql_native_hash() {
+        let mut s = UserStore::new();
+        s.create("alice", "wonderland", Role::Admin, [9u8; SALT_LEN])
+            .unwrap();
+        let rec = s.get("alice").unwrap();
+        let expected = compute_mysql_native_hash("wonderland");
+        assert_eq!(rec.mysql_native(), Some(&expected));
+    }
+
+    #[test]
+    fn verify_mysql_native_password_accepts_correct_response() {
+        // Build a fake scramble + the canonical client response.
+        let mut s = UserStore::new();
+        s.create("bob", "secret", Role::Admin, [3u8; SALT_LEN]).unwrap();
+        let rec = s.get("bob").unwrap();
+        let scramble: [u8; 20] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
+        // Compute the same response the client would.
+        let sha1_pwd = sha1_bytes(b"secret");
+        let sha1_sha1_pwd = sha1_bytes(&sha1_pwd);
+        let mut concat = [0u8; 40];
+        concat[..20].copy_from_slice(&scramble);
+        concat[20..].copy_from_slice(&sha1_sha1_pwd);
+        let mask = sha1_bytes(&concat);
+        let response: [u8; MYSQL_NATIVE_HASH_LEN] =
+            core::array::from_fn(|i| sha1_pwd[i] ^ mask[i]);
+        assert!(rec.verify_mysql_native_password(&scramble, &response));
+        // Tamper with one byte → rejected.
+        let mut bad = response;
+        bad[0] ^= 1;
+        assert!(!rec.verify_mysql_native_password(&scramble, &bad));
+    }
+
+    #[test]
+    fn v4_serialise_round_trips_both_mysql_native_and_caching_sha2() {
+        let mut s = UserStore::new();
+        s.create("alice", "wonderland", Role::Admin, [4u8; SALT_LEN])
+            .unwrap();
+        let bytes = serialize_users(&s);
+        assert_eq!(bytes[0], 0xfd, "v4 marker advertised");
+        let s2 = deserialize_users(&bytes).unwrap();
+        let r1 = s.get("alice").unwrap();
+        let r2 = s2.get("alice").unwrap();
+        assert_eq!(r1.mysql_native(), r2.mysql_native());
+        assert_eq!(r1.caching_sha2(), r2.caching_sha2());
+        // Sanity: both verifiers are populated for a fresh user.
+        assert!(r1.mysql_native().is_some());
+        assert!(r1.caching_sha2().is_some());
+    }
+
+    #[test]
+    fn v3_blob_still_loads_with_caching_sha2_none() {
+        // v7.17.0 Phase 3.P0-72: backward compat — readers must
+        // still parse v3-shaped blobs (mysql_native present,
+        // caching_sha2 missing) written before the v4 bump.
+        let mut buf = Vec::new();
+        buf.push(0xfe); // v3 marker
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&5u16.to_le_bytes());
+        buf.extend_from_slice(b"older");
+        buf.push(0); // role = admin
+        buf.extend_from_slice(&[1u8; SALT_LEN]);
+        buf.extend_from_slice(&[2u8; HASH_LEN]);
+        buf.push(0); // no SCRAM
+        buf.push(1); // mysql_native flag = present
+        buf.extend_from_slice(&[3u8; MYSQL_NATIVE_HASH_LEN]);
+        let s = deserialize_users(&buf).unwrap();
+        let rec = s.get("older").unwrap();
+        assert!(rec.mysql_native().is_some());
+        assert!(rec.caching_sha2().is_none());
+    }
+
+    #[test]
+    fn verify_caching_sha2_password_accepts_correct_response() {
+        let mut s = UserStore::new();
+        s.create("bob", "secret", Role::Admin, [3u8; SALT_LEN]).unwrap();
+        let rec = s.get("bob").unwrap();
+        let scramble: [u8; 20] = core::array::from_fn(|i| (i as u8).wrapping_mul(11));
+        let sha_pwd = sha256_bytes(b"secret");
+        let sha_sha_pwd = sha256_bytes(&sha_pwd);
+        let mut concat = [0u8; 20 + CACHING_SHA2_HASH_LEN];
+        concat[..20].copy_from_slice(&scramble);
+        concat[20..].copy_from_slice(&sha_sha_pwd);
+        let mask = sha256_bytes(&concat);
+        let response: [u8; CACHING_SHA2_HASH_LEN] =
+            core::array::from_fn(|i| sha_pwd[i] ^ mask[i]);
+        assert!(rec.verify_caching_sha2_password(&scramble, &response));
+        let mut bad = response;
+        bad[0] ^= 1;
+        assert!(!rec.verify_caching_sha2_password(&scramble, &bad));
     }
 
     #[test]

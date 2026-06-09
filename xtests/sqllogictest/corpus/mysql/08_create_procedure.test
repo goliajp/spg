@@ -1,0 +1,25 @@
+# v7.17.0 Phase 4.2 — MySQL CREATE PROCEDURE consumed as Empty
+# no-op so mysqldump stored-routine bodies (with internal `;`,
+# `@var` session variables, nested BEGIN/END, IF/END IF / LOOP /
+# WHILE blocks) load through without parser errors. SPG has no
+# procedure runtime so the body has no behavioural effect.
+
+# Empty body.
+statement ok
+CREATE PROCEDURE noop() BEGIN END
+
+# SET @var inside body.
+statement ok
+CREATE PROCEDURE foo() BEGIN SET @x = 1; SET @y = @x + 1; END
+
+# Nested BEGIN/END.
+statement ok
+CREATE PROCEDURE nested() BEGIN SET @outer = 1; BEGIN SET @inner = 2; END; END
+
+# IF / END IF inside body — END IF is the inner close.
+statement ok
+CREATE PROCEDURE conditional() BEGIN IF 1 > 0 THEN SET @y = 1; END IF; END
+
+# Procedure args.
+statement ok
+CREATE PROCEDURE add_one(IN val INT) BEGIN SET @result = val + 1; END

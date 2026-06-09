@@ -1,0 +1,87 @@
+# v7.17.0 Phase 3.P0-46 — MySQL TINYINT(1) INSERT-time int → bool.
+#
+# Phase 4.3 (`06_tinyint_bool.test`) made `TINYINT(1)` classify as
+# BOOL at CREATE-TABLE time. mysqldump emits boolean values as the
+# integer literals `0` / `1`, so the INSERT path has to coerce them
+# silently. Truthiness is MySQL-shaped: any non-zero is true.
+
+# Integer 0 / 1 literals land in the TINYINT(1) (BOOL-typed) column.
+statement ok
+CREATE TABLE flags (id INT NOT NULL, active TINYINT(1) NOT NULL)
+
+statement ok
+INSERT INTO flags VALUES (1, 0), (2, 1), (3, 1)
+
+query II rowsort
+SELECT id, active::INT FROM flags
+----
+1
+0
+2
+1
+3
+1
+
+# Non-zero is truthy (matches `mysql>` shell behaviour).
+statement ok
+CREATE TABLE truthy (id INT NOT NULL, flag TINYINT(1) NOT NULL)
+
+statement ok
+INSERT INTO truthy VALUES (1, 2), (2, 99), (3, -1)
+
+query II rowsort
+SELECT id, flag::INT FROM truthy
+----
+1
+1
+2
+1
+3
+1
+
+# UPDATE with int literal also coerces.
+statement ok
+CREATE TABLE toggles (id INT NOT NULL, active TINYINT(1) NOT NULL)
+
+statement ok
+INSERT INTO toggles VALUES (1, 0)
+
+statement ok
+UPDATE toggles SET active = 1 WHERE id = 1
+
+query I
+SELECT active::INT FROM toggles WHERE id = 1
+----
+1
+
+# NULL stays NULL on a nullable column.
+statement ok
+CREATE TABLE maybe (id INT NOT NULL, flag TINYINT(1) NULL)
+
+statement ok
+INSERT INTO maybe VALUES (1, NULL), (2, 0), (3, 1)
+
+query II rowsort
+SELECT id, flag FROM maybe
+----
+1
+NULL
+2
+0
+3
+1
+
+# Phase 4.3 boolean literal path is unaffected (regression check).
+statement ok
+CREATE TABLE legacy (id INT NOT NULL, active TINYINT(1) NOT NULL)
+
+statement ok
+INSERT INTO legacy VALUES (1, TRUE), (2, FALSE)
+
+query II rowsort
+SELECT id, active::INT FROM legacy
+----
+1
+1
+2
+0

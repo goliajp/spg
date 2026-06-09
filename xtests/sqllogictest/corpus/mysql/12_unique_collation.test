@@ -1,0 +1,56 @@
+# v7.17.0 Phase 3.P0-45 — UNIQUE constraint honours column collation.
+#
+# Phase 2.5b (`d3c731c`) wired the `Collation` field but only GROUP
+# BY / ORDER BY / `=` paths consulted it; the UNIQUE-constraint
+# enforcement still compared Text bytes. mysqldump-restored tables
+# with `VARCHAR COLLATE utf8mb4_0900_ai_ci UNIQUE` let case-variant
+# duplicates coexist, which MySQL would reject.
+
+# Inline UNIQUE on a ci column rejects case-variant inserts.
+statement ok
+CREATE TABLE names (s TEXT COLLATE "case_insensitive" NOT NULL UNIQUE)
+
+statement ok
+INSERT INTO names VALUES ('Foo')
+
+statement error
+INSERT INTO names VALUES ('FOO')
+
+statement error
+INSERT INTO names VALUES ('foo')
+
+# Distinct (non-case-variant) inserts pass.
+statement ok
+INSERT INTO names VALUES ('bar'), ('Baz')
+
+# Binary collation (default) keeps case-sensitive UNIQUE.
+statement ok
+CREATE TABLE bin_names (s TEXT NOT NULL UNIQUE)
+
+statement ok
+INSERT INTO bin_names VALUES ('Foo'), ('FOO'), ('foo')
+
+# Composite UNIQUE applies per-column collation.
+statement ok
+CREATE TABLE composite (
+    a TEXT NOT NULL,
+    b TEXT COLLATE "case_insensitive" NOT NULL,
+    UNIQUE (a, b)
+)
+
+statement ok
+INSERT INTO composite VALUES ('x', 'Foo')
+
+statement error
+INSERT INTO composite VALUES ('x', 'FOO')
+
+# Different leading column lets the case-variant b coexist.
+statement ok
+INSERT INTO composite VALUES ('y', 'FOO')
+
+# Within-batch case duplicate also rejected.
+statement ok
+CREATE TABLE batch (s TEXT COLLATE "case_insensitive" NOT NULL UNIQUE)
+
+statement error
+INSERT INTO batch VALUES ('Foo'), ('foo')

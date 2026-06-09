@@ -1,0 +1,21 @@
+# v7.17.0 Phase 3.P0-52 — pg_catalog.pg_namespace virtual view.
+
+query I
+SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public'
+----
+2200
+
+query I
+SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'pg_catalog'
+----
+11
+
+query I
+SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'information_schema'
+----
+13000
+
+query I
+SELECT COUNT(*) FROM pg_catalog.pg_namespace
+----
+3

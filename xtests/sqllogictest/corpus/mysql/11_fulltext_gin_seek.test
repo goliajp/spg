@@ -1,0 +1,68 @@
+# v7.17.0 Phase 3.P0-44 — MATCH AGAINST routes through GIN posting-list seek.
+#
+# Phase 2.2 (`06_fulltext.test` covers correctness via desugar; the
+# planner full-scanned). P0-44 hooks the seek arm to recognise the
+# `to_tsvector(col)` wrapper produced by the desugar and the
+# `IndexKind::GinFulltext` index built by `FULLTEXT KEY`, plus a new
+# OR-fold walker so multi-column MATCH AGAINST also accelerates.
+#
+# These tests pin the SQL-surface for the accelerated path. They
+# don't assert "the planner used the index" (no explain surface) —
+# they assert behaviour stays correct on the shapes the planner now
+# walks. Correctness mirrors what Phase 2.2 produced via full-scan.
+
+# Single-column MATCH AGAINST with single-term against FULLTEXT KEY.
+statement ok
+CREATE TABLE articles (
+    id INT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    FULLTEXT KEY ft_title (title),
+    FULLTEXT KEY ft_body (body)
+)
+
+statement ok
+INSERT INTO articles VALUES
+    (1, 'PostgreSQL guide', 'A friendly tour of PG'),
+    (2, 'MySQL basics', 'SELECT queries explained'),
+    (3, 'SPG performance', 'Vector search benchmarks'),
+    (4, 'Quick fox', 'The quick brown fox jumps over the lazy dog'),
+    (5, 'Rust async', 'tokio runtime internals'),
+    (6, 'Untitled', 'A digest of PostgreSQL internals')
+
+query I rowsort
+SELECT id FROM articles WHERE MATCH(title) AGAINST ('PostgreSQL')
+----
+1
+
+# Multi-column MATCH AGAINST OR-folds across both FULLTEXT indexes.
+query I rowsort
+SELECT id FROM articles WHERE MATCH(title, body) AGAINST ('PostgreSQL')
+----
+1
+6
+
+# Single-term hit in body only.
+query I rowsort
+SELECT id FROM articles WHERE MATCH(body) AGAINST ('fox')
+----
+4
+
+# Multi-term AGAINST (plainto_tsquery ANDs the words).
+# 'queries' AND 'explained' both live in row 2's body → 1 row.
+query I rowsort
+SELECT id FROM articles WHERE MATCH(body) AGAINST ('queries explained')
+----
+2
+
+# Term that doesn't index anywhere returns empty.
+query I rowsort
+SELECT id FROM articles WHERE MATCH(title, body) AGAINST ('nonexistent')
+----
+
+# AND-combined with a non-FULLTEXT predicate — Phase 2.2 AND walker
+# already keeps the FULLTEXT seek route.
+query I rowsort
+SELECT id FROM articles WHERE MATCH(body) AGAINST ('fox') AND id = 4
+----
+4

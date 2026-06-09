@@ -162,7 +162,7 @@ pub use crate::query_result::SpgQueryResult;
 pub use crate::row::SpgRow;
 pub use crate::statement::SpgStatement;
 pub use crate::transaction::SpgTransactionManager;
-pub use crate::type_info::SpgTypeInfo;
+pub use crate::type_info::{Kind, SpgTypeInfo};
 pub use crate::value::{SpgValue, SpgValueRef};
 
 // Re-export the embedded engine's owned-value type so consumers
