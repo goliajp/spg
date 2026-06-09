@@ -173,6 +173,12 @@ const WAL_V4_NO_CLOCK: i64 = i64::MIN;
 /// v7.18 — extra header bytes after the type byte in a v4 record:
 /// 8 bytes commit_lsn (u64 LE) + 8 bytes commit_unix_us (i64 LE).
 const WAL_V4_EXTRA_HEADER: usize = 16;
+/// v7.18 PITR — checkpoint anchor record written to the WAL *before*
+/// the snapshot file replaces the on-disk catalog. Carries the
+/// (lsn, ts, snapshot_path) triple so restore tooling can find the
+/// matching base snapshot without scanning the filesystem. Replay
+/// dispatch skips it (same as the v3 durability marker).
+const WAL_V4_TYPE_CHECKPOINT_MARKER: u8 = 0x11;
 
 /// v7.1 — auto-checkpoint threshold. Once the WAL grows past
 /// this many bytes, the next successful `execute()` call ends
@@ -206,6 +212,48 @@ fn encode_v3_auto_commit(sql: &str) -> Vec<u8> {
     out.extend_from_slice(&crc.to_le_bytes());
     out.push(WAL_V3_TYPE_AUTO_COMMIT_SQL);
     out.extend_from_slice(payload);
+    out
+}
+
+/// v7.18 PITR — encode one v4 `checkpoint_marker` record. Layout:
+///
+/// ```text
+/// [u32 LE (payload_len | WAL_V2_SENTINEL | WAL_V3_FLAG)]
+/// [u32 LE crc32 over (type_byte || payload)]
+/// [u8  type = 0x11]
+/// payload:
+///   [u64 LE checkpoint_lsn]
+///   [i64 LE checkpoint_unix_us  (WAL_V4_NO_CLOCK if no clock)]
+///   [u16 LE snapshot_path_len]
+///   [snapshot_path_bytes]
+/// ```
+///
+/// `payload_len` covers only the payload — keeping the framing
+/// uniform across v3 / v4 record types so torn-write detection in
+/// `replay_wal_into_engine` stays trivial.
+fn encode_v4_checkpoint_marker(
+    checkpoint_lsn: u64,
+    checkpoint_unix_us: i64,
+    snapshot_path: &Path,
+) -> Vec<u8> {
+    let snapshot_bytes = snapshot_path.to_string_lossy().into_owned();
+    let snap_payload = snapshot_bytes.as_bytes();
+    let snap_len_u16: u16 = snap_payload.len().min(u16::MAX as usize) as u16;
+    let mut payload = Vec::with_capacity(8 + 8 + 2 + snap_payload.len());
+    payload.extend_from_slice(&checkpoint_lsn.to_le_bytes());
+    payload.extend_from_slice(&checkpoint_unix_us.to_le_bytes());
+    payload.extend_from_slice(&snap_len_u16.to_le_bytes());
+    payload.extend_from_slice(&snap_payload[..snap_len_u16 as usize]);
+    let mut crc_buf = Vec::with_capacity(1 + payload.len());
+    crc_buf.push(WAL_V4_TYPE_CHECKPOINT_MARKER);
+    crc_buf.extend_from_slice(&payload);
+    let crc = spg_crypto::crc32::crc32(&crc_buf);
+    let header = ((payload.len() as u32) | WAL_V2_SENTINEL | WAL_V3_FLAG).to_le_bytes();
+    let mut out = Vec::with_capacity(4 + 4 + 1 + payload.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.push(WAL_V4_TYPE_CHECKPOINT_MARKER);
+    out.extend_from_slice(&payload);
     out
 }
 
@@ -282,6 +330,13 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
                 WAL_V3_TYPE_AUTO_COMMIT_SQL => {}
                 WAL_V3_TYPE_DURABILITY_CHECKPOINT => {
                     // durability_checkpoint marker — skip, no SQL.
+                    cur += header_len + rec_len;
+                    continue;
+                }
+                WAL_V4_TYPE_CHECKPOINT_MARKER => {
+                    // v7.18 PITR — checkpoint anchor, skip on replay
+                    // (engine state past this point reflects the
+                    // matching snapshot already loaded by the caller).
                     cur += header_len + rec_len;
                     continue;
                 }
@@ -416,6 +471,53 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                     commit_lsn: None,
                     commit_unix_us: None,
                     sql: &[],
+                });
+                cur += header_len + rec_len;
+            }
+            WAL_V4_TYPE_CHECKPOINT_MARKER => {
+                // v7.18 PITR — payload = (lsn u64)(ts i64)(path_len u16)(path bytes).
+                // We surface lsn + ts on the WalRecord; the path lives
+                // in `sql` since the type byte already disambiguates
+                // record meaning and adding a dedicated field would
+                // bloat the iterator return type for every variant.
+                if rec_len < 18 {
+                    return Err(format!(
+                        "WAL parse: checkpoint marker at offset {cur} too short ({rec_len} bytes)"
+                    ));
+                }
+                let lsn = u64::from_le_bytes(
+                    wal_bytes[cur + header_len..cur + header_len + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let ts_raw = i64::from_le_bytes(
+                    wal_bytes[cur + header_len + 8..cur + header_len + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let path_len = u16::from_le_bytes(
+                    wal_bytes[cur + header_len + 16..cur + header_len + 18]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                if rec_len < 18 + path_len {
+                    return Err(format!(
+                        "WAL parse: checkpoint marker at offset {cur} truncated path"
+                    ));
+                }
+                let path_start = cur + header_len + 18;
+                let path_bytes = &wal_bytes[path_start..path_start + path_len];
+                let commit_unix_us = if ts_raw == WAL_V4_NO_CLOCK {
+                    None
+                } else {
+                    Some(ts_raw)
+                };
+                out.push(WalRecord {
+                    offset: cur,
+                    type_byte,
+                    commit_lsn: Some(lsn),
+                    commit_unix_us,
+                    sql: path_bytes,
                 });
                 cur += header_len + rec_len;
             }
@@ -849,6 +951,21 @@ impl Database {
             std::fs::write(&m_tmp, &m_bytes).map_err(io_err)?;
             std::fs::rename(&m_tmp, &m_path).map_err(io_err)?;
         }
+        // v7.18 PITR — append a checkpoint marker BEFORE truncating
+        // so backup tooling that copies the WAL between snapshot
+        // rotations sees the (lsn, ts, snapshot_path) triple that
+        // anchors restore-to-time. The marker rides the WAL's
+        // existing CRC-protected v3 envelope under the new v4 type
+        // byte 0x11; replay dispatch (and `revert_wal_to_seq`)
+        // already skip it. The truncate below then drops both the
+        // SQL records the snapshot superseded AND this marker —
+        // PITR retention work (P4/P6) intercepts the WAL before
+        // this point to archive both pieces together.
+        let marker_lsn = self.commit_lsn.load(Ordering::SeqCst);
+        let marker_ts = wall_clock_micros();
+        let marker = encode_v4_checkpoint_marker(marker_lsn, marker_ts, &p.db_path);
+        p.wal.write_all(&marker).map_err(io_err)?;
+        p.wal.sync_data().map_err(io_err)?;
         p.wal.set_len(0).map_err(io_err)?;
         p.wal.seek(SeekFrom::Start(0)).map_err(io_err)?;
         p.wal.sync_data().map_err(io_err)?;
