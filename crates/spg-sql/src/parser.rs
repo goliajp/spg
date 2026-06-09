@@ -6704,6 +6704,44 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+        // v7.17.0 Phase 3.P0-41 — `LATERAL ( SELECT … )` derived
+        // table. Detect at the head so it claims precedence over
+        // every other table-ref shape (unnest / generate_series /
+        // bare ident); the lateral subquery itself follows the
+        // regular SELECT grammar.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // LATERAL
+            self.advance(); // (
+            // Parse the inner SELECT.
+            let inner = match self.parse_one_statement()? {
+                Statement::Select(s) => s,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected SELECT inside LATERAL ( … ), got {other:?}"
+                    )));
+                }
+            };
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after LATERAL subquery, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let alias_ident = self.parse_optional_alias();
+            let name = alias_ident.clone().unwrap_or_else(|| "lateral".to_string());
+            return Ok(TableRef {
+                name,
+                alias: alias_ident,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: Some(Box::new(inner)),
+            });
+        }
         // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>` set-returning
         // source. Detect at the head before the bare-ident fallback;
         // unnest is not a reserved token.
@@ -6729,6 +6767,7 @@ impl Parser {
                 unnest_expr: Some(Box::new(expr)),
                 unnest_column_aliases,
                 generate_series_args: None,
+                lateral_subquery: None,
             });
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
@@ -6778,6 +6817,7 @@ impl Parser {
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
                 generate_series_args: Some(args),
+                lateral_subquery: None,
             });
         }
         // v7.16.2 — preserve information_schema / pg_catalog
@@ -6841,6 +6881,7 @@ impl Parser {
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
             generate_series_args: None,
+            lateral_subquery: None,
         })
     }
 
