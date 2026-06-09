@@ -9465,6 +9465,36 @@ impl Engine {
                     let (schema, rows) = synth_pg_settings(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.17.0 Phase 3.P0-63 — information_schema.KEY_COLUMN_USAGE.
+                "__spg_info_key_column_usage" => {
+                    let (schema, rows) = synth_info_key_column_usage(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-64 — information_schema.REFERENTIAL_CONSTRAINTS.
+                "__spg_info_referential_constraints" => {
+                    let (schema, rows) =
+                        synth_info_referential_constraints(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-64 — information_schema.STATISTICS.
+                "__spg_info_statistics" => {
+                    let (schema, rows) = synth_info_statistics(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-64 — information_schema.ROUTINES.
+                "__spg_info_routines" => {
+                    let (schema, rows) = synth_info_routines();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-65 — mysql.user / mysql.db.
+                "__spg_mysql_user" => {
+                    let (schema, rows) = synth_mysql_user(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_mysql_db" => {
+                    let (schema, rows) = synth_mysql_db();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "meta view {view:?} is not yet materialisable; \
@@ -10607,6 +10637,221 @@ fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
     (schema, rows)
 }
 
+/// v7.17.0 Phase 3.P0-65 — synthesise `mysql.user`. MySQL admin
+/// queries (`SELECT user, host FROM mysql.user`) probe this at
+/// connect time to list accounts. SPG ships one row per
+/// UserStore entry plus a synthetic `root` superuser row for
+/// MySQL bootstrap compat.
+fn synth_mysql_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("user", DataType::Text, false),
+        ColumnSchema::new("host", DataType::Text, false),
+        ColumnSchema::new("select_priv", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    rows.push(Row::new(alloc::vec![
+        Value::Text("root".into()),
+        Value::Text("localhost".into()),
+        Value::Text("Y".into()),
+    ]));
+    for (name, _) in engine.users.iter() {
+        if name != "root" {
+            rows.push(Row::new(alloc::vec![
+                Value::Text(name.to_string()),
+                Value::Text("%".into()),
+                Value::Text("Y".into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-65 — synthesise `mysql.db`. The
+/// per-database privileges table. SPG is single-database so the
+/// table surfaces one row per declared user with full privileges
+/// on the canonical `postgres` database.
+fn synth_mysql_db() -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("host", DataType::Text, false),
+        ColumnSchema::new("db", DataType::Text, false),
+        ColumnSchema::new("user", DataType::Text, false),
+        ColumnSchema::new("select_priv", DataType::Text, false),
+    ];
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::Text("localhost".into()),
+        Value::Text("postgres".into()),
+        Value::Text("root".into()),
+        Value::Text("Y".into()),
+    ])];
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-63 — synthesise
+/// `information_schema.KEY_COLUMN_USAGE`. ORM migration tools
+/// (Alembic, Sequelize, TypeORM) walk this view to discover FK
+/// relationships in MySQL-flavoured introspection queries.
+///
+/// Schema columns exposed:
+///   * CONSTRAINT_NAME (Text)
+///   * TABLE_NAME (Text)
+///   * COLUMN_NAME (Text)
+///   * ORDINAL_POSITION (Int)
+///   * REFERENCED_TABLE_NAME (Text) — empty for non-FK rows
+///   * REFERENCED_COLUMN_NAME (Text) — empty for non-FK rows
+fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("constraint_name", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("ordinal_position", DataType::Int, false),
+        ColumnSchema::new("referenced_table_name", DataType::Text, false),
+        ColumnSchema::new("referenced_column_name", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let cols = &t.schema().columns;
+        let col_name_at = |pos: usize| -> String {
+            cols.get(pos)
+                .map_or_else(|| alloc::format!("col{pos}"), |c| c.name.clone())
+        };
+        // FKs.
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+            for (i, (&local, &parent)) in fk
+                .local_columns
+                .iter()
+                .zip(fk.parent_columns.iter())
+                .enumerate()
+            {
+                let parent_name = cat
+                    .get(&fk.parent_table)
+                    .and_then(|pt| pt.schema().columns.get(parent).map(|c| c.name.clone()))
+                    .unwrap_or_else(|| alloc::format!("col{parent}"));
+                #[allow(clippy::cast_possible_wrap)]
+                let ordinal = (i + 1) as i32;
+                rows.push(Row::new(alloc::vec![
+                    Value::Text(conname.clone()),
+                    Value::Text(tname.clone()),
+                    Value::Text(col_name_at(local)),
+                    Value::Int(ordinal),
+                    Value::Text(fk.parent_table.clone()),
+                    Value::Text(parent_name),
+                ]));
+            }
+        }
+        // PK / composite UC entries.
+        for (ci, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
+            let conname = if uc.is_primary_key {
+                alloc::format!("{}_pkey", tname)
+            } else {
+                alloc::format!("{}_uniq{ci}", tname)
+            };
+            for (i, &local) in uc.columns.iter().enumerate() {
+                #[allow(clippy::cast_possible_wrap)]
+                let ordinal = (i + 1) as i32;
+                rows.push(Row::new(alloc::vec![
+                    Value::Text(conname.clone()),
+                    Value::Text(tname.clone()),
+                    Value::Text(col_name_at(local)),
+                    Value::Int(ordinal),
+                    Value::Text(String::new()),
+                    Value::Text(String::new()),
+                ]));
+            }
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-64 — synthesise
+/// `information_schema.REFERENTIAL_CONSTRAINTS`. One row per FK.
+fn synth_info_referential_constraints(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("constraint_name", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("referenced_table_name", DataType::Text, false),
+        ColumnSchema::new("update_rule", DataType::Text, false),
+        ColumnSchema::new("delete_rule", DataType::Text, false),
+    ];
+    fn rule_name(a: spg_storage::FkAction) -> &'static str {
+        match a {
+            spg_storage::FkAction::Cascade => "CASCADE",
+            spg_storage::FkAction::SetNull => "SET NULL",
+            spg_storage::FkAction::SetDefault => "SET DEFAULT",
+            spg_storage::FkAction::Restrict => "RESTRICT",
+            spg_storage::FkAction::NoAction => "NO ACTION",
+        }
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{}_fk{fi}", tname));
+            rows.push(Row::new(alloc::vec![
+                Value::Text(conname),
+                Value::Text(tname.clone()),
+                Value::Text(fk.parent_table.clone()),
+                Value::Text(rule_name(fk.on_update).into()),
+                Value::Text(rule_name(fk.on_delete).into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-64 — synthesise `information_schema.STATISTICS`.
+/// One row per (index × column) — admin tools walk this to
+/// surface index-cardinality estimates.
+fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("index_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("seq_in_index", DataType::Int, false),
+        ColumnSchema::new("non_unique", DataType::Int, false),
+        ColumnSchema::new("index_type", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            let col = t
+                .schema()
+                .columns
+                .get(idx.column_position)
+                .map_or("?".into(), |c| c.name.clone());
+            rows.push(Row::new(alloc::vec![
+                Value::Text(tname.clone()),
+                Value::Text(idx.name.clone()),
+                Value::Text(col),
+                Value::Int(1),
+                Value::Int(i32::from(!idx.is_unique)),
+                Value::Text("BTREE".into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-64 — synthesise `information_schema.ROUTINES`.
+/// SPG has no user-defined functions in v7.17 so the surface is
+/// always empty; admin tools just need the table to exist.
+fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("routine_name", DataType::Text, false),
+        ColumnSchema::new("routine_type", DataType::Text, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+    ];
+    (schema, Vec::new())
+}
+
 /// v7.17.0 Phase 3.P0-54 — synthesise `pg_catalog.pg_constraint`.
 /// ORM compilers (Diesel, sea-orm) and admin tools probe this for
 /// FK / UNIQUE / PK / CHECK definitions to surface relationship
@@ -11015,7 +11260,9 @@ fn collect_view_refs(
 
 fn select_references_meta_view(stmt: &SelectStatement) -> bool {
     fn is_meta(name: &str) -> bool {
-        name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")
+        name.starts_with("__spg_info_")
+            || name.starts_with("__spg_pg_")
+            || name.starts_with("__spg_mysql_")
     }
     if let Some(from) = &stmt.from {
         if is_meta(&from.primary.name) {
@@ -11044,7 +11291,9 @@ fn collect_meta_view_names(
     into: &mut alloc::collections::BTreeSet<String>,
 ) {
     fn is_meta(name: &str) -> bool {
-        name.starts_with("__spg_info_") || name.starts_with("__spg_pg_")
+        name.starts_with("__spg_info_")
+            || name.starts_with("__spg_pg_")
+            || name.starts_with("__spg_mysql_")
     }
     if let Some(from) = &stmt.from {
         if is_meta(&from.primary.name) {

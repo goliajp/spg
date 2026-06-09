@@ -5,7 +5,7 @@ Per-corpus pass / fail / skip:
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
-| `mysql` | 131 | 0 | 0 | 100.0% |
+| `mysql` | 141 | 0 | 0 | 100.0% |
 | `pg_regress` | 1258 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 
@@ -55,6 +55,7 @@ Per-corpus pass / fail / skip:
 | `13_show_databases.test` | 2 | 0 | 0 |
 | `14_show_create_table.test` | 2 | 0 | 0 |
 | `15_show_indexes_status_processlist.test` | 8 | 0 | 0 |
+| `16_info_schema_mysql.test` | 10 | 0 | 0 |
 
 ### `pg_regress/`
 

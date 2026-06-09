@@ -1,0 +1,60 @@
+# v7.17.0 Phase 3.P0-63/64/65 — information_schema MySQL views + mysql.user/db.
+
+statement ok
+CREATE TABLE parents (id INT NOT NULL, PRIMARY KEY (id))
+
+statement ok
+CREATE TABLE children (id INT NOT NULL, parent_id INT NOT NULL,
+    FOREIGN KEY (parent_id) REFERENCES parents (id))
+
+# KEY_COLUMN_USAGE lists FK columns with referenced refs.
+query TTT
+SELECT column_name, referenced_table_name, referenced_column_name
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE table_name = 'children' AND referenced_table_name = 'parents'
+----
+parent_id
+parents
+id
+
+# REFERENTIAL_CONSTRAINTS.
+query TT
+SELECT table_name, referenced_table_name
+FROM information_schema.REFERENTIAL_CONSTRAINTS
+----
+children
+parents
+
+# STATISTICS lists per-index columns.
+statement ok
+CREATE TABLE idxtbl (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE INDEX idx_n ON idxtbl (name)
+
+query TTT
+SELECT table_name, index_name, column_name
+FROM information_schema.STATISTICS WHERE index_name = 'idx_n'
+----
+idxtbl
+idx_n
+name
+
+# ROUTINES is empty.
+query I
+SELECT COUNT(*) FROM information_schema.ROUTINES
+----
+0
+
+# mysql.user lists root.
+query TT
+SELECT user, host FROM mysql.user WHERE user = 'root'
+----
+root
+localhost
+
+# mysql.db lists the canonical grants.
+query T
+SELECT db FROM mysql.db WHERE db = 'postgres'
+----
+postgres
