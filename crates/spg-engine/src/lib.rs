@@ -9166,12 +9166,24 @@ impl Engine {
                     let (schema, rows) = synth_pg_namespace(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_indexes view
+                // for pgAdmin / DataGrip "indexes per table" listings.
+                "__spg_pg_indexes" => {
+                    let (schema, rows) = synth_pg_indexes(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_index (raw)
+                // for index introspection by ORM compilers.
+                "__spg_pg_index" => {
+                    let (schema, rows) = synth_pg_index_raw(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "meta view {view:?} is not yet materialisable; \
                          v7.16.2 covers information_schema.columns / .tables \
                          and pg_catalog.pg_class / pg_attribute; \
-                         v7.17.0 P0-50/51/52 add pg_catalog.pg_type / pg_proc / pg_namespace"
+                         v7.17.0 P0-50..P0-53 add pg_type / pg_proc / pg_namespace / pg_indexes / pg_index"
                     )));
                 }
             }
@@ -10302,6 +10314,92 @@ fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
             Value::Int(nargs),
             Value::BigInt(rettype),
         ]));
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-53 — synthesise `pg_catalog.pg_indexes`.
+/// PG's pg_indexes is a real view on pg_index + pg_class + pg_attribute.
+/// SPG ships it as a synthesised flat table so admin tools (pgAdmin,
+/// DataGrip) can list indexes by tablename without joining four catalogs.
+///
+/// Schema columns exposed:
+///   * schemaname (Text) — always `public`
+///   * tablename (Text)
+///   * indexname (Text)
+///   * indexdef (Text) — best-effort CREATE INDEX DDL
+fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("tablename", DataType::Text, false),
+        ColumnSchema::new("indexname", DataType::Text, false),
+        ColumnSchema::new("indexdef", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            let col_name = t
+                .schema()
+                .columns
+                .get(idx.column_position)
+                .map_or("?".into(), |c| c.name.clone());
+            let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+            let indexdef = alloc::format!(
+                "CREATE {unique_kw}INDEX {} ON public.{} ({})",
+                idx.name,
+                tname,
+                col_name
+            );
+            rows.push(Row::new(alloc::vec![
+                Value::Text("public".into()),
+                Value::Text(tname.clone()),
+                Value::Text(idx.name.clone()),
+                Value::Text(indexdef),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-53 — synthesise `pg_catalog.pg_index`. The
+/// "raw" pg_index catalog used by PG-internal tooling for index
+/// flags and ordinal information. SPG ships the columns ORM probes
+/// actually filter on.
+///
+/// Schema columns exposed:
+///   * indexrelid (BigInt) — index OID (synthetic = position+1)
+///   * indrelid (BigInt) — table OID (synthetic = position+1)
+///   * indnatts (Int) — number of indexed columns
+///   * indisunique (Bool)
+///   * indisprimary (Bool)
+fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("indexrelid", DataType::BigInt, false),
+        ColumnSchema::new("indrelid", DataType::BigInt, false),
+        ColumnSchema::new("indnatts", DataType::Int, false),
+        ColumnSchema::new("indisunique", DataType::Bool, false),
+        ColumnSchema::new("indisprimary", DataType::Bool, false),
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    let mut idx_oid: i64 = 100_000;
+    for (table_idx, tname) in cat.table_names().iter().enumerate() {
+        let Some(t) = cat.get(tname) else { continue };
+        for idx in t.indices() {
+            idx_oid += 1;
+            #[allow(clippy::cast_possible_wrap)]
+            let nattrs = (1 + idx.extra_column_positions.len()) as i32;
+            // is_primary: SPG / PG flag the primary via the
+            // index name convention `<table>_pkey`.
+            let is_primary = idx.name.ends_with("_pkey");
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(idx_oid),
+                Value::BigInt((table_idx + 1) as i64),
+                Value::Int(nattrs),
+                Value::Bool(idx.is_unique),
+                Value::Bool(is_primary),
+            ]));
+        }
     }
     (schema, rows)
 }
