@@ -74,6 +74,46 @@ cargo build --workspace --release
 ./target/release/spg version
 ```
 
+### sqlx embed (in-process, no daemon)
+
+Drop-in for `sqlx::PgPool`. Stock sqlx code — `Pool` +
+`query!` + transactions — runs against an in-process SPG.
+
+```rust
+use spg_sqlx::{SpgConnectOptions, SpgPool, SpgPoolOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // v7.18 — PG-shape Pool. 20 connections fan out reads through
+    // a per-statement snapshot path; writes serialise (engine
+    // single-writer). Read-committed isolation matches PG default.
+    let pool: SpgPool = SpgPoolOptions::new()
+        .max_connections(20)
+        .connect_with(SpgConnectOptions::file("./spg.db".into()))
+        .await?;
+
+    sqlx::query("CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL)")
+        .execute(&pool).await?;
+    sqlx::query("INSERT INTO users VALUES ($1, $2)")
+        .bind(1_i32).bind("alice")
+        .execute(&pool).await?;
+
+    let row = sqlx::query("SELECT name FROM users WHERE id = $1")
+        .bind(1_i32).fetch_one(&pool).await?;
+    let name: String = sqlx::Row::get(&row, 0);
+    println!("{name}");
+    Ok(())
+}
+```
+
+`SpgPool` is a `Pool<Spg>` type alias — every sqlx-core API
+generic over `Pool<DB>` works (transactions, savepoints,
+`query!()` compile-time validation against an in-memory catalog,
+`fetch_all` / `fetch_optional` / `fetch_one`). Concurrent
+`SELECT`s fan out across pool connections through the engine's
+snapshot path; benchmark data lives at
+[`xbench/competitor/results/sqlx_pool_concurrent_reads-v7.18-trial.md`](xbench/competitor/results/sqlx_pool_concurrent_reads-v7.18-trial.md).
+
 ### kNN demo
 
 ```sh

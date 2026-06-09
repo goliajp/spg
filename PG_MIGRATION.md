@@ -66,7 +66,7 @@ The rest of this doc backs each row with specifics.
 |---|---|---|
 | **Where it runs** | Daemon process (Docker / systemd / bare binary) | Inside your Rust binary |
 | **Network protocols** | SPG native wire on 5544, PG-wire on `SPG_PG_ADDR` (commonly 5432) | None — Rust function calls only |
-| **Concurrent clients** | Many (single-writer engine, multi-reader RwLock) | Single process, `Arc<Mutex<Database>>` to share threads |
+| **Concurrent clients** | Many (single-writer engine, multi-reader RwLock) | Many (v7.18 — `Arc<RwLock<Database>>` + per-statement snapshot routing via `spg-sqlx`; concurrent SELECTs fan out, writes serialise — see § Concurrency model below) |
 | **Persistence** | Auto: WAL + manifest + cold-tier files | Auto via `Database::open_path(p)` — same on-disk layout |
 | **Crash recovery** | WAL replay on boot | WAL replay on `open_path` |
 | **Replication** | Logical (`CREATE PUBLICATION` / `CREATE SUBSCRIPTION`) + binary (MAGIC_V2) | n/a — out of scope |
@@ -74,6 +74,62 @@ The rest of this doc backs each row with specifics.
 | **Vector / HNSW** | ✅ | ✅ |
 | **Image** | `goliakk/spg:7.3.0` (multi-arch) | Cargo crate `spg-embedded = "7.3.0"` |
 | **Sample boot** | `docker compose up -d` | `Database::open_path("./spg.db")?` |
+
+---
+
+## Concurrency model — `spg-sqlx` Pool semantics (v7.18)
+
+`spg-embedded` is single-writer at the engine level (the WAL
+and catalog are serialised through one mutation point). On top
+of that, `spg-sqlx` ships a `Pool<Spg>` (alias
+`SpgPool`) that behaves like `sqlx::PgPool` from the user's
+side — no application change needed when porting from PG.
+
+How it works under the hood:
+
+- Every `SpgConnection` lazily attaches an `AsyncReadHandle` on
+  the first read-only statement it sees outside a transaction.
+- Each subsequent SELECT / EXPLAIN / SHOW refreshes the handle's
+  snapshot (cheap — Arc-clone of the catalog trie roots) and
+  runs against it. No writer-lock acquisition. N pool
+  connections → N concurrent SELECTs.
+- DDL, DML, transaction control, `BEGIN`-bracketed work — all
+  take the writer lock. Engine invariant preserved.
+- Transaction visibility is unchanged: BEGIN-bracketed SELECT
+  sees the same TX's uncommitted writes (routing skips the
+  snapshot path while `tx_depth > 0`).
+
+PG isolation contract:
+
+| PG level | SPG-embed behaviour | Equivalent? |
+|---|---|---|
+| READ COMMITTED (default) | Per-statement fresh snapshot — writes committed elsewhere become visible at the next SELECT | ✅ |
+| READ UNCOMMITTED | PG treats as READ COMMITTED; SPG same | ✅ |
+| REPEATABLE READ | BEGIN integrates with writer lock; the open TX sees a stable view until COMMIT/ROLLBACK | ✅ |
+| SERIALIZABLE | Engine is single-writer — committed order *is* the serial schedule, no SSI false aborts | ✅ |
+
+Benchmark (smoke-grade,
+[`xbench/competitor/results/sqlx_pool_concurrent_reads-v7.18-trial.md`](xbench/competitor/results/sqlx_pool_concurrent_reads-v7.18-trial.md)):
+
+| Backend | Workload | Concurrency | Throughput (q/s) |
+|---|---|---:|---:|
+| SpgPool | pk-select | 16 | 20 561 |
+| PgPool (pgvector-pg18, wire) | pk-select | 16 | 13 724 |
+| SpgPool | range-scan | 16 | 11 517 |
+| PgPool | range-scan | 16 | 12 684 |
+| SpgPool | mixed-9to1 | 16 | 1 053 |
+| PgPool | mixed-9to1 | 16 | 15 250 |
+
+Reads beat the wire-mode PG comparator at the same
+concurrency. Mixed workloads with high write density are
+bounded by SPG's WAL fsync cadence — the
+WAL-group-commit / PITR track addresses this in v7.18.
+
+Escape hatch: `read_handle` ceiling for read-heavy code paths
+that bypass sqlx entirely is ~3× the routed `SpgPool` number
+(see same bench file). `read_handle` is documented as an
+advanced API for SPG-aware code; stock sqlx users do NOT need
+it — `SpgPool` is the first-class path.
 
 ---
 
