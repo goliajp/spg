@@ -769,7 +769,7 @@ fn encode_binary_row(values: &[Value], columns: &[ColumnSchema]) -> Vec<u8> {
     out.push(0x00); // packet header
     // Reserve space for the NULL bitmap; we'll fill in shortly.
     let bitmap_start = out.len();
-    out.extend(std::iter::repeat(0u8).take(bitmap_len));
+    out.extend(std::iter::repeat_n(0u8, bitmap_len));
     for (i, v) in values.iter().enumerate() {
         if matches!(v, Value::Null) {
             let bit_idx = i + 2; // first 2 bits reserved
@@ -785,7 +785,7 @@ fn encode_binary_row(values: &[Value], columns: &[ColumnSchema]) -> Vec<u8> {
 fn encode_binary_value(out: &mut Vec<u8>, v: &Value, declared: Option<DataType>) {
     match v {
         Value::Null => {} // handled by NULL bitmap caller-side
-        Value::Bool(b) => out.push(if *b { 1 } else { 0 }),
+        Value::Bool(b) => out.push(u8::from(*b)),
         Value::SmallInt(n) => out.extend_from_slice(&n.to_le_bytes()),
         Value::Int(n) => out.extend_from_slice(&n.to_le_bytes()),
         Value::BigInt(n) => out.extend_from_slice(&n.to_le_bytes()),
@@ -1155,7 +1155,7 @@ fn encode_column_def_41(c: &ColumnSchema) -> Vec<u8> {
     // column type byte
     buf.push(mysql_field_type(c.ty));
     // flags: NOT NULL = 0x0001; mostly leave 0 elsewhere.
-    let flags: u16 = if c.nullable { 0 } else { 0x0001 };
+    let flags: u16 = u16::from(!c.nullable);
     buf.extend_from_slice(&flags.to_le_bytes());
     // decimals: 0x1f = "no fixed decimal point" for floats.
     let decimals: u8 = match c.ty {

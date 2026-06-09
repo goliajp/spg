@@ -714,6 +714,7 @@ pub enum Collation {
     CaseInsensitive,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Collation {
     fn default() -> Self {
         Self::Binary
@@ -4496,6 +4497,7 @@ impl Catalog {
     /// their stored values. RESTART variants update last_value
     /// directly per PG: `RESTART` resets to current `start`;
     /// `RESTART WITH n` resets to `n`.
+    #[allow(clippy::too_many_arguments)]
     pub fn alter_sequence(
         &mut self,
         name: &str,
@@ -7920,12 +7922,10 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         }
         Value::TextArray2D(rows) => {
             let cols = rows.first().map(|r| r.len()).unwrap_or(0);
-            let mut n = 8 + rows.len() * cols * 1;
+            let mut n = 8 + rows.len() * cols;
             for row in rows {
-                for cell in row {
-                    if let Some(s) = cell {
-                        n += 4 + s.len();
-                    }
+                for s in row.iter().flatten() {
+                    n += 4 + s.len();
                 }
             }
             n
@@ -8257,10 +8257,8 @@ fn write_value_encoded_len(v: &Value) -> usize {
             let cols = rows.first().map(|r| r.len()).unwrap_or(0);
             let mut n = 1 + 8 + rows.len() * cols;
             for row in rows {
-                for cell in row {
-                    if let Some(s) = cell {
-                        n += 4 + s.len();
-                    }
+                for s in row.iter().flatten() {
+                    n += 4 + s.len();
                 }
             }
             n

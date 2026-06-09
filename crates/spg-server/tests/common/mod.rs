@@ -276,6 +276,7 @@ impl ServerBuilder {
 /// Tail the child's stderr, parsing every `listening on` line shape
 /// the server publishes, until every requested listener has reported
 /// its addr.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn read_listener_addrs(
     child: &mut Child,
     stderr: ChildStderr,

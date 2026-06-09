@@ -3402,7 +3402,7 @@ impl Engine {
         }
         let mut out = stmt.clone();
         // Prepend so view CTEs are visible to caller-supplied CTEs.
-        new_ctes.extend(out.ctes.into_iter());
+        new_ctes.extend(out.ctes);
         out.ctes = new_ctes;
         Ok(Some(out))
     }
@@ -4317,10 +4317,10 @@ impl Engine {
                 } else {
                     &source_only_ctx
                 };
-                match eval::eval_expr(cond_expr, &row, ctx_ref) {
-                    Ok(Value::Bool(true)) => true,
-                    _ => false,
-                }
+                matches!(
+                    eval::eval_expr(cond_expr, &row, ctx_ref),
+                    Ok(Value::Bool(true))
+                )
             });
             let Some(clause) = fired_clause else { continue };
             match &clause.action {

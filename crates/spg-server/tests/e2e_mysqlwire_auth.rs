@@ -72,7 +72,7 @@ fn extract_scramble(payload: &[u8]) -> Vec<u8> {
 fn native_password_response(scramble: &[u8], password: &str) -> Vec<u8> {
     use sha1::Digest;
     let sha1_pwd = sha1::Sha1::digest(password.as_bytes());
-    let sha1_sha1_pwd = sha1::Sha1::digest(&sha1_pwd);
+    let sha1_sha1_pwd = sha1::Sha1::digest(sha1_pwd);
     let mut buf = Vec::with_capacity(20 + 20);
     buf.extend_from_slice(scramble);
     buf.extend_from_slice(&sha1_sha1_pwd);

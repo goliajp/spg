@@ -248,7 +248,7 @@ fn concat_returns_non_null_even_when_every_input_null() {
     e.execute("INSERT INTO u VALUES (NULL, NULL)").unwrap();
     let r = e.execute("SELECT concat(a, b) FROM u").unwrap();
     let row = one_row(r);
-    assert_eq!(row[0], Value::Text("".into()));
+    assert_eq!(row[0], Value::Text(String::new()));
     assert!(!matches!(row[0], Value::Null));
 }
 

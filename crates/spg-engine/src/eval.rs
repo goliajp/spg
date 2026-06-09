@@ -2703,11 +2703,12 @@ fn age(args: &[Value]) -> Result<Value, EvalError> {
     })
 }
 
-/// `to_char(value, format)` — render a DATE / TIMESTAMP through a PG
-/// format template. Supports the high-traffic placeholders:
-///   YYYY YY MM Mon Month DD HH24 HH12 MI SS MS US AM PM
-/// Unrecognised characters pass through literally so the template's
-/// punctuation ('-', ':', ' ', '/') needs no escape mechanism.
+// `to_char(value, format)` — render a DATE / TIMESTAMP through a PG
+// format template. Supports the high-traffic placeholders:
+//   YYYY YY MM Mon Month DD HH24 HH12 MI SS MS US AM PM
+// Unrecognised characters pass through literally so the template's
+// punctuation ('-', ':', ' ', '/') needs no escape mechanism.
+
 // ─── v7.17.0 Phase 7 — INET / CIDR text helpers ───────────────────────
 //
 // SPG stores network address types as Text. The host() / network() /
@@ -2781,9 +2782,8 @@ fn inet_masklen(args: &[Value]) -> Result<Value, EvalError> {
         }
     };
     let mask: i32 = s
-        .splitn(2, '/')
-        .nth(1)
-        .and_then(|m| m.parse().ok())
+        .split_once('/')
+        .and_then(|(_, m)| m.parse().ok())
         .unwrap_or(32);
     Ok(Value::Int(mask))
 }
@@ -2871,9 +2871,8 @@ fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
         head.split(':').collect()
     };
     let tail_groups: Vec<&str> = match tail {
-        Some(t) if t.is_empty() => Vec::new(),
-        Some(t) => t.split(':').collect(),
-        None => Vec::new(),
+        Some(t) if !t.is_empty() => t.split(':').collect(),
+        _ => Vec::new(),
     };
     let head_len = head_groups.len();
     let tail_len = tail_groups.len();
@@ -3373,20 +3372,15 @@ fn regexp_matches(args: &[Value]) -> Result<Value, EvalError> {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Option<String>> = Vec::new();
     let mut from = 0usize;
-    loop {
-        match re_find(&node, &chars, from) {
-            Some((s_pos, e_pos)) => {
-                out.push(Some(chars[s_pos..e_pos].iter().collect()));
-                if !all_matches {
-                    break;
-                }
-                // Advance past the match; if zero-width, step one.
-                from = if e_pos > s_pos { e_pos } else { e_pos + 1 };
-                if from > chars.len() {
-                    break;
-                }
-            }
-            None => break,
+    while let Some((s_pos, e_pos)) = re_find(&node, &chars, from) {
+        out.push(Some(chars[s_pos..e_pos].iter().collect()));
+        if !all_matches {
+            break;
+        }
+        // Advance past the match; if zero-width, step one.
+        from = if e_pos > s_pos { e_pos } else { e_pos + 1 };
+        if from > chars.len() {
+            break;
         }
     }
     Ok(Value::TextArray(out))
