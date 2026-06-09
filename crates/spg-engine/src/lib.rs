@@ -1836,6 +1836,7 @@ impl Engine {
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Update(s) => self.exec_update_cancel(&s, cancel),
             Statement::Delete(s) => self.exec_delete_cancel(&s, cancel),
+            Statement::Merge(s) => self.exec_merge_cancel(&s, cancel),
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
@@ -4150,6 +4151,255 @@ impl Engine {
     /// v4.4 `DELETE FROM <table> [WHERE cond]`. Collects matching
     /// positions then delegates to `Table::delete_rows` (single index
     /// rebuild for the batch).
+    /// v7.17.0 Phase 3.P0-42 — SQL:2003 / PG 15+ `MERGE` execution.
+    ///
+    /// Semantics:
+    ///   * Resolve `target` and `source` tables (catalog reads).
+    ///   * Build a combined `(target_alias.col, source_alias.col)`
+    ///     schema so the ON / WHEN AND / SET / VALUES expressions
+    ///     resolve through the standard qualifier-aware resolver.
+    ///   * Pass 1: walk every source row × every target hot row,
+    ///     evaluate ON, then pick the first WHEN clause that fits
+    ///     (`Matched` if any target row matched, `NotMatched`
+    ///     otherwise; AND-condition must hold). Collect the action
+    ///     plan as `(deletes, updates, inserts)` so the apply pass
+    ///     reads the original target row state.
+    ///   * Pass 2: apply the plan against the target's mutable row
+    ///     vector. Deletes execute by index in descending order so
+    ///     earlier indices remain stable; updates next; inserts
+    ///     last (matching PG's "INSERT branch sees the post-delete
+    ///     state" behaviour for the common upsert shape).
+    ///
+    /// v7.17 simplifications (documented limitations):
+    ///   * No triggers / WAL plumbing (MVP); MERGE rows don't fire
+    ///     INSERT / UPDATE / DELETE row triggers in v7.17.
+    ///   * No cardinality check (PG-canonical: "MERGE command
+    ///     cannot affect row a second time" — SPG silently applies
+    ///     the last action for a target row covered twice).
+    ///   * Source must be a catalog-resolvable table (no subquery
+    ///     source); RETURNING / BY SOURCE / BY TARGET unsupported.
+    fn exec_merge_cancel(
+        &mut self,
+        stmt: &spg_sql::ast::MergeStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let target_alias = stmt
+            .target_alias
+            .clone()
+            .unwrap_or_else(|| stmt.target.clone());
+        let source_alias = stmt
+            .source_alias
+            .clone()
+            .unwrap_or_else(|| stmt.source.clone());
+        let (target_cols, target_rows_snapshot) = {
+            let t = self.active_catalog().get(&stmt.target).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.target.clone(),
+                })
+            })?;
+            (t.schema().columns.clone(), t.rows().iter().cloned().collect::<Vec<Row>>())
+        };
+        let (source_cols, source_rows) = {
+            let s = self.active_catalog().get(&stmt.source).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.source.clone(),
+                })
+            })?;
+            (s.schema().columns.clone(), s.rows().iter().cloned().collect::<Vec<Row>>())
+        };
+        // Composite schema: target_alias.col ... source_alias.col ...
+        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &target_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{target_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for col in &source_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{source_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        let combined_ctx = EvalContext::new(&combined_schema, None);
+        // Source-only context for WHEN NOT MATCHED actions (no
+        // matched target row exists — the source-side qualified
+        // columns must still resolve).
+        let mut source_only_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &target_cols {
+            source_only_schema.push(ColumnSchema::new(
+                alloc::format!("{target_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for col in &source_cols {
+            source_only_schema.push(ColumnSchema::new(
+                alloc::format!("{source_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        let source_only_ctx = EvalContext::new(&source_only_schema, None);
+        let target_arity = target_cols.len();
+        let source_arity = source_cols.len();
+
+        // Resolve INSERT column positions once (validate names).
+        // For each clause that's an INSERT, map column names → target positions.
+        let mut delete_indices: Vec<usize> = Vec::new();
+        let mut updates: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut inserts: Vec<Vec<Value>> = Vec::new();
+        let mut affected: usize = 0;
+
+        for (src_idx, src_row) in source_rows.iter().enumerate() {
+            if src_idx.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            // Find every matched target index (per the ON predicate).
+            let mut matched_targets: Vec<usize> = Vec::new();
+            for (t_idx, t_row) in target_rows_snapshot.iter().enumerate() {
+                let mut combined_vals = t_row.values.clone();
+                combined_vals.extend(src_row.values.iter().cloned());
+                let combined_row = Row::new(combined_vals);
+                let cond = eval::eval_expr(&stmt.on, &combined_row, &combined_ctx)?;
+                if matches!(cond, Value::Bool(true)) {
+                    matched_targets.push(t_idx);
+                }
+            }
+            let is_matched = !matched_targets.is_empty();
+            // Pick the first WHEN clause whose kind agrees with
+            // `is_matched` and whose AND condition (if any) holds.
+            // AND condition for MATCHED: evaluated against the
+            // first matched target row × source. For NOT MATCHED:
+            // evaluated with target side NULL-padded.
+            let fired_clause = stmt.clauses.iter().find(|c| {
+                let kind_ok = match c.matched {
+                    spg_sql::ast::MergeMatched::Matched => is_matched,
+                    spg_sql::ast::MergeMatched::NotMatched => !is_matched,
+                };
+                if !kind_ok {
+                    return false;
+                }
+                let Some(cond_expr) = &c.condition else {
+                    return true;
+                };
+                let row = if is_matched {
+                    let t = &target_rows_snapshot[matched_targets[0]];
+                    let mut vals = t.values.clone();
+                    vals.extend(src_row.values.iter().cloned());
+                    Row::new(vals)
+                } else {
+                    let mut vals: Vec<Value> = (0..target_arity).map(|_| Value::Null).collect();
+                    vals.extend(src_row.values.iter().cloned());
+                    Row::new(vals)
+                };
+                let ctx_ref = if is_matched { &combined_ctx } else { &source_only_ctx };
+                match eval::eval_expr(cond_expr, &row, ctx_ref) {
+                    Ok(Value::Bool(true)) => true,
+                    _ => false,
+                }
+            });
+            let Some(clause) = fired_clause else { continue };
+            match &clause.action {
+                spg_sql::ast::MergeAction::DoNothing => {}
+                spg_sql::ast::MergeAction::Delete => {
+                    for &t_idx in &matched_targets {
+                        if !delete_indices.contains(&t_idx) {
+                            delete_indices.push(t_idx);
+                            affected += 1;
+                        }
+                    }
+                }
+                spg_sql::ast::MergeAction::Update { assignments } => {
+                    // Pre-resolve SET targets to target column positions.
+                    let mut planned_sets: Vec<(usize, &Expr)> =
+                        Vec::with_capacity(assignments.len());
+                    for (col, expr) in assignments {
+                        let pos =
+                            target_cols.iter().position(|c| c.name == *col).ok_or_else(|| {
+                                EngineError::Eval(EvalError::ColumnNotFound {
+                                    name: col.clone(),
+                                })
+                            })?;
+                        planned_sets.push((pos, expr));
+                    }
+                    for &t_idx in &matched_targets {
+                        let t_row = &target_rows_snapshot[t_idx];
+                        let mut new_values = t_row.values.clone();
+                        let mut combined_vals = t_row.values.clone();
+                        combined_vals.extend(src_row.values.iter().cloned());
+                        let combined_row = Row::new(combined_vals);
+                        for (pos, expr) in &planned_sets {
+                            let raw = eval::eval_expr(expr, &combined_row, &combined_ctx)?;
+                            let coerced = coerce_value(
+                                raw,
+                                target_cols[*pos].ty,
+                                &target_cols[*pos].name,
+                                *pos,
+                            )?;
+                            new_values[*pos] = coerced;
+                        }
+                        updates.push((t_idx, new_values));
+                        affected += 1;
+                    }
+                }
+                spg_sql::ast::MergeAction::Insert { columns, values } => {
+                    // For INSERT NOT MATCHED, target side is NULL-padded.
+                    let mut vals: Vec<Value> = (0..target_arity).map(|_| Value::Null).collect();
+                    vals.extend(src_row.values.iter().cloned());
+                    let synth_row = Row::new(vals);
+                    let mut new_row_values: Vec<Value> =
+                        (0..target_arity).map(|_| Value::Null).collect();
+                    for (col, expr) in columns.iter().zip(values.iter()) {
+                        let pos =
+                            target_cols.iter().position(|c| c.name == *col).ok_or_else(|| {
+                                EngineError::Eval(EvalError::ColumnNotFound {
+                                    name: col.clone(),
+                                })
+                            })?;
+                        let raw = eval::eval_expr(expr, &synth_row, &source_only_ctx)?;
+                        let coerced =
+                            coerce_value(raw, target_cols[pos].ty, &target_cols[pos].name, pos)?;
+                        new_row_values[pos] = coerced;
+                    }
+                    inserts.push(new_row_values);
+                    affected += 1;
+                }
+            }
+        }
+        let _ = source_arity; // captured for symmetry; cancellation cost negligible.
+
+        // Apply the plan to the target table.
+        let table = self
+            .active_catalog_mut()
+            .get_mut(&stmt.target)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.target.clone(),
+                })
+            })?;
+        // Apply updates first (in-place), then deletes (one batch),
+        // then inserts. The storage API uses `update_row(pos,
+        // new_values)`, `delete_rows(&[positions])`, and `insert(row)`.
+        for (idx, new_vals) in &updates {
+            table
+                .update_row(*idx, new_vals.clone())
+                .map_err(EngineError::Storage)?;
+        }
+        if !delete_indices.is_empty() {
+            table.delete_rows(&delete_indices);
+        }
+        for vals in inserts {
+            table.insert(Row::new(vals)).map_err(EngineError::Storage)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: affected > 0,
+        })
+    }
+
     fn exec_delete_cancel(
         &mut self,
         stmt: &spg_sql::ast::DeleteStatement,

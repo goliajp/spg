@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 119 | 0 | 0 | 100.0% |
-| `pg_regress` | 1188 | 0 | 0 | 100.0% |
+| `pg_regress` | 1212 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 
 ## Per-file detail
@@ -134,6 +134,7 @@ Per-corpus pass / fail / skip:
 | `75_fetch_with_ties.test` | 10 | 0 | 0 |
 | `76_setof_aggregate.test` | 9 | 0 | 0 |
 | `77_window_join.test` | 9 | 0 | 0 |
+| `78_merge_statement.test` | 24 | 0 | 0 |
 
 ### `pgvector/`
 
