@@ -124,6 +124,40 @@ snapshot path; benchmark data lives at
 ./target/release/spg query "SELECT * FROM emb ORDER BY v <-> [1.0, 2.0, 3.0] LIMIT 2"
 ```
 
+### Backup / restore / PITR
+
+v7.18 ships a Point-in-Time Recovery workflow via four `spg` subcommands:
+
+```sh
+# Capture the current snapshot + WAL into a backup directory.
+spg backup-pitr --src ./spg.db --dst /backups/spg-2026-06-10
+
+# Verify the backup is intact (writes missing checksums on first run).
+spg verify-pitr --dir /backups/spg-2026-06-10 --write-missing-checksums
+
+# Restore the catalog to a specific moment.
+spg pitr-restore \
+    --snapshot /backups/spg-2026-06-10/snapshot.spg \
+    --wal /backups/spg-2026-06-10/wal/<chunk>.wal \
+    --to '2026-06-10 14:32:00' \
+    --target /restored/spg-2026-06-10-1432.spg
+
+# Drop WAL chunks past your retention window.
+spg prune-pitr --dir /backups/spg-2026-06-10 --retention-hours 24
+```
+
+Wire an external archival command via `SPG_PITR_ARCHIVE_CMD`
+(invoked by `backup-pitr` with the chunk path as `$1`):
+
+```sh
+export SPG_PITR_ARCHIVE_CMD='aws s3 cp "$1" s3://my-backups/spg/'
+spg backup-pitr --src ./spg.db --dst /backups/spg-now
+```
+
+SLA defaults: **RPO ≤ 1s**, **RTO ≤ 10min**, **retention 24h**.
+See [`PG_MIGRATION.md`](PG_MIGRATION.md#backup--pitr-v718) for the full
+operator playbook and the cron-friendly retention pattern.
+
 ### Tests
 
 ```sh

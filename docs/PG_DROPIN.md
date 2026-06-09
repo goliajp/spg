@@ -83,6 +83,20 @@ release-blocking:
 - PL/pgSQL: `CREATE FUNCTION ... LANGUAGE plpgsql AS $$ ... $$`
   + `CREATE TRIGGER ... FOR EACH ROW EXECUTE FUNCTION fn()`.
 
+## Backup + PITR
+
+Drop-in PG users expect WAL-based PITR. SPG v7.18 ships the four
+subcommands matching that expectation: `spg backup-pitr`,
+`spg verify-pitr`, `spg pitr-restore`, `spg prune-pitr`. Default SLA:
+
+- **RPO ≤ 1s** — every commit fsyncs to the WAL before returning
+- **RTO ≤ 10min** — replay = snapshot read + WAL apply
+- **Retention 24h** — `SPG_PITR_RETENTION_HOURS=24` default
+
+External archival rides on `SPG_PITR_ARCHIVE_CMD` (same loud-failure
+semantics PG's `archive_command` has). Full operator playbook in
+[`PG_MIGRATION.md`](../PG_MIGRATION.md#backup--pitr-v718).
+
 ## Verify it yourself — `scripts/dropin-acceptance.sh`
 
 ```sh

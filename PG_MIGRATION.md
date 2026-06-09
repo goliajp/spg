@@ -133,6 +133,92 @@ it — `SpgPool` is the first-class path.
 
 ---
 
+## Backup & PITR (v7.18)
+
+`spg-server` ships with a Point-in-Time Recovery workflow covering
+the four operational scenarios PG users expect: continuous WAL
+capture, restore-to-any-moment, online incremental backup, and
+verifiable archival.
+
+| Concern | PG | SPG v7.18 |
+|---|---|---|
+| Continuous backup | WAL archiving | `spg backup-pitr` snapshot + WAL chunk |
+| Restore granularity | any commit | any commit_lsn or wall-clock micros |
+| RPO | ≤ 1s (configurable) | ≤ 1s default — settable via `SPG_PITR_RETENTION_HOURS` etc |
+| RTO | minutes | minutes (replay = snapshot read + WAL apply) |
+| Online backup | `pg_basebackup` | `spg backup-pitr` — no application pause |
+| Verification | `pg_verifybackup` | `spg verify-pitr` — BLAKE3 chunk checksums + dry-run replay |
+| External archive | `archive_command` | `SPG_PITR_ARCHIVE_CMD` env, same loud-failure semantics |
+| Retention | `archive_cleanup` etc | `spg prune-pitr --retention-hours N` |
+
+### Operator playbook
+
+Periodic backups (cron / systemd timer):
+
+```sh
+# Every 5 minutes — snapshot + WAL diff into a fresh chunk.
+*/5 * * * * spg backup-pitr \
+    --src /data/spg.db \
+    --dst /backups/spg-$(date +\%Y-\%m-\%d)
+```
+
+Continuous archival to S3:
+
+```sh
+export SPG_PITR_ARCHIVE_CMD='aws s3 cp "$1" s3://my-org-spg/wal/'
+spg backup-pitr --src /data/spg.db --dst /backups/spg-now
+# stdout includes "archive=ok" or "archive=FAILED exit=… stderr=…"
+```
+
+Retention sweep:
+
+```sh
+# 24-hour retention. Cron daily.
+0 4 * * * spg prune-pitr \
+    --dir /backups/spg-rolling \
+    --retention-hours 24
+```
+
+Restore to a specific moment (after a bad migration / accidental DELETE):
+
+```sh
+spg pitr-restore \
+    --snapshot /backups/spg-rolling/snapshot.spg \
+    --wal /backups/spg-rolling/wal/1781028000000000_142.wal \
+    --to '2026-06-10 14:32:00' \
+    --target /restored/spg-pre-incident.spg
+```
+
+`--to` accepts:
+
+| Form | Meaning |
+|---|---|
+| `42` | bare integer = `commit_lsn` upper bound |
+| `1750000000s` / `…ms` / `…us` | unix epoch in that unit |
+| `2026-06-10 14:32:00` / `…T14:32:00` | UTC wall-clock |
+
+Verification before promoting a restored snapshot to prod:
+
+```sh
+spg verify-pitr --dir /backups/spg-rolling --write-missing-checksums
+# Exit 0 = clean (snapshot deserializes, every chunk parses + monotonic LSN,
+#                checksum matches, replay dry-run applies cleanly).
+# Exit 1 = corrupt (markdown report on stdout lists the broken chunk + msg).
+# Exit 2 = harness error (dir missing / permissions).
+```
+
+The `verify-pitr` markdown report uploads cleanly as a CI artifact;
+SPG's own `.github/workflows/ci.yml` runs the harness against the
+mailrs fixture every PR.
+
+### What's NOT in v7.18 PITR scope
+
+- Multi-database fan-out (each SPG file is single-process; v7.19+ ask)
+- Replication-coupled WAL streaming (logical replication exists separately;
+  PITR ride along is v7.19+)
+- In-engine chunk rotation thread (cron + external archive cover the steady
+  state today; the in-process retention thread lands when scheduled)
+
 ## Connecting from existing PG clients (server mode only)
 
 After `docker compose up -d` against the v7.3 image,
