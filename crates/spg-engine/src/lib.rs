@@ -12506,9 +12506,22 @@ fn enforce_uniqueness_inserts(
             name: child_table.into(),
         })
     })?;
+    let schema = table.schema();
     for uc in constraints {
         for (batch_idx, row_values) in rows.iter().enumerate() {
-            let key: Vec<&Value> = uc.columns.iter().map(|&i| &row_values[i]).collect();
+            // v7.17.0 Phase 3.P0-45 — fold each key cell by its
+            // column's declared Collation before comparing. Phase
+            // 2.5b wired Collation into GROUP BY / ORDER BY / `=`
+            // but the UNIQUE-constraint enforcement still compared
+            // Text byte-wise; a `*_ci` column would let
+            // `('Foo')` and `('FOO')` coexist when MySQL would
+            // reject the second. Owned Values so the fold and
+            // the borrow live in the same scope.
+            let key: Vec<Value> = uc
+                .columns
+                .iter()
+                .map(|&i| collated_key_cell(&row_values[i], i, schema))
+                .collect();
             let has_null = key.iter().any(|v| matches!(v, Value::Null));
             // v7.13.0 — `NULLS NOT DISTINCT` (mailrs round-5 G10,
             // PG 15+): two rows whose constrained columns are all
@@ -12519,17 +12532,19 @@ fn enforce_uniqueness_inserts(
             }
             // Table-side collision: scan existing rows.
             let collides_in_table = table.rows().iter().any(|prow| {
-                uc.columns
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &p)| prow.values.get(p) == Some(key[i]))
+                uc.columns.iter().enumerate().all(|(i, &p)| {
+                    prow.values
+                        .get(p)
+                        .is_some_and(|v| collated_key_cell(v, p, schema) == key[i])
+                })
             });
             // Batch-side collision: earlier rows in the same INSERT.
             let collides_in_batch = rows[..batch_idx].iter().any(|earlier| {
-                uc.columns
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &p)| earlier.get(p) == Some(key[i]))
+                uc.columns.iter().enumerate().all(|(i, &p)| {
+                    earlier
+                        .get(p)
+                        .is_some_and(|v| collated_key_cell(v, p, schema) == key[i])
+                })
             });
             if collides_in_table || collides_in_batch {
                 let kind = if uc.is_primary_key {
@@ -12550,6 +12565,25 @@ fn enforce_uniqueness_inserts(
         }
     }
     Ok(())
+}
+
+/// v7.17.0 Phase 3.P0-45 — return a key cell folded by its column's
+/// declared `Collation`. For `CaseInsensitive`, fold Text payloads to
+/// ASCII lowercase (matches Phase 2.5's `*_ci` semantics: ASCII case-
+/// fold only, non-ASCII bytes stay byte-wise). For `Binary` or non-Text
+/// values, the cell passes through unchanged. The caller compares the
+/// folded values with `==`.
+fn collated_key_cell(
+    v: &spg_storage::Value,
+    column_position: usize,
+    schema: &spg_storage::TableSchema,
+) -> spg_storage::Value {
+    match (v, schema.columns.get(column_position).map(|c| c.collation)) {
+        (spg_storage::Value::Text(s), Some(spg_storage::Collation::CaseInsensitive)) => {
+            spg_storage::Value::Text(s.to_ascii_lowercase())
+        }
+        _ => v.clone(),
+    }
 }
 
 /// v7.9.29 — `true` iff `v` counts as a truthy SQL value for a
@@ -12604,10 +12638,12 @@ fn check_existing_unique_violation(
         let key: alloc::vec::Vec<spg_storage::Value> = key_positions
             .iter()
             .map(|&p| {
-                row.values
+                let v = row
+                    .values
                     .get(p)
                     .cloned()
-                    .unwrap_or(spg_storage::Value::Null)
+                    .unwrap_or(spg_storage::Value::Null);
+                collated_key_cell(&v, p, schema)
             })
             .collect();
         if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
@@ -12669,9 +12705,15 @@ fn enforce_unique_index_inserts(
         };
         let key_positions = unique_key_positions(idx);
         let key_of = |values: &[spg_storage::Value]| -> alloc::vec::Vec<spg_storage::Value> {
+            // v7.17.0 Phase 3.P0-45 — fold per-column collation
+            // before building the comparison key so a `*_ci`
+            // column treats `'Foo'` and `'FOO'` as equal.
             key_positions
                 .iter()
-                .map(|&p| values.get(p).cloned().unwrap_or(spg_storage::Value::Null))
+                .map(|&p| {
+                    let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
+                    collated_key_cell(&v, p, schema)
+                })
                 .collect()
         };
         // Helper: does `values` participate in this index? (predicate
