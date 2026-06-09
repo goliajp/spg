@@ -1,0 +1,31 @@
+# v7.17.0 Phase 3.P0-60..P0-62 — SHOW INDEXES / STATUS / VARIABLES / PROCESSLIST.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
+
+statement ok
+CREATE INDEX idx_t_name ON t (name)
+
+# SHOW INDEXES.
+statement ok
+SHOW INDEXES FROM t
+
+# SHOW INDEX (singular alias).
+statement ok
+SHOW INDEX FROM t
+
+# SHOW KEYS (alias).
+statement ok
+SHOW KEYS FROM t
+
+# SHOW STATUS.
+statement ok
+SHOW STATUS
+
+# SHOW VARIABLES.
+statement ok
+SHOW VARIABLES
+
+# SHOW PROCESSLIST.
+statement ok
+SHOW PROCESSLIST
