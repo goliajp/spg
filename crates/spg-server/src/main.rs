@@ -37,6 +37,7 @@ thread_local! {
     /// .cold_prefetch_hits` after the state is built.
     static PREFETCH_HITS_BOOT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+mod mysqlwire;
 mod pgwire;
 mod replication;
 mod scram;
@@ -1292,6 +1293,20 @@ fn run(
         match pgwire::spawn_listener(&pg_addr, Arc::clone(&state)) {
             Ok(pg_local) => eprintln!("spg-server: pg-wire listening on {pg_local}"),
             Err(e) => eprintln!("spg-server: pg-wire failed to start on {pg_addr}: {e}"),
+        }
+    }
+
+    // v7.17.0 Phase 3.P0-70 — optional MySQL-wire compatibility
+    // listener. Opt-in via env so existing deployments don't
+    // suddenly grow a third bound port. Plumbed through Segment
+    // G as auth (P0-71/P0-72), commands (P0-73..P0-75), binary
+    // result rows (P0-76), and SSL upgrade (P0-77) land.
+    if let Ok(my_addr) = env::var("SPG_MYSQLWIRE_ADDR")
+        && !my_addr.is_empty()
+    {
+        match mysqlwire::spawn_listener(&my_addr, Arc::clone(&state)) {
+            Ok(my_local) => eprintln!("spg-server: mysql-wire listening on {my_local}"),
+            Err(e) => eprintln!("spg-server: mysql-wire failed to start on {my_addr}: {e}"),
         }
     }
 

@@ -62,6 +62,7 @@ pub struct ServerAddrs {
     pub native: String,
     pub http: Option<String>,
     pub pgwire: Option<String>,
+    pub mysqlwire: Option<String>,
     pub repl: Option<String>,
 }
 
@@ -76,6 +77,7 @@ pub struct ServerBuilder {
     env_remove: Vec<String>,
     want_http: bool,
     want_pgwire: bool,
+    want_mysqlwire: bool,
     want_repl: bool,
     startup_timeout: Duration,
     inherit_stderr_echo: bool,
@@ -89,6 +91,7 @@ impl Default for ServerBuilder {
             env_remove: alloc_default_env_remove(),
             want_http: false,
             want_pgwire: false,
+            want_mysqlwire: false,
             want_repl: false,
             startup_timeout: STARTUP_TIMEOUT,
             inherit_stderr_echo: false,
@@ -166,6 +169,17 @@ impl ServerBuilder {
         self
     }
 
+    /// v7.17.0 Phase 3.P0-70 — add a MySQL-wire listener via
+    /// `SPG_MYSQLWIRE_ADDR=127.0.0.1:0`.
+    #[must_use]
+    pub fn with_mysqlwire(mut self) -> Self {
+        self.want_mysqlwire = true;
+        self.env_remove.retain(|k| k != "SPG_MYSQLWIRE_ADDR");
+        self.extra_env
+            .push(("SPG_MYSQLWIRE_ADDR".into(), "127.0.0.1:0".into()));
+        self
+    }
+
     /// Add a replication listener via `SPG_REPL_ADDR=127.0.0.1:0`.
     #[must_use]
     pub fn with_repl(mut self) -> Self {
@@ -231,6 +245,7 @@ impl ServerBuilder {
             self.startup_timeout,
             self.want_http,
             self.want_pgwire,
+            self.want_mysqlwire,
             self.want_repl,
             self.inherit_stderr_echo,
         );
@@ -267,6 +282,7 @@ fn read_listener_addrs(
     deadline: Duration,
     want_http: bool,
     want_pgwire: bool,
+    want_mysqlwire: bool,
     want_repl: bool,
     inherit_echo: bool,
 ) -> ServerAddrs {
@@ -275,12 +291,14 @@ fn read_listener_addrs(
     let mut native: Option<String> = None;
     let mut http: Option<String> = None;
     let mut pgwire: Option<String> = None;
+    let mut mysqlwire: Option<String> = None;
     let mut repl: Option<String> = None;
     let mut line = String::new();
     while Instant::now() < until {
         if native.is_some()
             && (!want_http || http.is_some())
             && (!want_pgwire || pgwire.is_some())
+            && (!want_mysqlwire || mysqlwire.is_some())
             && (!want_repl || repl.is_some())
         {
             break;
@@ -301,6 +319,8 @@ fn read_listener_addrs(
                     http = Some(a);
                 } else if let Some(a) = extract("pg-wire listening on ", &line) {
                     pgwire = Some(a);
+                } else if let Some(a) = extract("mysql-wire listening on ", &line) {
+                    mysqlwire = Some(a);
                 } else if let Some(a) = extract("replication listening on ", &line) {
                     repl = Some(a);
                 } else if let Some(a) = extract("listening on ", &line) {
@@ -321,6 +341,10 @@ fn read_listener_addrs(
     if want_pgwire && pgwire.is_none() {
         let _ = child.kill();
         panic!("server didn't publish pg-wire addr within {deadline:?}");
+    }
+    if want_mysqlwire && mysqlwire.is_none() {
+        let _ = child.kill();
+        panic!("server didn't publish mysql-wire addr within {deadline:?}");
     }
     if want_repl && repl.is_none() {
         let _ = child.kill();
@@ -347,6 +371,7 @@ fn read_listener_addrs(
         native: n,
         http,
         pgwire,
+        mysqlwire,
         repl,
     }
 }
