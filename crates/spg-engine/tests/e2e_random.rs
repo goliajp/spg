@@ -31,7 +31,7 @@ fn random_returns_value_in_zero_to_one() {
     let mut e = Engine::new();
     let row = one_row(e.execute("SELECT random()").unwrap());
     let v = f(&row[0]);
-    assert!(v >= 0.0 && v < 1.0, "got {v}");
+    assert!((0.0..1.0).contains(&v), "got {v}");
 }
 
 #[test]
