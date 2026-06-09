@@ -17642,6 +17642,50 @@ mod tests {
     }
 
     #[test]
+    fn bytea_cast_round_trips_text_input() {
+        // v7.18 — `'hello'::bytea` produces the raw bytes. Closes
+        // the mailrs D-pre #3 reverse-acceptance gap.
+        let e = Engine::new();
+        let r = e.execute_readonly("SELECT 'hello'::bytea").unwrap();
+        let QueryResult::Rows { rows, .. } = r else { panic!("expected Rows") };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Bytes(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn bytea_cast_pg_escape_hex_form() {
+        // E'\\xdeadbeef'::bytea — E-string decodes to `\xdeadbeef`
+        // (literal 10 chars), then ::bytea reads it as PG hex
+        // form bytea literal → 4 bytes.
+        let e = Engine::new();
+        let r = e
+            .execute_readonly(r"SELECT E'\\xdeadbeef'::bytea")
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = r else { panic!("expected Rows") };
+        assert_eq!(
+            rows[0].values[0],
+            Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+    }
+
+    #[test]
+    fn bytea_cast_chains_through_octet_length() {
+        // octet_length('hello'::bytea) → 5. Confirms the cast
+        // composes inside larger expressions, not just at top
+        // level.
+        let e = Engine::new();
+        let r = e
+            .execute_readonly("SELECT octet_length('hello'::bytea)")
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = r else { panic!("expected Rows") };
+        match &rows[0].values[0] {
+            Value::Int(n) => assert_eq!(*n, 5),
+            Value::BigInt(n) => assert_eq!(*n, 5),
+            other => panic!("expected integer length, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn readonly_prepared_on_snapshot_select_with_placeholder() {
         // v7.18 — sqlx Pool fan-out relies on running prepared
         // SELECTs against a frozen snapshot without re-entering

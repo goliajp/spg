@@ -7386,6 +7386,11 @@ impl Parser {
                         // v7.17.0 — `::uuid`. Engine decodes the LHS
                         // text via `spg_storage::parse_uuid_str`.
                         "uuid" => CastTarget::Uuid,
+                        // v7.18 — `::bytea`. Engine decodes the LHS
+                        // text via the PG hex form (`'\xdeadbeef'`)
+                        // or escape form (`'\\x05\\x00'`). Closes
+                        // mailrs D-pre #3 reverse-acceptance gap.
+                        "bytea" => CastTarget::Bytea,
                         // v7.17.0 Phase 3.P0-47 — `::inet` / `::cidr` /
                         // `::macaddr`. SPG stores these as Text (Phase 7);
                         // the cast is a no-op passthrough so containment
