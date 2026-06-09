@@ -6248,7 +6248,7 @@ pub fn cast_to_vector(v: Value) -> Result<Value, EvalError> {
 }
 
 /// Parse `"[1.0, 2.0, -3]"` into `Vec<f32>`. Returns `None` on malformed input.
-fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
+pub fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
     let trimmed = s.trim();
     let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
     let trimmed_inner = inner.trim();

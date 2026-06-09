@@ -18,13 +18,16 @@ impl Type<Spg> for str {
     }
 
     fn compatible(ty: &SpgTypeInfo) -> bool {
-        // v7.17.0 Phase 3.P0-67 — NUMERIC cells decode to
-        // canonical PG decimal text, so `String` / `&str`
-        // accept them as compatible. Keeps the
-        // `query_as::<_, (String,)>("SELECT amount …")` shape
-        // working without forcing every caller to enable the
-        // bigdecimal feature.
-        matches!(ty.kind(), Kind::Text | Kind::Numeric)
+        // v7.17.0 Phase 3.P0-67 / P0-68 — exact-decimal,
+        // pgvector, and tsvector cells all decode to their
+        // canonical PG text form, so `String` / `&str` accept
+        // them as compatible. Keeps
+        // `query_as::<_, (String,)>("SELECT vec_col …")` shapes
+        // working without enabling type-specific features.
+        matches!(
+            ty.kind(),
+            Kind::Text | Kind::Numeric | Kind::Vector | Kind::TsVector
+        )
     }
 }
 
@@ -62,11 +65,17 @@ impl<'q> Encode<'q, Spg> for String {
 
 impl<'r> Decode<'r, Spg> for String {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
-        // v7.17.0 Phase 3.P0-67 — NUMERIC cells decode to their
-        // canonical PG text form so the dominant
-        // `query_as::<_, (String,)>` pattern works without the
-        // bigdecimal feature.
+        // v7.17.0 Phase 3.P0-67 / P0-68 — NUMERIC / VECTOR /
+        // TSVECTOR cells all decode to their canonical PG text
+        // form so the dominant `query_as::<_, (String,)>` pattern
+        // works without enabling any type-specific feature.
         if let Some(s) = crate::types::decimal::try_numeric_as_string(value.engine()) {
+            return Ok(s);
+        }
+        if let Some(s) = crate::types::vector::try_vector_as_string(value.engine()) {
+            return Ok(s);
+        }
+        if let Some(s) = crate::types::vector::try_tsvector_as_string(value.engine()) {
             return Ok(s);
         }
         match value.engine() {

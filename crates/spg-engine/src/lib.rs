@@ -17018,6 +17018,38 @@ fn coerce_value(
         // external array form (`{a,b,NULL}`). Lets a SELECT
         // pull an array column through any Text-side codepath.
         (Value::TextArray(items), DataType::Text) => Some(Value::Text(encode_text_array(&items))),
+        // v7.17.0 Phase 3.P0-68 — Text → VECTOR auto-coerce.
+        // Matches the existing Text → TsVector arm and the
+        // `::vector` cast: PG-canonical pgvector external form
+        // (`'[1, 2, -3]'`) becomes a typed Vector value at the
+        // column boundary. Dim mismatch surfaces as TypeMismatch.
+        // For SQ8 / HALF encodings we chain through the standard
+        // quantise helpers so the storage shape matches the
+        // declared encoding without a second coerce pass.
+        (Value::Text(s), DataType::Vector { dim, encoding }) => {
+            let parsed = eval::parse_vector_text(&s).ok_or_else(|| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as VECTOR for column `{col_name}`"
+                    ),
+                })
+            })?;
+            if parsed.len() != dim as usize {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "VECTOR({dim}) column `{col_name}` rejects literal of length {}",
+                        parsed.len()
+                    ),
+                }));
+            }
+            Some(match encoding {
+                VecEncoding::F32 => Value::Vector(parsed),
+                VecEncoding::Sq8 => Value::Sq8Vector(spg_storage::quantize::quantize(&parsed)),
+                VecEncoding::F16 => Value::HalfVector(
+                    spg_storage::halfvec::HalfVector::from_f32_slice(&parsed),
+                ),
+            })
+        }
         // v7.16.1 — Text → TSVECTOR auto-coerce for the
         // INSERT-side wire path (mailrs round-9 A.2.a). PG
         // implicitly promotes the TEXT literal at INSERT into a
