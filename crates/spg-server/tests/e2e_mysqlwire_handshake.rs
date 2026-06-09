@@ -152,19 +152,19 @@ fn handshake_v10_greeting_carries_every_required_field() {
 }
 
 #[test]
-fn server_replies_to_handshake_response_with_err_pointing_to_p0_71() {
+fn server_replies_to_handshake_response_with_ok_in_open_mode() {
+    // P0-70 originally asserted an ERR pointing at the
+    // not-yet-implemented auth surface; P0-71 wires auth and
+    // the open-mode (no users) path now flips to OK. The deeper
+    // auth-table flow is exercised in e2e_mysqlwire_auth.
     let dir = unique_tmpdir();
     let db: PathBuf = dir.join("spg.db");
     let (_guard, addr) = spawn_with_mysqlwire(&db);
 
     let mut s = common::connect_to(&addr);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    // Drain the greeting so seqno alignment is right.
     let (_seqno, _payload) = read_packet(&mut s);
 
-    // Build a minimal HandshakeResponse41 (CLIENT_PROTOCOL_41 +
-    // CLIENT_SECURE_CONNECTION + CLIENT_PLUGIN_AUTH, user='root',
-    // empty auth_response, plugin='mysql_native_password').
     let caps: u32 = 0x0000_0200 | 0x0000_8000 | 0x0008_0000;
     let mut payload = Vec::new();
     payload.extend_from_slice(&caps.to_le_bytes());
@@ -172,24 +172,13 @@ fn server_replies_to_handshake_response_with_err_pointing_to_p0_71() {
     payload.push(0xff);
     payload.extend_from_slice(&[0u8; 23]);
     payload.extend_from_slice(b"root\0");
-    payload.push(0); // auth_response length = 0
+    payload.push(0); // empty auth_response — open mode accepts it
     payload.extend_from_slice(b"mysql_native_password\0");
     write_packet(&mut s, 1, &payload);
 
     let (seqno, payload) = read_packet(&mut s);
     assert_eq!(seqno, 2, "server's reply to client seqno=1 is seqno=2");
-    assert_eq!(payload[0], 0xff, "expected ERR packet");
-    // Error code 1251 = ER_NOT_SUPPORTED_AUTH_MODE — picked so
-    // mysql CLI shows "Authentication plugin not supported".
-    let errno = u16::from_le_bytes(payload[1..3].try_into().unwrap());
-    assert_eq!(errno, 1251);
-    assert_eq!(payload[3], b'#');
-    assert_eq!(&payload[4..9], b"08004");
-    let msg = std::str::from_utf8(&payload[9..]).unwrap();
-    assert!(
-        msg.contains("P0-71"),
-        "expected message to name the follow-on commit, got {msg:?}"
-    );
+    assert_eq!(payload[0], 0x00, "expected OK packet in open mode");
 }
 
 #[test]
