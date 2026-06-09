@@ -70,7 +70,7 @@
         { "file": "12_unique_collation.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1245, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1248, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -239,6 +239,8 @@
         { "file": "83_pg_indexes_view.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "84_pg_constraint_view.test", "pass": 4, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "85_pg_database_roles_view.test", "pass": 3, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pgvector", "pass": 63, "fail": 0, "skip": 0,
