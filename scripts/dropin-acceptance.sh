@@ -43,6 +43,7 @@ REPORT="./dropin-acceptance-report.md"
 KEEP=0
 NO_PULL=0
 CONTAINER_NAME="spg-dropin-$$"
+FIXTURES=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,8 +52,15 @@ while [ $# -gt 0 ]; do
     --report) REPORT="$2"; shift 2 ;;
     --keep-container) KEEP=1; shift ;;
     --no-pull) NO_PULL=1; shift ;;
+    --fixture)
+      # SQL file to feed to SPG as one chunk; each --fixture
+      # adds another file (applied in argv order, useful for
+      # pg-extensions.sql before init-schema.sql).
+      FIXTURES+=("$2")
+      shift 2
+      ;;
     -h|--help)
-      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -218,6 +226,33 @@ run_case "stock.transaction_commit" \
   "CREATE TABLE tx1 (id INT); BEGIN; INSERT INTO tx1 VALUES (1); COMMIT; SELECT count(*) FROM tx1;"
 run_case "stock.transaction_rollback" \
   "CREATE TABLE tx2 (id INT); BEGIN; INSERT INTO tx2 VALUES (1); ROLLBACK; SELECT count(*) FROM tx2;"
+
+# --- Fixture mode — apply each --fixture SQL file as a single chunk ---
+FIXTURE_REPORT=""
+if [ "${#FIXTURES[@]}" -gt 0 ]; then
+  echo ""
+  echo "=== Fixture panel ==="
+  for f in "${FIXTURES[@]}"; do
+    fname=$(basename "$f")
+    if [ ! -f "$f" ]; then
+      echo "[fixture] $fname — MISSING file at $f"
+      FAIL_COUNT=$((FAIL_COUNT+1))
+      CASES+=("fixture.$fname|FAIL|fixture file not found: $f")
+      continue
+    fi
+    echo "[fixture] $fname"
+    out=$(cat "$f" | $PSQL 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      PASS_COUNT=$((PASS_COUNT+1))
+      CASES+=("fixture.$fname|PASS|")
+    else
+      FAIL_COUNT=$((FAIL_COUNT+1))
+      first_err=$(echo "$out" | grep -E "^(ERROR|psql: error)" | head -1 | sed 's/^ERROR:\s*//' | tr -s ' ')
+      CASES+=("fixture.$fname|FAIL|$first_err")
+    fi
+  done
+fi
 
 # --- Render markdown report ---
 TOTAL=$((PASS_COUNT + FAIL_COUNT))
