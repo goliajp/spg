@@ -4148,6 +4148,11 @@ impl Parser {
                 .map(alloc::string::String::from)
                 .unwrap_or_else(|| tbl.to_ascii_lowercase());
             ("__spg_pg_", bare)
+        } else if schema.eq_ignore_ascii_case("mysql") {
+            // v7.17.0 Phase 3.P0-65 — MySQL system schema
+            // (`mysql.user`, `mysql.db`). Same synthetic-name
+            // shape as pg_catalog.
+            ("__spg_mysql_", tbl.to_ascii_lowercase())
         } else {
             return None;
         };
