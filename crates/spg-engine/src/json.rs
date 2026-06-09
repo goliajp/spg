@@ -840,14 +840,12 @@ pub fn path_query_array(doc: &Value, path: &Value) -> Result<Value, EvalError> {
         Value::TextArray(items) => {
             let mut buf = String::from("[");
             let mut first = true;
-            for it in items {
-                if let Some(s) = it {
-                    if !first {
-                        buf.push(',');
-                    }
-                    buf.push_str(&s);
-                    first = false;
+            for s in items.into_iter().flatten() {
+                if !first {
+                    buf.push(',');
                 }
+                buf.push_str(&s);
+                first = false;
             }
             buf.push(']');
             Ok(Value::Json(buf))

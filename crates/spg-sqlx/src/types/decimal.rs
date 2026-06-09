@@ -131,7 +131,7 @@ mod bd {
 
     /// Reshape a BigDecimal into SPG's `(i128 scaled, u8 scale)`
     /// pair. Errors out if the mantissa overflows i128 (precision
-    /// > 38) or the exponent is outside `0..=u8::MAX` — both
+    /// `> 38`) or the exponent is outside `0..=u8::MAX` — both
     /// states fall outside what SPG NUMERIC can represent.
     fn bigdecimal_to_scaled(d: &BigDecimal) -> Result<(i128, u8), BoxDynError> {
         // BigDecimal::as_bigint_and_exponent gives (mantissa,

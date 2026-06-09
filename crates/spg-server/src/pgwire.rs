@@ -1500,6 +1500,7 @@ fn looks_numeric(s: &str) -> bool {
     s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_execute(
     body: &[u8],
     portals: &std::collections::HashMap<String, Portal>,

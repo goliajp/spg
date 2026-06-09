@@ -245,7 +245,7 @@ fn trim_over_column() {
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::Text("".into()));
+    assert_eq!(rows[0].values[0], Value::Text(String::new()));
     assert_eq!(rows[1].values[0], Value::Text("john".into()));
 }
 

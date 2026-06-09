@@ -12,7 +12,6 @@
 )]
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

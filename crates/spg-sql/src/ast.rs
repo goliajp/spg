@@ -565,6 +565,7 @@ pub struct AlterTableStatement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum AlterTableTarget {
     /// Per-table hot-tier byte budget override. The freezer
     /// reads this before falling back to `SPG_HOT_TIER_BYTES`.
@@ -1240,6 +1241,7 @@ pub enum Collation {
     CaseInsensitive,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Collation {
     fn default() -> Self {
         Self::Binary
