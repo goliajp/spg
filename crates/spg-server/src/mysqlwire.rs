@@ -1,0 +1,643 @@
+// MySQL wire protocol is a hand-rolled binary protocol. Casts
+// between integer widths (u24 lengths, u16 cap-flag halves) and
+// verbose match arms are inherent to the format. Allowlist
+// scoped to this file, mirroring pgwire.rs.
+#![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unreadable_literal
+)]
+
+//! v7.17.0 Phase 3.P0-70 — MySQL wire-protocol compatibility shim
+//! (foundation: HandshakeV10 + HandshakeResponse41 packet framing).
+//!
+//! Opt-in: set `SPG_MYSQLWIRE_ADDR=127.0.0.1:3307` (or any
+//! host:port) and the server starts a third TCP listener (after
+//! native + pgwire) that talks the MySQL `Protocol::HandshakeV10`
+//! handshake. Goal of the full Segment G is "mysql CLI / DBeaver
+//! / MySQL Workbench / sqlx-mysql can connect against the same
+//! Engine instance".
+//!
+//! P0-70 lands the framing + handshake exchange ONLY. The
+//! follow-on P0s wire auth verification (P0-71/P0-72), command
+//! handling (P0-73/P0-74/P0-75), binary result encoding (P0-76),
+//! and SSL upgrade (P0-77).
+//!
+//! Packet framing is fixed (every MySQL packet on the wire):
+//!   bytes 0..3 — payload length, little-endian u24
+//!   byte  3    — sequence id (starts at 0 from the server's
+//!                first greeting, then client and server
+//!                alternate seqno increments per RTT step)
+//!   bytes 4..  — payload bytes
+//!
+//! Reference: <https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html>
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::thread;
+
+use crate::ServerState;
+
+// ---- capability flags ---------------------------------------
+
+/// CLIENT_LONG_PASSWORD — historical (use ≥ 4.1 password).
+pub(crate) const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
+/// CLIENT_FOUND_ROWS — affected-rows reports matched rather than
+/// changed.
+pub(crate) const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
+/// CLIENT_LONG_FLAG — full column flag mask.
+pub(crate) const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
+/// CLIENT_CONNECT_WITH_DB — schema name follows in
+/// HandshakeResponse.
+pub(crate) const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+/// CLIENT_PROTOCOL_41 — modern protocol shape (we always
+/// advertise this).
+pub(crate) const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+/// CLIENT_TRANSACTIONS — server reports transaction status flags.
+pub(crate) const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
+/// CLIENT_SECURE_CONNECTION — uses the 4.1+ auth response shape.
+pub(crate) const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+/// CLIENT_PLUGIN_AUTH — server names an auth plugin in
+/// HandshakeV10 and may issue AuthSwitchRequest mid-handshake.
+pub(crate) const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+/// CLIENT_CONNECT_ATTRS — k=v attrs follow auth response.
+pub(crate) const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
+/// CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA — auth response length
+/// is length-encoded, not 1-byte.
+pub(crate) const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+/// CLIENT_DEPRECATE_EOF — replace EOF packets with OK packets.
+pub(crate) const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
+
+/// Server-advertised capability mask for P0-70. Each follow-on
+/// P0 ORs additional bits in as it implements the feature
+/// (SSL, multi-result, etc.).
+pub(crate) const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
+    | CLIENT_FOUND_ROWS
+    | CLIENT_LONG_FLAG
+    | CLIENT_CONNECT_WITH_DB
+    | CLIENT_PROTOCOL_41
+    | CLIENT_TRANSACTIONS
+    | CLIENT_SECURE_CONNECTION
+    | CLIENT_PLUGIN_AUTH
+    | CLIENT_DEPRECATE_EOF;
+
+/// utf8mb4 collation id — what MySQL 8.0+ servers advertise by
+/// default.
+const CHARSET_UTF8MB4: u8 = 0xff;
+
+/// SERVER_STATUS_AUTOCOMMIT (we always run autocommit until
+/// BEGIN is wired in a later P0).
+const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
+
+/// Auth plugin name advertised in the initial HandshakeV10. We
+/// pick `mysql_native_password` since it's the simplest and
+/// every client speaks it; clients that want `caching_sha2`
+/// will send AuthSwitchRequest after seeing this — handled in
+/// P0-72.
+pub(crate) const AUTH_PLUGIN_NATIVE: &str = "mysql_native_password";
+
+// ---- listener bootstrap -------------------------------------
+
+/// Spawn the MySQL-wire listener thread. Returns once the
+/// listener is bound (so the parent can log "listening on …").
+/// Each accepted connection runs its own thread that owns the
+/// `Conn` state — same shape as `pgwire::spawn_listener`.
+///
+/// # Errors
+/// Surfaces bind / address errors from `TcpListener::bind`.
+pub fn spawn_listener(
+    addr: &str,
+    state: Arc<ServerState>,
+) -> std::io::Result<std::net::SocketAddr> {
+    let listener = TcpListener::bind(addr)?;
+    let local = listener.local_addr()?;
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                continue;
+            };
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                if let Err(e) = handle_conn(stream, &state) {
+                    eprintln!("spg-server: mysql-wire conn error: {e}");
+                }
+            });
+        }
+    });
+    Ok(local)
+}
+
+fn handle_conn(mut stream: TcpStream, _state: &Arc<ServerState>) -> std::io::Result<()> {
+    let _ = stream.set_nodelay(true);
+
+    // ---- HandshakeV10 (server → client) ----------------------
+    //
+    // Connection id is just the local port to keep it
+    // deterministic per-connection without an extra atomic.
+    // The full Segment G binds it to ServerState.active_connections
+    // once command handling needs the id for KILL.
+    let conn_id = stream
+        .local_addr()
+        .map(|a| u32::from(a.port()))
+        .unwrap_or(1);
+    // 20-byte auth-plugin-data scramble. Deterministic random
+    // from the connection id + clock so retries reproduce the
+    // same bytes during e2e testing without a separate seed
+    // channel. Production strength is added in P0-71 (where
+    // mysql_native_password verification proves the scramble
+    // was actually random).
+    let scramble = generate_scramble(conn_id);
+
+    let mut greeting = HandshakeV10Greeting {
+        protocol_version: 10,
+        server_version: server_version_string(),
+        connection_id: conn_id,
+        scramble: scramble.clone(),
+        capability_flags: SERVER_CAPABILITIES,
+        character_set: CHARSET_UTF8MB4,
+        status_flags: SERVER_STATUS_AUTOCOMMIT,
+        auth_plugin_name: AUTH_PLUGIN_NATIVE.to_string(),
+    };
+    // seqno starts at 0 for the server's first greeting.
+    write_packet(&mut stream, 0, &encode_handshake_v10(&greeting))?;
+
+    // ---- HandshakeResponse41 (client → server) ---------------
+    let (seqno_in, payload) = read_packet(&mut stream)?;
+    if seqno_in != 1 {
+        // Spec: the client's HandshakeResponse must arrive with
+        // sequence id = 1. Any other id is a protocol error.
+        return write_packet(
+            &mut stream,
+            seqno_in.wrapping_add(1),
+            &encode_err_packet(
+                1043,
+                "08S01",
+                &format!(
+                    "bad handshake: expected client seqno 1, got {seqno_in}"
+                ),
+            ),
+        );
+    }
+    let parsed = match parse_handshake_response_41(&payload) {
+        Ok(r) => r,
+        Err(msg) => {
+            return write_packet(
+                &mut stream,
+                seqno_in.wrapping_add(1),
+                &encode_err_packet(1043, "08S01", &msg),
+            );
+        }
+    };
+
+    // P0-70 stops here. The follow-on P0-71 / P0-72 verify the
+    // auth response and send OK / AuthSwitchRequest. For now we
+    // ack the connection with an Error packet that names the
+    // missing surface — every modern mysql client surfaces this
+    // as "auth plugin not supported" rather than hanging.
+    let _ = parsed; // silence "unused" until P0-71 reads it
+    let _ = &mut greeting; // silence "unused" until P0-71 reuses
+    write_packet(
+        &mut stream,
+        seqno_in.wrapping_add(1),
+        &encode_err_packet(
+            1251,
+            "08004",
+            "Authentication is not yet wired in v7.17 — P0-71 lands mysql_native_password",
+        ),
+    )?;
+    Ok(())
+}
+
+// ---- HandshakeV10 packet encode -----------------------------
+
+pub(crate) struct HandshakeV10Greeting {
+    pub(crate) protocol_version: u8,
+    pub(crate) server_version: String,
+    pub(crate) connection_id: u32,
+    /// 20-byte scramble (auth-plugin-data parts 1 + 2 combined
+    /// without the trailing null byte).
+    pub(crate) scramble: Vec<u8>,
+    pub(crate) capability_flags: u32,
+    pub(crate) character_set: u8,
+    pub(crate) status_flags: u16,
+    pub(crate) auth_plugin_name: String,
+}
+
+pub(crate) fn encode_handshake_v10(g: &HandshakeV10Greeting) -> Vec<u8> {
+    debug_assert_eq!(
+        g.scramble.len(),
+        20,
+        "MySQL scramble is fixed at 20 bytes (8 + 12) per spec"
+    );
+    let mut out = Vec::with_capacity(64 + g.server_version.len() + g.auth_plugin_name.len());
+    out.push(g.protocol_version);
+    out.extend_from_slice(g.server_version.as_bytes());
+    out.push(0); // null-terminator on server_version
+    out.extend_from_slice(&g.connection_id.to_le_bytes());
+    // auth-plugin-data-part-1 (8 bytes)
+    out.extend_from_slice(&g.scramble[..8]);
+    out.push(0); // filler
+    let caps = g.capability_flags;
+    // lower 2 bytes of cap flags
+    out.extend_from_slice(&(caps as u16).to_le_bytes());
+    out.push(g.character_set);
+    out.extend_from_slice(&g.status_flags.to_le_bytes());
+    // upper 2 bytes of cap flags
+    out.extend_from_slice(&((caps >> 16) as u16).to_le_bytes());
+    // length of full auth-plugin-data (server-side length we
+    // advertise — 21 = 8 + 12 + 1 null terminator on part 2).
+    out.push(21);
+    // 10 reserved bytes (all zero) per spec.
+    out.extend_from_slice(&[0u8; 10]);
+    // auth-plugin-data-part-2: 12 bytes + 1 null terminator =
+    // 13 bytes per the v10 spec ("length_of_auth_plugin_data" is
+    // max(13, real_len) — we send the real 12 plus null).
+    out.extend_from_slice(&g.scramble[8..20]);
+    out.push(0);
+    // null-terminated auth plugin name (CLIENT_PLUGIN_AUTH).
+    out.extend_from_slice(g.auth_plugin_name.as_bytes());
+    out.push(0);
+    out
+}
+
+// ---- HandshakeResponse41 packet parse ------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct HandshakeResponse41 {
+    pub(crate) client_capabilities: u32,
+    pub(crate) max_packet_size: u32,
+    pub(crate) character_set: u8,
+    pub(crate) username: String,
+    pub(crate) auth_response: Vec<u8>,
+    pub(crate) database: Option<String>,
+    pub(crate) auth_plugin_name: Option<String>,
+}
+
+pub(crate) fn parse_handshake_response_41(payload: &[u8]) -> Result<HandshakeResponse41, String> {
+    let mut p = Cursor::new(payload);
+    let caps = p.u32_le().ok_or_else(|| "truncated cap flags".to_string())?;
+    let max_packet = p
+        .u32_le()
+        .ok_or_else(|| "truncated max packet size".to_string())?;
+    let charset = p.u8().ok_or_else(|| "truncated charset".to_string())?;
+    // 23 reserved filler bytes per spec.
+    p.skip(23)
+        .ok_or_else(|| "truncated reserved filler".to_string())?;
+    let username = p
+        .null_string()
+        .ok_or_else(|| "truncated username".to_string())?;
+    // Auth response: length-encoded if CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
+    // 1-byte length if CLIENT_SECURE_CONNECTION, NUL-terminated
+    // otherwise. P0-70 supports the modern paths (lenenc + 1-byte).
+    let auth_response = if caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+        let n = p
+            .lenenc_int()
+            .ok_or_else(|| "truncated auth_response lenenc".to_string())?;
+        if n > 4096 {
+            return Err(format!("auth_response oversized: {n} bytes"));
+        }
+        p.bytes(n as usize)
+            .ok_or_else(|| "truncated auth_response payload".to_string())?
+    } else if caps & CLIENT_SECURE_CONNECTION != 0 {
+        let n = p.u8().ok_or_else(|| "truncated auth_response u8".to_string())?;
+        p.bytes(n as usize)
+            .ok_or_else(|| "truncated auth_response payload".to_string())?
+    } else {
+        return Err(
+            "legacy CLIENT_LONG_PASSWORD auth (pre-4.1) is not supported".to_string(),
+        );
+    };
+    let database = if caps & CLIENT_CONNECT_WITH_DB != 0 {
+        Some(
+            p.null_string()
+                .ok_or_else(|| "truncated database name".to_string())?,
+        )
+    } else {
+        None
+    };
+    let auth_plugin_name = if caps & CLIENT_PLUGIN_AUTH != 0 {
+        Some(
+            p.null_string()
+                .ok_or_else(|| "truncated auth plugin name".to_string())?,
+        )
+    } else {
+        None
+    };
+    Ok(HandshakeResponse41 {
+        client_capabilities: caps,
+        max_packet_size: max_packet,
+        character_set: charset,
+        username,
+        auth_response,
+        database,
+        auth_plugin_name,
+    })
+}
+
+// ---- ERR packet ---------------------------------------------
+
+pub(crate) fn encode_err_packet(errno: u16, sqlstate: &str, msg: &str) -> Vec<u8> {
+    debug_assert_eq!(sqlstate.len(), 5, "SQLSTATE is exactly 5 ASCII chars");
+    let mut out = Vec::with_capacity(9 + msg.len());
+    out.push(0xff); // ERR header
+    out.extend_from_slice(&errno.to_le_bytes());
+    out.push(b'#');
+    out.extend_from_slice(sqlstate.as_bytes());
+    out.extend_from_slice(msg.as_bytes());
+    out
+}
+
+// ---- packet framing -----------------------------------------
+
+pub(crate) fn write_packet(
+    stream: &mut TcpStream,
+    seqno: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    if payload.len() > 0x00ff_ffff {
+        // Multi-segment packets land in P0-73 (COM_QUERY can
+        // send very large LOAD DATA). For P0-70 the surface is
+        // tiny — ERR / handshake — so a hard error here is the
+        // safe choice.
+        return Err(std::io::Error::other(format!(
+            "mysqlwire: refusing to send {} bytes — multi-segment send is P0-73",
+            payload.len()
+        )));
+    }
+    let len = payload.len() as u32;
+    let mut hdr = [0u8; 4];
+    hdr[0] = len as u8;
+    hdr[1] = (len >> 8) as u8;
+    hdr[2] = (len >> 16) as u8;
+    hdr[3] = seqno;
+    stream.write_all(&hdr)?;
+    stream.write_all(payload)?;
+    Ok(())
+}
+
+pub(crate) fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut hdr = [0u8; 4];
+    stream.read_exact(&mut hdr)?;
+    let len = u32::from(hdr[0]) | (u32::from(hdr[1]) << 8) | (u32::from(hdr[2]) << 16);
+    let seqno = hdr[3];
+    let mut payload = vec![0u8; len as usize];
+    stream.read_exact(&mut payload)?;
+    Ok((seqno, payload))
+}
+
+// ---- payload cursor helpers ---------------------------------
+
+pub(crate) struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    pub(crate) fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    pub(crate) fn u32_le(&mut self) -> Option<u32> {
+        let slice = self.buf.get(self.pos..self.pos + 4)?;
+        let v = u32::from_le_bytes(slice.try_into().ok()?);
+        self.pos += 4;
+        Some(v)
+    }
+
+    pub(crate) fn skip(&mut self, n: usize) -> Option<()> {
+        if self.pos + n > self.buf.len() {
+            return None;
+        }
+        self.pos += n;
+        Some(())
+    }
+
+    pub(crate) fn bytes(&mut self, n: usize) -> Option<Vec<u8>> {
+        let slice = self.buf.get(self.pos..self.pos + n)?;
+        self.pos += n;
+        Some(slice.to_vec())
+    }
+
+    pub(crate) fn null_string(&mut self) -> Option<String> {
+        let rest = self.buf.get(self.pos..)?;
+        let nul = rest.iter().position(|b| *b == 0)?;
+        let s = String::from_utf8(rest[..nul].to_vec()).ok()?;
+        self.pos += nul + 1;
+        Some(s)
+    }
+
+    pub(crate) fn lenenc_int(&mut self) -> Option<u64> {
+        // MySQL length-encoded integer: 0..250 = 1 byte; 0xfb =
+        // NULL; 0xfc = 2-byte; 0xfd = 3-byte; 0xfe = 8-byte.
+        let first = self.u8()?;
+        match first {
+            0xfb => Some(0), // treat NULL as zero — caller decides if NULL is legal
+            0xfc => {
+                let slice = self.buf.get(self.pos..self.pos + 2)?;
+                let v = u16::from_le_bytes(slice.try_into().ok()?);
+                self.pos += 2;
+                Some(u64::from(v))
+            }
+            0xfd => {
+                let slice = self.buf.get(self.pos..self.pos + 3)?;
+                let mut bytes = [0u8; 4];
+                bytes[..3].copy_from_slice(slice);
+                let v = u32::from_le_bytes(bytes);
+                self.pos += 3;
+                Some(u64::from(v))
+            }
+            0xfe => {
+                let slice = self.buf.get(self.pos..self.pos + 8)?;
+                let v = u64::from_le_bytes(slice.try_into().ok()?);
+                self.pos += 8;
+                Some(v)
+            }
+            n => Some(u64::from(n)),
+        }
+    }
+}
+
+// ---- scramble / version helpers -----------------------------
+
+fn server_version_string() -> String {
+    // Advertise an 8.0 lineage so caching_sha2 capable clients
+    // don't downgrade to mysql_native_password preemptively.
+    // The trailing tag identifies us to dump tooling.
+    format!("8.0.0-spg-v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Generate a deterministic 20-byte scramble from a seed. xorshift64*
+/// is enough randomness for the pre-auth nonce (the auth proof
+/// itself binds the password); this avoids pulling `rand` and
+/// keeps replays reproducible inside one process for the e2e
+/// tests.
+pub(crate) fn generate_scramble(seed: u32) -> Vec<u8> {
+    let mut state: u64 = u64::from(seed).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    if state == 0 {
+        state = 0x9E37_79B9_7F4A_7C15;
+    }
+    let mut out = Vec::with_capacity(20);
+    while out.len() < 20 {
+        // xorshift64*
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let v = state.wrapping_mul(0x2545F4914F6CDD1D);
+        for byte in v.to_le_bytes() {
+            if out.len() == 20 {
+                break;
+            }
+            // Stay in the printable ASCII range to match what
+            // real MySQL servers send (and to make handshake
+            // dumps human-readable in e2e logs).
+            out.push(((byte % (0x7e - 0x21)) + 0x21).max(0x21));
+        }
+    }
+    out
+}
+
+// ---- unit tests ----------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_v10_round_trip_through_cursor() {
+        let g = HandshakeV10Greeting {
+            protocol_version: 10,
+            server_version: "8.0.0-spg-vtest".to_string(),
+            connection_id: 42,
+            scramble: vec![b'a'; 20],
+            capability_flags: SERVER_CAPABILITIES,
+            character_set: CHARSET_UTF8MB4,
+            status_flags: SERVER_STATUS_AUTOCOMMIT,
+            auth_plugin_name: AUTH_PLUGIN_NATIVE.to_string(),
+        };
+        let bytes = encode_handshake_v10(&g);
+        // Re-parse the byte string to make sure each field is
+        // where the spec says it should be.
+        let mut p = Cursor::new(&bytes);
+        assert_eq!(p.u8().unwrap(), 10);
+        assert_eq!(p.null_string().unwrap(), "8.0.0-spg-vtest");
+        assert_eq!(p.u32_le().unwrap(), 42);
+        let scramble_pt1 = p.bytes(8).unwrap();
+        assert_eq!(scramble_pt1, vec![b'a'; 8]);
+        assert_eq!(p.u8().unwrap(), 0); // filler
+        let cap_lo = u32::from(p.u8().unwrap()) | (u32::from(p.u8().unwrap()) << 8);
+        let _charset = p.u8().unwrap();
+        let _status = p.u8().unwrap();
+        let _status_hi = p.u8().unwrap();
+        let cap_hi = u32::from(p.u8().unwrap()) | (u32::from(p.u8().unwrap()) << 8);
+        let recovered_caps = cap_lo | (cap_hi << 16);
+        assert_eq!(recovered_caps, SERVER_CAPABILITIES);
+        assert_eq!(p.u8().unwrap(), 21); // auth_plugin_data_len
+        p.skip(10).unwrap(); // reserved zeros
+        let scramble_pt2 = p.bytes(12).unwrap();
+        assert_eq!(scramble_pt2, vec![b'a'; 12]);
+        assert_eq!(p.u8().unwrap(), 0); // null after part-2
+        assert_eq!(p.null_string().unwrap(), AUTH_PLUGIN_NATIVE);
+    }
+
+    #[test]
+    fn handshake_response_41_parses_minimal_payload() {
+        // Build the smallest valid HandshakeResponse41 by hand:
+        // CLIENT_PROTOCOL_41 + CLIENT_SECURE_CONNECTION +
+        // CLIENT_PLUGIN_AUTH, no DB / no connect-attrs.
+        let caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&caps.to_le_bytes());
+        payload.extend_from_slice(&16_777_215u32.to_le_bytes()); // max_packet
+        payload.push(CHARSET_UTF8MB4);
+        payload.extend_from_slice(&[0u8; 23]); // reserved filler
+        payload.extend_from_slice(b"root\0");
+        payload.push(0); // auth_response length = 0 (no password)
+        payload.extend_from_slice(b"mysql_native_password\0");
+        let parsed = parse_handshake_response_41(&payload).unwrap();
+        assert_eq!(parsed.client_capabilities, caps);
+        assert_eq!(parsed.username, "root");
+        assert!(parsed.auth_response.is_empty());
+        assert_eq!(
+            parsed.auth_plugin_name.as_deref(),
+            Some("mysql_native_password")
+        );
+        assert!(parsed.database.is_none());
+    }
+
+    #[test]
+    fn handshake_response_41_with_db_and_password() {
+        let caps = CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_CONNECT_WITH_DB;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&caps.to_le_bytes());
+        payload.extend_from_slice(&16_777_215u32.to_le_bytes());
+        payload.push(CHARSET_UTF8MB4);
+        payload.extend_from_slice(&[0u8; 23]);
+        payload.extend_from_slice(b"alice\0");
+        payload.push(20); // 20-byte auth_response
+        payload.extend_from_slice(&[0xab; 20]);
+        payload.extend_from_slice(b"mydb\0");
+        payload.extend_from_slice(b"mysql_native_password\0");
+        let parsed = parse_handshake_response_41(&payload).unwrap();
+        assert_eq!(parsed.username, "alice");
+        assert_eq!(parsed.auth_response.len(), 20);
+        assert_eq!(parsed.database.as_deref(), Some("mydb"));
+    }
+
+    #[test]
+    fn err_packet_layout_matches_spec() {
+        let bytes = encode_err_packet(1043, "08S01", "bad handshake");
+        assert_eq!(bytes[0], 0xff);
+        assert_eq!(&bytes[1..3], &1043u16.to_le_bytes());
+        assert_eq!(bytes[3], b'#');
+        assert_eq!(&bytes[4..9], b"08S01");
+        assert_eq!(&bytes[9..], b"bad handshake");
+    }
+
+    #[test]
+    fn lenenc_int_decodes_all_four_widths() {
+        // 1-byte
+        let mut p = Cursor::new(&[42u8]);
+        assert_eq!(p.lenenc_int(), Some(42));
+        // 2-byte (0xfc prefix)
+        let mut p = Cursor::new(&[0xfc, 0x39, 0x30]);
+        assert_eq!(p.lenenc_int(), Some(12345));
+        // 3-byte (0xfd prefix)
+        let mut p = Cursor::new(&[0xfd, 0x40, 0xe2, 0x01]);
+        assert_eq!(p.lenenc_int(), Some(123456));
+        // 8-byte (0xfe prefix)
+        let mut p = Cursor::new(&[0xfe, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
+        assert_eq!(p.lenenc_int(), Some(0xfedc_ba98_7654_3210));
+    }
+
+    #[test]
+    fn scramble_is_deterministic_per_seed_and_printable_ascii() {
+        let s1 = generate_scramble(42);
+        let s2 = generate_scramble(42);
+        assert_eq!(s1, s2, "same seed → same scramble");
+        assert_eq!(s1.len(), 20);
+        for b in &s1 {
+            assert!(
+                (0x21..=0x7e).contains(b),
+                "scramble byte {b:#x} outside printable ASCII"
+            );
+        }
+        let s_other = generate_scramble(43);
+        assert_ne!(s1, s_other, "different seed → different scramble");
+    }
+}
