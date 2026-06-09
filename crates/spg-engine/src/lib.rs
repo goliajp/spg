@@ -6728,6 +6728,20 @@ impl Engine {
         } else {
             rows
         };
+        // v7.17.0 Phase 3.P0-48 — aggregate dispatch over the
+        // unnest source. Same routing the relational scan path
+        // already takes — without it `SELECT COUNT(*) FROM
+        // unnest(ARRAY[…])` either errored at projection time or
+        // returned the wrong shape.
+        if aggregate::uses_aggregate(stmt) {
+            let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
+            let mut agg = aggregate::run(stmt, &filtered_refs, &schema_cols, Some(&alias))?;
+            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
+            return Ok(QueryResult::Rows {
+                columns: agg.columns,
+                rows: agg.rows,
+            });
+        }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
         let mut projected_rows: alloc::vec::Vec<Row> =
@@ -6885,6 +6899,24 @@ impl Engine {
         } else {
             rows
         };
+        // v7.17.0 Phase 3.P0-48 — aggregate dispatch for set-
+        // returning sources. When the SELECT projection contains
+        // aggregate functions (COUNT/SUM/MIN/MAX/AVG/string_agg/
+        // …) we route the filtered row stream through the same
+        // aggregate executor the relational scan path uses, so
+        // `SELECT COUNT(*) FROM generate_series(1, 100)` returns
+        // a single 100 row instead of erroring at projection
+        // time. GROUP BY / HAVING / ORDER BY over the aggregate
+        // output all ride through `aggregate::run`.
+        if aggregate::uses_aggregate(stmt) {
+            let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
+            let mut agg = aggregate::run(stmt, &filtered_refs, &schema_cols, Some(&alias))?;
+            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
+            return Ok(QueryResult::Rows {
+                columns: agg.columns,
+                rows: agg.rows,
+            });
+        }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
         let mut projected_rows: alloc::vec::Vec<Row> =
