@@ -822,6 +822,28 @@ impl Database {
         })
     }
 
+    /// v7.17.0 Phase 3.P0-66 — describe a SQL string without
+    /// executing. Returns `(parameter_oid_count, output_columns)`
+    /// where `output_columns` is empty for non-SELECT statements
+    /// or for SELECT shapes the describe planner can't resolve
+    /// (JOIN / subquery / unknown table). Wraps
+    /// `Engine::describe_prepared` so the spg-sqlx bridge can
+    /// surface PG-shape Describe replies for
+    /// `sqlx::query!()` compile-time validation.
+    ///
+    /// # Errors
+    /// Propagates parse errors from the underlying prepare path.
+    pub fn describe(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<u32>, Vec<ColumnSchema>), EngineError> {
+        let stmt = self
+            .engine
+            .prepare_cached(sql)
+            .map_err(EngineError::Parse)?;
+        Ok(self.engine.describe_prepared(&stmt))
+    }
+
     /// v7.16.0 — execute a prepared statement with bound
     /// parameters. Mirrors `Engine::execute_prepared`: clones
     /// the AST, substitutes `$1..$N` → `params[0..N-1]`, runs.

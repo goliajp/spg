@@ -163,6 +163,30 @@ impl AsyncDatabase {
         .expect("spawn_blocking join")
     }
 
+    /// v7.17.0 Phase 3.P0-66 — async wrapper for
+    /// [`Database::describe`]. Returns `(parameter_oids,
+    /// output_columns)` for a prepared SQL string without
+    /// executing it. Drives the spg-sqlx adapter's
+    /// `Executor::describe` so `sqlx::query!()` compile-time
+    /// validation can resolve column types.
+    ///
+    /// # Errors
+    /// Propagates `EngineError` from the prepare path
+    /// (typically `ParseError`).
+    pub async fn describe(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<u32>, Vec<spg_embedded::ColumnSchema>), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            guard.describe(&sql)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
     /// v7.16.0 — execute a prepared statement with bound params.
     /// `params` is taken by value because the spawn_blocking
     /// closure needs a `'static` capture; the cost is one

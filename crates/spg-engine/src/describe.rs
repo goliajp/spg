@@ -39,15 +39,17 @@ fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSch
     let Statement::Select(s) = stmt else {
         return Vec::new();
     };
-    // Only handle single-table FROM. JOIN + subquery + multi-arm UNION
-    // fall through to NoData (drivers tolerate this).
-    let Some(from) = &s.from else {
-        return Vec::new();
-    };
-    if !from.joins.is_empty() {
+    // Multi-arm UNION falls through to NoData (drivers tolerate).
+    if !s.unions.is_empty() {
         return Vec::new();
     }
-    if !s.unions.is_empty() {
+    // No FROM (`SELECT 1::INT AS one`) → describe items against an
+    // empty schema; literal / cast / function items still resolve.
+    let Some(from) = &s.from else {
+        return describe_select_items(&s.items, &[]);
+    };
+    // JOIN / subquery FROM falls through to NoData.
+    if !from.joins.is_empty() {
         return Vec::new();
     }
     let Some(table) = catalog.get(&from.primary.name) else {

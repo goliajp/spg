@@ -204,15 +204,44 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
 
     fn describe<'e, 'q: 'e>(
         self,
-        _sql: &'q str,
+        sql: &'q str,
     ) -> BoxFuture<'e, Result<sqlx_core::describe::Describe<Self::Database>, Error>>
     where
         'c: 'e,
     {
+        // v7.17.0 Phase 3.P0-66 — real Describe wired through to
+        // `Engine::describe_prepared`. Surfaces column metadata
+        // (name / type / nullable) and a parameter count for
+        // `sqlx::query!()` compile-time validation. Statement
+        // shapes the describe planner can't resolve (JOIN /
+        // subquery / unknown table) return an empty `columns`
+        // vec — sqlx tolerates this as "no row description
+        // available" and the macros fall back to offline mode
+        // for those shapes.
+        let inner = self.inner.clone();
+        let sql_str = sql.to_string();
         Box::pin(async move {
-            Err(Error::Protocol(
-                "describe is v7.17 — compile-time sqlx::query!() macros need offline mode in the meantime".into(),
-            ))
+            let (params, cols) = inner.describe(&sql_str).await.map_err(engine_to_sqlx)?;
+            let nullable: Vec<Option<bool>> =
+                cols.iter().map(|c| Some(c.nullable)).collect();
+            let columns: Vec<SpgColumn> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let ti = SpgTypeInfo::from_data_type(c.ty);
+                    SpgColumn::new(i, c.name.clone(), ti)
+                })
+                .collect();
+            let parameters = if params.is_empty() {
+                None
+            } else {
+                Some(either::Either::Right(params.len()))
+            };
+            Ok(sqlx_core::describe::Describe {
+                columns,
+                parameters,
+                nullable,
+            })
         })
     }
 }
