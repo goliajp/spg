@@ -81,10 +81,7 @@ fn many_args_stress() {
 fn null_arg_skipped() {
     // PG: concat('a', NULL, 'b') → 'ab'
     let mut e = Engine::new();
-    assert_eq!(
-        text_result(&mut e, "SELECT concat('a', NULL, 'b')"),
-        "ab"
-    );
+    assert_eq!(text_result(&mut e, "SELECT concat('a', NULL, 'b')"), "ab");
 }
 
 #[test]
@@ -104,10 +101,7 @@ fn single_null_arg_returns_empty_string() {
 fn nulls_between_text_skipped() {
     let mut e = Engine::new();
     assert_eq!(
-        text_result(
-            &mut e,
-            "SELECT concat(NULL, 'x', NULL, 'y', NULL, 'z')"
-        ),
+        text_result(&mut e, "SELECT concat(NULL, 'x', NULL, 'y', NULL, 'z')"),
         "xyz"
     );
 }
@@ -155,7 +149,10 @@ fn smallint_arg_coerced() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (s SMALLINT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (32767)").unwrap();
-    assert_eq!(text_result(&mut e, "SELECT concat('s=', s) FROM t"), "s=32767");
+    assert_eq!(
+        text_result(&mut e, "SELECT concat('s=', s) FROM t"),
+        "s=32767"
+    );
 }
 
 #[test]
@@ -211,13 +208,9 @@ fn emoji_preserved() {
 fn ascii_control_chars_preserved() {
     let mut e = Engine::new();
     // Tab character literal — PG accepts it inside a string literal.
-    let r = e
-        .execute("SELECT concat('a', '\t', 'b')")
-        .expect("execute");
+    let r = e.execute("SELECT concat('a', '\t', 'b')").expect("execute");
     let row = one_row(r);
-    let Value::Text(s) = &row[0] else {
-        panic!()
-    };
+    let Value::Text(s) = &row[0] else { panic!() };
     assert_eq!(s, "a\tb");
 }
 
@@ -291,7 +284,8 @@ fn concat_inside_where_clause() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (id INT NOT NULL, n TEXT NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO u VALUES (1, 'a'), (2, 'b')").unwrap();
+    e.execute("INSERT INTO u VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
     let r = e
         .execute("SELECT id FROM u WHERE concat(n, '!') = 'b!'")
         .unwrap();
@@ -323,7 +317,8 @@ fn concat_used_in_order_by() {
 fn concat_inside_insert_value() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (display TEXT NOT NULL)").unwrap();
-    e.execute("INSERT INTO u VALUES (concat('U-', 42))").unwrap();
+    e.execute("INSERT INTO u VALUES (concat('U-', 42))")
+        .unwrap();
     let r = e.execute("SELECT display FROM u").unwrap();
     let row = one_row(r);
     assert_eq!(row[0], Value::Text("U-42".into()));
@@ -333,10 +328,7 @@ fn concat_inside_insert_value() {
 fn nested_concat_calls() {
     let mut e = Engine::new();
     assert_eq!(
-        text_result(
-            &mut e,
-            "SELECT concat(concat('A', 'B'), concat('C', 'D'))"
-        ),
+        text_result(&mut e, "SELECT concat(concat('A', 'B'), concat('C', 'D'))"),
         "ABCD"
     );
 }

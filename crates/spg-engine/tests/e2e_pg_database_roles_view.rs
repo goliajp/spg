@@ -25,10 +25,8 @@ fn pg_database_lists_postgres() {
 fn pg_roles_includes_postgres_superuser() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT rolname, rolsuper FROM pg_catalog.pg_roles WHERE rolname = 'postgres'",
-        )
-        .unwrap(),
+        e.execute("SELECT rolname, rolsuper FROM pg_catalog.pg_roles WHERE rolname = 'postgres'")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("postgres".into()));

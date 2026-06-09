@@ -80,11 +80,13 @@ fn insert_listed_value_round_trips() {
 
 #[test]
 fn insert_unlisted_value_is_error() {
-    let mut eng = engine_with(&[
-        "CREATE TABLE t (id INT NOT NULL, color ENUM('red','green','blue'))",
-    ]);
+    let mut eng =
+        engine_with(&["CREATE TABLE t (id INT NOT NULL, color ENUM('red','green','blue'))"]);
     let r = eng.execute("INSERT INTO t VALUES (1, 'purple')");
-    assert!(r.is_err(), "non-listed enum value must error, not silently store");
+    assert!(
+        r.is_err(),
+        "non-listed enum value must error, not silently store"
+    );
 }
 
 #[test]
@@ -108,9 +110,15 @@ fn inline_enum_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, role FROM users ORDER BY id");
     assert_eq!(rows.len(), 3);
-    let Value::Text(r1) = &rows[0][1] else { panic!() };
-    let Value::Text(r2) = &rows[1][1] else { panic!() };
-    let Value::Text(r3) = &rows[2][1] else { panic!() };
+    let Value::Text(r1) = &rows[0][1] else {
+        panic!()
+    };
+    let Value::Text(r2) = &rows[1][1] else {
+        panic!()
+    };
+    let Value::Text(r3) = &rows[2][1] else {
+        panic!()
+    };
     assert_eq!(r1, "admin");
     assert_eq!(r2, "editor");
     assert_eq!(r3, "viewer");
@@ -120,7 +128,10 @@ fn inline_enum_column_survives_catalog_round_trip() {
 fn ddl_rejects_empty_enum_list() {
     let mut eng = Engine::new();
     let r = eng.execute("CREATE TABLE t (id INT NOT NULL, color ENUM())");
-    assert!(r.is_err(), "ENUM with empty value list must be rejected at parse");
+    assert!(
+        r.is_err(),
+        "ENUM with empty value list must be rejected at parse"
+    );
 }
 
 #[test]
@@ -135,11 +146,13 @@ fn variants_preserved_after_round_trip() {
     let schema = cat.get("t").unwrap().schema();
     assert_eq!(
         schema.columns[1].inline_enum_variants.as_deref(),
-        Some(&[
-            "small".to_string(),
-            "medium".to_string(),
-            "large".to_string(),
-            "xlarge".to_string()
-        ][..])
+        Some(
+            &[
+                "small".to_string(),
+                "medium".to_string(),
+                "large".to_string(),
+                "xlarge".to_string()
+            ][..]
+        )
     );
 }

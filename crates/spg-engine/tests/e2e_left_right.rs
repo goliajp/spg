@@ -40,7 +40,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn text(e: &mut Engine, sql: &str) -> String {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -254,7 +257,8 @@ fn left_inside_where() {
 fn right_inside_insert_values() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (last3 TEXT NOT NULL)").unwrap();
-    e.execute("INSERT INTO u VALUES (right('abc-XYZ', 3))").unwrap();
+    e.execute("INSERT INTO u VALUES (right('abc-XYZ', 3))")
+        .unwrap();
     let row = one_row(e.execute("SELECT last3 FROM u").unwrap());
     assert_eq!(row[0], Value::Text("XYZ".into()));
 }

@@ -44,10 +44,8 @@ fn pg_proc_count_aggregate_is_aggregate_kind() {
 fn pg_proc_window_function_kind() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT prokind FROM pg_catalog.pg_proc WHERE proname = 'row_number'",
-        )
-        .unwrap(),
+        e.execute("SELECT prokind FROM pg_catalog.pg_proc WHERE proname = 'row_number'")
+            .unwrap(),
     );
     assert!(!r.is_empty());
     assert_eq!(r[0][0], Value::Text("w".into()));

@@ -117,9 +117,7 @@ mod bd {
     impl<'r> Decode<'r, Spg> for BigDecimal {
         fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
             match value.engine() {
-                EngineValue::Numeric { scaled, scale } => {
-                    Ok(scaled_to_bigdecimal(*scaled, *scale))
-                }
+                EngineValue::Numeric { scaled, scale } => Ok(scaled_to_bigdecimal(*scaled, *scale)),
                 // Generous coerce: small ints are valid NUMERICs
                 // too. Mirrors what PG would do on the wire when
                 // a column is widened.

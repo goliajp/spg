@@ -70,7 +70,8 @@ fn procedure_with_if_end_if() {
 #[test]
 fn procedure_does_not_affect_subsequent_statements() {
     let mut e = Engine::new();
-    e.execute("CREATE PROCEDURE p() BEGIN SET @x = 1; END").unwrap();
+    e.execute("CREATE PROCEDURE p() BEGIN SET @x = 1; END")
+        .unwrap();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (1)").unwrap();
 }

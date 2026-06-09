@@ -223,9 +223,7 @@ fn render_cell(v: &Value, ty: char) -> String {
         // v7.17.0 Phase 3.P0-33 — MySQL YEAR 4-digit zero-padded.
         Value::Year(y) => format!("{y:04}"),
         // v7.17.0 Phase 3.P0-34 — PG TIMETZ canonical text form.
-        Value::TimeTz { us, offset_secs } => {
-            spg_engine::eval::format_timetz(*us, *offset_secs)
-        }
+        Value::TimeTz { us, offset_secs } => spg_engine::eval::format_timetz(*us, *offset_secs),
         // v7.17.0 Phase 3.P0-35 — PG MONEY canonical en_US text form.
         Value::Money(c) => spg_engine::eval::format_money(*c),
         // v7.17.0 Phase 3.P0-38 — PG range canonical text form.

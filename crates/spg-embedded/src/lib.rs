@@ -833,10 +833,7 @@ impl Database {
     ///
     /// # Errors
     /// Propagates parse errors from the underlying prepare path.
-    pub fn describe(
-        &mut self,
-        sql: &str,
-    ) -> Result<(Vec<u32>, Vec<ColumnSchema>), EngineError> {
+    pub fn describe(&mut self, sql: &str) -> Result<(Vec<u32>, Vec<ColumnSchema>), EngineError> {
         let stmt = self
             .engine
             .prepare_cached(sql)

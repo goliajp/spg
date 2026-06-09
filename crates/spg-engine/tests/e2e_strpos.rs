@@ -32,7 +32,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn int(e: &mut Engine, sql: &str) -> i32 {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Int(n) => *n,
         Value::BigInt(n) => *n as i32,
@@ -203,10 +206,8 @@ fn strpos_inside_where() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (id INT NOT NULL, email TEXT NOT NULL)")
         .unwrap();
-    e.execute(
-        "INSERT INTO u VALUES (1, 'alice@example.com'), (2, 'no-at-here')",
-    )
-    .unwrap();
+    e.execute("INSERT INTO u VALUES (1, 'alice@example.com'), (2, 'no-at-here')")
+        .unwrap();
     let r = e
         .execute("SELECT id FROM u WHERE strpos(email, '@') > 0")
         .unwrap();
@@ -221,7 +222,8 @@ fn strpos_inside_where() {
 fn strpos_inside_insert_values() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (pos INT NOT NULL)").unwrap();
-    e.execute("INSERT INTO u VALUES (strpos('hello', 'll'))").unwrap();
+    e.execute("INSERT INTO u VALUES (strpos('hello', 'll'))")
+        .unwrap();
     let row = one_row(e.execute("SELECT pos FROM u").unwrap());
     assert_eq!(row[0], Value::Int(3));
 }

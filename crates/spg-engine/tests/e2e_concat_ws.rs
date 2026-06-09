@@ -42,7 +42,10 @@ fn first_text(e: &mut Engine, sql: &str) -> Value {
 fn separator_only_returns_empty_string() {
     // PG: SELECT concat_ws(',') → ''
     let mut e = Engine::new();
-    assert_eq!(first_text(&mut e, "SELECT concat_ws(',')"), Value::Text("".into()));
+    assert_eq!(
+        first_text(&mut e, "SELECT concat_ws(',')"),
+        Value::Text("".into())
+    );
 }
 
 #[test]
@@ -165,7 +168,10 @@ fn trailing_nulls_after_value() {
 fn alternating_nulls_and_values() {
     let mut e = Engine::new();
     assert_eq!(
-        first_text(&mut e, "SELECT concat_ws('-', NULL, 'a', NULL, 'b', NULL, 'c')"),
+        first_text(
+            &mut e,
+            "SELECT concat_ws('-', NULL, 'a', NULL, 'b', NULL, 'c')"
+        ),
         Value::Text("a-b-c".into())
     );
 }
@@ -251,7 +257,8 @@ fn concat_ws_over_nullable_columns() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE p (first TEXT, middle TEXT, last TEXT)")
         .unwrap();
-    e.execute("INSERT INTO p VALUES ('John', NULL, 'Doe')").unwrap();
+    e.execute("INSERT INTO p VALUES ('John', NULL, 'Doe')")
+        .unwrap();
     let row = one_row(
         e.execute("SELECT concat_ws(' ', first, middle, last) FROM p")
             .unwrap(),
@@ -277,7 +284,8 @@ fn concat_ws_full_name_with_all_null_returns_empty() {
 fn concat_ws_inside_insert_values() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (label TEXT NOT NULL)").unwrap();
-    e.execute("INSERT INTO u VALUES (concat_ws('-', 'X', 42, 'Y'))").unwrap();
+    e.execute("INSERT INTO u VALUES (concat_ws('-', 'X', 42, 'Y'))")
+        .unwrap();
     let row = one_row(e.execute("SELECT label FROM u").unwrap());
     assert_eq!(row[0], Value::Text("X-42-Y".into()));
 }

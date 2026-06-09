@@ -222,8 +222,7 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
         let sql_str = sql.to_string();
         Box::pin(async move {
             let (params, cols) = inner.describe(&sql_str).await.map_err(engine_to_sqlx)?;
-            let nullable: Vec<Option<bool>> =
-                cols.iter().map(|c| Some(c.nullable)).collect();
+            let nullable: Vec<Option<bool>> = cols.iter().map(|c| Some(c.nullable)).collect();
             let columns: Vec<SpgColumn> = cols
                 .iter()
                 .enumerate()

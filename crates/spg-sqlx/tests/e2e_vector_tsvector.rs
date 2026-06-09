@@ -23,11 +23,10 @@ async fn vector_column_round_trips_through_bind() {
         .execute(&mut conn)
         .await
         .unwrap();
-    let rows: Vec<(i32, Vec<f32>)> =
-        sqlx::query_as("SELECT id, v FROM embeds ORDER BY id")
-            .fetch_all(&mut conn)
-            .await
-            .unwrap();
+    let rows: Vec<(i32, Vec<f32>)> = sqlx::query_as("SELECT id, v FROM embeds ORDER BY id")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].1, v1);
     assert_eq!(rows[1].1, v2);
@@ -186,10 +185,7 @@ async fn vec_f32_decode_rejects_non_vector_cells() {
     let r: Result<(Vec<f32>,), _> = sqlx::query_as("SELECT name FROM t")
         .fetch_one(&mut conn)
         .await;
-    assert!(
-        r.is_err(),
-        "TEXT cell must not silently decode as Vec<f32>"
-    );
+    assert!(r.is_err(), "TEXT cell must not silently decode as Vec<f32>");
 }
 
 #[tokio::test]

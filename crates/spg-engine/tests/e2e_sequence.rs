@@ -136,11 +136,15 @@ fn cycle_wraps_to_minvalue() {
 #[test]
 fn no_cycle_errors_at_max() {
     let mut e = Engine::new();
-    e.execute("CREATE SEQUENCE s START WITH 1 MAXVALUE 2").unwrap();
+    e.execute("CREATE SEQUENCE s START WITH 1 MAXVALUE 2")
+        .unwrap();
     assert_bigint_eq(&mut e, "SELECT nextval('s')", 1);
     assert_bigint_eq(&mut e, "SELECT nextval('s')", 2);
     let r = e.execute("SELECT nextval('s')");
-    assert!(r.is_err(), "nextval past MAXVALUE without CYCLE should error");
+    assert!(
+        r.is_err(),
+        "nextval past MAXVALUE without CYCLE should error"
+    );
 }
 
 #[test]

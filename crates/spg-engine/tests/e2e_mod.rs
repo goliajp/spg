@@ -27,7 +27,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn int_result(e: &mut Engine, sql: &str) -> i64 {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Int(n) => i64::from(*n),
         Value::BigInt(n) => *n,
@@ -145,7 +148,8 @@ fn mod_bigint() {
 fn mod_inside_where_for_even_filter() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (n INT NOT NULL)").unwrap();
-    e.execute("INSERT INTO u VALUES (1), (2), (3), (4), (5)").unwrap();
+    e.execute("INSERT INTO u VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
     let r = e
         .execute("SELECT n FROM u WHERE mod(n, 2) = 0 ORDER BY n")
         .unwrap();

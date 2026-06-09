@@ -36,10 +36,8 @@ fn pg_namespace_lists_pg_catalog() {
 fn pg_namespace_lists_information_schema() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'information_schema'",
-        )
-        .unwrap(),
+        e.execute("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'information_schema'")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::BigInt(13000));

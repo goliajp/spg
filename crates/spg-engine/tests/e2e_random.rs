@@ -60,8 +60,12 @@ fn random_many_calls_distribute_widely() {
     for _ in 0..50 {
         let row = one_row(e.execute("SELECT random()").unwrap());
         let v = f(&row[0]);
-        if v < min { min = v; }
-        if v > max { max = v; }
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
     }
     assert!(min < 0.5, "min={min} should fall below 0.5 in 50 samples");
     assert!(max > 0.5, "max={max} should rise above 0.5 in 50 samples");

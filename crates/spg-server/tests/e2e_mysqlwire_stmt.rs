@@ -130,7 +130,9 @@ fn read_lenenc(buf: &[u8], pos: usize) -> (u64, usize) {
     let first = buf[pos];
     match first {
         0xfc => (
-            u64::from(u16::from_le_bytes(buf[pos + 1..pos + 3].try_into().unwrap())),
+            u64::from(u16::from_le_bytes(
+                buf[pos + 1..pos + 3].try_into().unwrap(),
+            )),
             3,
         ),
         0xfd => {

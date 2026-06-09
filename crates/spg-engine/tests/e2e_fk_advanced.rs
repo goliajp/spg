@@ -94,10 +94,8 @@ fn deferrable_clause_accepted_as_immediate() {
     let mut eng = Engine::new();
     eng.execute("CREATE TABLE u (id INT NOT NULL)").unwrap();
     eng.execute("CREATE INDEX u_pk ON u (id)").unwrap();
-    eng.execute(
-        "CREATE TABLE o (uid INT NOT NULL REFERENCES u(id) DEFERRABLE INITIALLY DEFERRED)",
-    )
-    .unwrap();
+    eng.execute("CREATE TABLE o (uid INT NOT NULL REFERENCES u(id) DEFERRABLE INITIALLY DEFERRED)")
+        .unwrap();
     eng.execute("INSERT INTO u VALUES (1)").unwrap();
     eng.execute("INSERT INTO o VALUES (1)").unwrap();
     // Violating FK still errors immediately (not deferred).

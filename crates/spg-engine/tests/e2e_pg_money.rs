@@ -81,7 +81,9 @@ fn insert_text_with_comma_thousands() {
         "INSERT INTO t VALUES (1, '$1,234,567.89')",
     ]);
     let rows = select(&mut eng, "SELECT price FROM t");
-    let Value::Money(c) = &rows[0][0] else { panic!() };
+    let Value::Money(c) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*c, 123_456_789);
 }
 
@@ -92,7 +94,9 @@ fn insert_negative_money() {
         "INSERT INTO t VALUES (1, '-$0.50')",
     ]);
     let rows = select(&mut eng, "SELECT price FROM t");
-    let Value::Money(c) = &rows[0][0] else { panic!() };
+    let Value::Money(c) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*c, -50);
 }
 
@@ -103,7 +107,9 @@ fn insert_zero_cents() {
         "INSERT INTO t VALUES (1, '$0.00')",
     ]);
     let rows = select(&mut eng, "SELECT price FROM t");
-    let Value::Money(c) = &rows[0][0] else { panic!() };
+    let Value::Money(c) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*c, 0);
 }
 
@@ -116,7 +122,9 @@ fn insert_integer_literal_treated_as_dollars() {
         "INSERT INTO t VALUES (1, 100)",
     ]);
     let rows = select(&mut eng, "SELECT price FROM t");
-    let Value::Money(c) = &rows[0][0] else { panic!() };
+    let Value::Money(c) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*c, 10_000); // $100.00 = 10000 cents
 }
 
@@ -131,8 +139,12 @@ fn money_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, total FROM invoices ORDER BY id");
     assert_eq!(rows.len(), 2);
-    let Value::Money(a) = &rows[0][1] else { panic!() };
-    let Value::Money(b) = &rows[1][1] else { panic!() };
+    let Value::Money(a) = &rows[0][1] else {
+        panic!()
+    };
+    let Value::Money(b) = &rows[1][1] else {
+        panic!()
+    };
     assert_eq!((*a, *b), (1999, -250));
 }
 

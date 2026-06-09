@@ -33,7 +33,8 @@ fn on_update_refreshes_when_column_not_in_set() {
     let initial = read_updated_at(&mut e);
     // Sleep so the engine clock ticks past the initial INSERT.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    e.execute("UPDATE t SET name = 'alicia' WHERE id = 1").unwrap();
+    e.execute("UPDATE t SET name = 'alicia' WHERE id = 1")
+        .unwrap();
     let after = read_updated_at(&mut e);
     assert!(
         after > initial,
@@ -53,7 +54,8 @@ fn on_update_skipped_when_column_explicitly_set() {
          )",
     )
     .unwrap();
-    e.execute("INSERT INTO t (id, name) VALUES (1, 'a')").unwrap();
+    e.execute("INSERT INTO t (id, name) VALUES (1, 'a')")
+        .unwrap();
     // Caller-supplied value wins per MySQL semantics.
     e.execute("UPDATE t SET name = 'b', updated_at = '2030-01-01 00:00:00'::TIMESTAMP")
         .unwrap();

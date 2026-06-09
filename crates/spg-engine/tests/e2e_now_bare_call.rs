@@ -183,7 +183,8 @@ fn current_timestamp_inside_insert_values() {
 fn current_date_inside_insert_values() {
     let mut e = engine_with_fixed_clock(FIXED_MICROS);
     e.execute("CREATE TABLE evt (day DATE NOT NULL)").unwrap();
-    e.execute("INSERT INTO evt VALUES (current_date())").unwrap();
+    e.execute("INSERT INTO evt VALUES (current_date())")
+        .unwrap();
     let row = one_row(e.execute("SELECT day FROM evt").unwrap());
     let days = FIXED_MICROS / 86_400_000_000;
     assert_eq!(row[0], Value::Date(days as i32));

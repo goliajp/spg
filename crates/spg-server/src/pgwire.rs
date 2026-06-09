@@ -1776,9 +1776,7 @@ fn parse_timeout_ms(s: &str) -> Option<u64> {
     if let Ok(n) = t.parse::<u64>() {
         return Some(n);
     }
-    let split_at = t
-        .find(|c: char| c.is_ascii_alphabetic())
-        .unwrap_or(t.len());
+    let split_at = t.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(t.len());
     let (num_part, unit) = t.split_at(split_at);
     let num: u64 = num_part.trim().parse().ok()?;
     let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
@@ -1801,9 +1799,7 @@ fn parse_timeout_ms(s: &str) -> Option<u64> {
 /// hot path (default SLO load) elides the deadline check entirely
 /// — costing only one predicted-not-taken branch in
 /// `CancelToken::is_cancelled`.
-fn statement_cancel(
-    settings: &std::collections::HashMap<String, String>,
-) -> CancelToken<'static> {
+fn statement_cancel(settings: &std::collections::HashMap<String, String>) -> CancelToken<'static> {
     let raw = settings
         .get("statement_timeout")
         .map(String::as_str)
@@ -3044,9 +3040,7 @@ fn value_to_pg_text(v: &Value, ty: Option<DataType>) -> Option<String> {
         // v7.17.0 Phase 3.P0-34 — TIMETZ via the shared engine
         // helper so the canonical `HH:MM:SS[.ffffff]±HH[:MM]`
         // shape matches PG `timetz_out` across all renderers.
-        Value::TimeTz { us, offset_secs } => {
-            spg_engine::eval::format_timetz(*us, *offset_secs)
-        }
+        Value::TimeTz { us, offset_secs } => spg_engine::eval::format_timetz(*us, *offset_secs),
         // v7.17.0 Phase 3.P0-35 — MONEY via the shared engine
         // helper so the canonical en_US text form matches PG
         // `cash_out` across all renderers.

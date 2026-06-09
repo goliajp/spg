@@ -204,7 +204,9 @@ fn unix_timestamp_bare_call_returns_bigint() {
     // 2025-06-08 14:30:45 UTC = 1_749_393_045 sec
     //                          = 1_749_393_045_000_000 µsec
     const FROZEN_NOW_US: i64 = 1_749_393_045_000_000;
-    fn frozen_clock() -> i64 { FROZEN_NOW_US }
+    fn frozen_clock() -> i64 {
+        FROZEN_NOW_US
+    }
     let mut e = Engine::new().with_clock(frozen_clock);
     let n = bigint_of(one_cell(&mut e, "SELECT unix_timestamp()"));
     assert_eq!(n, 1_749_393_045);
@@ -215,10 +217,7 @@ fn unix_timestamp_bare_call_returns_bigint() {
 #[test]
 fn from_unixtime_seconds_to_timestamp() {
     let mut e = Engine::new();
-    let v = one_cell(
-        &mut e,
-        "SELECT from_unixtime(1749393045)",
-    );
+    let v = one_cell(&mut e, "SELECT from_unixtime(1749393045)");
     let Value::Timestamp(t) = v else {
         panic!("expected Timestamp, got {v:?}");
     };

@@ -154,8 +154,16 @@ fn ssl_upgrade_completes_handshake_and_reaches_command_phase() {
     // (capability hi at the documented offset).
     let nul = greeting[1..].iter().position(|b| *b == 0).unwrap();
     let pos_after_version = 1 + nul + 1 + 4 + 8 + 1;
-    let cap_lo = u16::from_le_bytes(greeting[pos_after_version..pos_after_version + 2].try_into().unwrap()) as u32;
-    let cap_hi = u16::from_le_bytes(greeting[pos_after_version + 5..pos_after_version + 7].try_into().unwrap()) as u32;
+    let cap_lo = u16::from_le_bytes(
+        greeting[pos_after_version..pos_after_version + 2]
+            .try_into()
+            .unwrap(),
+    ) as u32;
+    let cap_hi = u16::from_le_bytes(
+        greeting[pos_after_version + 5..pos_after_version + 7]
+            .try_into()
+            .unwrap(),
+    ) as u32;
     let caps = cap_lo | (cap_hi << 16);
     assert!(caps & CLIENT_SSL != 0, "server should advertise CLIENT_SSL");
 

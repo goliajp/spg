@@ -240,13 +240,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             }
         };
         let scramble = std::mem::take(&mut greeting.scramble);
-        return complete_auth_and_command(
-            &mut tls_stream,
-            state,
-            &parsed,
-            &scramble,
-            seqno_in,
-        );
+        return complete_auth_and_command(&mut tls_stream, state, &parsed, &scramble, seqno_in);
     }
     let parsed = match parse_handshake_response_41(&payload) {
         Ok(r) => r,
@@ -294,11 +288,7 @@ fn complete_auth_and_command(
             write_packet(stream, reply_seqno.wrapping_add(1), &encode_ok_packet())?;
         }
         AuthOutcome::AccessDenied(msg) => {
-            return write_packet(
-                stream,
-                reply_seqno,
-                &encode_err_packet(1045, "28000", &msg),
-            );
+            return write_packet(stream, reply_seqno, &encode_err_packet(1045, "28000", &msg));
         }
         AuthOutcome::PluginMismatch(plugin) => {
             return write_packet(
@@ -411,9 +401,7 @@ fn command_loop(
         match cmd {
             CMD_QUIT => return Ok(()),
             CMD_QUERY => {
-                let sql = std::str::from_utf8(&payload[1..])
-                    .unwrap_or("")
-                    .to_string();
+                let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
                 handle_com_query(stream, state, &sql, reply_seqno)?;
             }
             CMD_PING => {
@@ -441,19 +429,11 @@ fn command_loop(
                 handle_com_field_list(stream, state, &payload[1..], reply_seqno)?;
             }
             CMD_STMT_PREPARE => {
-                let sql = std::str::from_utf8(&payload[1..])
-                    .unwrap_or("")
-                    .to_string();
+                let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
                 handle_com_stmt_prepare(stream, state, &mut prepared, &sql, reply_seqno)?;
             }
             CMD_STMT_EXECUTE => {
-                handle_com_stmt_execute(
-                    stream,
-                    state,
-                    &mut prepared,
-                    &payload[1..],
-                    reply_seqno,
-                )?;
+                handle_com_stmt_execute(stream, state, &mut prepared, &payload[1..], reply_seqno)?;
             }
             CMD_STMT_CLOSE => {
                 // COM_STMT_CLOSE has no response — server just
@@ -540,7 +520,11 @@ fn handle_com_query(
             write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
-            write_packet(stream, start_seqno, &encode_ok_with_affected(affected as u64))?;
+            write_packet(
+                stream,
+                start_seqno,
+                &encode_ok_with_affected(affected as u64),
+            )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
             encode_text_result_set(stream, &columns, &rows, start_seqno)?;
@@ -587,11 +571,7 @@ fn handle_com_stmt_prepare(
             }
             Err(e) => {
                 let msg = format!("{e:?}");
-                return write_packet(
-                    stream,
-                    start_seqno,
-                    &encode_err_packet(1064, "42000", &msg),
-                );
+                return write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg));
             }
         }
     };
@@ -698,11 +678,7 @@ fn handle_com_stmt_execute(
     let params = match parse_execute_params(&entry, &payload[9..]) {
         Ok(p) => p,
         Err(msg) => {
-            return write_packet(
-                stream,
-                start_seqno,
-                &encode_err_packet(1064, "42000", &msg),
-            );
+            return write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg));
         }
     };
 
@@ -719,11 +695,7 @@ fn handle_com_stmt_execute(
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("{e:?}");
-                return write_packet(
-                    stream,
-                    start_seqno,
-                    &encode_err_packet(1064, "42000", &msg),
-                );
+                return write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg));
             }
         };
         engine.execute_prepared(stmt, &params)
@@ -928,10 +900,7 @@ impl PreparedEntry {
 ///       signed) + per-value encoded data
 ///     * == 0: reuse last bound types (we don't cache, so this
 ///       surfaces as an error)
-fn parse_execute_params(
-    entry: &PreparedEntry,
-    payload: &[u8],
-) -> Result<Vec<Value>, String> {
+fn parse_execute_params(entry: &PreparedEntry, payload: &[u8]) -> Result<Vec<Value>, String> {
     let n = entry.param_count as usize;
     if n == 0 {
         return Ok(Vec::new());
@@ -1052,7 +1021,9 @@ fn decode_binary_param(ty: u8, unsigned: bool, buf: &[u8]) -> Result<(Value, usi
         // DECIMAL / NEWDECIMAL / JSON / BIT
         0xfd | 0xfe | 0x0f | 0xfc | 0xfb | 0xfa | 0xf9 | 0xf8 | 0xf5 | 0xf6 | 0x00 | 0x10 => {
             let mut cursor = Cursor::new(buf);
-            let n = cursor.lenenc_int().ok_or_else(|| "truncated string lenenc".to_string())?;
+            let n = cursor
+                .lenenc_int()
+                .ok_or_else(|| "truncated string lenenc".to_string())?;
             let bytes = cursor
                 .bytes(n as usize)
                 .ok_or_else(|| "truncated string body".to_string())?;
@@ -1086,7 +1057,10 @@ fn handle_com_field_list(
     payload: &[u8],
     start_seqno: u8,
 ) -> std::io::Result<()> {
-    let nul = payload.iter().position(|b| *b == 0).unwrap_or(payload.len());
+    let nul = payload
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(payload.len());
     let table = std::str::from_utf8(&payload[..nul]).unwrap_or("");
     let cols_opt = {
         let Ok(engine) = state.engine.read() else {
@@ -1107,11 +1081,7 @@ fn handle_com_field_list(
             return write_packet(
                 stream,
                 start_seqno,
-                &encode_err_packet(
-                    1146,
-                    "42S02",
-                    &format!("Table '{table}' doesn't exist"),
-                ),
+                &encode_err_packet(1146, "42S02", &format!("Table '{table}' doesn't exist")),
             );
         }
     };
@@ -1249,17 +1219,17 @@ fn format_timestamp_mysql(us: i64) -> String {
 
 fn mysql_field_type(ty: DataType) -> u8 {
     match ty {
-        DataType::Bool => 0x01,            // MYSQL_TYPE_TINY
-        DataType::SmallInt => 0x02,        // MYSQL_TYPE_SHORT
-        DataType::Int => 0x03,             // MYSQL_TYPE_LONG
-        DataType::BigInt => 0x08,          // MYSQL_TYPE_LONGLONG
-        DataType::Float => 0x05,           // MYSQL_TYPE_DOUBLE
-        DataType::Date => 0x0a,            // MYSQL_TYPE_DATE
-        DataType::Timestamp => 0x07,       // MYSQL_TYPE_TIMESTAMP
+        DataType::Bool => 0x01,      // MYSQL_TYPE_TINY
+        DataType::SmallInt => 0x02,  // MYSQL_TYPE_SHORT
+        DataType::Int => 0x03,       // MYSQL_TYPE_LONG
+        DataType::BigInt => 0x08,    // MYSQL_TYPE_LONGLONG
+        DataType::Float => 0x05,     // MYSQL_TYPE_DOUBLE
+        DataType::Date => 0x0a,      // MYSQL_TYPE_DATE
+        DataType::Timestamp => 0x07, // MYSQL_TYPE_TIMESTAMP
         DataType::Timestamptz => 0x07,
-        DataType::Json | DataType::Jsonb => 0xf5,  // MYSQL_TYPE_JSON
-        DataType::Numeric { .. } => 0xf6,  // MYSQL_TYPE_NEWDECIMAL
-        DataType::Bytes => 0xfc,           // MYSQL_TYPE_BLOB
+        DataType::Json | DataType::Jsonb => 0xf5, // MYSQL_TYPE_JSON
+        DataType::Numeric { .. } => 0xf6,         // MYSQL_TYPE_NEWDECIMAL
+        DataType::Bytes => 0xfc,                  // MYSQL_TYPE_BLOB
         // Everything else (Text, Char, Varchar, Uuid, vectors,
         // arrays, ts*, range, hstore, money, time*) decodes as a
         // varchar-string on the wire — clients see the engine's
@@ -1359,9 +1329,7 @@ fn verify_handshake_response(
     }
     let user = &response.username;
     let Some(record) = engine.users().get(user) else {
-        return AuthOutcome::AccessDenied(format!(
-            "Access denied for user '{user}'"
-        ));
+        return AuthOutcome::AccessDenied(format!("Access denied for user '{user}'"));
     };
     if response.auth_response.is_empty() {
         return AuthOutcome::AccessDenied(format!(
@@ -1473,7 +1441,9 @@ pub(crate) struct HandshakeResponse41 {
 
 pub(crate) fn parse_handshake_response_41(payload: &[u8]) -> Result<HandshakeResponse41, String> {
     let mut p = Cursor::new(payload);
-    let caps = p.u32_le().ok_or_else(|| "truncated cap flags".to_string())?;
+    let caps = p
+        .u32_le()
+        .ok_or_else(|| "truncated cap flags".to_string())?;
     let max_packet = p
         .u32_le()
         .ok_or_else(|| "truncated max packet size".to_string())?;
@@ -1497,13 +1467,13 @@ pub(crate) fn parse_handshake_response_41(payload: &[u8]) -> Result<HandshakeRes
         p.bytes(n as usize)
             .ok_or_else(|| "truncated auth_response payload".to_string())?
     } else if caps & CLIENT_SECURE_CONNECTION != 0 {
-        let n = p.u8().ok_or_else(|| "truncated auth_response u8".to_string())?;
+        let n = p
+            .u8()
+            .ok_or_else(|| "truncated auth_response u8".to_string())?;
         p.bytes(n as usize)
             .ok_or_else(|| "truncated auth_response payload".to_string())?
     } else {
-        return Err(
-            "legacy CLIENT_LONG_PASSWORD auth (pre-4.1) is not supported".to_string(),
-        );
+        return Err("legacy CLIENT_LONG_PASSWORD auth (pre-4.1) is not supported".to_string());
     };
     let database = if caps & CLIENT_CONNECT_WITH_DB != 0 {
         Some(
@@ -1676,7 +1646,9 @@ fn server_version_string() -> String {
 /// keeps replays reproducible inside one process for the e2e
 /// tests.
 pub(crate) fn generate_scramble(seed: u32) -> Vec<u8> {
-    let mut state: u64 = u64::from(seed).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut state: u64 = u64::from(seed)
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     if state == 0 {
         state = 0x9E37_79B9_7F4A_7C15;
     }

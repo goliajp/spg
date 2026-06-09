@@ -9,7 +9,8 @@ fn create_statistics_parses_as_noop() {
     e.execute("CREATE TABLE t (a INT NOT NULL, b INT NOT NULL)")
         .unwrap();
     // PG 12+ emits this in dumps with extended statistics objects.
-    e.execute("CREATE STATISTICS stat_ab ON a, b FROM t").unwrap();
+    e.execute("CREATE STATISTICS stat_ab ON a, b FROM t")
+        .unwrap();
 }
 
 #[test]

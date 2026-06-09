@@ -30,7 +30,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn text(e: &mut Engine, sql: &str) -> String {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -233,7 +236,8 @@ fn lpad_zero_padded_ids_for_display() {
 #[test]
 fn rpad_inside_insert_values() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE u (name_field TEXT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE u (name_field TEXT NOT NULL)")
+        .unwrap();
     e.execute("INSERT INTO u VALUES (rpad('Alice', 10, '.'))")
         .unwrap();
     let row = one_row(e.execute("SELECT name_field FROM u").unwrap());

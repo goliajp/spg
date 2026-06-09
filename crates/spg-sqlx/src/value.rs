@@ -126,9 +126,9 @@ pub fn engine_value_kind(v: &EngineValue) -> Kind {
         // tsvector. Sq8 + Half storage variants dequantise to
         // f32 inside Decode, so the column-side kind is still
         // Vector.
-        EngineValue::Vector(_)
-        | EngineValue::Sq8Vector(_)
-        | EngineValue::HalfVector(_) => Kind::Vector,
+        EngineValue::Vector(_) | EngineValue::Sq8Vector(_) | EngineValue::HalfVector(_) => {
+            Kind::Vector
+        }
         EngineValue::TsVector(_) => Kind::TsVector,
         // v7.16.0 — non-exhaustive enum; future types
         // (Interval, arrays beyond text/int/bigint, hstore) decode

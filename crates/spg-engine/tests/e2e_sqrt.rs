@@ -14,14 +14,15 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn float_result(e: &mut Engine, sql: &str) -> f64 {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Float(x) => *x,
         Value::Int(n) => f64::from(*n),
         Value::BigInt(n) => *n as f64,
-        Value::Numeric { scaled, scale } => {
-            (*scaled as f64) / 10f64.powi(i32::from(*scale))
-        }
+        Value::Numeric { scaled, scale } => (*scaled as f64) / 10f64.powi(i32::from(*scale)),
         other => panic!("got {other:?}"),
     }
 }

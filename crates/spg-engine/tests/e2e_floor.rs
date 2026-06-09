@@ -182,9 +182,7 @@ fn floor_inside_where() {
         .unwrap();
     e.execute("INSERT INTO u VALUES (1, 1.5), (2, 2.5), (3, 3.5)")
         .unwrap();
-    let r = e
-        .execute("SELECT id FROM u WHERE floor(x) = 2")
-        .unwrap();
+    let r = e.execute("SELECT id FROM u WHERE floor(x) = 2").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };

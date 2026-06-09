@@ -60,12 +60,7 @@ fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
 
 fn write_packet(stream: &mut TcpStream, seqno: u8, payload: &[u8]) {
     let len = payload.len() as u32;
-    let hdr = [
-        len as u8,
-        (len >> 8) as u8,
-        (len >> 16) as u8,
-        seqno,
-    ];
+    let hdr = [len as u8, (len >> 8) as u8, (len >> 16) as u8, seqno];
     stream.write_all(&hdr).expect("write header");
     stream.write_all(payload).expect("write payload");
 }
@@ -84,9 +79,11 @@ fn handshake_v10_greeting_carries_every_required_field() {
     // protocol_version = 10
     assert_eq!(payload[0], 10);
     // server_version is a NUL-terminated string.
-    let nul = payload[1..].iter().position(|b| *b == 0).expect("server_version NUL");
-    let server_version =
-        std::str::from_utf8(&payload[1..1 + nul]).expect("server_version utf8");
+    let nul = payload[1..]
+        .iter()
+        .position(|b| *b == 0)
+        .expect("server_version NUL");
+    let server_version = std::str::from_utf8(&payload[1..1 + nul]).expect("server_version utf8");
     assert!(
         server_version.starts_with("8.0.0-spg"),
         "expected 8.0-lineage advertisement, got {server_version}"
@@ -134,7 +131,10 @@ fn handshake_v10_greeting_carries_every_required_field() {
     let pos = pos + 1;
     // null-terminated auth plugin name
     let rest = &payload[pos..];
-    let nul = rest.iter().position(|b| *b == 0).expect("auth plugin name NUL");
+    let nul = rest
+        .iter()
+        .position(|b| *b == 0)
+        .expect("auth plugin name NUL");
     let plugin = std::str::from_utf8(&rest[..nul]).unwrap();
     assert_eq!(plugin, "mysql_native_password");
 

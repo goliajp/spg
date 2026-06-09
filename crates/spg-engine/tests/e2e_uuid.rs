@@ -28,7 +28,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn text_col(e: &mut Engine, sql: &str) -> String {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -122,15 +125,18 @@ fn malformed_uuid_input_errors() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     assert!(e.execute("INSERT INTO u VALUES ('not-a-uuid')").is_err());
-    assert!(e
-        .execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-44665544000')")
-        .is_err()); // too short
-    assert!(e
-        .execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-4466554400000')")
-        .is_err()); // too long
-    assert!(e
-        .execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-44665544000g')")
-        .is_err()); // non-hex
+    assert!(
+        e.execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-44665544000')")
+            .is_err()
+    ); // too short
+    assert!(
+        e.execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-4466554400000')")
+            .is_err()
+    ); // too long
+    assert!(
+        e.execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-44665544000g')")
+            .is_err()
+    ); // non-hex
 }
 
 // ── gen_random_uuid() ────────────────────────────────────────────

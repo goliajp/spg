@@ -29,7 +29,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn text(e: &mut Engine, sql: &str) -> String {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -83,10 +86,7 @@ fn translate_empty_to_deletes_all_from_chars() {
 #[test]
 fn translate_empty_from_passes_through_unchanged() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT translate('hello', '', 'X')"),
-        "hello"
-    );
+    assert_eq!(text(&mut e, "SELECT translate('hello', '', 'X')"), "hello");
 }
 
 #[test]
@@ -100,10 +100,7 @@ fn translate_duplicate_chars_in_from_first_match_wins() {
     // PG: when `from` has duplicates, the FIRST occurrence's
     // mapping wins.
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT translate('aaa', 'aaa', 'XYZ')"),
-        "XXX"
-    );
+    assert_eq!(text(&mut e, "SELECT translate('aaa', 'aaa', 'XYZ')"), "XXX");
 }
 
 #[test]

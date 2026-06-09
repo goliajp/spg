@@ -25,7 +25,9 @@ fn bare_count_star() {
 fn count_star_with_group_by() {
     let mut e = Engine::new();
     setup(&mut e);
-    let r = e.execute("SELECT name, count(*) FROM t GROUP BY name").unwrap();
+    let r = e
+        .execute("SELECT name, count(*) FROM t GROUP BY name")
+        .unwrap();
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };

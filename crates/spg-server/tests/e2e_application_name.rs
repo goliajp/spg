@@ -189,7 +189,10 @@ fn set_application_name_updates_activity_row() {
     send_query(&mut s, "SELECT * FROM spg_stat_activity");
     let msgs0 = read_until_ready(&mut s);
     let pre = find_row_cell(&msgs0, 1, "bob", 7).expect("bob row");
-    assert_eq!(pre, "", "pre-SET application_name is empty when no startup param");
+    assert_eq!(
+        pre, "",
+        "pre-SET application_name is empty when no startup param"
+    );
 
     // SET it.
     send_query(&mut s, "SET application_name = 'pytest-runner'");

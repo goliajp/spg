@@ -28,7 +28,10 @@ fn integer_two_arg_default_step() {
 #[test]
 fn integer_three_arg_step() {
     let mut e = Engine::new();
-    let r = rows(e.execute("SELECT * FROM generate_series(1, 10, 2)").unwrap());
+    let r = rows(
+        e.execute("SELECT * FROM generate_series(1, 10, 2)")
+            .unwrap(),
+    );
     let vals: Vec<i64> = r
         .iter()
         .map(|row| match row[0] {
@@ -42,7 +45,10 @@ fn integer_three_arg_step() {
 #[test]
 fn integer_negative_step_descending() {
     let mut e = Engine::new();
-    let r = rows(e.execute("SELECT * FROM generate_series(5, 1, -1)").unwrap());
+    let r = rows(
+        e.execute("SELECT * FROM generate_series(5, 1, -1)")
+            .unwrap(),
+    );
     let vals: Vec<i64> = r
         .iter()
         .map(|row| match row[0] {
@@ -133,9 +139,7 @@ fn timestamp_interval_one_hour_count_only() {
 fn unsupported_arg_shape_errors_cleanly() {
     let mut e = Engine::new();
     // Mixed shape (timestamp + integer) — should error, not panic.
-    let r = e.execute(
-        "SELECT * FROM generate_series('2024-01-01'::TIMESTAMP, 5)",
-    );
+    let r = e.execute("SELECT * FROM generate_series('2024-01-01'::TIMESTAMP, 5)");
     assert!(r.is_err());
 }
 
@@ -149,20 +153,32 @@ fn parse_iso_to_micros(s: &str) -> i64 {
     let y: i32 = std::str::from_utf8(&bytes[0..4]).unwrap().parse().unwrap();
     let mo: u32 = std::str::from_utf8(&bytes[5..7]).unwrap().parse().unwrap();
     let d: u32 = std::str::from_utf8(&bytes[8..10]).unwrap().parse().unwrap();
-    let h: u32 = std::str::from_utf8(&bytes[11..13]).unwrap().parse().unwrap();
-    let mi: u32 = std::str::from_utf8(&bytes[14..16]).unwrap().parse().unwrap();
-    let se: u32 = std::str::from_utf8(&bytes[17..19]).unwrap().parse().unwrap();
+    let h: u32 = std::str::from_utf8(&bytes[11..13])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mi: u32 = std::str::from_utf8(&bytes[14..16])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let se: u32 = std::str::from_utf8(&bytes[17..19])
+        .unwrap()
+        .parse()
+        .unwrap();
     // Days from epoch using Gregorian. For 2024 dates only we
     // hard-code the leap-year-aware day-of-year table.
-    const DAYS_PER_MONTH_LEAP: [i64; 12] =
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    const DAYS_PER_MONTH_LEAP: [i64; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     const DAYS_PER_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let is_leap = |y: i32| -> bool { (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) };
     let mut days_since_epoch: i64 = 0;
     for yr in 1970..y {
         days_since_epoch += if is_leap(yr) { 366 } else { 365 };
     }
-    let dom = if is_leap(y) { &DAYS_PER_MONTH_LEAP } else { &DAYS_PER_MONTH };
+    let dom = if is_leap(y) {
+        &DAYS_PER_MONTH_LEAP
+    } else {
+        &DAYS_PER_MONTH
+    };
     for m in 0..(mo as usize - 1) {
         days_since_epoch += dom[m];
     }

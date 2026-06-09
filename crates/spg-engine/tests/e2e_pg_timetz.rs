@@ -77,7 +77,9 @@ fn insert_positive_whole_hour_offset() {
         "INSERT INTO t VALUES (1, '09:00:00+09')",
     ]);
     let rows = select(&mut eng, "SELECT started FROM t");
-    let Value::TimeTz { us, offset_secs } = &rows[0][0] else { panic!() };
+    let Value::TimeTz { us, offset_secs } = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*us, 32_400_000_000);
     assert_eq!(*offset_secs, 9 * 3600);
 }
@@ -91,7 +93,9 @@ fn insert_negative_sub_hour_offset_newfoundland() {
         "INSERT INTO t VALUES (1, '08:30:00-03:30')",
     ]);
     let rows = select(&mut eng, "SELECT started FROM t");
-    let Value::TimeTz { us, offset_secs } = &rows[0][0] else { panic!() };
+    let Value::TimeTz { us, offset_secs } = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*us, 30_600_000_000);
     assert_eq!(*offset_secs, -(3 * 3600 + 30 * 60));
 }
@@ -103,7 +107,9 @@ fn insert_microseconds_with_india_offset() {
         "INSERT INTO t VALUES (1, '14:30:45.123456+05:30')",
     ]);
     let rows = select(&mut eng, "SELECT started FROM t");
-    let Value::TimeTz { us, offset_secs } = &rows[0][0] else { panic!() };
+    let Value::TimeTz { us, offset_secs } = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(*us, 52_245_123_456);
     assert_eq!(*offset_secs, 5 * 3600 + 30 * 60);
 }
@@ -119,8 +125,20 @@ fn timetz_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, started FROM meetings ORDER BY id");
     assert_eq!(rows.len(), 2);
-    let Value::TimeTz { us: a_us, offset_secs: a_off } = &rows[0][1] else { panic!() };
-    let Value::TimeTz { us: b_us, offset_secs: b_off } = &rows[1][1] else { panic!() };
+    let Value::TimeTz {
+        us: a_us,
+        offset_secs: a_off,
+    } = &rows[0][1]
+    else {
+        panic!()
+    };
+    let Value::TimeTz {
+        us: b_us,
+        offset_secs: b_off,
+    } = &rows[1][1]
+    else {
+        panic!()
+    };
     assert_eq!(*a_us, 32_400_000_000);
     assert_eq!(*a_off, 0);
     assert_eq!(*b_us, 52_200_000_000);
@@ -151,7 +169,10 @@ fn timetz_missing_offset_is_error() {
     // so we surface as a hard error. App must spell the offset.
     let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL, started TIMETZ)"]);
     let r = eng.execute("INSERT INTO t VALUES (1, '14:30:45')");
-    assert!(r.is_err(), "TIMETZ literal without an offset must error in SPG");
+    assert!(
+        r.is_err(),
+        "TIMETZ literal without an offset must error in SPG"
+    );
 }
 
 #[test]

@@ -76,7 +76,8 @@ fn greatest_single_arg_returns_arg() {
 fn greatest_strings_lexicographic() {
     let mut e = Engine::new();
     let row = one_row(
-        e.execute("SELECT greatest('apple', 'banana', 'cherry')").unwrap(),
+        e.execute("SELECT greatest('apple', 'banana', 'cherry')")
+            .unwrap(),
     );
     assert_eq!(row[0], Value::Text("cherry".into()));
 }
@@ -124,7 +125,8 @@ fn least_negative_numbers() {
 fn least_strings_lexicographic() {
     let mut e = Engine::new();
     let row = one_row(
-        e.execute("SELECT least('banana', 'apple', 'cherry')").unwrap(),
+        e.execute("SELECT least('banana', 'apple', 'cherry')")
+            .unwrap(),
     );
     assert_eq!(row[0], Value::Text("apple".into()));
 }
@@ -208,7 +210,8 @@ fn greatest_inside_where() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u (id INT NOT NULL, a INT NOT NULL, b INT NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO u VALUES (1, 5, 3), (2, 1, 9)").unwrap();
+    e.execute("INSERT INTO u VALUES (1, 5, 3), (2, 1, 9)")
+        .unwrap();
     let r = e
         .execute("SELECT id FROM u WHERE greatest(a, b) >= 9")
         .unwrap();

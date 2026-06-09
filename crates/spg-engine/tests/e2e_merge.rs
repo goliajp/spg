@@ -33,7 +33,8 @@ fn setup(e: &mut Engine) {
         .unwrap();
     e.execute("CREATE TABLE source (id INT NOT NULL, val INT NOT NULL)")
         .unwrap();
-    e.execute("INSERT INTO target VALUES (1, 100), (2, 200)").unwrap();
+    e.execute("INSERT INTO target VALUES (1, 100), (2, 200)")
+        .unwrap();
     e.execute("INSERT INTO source VALUES (1, 150), (3, 300)")
         .unwrap();
 }
@@ -131,9 +132,7 @@ fn insert_on_conflict_do_update_workaround() {
          ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val",
     )
     .unwrap();
-    let r = rows(
-        e.execute("SELECT id, val FROM target ORDER BY id").unwrap(),
-    );
+    let r = rows(e.execute("SELECT id, val FROM target ORDER BY id").unwrap());
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][1], Value::Int(150), "id=1 updated");
     assert_eq!(r[1][1], Value::Int(200), "id=2 unchanged");
@@ -151,9 +150,7 @@ fn insert_on_conflict_do_nothing_alternative() {
          ON CONFLICT (id) DO NOTHING",
     )
     .unwrap();
-    let r = rows(
-        e.execute("SELECT id, val FROM target ORDER BY id").unwrap(),
-    );
+    let r = rows(e.execute("SELECT id, val FROM target ORDER BY id").unwrap());
     assert_eq!(r.len(), 3, "id=4 inserted; id=1 preserved");
     assert_eq!(r[0][1], Value::Int(100), "id=1 NOT updated");
 }

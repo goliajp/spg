@@ -124,9 +124,7 @@ fn ipv6_supernet_contains_member() {
 #[test]
 fn null_propagates() {
     let mut e = Engine::new();
-    let r = e
-        .execute("SELECT NULL::inet >>= '10.0.0.1'::inet")
-        .unwrap();
+    let r = e.execute("SELECT NULL::inet >>= '10.0.0.1'::inet").unwrap();
     assert_eq!(bool_of(r), Value::Null);
     let r = e
         .execute("SELECT '10.0.0.0/8'::inet && NULL::inet")

@@ -131,10 +131,7 @@ fn split_part_no_delim_in_input_n1_returns_whole_string() {
 #[test]
 fn split_part_no_delim_in_input_n2_returns_empty() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT split_part('abcdef', ',', 2)"),
-        ""
-    );
+    assert_eq!(text(&mut e, "SELECT split_part('abcdef', ',', 2)"), "");
 }
 
 #[test]
@@ -185,10 +182,7 @@ fn split_part_trailing_delim_last_field_empty() {
 #[test]
 fn split_part_multi_char_delim() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT split_part('a::b::c', '::', 2)"),
-        "b"
-    );
+    assert_eq!(text(&mut e, "SELECT split_part('a::b::c', '::', 2)"), "b");
 }
 
 #[test]
@@ -211,10 +205,7 @@ fn split_part_unicode_input() {
 #[test]
 fn split_part_unicode_delim() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT split_part('a・b・c', '・', 2)"),
-        "b"
-    );
+    assert_eq!(text(&mut e, "SELECT split_part('a・b・c', '・', 2)"), "b");
 }
 
 // ── NULL HANDLING ────────────────────────────────────────────────
@@ -229,18 +220,14 @@ fn split_part_null_input_returns_null() {
 #[test]
 fn split_part_null_delim_returns_null() {
     let mut e = Engine::new();
-    let row = one_row(
-        e.execute("SELECT split_part('a,b', NULL, 1)").unwrap(),
-    );
+    let row = one_row(e.execute("SELECT split_part('a,b', NULL, 1)").unwrap());
     assert_eq!(row[0], Value::Null);
 }
 
 #[test]
 fn split_part_null_n_returns_null() {
     let mut e = Engine::new();
-    let row = one_row(
-        e.execute("SELECT split_part('a,b', ',', NULL)").unwrap(),
-    );
+    let row = one_row(e.execute("SELECT split_part('a,b', ',', NULL)").unwrap());
     assert_eq!(row[0], Value::Null);
 }
 

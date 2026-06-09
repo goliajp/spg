@@ -28,14 +28,15 @@ fn gin_trgm_partial_index_creates_and_filters() {
     .unwrap();
     // mailrs round-6 S2 shape: trigram index restricted to live
     // rows via partial WHERE.
-    e.execute(
-        "CREATE INDEX idx_t_name_trgm ON t USING gin (name gin_trgm_ops) WHERE active",
-    )
-    .unwrap();
+    e.execute("CREATE INDEX idx_t_name_trgm ON t USING gin (name gin_trgm_ops) WHERE active")
+        .unwrap();
     // Substring search via the `%` (pg_trgm similarity) /
     // `LIKE` shapes that the planner can route through the
     // trigram index.
-    let r = rows(e.execute("SELECT id FROM t WHERE name LIKE '%lic%'").unwrap());
+    let r = rows(
+        e.execute("SELECT id FROM t WHERE name LIKE '%lic%'")
+            .unwrap(),
+    );
     let ids: Vec<i32> = r
         .iter()
         .map(|row| match row[0] {
@@ -56,7 +57,10 @@ fn gin_trgm_index_without_partial_predicate() {
         .unwrap();
     e.execute("CREATE INDEX idx_t_name_trgm ON t USING gin (name gin_trgm_ops)")
         .unwrap();
-    let r = rows(e.execute("SELECT id FROM t WHERE name LIKE '%bo%'").unwrap());
+    let r = rows(
+        e.execute("SELECT id FROM t WHERE name LIKE '%bo%'")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int(2));
 }
@@ -87,7 +91,10 @@ fn gin_trgm_partial_predicate_with_complex_expression() {
             (2, 'archive', 'archived', '2024-01-02 00:00:00'::TIMESTAMP)",
     )
     .unwrap();
-    let r = rows(e.execute("SELECT id FROM t WHERE name LIKE '%lic%' AND status = 'live'").unwrap());
+    let r = rows(
+        e.execute("SELECT id FROM t WHERE name LIKE '%lic%' AND status = 'live'")
+            .unwrap(),
+    );
     let ids: Vec<i32> = r
         .iter()
         .map(|row| match row[0] {

@@ -4240,9 +4240,7 @@ impl Catalog {
         // and CYCLE-wraps on overflow.
         let candidate = if seq.is_called {
             let next = seq.last_value.checked_add(seq.increment).ok_or_else(|| {
-                StorageError::Corrupt(format!(
-                    "sequence {name:?} arithmetic overflow"
-                ))
+                StorageError::Corrupt(format!("sequence {name:?} arithmetic overflow"))
             })?;
             if seq.increment > 0 {
                 if next > seq.max_value {
@@ -4457,11 +4455,7 @@ impl Catalog {
     /// v7.17.0 Phase 1.6 — register a new schema. Errors if the
     /// name already exists and `if_not_exists=false`. Built-in
     /// names cannot be redeclared.
-    pub fn create_schema(
-        &mut self,
-        name: String,
-        if_not_exists: bool,
-    ) -> Result<(), StorageError> {
+    pub fn create_schema(&mut self, name: String, if_not_exists: bool) -> Result<(), StorageError> {
         if is_builtin_schema(&name) {
             if if_not_exists {
                 return Ok(());
@@ -6530,8 +6524,7 @@ impl Catalog {
             }
             write_u16(
                 &mut out,
-                u16::try_from(unsigned_bindings.len())
-                    .expect("≤ 65k UNSIGNED columns/table"),
+                u16::try_from(unsigned_bindings.len()).expect("≤ 65k UNSIGNED columns/table"),
             );
             for pos in unsigned_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
@@ -6549,8 +6542,7 @@ impl Catalog {
             }
             write_u16(
                 &mut out,
-                u16::try_from(enum_inline_bindings.len())
-                    .expect("≤ 65k inline-ENUM columns/table"),
+                u16::try_from(enum_inline_bindings.len()).expect("≤ 65k inline-ENUM columns/table"),
             );
             for (pos, variants) in enum_inline_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
@@ -6573,8 +6565,7 @@ impl Catalog {
             }
             write_u16(
                 &mut out,
-                u16::try_from(set_inline_bindings.len())
-                    .expect("≤ 65k inline-SET columns/table"),
+                u16::try_from(set_inline_bindings.len()).expect("≤ 65k inline-SET columns/table"),
             );
             for (pos, variants) in set_inline_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
@@ -6936,10 +6927,8 @@ impl Catalog {
                 for _ in 0..label_count {
                     labels.push(cur.read_str()?);
                 }
-                cat.enum_types.insert(
-                    name.clone(),
-                    EnumDef { name, labels },
-                );
+                cat.enum_types
+                    .insert(name.clone(), EnumDef { name, labels });
             }
         }
         // v7.17.0 Phase 1.5 — DOMAIN types catalog block
@@ -7767,9 +7756,8 @@ impl Cursor<'_> {
             // v7.17.0 Phase 3.P0-38: tag 29 + RangeKind tag.
             29 => {
                 let kt = self.read_u8()?;
-                let k = RangeKind::from_tag(kt).ok_or_else(|| {
-                    StorageError::Corrupt(format!("unknown RangeKind tag: {kt}"))
-                })?;
+                let k = RangeKind::from_tag(kt)
+                    .ok_or_else(|| StorageError::Corrupt(format!("unknown RangeKind tag: {kt}")))?;
                 Ok(DataType::Range(k))
             }
             // v7.17.0 Phase 3.P0-39: tag 30 — HSTORE.
@@ -7897,8 +7885,14 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         // (which carries its own tag byte). The flags byte
         // captures empty/lower_some/upper_some/lower_inc/upper_inc.
         Value::Range { lower, upper, .. } => {
-            1 + lower.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
-                + upper.as_ref().map(|v| write_value_encoded_len(v)).unwrap_or(0)
+            1 + lower
+                .as_ref()
+                .map(|v| write_value_encoded_len(v))
+                .unwrap_or(0)
+                + upper
+                    .as_ref()
+                    .map(|v| write_value_encoded_len(v))
+                    .unwrap_or(0)
         }
         // v7.17.0 Phase 3.P0-39: hstore dense body — `[u32 count]
         // then per pair [u32 klen][k bytes][u8 has_val][if has_val:
@@ -8165,13 +8159,33 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         // v7.17.0 Phase 3.P0-38: range dense body — see
         // value_body_encoded_len for layout. `kind` is implicit
         // from the column DataType.
-        (Value::Range { lower, upper, lower_inc, upper_inc, empty, .. }, DataType::Range(_)) => {
+        (
+            Value::Range {
+                lower,
+                upper,
+                lower_inc,
+                upper_inc,
+                empty,
+                ..
+            },
+            DataType::Range(_),
+        ) => {
             let mut flags: u8 = 0;
-            if *empty { flags |= 0b0000_0001; }
-            if lower.is_some() { flags |= 0b0000_0010; }
-            if upper.is_some() { flags |= 0b0000_0100; }
-            if *lower_inc { flags |= 0b0000_1000; }
-            if *upper_inc { flags |= 0b0001_0000; }
+            if *empty {
+                flags |= 0b0000_0001;
+            }
+            if lower.is_some() {
+                flags |= 0b0000_0010;
+            }
+            if upper.is_some() {
+                flags |= 0b0000_0100;
+            }
+            if *lower_inc {
+                flags |= 0b0000_1000;
+            }
+            if *upper_inc {
+                flags |= 0b0001_0000;
+            }
             out.push(flags);
             if let Some(l) = lower {
                 write_value(out, l);
@@ -8447,15 +8461,32 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         // v7.17.0 Phase 3.P0-38: range — tag 25. Body =
         // [u8 RangeKind tag][u8 flags][if lower: write_value(lower)]
         // [if upper: write_value(upper)].
-        Value::Range { kind, lower, upper, lower_inc, upper_inc, empty } => {
+        Value::Range {
+            kind,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+        } => {
             out.push(25);
             out.push(kind.tag());
             let mut flags: u8 = 0;
-            if *empty { flags |= 0b0000_0001; }
-            if lower.is_some() { flags |= 0b0000_0010; }
-            if upper.is_some() { flags |= 0b0000_0100; }
-            if *lower_inc { flags |= 0b0000_1000; }
-            if *upper_inc { flags |= 0b0001_0000; }
+            if *empty {
+                flags |= 0b0000_0001;
+            }
+            if lower.is_some() {
+                flags |= 0b0000_0010;
+            }
+            if upper.is_some() {
+                flags |= 0b0000_0100;
+            }
+            if *lower_inc {
+                flags |= 0b0000_1000;
+            }
+            if *upper_inc {
+                flags |= 0b0001_0000;
+            }
             out.push(flags);
             if let Some(l) = lower {
                 write_value(out, l);
@@ -8490,8 +8521,7 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
 /// v7.17.0 Phase 3.P0-40 — shared 2D INT writer.
 fn write_int_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i32>>]) {
     let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
-    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
-        .expect("≤ 4G cols");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0)).expect("≤ 4G cols");
     out.extend_from_slice(&nrows.to_le_bytes());
     out.extend_from_slice(&ncols.to_le_bytes());
     for row in rows {
@@ -8510,8 +8540,7 @@ fn write_int_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i32>>]) {
 /// v7.17.0 Phase 3.P0-40 — shared 2D BIGINT writer.
 fn write_bigint_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i64>>]) {
     let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
-    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
-        .expect("≤ 4G cols");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0)).expect("≤ 4G cols");
     out.extend_from_slice(&nrows.to_le_bytes());
     out.extend_from_slice(&ncols.to_le_bytes());
     for row in rows {
@@ -8531,8 +8560,7 @@ fn write_bigint_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<i64>>]) {
 /// `[u8 null_flag][if non-null: u32 len][utf-8 bytes]` layout.
 fn write_text_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<String>>]) {
     let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
-    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0))
-        .expect("≤ 4G cols");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0)).expect("≤ 4G cols");
     out.extend_from_slice(&nrows.to_le_bytes());
     out.extend_from_slice(&ncols.to_le_bytes());
     for row in rows {
@@ -8989,7 +9017,11 @@ impl<'a> Cursor<'a> {
             let mut row = Vec::with_capacity(ncols);
             for _ in 0..ncols {
                 let null = self.read_u8()?;
-                row.push(if null == 1 { None } else { Some(self.read_i32()?) });
+                row.push(if null == 1 {
+                    None
+                } else {
+                    Some(self.read_i32()?)
+                });
             }
             rows.push(row);
         }
@@ -9005,7 +9037,11 @@ impl<'a> Cursor<'a> {
             let mut row = Vec::with_capacity(ncols);
             for _ in 0..ncols {
                 let null = self.read_u8()?;
-                row.push(if null == 1 { None } else { Some(self.read_i64()?) });
+                row.push(if null == 1 {
+                    None
+                } else {
+                    Some(self.read_i64()?)
+                });
             }
             rows.push(row);
         }
@@ -9046,19 +9082,19 @@ impl<'a> Cursor<'a> {
         for _ in 0..count {
             let klen = self.read_u32()? as usize;
             let k_bytes = self.take(klen)?.to_vec();
-            let k = String::from_utf8(k_bytes).map_err(|_| {
-                StorageError::Corrupt("hstore key is not valid UTF-8".into())
-            })?;
+            let k = String::from_utf8(k_bytes)
+                .map_err(|_| StorageError::Corrupt("hstore key is not valid UTF-8".into()))?;
             let has_val = self.read_u8()? != 0;
-            let v = if has_val {
-                let vlen = self.read_u32()? as usize;
-                let v_bytes = self.take(vlen)?.to_vec();
-                Some(String::from_utf8(v_bytes).map_err(|_| {
-                    StorageError::Corrupt("hstore value is not valid UTF-8".into())
-                })?)
-            } else {
-                None
-            };
+            let v =
+                if has_val {
+                    let vlen = self.read_u32()? as usize;
+                    let v_bytes = self.take(vlen)?.to_vec();
+                    Some(String::from_utf8(v_bytes).map_err(|_| {
+                        StorageError::Corrupt("hstore value is not valid UTF-8".into())
+                    })?)
+                } else {
+                    None
+                };
             out.push((k, v));
         }
         Ok(out)
@@ -9266,9 +9302,8 @@ impl<'a> Cursor<'a> {
             // [u8 RangeKind tag][u8 flags][opt lower][opt upper].
             25 => {
                 let kt = self.read_u8()?;
-                let kind = RangeKind::from_tag(kt).ok_or_else(|| {
-                    StorageError::Corrupt(format!("unknown RangeKind tag: {kt}"))
-                })?;
+                let kind = RangeKind::from_tag(kt)
+                    .ok_or_else(|| StorageError::Corrupt(format!("unknown RangeKind tag: {kt}")))?;
                 let flags = self.read_u8()?;
                 let empty = flags & 0b0000_0001 != 0;
                 let has_lower = flags & 0b0000_0010 != 0;

@@ -94,7 +94,9 @@ fn insert_text_2d_round_trips() {
         "INSERT INTO t VALUES (1, '{{a,b},{c,d}}')",
     ]);
     let rows = select(&mut eng, "SELECT m FROM t");
-    let Value::TextArray2D(rows2d) = &rows[0][0] else { panic!() };
+    let Value::TextArray2D(rows2d) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(rows2d.len(), 2);
     assert_eq!(rows2d[0][0].as_deref(), Some("a"));
     assert_eq!(rows2d[1][1].as_deref(), Some("d"));
@@ -107,7 +109,9 @@ fn insert_bigint_2d_round_trips() {
         "INSERT INTO t VALUES (1, '{{9999999999,8888888888}}')",
     ]);
     let rows = select(&mut eng, "SELECT m FROM t");
-    let Value::BigIntArray2D(rows2d) = &rows[0][0] else { panic!() };
+    let Value::BigIntArray2D(rows2d) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(rows2d.len(), 1);
     assert_eq!(rows2d[0][0], Some(9_999_999_999));
 }
@@ -119,7 +123,9 @@ fn insert_null_elements_preserved() {
         "INSERT INTO t VALUES (1, '{{1,NULL},{NULL,4}}')",
     ]);
     let rows = select(&mut eng, "SELECT m FROM t");
-    let Value::IntArray2D(rows2d) = &rows[0][0] else { panic!() };
+    let Value::IntArray2D(rows2d) = &rows[0][0] else {
+        panic!()
+    };
     assert_eq!(rows2d[0][1], None);
     assert_eq!(rows2d[1][0], None);
     assert_eq!(rows2d[1][1], Some(4));
@@ -132,7 +138,9 @@ fn empty_2d_array() {
         "INSERT INTO t VALUES (1, '{}')",
     ]);
     let rows = select(&mut eng, "SELECT m FROM t");
-    let Value::IntArray2D(rows2d) = &rows[0][0] else { panic!() };
+    let Value::IntArray2D(rows2d) = &rows[0][0] else {
+        panic!()
+    };
     assert!(rows2d.is_empty());
 }
 
@@ -157,8 +165,12 @@ fn array_2d_column_survives_catalog_round_trip() {
     let mut eng2 = Engine::restore(cat);
     let rows = select(&mut eng2, "SELECT id, m FROM grid ORDER BY id");
     assert_eq!(rows.len(), 2);
-    let Value::IntArray2D(g1) = &rows[0][1] else { panic!() };
-    let Value::IntArray2D(g2) = &rows[1][1] else { panic!() };
+    let Value::IntArray2D(g1) = &rows[0][1] else {
+        panic!()
+    };
+    let Value::IntArray2D(g2) = &rows[1][1] else {
+        panic!()
+    };
     assert_eq!(g1.len(), 2);
     assert_eq!(g2.len(), 1);
     assert_eq!(g2[0].len(), 3);
@@ -173,7 +185,9 @@ fn display_canonical_via_text_cast() {
     let r = eng.execute("SELECT m::text FROM t").unwrap();
     match r {
         QueryResult::Rows { rows, .. } => {
-            let Value::Text(s) = &rows[0].values[0] else { panic!() };
+            let Value::Text(s) = &rows[0].values[0] else {
+                panic!()
+            };
             assert_eq!(s, "{{1,2},{3,4}}");
         }
         _ => panic!(),

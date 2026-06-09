@@ -11,7 +11,8 @@ use spg_engine::Engine;
 fn setup_parent(e: &mut Engine) {
     e.execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")
         .unwrap();
-    e.execute("INSERT INTO parent VALUES (1), (2), (3)").unwrap();
+    e.execute("INSERT INTO parent VALUES (1), (2), (3)")
+        .unwrap();
 }
 
 #[test]
@@ -128,7 +129,10 @@ fn fk_deferrable_runs_constraint_immediately() {
     // parent_id = 999 violates the FK; we expect an immediate
     // error (single-writer no-deferred-window).
     let r = e.execute("INSERT INTO child VALUES (1, 999)");
-    assert!(r.is_err(), "FK violation should error immediately even with DEFERRABLE");
+    assert!(
+        r.is_err(),
+        "FK violation should error immediately even with DEFERRABLE"
+    );
 }
 
 #[test]

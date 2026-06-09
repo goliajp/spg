@@ -84,11 +84,7 @@ fn native_password_response(scramble: &[u8], password: &str) -> Vec<u8> {
         .collect()
 }
 
-fn build_handshake_response(
-    username: &str,
-    auth_response: &[u8],
-    plugin: &str,
-) -> Vec<u8> {
+fn build_handshake_response(username: &str, auth_response: &[u8], plugin: &str) -> Vec<u8> {
     let caps: u32 = 0x0000_0200 // CLIENT_PROTOCOL_41
         | 0x0000_8000 // CLIENT_SECURE_CONNECTION
         | 0x0008_0000; // CLIENT_PLUGIN_AUTH

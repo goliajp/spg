@@ -15,7 +15,8 @@ fn pg_views_lists_declared_view() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, label TEXT NOT NULL)")
         .unwrap();
-    e.execute("CREATE VIEW v AS SELECT id, label FROM t").unwrap();
+    e.execute("CREATE VIEW v AS SELECT id, label FROM t")
+        .unwrap();
     let r = rows(
         e.execute(
             "SELECT viewname, schemaname FROM pg_catalog.pg_views \
@@ -34,10 +35,8 @@ fn pg_views_definition_carries_body() {
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();
     let r = rows(
-        e.execute(
-            "SELECT definition FROM pg_catalog.pg_views WHERE viewname = 'v'",
-        )
-        .unwrap(),
+        e.execute("SELECT definition FROM pg_catalog.pg_views WHERE viewname = 'v'")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     let def = match &r[0][0] {

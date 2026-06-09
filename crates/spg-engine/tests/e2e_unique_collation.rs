@@ -17,10 +17,8 @@ use spg_engine::Engine;
 #[test]
 fn ci_inline_unique_rejects_case_variant() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL UNIQUE)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL UNIQUE)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES ('Foo')").unwrap();
     let err = e
         .execute("INSERT INTO t VALUES ('FOO')")
@@ -35,10 +33,8 @@ fn ci_inline_unique_rejects_case_variant() {
 #[test]
 fn ci_inline_unique_accepts_distinct_values() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL UNIQUE)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL UNIQUE)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES ('Foo'), ('bar'), ('baz')")
         .unwrap();
 }
@@ -47,17 +43,16 @@ fn ci_inline_unique_accepts_distinct_values() {
 fn binary_collation_keeps_case_sensitive_unique() {
     // Binary (default) collation: `'Foo'` and `'FOO'` coexist.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (s TEXT NOT NULL UNIQUE)").unwrap();
+    e.execute("CREATE TABLE t (s TEXT NOT NULL UNIQUE)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES ('Foo'), ('FOO')").unwrap();
 }
 
 #[test]
 fn ci_unique_rejects_within_same_batch() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL UNIQUE)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL UNIQUE)")
+        .unwrap();
     let err = e
         .execute("INSERT INTO t VALUES ('Foo'), ('foo')")
         .expect_err("case-insensitive UNIQUE must reject within-batch case variant");
@@ -93,10 +88,8 @@ fn create_unique_index_rejects_existing_case_dup() {
     // Pre-fill with case-variant duplicates, then CREATE UNIQUE
     // INDEX on a ci column must detect the existing collision.
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NOT NULL)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES ('Foo'), ('FOO')").unwrap();
     let err = e
         .execute("CREATE UNIQUE INDEX idx_s ON t (s)")
@@ -110,10 +103,8 @@ fn null_keys_still_lift_out_of_check() {
     // PG / MySQL both allow multiple NULLs in a UNIQUE column by
     // default — collation must not change that.
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NULL UNIQUE)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t (s TEXT COLLATE \"case_insensitive\" NULL UNIQUE)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (NULL), (NULL), ('Foo')")
         .unwrap();
 }

@@ -48,14 +48,20 @@ fn engine_with_flags() -> Engine {
 #[test]
 fn bool_and_all_true_group() {
     let mut e = engine_with_flags();
-    let row = one_row(e.execute("SELECT bool_and(ok) FROM u WHERE id = 1").unwrap());
+    let row = one_row(
+        e.execute("SELECT bool_and(ok) FROM u WHERE id = 1")
+            .unwrap(),
+    );
     assert_eq!(row[0], Value::Bool(true));
 }
 
 #[test]
 fn bool_and_with_one_false_returns_false() {
     let mut e = engine_with_flags();
-    let row = one_row(e.execute("SELECT bool_and(ok) FROM u WHERE id = 2").unwrap());
+    let row = one_row(
+        e.execute("SELECT bool_and(ok) FROM u WHERE id = 2")
+            .unwrap(),
+    );
     assert_eq!(row[0], Value::Bool(false));
 }
 
@@ -63,14 +69,20 @@ fn bool_and_with_one_false_returns_false() {
 fn bool_and_nulls_skipped() {
     // id=3: (NULL, true) → bool_and = true (NULL skipped).
     let mut e = engine_with_flags();
-    let row = one_row(e.execute("SELECT bool_and(ok) FROM u WHERE id = 3").unwrap());
+    let row = one_row(
+        e.execute("SELECT bool_and(ok) FROM u WHERE id = 3")
+            .unwrap(),
+    );
     assert_eq!(row[0], Value::Bool(true));
 }
 
 #[test]
 fn bool_and_all_null_returns_null() {
     let mut e = engine_with_flags();
-    let row = one_row(e.execute("SELECT bool_and(ok) FROM u WHERE id = 4").unwrap());
+    let row = one_row(
+        e.execute("SELECT bool_and(ok) FROM u WHERE id = 4")
+            .unwrap(),
+    );
     assert_eq!(row[0], Value::Null);
 }
 
@@ -87,7 +99,10 @@ fn bool_and_empty_group_returns_null() {
 #[test]
 fn bool_and_all_false_group_returns_false() {
     let mut e = engine_with_flags();
-    let row = one_row(e.execute("SELECT bool_and(ok) FROM u WHERE id = 5").unwrap());
+    let row = one_row(
+        e.execute("SELECT bool_and(ok) FROM u WHERE id = 5")
+            .unwrap(),
+    );
     assert_eq!(row[0], Value::Bool(false));
 }
 

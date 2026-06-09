@@ -23,7 +23,10 @@ fn unwrap_text_array(v: &Value) -> Vec<Option<String>> {
 #[test]
 fn matches_simple_literal() {
     let mut e = Engine::new();
-    let r = rows(e.execute("SELECT regexp_matches('hello world', 'world')").unwrap());
+    let r = rows(
+        e.execute("SELECT regexp_matches('hello world', 'world')")
+            .unwrap(),
+    );
     let a = unwrap_text_array(&r[0][0]);
     assert_eq!(a, vec![Some("world".into())]);
 }
@@ -31,7 +34,10 @@ fn matches_simple_literal() {
 #[test]
 fn matches_digit_shortcut() {
     let mut e = Engine::new();
-    let r = rows(e.execute(r"SELECT regexp_matches('abc123def', '\d+')").unwrap());
+    let r = rows(
+        e.execute(r"SELECT regexp_matches('abc123def', '\d+')")
+            .unwrap(),
+    );
     let a = unwrap_text_array(&r[0][0]);
     assert_eq!(a, vec![Some("123".into())]);
 }
@@ -40,7 +46,8 @@ fn matches_digit_shortcut() {
 fn matches_global_flag() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(r"SELECT regexp_matches('a1b22c333', '\d+', 'g')").unwrap(),
+        e.execute(r"SELECT regexp_matches('a1b22c333', '\d+', 'g')")
+            .unwrap(),
     );
     let a = unwrap_text_array(&r[0][0]);
     assert_eq!(
@@ -70,7 +77,8 @@ fn matches_null_propagates() {
 fn replace_single_first_match() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT regexp_replace('hello world', 'world', 'PG')").unwrap(),
+        e.execute("SELECT regexp_replace('hello world', 'world', 'PG')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("hello PG".into()));
 }
@@ -79,7 +87,8 @@ fn replace_single_first_match() {
 fn replace_first_match_only_by_default() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT regexp_replace('a b a b', 'a', 'X')").unwrap(),
+        e.execute("SELECT regexp_replace('a b a b', 'a', 'X')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("X b a b".into()));
 }
@@ -88,7 +97,8 @@ fn replace_first_match_only_by_default() {
 fn replace_global_flag() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT regexp_replace('a b a b', 'a', 'X', 'g')").unwrap(),
+        e.execute("SELECT regexp_replace('a b a b', 'a', 'X', 'g')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("X b X b".into()));
 }
@@ -97,7 +107,8 @@ fn replace_global_flag() {
 fn replace_with_character_class() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(r"SELECT regexp_replace('Hello, World!', '[^a-zA-Z0-9]', '-', 'g')").unwrap(),
+        e.execute(r"SELECT regexp_replace('Hello, World!', '[^a-zA-Z0-9]', '-', 'g')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("Hello--World-".into()));
 }
@@ -106,7 +117,8 @@ fn replace_with_character_class() {
 fn replace_digit_with_hash() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(r"SELECT regexp_replace('order #1234', '\d+', '#', 'g')").unwrap(),
+        e.execute(r"SELECT regexp_replace('order #1234', '\d+', '#', 'g')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("order ##".into()));
 }
@@ -115,7 +127,8 @@ fn replace_digit_with_hash() {
 fn replace_no_match_unchanged() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(r"SELECT regexp_replace('hello', '\d+', 'X')").unwrap(),
+        e.execute(r"SELECT regexp_replace('hello', '\d+', 'X')")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Text("hello".into()));
 }
@@ -126,7 +139,8 @@ fn replace_no_match_unchanged() {
 fn split_on_comma() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT regexp_split_to_array('a,b,c', ',')").unwrap(),
+        e.execute("SELECT regexp_split_to_array('a,b,c', ',')")
+            .unwrap(),
     );
     let a = unwrap_text_array(&r[0][0]);
     assert_eq!(
@@ -139,16 +153,13 @@ fn split_on_comma() {
 fn split_on_whitespace_pattern() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(r"SELECT regexp_split_to_array('one two   three', '\s+')").unwrap(),
+        e.execute(r"SELECT regexp_split_to_array('one two   three', '\s+')")
+            .unwrap(),
     );
     let a = unwrap_text_array(&r[0][0]);
     assert_eq!(
         a,
-        vec![
-            Some("one".into()),
-            Some("two".into()),
-            Some("three".into())
-        ]
+        vec![Some("one".into()), Some("two".into()), Some("three".into())]
     );
 }
 
@@ -156,7 +167,8 @@ fn split_on_whitespace_pattern() {
 fn split_no_delimiter_returns_single_element() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT regexp_split_to_array('abc', ',')").unwrap(),
+        e.execute("SELECT regexp_split_to_array('abc', ',')")
+            .unwrap(),
     );
     let a = unwrap_text_array(&r[0][0]);
     assert_eq!(a, vec![Some("abc".into())]);
@@ -166,7 +178,8 @@ fn split_no_delimiter_returns_single_element() {
 fn split_on_character_class() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(r"SELECT regexp_split_to_array('a1b2c3', '[0-9]')").unwrap(),
+        e.execute(r"SELECT regexp_split_to_array('a1b2c3', '[0-9]')")
+            .unwrap(),
     );
     let a = unwrap_text_array(&r[0][0]);
     assert_eq!(

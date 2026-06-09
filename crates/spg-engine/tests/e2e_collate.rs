@@ -40,7 +40,10 @@ fn case_insensitive_equality_matches_mixed_case() {
             _ => unreachable!(),
         })
         .collect();
-    assert!(!ids.contains(&1), "row 1 (Alice) should be excluded by != 'alice'");
+    assert!(
+        !ids.contains(&1),
+        "row 1 (Alice) should be excluded by != 'alice'"
+    );
     assert!(ids.contains(&2) && ids.contains(&3));
 }
 
@@ -52,7 +55,11 @@ fn binary_collation_still_byte_strict_by_default() {
     e.execute("INSERT INTO t (id, name) VALUES (1, 'Alice'), (2, 'alice')")
         .unwrap();
     let r = rows(e.execute("SELECT id FROM t WHERE name = 'alice'").unwrap());
-    assert_eq!(r.len(), 1, "default binary collation only matches exact case");
+    assert_eq!(
+        r.len(),
+        1,
+        "default binary collation only matches exact case"
+    );
     assert_eq!(r[0][0], Value::Int(2));
 }
 
@@ -81,7 +88,10 @@ fn unknown_collation_falls_back_to_binary() {
     e.execute("INSERT INTO t (id, name) VALUES (1, 'Alice')")
         .unwrap();
     let r = rows(e.execute("SELECT id FROM t WHERE name = 'alice'").unwrap());
-    assert!(r.is_empty(), "COLLATE 'C' is binary; mixed case shouldn't match");
+    assert!(
+        r.is_empty(),
+        "COLLATE 'C' is binary; mixed case shouldn't match"
+    );
 }
 
 #[test]

@@ -65,10 +65,7 @@ async fn describe_resolves_numeric_columns_for_sqlx_query_macro() {
         .execute(&mut conn)
         .await
         .unwrap();
-    let d = conn
-        .describe("SELECT amount FROM bal")
-        .await
-        .unwrap();
+    let d = conn.describe("SELECT amount FROM bal").await.unwrap();
     assert_eq!(d.columns.len(), 1);
     assert_eq!(d.columns[0].type_info().kind(), Kind::Numeric);
 }
@@ -119,11 +116,10 @@ async fn bigdecimal_decode_widens_small_ints() {
         .execute(&mut conn)
         .await
         .unwrap();
-    let row: (BigDecimal, BigDecimal, BigDecimal) =
-        sqlx::query_as("SELECT a, b, c FROM t")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
+    let row: (BigDecimal, BigDecimal, BigDecimal) = sqlx::query_as("SELECT a, b, c FROM t")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(row.0, BigDecimal::from(42));
     assert_eq!(row.1, BigDecimal::from(9_000_000_000i64));
     assert_eq!(row.2, BigDecimal::from(7));
@@ -145,7 +141,10 @@ async fn bigdecimal_decode_rejects_non_numeric_cells() {
     let r: Result<(BigDecimal,), _> = sqlx::query_as("SELECT name FROM t")
         .fetch_one(&mut conn)
         .await;
-    assert!(r.is_err(), "TEXT cell must not silently decode as BigDecimal");
+    assert!(
+        r.is_err(),
+        "TEXT cell must not silently decode as BigDecimal"
+    );
 }
 
 #[tokio::test]

@@ -28,7 +28,10 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 #[test]
 fn count_star_over_generate_series() {
     let mut e = Engine::new();
-    let r = rows(e.execute("SELECT COUNT(*) FROM generate_series(1, 100)").unwrap());
+    let r = rows(
+        e.execute("SELECT COUNT(*) FROM generate_series(1, 100)")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::BigInt(100));
 }
@@ -61,10 +64,8 @@ fn min_max_over_generate_series() {
 fn count_with_where_filter_over_generate_series() {
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT COUNT(*) FROM generate_series(1, 100) AS g WHERE g > 50",
-        )
-        .unwrap(),
+        e.execute("SELECT COUNT(*) FROM generate_series(1, 100) AS g WHERE g > 50")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::BigInt(50));
@@ -77,10 +78,8 @@ fn count_with_predicate_over_unnest() {
     // unnest output.
     let mut e = Engine::new();
     let r = rows(
-        e.execute(
-            "SELECT COUNT(*) FROM unnest(ARRAY['a','b','b','c','c','c']) AS u WHERE u = 'c'",
-        )
-        .unwrap(),
+        e.execute("SELECT COUNT(*) FROM unnest(ARRAY['a','b','b','c','c','c']) AS u WHERE u = 'c'")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::BigInt(3));

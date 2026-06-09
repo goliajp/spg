@@ -25,8 +25,8 @@ use crate::ast::{
     FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod, InsertStatement,
     JoinKind, Literal, NullTreatment, OrderBy, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
     PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
-    Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind,
-    VecEncoding, WindowFrame,
+    Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding,
+    WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -1670,9 +1670,9 @@ impl Parser {
                     labels.push(s);
                 }
                 other => {
-                    return Err(self.err(alloc::format!(
-                        "expected enum label string, got {other:?}"
-                    )));
+                    return Err(
+                        self.err(alloc::format!("expected enum label string, got {other:?}"))
+                    );
                 }
             }
             if matches!(self.peek(), Token::Comma) {
@@ -1689,9 +1689,7 @@ impl Parser {
             )));
         }
         if labels.is_empty() {
-            return Err(self.err(
-                "CREATE TYPE … AS ENUM must declare at least one label".into(),
-            ));
+            return Err(self.err("CREATE TYPE … AS ENUM must declare at least one label".into()));
         }
         Ok(Statement::CreateType(crate::ast::CreateTypeStatement {
             name,
@@ -1703,9 +1701,7 @@ impl Parser {
     /// [IF NOT EXISTS] name [(col, …)] AS <SELECT …> [WITH [NO] DATA]`.
     /// The `CREATE MATERIALIZED VIEW` keywords have already been
     /// consumed.
-    fn parse_create_materialized_view_after_keyword(
-        &mut self,
-    ) -> Result<Statement, ParseError> {
+    fn parse_create_materialized_view_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
         let name = self.expect_ident_like()?;
         let mut columns: Vec<String> = Vec::new();
@@ -1758,10 +1754,7 @@ impl Parser {
     /// `default_when_absent` is what to return if the tail is
     /// missing (CREATE defaults to WITH DATA, REFRESH defaults to
     /// WITH DATA).
-    fn parse_optional_with_data(
-        &mut self,
-        default_when_absent: bool,
-    ) -> Result<bool, ParseError> {
+    fn parse_optional_with_data(&mut self, default_when_absent: bool) -> Result<bool, ParseError> {
         let save = self.pos;
         // `WITH` is an Ident (not reserved in the lexer).
         let is_with = match self.peek() {
@@ -1873,13 +1866,15 @@ impl Parser {
             None
         };
         let options = self.parse_sequence_options(/* allow_restart = */ false)?;
-        Ok(Statement::CreateSequence(crate::ast::CreateSequenceStatement {
-            name,
-            if_not_exists,
-            temporary,
-            data_type,
-            options,
-        }))
+        Ok(Statement::CreateSequence(
+            crate::ast::CreateSequenceStatement {
+                name,
+                if_not_exists,
+                temporary,
+                data_type,
+                options,
+            },
+        ))
     }
 
     /// v7.17.0 — body of `ALTER SEQUENCE`. The `ALTER` keyword has
@@ -1888,11 +1883,13 @@ impl Parser {
         let if_exists = self.parse_if_exists();
         let name = self.expect_ident_like()?;
         let options = self.parse_sequence_options(/* allow_restart = */ true)?;
-        Ok(Statement::AlterSequence(crate::ast::AlterSequenceStatement {
-            name,
-            if_exists,
-            options,
-        }))
+        Ok(Statement::AlterSequence(
+            crate::ast::AlterSequenceStatement {
+                name,
+                if_exists,
+                options,
+            },
+        ))
     }
 
     fn parse_sequence_data_type(&mut self) -> Result<crate::ast::SequenceDataType, ParseError> {
@@ -1994,9 +1991,9 @@ impl Parser {
                             self.advance();
                         }
                         other => {
-                            return Err(self.err(alloc::format!(
-                                "expected BY after OWNED, got {other:?}"
-                            )));
+                            return Err(
+                                self.err(alloc::format!("expected BY after OWNED, got {other:?}"))
+                            );
                         }
                     }
                     // OWNED BY {NONE | tab.col}. Read just one ident
@@ -2076,9 +2073,7 @@ impl Parser {
                 self.advance();
                 Ok(if neg { -v } else { v })
             }
-            other => Err(self.err(alloc::format!(
-                "expected signed integer, got {other:?}"
-            ))),
+            other => Err(self.err(alloc::format!("expected signed integer, got {other:?}"))),
         }
     }
 
@@ -2185,10 +2180,7 @@ impl Parser {
                             // ident if present so we don't
                             // mistake `END IF;` for the outer
                             // close.
-                            if matches!(
-                                self.peek(),
-                                Token::Ident(_) | Token::QuotedIdent(_)
-                            ) {
+                            if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
                                 // If the next token is one of the
                                 // PL/SQL block-closer keywords,
                                 // the END belongs to an inner
@@ -2239,9 +2231,7 @@ impl Parser {
     fn consume_mysql_view_prefix(&mut self) -> Result<(), ParseError> {
         loop {
             match self.peek().clone() {
-                Token::Ident(s) | Token::QuotedIdent(s)
-                    if s.eq_ignore_ascii_case("algorithm") =>
-                {
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("algorithm") => {
                     self.advance(); // ALGORITHM
                     // Optional `=`. MySQL spec requires it but be
                     // generous.
@@ -2258,9 +2248,7 @@ impl Parser {
                         self.advance();
                     }
                 }
-                Token::Ident(s) | Token::QuotedIdent(s)
-                    if s.eq_ignore_ascii_case("definer") =>
-                {
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("definer") => {
                     self.advance(); // DEFINER
                     if matches!(self.peek(), Token::Eq) {
                         self.advance();
@@ -2296,10 +2284,7 @@ impl Parser {
                     {
                         self.advance(); // SECURITY
                         // DEFINER / INVOKER trailing ident.
-                        if matches!(
-                            self.peek(),
-                            Token::Ident(_) | Token::QuotedIdent(_)
-                        ) {
+                        if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
                             self.advance();
                         }
                     } else {
@@ -3533,9 +3518,7 @@ impl Parser {
             });
         }
         if clauses.is_empty() {
-            return Err(self.err(String::from(
-                "MERGE requires at least one WHEN clause",
-            )));
+            return Err(self.err(String::from("MERGE requires at least one WHEN clause")));
         }
         Ok(Statement::Merge(crate::ast::MergeStatement {
             target,
@@ -4420,10 +4403,7 @@ impl Parser {
                             // Optional schema-qualified `schema.table`.
                             if matches!(self.peek(), Token::Dot) {
                                 self.advance();
-                                if matches!(
-                                    self.peek(),
-                                    Token::Ident(_) | Token::QuotedIdent(_)
-                                ) {
+                                if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
                                     self.advance();
                                 }
                             }
@@ -5936,9 +5916,7 @@ impl Parser {
                     }
                 }
                 if variants.is_empty() {
-                    return Err(self.err(
-                        "ENUM(...) must declare at least one variant".into(),
-                    ));
+                    return Err(self.err("ENUM(...) must declare at least one variant".into()));
                 }
                 inline_enum_variants = Some(variants);
                 // Storage is plain TEXT; the variant list lives on
@@ -5983,9 +5961,7 @@ impl Parser {
                     }
                 }
                 if variants.is_empty() {
-                    return Err(self.err(
-                        "SET(...) must declare at least one variant".into(),
-                    ));
+                    return Err(self.err("SET(...) must declare at least one variant".into()));
                 }
                 inline_set_variants = Some(variants);
                 ColumnTypeName::Text
@@ -6213,8 +6189,10 @@ impl Parser {
                             }
                             self.advance();
                         }
-                        on_update_runtime =
-                            Some(Expr::FunctionCall { name: "now".into(), args: Vec::new() });
+                        on_update_runtime = Some(Expr::FunctionCall {
+                            name: "now".into(),
+                            args: Vec::new(),
+                        });
                         continue;
                     }
                     other => {

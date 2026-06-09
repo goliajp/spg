@@ -24,7 +24,10 @@ fn one_row(r: QueryResult) -> Vec<Value> {
 }
 
 fn text(e: &mut Engine, sql: &str) -> String {
-    let row = one_row(e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")));
+    let row = one_row(
+        e.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}")),
+    );
     match &row[0] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -85,10 +88,7 @@ fn repeat_multibyte_preserved() {
 #[test]
 fn repeat_multichar_unicode() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT repeat('日本', 3)"),
-        "日本日本日本"
-    );
+    assert_eq!(text(&mut e, "SELECT repeat('日本', 3)"), "日本日本日本");
 }
 
 #[test]
