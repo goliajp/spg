@@ -9154,12 +9154,24 @@ impl Engine {
                     let (schema, rows) = synth_pg_type(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.17.0 Phase 3.P0-51 — pg_catalog.pg_proc for
+                // function-name introspection (ORM / pgAdmin).
+                "__spg_pg_proc" => {
+                    let (schema, rows) = synth_pg_proc(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-52 — pg_catalog.pg_namespace
+                // (schema list for admin tools' tree views).
+                "__spg_pg_namespace" => {
+                    let (schema, rows) = synth_pg_namespace(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "meta view {view:?} is not yet materialisable; \
                          v7.16.2 covers information_schema.columns / .tables \
                          and pg_catalog.pg_class / pg_attribute; \
-                         v7.17.0 P0-50 adds pg_catalog.pg_type"
+                         v7.17.0 P0-50/51/52 add pg_catalog.pg_type / pg_proc / pg_namespace"
                     )));
                 }
             }
@@ -10176,6 +10188,151 @@ fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
             Value::BigInt(2200),
         ]));
     }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-51 — synthesise `pg_catalog.pg_proc`. ORM /
+/// pgAdmin probes look up functions by name; SPG synthesises rows
+/// for the built-in scalar functions / aggregates / window funcs
+/// the engine actually dispatches. SPG has no user-defined
+/// functions yet so the table is a stable static list.
+///
+/// Schema columns exposed:
+///   * oid (BigInt) — function OID from PG's pg_proc.dat
+///   * proname (Text) — function name (lowercase)
+///   * pronamespace (BigInt) — 11 (`pg_catalog`)
+///   * prokind (Text) — 'f' function, 'a' aggregate, 'w' window
+///   * pronargs (SmallInt) — declared arg count (-1 for variadic)
+///   * prorettype (BigInt) — return type OID (matches synth_pg_type)
+fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("proname", DataType::Text, false),
+        ColumnSchema::new("pronamespace", DataType::BigInt, false),
+        ColumnSchema::new("prokind", DataType::Text, false),
+        ColumnSchema::new("pronargs", DataType::Int, false),
+        ColumnSchema::new("prorettype", DataType::BigInt, false),
+    ];
+    // (oid, name, kind, nargs, rettype). OIDs taken from PG's
+    // pg_proc.dat for the common subset.
+    let funcs: &[(i64, &str, &str, i32, i64)] = &[
+        // Scalar functions.
+        (1318, "length", "f", 1, 23),
+        (871, "upper", "f", 1, 25),
+        (870, "lower", "f", 1, 25),
+        (936, "substring", "f", 3, 25),
+        (937, "substring", "f", 2, 25),
+        (3055, "btrim", "f", 1, 25),
+        (885, "btrim", "f", 2, 25),
+        (3056, "ltrim", "f", 1, 25),
+        (875, "ltrim", "f", 2, 25),
+        (3057, "rtrim", "f", 1, 25),
+        (876, "rtrim", "f", 2, 25),
+        (1397, "abs", "f", 1, 23),
+        (1396, "abs", "f", 1, 20),
+        (1606, "round", "f", 1, 1700),
+        (1707, "round", "f", 2, 1700),
+        (2308, "ceil", "f", 1, 701),
+        (2309, "ceiling", "f", 1, 701),
+        (2310, "floor", "f", 1, 701),
+        (1376, "sqrt", "f", 1, 701),
+        (1369, "ln", "f", 1, 701),
+        (1373, "exp", "f", 1, 701),
+        (1368, "power", "f", 2, 701),
+        (2228, "random", "f", 0, 701),
+        // Date / time.
+        (1299, "now", "f", 0, 1184),
+        (1274, "current_timestamp", "f", 0, 1184),
+        (1140, "current_date", "f", 0, 1082),
+        (2050, "current_time", "f", 0, 1083),
+        (1158, "date_trunc", "f", 2, 1184),
+        (1171, "date_part", "f", 2, 701),
+        (1172, "age", "f", 1, 1186),
+        (936, "to_char", "f", 2, 25),
+        // Session / introspection.
+        (861, "current_database", "f", 0, 19),
+        (745, "current_user", "f", 0, 19),
+        (745, "session_user", "f", 0, 19),
+        (1402, "current_schema", "f", 0, 19),
+        // String concat / format.
+        (3058, "concat", "f", -1, 25),
+        (3059, "concat_ws", "f", -1, 25),
+        (3539, "format", "f", -1, 25),
+        // Type introspection.
+        (2877, "pg_typeof", "f", 1, 2206),
+        // JSON.
+        (3198, "json_build_object", "f", -1, 114),
+        (3199, "jsonb_build_object", "f", -1, 3802),
+        (3271, "json_build_array", "f", -1, 114),
+        (3272, "jsonb_build_array", "f", -1, 3802),
+        // UUID.
+        (3253, "gen_random_uuid", "f", 0, 2950),
+        (3252, "uuid_generate_v4", "f", 0, 2950),
+        // Aggregates.
+        (2147, "count", "a", 0, 20),
+        (2803, "count", "a", -1, 20),
+        (2116, "max", "a", 1, 23),
+        (2132, "min", "a", 1, 23),
+        (2108, "sum", "a", 1, 20),
+        (2100, "avg", "a", 1, 1700),
+        (2517, "string_agg", "a", 2, 25),
+        (2747, "array_agg", "a", 1, 1009),
+        (2517, "bool_and", "a", 1, 16),
+        (2518, "bool_or", "a", 1, 16),
+        (2519, "every", "a", 1, 16),
+        // Window functions.
+        (3100, "row_number", "w", 0, 20),
+        (3101, "rank", "w", 0, 20),
+        (3102, "dense_rank", "w", 0, 20),
+        (3103, "percent_rank", "w", 0, 701),
+        (3104, "cume_dist", "w", 0, 701),
+        (3105, "lag", "w", -1, 2283),
+        (3106, "lead", "w", -1, 2283),
+        (3107, "first_value", "w", 1, 2283),
+        (3108, "last_value", "w", 1, 2283),
+        (3109, "nth_value", "w", 2, 2283),
+    ];
+    let mut rows: Vec<Row> = Vec::with_capacity(funcs.len());
+    for &(oid, name, kind, nargs, rettype) in funcs {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::Text(name.into()),
+            Value::BigInt(11),
+            Value::Text(kind.into()),
+            Value::Int(nargs),
+            Value::BigInt(rettype),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-52 — synthesise `pg_catalog.pg_namespace`.
+/// SPG is single-schema so we expose the canonical PG schemas:
+/// `public` (user-facing), `pg_catalog` (built-in), and
+/// `information_schema` (PG meta).
+fn synth_pg_namespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("nspname", DataType::Text, false),
+        ColumnSchema::new("nspowner", DataType::BigInt, false),
+    ];
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(11),
+            Value::Text("pg_catalog".into()),
+            Value::BigInt(10),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(2200),
+            Value::Text("public".into()),
+            Value::BigInt(10),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(13000),
+            Value::Text("information_schema".into()),
+            Value::BigInt(10),
+        ]),
+    ];
     (schema, rows)
 }
 
