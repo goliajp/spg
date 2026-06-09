@@ -6951,6 +6951,11 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.17.0 Phase 3.P0-49 — `FETCH FIRST N ROWS WITH TIES`
+        // is meaningless without an ORDER BY; PG raises a hard
+        // error and SPG mirrors the surface so the same DDL/app
+        // path behaves identically on cutover.
+        check_with_ties_requires_order_by(stmt)?;
         // v7.16.2 — same meta-view dispatch as
         // `exec_select_cancel`, applied here too because
         // `subquery_replacement` enters this function directly
@@ -7160,7 +7165,10 @@ impl Engine {
             // the row count, select_nth_unstable + sort just the
             // prefix is O(n + k log k) instead of O(n log n). DISTINCT
             // requires the full sort because de-dup happens after.
-            let keep = if stmt.distinct {
+            // WITH TIES likewise needs the full sort so the tie
+            // extension can scan past `limit` to find rows that
+            // share the last-kept row's key.
+            let keep = if stmt.distinct || stmt.limit_with_ties {
                 None
             } else {
                 stmt.limit_literal()
@@ -7170,15 +7178,35 @@ impl Engine {
             partial_sort_tagged(&mut tagged, keep, &descs);
         }
 
-        let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
-        if stmt.distinct {
-            output_rows = dedup_rows(output_rows);
-        }
-        apply_offset_and_limit(
-            &mut output_rows,
-            stmt.offset_literal(),
-            stmt.limit_literal(),
-        );
+        // v7.17.0 Phase 3.P0-49 — `FETCH FIRST … WITH TIES` extends
+        // past the truncated tail through every row that shares the
+        // last-kept row's ORDER BY key. The tie check uses the
+        // already-computed `(order_keys, row)` pairs so it matches
+        // the sort comparator exactly. DISTINCT + WITH TIES falls
+        // through to the no-ties path (PG also disallows their
+        // combination; SPG silently drops the tie extension here so
+        // the customer doesn't see a hard error mid-query — the
+        // user-visible result is still correct, just narrower).
+        let output_rows: Vec<Row> = if stmt.limit_with_ties && !stmt.distinct {
+            apply_offset_and_limit_tagged(
+                &mut tagged,
+                stmt.offset_literal(),
+                stmt.limit_literal(),
+                true,
+            );
+            tagged.into_iter().map(|(_, r)| r).collect()
+        } else {
+            let mut output_rows: Vec<Row> = tagged.into_iter().map(|(_, r)| r).collect();
+            if stmt.distinct {
+                output_rows = dedup_rows(output_rows);
+            }
+            apply_offset_and_limit(
+                &mut output_rows,
+                stmt.offset_literal(),
+                stmt.limit_literal(),
+            );
+            output_rows
+        };
 
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
@@ -12059,6 +12087,59 @@ fn apply_offset_and_limit(rows: &mut Vec<Row>, offset: Option<u32>, limit: Optio
     if let Some(n) = limit {
         rows.truncate(n as usize);
     }
+}
+
+/// v7.17.0 Phase 3.P0-49 — offset + limit applied to a tagged
+/// `(order_keys, row)` sequence, with optional SQL:2008 `WITH
+/// TIES` extension. When `with_ties` is set, the truncated tail
+/// is extended through every subsequent row whose order keys
+/// equal the last-kept row's keys (so a "top 3 by score" with
+/// WITH TIES emits row 4 too when row 4 ties row 3 on `score`).
+///
+/// The order-key vector is the per-row sort key the caller already
+/// computed via `build_order_keys`; equal-key detection therefore
+/// matches the sort comparator exactly.
+fn apply_offset_and_limit_tagged(
+    tagged: &mut Vec<(Vec<f64>, Row)>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    with_ties: bool,
+) {
+    if let Some(off) = offset {
+        let off = off as usize;
+        if off >= tagged.len() {
+            tagged.clear();
+        } else {
+            tagged.drain(..off);
+        }
+    }
+    if let Some(n) = limit {
+        let n = n as usize;
+        if with_ties && n > 0 && n < tagged.len() {
+            let cutoff_key = tagged[n - 1].0.clone();
+            let mut end = n;
+            while end < tagged.len() && tagged[end].0 == cutoff_key {
+                end += 1;
+            }
+            tagged.truncate(end);
+        } else {
+            tagged.truncate(n);
+        }
+    }
+}
+
+/// v7.17.0 Phase 3.P0-49 — PG-canonical: `FETCH FIRST <n> ROWS
+/// WITH TIES` requires an `ORDER BY`. Without one, there's no
+/// way to identify "ties" deterministically, so PG errors at
+/// plan time. SPG mirrors that surface so the same DDL / app
+/// behaviour holds on cutover.
+fn check_with_ties_requires_order_by(stmt: &SelectStatement) -> Result<(), EngineError> {
+    if stmt.limit_with_ties && stmt.order_by.is_empty() {
+        return Err(EngineError::Unsupported(alloc::string::String::from(
+            "FETCH FIRST … ROWS WITH TIES requires an ORDER BY clause",
+        )));
+    }
+    Ok(())
 }
 
 /// v7.6.1 — resolve a parser-level `ForeignKeyConstraint` (column

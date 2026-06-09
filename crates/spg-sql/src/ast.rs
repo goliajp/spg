@@ -1628,6 +1628,15 @@ pub struct SelectStatement {
     /// `OFFSET <n>` — drop the first `n` rows after ORDER BY but
     /// before LIMIT (so `LIMIT 10 OFFSET 5` keeps rows 6..=15).
     pub offset: Option<LimitExpr>,
+    /// v7.17.0 Phase 3.P0-49 — `FETCH FIRST <n> ROWS WITH TIES`
+    /// (SQL:2008). When true and an ORDER BY is present, the
+    /// executor extends past the LIMIT-truncated tail to include
+    /// every row whose ORDER BY key equals the last-kept row's
+    /// key. Requires an ORDER BY; the executor errors otherwise
+    /// (matching PG's `WITH TIES` rule). The parser was already
+    /// accepting `WITH TIES` since Phase 5.1; this field captures
+    /// the choice so the executor can act on it.
+    pub limit_with_ties: bool,
 }
 
 /// v7.9.24 — LIMIT / OFFSET value. Integer literal at parse
@@ -3716,6 +3725,7 @@ mod tests {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            limit_with_ties: false,
             distinct: false,
             ctes: vec![],
         };

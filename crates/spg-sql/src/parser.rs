@@ -3972,10 +3972,11 @@ impl Parser {
             };
             // Eat `ROW` / `ROWS` if not already consumed above.
             self.consume_optional_rows_keyword();
-            // Optional `ONLY` (the spec form) — also accept the
-            // PG-accepted `WITH TIES` (parsed-and-discarded for now;
-            // SPG's planner doesn't model the tie semantics yet,
-            // out-of-scope for Phase 5.1).
+            // Optional `ONLY` (the spec form) — or the SQL:2008
+            // `WITH TIES` form. v7.17.0 Phase 3.P0-49: the executor
+            // now honours WITH TIES by extending past the LIMIT
+            // truncation point through every row that shares the
+            // last-kept row's ORDER BY key.
             if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("only"))
             {
@@ -3988,6 +3989,7 @@ impl Parser {
                     if s.eq_ignore_ascii_case("ties"))
                 {
                     self.advance();
+                    head.limit_with_ties = true;
                 }
             }
             head.limit = Some(count);
@@ -4231,6 +4233,7 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            limit_with_ties: false,
         })
     }
 
