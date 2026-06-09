@@ -9196,13 +9196,19 @@ impl Engine {
                     let (schema, rows) = synth_pg_roles(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
-                // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_views /
-                // pg_matviews. SPG has no materialised views yet so
-                // pg_matviews shares the pg_views shape (always
-                // empty).
-                "__spg_pg_views" | "__spg_pg_matviews" => {
+                // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_views. PG's
+                // pg_views surfaces every CREATE VIEW result; SPG
+                // ships one row per declared view from the catalog.
+                "__spg_pg_views" => {
                     let (schema, rows) = synth_pg_views(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_matviews.
+                // SPG has no materialised view surface yet so the
+                // table shares pg_views's schema but stays empty.
+                "__spg_pg_matviews" => {
+                    let (schema, _) = synth_pg_views(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, Vec::new())?;
                 }
                 // v7.17.0 Phase 3.P0-57 — pg_catalog.pg_settings.
                 "__spg_pg_settings" => {
