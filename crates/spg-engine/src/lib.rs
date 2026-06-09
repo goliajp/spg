@@ -967,6 +967,21 @@ impl Engine {
         describe::describe_prepared(stmt, &snapshot.catalog)
     }
 
+    /// v7.18 — does this SQL string classify as read-only? Parses
+    /// `sql` with the engine parser and consults
+    /// `Statement::is_readonly()`. A parse error returns `false`
+    /// (route to the writer path so the user sees the canonical
+    /// parse error from the writer's simple-query dispatch).
+    /// Static-on-Self so the spg-sqlx connection layer can ask
+    /// without an `Engine` borrow.
+    #[must_use]
+    pub fn is_readonly_sql(sql: &str) -> bool {
+        parser::parse_statement(sql)
+            .as_ref()
+            .map(spg_sql::ast::Statement::is_readonly)
+            .unwrap_or(false)
+    }
+
     /// v7.18 — parse + plan a SQL string against a
     /// `CatalogSnapshot`. Mirror of [`Engine::prepare`] for the
     /// readonly fan-out path: applies the same prepare-time
