@@ -43,6 +43,12 @@ spg-manifest = { workspace = true }
 # Both are macOS + Linux. Each call site is wrapped in
 # `#[allow(unsafe_code)]` and stays a tight FFI shim.
 libc        = "0.2"
+# v7.17.0 Phase 3.P0-77 — TLS for the MySQL-wire `CLIENT_SSL`
+# mid-handshake upgrade. rustls is pure Rust (no system OpenSSL
+# requirement); rcgen mints a runtime self-signed cert when no
+# operator-supplied certificate path is configured via env.
+rustls      = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
+rcgen       = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [dev-dependencies]
 spg-audit   = { workspace = true }
@@ -57,6 +63,9 @@ sha1        = { version = "0.10", default-features = false }
 # v7.17.0 Phase 3.P0-72 — same shape for caching_sha2_password
 # (SHA256-based fast path).
 sha2        = { version = "0.10", default-features = false }
+# v7.17.0 Phase 3.P0-77 — the SSL e2e test drives the client side
+# of a TLS handshake against the server's self-signed cert.
+rustls      = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
 
 [lints]
 workspace = true
