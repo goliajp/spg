@@ -967,6 +967,35 @@ impl Engine {
         describe::describe_prepared(stmt, &snapshot.catalog)
     }
 
+    /// v7.18 — parse + plan a SQL string against a
+    /// `CatalogSnapshot`. Mirror of [`Engine::prepare`] for the
+    /// readonly fan-out path: applies the same prepare-time
+    /// transforms (clock rewrite, `GROUP BY ALL` expansion, ORDER
+    /// BY position resolve, cost-based JOIN reorder) but resolves
+    /// catalog + statistics against the snapshot, not a live
+    /// engine. Static-on-Self — `AsyncReadHandle::prepare` calls
+    /// this without taking the writer lock so multiple read
+    /// handles can prepare concurrently against frozen views.
+    ///
+    /// # Errors
+    /// Propagates [`ParseError`] from the parser. Schema
+    /// validation deferred to execute time, same as
+    /// [`Engine::prepare`].
+    pub fn prepare_on_snapshot(
+        snapshot: &CatalogSnapshot,
+        sql: &str,
+    ) -> Result<Statement, ParseError> {
+        let mut stmt = parser::parse_statement(sql)?;
+        let now_micros = snapshot.clock.map(|f| f());
+        rewrite_clock_calls(&mut stmt, now_micros);
+        if let Statement::Select(s) = &mut stmt {
+            expand_group_by_all(s);
+            resolve_order_by_position(s);
+            reorder::reorder_joins(s, &snapshot.catalog, &snapshot.statistics);
+        }
+        Ok(stmt)
+    }
+
     /// Construct an engine restored from a previously-snapshotted catalog
     /// (see `snapshot()`).
     pub fn restore(catalog: Catalog) -> Self {

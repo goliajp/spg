@@ -153,3 +153,122 @@ async fn read_handle_after_database_clone() {
     let r = h_b.query("SELECT COUNT(*) FROM t").await.unwrap();
     assert_eq!(count_value(r), 2);
 }
+
+// v7.18 — readonly prepared/bind path on the fan-out reader.
+// Backs the spg-sqlx Pool full-support track: sqlx::query!()
+// goes through prepare + bind, and the SpgConnection router
+// dispatches readonly statements through AsyncReadHandle so they
+// don't take the writer lock.
+
+#[tokio::test]
+async fn read_handle_prepare_then_execute_prepared() {
+    let db = AsyncDatabase::open_in_memory();
+    db.execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
+        .await
+        .unwrap();
+    for i in 0..10i32 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 7))
+            .await
+            .unwrap();
+    }
+    let h = db.read_handle().await;
+    let stmt = h.prepare("SELECT id FROM t WHERE v = $1").await.unwrap();
+    let QueryResult::Rows { rows, .. } = h
+        .execute_prepared(&stmt, vec![Value::Int(35)])
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Int(5));
+}
+
+#[tokio::test]
+async fn read_handle_execute_prepared_rejects_writes() {
+    let db = AsyncDatabase::open_in_memory();
+    db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    let h = db.read_handle().await;
+    let stmt = h.prepare("INSERT INTO t VALUES ($1)").await.unwrap();
+    let err = h
+        .execute_prepared(&stmt, vec![Value::Int(1)])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::WriteRequired), "{err:?}");
+}
+
+#[tokio::test]
+async fn read_handle_describe_resolves_columns() {
+    let db = AsyncDatabase::open_in_memory();
+    db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    let h = db.read_handle().await;
+    let (_params, cols) = h
+        .describe("SELECT id, name FROM t WHERE id = $1")
+        .await
+        .unwrap();
+    assert_eq!(cols.len(), 2);
+    assert_eq!(cols[0].name, "id");
+    assert_eq!(cols[1].name, "name");
+}
+
+#[tokio::test]
+async fn read_handle_prepared_frozen_view() {
+    // Same snapshot-isolation contract as `query()`: writes
+    // committed after the handle was taken are invisible until
+    // refresh().
+    let db = AsyncDatabase::open_in_memory();
+    db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    db.execute("INSERT INTO t VALUES (1)").await.unwrap();
+    let h = db.read_handle().await;
+    db.execute("INSERT INTO t VALUES (2)").await.unwrap();
+    let stmt = h
+        .prepare("SELECT id FROM t WHERE id = $1")
+        .await
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = h
+        .execute_prepared(&stmt, vec![Value::Int(2)])
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows")
+    };
+    assert!(rows.is_empty(), "id=2 was inserted after snapshot");
+}
+
+#[tokio::test]
+async fn read_handle_prepared_concurrent_fan_out() {
+    // 16 read handles each preparing + executing concurrently —
+    // no writer-lock contention since the prepared path is
+    // static-on-snapshot.
+    let db = AsyncDatabase::open_in_memory();
+    db.execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
+        .await
+        .unwrap();
+    for i in 0..100i32 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 7))
+            .await
+            .unwrap();
+    }
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let h = db.read_handle().await;
+        tasks.push(tokio::spawn(async move {
+            let stmt = h.prepare("SELECT id FROM t WHERE v = $1").await.unwrap();
+            let v = (i % 10) * 7;
+            let QueryResult::Rows { rows, .. } = h
+                .execute_prepared(&stmt, vec![Value::Int(v)])
+                .await
+                .unwrap()
+            else {
+                panic!("expected Rows");
+            };
+            (i, rows.len())
+        }));
+    }
+    for t in tasks {
+        let (i, count) = t.await.expect("task");
+        assert_eq!(count, 1, "task {i} expected 1 row");
+    }
+}

@@ -76,7 +76,7 @@
 //! threading), so it lives in its own crate to keep the
 //! `no_std` boundary clean.
 
-pub use spg_engine::{Engine, EngineError, ParsedStatement, QueryResult};
+pub use spg_engine::{CatalogSnapshot, Engine, EngineError, ParsedStatement, QueryResult};
 pub use spg_storage::{ColumnSchema, DataType, Value};
 
 /// v7.16.0 — handle for a parsed-and-planned SQL statement.
@@ -920,6 +920,68 @@ impl Database {
                 "query_prepared() expects a SELECT — use execute_prepared() for DML/DDL".into(),
             )),
         }
+    }
+
+    /// v7.18 — parse + plan a SQL string against a
+    /// `CatalogSnapshot`. Mirror of [`Database::prepare`] for the
+    /// readonly fan-out path: no writer lock taken, no WAL write,
+    /// no plan-cache mutation. Static-on-`Self` so callers can
+    /// dispatch against a snapshot without an `&mut Database`
+    /// borrow — `AsyncReadHandle::prepare` in spg-embedded-tokio
+    /// is the load-bearing consumer.
+    ///
+    /// # Errors
+    /// Propagates `EngineError::Parse` from the parser.
+    pub fn prepare_on_snapshot(
+        snapshot: &CatalogSnapshot,
+        sql: &str,
+    ) -> Result<Statement, EngineError> {
+        let stmt = spg_engine::Engine::prepare_on_snapshot(snapshot, sql)
+            .map_err(EngineError::Parse)?;
+        Ok(Statement {
+            stmt,
+            sql: sql.to_string(),
+        })
+    }
+
+    /// v7.18 — execute a prepared `Statement` against a
+    /// `CatalogSnapshot` with bound params. Mirror of
+    /// [`Database::execute_prepared`] on the readonly path:
+    /// writes / DDL hit `EngineError::WriteRequired`. No WAL
+    /// write, no writer lock, multiple snapshots can run
+    /// concurrently — the snapshot is immutable from prepare time.
+    ///
+    /// # Errors
+    /// Surfaces `EngineError::WriteRequired` for non-readonly
+    /// statements; propagates other engine errors.
+    pub fn execute_prepared_on_snapshot(
+        snapshot: &CatalogSnapshot,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<QueryResult, EngineError> {
+        spg_engine::Engine::execute_readonly_prepared_on_snapshot(
+            snapshot,
+            stmt.stmt.clone(),
+            params,
+        )
+    }
+
+    /// v7.18 — describe a SQL string against a
+    /// `CatalogSnapshot`. Mirror of [`Database::describe`] on
+    /// the readonly path. Pure function on the snapshot's
+    /// catalog; safe to call from any thread.
+    ///
+    /// # Errors
+    /// Propagates `EngineError::Parse` from the parser.
+    pub fn describe_on_snapshot(
+        snapshot: &CatalogSnapshot,
+        sql: &str,
+    ) -> Result<(Vec<u32>, Vec<ColumnSchema>), EngineError> {
+        let stmt = spg_engine::Engine::prepare_on_snapshot(snapshot, sql)
+            .map_err(EngineError::Parse)?;
+        Ok(spg_engine::Engine::describe_prepared_on_snapshot(
+            snapshot, &stmt,
+        ))
     }
 
     /// v7.2.0 — run `body` inside an implicit `BEGIN` /
