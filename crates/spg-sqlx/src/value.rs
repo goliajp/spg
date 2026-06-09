@@ -116,9 +116,12 @@ pub fn engine_value_kind(v: &EngineValue) -> Kind {
         EngineValue::Date(_) => Kind::Date,
         EngineValue::Timestamp(_) => Kind::Timestamp,
         EngineValue::Json(_) => Kind::Json,
+        // v7.17.0 Phase 3.P0-67 — NUMERIC bridges to bigdecimal /
+        // String.
+        EngineValue::Numeric { .. } => Kind::Numeric,
         // v7.16.0 — non-exhaustive enum; future types
-        // (Numeric, Interval, vector, tsvector, arrays) decode
-        // to Kind::Null until the corresponding Decode lands.
+        // (Interval, vector, tsvector, arrays) decode to
+        // Kind::Null until the corresponding Decode lands.
         _ => Kind::Null,
     }
 }

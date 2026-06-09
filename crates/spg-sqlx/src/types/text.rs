@@ -18,7 +18,13 @@ impl Type<Spg> for str {
     }
 
     fn compatible(ty: &SpgTypeInfo) -> bool {
-        matches!(ty.kind(), Kind::Text)
+        // v7.17.0 Phase 3.P0-67 — NUMERIC cells decode to
+        // canonical PG decimal text, so `String` / `&str`
+        // accept them as compatible. Keeps the
+        // `query_as::<_, (String,)>("SELECT amount …")` shape
+        // working without forcing every caller to enable the
+        // bigdecimal feature.
+        matches!(ty.kind(), Kind::Text | Kind::Numeric)
     }
 }
 
@@ -56,6 +62,13 @@ impl<'q> Encode<'q, Spg> for String {
 
 impl<'r> Decode<'r, Spg> for String {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
+        // v7.17.0 Phase 3.P0-67 — NUMERIC cells decode to their
+        // canonical PG text form so the dominant
+        // `query_as::<_, (String,)>` pattern works without the
+        // bigdecimal feature.
+        if let Some(s) = crate::types::decimal::try_numeric_as_string(value.engine()) {
+            return Ok(s);
+        }
         match value.engine() {
             EngineValue::Text(s) | EngineValue::Json(s) => Ok(s.clone()),
             other => Err(format!("cannot decode {other:?} as String / TEXT").into()),

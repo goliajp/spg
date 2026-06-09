@@ -9032,6 +9032,67 @@ fn numeric_from_float(
     Ok(Value::Numeric { scaled, scale })
 }
 
+/// v7.17.0 Phase 3.P0-67 — parse PG-canonical decimal text into
+/// `(mantissa: i128, source_scale: u8)`. Accepts optional sign,
+/// optional integer part, optional fractional part. Rejects
+/// scientific notation, embedded spaces, locale-specific
+/// thousand separators. Returns None on bad input — coerce_value
+/// turns that into a TypeMismatch error.
+fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (negative, rest) = match s.as_bytes()[0] {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    // Reject scientific notation — bigdecimal collapses it before
+    // hitting the wire, and we want a clear error if a stray `e`
+    // sneaks in.
+    if rest.bytes().any(|b| b == b'e' || b == b'E') {
+        return None;
+    }
+    let (int_part, frac_part) = match rest.find('.') {
+        Some(idx) => (&rest[..idx], &rest[idx + 1..]),
+        None => (rest, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if int_part.bytes().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    if frac_part.bytes().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    let scale_u32 = u32::try_from(frac_part.len()).ok()?;
+    if scale_u32 > u32::from(u8::MAX) {
+        return None;
+    }
+    let scale = scale_u32 as u8;
+    let mut digits = alloc::string::String::with_capacity(int_part.len() + frac_part.len() + 1);
+    if negative {
+        digits.push('-');
+    }
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    // Strip a leading "+0..0" so parse doesn't choke on "00" etc.
+    let digits = if digits == "-" {
+        return None;
+    } else if digits.is_empty() {
+        "0"
+    } else {
+        digits.as_str()
+    };
+    let mantissa: i128 = digits.parse().ok()?;
+    Some((mantissa, scale))
+}
+
 /// Move a Numeric value from `src_scale` to `dst_scale`. Going up
 /// multiplies by 10; going down rounds half-away-from-zero.
 fn numeric_rescale(
@@ -16596,6 +16657,26 @@ fn coerce_value(
         )?),
         (Value::Float(x), DataType::Numeric { precision, scale }) => {
             Some(numeric_from_float(x, precision, scale, col_name)?)
+        }
+        // v7.17.0 Phase 3.P0-67 — Text → NUMERIC. Parse a
+        // canonical decimal text (`"-1234.56"` / `"42"` /
+        // `"0.0001"`) into `(mantissa, source_scale)` and rescale
+        // to the column's declared scale. Required for prepared
+        // binds: `value_to_literal` flattens a Value::Numeric
+        // into a TEXT literal because Literal carries no native
+        // Numeric variant, so the placeholder substitution path
+        // reaches coerce_value as Text → Numeric. Without this
+        // arm the round-trip surfaces a TypeMismatch even though
+        // the cell already left the engine as a valid Numeric.
+        (Value::Text(s), DataType::Numeric { precision, scale }) => {
+            let Some((mantissa, src_scale)) = parse_numeric_text(&s) else {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot parse {s:?} as NUMERIC for column `{col_name}`"
+                    ),
+                }));
+            };
+            Some(numeric_rescale(mantissa, src_scale, precision, scale, col_name)?)
         }
         // Text → DATE / TIMESTAMP: parse canonical text forms.
         (Value::Text(s), DataType::Date) => {
