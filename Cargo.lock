@@ -1398,6 +1398,7 @@ name = "spg-engine"
 version = "7.16.2"
 dependencies = [
  "criterion",
+ "sha1",
  "spg-crypto",
  "spg-sql",
  "spg-storage",
@@ -1415,6 +1416,7 @@ name = "spg-server"
 version = "7.16.2"
 dependencies = [
  "libc",
+ "sha1",
  "spg-audit",
  "spg-crypto",
  "spg-engine",

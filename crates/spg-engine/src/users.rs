@@ -20,6 +20,9 @@ use alloc::vec::Vec;
 
 const SALT_LEN: usize = 16;
 const HASH_LEN: usize = 32;
+/// v7.17.0 Phase 3.P0-71 — length of SHA1(SHA1(password)) stored
+/// per user for `mysql_native_password` auth verification.
+pub const MYSQL_NATIVE_HASH_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -74,6 +77,15 @@ pub struct UserRecord {
     /// snapshot); the PG-wire layer falls back to
     /// `CleartextPassword` for those users.
     scram: Option<ScramSecrets>,
+    /// v7.17.0 Phase 3.P0-71: SHA1(SHA1(password)) — the
+    /// `mysql.user.authentication_string` shape for the
+    /// `mysql_native_password` plugin. Computed at create /
+    /// set_password time alongside the BLAKE3 hash and the
+    /// SCRAM verifier so the MySQL-wire shim doesn't need
+    /// plaintext to verify. `None` for users loaded from a
+    /// pre-v7.17.0 snapshot — the MySQL-wire shim rejects
+    /// those with Access Denied until the password is reset.
+    mysql_native: Option<[u8; MYSQL_NATIVE_HASH_LEN]>,
 }
 
 /// SCRAM-SHA-256 stored credentials per RFC 5802 §5.
@@ -100,6 +112,67 @@ impl UserRecord {
     pub const fn scram(&self) -> Option<&ScramSecrets> {
         self.scram.as_ref()
     }
+
+    /// v7.17.0 Phase 3.P0-71: borrow the stored
+    /// `mysql_native_password` verifier (SHA1(SHA1(password)))
+    /// for the MySQL-wire shim.
+    pub const fn mysql_native(&self) -> Option<&[u8; MYSQL_NATIVE_HASH_LEN]> {
+        self.mysql_native.as_ref()
+    }
+
+    /// v7.17.0 Phase 3.P0-71 — verify a client
+    /// `mysql_native_password` auth response.
+    ///
+    /// Protocol: the client sends a 20-byte response
+    /// `client_proof = SHA1(password) XOR SHA1(scramble ||
+    /// SHA1(SHA1(password)))`. The server reconstructs
+    /// `SHA1(password) = client_proof XOR SHA1(scramble ||
+    /// stored_hash)` and verifies `SHA1(reconstructed) ==
+    /// stored_hash`. Returns false if the user has no stored
+    /// hash (loaded from a pre-v7.17 snapshot — the operator
+    /// has to reset the password to re-populate it).
+    pub fn verify_mysql_native_password(
+        &self,
+        scramble: &[u8],
+        client_response: &[u8],
+    ) -> bool {
+        let Some(stored) = self.mysql_native else {
+            return false;
+        };
+        if client_response.len() != MYSQL_NATIVE_HASH_LEN {
+            return false;
+        }
+        if scramble.len() != 20 {
+            return false;
+        }
+        let mut buf = [0u8; 40];
+        buf[..20].copy_from_slice(scramble);
+        buf[20..].copy_from_slice(&stored);
+        let mask = sha1_bytes(&buf);
+        let mut recovered = [0u8; MYSQL_NATIVE_HASH_LEN];
+        for i in 0..MYSQL_NATIVE_HASH_LEN {
+            recovered[i] = client_response[i] ^ mask[i];
+        }
+        let candidate = sha1_bytes(&recovered);
+        constant_time_eq_sha1(&candidate, &stored)
+    }
+}
+
+/// Compute the `mysql_native_password` stored hash =
+/// SHA1(SHA1(password)). Public so user-creation paths can
+/// populate the field at the same moment they have cleartext.
+#[must_use]
+pub fn compute_mysql_native_hash(password: &str) -> [u8; MYSQL_NATIVE_HASH_LEN] {
+    let inner = sha1_bytes(password.as_bytes());
+    sha1_bytes(&inner)
+}
+
+fn sha1_bytes(input: &[u8]) -> [u8; MYSQL_NATIVE_HASH_LEN] {
+    use sha1::Digest;
+    let digest = sha1::Sha1::digest(input);
+    let mut out = [0u8; MYSQL_NATIVE_HASH_LEN];
+    out.copy_from_slice(&digest);
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +222,16 @@ impl UserStore {
 
     /// Stable iteration in name order — used by SHOW USERS and the
     /// snapshot writer.
+    /// v7.17.0 Phase 3.P0-71: look up a user by name. Returns
+    /// `None` for unknown names; the caller decides whether to
+    /// surface "Access Denied" or "User not found" (the
+    /// MySQL-wire shim picks the former to avoid leaking user
+    /// existence to unauthenticated clients).
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&UserRecord> {
+        self.users.get(name)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&str, &UserRecord)> {
         self.users.iter().map(|(k, v)| (k.as_str(), v))
     }
@@ -170,6 +253,7 @@ impl UserStore {
             return Err(UserError::Exists);
         }
         let hash = derive_hash(&salt, password);
+        let mysql_native = Some(compute_mysql_native_hash(password));
         self.users.insert(
             name.to_string(),
             UserRecord {
@@ -177,6 +261,7 @@ impl UserStore {
                 salt,
                 hash,
                 scram: None,
+                mysql_native,
             },
         );
         Ok(())
@@ -260,6 +345,19 @@ fn constant_time_eq(a: &[u8; HASH_LEN], b: &[u8; HASH_LEN]) -> bool {
     diff == 0
 }
 
+/// v7.17.0 Phase 3.P0-71 — same idea, sized for the SHA-1 digest
+/// used by `mysql_native_password`.
+fn constant_time_eq_sha1(
+    a: &[u8; MYSQL_NATIVE_HASH_LEN],
+    b: &[u8; MYSQL_NATIVE_HASH_LEN],
+) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..MYSQL_NATIVE_HASH_LEN {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 // ---- snapshot encoding ----
 //
 // Layout (after a magic + version envelope handled at Engine level):
@@ -285,11 +383,19 @@ fn constant_time_eq(a: &[u8; HASH_LEN], b: &[u8; HASH_LEN]) -> bool {
 // switch is unambiguous.
 
 const SCRAM_FORMAT_MARKER: u8 = 0xff;
+/// v7.17.0 Phase 3.P0-71 — v3 format marker. v3 extends v2 by
+/// appending an optional `mysql_native_password` SHA1(SHA1(pwd))
+/// per user. Writer always emits v3; reader still understands
+/// v1 (no SCRAM) and v2 (no mysql_native).
+const MYSQL_NATIVE_FORMAT_MARKER: u8 = 0xfe;
 
 pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
-    let per_user_floor = 2 + 16 + 1 + SALT_LEN + HASH_LEN + 1;
+    let per_user_floor = 2 + 16 + 1 + SALT_LEN + HASH_LEN + 1 + 1;
     let mut out = Vec::with_capacity(1 + 4 + store.len() * per_user_floor);
-    out.push(SCRAM_FORMAT_MARKER);
+    // v7.17.0 Phase 3.P0-71 — bump on-disk format to v3 so the
+    // per-user `mysql_native_password` hash trails the SCRAM
+    // block.
+    out.push(MYSQL_NATIVE_FORMAT_MARKER);
     out.extend_from_slice(
         &u32::try_from(store.users.len())
             .expect("≤ 4G users")
@@ -314,6 +420,13 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
                 out.extend_from_slice(&s.salt);
                 out.extend_from_slice(&s.stored_key);
                 out.extend_from_slice(&s.server_key);
+            }
+        }
+        match &rec.mysql_native {
+            None => out.push(0),
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(h);
             }
         }
     }
@@ -348,16 +461,23 @@ fn take<'a>(p: &mut usize, n: usize, buf: &'a [u8]) -> Result<&'a [u8], UserDese
 
 pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserializeError> {
     let mut p = 0usize;
-    // v1 → starts with a u32 user_count (LO byte rarely 0xff in
-    // practice). v2 → starts with the 0xff marker, then u32 count.
-    // Probing the first byte before advancing keeps the v1 path
-    // intact for old snapshots.
-    let scram_present_inline = if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
-        p += 1;
-        true
-    } else {
-        false
-    };
+    // v1 → starts with a u32 user_count (LO byte rarely 0xff /
+    // 0xfe in practice).
+    // v2 → starts with 0xff marker (SCRAM_FORMAT_MARKER) then u32 count.
+    // v3 → starts with 0xfe marker (MYSQL_NATIVE_FORMAT_MARKER) then
+    //      u32 count; per-user payload adds a 1-byte flag + 20-byte
+    //      SHA1(SHA1(pwd)) tail for the `mysql_native_password`
+    //      verifier.
+    let (scram_present_inline, mysql_native_present_inline) =
+        if !buf.is_empty() && buf[0] == MYSQL_NATIVE_FORMAT_MARKER {
+            p += 1;
+            (true, true)
+        } else if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
+            p += 1;
+            (true, false)
+        } else {
+            (false, false)
+        };
     let count_bytes = take(&mut p, 4, buf)?;
     let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
     let mut store = UserStore::new();
@@ -402,6 +522,18 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         } else {
             None
         };
+        let mysql_native = if mysql_native_present_inline {
+            let flag = take(&mut p, 1, buf)?[0];
+            if flag == 1 {
+                let mut h = [0u8; MYSQL_NATIVE_HASH_LEN];
+                h.copy_from_slice(take(&mut p, MYSQL_NATIVE_HASH_LEN, buf)?);
+                Some(h)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         store.users.insert(
             name,
             UserRecord {
@@ -409,6 +541,7 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
                 salt,
                 hash,
                 scram,
+                mysql_native,
             },
         );
     }
@@ -476,12 +609,85 @@ mod tests {
 
     #[test]
     fn empty_store_round_trip() {
-        // v4.8: format prefix byte (0xff) + zero u32 count.
+        // v7.17.0 Phase 3.P0-71: writer flipped to v3 marker (0xfe).
+        // Empty store has no per-user payload to differentiate
+        // — just marker + u32 count of zero.
         let s = UserStore::new();
         let bytes = serialize_users(&s);
-        assert_eq!(bytes, [0xff, 0, 0, 0, 0]);
+        assert_eq!(bytes, [0xfe, 0, 0, 0, 0]);
         let s2 = deserialize_users(&bytes).unwrap();
         assert!(s2.is_empty());
+    }
+
+    #[test]
+    fn v2_blob_still_loads_with_mysql_native_none() {
+        // v7.17.0 Phase 3.P0-71: cross-version compat — readers
+        // must still parse v2-shaped blobs written before the v3
+        // bump and surface `mysql_native = None` for those
+        // users so the operator knows to reset the password.
+        let mut buf = Vec::new();
+        buf.push(0xff); // v2 marker
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&3u16.to_le_bytes());
+        buf.extend_from_slice(b"old");
+        buf.push(0); // role = admin
+        buf.extend_from_slice(&[1u8; SALT_LEN]);
+        buf.extend_from_slice(&[2u8; HASH_LEN]);
+        buf.push(0); // no SCRAM
+        let s = deserialize_users(&buf).unwrap();
+        let rec = s.get("old").expect("v2 user loads");
+        assert!(rec.mysql_native().is_none());
+    }
+}
+
+#[cfg(test)]
+mod p0_71_tests {
+    use super::*;
+
+    #[test]
+    fn create_populates_mysql_native_hash() {
+        let mut s = UserStore::new();
+        s.create("alice", "wonderland", Role::Admin, [9u8; SALT_LEN])
+            .unwrap();
+        let rec = s.get("alice").unwrap();
+        let expected = compute_mysql_native_hash("wonderland");
+        assert_eq!(rec.mysql_native(), Some(&expected));
+    }
+
+    #[test]
+    fn verify_mysql_native_password_accepts_correct_response() {
+        // Build a fake scramble + the canonical client response.
+        let mut s = UserStore::new();
+        s.create("bob", "secret", Role::Admin, [3u8; SALT_LEN]).unwrap();
+        let rec = s.get("bob").unwrap();
+        let scramble: [u8; 20] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
+        // Compute the same response the client would.
+        let sha1_pwd = sha1_bytes(b"secret");
+        let sha1_sha1_pwd = sha1_bytes(&sha1_pwd);
+        let mut concat = [0u8; 40];
+        concat[..20].copy_from_slice(&scramble);
+        concat[20..].copy_from_slice(&sha1_sha1_pwd);
+        let mask = sha1_bytes(&concat);
+        let response: [u8; MYSQL_NATIVE_HASH_LEN] =
+            core::array::from_fn(|i| sha1_pwd[i] ^ mask[i]);
+        assert!(rec.verify_mysql_native_password(&scramble, &response));
+        // Tamper with one byte → rejected.
+        let mut bad = response;
+        bad[0] ^= 1;
+        assert!(!rec.verify_mysql_native_password(&scramble, &bad));
+    }
+
+    #[test]
+    fn v3_serialise_round_trips_mysql_native_hash() {
+        let mut s = UserStore::new();
+        s.create("alice", "wonderland", Role::Admin, [4u8; SALT_LEN])
+            .unwrap();
+        let bytes = serialize_users(&s);
+        assert_eq!(bytes[0], 0xfe, "v3 marker advertised");
+        let s2 = deserialize_users(&bytes).unwrap();
+        let r1 = s.get("alice").unwrap();
+        let r2 = s2.get("alice").unwrap();
+        assert_eq!(r1.mysql_native(), r2.mysql_native());
     }
 
     #[test]

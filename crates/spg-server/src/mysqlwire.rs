@@ -134,7 +134,7 @@ pub fn spawn_listener(
     Ok(local)
 }
 
-fn handle_conn(mut stream: TcpStream, _state: &Arc<ServerState>) -> std::io::Result<()> {
+fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
 
     // ---- HandshakeV10 (server → client) ----------------------
@@ -196,23 +196,122 @@ fn handle_conn(mut stream: TcpStream, _state: &Arc<ServerState>) -> std::io::Res
         }
     };
 
-    // P0-70 stops here. The follow-on P0-71 / P0-72 verify the
-    // auth response and send OK / AuthSwitchRequest. For now we
-    // ack the connection with an Error packet that names the
-    // missing surface — every modern mysql client surfaces this
-    // as "auth plugin not supported" rather than hanging.
-    let _ = parsed; // silence "unused" until P0-71 reads it
-    let _ = &mut greeting; // silence "unused" until P0-71 reuses
-    write_packet(
-        &mut stream,
-        seqno_in.wrapping_add(1),
-        &encode_err_packet(
-            1251,
-            "08004",
-            "Authentication is not yet wired in v7.17 — P0-71 lands mysql_native_password",
-        ),
-    )?;
+    // v7.17.0 Phase 3.P0-71 — verify the mysql_native_password
+    // response against the user table. Open mode (engine has no
+    // users) accepts any client and sends OK; users-present
+    // mode verifies SHA1(SHA1(pwd)) per the protocol. A user
+    // loaded from a pre-v7.17 snapshot has no stored hash —
+    // verify_mysql_native_password returns false and we reply
+    // with Access Denied (the operator has to reset the
+    // password to re-populate the field).
+    //
+    // Greeting state is kept by reference (for the scramble we
+    // sent at the top of the handshake); the next handshake
+    // step (AuthSwitchRequest for caching_sha2 etc.) lands in
+    // P0-72 and will need to re-read this value.
+    let scramble = std::mem::take(&mut greeting.scramble);
+    let auth_outcome = verify_native_password(state, &parsed, &scramble);
+    let reply_seqno = seqno_in.wrapping_add(1);
+    match auth_outcome {
+        AuthOutcome::Ok => {
+            write_packet(&mut stream, reply_seqno, &encode_ok_packet())?;
+        }
+        AuthOutcome::AccessDenied(msg) => {
+            write_packet(
+                &mut stream,
+                reply_seqno,
+                &encode_err_packet(1045, "28000", &msg),
+            )?;
+        }
+        AuthOutcome::PluginMismatch(plugin) => {
+            // The client asked for a plugin we don't yet
+            // implement (e.g. caching_sha2_password). P0-72
+            // handles the AuthSwitchRequest follow-up; until
+            // then surface an explicit error message.
+            write_packet(
+                &mut stream,
+                reply_seqno,
+                &encode_err_packet(
+                    1251,
+                    "08004",
+                    &format!(
+                        "auth plugin {plugin:?} not yet supported — P0-72 lands caching_sha2_password",
+                    ),
+                ),
+            )?;
+        }
+    }
     Ok(())
+}
+
+/// Outcome of verifying a HandshakeResponse41 against the engine's
+/// user store.
+#[derive(Debug)]
+enum AuthOutcome {
+    Ok,
+    AccessDenied(String),
+    PluginMismatch(String),
+}
+
+fn verify_native_password(
+    state: &Arc<ServerState>,
+    response: &HandshakeResponse41,
+    scramble: &[u8],
+) -> AuthOutcome {
+    // Only mysql_native_password lands here. caching_sha2 needs
+    // its own AuthSwitchRequest handshake step which P0-72
+    // implements.
+    if let Some(plugin) = &response.auth_plugin_name
+        && plugin != AUTH_PLUGIN_NATIVE
+    {
+        return AuthOutcome::PluginMismatch(plugin.clone());
+    }
+    let engine = match state.engine.read() {
+        Ok(e) => e,
+        Err(_) => {
+            return AuthOutcome::AccessDenied(
+                "engine lock poisoned; refusing connection".to_string(),
+            );
+        }
+    };
+    // Open mode — no users registered → accept anyone. Mirrors
+    // the pgwire shim's behaviour.
+    if engine.users().is_empty() {
+        return AuthOutcome::Ok;
+    }
+    let user = &response.username;
+    let Some(record) = engine.users().get(user) else {
+        return AuthOutcome::AccessDenied(format!(
+            "Access denied for user '{user}'"
+        ));
+    };
+    // Empty client response = "no password supplied". Match
+    // MySQL: only the user with empty stored hash can pass.
+    if response.auth_response.is_empty() {
+        return AuthOutcome::AccessDenied(format!(
+            "Access denied for user '{user}' (empty password)"
+        ));
+    }
+    if record.verify_mysql_native_password(scramble, &response.auth_response) {
+        AuthOutcome::Ok
+    } else {
+        AuthOutcome::AccessDenied(format!(
+            "Access denied for user '{user}' (using mysql_native_password)"
+        ))
+    }
+}
+
+/// Minimal OK packet — protocol-41 shape.
+///   0x00 header + lenenc affected_rows(=0) + lenenc last_insert_id(=0)
+///   + 2-byte status_flags(AUTOCOMMIT) + 2-byte warnings(=0)
+pub(crate) fn encode_ok_packet() -> Vec<u8> {
+    let mut out = Vec::with_capacity(7);
+    out.push(0x00);
+    out.push(0); // affected_rows = 0
+    out.push(0); // last_insert_id = 0
+    out.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // warnings
+    out
 }
 
 // ---- HandshakeV10 packet encode -----------------------------
