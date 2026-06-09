@@ -7806,6 +7806,27 @@ fn try_gin_seek<'a>(
         }
         return try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx);
     }
+    // v7.17.0 Phase 3.P0-44 — MySQL `MATCH(col1, col2) AGAINST (...)`
+    // desugars into `(to_tsvector(col1) @@ q) OR (to_tsvector(col2) @@ q)`
+    // in the parser. To accelerate the multi-column case, walk OR the same
+    // way we walk AND: only emit a candidate set if BOTH sides can seek
+    // (otherwise the OR result is unbounded and we must fall through to
+    // the full scan). Candidates are union'd; the caller's WHERE re-eval
+    // verifies the full predicate per row, so duplicates / supersets stay
+    // semantically safe.
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::Or,
+        rhs,
+    } = where_expr
+    {
+        let left = try_gin_seek(lhs, schema_cols, catalog, table, table_alias, ctx)?;
+        let right = try_gin_seek(rhs, schema_cols, catalog, table, table_alias, ctx)?;
+        let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(left.len() + right.len());
+        out.extend(left);
+        out.extend(right);
+        return Some(out);
+    }
     let Expr::Binary {
         lhs,
         op: BinOp::TsMatch,
@@ -7820,10 +7841,16 @@ fn try_gin_seek<'a>(
     // tables resolve `q` to a Column too.
     let (col_pos, query) = resolve_gin_col_query(lhs, rhs, schema_cols, table_alias, ctx)
         .or_else(|| resolve_gin_col_query(rhs, lhs, schema_cols, table_alias, ctx))?;
+    // v7.17.0 Phase 3.P0-44 — MySQL `FULLTEXT KEY` builds a
+    // `IndexKind::GinFulltext` posting list (Phase 2.2). It shares
+    // the same `gin_lookup_word` shape as the tsvector-typed GIN,
+    // so the MATCH-AGAINST `@@` predicate (desugared by the parser
+    // into `to_tsvector(col) @@ plainto_tsquery('term')`) routes
+    // through the same candidate-set seek.
     let idx = table
         .indices()
         .iter()
-        .find(|i| i.column_position == col_pos && i.is_gin())?;
+        .find(|i| i.column_position == col_pos && (i.is_gin() || i.is_gin_fulltext()))?;
     let candidates = gin_query_candidates(idx, &query)?;
     let _ = catalog; // cold-tier row resolution unused in MVP; see below.
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(candidates.len());
@@ -7970,9 +7997,27 @@ fn resolve_gin_col_query(
     table_alias: &str,
     ctx: &eval::EvalContext<'_>,
 ) -> Option<(usize, spg_storage::TsQueryAst)> {
-    let Expr::Column(c) = col_side else {
-        return None;
+    // v7.17.0 Phase 3.P0-44 — the MATCH AGAINST desugar wraps the
+    // column in `to_tsvector('simple', col)`, so we peel that wrapper
+    // before the column lookup. Direct `col @@ tsquery` paths (the
+    // tsvector-typed v7.12 surface) skip the wrapper entirely.
+    let column = match col_side {
+        Expr::Column(c) => c,
+        Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("to_tsvector") && !args.is_empty() =>
+        {
+            // PG `to_tsvector` accepts either `to_tsvector(col)` or
+            // `to_tsvector(config, col)`. In both shapes the column
+            // we care about is the final argument.
+            if let Expr::Column(c) = args.last().unwrap() {
+                c
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
     };
+    let c = column;
     if let Some(q) = &c.qualifier
         && q != table_alias
     {
