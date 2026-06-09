@@ -625,7 +625,22 @@ fn execute_with_role(
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let is_read = matches!(lower_first.as_str(), "select" | "show");
+    let mut is_read = matches!(lower_first.as_str(), "select" | "show");
+    // v7.17 dump-compat — `SELECT setval(...)` /
+    // `SELECT nextval(...)` mutate sequence state. The
+    // readonly path takes `&self` so its pre-resolve hook
+    // can't fire — drop the read fast-path when those calls
+    // are present so the write path runs them in
+    // pre_resolve_sequence_calls_in_statement.
+    if is_read {
+        let lower_sql = sql.to_ascii_lowercase();
+        if lower_sql.contains("setval(")
+            || lower_sql.contains("nextval(")
+            || lower_sql.contains("currval(")
+        {
+            is_read = false;
+        }
+    }
     if !is_read && !role.can_write() {
         return Err(EngineError::Unsupported(
             "permission denied: write requires admin or readwrite role".into(),

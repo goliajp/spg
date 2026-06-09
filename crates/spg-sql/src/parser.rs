@@ -2014,7 +2014,7 @@ impl Parser {
                         opts.owned_by = Some(SequenceOwnedBy::None);
                     } else if matches!(self.peek(), Token::Dot) {
                         self.advance();
-                        let col = match self.advance() {
+                        let second = match self.advance() {
                             Token::Ident(s) | Token::QuotedIdent(s) => s,
                             other => {
                                 return Err(self.err(alloc::format!(
@@ -2022,10 +2022,35 @@ impl Parser {
                                 )));
                             }
                         };
-                        opts.owned_by = Some(SequenceOwnedBy::Column {
-                            table: first,
-                            column: col,
-                        });
+                        // v7.17 dump-compat fix — pg_dump emits
+                        // OWNED BY clauses as
+                        // `schema.table.column` (three segments).
+                        // If a third `.<ident>` follows, treat the
+                        // first ident as schema (drop it; SPG is
+                        // single-schema) and the middle / last
+                        // pair as table.column. Otherwise it's
+                        // the two-segment form table.column.
+                        if matches!(self.peek(), Token::Dot) {
+                            self.advance();
+                            let third = match self.advance() {
+                                Token::Ident(s) | Token::QuotedIdent(s) => s,
+                                other => {
+                                    return Err(self.err(alloc::format!(
+                                        "expected column name after OWNED BY {first}.{second}., got {other:?}"
+                                    )));
+                                }
+                            };
+                            let _ = first; // schema prefix discarded
+                            opts.owned_by = Some(SequenceOwnedBy::Column {
+                                table: second,
+                                column: third,
+                            });
+                        } else {
+                            opts.owned_by = Some(SequenceOwnedBy::Column {
+                                table: first,
+                                column: second,
+                            });
+                        }
                     } else {
                         return Err(self.err(alloc::format!(
                             "expected table.column or NONE after OWNED BY, got {first:?}"

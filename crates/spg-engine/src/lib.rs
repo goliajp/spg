@@ -1807,9 +1807,15 @@ impl Engine {
         // walker entirely. Single map-emptiness check on the
         // catalog beats walking every expression on every call.
         let mut stmt = stmt;
-        if !self.active_catalog().sequences().is_empty() {
-            self.pre_resolve_sequence_calls_in_statement(&mut stmt)?;
-        }
+        // v7.17 dump-compat — the fast-path check
+        // `sequences().is_empty()` skips pre-resolve when no
+        // sequence exists in the *currently active* catalog
+        // snapshot. The committed catalog or the implicit-TX
+        // catalog may legitimately disagree on this between
+        // CREATE SEQUENCE and a later setval(): always run the
+        // resolver — the walk is O(expr-count) and dwarfed by
+        // the parse cost we just paid.
+        self.pre_resolve_sequence_calls_in_statement(&mut stmt)?;
         let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             // v7.9.15 — CREATE EXTENSION is a no-op on SPG. Returns
@@ -3274,7 +3280,35 @@ impl Engine {
             )));
         }
         let seq_name = match &args[0] {
-            Expr::Literal(spg_sql::ast::Literal::String(s)) => s.clone(),
+            Expr::Literal(spg_sql::ast::Literal::String(s)) => {
+                // v7.17 dump-compat — pg_dump emits sequence
+                // names schema-qualified (`'public.posts_id_seq'`).
+                // SPG is single-schema; strip a leading
+                // `public.` / `pg_catalog.` so the catalog lookup
+                // matches the bare-name CREATE SEQUENCE used.
+                let trimmed = s
+                    .strip_prefix("public.")
+                    .or_else(|| s.strip_prefix("pg_catalog."))
+                    .unwrap_or(s);
+                trimmed.to_string()
+            }
+            // v7.17 dump-compat — pg_dump also emits
+            // `nextval('public.posts_id_seq'::regclass)`
+            // where the cast wraps the literal. Peel the cast
+            // and continue.
+            Expr::Cast { expr, .. } => {
+                if let Expr::Literal(spg_sql::ast::Literal::String(s)) = expr.as_ref() {
+                    let trimmed = s
+                        .strip_prefix("public.")
+                        .or_else(|| s.strip_prefix("pg_catalog."))
+                        .unwrap_or(s);
+                    trimmed.to_string()
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "{op}() first argument must be a literal sequence name"
+                    )));
+                }
+            }
             other => {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "{op}() first argument must be a literal sequence name, got {other:?}"
