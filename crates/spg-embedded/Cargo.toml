@@ -26,6 +26,8 @@ spg-manifest = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# v7.18 PITR integration tests need scratch directories.
+tempfile  = "3"
 
 [[bench]]
 name    = "embedded"

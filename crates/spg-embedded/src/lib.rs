@@ -131,7 +131,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -157,6 +157,22 @@ use spg_manifest::{CatalogManifest, ColdSegmentEntry, manifest_path as spg_manif
 const WAL_V2_SENTINEL: u32 = 0x8000_0000;
 const WAL_V3_FLAG: u32 = 0x4000_0000;
 const WAL_V3_TYPE_AUTO_COMMIT_SQL: u8 = 0x01;
+/// v7.18 — durability checkpoint marker stays at 0x02 (skipped on replay).
+const WAL_V3_TYPE_DURABILITY_CHECKPOINT: u8 = 0x02;
+/// v7.18 PITR — auto-commit-sql record with appended (commit_lsn,
+/// commit_unix_us) fields so replay can target a specific point in
+/// time. Backward-compat: v3 records (type 0x01) keep working, the
+/// envelope flag bits are unchanged. The new type byte is the
+/// schema-version discriminator.
+const WAL_V4_TYPE_AUTO_COMMIT_SQL: u8 = 0x10;
+/// v7.18 — sentinel for "no wall clock" inside a v4 record's
+/// commit_unix_us slot. Restore-to-timestamp skips records with
+/// this sentinel (no time anchor); LSN-based restore is
+/// unaffected.
+const WAL_V4_NO_CLOCK: i64 = i64::MIN;
+/// v7.18 — extra header bytes after the type byte in a v4 record:
+/// 8 bytes commit_lsn (u64 LE) + 8 bytes commit_unix_us (i64 LE).
+const WAL_V4_EXTRA_HEADER: usize = 16;
 
 /// v7.1 — auto-checkpoint threshold. Once the WAL grows past
 /// this many bytes, the next successful `execute()` call ends
@@ -189,6 +205,41 @@ fn encode_v3_auto_commit(sql: &str) -> Vec<u8> {
     out.extend_from_slice(&header);
     out.extend_from_slice(&crc.to_le_bytes());
     out.push(WAL_V3_TYPE_AUTO_COMMIT_SQL);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// v7.18 PITR — encode one v4 `auto_commit_sql` record. Layout:
+///
+/// ```text
+/// [u32 LE (sql_len | WAL_V2_SENTINEL | WAL_V3_FLAG)]
+/// [u32 LE crc32 over (type_byte || lsn || ts || sql_bytes)]
+/// [u8  type = 0x10]
+/// [u64 LE commit_lsn]
+/// [i64 LE commit_unix_us  (= WAL_V4_NO_CLOCK when no ClockFn)]
+/// [sql bytes]
+/// ```
+///
+/// `sql_len` field stays the SQL byte count — same shape as v3 — so
+/// replay-buffer torn-write detection compares against
+/// `WAL_V4_EXTRA_HEADER + sql_len`. v3 records (type 0x01) stay
+/// readable by the same loop with their original 9-byte header
+/// arithmetic.
+fn encode_v4_auto_commit(sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    let payload = sql.as_bytes();
+    let mut crc_buf = Vec::with_capacity(1 + WAL_V4_EXTRA_HEADER + payload.len());
+    crc_buf.push(WAL_V4_TYPE_AUTO_COMMIT_SQL);
+    crc_buf.extend_from_slice(&commit_lsn.to_le_bytes());
+    crc_buf.extend_from_slice(&commit_unix_us.to_le_bytes());
+    crc_buf.extend_from_slice(payload);
+    let crc = spg_crypto::crc32::crc32(&crc_buf);
+    let header = ((payload.len() as u32) | WAL_V2_SENTINEL | WAL_V3_FLAG).to_le_bytes();
+    let mut out = Vec::with_capacity(4 + 4 + 1 + WAL_V4_EXTRA_HEADER + payload.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.push(WAL_V4_TYPE_AUTO_COMMIT_SQL);
+    out.extend_from_slice(&commit_lsn.to_le_bytes());
+    out.extend_from_slice(&commit_unix_us.to_le_bytes());
     out.extend_from_slice(payload);
     out
 }
@@ -229,9 +280,35 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
             let type_byte = wal_bytes[cur + 8];
             match type_byte {
                 WAL_V3_TYPE_AUTO_COMMIT_SQL => {}
-                0x02 => {
+                WAL_V3_TYPE_DURABILITY_CHECKPOINT => {
                     // durability_checkpoint marker — skip, no SQL.
                     cur += header_len + rec_len;
+                    continue;
+                }
+                WAL_V4_TYPE_AUTO_COMMIT_SQL => {
+                    // v7.18 PITR — v4 record carries 16 bytes of
+                    // (commit_lsn, commit_unix_us) between the type
+                    // byte and the SQL payload. Replay reads them but
+                    // does not enforce them — the engine doesn't
+                    // surface LSN/clock here. Restore tooling
+                    // (spgctl) parses them via parse_wal_record below.
+                    let v4_total = header_len + WAL_V4_EXTRA_HEADER + rec_len;
+                    if wal_bytes.len() - cur < v4_total {
+                        // Torn v4 record at the tail — drop, stop.
+                        break;
+                    }
+                    let sql_start = cur + header_len + WAL_V4_EXTRA_HEADER;
+                    let sql_bytes = &wal_bytes[sql_start..sql_start + rec_len];
+                    let sql = std::str::from_utf8(sql_bytes).map_err(|e| {
+                        format!("WAL replay: non-UTF-8 SQL at offset {cur}: {e}")
+                    })?;
+                    engine.execute(sql).map_err(|e| {
+                        format!(
+                            "WAL replay: apply {sql:?} at offset {cur} rejected: {e:?}"
+                        )
+                    })?;
+                    applied += 1;
+                    cur += v4_total;
                     continue;
                 }
                 other => {
@@ -251,6 +328,136 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
         cur += header_len + rec_len;
     }
     Ok(applied)
+}
+
+/// v7.18 PITR — parsed WAL record, surfaced for restore / verify
+/// tooling. The replay loop above doesn't expose LSN/timestamp;
+/// `spgctl restore --to <timestamp>` and `spgctl verify` need them.
+/// Returned offsets are byte-positions inside the WAL buffer.
+#[derive(Debug, Clone)]
+pub struct WalRecord<'a> {
+    /// Byte offset in the WAL buffer where this record starts.
+    pub offset: usize,
+    /// Type byte (0x01 = v3 auto-commit, 0x10 = v4 auto-commit,
+    /// 0x02 = durability checkpoint marker).
+    pub type_byte: u8,
+    /// `Some(lsn)` for v4 records, `None` for v3.
+    pub commit_lsn: Option<u64>,
+    /// `Some(unix_us)` for v4 records carrying a clock-set timestamp,
+    /// `None` for v3 or for v4 records explicitly written with
+    /// `WAL_V4_NO_CLOCK` (sentinel for "no ClockFn at commit time").
+    pub commit_unix_us: Option<i64>,
+    /// SQL payload as borrowed bytes. Empty for durability markers.
+    pub sql: &'a [u8],
+}
+
+/// v7.18 PITR — iterate over `wal_bytes` yielding one `WalRecord`
+/// per intact record. Torn-tail records terminate iteration
+/// silently (same recovery story as `replay_wal_into_engine`).
+/// Unknown type bytes inside a v3 envelope return `Err` so the
+/// caller knows the WAL was written by a newer SPG.
+pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String> {
+    let mut out = Vec::new();
+    let mut cur = 0usize;
+    while cur < wal_bytes.len() {
+        if wal_bytes.len() - cur < 4 {
+            break;
+        }
+        let raw_len = u32::from_le_bytes(wal_bytes[cur..cur + 4].try_into().unwrap());
+        let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
+        let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+        let len_mask = if is_v3 {
+            !(WAL_V2_SENTINEL | WAL_V3_FLAG)
+        } else {
+            !WAL_V2_SENTINEL
+        };
+        let rec_len = (raw_len & len_mask) as usize;
+        let header_len = if is_v3 {
+            9
+        } else if is_v2 {
+            8
+        } else {
+            4
+        };
+        if wal_bytes.len() - cur < header_len + rec_len {
+            break;
+        }
+        if !is_v3 {
+            // v1 / v2 records carry no type byte; treat as legacy
+            // auto-commit SQL with no LSN/time.
+            let sql = &wal_bytes[cur + header_len..cur + header_len + rec_len];
+            out.push(WalRecord {
+                offset: cur,
+                type_byte: WAL_V3_TYPE_AUTO_COMMIT_SQL,
+                commit_lsn: None,
+                commit_unix_us: None,
+                sql,
+            });
+            cur += header_len + rec_len;
+            continue;
+        }
+        let type_byte = wal_bytes[cur + 8];
+        match type_byte {
+            WAL_V3_TYPE_AUTO_COMMIT_SQL => {
+                let sql = &wal_bytes[cur + header_len..cur + header_len + rec_len];
+                out.push(WalRecord {
+                    offset: cur,
+                    type_byte,
+                    commit_lsn: None,
+                    commit_unix_us: None,
+                    sql,
+                });
+                cur += header_len + rec_len;
+            }
+            WAL_V3_TYPE_DURABILITY_CHECKPOINT => {
+                out.push(WalRecord {
+                    offset: cur,
+                    type_byte,
+                    commit_lsn: None,
+                    commit_unix_us: None,
+                    sql: &[],
+                });
+                cur += header_len + rec_len;
+            }
+            WAL_V4_TYPE_AUTO_COMMIT_SQL => {
+                let v4_total = header_len + WAL_V4_EXTRA_HEADER + rec_len;
+                if wal_bytes.len() - cur < v4_total {
+                    break;
+                }
+                let lsn = u64::from_le_bytes(
+                    wal_bytes[cur + header_len..cur + header_len + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let ts_raw = i64::from_le_bytes(
+                    wal_bytes[cur + header_len + 8..cur + header_len + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let commit_unix_us = if ts_raw == WAL_V4_NO_CLOCK {
+                    None
+                } else {
+                    Some(ts_raw)
+                };
+                let sql_start = cur + header_len + WAL_V4_EXTRA_HEADER;
+                let sql = &wal_bytes[sql_start..sql_start + rec_len];
+                out.push(WalRecord {
+                    offset: cur,
+                    type_byte,
+                    commit_lsn: Some(lsn),
+                    commit_unix_us,
+                    sql,
+                });
+                cur += v4_total;
+            }
+            other => {
+                return Err(format!(
+                    "WAL parse: unknown type byte {other:#04x} at offset {cur}"
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// v7.1 — predicate for "should the next `execute()` mutate the
@@ -288,13 +495,19 @@ fn sql_is_read_only(sql: &str) -> bool {
 pub struct Database {
     engine: Engine,
     /// v7.1 — persistence sidecar. When `Some(p)`, every
-    /// `execute(sql)` that mutates state appends a v3
+    /// `execute(sql)` that mutates state appends a v4
     /// `auto_commit_sql` WAL record + fsyncs before the call
     /// returns; `Drop` writes a final catalog snapshot to
     /// `<db_path>` so the next session boots from a clean
     /// snapshot + an empty WAL. `None` = in-memory only (the
     /// v6.10.3 shape).
     persistence: Option<PersistenceCtx>,
+    /// v7.18 PITR — monotonic per-database commit LSN. Increments
+    /// before each successful WAL append; bootstrapped at
+    /// open_path from `max(parse_wal_records → commit_lsn)` so
+    /// reopen never reuses an LSN. In-memory databases start at
+    /// 0 and never advance (no WAL = no LSN-meaningful records).
+    commit_lsn: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -339,6 +552,7 @@ impl Database {
         Self {
             engine: Engine::new().with_clock(wall_clock_micros),
             persistence: None,
+            commit_lsn: AtomicU64::new(0),
         }
     }
 
@@ -479,11 +693,22 @@ impl Database {
                 }
             }
         }
+        let mut initial_lsn: u64 = 0;
         if wal_path.exists() {
             let wal_bytes = std::fs::read(&wal_path).map_err(io_err)?;
             if !wal_bytes.is_empty() {
                 replay_wal_into_engine(&wal_bytes, &mut engine)
                     .map_err(|m| EngineError::Storage(spg_storage::StorageError::Corrupt(m)))?;
+                // v7.18 PITR — recover the commit-LSN watermark so
+                // the new session does not re-issue an LSN that
+                // already lives in the WAL. parse_wal_records yields
+                // None for v3 records (they predate the LSN field);
+                // an empty / v3-only WAL leaves the counter at 0.
+                if let Ok(records) = parse_wal_records(&wal_bytes) {
+                    if let Some(max) = records.iter().filter_map(|r| r.commit_lsn).max() {
+                        initial_lsn = max;
+                    }
+                }
             }
         }
         let wal = OpenOptions::new()
@@ -495,6 +720,7 @@ impl Database {
         let wal_len = wal.metadata().map_err(io_err)?.len();
         Ok(Self {
             engine,
+            commit_lsn: AtomicU64::new(initial_lsn),
             persistence: Some(PersistenceCtx {
                 db_path,
                 wal_path,
@@ -641,6 +867,7 @@ impl Database {
         Ok(Self {
             engine,
             persistence: None,
+            commit_lsn: AtomicU64::new(0),
         })
     }
 
@@ -676,15 +903,17 @@ impl Database {
                 }
             )
         {
-            // Append + sync the v3 record AFTER the in-memory
-            // exec succeeds, so a WAL record never describes a
-            // mutation that didn't actually apply. The crash
-            // window between in-memory commit and WAL fsync is
-            // bounded by one record — replay re-applies the
-            // statement idempotently on next boot if we crashed
-            // between (and SPG's DDL/DML are crash-idempotent at
-            // the granularities the wire protocol exposes).
-            let record = encode_v3_auto_commit(sql);
+            // v7.18 PITR — write v4 records that carry the commit
+            // LSN + wall-clock micros so restore tooling can
+            // target a point in time. Replay path still accepts
+            // v3 records emitted by older spg-embedded versions.
+            // Crash window is bounded by one record exactly as
+            // under v3: WAL fsync happens after the in-memory
+            // mutation, so the WAL never describes a write that
+            // didn't apply.
+            let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+            let ts = wall_clock_micros();
+            let record = encode_v4_auto_commit(sql, lsn, ts);
             let p = self.persistence.as_mut().expect("checked above");
             p.wal.write_all(&record).map_err(io_err)?;
             p.wal.sync_data().map_err(io_err)?;
@@ -886,7 +1115,12 @@ impl Database {
             // re-run the substitution only for Display.
             crate::wal_render_with_params(&mut wal_stmt, params);
             let canonical = format!("{wal_stmt}");
-            let record = encode_v3_auto_commit(&canonical);
+            // v7.18 PITR — prepared path also emits v4 records so
+            // LSN/timestamp coverage is uniform across simple and
+            // extended query.
+            let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+            let ts = wall_clock_micros();
+            let record = encode_v4_auto_commit(&canonical, lsn, ts);
             let p = self.persistence.as_mut().expect("checked above");
             p.wal.write_all(&record).map_err(io_err)?;
             p.wal.sync_data().map_err(io_err)?;
@@ -1386,22 +1620,38 @@ fn decode_wal_record(tail: &[u8]) -> Result<(Vec<u8>, usize), EngineError> {
             ),
         )));
     }
-    let payload = &tail[header_len..header_len + rec_len];
-    let sql_bytes = if is_v3 {
+    if is_v3 {
         let type_byte = tail[8];
         // v3 type 0x01 = auto_commit_sql (payload = SQL).
-        // v3 type 0x02 = durability marker (payload = u64
-        // offset, no SQL to apply). Anything else is unknown.
+        // v3 type 0x02 = durability marker (no SQL to apply).
+        // v4 type 0x10 = auto_commit_sql with 16-byte (lsn, ts)
+        //                prefix between type and SQL — strip
+        //                the prefix so the caller still sees raw
+        //                SQL bytes.
+        // Anything else is unknown.
         if type_byte == WAL_V3_TYPE_AUTO_COMMIT_SQL {
-            payload.to_vec()
-        } else {
-            // Caller treats empty payload as a skip-marker.
-            Vec::new()
+            let payload = &tail[header_len..header_len + rec_len];
+            return Ok((payload.to_vec(), header_len + rec_len));
         }
-    } else {
-        payload.to_vec()
-    };
-    Ok((sql_bytes, header_len + rec_len))
+        if type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL {
+            let v4_total = header_len + WAL_V4_EXTRA_HEADER + rec_len;
+            if tail.len() < v4_total {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    format!(
+                        "WAL truncated v4 record: header+payload {v4_total} > available {}",
+                        tail.len()
+                    ),
+                )));
+            }
+            let sql_start = header_len + WAL_V4_EXTRA_HEADER;
+            let sql_bytes = tail[sql_start..sql_start + rec_len].to_vec();
+            return Ok((sql_bytes, v4_total));
+        }
+        // Caller treats empty payload as a skip-marker.
+        return Ok((Vec::new(), header_len + rec_len));
+    }
+    let payload = &tail[header_len..header_len + rec_len];
+    Ok((payload.to_vec(), header_len + rec_len))
 }
 
 impl Drop for Database {
