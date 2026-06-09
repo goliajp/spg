@@ -9148,11 +9148,18 @@ impl Engine {
                     let (schema, rows) = synth_pg_attribute(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.17.0 Phase 3.P0-50 — pg_catalog.pg_type for
+                // sqlx / SQLAlchemy / Diesel / pgAdmin lookups.
+                "__spg_pg_type" => {
+                    let (schema, rows) = synth_pg_type(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "meta view {view:?} is not yet materialisable; \
                          v7.16.2 covers information_schema.columns / .tables \
-                         and pg_catalog.pg_class / pg_attribute"
+                         and pg_catalog.pg_class / pg_attribute; \
+                         v7.17.0 P0-50 adds pg_catalog.pg_type"
                     )));
                 }
             }
@@ -10035,6 +10042,139 @@ fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
                 Value::Bool(!col.nullable),
             ]));
         }
+    }
+    (schema, rows)
+}
+
+/// v7.17.0 Phase 3.P0-50 — synthesise `pg_catalog.pg_type`. The
+/// returned rows cover every built-in scalar / array type sqlx,
+/// SQLAlchemy, Diesel and pgAdmin look up at compile / connect
+/// time. PG-canonical schema columns we expose:
+///   * oid           — type OID (the lookup key sqlx uses)
+///   * typname       — canonical type name (`int4`, `text`, …)
+///   * typlen        — width in bytes (-1 for var-length)
+///   * typtype       — `b`ase / `c`omposite / `e`num / etc.
+///   * typcategory   — PG type category single-char
+///   * typelem       — element OID for arrays (0 otherwise)
+///   * typarray      — array-type OID (0 if no array type)
+///   * typnamespace  — schema OID (always `public` = 2200)
+///
+/// Other pg_type columns (typowner, typinput/typoutput, etc.)
+/// land in follow-up work — sqlx encoders don't query them at
+/// connect time.
+fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("typname", DataType::Text, false),
+        ColumnSchema::new("typlen", DataType::SmallInt, false),
+        ColumnSchema::new("typtype", DataType::Text, false),
+        ColumnSchema::new("typcategory", DataType::Text, false),
+        ColumnSchema::new("typelem", DataType::BigInt, false),
+        ColumnSchema::new("typarray", DataType::BigInt, false),
+        ColumnSchema::new("typnamespace", DataType::BigInt, false),
+    ];
+    // (oid, name, len, type, cat, elem, array_oid). PG OID
+    // numbers come straight from `pg_type.dat`.
+    let scalars: &[(i64, &str, i16, &str, &str, i64, i64)] = &[
+        // bool
+        (16, "bool", 1, "b", "B", 0, 1000),
+        (17, "bytea", -1, "b", "U", 0, 1001),
+        (18, "char", 1, "b", "S", 0, 1002),
+        (19, "name", 64, "b", "S", 0, 1003),
+        (20, "int8", 8, "b", "N", 0, 1016),
+        (21, "int2", 2, "b", "N", 0, 1005),
+        (23, "int4", 4, "b", "N", 0, 1007),
+        (24, "regproc", 4, "b", "N", 0, 1008),
+        (25, "text", -1, "b", "S", 0, 1009),
+        (26, "oid", 4, "b", "N", 0, 1028),
+        (114, "json", -1, "b", "U", 0, 199),
+        (142, "xml", -1, "b", "U", 0, 143),
+        (700, "float4", 4, "b", "N", 0, 1021),
+        (701, "float8", 8, "b", "N", 0, 1022),
+        (650, "cidr", -1, "b", "I", 0, 651),
+        (869, "inet", -1, "b", "I", 0, 1041),
+        (829, "macaddr", 6, "b", "U", 0, 1040),
+        (1042, "bpchar", -1, "b", "S", 0, 1014),
+        (1043, "varchar", -1, "b", "S", 0, 1015),
+        (1082, "date", 4, "b", "D", 0, 1182),
+        (1083, "time", 8, "b", "D", 0, 1183),
+        (1114, "timestamp", 8, "b", "D", 0, 1115),
+        (1184, "timestamptz", 8, "b", "D", 0, 1185),
+        (1186, "interval", 16, "b", "T", 0, 1187),
+        (1266, "timetz", 12, "b", "D", 0, 1270),
+        (1700, "numeric", -1, "b", "N", 0, 1231),
+        (790, "money", 8, "b", "N", 0, 791),
+        (2950, "uuid", 16, "b", "U", 0, 2951),
+        (3802, "jsonb", -1, "b", "U", 0, 3807),
+        (3614, "tsvector", -1, "b", "U", 0, 3643),
+        (3615, "tsquery", -1, "b", "U", 0, 3645),
+        // hstore + range types — typcategory 'U' (user) / 'R' (range).
+        (3908, "tstzrange", -1, "r", "R", 0, 3909),
+        (3910, "tsrange", -1, "r", "R", 0, 3911),
+        (3904, "int4range", -1, "r", "R", 0, 3905),
+        (3926, "int8range", -1, "r", "R", 0, 3927),
+        (3906, "numrange", -1, "r", "R", 0, 3907),
+        (3912, "daterange", -1, "r", "R", 0, 3913),
+    ];
+    // Array companion types share the typelem / typcategory='A'.
+    // We emit just the array OIDs the scalars reference.
+    let arrays: &[(i64, &str, i64)] = &[
+        (1000, "_bool", 16),
+        (1001, "_bytea", 17),
+        (1002, "_char", 18),
+        (1003, "_name", 19),
+        (1016, "_int8", 20),
+        (1005, "_int2", 21),
+        (1007, "_int4", 23),
+        (1008, "_regproc", 24),
+        (1009, "_text", 25),
+        (1028, "_oid", 26),
+        (199, "_json", 114),
+        (143, "_xml", 142),
+        (1021, "_float4", 700),
+        (1022, "_float8", 701),
+        (651, "_cidr", 650),
+        (1041, "_inet", 869),
+        (1040, "_macaddr", 829),
+        (1014, "_bpchar", 1042),
+        (1015, "_varchar", 1043),
+        (1182, "_date", 1082),
+        (1183, "_time", 1083),
+        (1115, "_timestamp", 1114),
+        (1185, "_timestamptz", 1184),
+        (1187, "_interval", 1186),
+        (1270, "_timetz", 1266),
+        (1231, "_numeric", 1700),
+        (791, "_money", 790),
+        (2951, "_uuid", 2950),
+        (3807, "_jsonb", 3802),
+        (3643, "_tsvector", 3614),
+        (3645, "_tsquery", 3615),
+    ];
+    let mut rows: Vec<Row> = Vec::with_capacity(scalars.len() + arrays.len());
+    for &(oid, name, len, ty, cat, elem, arr) in scalars {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::Text(name.into()),
+            Value::SmallInt(len),
+            Value::Text(ty.into()),
+            Value::Text(cat.into()),
+            Value::BigInt(elem),
+            Value::BigInt(arr),
+            Value::BigInt(2200),
+        ]));
+    }
+    for &(oid, name, elem) in arrays {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::Text(name.into()),
+            Value::SmallInt(-1),
+            Value::Text("b".into()),
+            Value::Text("A".into()),
+            Value::BigInt(elem),
+            Value::BigInt(0),
+            Value::BigInt(2200),
+        ]));
     }
     (schema, rows)
 }
