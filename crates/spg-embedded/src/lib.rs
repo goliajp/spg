@@ -215,6 +215,221 @@ fn encode_v3_auto_commit(sql: &str) -> Vec<u8> {
     out
 }
 
+/// v7.20 P2 — WAL group-commit. N concurrent commits share one
+/// fsync (the 4.2 ms p50 that profile_breakdown measured as
+/// 99.2% of the durable write path).
+///
+/// Leader-follower protocol, same family as PG's group commit:
+///
+/// 1. `enqueue(record)` — called while the caller still holds
+///    the engine's write lock. Appends the encoded record to the
+///    shared buffer, returns a sequence ticket. O(memcpy).
+/// 2. Caller RELEASES the engine write lock (the next writer's
+///    mutation proceeds in parallel with this batch's fsync).
+/// 3. `wait_flushed(seq)` — if nobody is flushing, the caller
+///    elects itself leader: swaps the buffer out, writes +
+///    fsyncs ONCE for every record in the batch, marks the
+///    batch durable, wakes all followers. Otherwise it parks on
+///    the condvar until a leader covers its seq.
+///
+/// Durability contract is unchanged from v7.19: `execute()`
+/// does not return Ok until the record that describes its
+/// mutation is fsynced. The only change is N callers sharing
+/// one fsync instead of paying one each.
+///
+/// Lock order (deadlock-free): `state` then `file`; never the
+/// reverse. The leader holds `file` WITHOUT `state` during IO so
+/// enqueues continue while fsync runs.
+#[derive(Debug)]
+struct WalGroup {
+    state: Mutex<WalGroupState>,
+    cond: std::sync::Condvar,
+    /// Active chunk file handle. Separate lock from `state` so
+    /// the leader's write+fsync doesn't block concurrent
+    /// enqueues. Swapped by `checkpoint()` at rotation.
+    file: Mutex<File>,
+}
+
+#[derive(Debug)]
+struct WalGroupState {
+    /// Encoded records awaiting flush.
+    buf: Vec<u8>,
+    /// Monotonic enqueue counter (1-based).
+    enqueued_seq: u64,
+    /// Highest seq whose record is fsynced.
+    flushed_seq: u64,
+    /// True while some caller is inside the leader IO section.
+    leader_active: bool,
+    /// Sticky fatal error — a failed fsync poisons the WAL
+    /// (loud, never silent). All current + future waiters error.
+    failed: Option<String>,
+    /// Bytes written to the active chunk since rotation —
+    /// drives the auto-checkpoint trigger.
+    written_len: u64,
+}
+
+/// Ticket returned by the buffered write path; `wait()` blocks
+/// until the record it covers is durable (or the WAL is
+/// poisoned). Cheap to move across threads.
+#[derive(Debug)]
+pub struct WalTicket {
+    group: Arc<WalGroup>,
+    seq: u64,
+}
+
+impl WalGroup {
+    fn new(file: File, initial_len: u64) -> Self {
+        Self {
+            state: Mutex::new(WalGroupState {
+                buf: Vec::new(),
+                enqueued_seq: 0,
+                flushed_seq: 0,
+                leader_active: false,
+                failed: None,
+                written_len: initial_len,
+            }),
+            cond: std::sync::Condvar::new(),
+            file: Mutex::new(file),
+        }
+    }
+
+    /// Append `record` to the pending batch. Returns the seq the
+    /// caller must wait on. Called under the engine write lock —
+    /// keep it O(memcpy).
+    fn enqueue(&self, record: &[u8]) -> u64 {
+        let mut g = self.state.lock().expect("wal state poisoned");
+        g.buf.extend_from_slice(record);
+        g.enqueued_seq += 1;
+        g.enqueued_seq
+    }
+
+    /// Block until `seq` is durable. Leader-follower: the first
+    /// arriving waiter flushes for everyone.
+    fn wait_flushed(&self, seq: u64) -> Result<(), EngineError> {
+        let mut g = self.state.lock().expect("wal state poisoned");
+        loop {
+            if let Some(e) = &g.failed {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    format!("WAL poisoned by earlier flush failure: {e}"),
+                )));
+            }
+            if g.flushed_seq >= seq {
+                return Ok(());
+            }
+            if !g.leader_active {
+                // Elect self leader.
+                g.leader_active = true;
+                drop(g);
+                // v7.20 — commit_delay (PG's same-named knob):
+                // before taking the batch, give in-flight
+                // writers a short window to enqueue so the
+                // shared fsync covers more commits. 150 µs costs
+                // ~3.5% on a solo 4.2 ms fsync but multiplies
+                // batch size under load. Tunable via
+                // SPG_COMMIT_DELAY_US (0 disables).
+                let delay = commit_delay_us();
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(delay));
+                }
+                let (batch, flush_to) = {
+                    let mut g2 = self.state.lock().expect("wal state poisoned");
+                    (core::mem::take(&mut g2.buf), g2.enqueued_seq)
+                };
+                let io_result: std::io::Result<()> = (|| {
+                    let mut f = self.file.lock().expect("wal file poisoned");
+                    f.write_all(&batch)?;
+                    f.sync_data()
+                })();
+                g = self.state.lock().expect("wal state poisoned");
+                g.leader_active = false;
+                match io_result {
+                    Ok(()) => {
+                        g.flushed_seq = flush_to;
+                        g.written_len = g.written_len.saturating_add(batch.len() as u64);
+                    }
+                    Err(e) => {
+                        g.failed = Some(e.to_string());
+                    }
+                }
+                self.cond.notify_all();
+                //
+
+                // Loop continues: either our seq is now covered
+                // (leader path normally returns next iteration)
+                // or the error branch surfaces.
+                continue;
+            }
+            g = self
+                .cond
+                .wait(g)
+                .expect("wal condvar poisoned");
+        }
+    }
+
+    /// Drain the pending batch + flush synchronously. Caller must
+    /// guarantee no concurrent enqueues (checkpoint holds the
+    /// engine exclusively). Used before rotation so the marker
+    /// lands in the right chunk.
+    fn flush_now(&self) -> Result<(), EngineError> {
+        let mut g = self.state.lock().expect("wal state poisoned");
+        if let Some(e) = &g.failed {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                format!("WAL poisoned: {e}"),
+            )));
+        }
+        let batch = core::mem::take(&mut g.buf);
+        let flush_to = g.enqueued_seq;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        drop(g);
+        let io: std::io::Result<()> = (|| {
+            let mut f = self.file.lock().expect("wal file poisoned");
+            f.write_all(&batch)?;
+            f.sync_data()
+        })();
+        let mut g = self.state.lock().expect("wal state poisoned");
+        match io {
+            Ok(()) => {
+                g.flushed_seq = flush_to;
+                g.written_len = g.written_len.saturating_add(batch.len() as u64);
+                self.cond.notify_all();
+                Ok(())
+            }
+            Err(e) => {
+                g.failed = Some(e.to_string());
+                self.cond.notify_all();
+                Err(io_err(e))
+            }
+        }
+    }
+
+    /// Swap the active chunk handle (rotation). Caller flushes
+    /// first; both locks taken in canonical order.
+    fn rotate_file(&self, new_file: File) {
+        let mut g = self.state.lock().expect("wal state poisoned");
+        let mut f = self.file.lock().expect("wal file poisoned");
+        *f = new_file;
+        g.written_len = 0;
+    }
+
+    fn written_len(&self) -> u64 {
+        let g = self.state.lock().expect("wal state poisoned");
+        g.written_len + g.buf.len() as u64
+    }
+}
+
+impl WalTicket {
+    /// Block until the record this ticket covers is durable.
+    ///
+    /// # Errors
+    /// Surfaces the leader's IO error if the batch flush failed
+    /// (the WAL is then poisoned for all subsequent writes).
+    pub fn wait(&self) -> Result<(), EngineError> {
+        self.group.wait_flushed(self.seq)
+    }
+}
+
 /// v7.19 P3 — retention sweep loop. Runs in a dedicated thread
 /// spawned by `Database::open_path` when `SPG_PITR_RETENTION_HOURS`
 /// is set to a non-zero value. Wakes every
@@ -315,6 +530,20 @@ pub fn retention_sweep_once(
         let _ = std::fs::remove_file(&cs);
     }
     Ok(())
+}
+
+/// v7.20 — group-commit delay window in µs (PG `commit_delay`
+/// analogue). The flush leader sleeps this long before taking
+/// the batch so concurrent writers pile in. Default 150 µs;
+/// `SPG_COMMIT_DELAY_US=0` disables.
+fn commit_delay_us() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("SPG_COMMIT_DELAY_US")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(150)
+    })
 }
 
 fn pitr_retention_hours() -> u64 {
@@ -838,7 +1067,7 @@ struct PersistenceCtx {
     /// so default-lex sort = LSN order).
     wal_dir: PathBuf,
     /// Path of the currently-open chunk file inside `wal_dir`.
-    /// Rotated at checkpoint and whenever `wal_len` crosses
+    /// Rotated at checkpoint and whenever the chunk crosses
     /// `checkpoint_threshold_bytes`.
     current_chunk_path: PathBuf,
     /// v7.19 P3 — retention sweeper handle. `Some` when
@@ -851,12 +1080,10 @@ struct PersistenceCtx {
     /// `retention_shutdown` on Drop.
     retention_shutdown: Option<Arc<AtomicBool>>,
     retention_thread: Option<std::thread::JoinHandle<()>>,
-    /// Append-only handle on `current_chunk_path`.
-    wal: File,
-    /// Cached length of the current chunk so `execute()` skips
-    /// a `stat()` per write. Refreshed on append + reset to 0
-    /// on rotation.
-    wal_len: u64,
+    /// v7.20 P2 — group-commit WAL. Shared with WalTickets
+    /// returned by the buffered write path so `wait()` can run
+    /// after the engine write lock is released.
+    wal: Arc<WalGroup>,
     checkpoint_threshold_bytes: u64,
     /// v7.1.4 — `<db_path>.spg/segments/` directory. Cold-tier
     /// segments produced by `freeze_oldest_to_cold` / compaction
@@ -1121,13 +1348,14 @@ impl Database {
         } else {
             wal_dir.join(chunk_filename(now_us, initial_lsn + 1))
         };
-        let wal = OpenOptions::new()
+        let wal_file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&current_chunk_path)
             .map_err(io_err)?;
-        let wal_len = wal.metadata().map_err(io_err)?.len();
+        let wal_len = wal_file.metadata().map_err(io_err)?.len();
+        let wal = Arc::new(WalGroup::new(wal_file, wal_len));
         // v7.19 P3 — spawn retention sweep thread when the
         // operator opted in via SPG_PITR_RETENTION_HOURS > 0.
         // Otherwise stay on the v7.18 behaviour (chunks accumulate
@@ -1164,7 +1392,6 @@ impl Database {
                 wal_dir,
                 current_chunk_path,
                 wal,
-                wal_len,
                 checkpoint_threshold_bytes: default_checkpoint_threshold_bytes(),
                 cold_segments_dir,
                 cold_segment_paths,
@@ -1301,12 +1528,12 @@ impl Database {
         let marker_lsn = self.commit_lsn.load(Ordering::SeqCst);
         let marker_ts = wall_clock_micros();
         let marker = encode_v4_checkpoint_marker(marker_lsn, marker_ts, &p.db_path);
-        p.wal.write_all(&marker).map_err(io_err)?;
-        p.wal.sync_data().map_err(io_err)?;
-        // Close the active chunk by replacing the handle. The
-        // OpenOptions append+create combo creates the new chunk
-        // file fresh; `wal_len` resets to 0 ready for the next
-        // execute()'s record.
+        // v7.20 P2 — checkpoint holds &mut self (engine
+        // exclusive), so there are no concurrent enqueues: drain
+        // the pending batch, append the marker, flush, then
+        // rotate the chunk handle inside the group.
+        p.wal.enqueue(&marker);
+        p.wal.flush_now()?;
         let new_chunk_path = p.wal_dir.join(chunk_filename(marker_ts, marker_lsn + 1));
         let new_handle = OpenOptions::new()
             .create(true)
@@ -1315,8 +1542,7 @@ impl Database {
             .open(&new_chunk_path)
             .map_err(io_err)?;
         p.current_chunk_path = new_chunk_path;
-        p.wal = new_handle;
-        p.wal_len = 0;
+        p.wal.rotate_file(new_handle);
         Ok(())
     }
 
@@ -1356,7 +1582,41 @@ impl Database {
     /// EXPLAIN / BEGIN-COMMIT-ROLLBACK / CHECKPOINT / COMPACT
     /// etc.) skip the WAL entirely.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
+        // v7.20 P2 — single-caller convenience over the buffered
+        // path: enqueue + immediately wait. Batch size is 1 here,
+        // so the durability behaviour (one fsync before Ok) is
+        // identical to v7.19. Concurrent callers go through
+        // `execute_buffered` (AsyncDatabase does) and share the
+        // leader's fsync.
+        let (result, ticket) = self.execute_buffered(sql)?;
+        if let Some(t) = ticket {
+            t.wait()?;
+        }
+        Ok(result)
+    }
+
+    /// v7.20 P2 — group-commit write entry. Runs the engine
+    /// mutation + encodes/enqueues the WAL record, then RETURNS
+    /// WITHOUT waiting for the fsync. The caller must call
+    /// [`WalTicket::wait`] before treating the write as durable
+    /// — crucially, the caller can (and should) drop whatever
+    /// lock guards this `Database` first, so the next writer's
+    /// mutation overlaps this batch's fsync.
+    ///
+    /// `None` ticket = nothing hit the WAL (read-only statement,
+    /// no-op DDL, or in-memory database) — the result is final
+    /// as returned.
+    ///
+    /// # Errors
+    /// Engine errors propagate unchanged. Auto-checkpoint (when
+    /// the active chunk crosses the threshold) runs inline and
+    /// may surface IO errors.
+    pub fn execute_buffered(
+        &mut self,
+        sql: &str,
+    ) -> Result<(QueryResult, Option<WalTicket>), EngineError> {
         let result = self.engine.execute(sql)?;
+        let mut ticket = None;
         if self.persistence.is_some()
             && !sql_is_read_only(sql)
             && matches!(
@@ -1367,26 +1627,25 @@ impl Database {
                 }
             )
         {
-            // v7.18 PITR — write v4 records that carry the commit
-            // LSN + wall-clock micros so restore tooling can
-            // target a point in time. Replay path still accepts
-            // v3 records emitted by older spg-embedded versions.
-            // Crash window is bounded by one record exactly as
-            // under v3: WAL fsync happens after the in-memory
-            // mutation, so the WAL never describes a write that
-            // didn't apply.
+            // v7.18 PITR — v4 records carry commit LSN +
+            // wall-clock micros. The crash window remains one
+            // BATCH now instead of one record: replay re-applies
+            // idempotently exactly as before, and a torn batch
+            // tail drops cleanly (same torn-write handling).
             let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
             let ts = wall_clock_micros();
             let record = encode_v4_auto_commit(sql, lsn, ts);
             let p = self.persistence.as_mut().expect("checked above");
-            p.wal.write_all(&record).map_err(io_err)?;
-            p.wal.sync_data().map_err(io_err)?;
-            p.wal_len = p.wal_len.saturating_add(record.len() as u64);
-            if p.wal_len >= p.checkpoint_threshold_bytes {
+            let seq = p.wal.enqueue(&record);
+            ticket = Some(WalTicket {
+                group: Arc::clone(&p.wal),
+                seq,
+            });
+            if p.wal.written_len() >= p.checkpoint_threshold_bytes {
                 self.checkpoint()?;
             }
         }
-        Ok(result)
+        Ok((result, ticket))
     }
 
     /// v7.3.0 — typed-row variant of [`Database::query`]. Each
@@ -1553,7 +1812,29 @@ impl Database {
         stmt: &Statement,
         params: &[Value],
     ) -> Result<QueryResult, EngineError> {
+        let (result, ticket) = self.execute_prepared_buffered(stmt, params)?;
+        if let Some(t) = ticket {
+            t.wait()?;
+        }
+        Ok(result)
+    }
+
+    /// v7.20 P2 — group-commit variant of
+    /// [`Database::execute_prepared`]. Same contract as
+    /// [`Database::execute_buffered`]: mutation + enqueue happen
+    /// here; the caller waits on the ticket AFTER releasing
+    /// whatever lock guards this `Database`.
+    ///
+    /// # Errors
+    /// Engine errors propagate unchanged; inline auto-checkpoint
+    /// may surface IO errors.
+    pub fn execute_prepared_buffered(
+        &mut self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<(QueryResult, Option<WalTicket>), EngineError> {
         let result = self.engine.execute_prepared(stmt.stmt.clone(), params)?;
+        let mut ticket = None;
         // WAL persistence on the bind-final SQL. Build the
         // canonical Display form by re-printing the
         // placeholder-substituted statement (cheap — the AST
@@ -1569,14 +1850,7 @@ impl Database {
                 }
             )
         {
-            // Render the AST back to SQL for WAL replay. The
-            // placeholder positions are already substituted in
-            // the executed clone; we re-substitute on a fresh
-            // clone here purely to obtain the canonical text.
             let mut wal_stmt = stmt.stmt.clone();
-            // Use the engine's substitute_placeholders entry —
-            // exposed via execute_prepared above. Here we
-            // re-run the substitution only for Display.
             crate::wal_render_with_params(&mut wal_stmt, params);
             let canonical = format!("{wal_stmt}");
             // v7.18 PITR — prepared path also emits v4 records so
@@ -1586,14 +1860,16 @@ impl Database {
             let ts = wall_clock_micros();
             let record = encode_v4_auto_commit(&canonical, lsn, ts);
             let p = self.persistence.as_mut().expect("checked above");
-            p.wal.write_all(&record).map_err(io_err)?;
-            p.wal.sync_data().map_err(io_err)?;
-            p.wal_len = p.wal_len.saturating_add(record.len() as u64);
-            if p.wal_len >= p.checkpoint_threshold_bytes {
+            let seq = p.wal.enqueue(&record);
+            ticket = Some(WalTicket {
+                group: Arc::clone(&p.wal),
+                seq,
+            });
+            if p.wal.written_len() >= p.checkpoint_threshold_bytes {
                 self.checkpoint()?;
             }
         }
-        Ok(result)
+        Ok((result, ticket))
     }
 
     /// v7.16.0 — run a prepared SELECT with bound params and
@@ -1850,7 +2126,7 @@ impl Database {
             }
         }
         let (wal_bytes, persistent) = match &self.persistence {
-            Some(p) => (p.wal_len, true),
+            Some(p) => (p.wal.written_len(), true),
             None => (0, false),
         };
         EmbeddedMetrics {

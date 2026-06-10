@@ -112,19 +112,32 @@ impl AsyncDatabase {
         })
     }
 
-    /// Execute a single SQL statement. Acquires the internal lock
-    /// (FIFO under Tokio's `RwLock` write side), then dispatches the engine
-    /// call to `spawn_blocking` so a WAL fsync or cold-tier read
-    /// can't stall the runtime worker.
+    /// Execute a single SQL statement.
+    ///
+    /// v7.20 P2 — group-commit: the engine mutation + WAL enqueue
+    /// run under the write lock (~1 µs), then the lock DROPS
+    /// before the fsync wait. N concurrent writers' mutations
+    /// pipeline behind each other while the WAL leader fsyncs
+    /// once for the whole batch — profile_breakdown measured
+    /// fsync at 99.2% of the durable write path, so this is
+    /// where the concurrency comes back.
     ///
     /// # Errors
-    /// Propagates `EngineError` unchanged from the sync engine.
+    /// Propagates `EngineError` unchanged from the sync engine;
+    /// a failed batch flush poisons the WAL loudly for all
+    /// waiters.
     pub async fn execute(&self, sql: &str) -> Result<QueryResult, EngineError> {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_write();
-            guard.execute(&sql)
+            let (result, ticket) = {
+                let mut guard = inner.blocking_write();
+                guard.execute_buffered(&sql)?
+            }; // ← write lock released here
+            if let Some(t) = ticket {
+                t.wait()?; // group-commit: shared fsync
+            }
+            Ok(result)
         })
         .await
         .expect("spawn_blocking join")
@@ -210,8 +223,16 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         let stmt_inner = Arc::clone(&stmt.inner);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_write();
-            guard.execute_prepared(&stmt_inner, &params)
+            // v7.20 P2 — group-commit (see `execute`): mutation
+            // under the lock, fsync wait after release.
+            let (result, ticket) = {
+                let mut guard = inner.blocking_write();
+                guard.execute_prepared_buffered(&stmt_inner, &params)?
+            };
+            if let Some(t) = ticket {
+                t.wait()?;
+            }
+            Ok(result)
         })
         .await
         .expect("spawn_blocking join")
