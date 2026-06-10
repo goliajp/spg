@@ -309,10 +309,7 @@ pub fn retention_sweep_once(
             continue;
         }
         let mut cs = chunk.clone();
-        let mut name = cs
-            .file_name()
-            .map(|n| n.to_os_string())
-            .unwrap_or_default();
+        let mut name = cs.file_name().map(|n| n.to_os_string()).unwrap_or_default();
         name.push(".checksum");
         cs.set_file_name(name);
         let _ = std::fs::remove_file(&cs);
@@ -359,10 +356,7 @@ fn replay_wal_filtered(
     engine: &mut Engine,
     floor_lsn: u64,
 ) -> Result<usize, String> {
-    let records = match parse_wal_records(wal_bytes) {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    let records = parse_wal_records(wal_bytes)?;
     let mut applied = 0usize;
     for r in &records {
         // Skip markers + non-SQL records.
@@ -388,7 +382,10 @@ fn replay_wal_filtered(
             Err(e) => return Err(format!("non-UTF-8 SQL at offset {}: {e}", r.offset)),
         };
         engine.execute(sql).map_err(|e| {
-            format!("WAL replay: apply {sql:?} at offset {} rejected: {e:?}", r.offset)
+            format!(
+                "WAL replay: apply {sql:?} at offset {} rejected: {e:?}",
+                r.offset
+            )
         })?;
         applied += 1;
     }
@@ -575,13 +572,10 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
                     }
                     let sql_start = cur + header_len + WAL_V4_EXTRA_HEADER;
                     let sql_bytes = &wal_bytes[sql_start..sql_start + rec_len];
-                    let sql = std::str::from_utf8(sql_bytes).map_err(|e| {
-                        format!("WAL replay: non-UTF-8 SQL at offset {cur}: {e}")
-                    })?;
+                    let sql = std::str::from_utf8(sql_bytes)
+                        .map_err(|e| format!("WAL replay: non-UTF-8 SQL at offset {cur}: {e}"))?;
                     engine.execute(sql).map_err(|e| {
-                        format!(
-                            "WAL replay: apply {sql:?} at offset {cur} rejected: {e:?}"
-                        )
+                        format!("WAL replay: apply {sql:?} at offset {cur} rejected: {e:?}")
                     })?;
                     applied += 1;
                     cur += v4_total;
@@ -1640,8 +1634,8 @@ impl Database {
         snapshot: &CatalogSnapshot,
         sql: &str,
     ) -> Result<Statement, EngineError> {
-        let stmt = spg_engine::Engine::prepare_on_snapshot(snapshot, sql)
-            .map_err(EngineError::Parse)?;
+        let stmt =
+            spg_engine::Engine::prepare_on_snapshot(snapshot, sql).map_err(EngineError::Parse)?;
         Ok(Statement {
             stmt,
             sql: sql.to_string(),
@@ -1681,8 +1675,8 @@ impl Database {
         snapshot: &CatalogSnapshot,
         sql: &str,
     ) -> Result<(Vec<u32>, Vec<ColumnSchema>), EngineError> {
-        let stmt = spg_engine::Engine::prepare_on_snapshot(snapshot, sql)
-            .map_err(EngineError::Parse)?;
+        let stmt =
+            spg_engine::Engine::prepare_on_snapshot(snapshot, sql).map_err(EngineError::Parse)?;
         Ok(spg_engine::Engine::describe_prepared_on_snapshot(
             snapshot, &stmt,
         ))
