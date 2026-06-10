@@ -150,14 +150,22 @@ fn auto_checkpoint_fires_under_tight_threshold() {
             db.execute(&format!("INSERT INTO t VALUES ({i}, '{payload}')"))
                 .unwrap();
         }
-        // After 50 INSERTs the WAL should have been
-        // checkpointed at least once; final size is whatever
-        // landed since the latest auto-checkpoint, well below
-        // 50 × ~50 B.
-        let wal_size = std::fs::metadata(&wal_path).unwrap().len();
+        // After 50 INSERTs the WAL must have been checkpointed at
+        // least once. Since v7.19 the WAL is a CHUNK DIRECTORY and
+        // checkpoints rotate chunks (pre-checkpoint chunks stay for
+        // PITR), so the observable signal is chunk count ≥ 2.
+        // (The old assertion measured `metadata(<db>.wal).len()` —
+        // the directory inode, which is 4096 B on Linux ext4 and
+        // small on APFS, so it silently passed on macOS and always
+        // failed on Linux CI.)
+        let chunk_count = std::fs::read_dir(&wal_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("wal"))
+            .count();
         assert!(
-            wal_size < 50 * 50,
-            "auto-checkpoint never fired: WAL is {wal_size} B"
+            chunk_count >= 2,
+            "auto-checkpoint never fired: only {chunk_count} WAL chunk(s)"
         );
     }
     // Sanity: data still readable on next open.

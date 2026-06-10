@@ -12,14 +12,16 @@
 //!   - `one_b_rows::pipeline_sanity_50k_rows` — ingest→freeze→
 //!     compact→restart pipeline sanity at 50K rows
 //!   - `parallel_freezer::four_worker_prepare_speedup_scales` —
-//!     v6.7.4 ship-gate
-//!   - `prefetch::four_worker_pool_speedup_at_least_1_3x` —
-//!     v6.7.6 ship-gate
+//!     v6.7.4 ship-gate (host-tiered floor)
 //!
 //! full tier (`#[ignore]`, run via `scripts/gate.sh gates --full`
 //! → `--include-ignored`):
 //!   - `one_b_rows::cold_start_under_120s` — L2 gate at
 //!     `SPG_PERF_1B_ROW_BUDGET` rows (default 1M)
+//!   - `prefetch::four_worker_pool_speedup_at_least_1_3x` —
+//!     v6.7.6 ship-gate; I/O-topology-sensitive, only meaningful
+//!     on local-NVMe hosts (cloud-runner disks invert under
+//!     4-way reads)
 //!   - `sq8::*` — 1M dim-128 kNN p50 + RSS gates (minutes)
 //!   - `concurrency::concurrency_bench` — exploratory throughput
 //!   - `prepared_vs_simple::*` — exploratory wire-path micro-bench
