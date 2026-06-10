@@ -2500,10 +2500,10 @@ impl Table {
     }
 
     /// v4.4: replace the row at `position` with `new_values` (must
-    /// match the schema arity + types). Indices are rebuilt for
-    /// correctness — the affected column might be indexed and its
-    /// key may have shifted, and a NSW node's vector may have
-    /// changed, both of which need fresh state.
+    /// match the schema arity + types). v7.20: index maintenance is
+    /// incremental — only indices whose key value changed are
+    /// touched (B-tree entry move in place; NSW / BRIN / GIN fall
+    /// back to a full rebuild when their column changed).
     pub fn update_row(
         &mut self,
         position: usize,
@@ -2569,6 +2569,54 @@ impl Table {
         let old_bytes = row_body_encoded_len(old_row, &self.schema) as u64;
         let new_row = Row::new(new_values);
         let new_bytes = row_body_encoded_len(&new_row, &self.schema) as u64;
+        // v7.20 P4 — incremental index maintenance. `rows.set`
+        // replaces the row in place, so every OTHER row's Hot
+        // locator stays valid; only indices whose key value
+        // actually changed at `position` need touching. The
+        // common OLTP shape (`UPDATE … SET non_indexed_col = …
+        // WHERE pk = $1`) touches no index at all — pre-v7.20
+        // this path paid a full rebuild_indices() (O(rows ×
+        // indices)) per UPDATE, which dominated the profiled
+        // write cost on a 5k-row table (~1 ms/stmt).
+        //
+        // BTree gets an in-place entry move (drop Hot(position)
+        // from the old key's locator list, append to the new
+        // key's). NSW graphs / BRIN summaries / GIN posting
+        // lists have no cheap single-key move — a changed column
+        // under one of those falls back to the full rebuild.
+        enum IdxFix {
+            BTreeMove {
+                idx_pos: usize,
+                old_key: Option<IndexKey>,
+                new_key: Option<IndexKey>,
+            },
+            FullRebuild,
+        }
+        let mut fixes: Vec<IdxFix> = Vec::new();
+        for (idx_pos, idx) in self.indices.iter().enumerate() {
+            let col = idx.column_position;
+            let old_v = &old_row.values[col];
+            let new_v = &new_row.values[col];
+            if old_v == new_v {
+                continue;
+            }
+            match &idx.kind {
+                IndexKind::BTree(_) => fixes.push(IdxFix::BTreeMove {
+                    idx_pos,
+                    old_key: IndexKey::from_value(old_v),
+                    new_key: IndexKey::from_value(new_v),
+                }),
+                IndexKind::Nsw(_)
+                | IndexKind::Brin { .. }
+                | IndexKind::Gin(_)
+                | IndexKind::GinTrgm(_)
+                | IndexKind::GinFulltext(_) => {
+                    fixes.clear();
+                    fixes.push(IdxFix::FullRebuild);
+                    break;
+                }
+            }
+        }
         self.rows = self
             .rows
             .set(position, new_row)
@@ -2577,7 +2625,42 @@ impl Table {
             .hot_bytes
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
-        self.rebuild_indices();
+        for fix in fixes {
+            match fix {
+                IdxFix::FullRebuild => {
+                    self.rebuild_indices();
+                    break;
+                }
+                IdxFix::BTreeMove {
+                    idx_pos,
+                    old_key,
+                    new_key,
+                } => {
+                    let IndexKind::BTree(map) = &mut self.indices[idx_pos].kind else {
+                        unreachable!("IdxFix::BTreeMove built from a BTree index");
+                    };
+                    // NULL keys never enter the B-tree (from_value
+                    // returns None), so a None on either side means
+                    // "no entry on that side".
+                    if let Some(k) = old_key
+                        && let Some(locs) = map.get(&k)
+                    {
+                        let mut locs = locs.clone();
+                        locs.retain(|l| *l != RowLocator::Hot(position));
+                        // No remove_mut on the persistent map: an
+                        // empty locator list is the tombstone —
+                        // lookup_eq returns an empty slice, and the
+                        // next rebuild_indices() drops the key.
+                        map.insert_mut(k, locs);
+                    }
+                    if let Some(k) = new_key {
+                        let mut entries = map.get(&k).cloned().unwrap_or_default();
+                        entries.push(RowLocator::Hot(position));
+                        map.insert_mut(k, entries);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -10548,6 +10631,103 @@ mod tests {
 
     fn make_user_row(id: i64, name: &str) -> Row {
         Row::new(vec![Value::BigInt(id), Value::Text(name.into())])
+    }
+
+    // v7.20 P4 — update_row incremental index maintenance.
+
+    #[test]
+    fn update_row_non_indexed_column_keeps_index_intact() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
+            t.insert(make_user_row(id, name)).unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        // Change only the non-indexed `name` column — the by_id
+        // entry for key 2 must still resolve position 1.
+        t.update_row(1, vec![Value::BigInt(2), Value::Text("bobby".into())])
+            .unwrap();
+        let idx = t.index_on(0).unwrap();
+        assert_eq!(
+            idx.lookup_eq(&IndexKey::Int(2)),
+            &[RowLocator::Hot(1)],
+            "old key still resolves the in-place position"
+        );
+        assert_eq!(t.rows()[1].values[1], Value::Text("bobby".into()));
+    }
+
+    #[test]
+    fn update_row_indexed_column_moves_entry() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
+            t.insert(make_user_row(id, name)).unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        // Change the indexed key 2 → 20.
+        t.update_row(1, vec![Value::BigInt(20), Value::Text("bob".into())])
+            .unwrap();
+        let idx = t.index_on(0).unwrap();
+        assert!(
+            idx.lookup_eq(&IndexKey::Int(2)).is_empty(),
+            "old key entry removed"
+        );
+        assert_eq!(
+            idx.lookup_eq(&IndexKey::Int(20)),
+            &[RowLocator::Hot(1)],
+            "new key entry resolves the position"
+        );
+        // Untouched neighbours unaffected.
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(1)), &[RowLocator::Hot(0)]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(3)), &[RowLocator::Hot(2)]);
+    }
+
+    #[test]
+    fn update_row_duplicate_key_moves_only_target_position() {
+        let mut cat = Catalog::new();
+        cat.create_table(bigint_pk_users_schema()).unwrap();
+        let t = cat.get_mut("users").unwrap();
+        // Two rows share key 7.
+        for (id, name) in [(7i64, "a"), (7, "b"), (9, "c")] {
+            t.insert(make_user_row(id, name)).unwrap();
+        }
+        t.add_index("by_id".into(), "id").unwrap();
+        // Move position 1's key 7 → 8; position 0 must keep its 7.
+        t.update_row(1, vec![Value::BigInt(8), Value::Text("b".into())])
+            .unwrap();
+        let idx = t.index_on(0).unwrap();
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(7)), &[RowLocator::Hot(0)]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(8)), &[RowLocator::Hot(1)]);
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(9)), &[RowLocator::Hot(2)]);
+    }
+
+    #[test]
+    fn update_row_null_transition_on_indexed_nullable_column() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "n",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("tag", DataType::BigInt, true),
+            ],
+        ))
+        .unwrap();
+        let t = cat.get_mut("n").unwrap();
+        t.insert(Row::new(vec![Value::BigInt(1), Value::BigInt(5)]))
+            .unwrap();
+        t.add_index("by_tag".into(), "tag").unwrap();
+        // 5 → NULL: entry leaves the index (NULL never enters a B-tree).
+        t.update_row(0, vec![Value::BigInt(1), Value::Null])
+            .unwrap();
+        let idx = t.index_on(1).unwrap();
+        assert!(idx.lookup_eq(&IndexKey::Int(5)).is_empty());
+        // NULL → 6: entry re-enters under the new key.
+        t.update_row(0, vec![Value::BigInt(1), Value::BigInt(6)])
+            .unwrap();
+        let idx = t.index_on(1).unwrap();
+        assert_eq!(idx.lookup_eq(&IndexKey::Int(6)), &[RowLocator::Hot(0)]);
     }
 
     #[test]

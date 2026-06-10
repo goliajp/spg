@@ -359,10 +359,7 @@ impl WalGroup {
                 // or the error branch surfaces.
                 continue;
             }
-            g = self
-                .cond
-                .wait(g)
-                .expect("wal condvar poisoned");
+            g = self.cond.wait(g).expect("wal condvar poisoned");
         }
     }
 
@@ -422,10 +419,19 @@ impl WalGroup {
 impl WalTicket {
     /// Block until the record this ticket covers is durable.
     ///
+    /// Under `SPG_SYNCHRONOUS_COMMIT=off` this returns
+    /// immediately — the background flusher (or the next
+    /// checkpoint / clean shutdown) makes the record durable
+    /// within `SPG_WAL_WRITER_DELAY_MS`. Same contract as PG's
+    /// `synchronous_commit = off`.
+    ///
     /// # Errors
     /// Surfaces the leader's IO error if the batch flush failed
     /// (the WAL is then poisoned for all subsequent writes).
     pub fn wait(&self) -> Result<(), EngineError> {
+        if !synchronous_commit_on() {
+            return Ok(());
+        }
         self.group.wait_flushed(self.seq)
     }
 }
@@ -543,6 +549,37 @@ fn commit_delay_us() -> u64 {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(150)
+    })
+}
+
+/// v7.20 — PG `synchronous_commit` analogue. `on` (default):
+/// `execute()` blocks until its WAL record is fsynced —
+/// zero-loss durability. `off`: `execute()` returns after the
+/// in-memory mutation + WAL enqueue; a background flusher
+/// thread writes + fsyncs every `SPG_WAL_WRITER_DELAY_MS`
+/// (default 200 ms — PG's `wal_writer_delay` default). Crash
+/// window = up to one flush interval of confirmed-but-unsynced
+/// commits — exactly the trade PG documents for the same
+/// setting. Clean shutdown (Drop / checkpoint) always flushes.
+fn synchronous_commit_on() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !std::env::var("SPG_SYNCHRONOUS_COMMIT")
+            .map(|v| v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    })
+}
+
+/// v7.20 — background WAL flusher cadence for
+/// `SPG_SYNCHRONOUS_COMMIT=off` (PG `wal_writer_delay`).
+fn wal_writer_delay_ms() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("SPG_WAL_WRITER_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(200)
     })
 }
 
@@ -1080,6 +1117,14 @@ struct PersistenceCtx {
     /// `retention_shutdown` on Drop.
     retention_shutdown: Option<Arc<AtomicBool>>,
     retention_thread: Option<std::thread::JoinHandle<()>>,
+    /// v7.20 — background WAL flusher for
+    /// `SPG_SYNCHRONOUS_COMMIT=off`. `None` in the default
+    /// synchronous mode. Flushes the pending batch every
+    /// `SPG_WAL_WRITER_DELAY_MS`; signalled + joined on Drop
+    /// before the final checkpoint so clean shutdown never
+    /// loses confirmed commits.
+    flusher_shutdown: Option<Arc<AtomicBool>>,
+    flusher_thread: Option<std::thread::JoinHandle<()>>,
     /// v7.20 P2 — group-commit WAL. Shared with WalTickets
     /// returned by the buffered write path so `wait()` can run
     /// after the engine write lock is released.
@@ -1384,6 +1429,29 @@ impl Database {
         } else {
             (None, None)
         };
+        // v7.20 — background flusher for SPG_SYNCHRONOUS_COMMIT=off.
+        let (flusher_shutdown, flusher_thread) = if synchronous_commit_on() {
+            (None, None)
+        } else {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_clone = Arc::clone(&shutdown);
+            let group = Arc::clone(&wal);
+            let interval = std::time::Duration::from_millis(wal_writer_delay_ms());
+            let handle = std::thread::Builder::new()
+                .name("spg-wal-flusher".into())
+                .spawn(move || {
+                    while !shutdown_clone.load(Ordering::SeqCst) {
+                        std::thread::sleep(interval);
+                        if let Err(e) = group.flush_now() {
+                            eprintln!("spg-embedded: background WAL flush failed: {e:?}");
+                        }
+                    }
+                    // Final drain on shutdown signal.
+                    let _ = group.flush_now();
+                })
+                .map_err(io_err)?;
+            (Some(shutdown), Some(handle))
+        };
         Ok(Self {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
@@ -1398,6 +1466,8 @@ impl Database {
                 lock_path,
                 retention_shutdown,
                 retention_thread,
+                flusher_shutdown,
+                flusher_thread,
             }),
         })
     }
@@ -2426,17 +2496,24 @@ impl Drop for Database {
                 );
             }
         }
-        // v7.19 P3 — signal the retention thread to exit, then
-        // wait for it. Done BEFORE the lock release so the
-        // background thread doesn't outlive the database handle.
-        // The signal + join pair lives behind take() because Drop
-        // takes `&mut self` and we need to move the thread handle
-        // out.
+        // v7.19 P3 / v7.20 — signal the retention + flusher
+        // threads to exit, then wait for them. Done BEFORE the
+        // lock release so background threads don't outlive the
+        // database handle. The flusher drains the pending batch
+        // on its way out (final flush_now in the thread body),
+        // so `SPG_SYNCHRONOUS_COMMIT=off` never loses confirmed
+        // commits across a clean shutdown.
         if let Some(ctx) = self.persistence.as_mut() {
             if let Some(shutdown) = ctx.retention_shutdown.take() {
                 shutdown.store(true, Ordering::SeqCst);
             }
             if let Some(handle) = ctx.retention_thread.take() {
+                let _ = handle.join();
+            }
+            if let Some(shutdown) = ctx.flusher_shutdown.take() {
+                shutdown.store(true, Ordering::SeqCst);
+            }
+            if let Some(handle) = ctx.flusher_thread.take() {
                 let _ = handle.join();
             }
         }
