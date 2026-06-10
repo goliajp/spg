@@ -498,6 +498,9 @@ fn extract_field(field: spg_sql::ast::ExtractField, v: &Value) -> Result<Value, 
             F::Minute => (secs_total / 60) % 60,
             F::Second => secs_total % 60,
             F::Microsecond => (secs_total % 60) * 1_000_000 + frac,
+            // total seconds in the interval (months count as 30 days,
+            // PG's justify_interval convention).
+            F::Epoch => i64::from(months) * 30 * 86_400 + secs_total,
         };
         return Ok(Value::BigInt(result));
     }
@@ -531,6 +534,9 @@ fn extract_field(field: spg_sql::ast::ExtractField, v: &Value) -> Result<Value, 
         F::Minute => mm,
         F::Second => ss,
         F::Microsecond => ss * 1_000_000 + frac,
+        // seconds since the unix epoch (truncated; PG returns
+        // numeric with fraction — mailrs casts ::BIGINT anyway).
+        F::Epoch => i64::from(days) * 86_400 + secs,
     };
     Ok(Value::BigInt(result))
 }
@@ -2644,6 +2650,7 @@ fn date_part(args: &[Value]) -> Result<Value, EvalError> {
         "minute" => F::Minute,
         "second" => F::Second,
         "microsecond" | "microseconds" => F::Microsecond,
+        "epoch" => F::Epoch,
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
@@ -6209,6 +6216,9 @@ fn literal_to_value(l: &Literal) -> Value {
         Literal::Float(x) => Value::Float(*x),
         Literal::String(s) => Value::Text(s.clone()),
         Literal::Vector(v) => Value::Vector(v.clone()),
+        Literal::TextArray(items) => Value::TextArray(items.clone()),
+        Literal::IntArray(items) => Value::IntArray(items.clone()),
+        Literal::BigIntArray(items) => Value::BigIntArray(items.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
         Literal::Interval { months, micros, .. } => Value::Interval {
@@ -6347,6 +6357,12 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value, EvalError> {
         (UnOp::Neg, other) => Err(EvalError::TypeMismatch {
             detail: format!("unary - applied to {:?}", other.data_type()),
         }),
+        (UnOp::BitNot, Value::SmallInt(n)) => Ok(Value::Int(!i32::from(n))),
+        (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
+        (UnOp::BitNot, Value::BigInt(n)) => Ok(Value::BigInt(!n)),
+        (UnOp::BitNot, other) => Err(EvalError::TypeMismatch {
+            detail: format!("cannot apply ~ to {other:?}"),
+        }),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnOp::Not, other) => Err(EvalError::TypeMismatch {
             detail: format!("NOT applied to {:?}", other.data_type()),
@@ -6409,6 +6425,8 @@ fn apply_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         BinOp::InnerProduct => inner_product(l, r),
         BinOp::CosineDistance => cosine_distance(l, r),
         BinOp::Concat => Ok(text_concat(&l, &r)),
+        BinOp::BitOr => bitop(l, r, |a, b| a | b, "|"),
+        BinOp::BitAnd => bitop(l, r, |a, b| a & b, "&"),
         BinOp::JsonGet => crate::json::path_get(&l, &r, false),
         BinOp::JsonGetText => crate::json::path_get(&l, &r, true),
         BinOp::JsonGetPath => crate::json::path_walk(&l, &r, false),
@@ -7005,6 +7023,37 @@ fn unwrap_vec_pair(l: Value, r: Value, op: &str) -> Result<(Vec<f32>, Vec<f32>),
 /// - both `Int` → `Int` (with overflow check)
 /// - `Int` op `BigInt` (either side) → `BigInt`
 /// - any `Float` involved → `Float`
+/// Bitwise integer op (`|` / `&`). PG defines these for integer
+/// types only — SmallInt widens to Int, Int x BigInt widens to
+/// BigInt, anything else is a type error (mailrs embed round-12).
+fn bitop(
+    l: Value,
+    r: Value,
+    f: impl Fn(i64, i64) -> i64,
+    op_name: &str,
+) -> Result<Value, EvalError> {
+    let widen = |v: Value| -> Value {
+        match v {
+            Value::SmallInt(n) => Value::Int(i32::from(n)),
+            other => other,
+        }
+    };
+    match (widen(l), widen(r)) {
+        (Value::Int(a), Value::Int(b)) => {
+            let result = f(i64::from(a), i64::from(b));
+            // Two i32 inputs can't overflow i32 under | / &.
+            Ok(Value::Int(result as i32))
+        }
+        (Value::Int(a), Value::BigInt(b)) | (Value::BigInt(b), Value::Int(a)) => {
+            Ok(Value::BigInt(f(i64::from(a), b)))
+        }
+        (Value::BigInt(a), Value::BigInt(b)) => Ok(Value::BigInt(f(a, b))),
+        (a, b) => Err(EvalError::TypeMismatch {
+            detail: format!("cannot apply {op_name} to {a:?} and {b:?}"),
+        }),
+    }
+}
+
 fn arith(
     l: Value,
     r: Value,
@@ -7237,6 +7286,8 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         BinOp::GtEq => ord.is_ge(),
         BinOp::And
         | BinOp::Or
+        | BinOp::BitOr
+        | BinOp::BitAnd
         | BinOp::Add
         | BinOp::Sub
         | BinOp::Mul

@@ -2072,6 +2072,9 @@ pub enum ExtractField {
     Minute,
     Second,
     Microsecond,
+    /// Seconds since 1970-01-01 00:00:00 UTC (PG returns numeric;
+    /// SPG keeps the integer convention — truncated seconds).
+    Epoch,
 }
 
 impl fmt::Display for ExtractField {
@@ -2084,6 +2087,7 @@ impl fmt::Display for ExtractField {
             Self::Minute => "MINUTE",
             Self::Second => "SECOND",
             Self::Microsecond => "MICROSECOND",
+            Self::Epoch => "EPOCH",
         })
     }
 }
@@ -2176,6 +2180,14 @@ pub enum Literal {
     Null,
     /// pgvector-style array literal, e.g. `[1, 2.5, -3]`.
     Vector(Vec<f32>),
+    /// TEXT[] value carried through the prepared-bind path
+    /// (`= ANY($1)` has no column context to re-parse a `{a,b}`
+    /// text form, so the array rides the AST natively).
+    TextArray(Vec<Option<String>>),
+    /// INT[] value carried through the prepared-bind path.
+    IntArray(Vec<Option<i32>>),
+    /// BIGINT[] value carried through the prepared-bind path.
+    BigIntArray(Vec<Option<i64>>),
     /// `INTERVAL '<n> <unit> [<n> <unit> ...]'` — calendar-aware span.
     /// Split into a months part (because a month is not a fixed number of
     /// days) and a microseconds part (everything sub-month). `text` keeps
@@ -2224,6 +2236,10 @@ pub enum BinOp {
     CosineDistance,
     /// SQL string concatenation `||`. NULL propagates.
     Concat,
+    /// Bitwise OR `|` on integers.
+    BitOr,
+    /// Bitwise AND `&` on integers.
+    BitAnd,
     /// v4.14 `json -> key` — element access by string key (object)
     /// or integer index (array). Returns a JSON value.
     JsonGet,
@@ -2265,6 +2281,8 @@ pub enum BinOp {
 pub enum UnOp {
     Not,
     Neg,
+    /// Bitwise NOT `~` on integers.
+    BitNot,
 }
 
 // --- Display impls (round-trip-safe) --------------------------------------
@@ -3612,6 +3630,7 @@ impl fmt::Display for Expr {
             Self::Unary { op, expr } => match op {
                 UnOp::Not => write!(f, "(NOT {expr})"),
                 UnOp::Neg => write!(f, "(-{expr})"),
+                UnOp::BitNot => write!(f, "(~{expr})"),
             },
             Self::Cast { expr, target } => write!(f, "({expr}::{target})"),
             Self::IsNull { expr, negated } => {
@@ -3786,6 +3805,56 @@ impl fmt::Display for Literal {
             }
             Self::Bool(b) => f.write_str(if *b { "TRUE" } else { "FALSE" }),
             Self::Null => f.write_str("NULL"),
+            // PG external array form. Display round-trip re-enters
+            // through the column-typed text coerce, same as pgwire.
+            Self::TextArray(items) => {
+                f.write_str("'{")?;
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(",")?;
+                    }
+                    match it {
+                        None => f.write_str("NULL")?,
+                        Some(s) => {
+                            f.write_str("\"")?;
+                            for c in s.chars() {
+                                if c == '"' || c == '\\' {
+                                    f.write_str("\\")?;
+                                }
+                                write!(f, "{c}")?;
+                            }
+                            f.write_str("\"")?;
+                        }
+                    }
+                }
+                f.write_str("}'")
+            }
+            Self::IntArray(items) => {
+                f.write_str("'{")?;
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(",")?;
+                    }
+                    match it {
+                        None => f.write_str("NULL")?,
+                        Some(n) => write!(f, "{n}")?,
+                    }
+                }
+                f.write_str("}'")
+            }
+            Self::BigIntArray(items) => {
+                f.write_str("'{")?;
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(",")?;
+                    }
+                    match it {
+                        None => f.write_str("NULL")?,
+                        Some(n) => write!(f, "{n}")?,
+                    }
+                }
+                f.write_str("}'")
+            }
             Self::Vector(v) => {
                 f.write_str("[")?;
                 for (i, x) in v.iter().enumerate() {
@@ -3839,6 +3908,8 @@ impl fmt::Display for BinOp {
             Self::InnerProduct => "<#>",
             Self::CosineDistance => "<=>",
             Self::Concat => "||",
+            Self::BitOr => "|",
+            Self::BitAnd => "&",
             Self::JsonGet => "->",
             Self::JsonGetText => "->>",
             Self::JsonGetPath => "#>",

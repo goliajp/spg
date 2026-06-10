@@ -1223,18 +1223,7 @@ impl Database {
             p.set_file_name(name);
             p
         };
-        std::fs::create_dir(&lock_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                EngineError::Unsupported(format!(
-                    "database is locked by another process (or stale lock): {}; \
-                     remove the directory manually after confirming no other \
-                     process holds it, or call Database::force_unlock()",
-                    lock_path.display()
-                ))
-            } else {
-                io_err(e)
-            }
-        })?;
+        acquire_path_lock(&lock_path)?;
         let mut engine = if db_path.exists() {
             let bytes = std::fs::read(&db_path).map_err(io_err)?;
             let engine = Engine::restore_envelope(&bytes).map_err(|e| {
@@ -2525,7 +2514,9 @@ impl Drop for Database {
         if let Some(ctx) = &self.persistence
             && ctx.lock_path.exists()
         {
-            if let Err(e) = std::fs::remove_dir(&ctx.lock_path) {
+            // remove_dir_all: the lock dir carries the owner-pid
+            // record since round-12.
+            if let Err(e) = std::fs::remove_dir_all(&ctx.lock_path) {
                 eprintln!(
                     "spg-embedded: lock release on Drop failed for {}: {e:?}",
                     ctx.lock_path.display()
@@ -2560,7 +2551,7 @@ impl Database {
         if !lock_path.exists() {
             return Ok(());
         }
-        std::fs::remove_dir(&lock_path).map_err(io_err)
+        std::fs::remove_dir_all(&lock_path).map_err(io_err)
     }
 }
 
@@ -2783,6 +2774,185 @@ impl<T: FromSpgValue> FromSpgValue for Option<T> {
             other => T::from_spg_value(other).map(Some),
         }
     }
+}
+
+/// Acquire the cross-process exclusion lock at `lock_path` (atomic
+/// `mkdir`), recording the owner pid inside. If the lock already
+/// exists, read the recorded pid and probe liveness — a lock left
+/// behind by a killed process (docker SIGKILL, crash) is reclaimed
+/// automatically instead of forcing the operator to delete it by
+/// hand (mailrs embed round-12: a restarted server came up in
+/// degraded mode because the previous instance's lock survived).
+fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
+    for attempt in 0..2 {
+        match std::fs::create_dir(lock_path) {
+            Ok(()) => {
+                // Best-effort owner record; liveness probing treats a
+                // missing pid file as stale (crash between mkdir and
+                // write is indistinguishable from an ancient lock).
+                let _ = std::fs::write(lock_path.join("pid"), std::process::id().to_string());
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                let owner = std::fs::read_to_string(lock_path.join("pid"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let owner_alive = owner.is_some_and(pid_alive);
+                if owner_alive {
+                    return Err(EngineError::Unsupported(format!(
+                        "database is locked by another process (pid {}): {}; \
+                         stop that process first, or call Database::force_unlock()",
+                        owner.unwrap_or(0),
+                        lock_path.display()
+                    )));
+                }
+                // Stale — owner pid dead or unrecorded. Reclaim.
+                eprintln!(
+                    "spg-embedded: reclaiming stale lock {} (owner pid {:?} not alive)",
+                    lock_path.display(),
+                    owner
+                );
+                std::fs::remove_dir_all(lock_path).map_err(io_err)?;
+                // Loop retries the create_dir; a concurrent reclaimer
+                // winning the race surfaces as AlreadyExists on
+                // attempt 1 below.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(EngineError::Unsupported(format!(
+                    "database is locked by another process: {}; \
+                     stop that process first, or call Database::force_unlock()",
+                    lock_path.display()
+                )));
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    unreachable!("acquire_path_lock loop covers both attempts")
+}
+
+/// Probe whether `pid` is a live process. Unix: `kill -0` via the
+/// system binary (std-only — no libc dependency). Non-unix targets
+/// conservatively report alive so locks are never auto-reclaimed.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Split a multi-statement SQL script into individual statements on
+/// top-level `;`, honouring single-quoted strings (with `''`
+/// escapes), double-quoted identifiers, dollar-quoted bodies
+/// (`$tag$ … $tag$`), line comments (`--`) and nested block
+/// comments (`/* … */`). Chunks that contain no statement content
+/// (whitespace / comments only) are dropped. PG's simple-query
+/// protocol does this server-side; the embed path owns it here.
+pub fn split_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut stmts = Vec::new();
+    let mut start = 0usize;
+    let mut has_content = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                has_content = true;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        // `''` is an escaped quote inside the literal.
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                has_content = true;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += 1;
+                }
+            }
+            b'$' => {
+                // Possible dollar-quote opener `$tag$` (tag may be
+                // empty). If the shape doesn't match, it's a plain
+                // `$` (positional param) — fall through.
+                let tag_end = bytes[i + 1..]
+                    .iter()
+                    .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                    .map(|off| i + 1 + off);
+                if let Some(te) = tag_end
+                    && te < bytes.len()
+                    && bytes[te] == b'$'
+                {
+                    has_content = true;
+                    let tag = &sql[i..=te];
+                    // Find the closing `$tag$`.
+                    if let Some(close) = sql[te + 1..].find(tag) {
+                        i = te + 1 + close + tag.len();
+                        continue;
+                    }
+                    // Unterminated — consume the rest; the parser
+                    // will report it.
+                    i = bytes.len();
+                    continue;
+                }
+                has_content = true;
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b';' => {
+                if has_content {
+                    stmts.push(&sql[start..i]);
+                }
+                start = i + 1;
+                has_content = false;
+            }
+            b => {
+                if !b.is_ascii_whitespace() {
+                    has_content = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    if has_content {
+        stmts.push(&sql[start..]);
+    }
+    stmts
 }
 
 #[cfg(test)]

@@ -1970,8 +1970,26 @@ impl Engine {
             Statement::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists),
             Statement::CreateIndex(s) => self.exec_create_index(s),
             Statement::Insert(s) => self.exec_insert(s),
-            Statement::Update(s) => self.exec_update_cancel(&s, cancel),
-            Statement::Delete(s) => self.exec_delete_cancel(&s, cancel),
+            Statement::Update(mut s) => {
+                // Materialise uncorrelated subqueries in SET / WHERE
+                // before the row walk — the SELECT path has done this
+                // since v4.10; UPDATE gained it for mailrs's
+                // `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP
+                // LOCKED)` claim pattern (embed round-12).
+                for (_, e) in &mut s.assignments {
+                    self.resolve_expr_subqueries(e, cancel)?;
+                }
+                if let Some(w) = &mut s.where_ {
+                    self.resolve_expr_subqueries(w, cancel)?;
+                }
+                self.exec_update_cancel(&s, cancel)
+            }
+            Statement::Delete(mut s) => {
+                if let Some(w) = &mut s.where_ {
+                    self.resolve_expr_subqueries(w, cancel)?;
+                }
+                self.exec_delete_cancel(&s, cancel)
+            }
             Statement::Merge(s) => self.exec_merge_cancel(&s, cancel),
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::Begin => self.exec_begin(),
@@ -6779,15 +6797,13 @@ impl Engine {
         }
         // v7.13.0 — CHECK constraint enforcement (mailrs round-5 G3).
         enforce_check_constraints(self.active_catalog(), &stmt.table, &all_values)?;
-        // v7.9.19 — composite UNIQUE / PRIMARY KEY enforcement.
-        enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
-        // v7.9.29 — CREATE UNIQUE INDEX [WHERE pred] enforcement.
-        // Independent of table-level UniquenessConstraint (which
-        // can't carry a predicate). Walks the table's indexes;
-        // for each `is_unique` index, only rows whose
-        // partial_predicate evaluates truthy are checked for
-        // collision. mailrs K1.
-        enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
+        // NOTE (mailrs embed round-12): UNIQUE / PRIMARY KEY and
+        // UNIQUE INDEX enforcement moved BELOW the ON CONFLICT
+        // resolution pass. Running them first made every
+        // `ON CONFLICT … DO UPDATE` upsert fail with a uniqueness
+        // violation before the conflict handler could route the row
+        // to an UPDATE — PG resolves the conflict action first and
+        // only errors on rows no arbiter matched.
         // v7.9.8 / v7.9.9 — ON CONFLICT handling.
         //   - `DO NOTHING` filters `all_values` to non-conflicting
         //     rows + drops within-batch duplicates.
@@ -6870,6 +6886,13 @@ impl Engine {
             }
             all_values = kept;
         }
+        // v7.9.19 — composite UNIQUE / PRIMARY KEY enforcement.
+        // v7.9.29 — CREATE UNIQUE INDEX [WHERE pred] enforcement.
+        // Both run on the post-ON-CONFLICT row set: conflicting rows
+        // already left `all_values` (DO NOTHING drop / DO UPDATE
+        // reroute), so what remains must be genuinely unique.
+        enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
+        enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
         // Stage 3 — insert all rows under a fresh mutable borrow.
         let table = self
             .active_catalog_mut()
@@ -7151,7 +7174,19 @@ impl Engine {
                 SelectItem::Wildcard => {
                     out.extend(schema_cols.iter().cloned());
                 }
-                SelectItem::Expr { alias, .. } => {
+                SelectItem::Expr { expr, alias } => {
+                    // Bare column references inherit the schema
+                    // column's name + type — PG names `RETURNING id`
+                    // "id" and types it BIGINT, and the sqlx embed
+                    // path type-checks RowDescription against the
+                    // Rust target (mailrs embed round-12).
+                    if let Expr::Column(col) = expr
+                        && let Some(sc) = schema_cols.iter().find(|c| c.name == col.name)
+                    {
+                        let name = alias.clone().unwrap_or_else(|| sc.name.clone());
+                        out.push(ColumnSchema::new(name, sc.ty, sc.nullable));
+                        continue;
+                    }
                     let name = alias.clone().unwrap_or_else(|| "?column?".to_string());
                     // Default to Text; the caller's row values
                     // carry the actual type. v6.10.2 scope.
@@ -9145,9 +9180,13 @@ fn resolve_col_literal_pair(
         Literal::String(s) => Value::Text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
-        // Vector and Interval literals can't be used as B-tree index keys.
-        // Tell the planner to fall back to full-scan.
-        Literal::Vector(_) | Literal::Interval { .. } => return None,
+        // Vector, array and Interval literals can't be used as B-tree
+        // index keys. Tell the planner to fall back to full-scan.
+        Literal::Vector(_)
+        | Literal::Interval { .. }
+        | Literal::TextArray(_)
+        | Literal::IntArray(_)
+        | Literal::BigIntArray(_) => return None,
     };
     Some((pos, v))
 }
@@ -9813,6 +9852,12 @@ impl Engine {
                 "__spg_pg_matviews" => {
                     let (schema, _) = synth_pg_views(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, Vec::new())?;
+                }
+                // pg_catalog.pg_extension — native capability list
+                // (mailrs embed round-12).
+                "__spg_pg_extension" => {
+                    let (schema, rows) = synth_pg_extension();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-57 — pg_catalog.pg_settings.
                 "__spg_pg_settings" => {
@@ -11392,6 +11437,34 @@ fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row>) {
 /// v7.17.0 Phase 3.P0-56 — synthesise `pg_catalog.pg_views`. PG's
 /// pg_views is a view listing every catalog view; SPG ships one
 /// row per declared view + its definition text.
+/// Synthesise `pg_catalog.pg_extension`. SPG ships its "extension"
+/// surfaces natively (vector, pg_trgm, plpgsql-shaped DO blocks), so
+/// the table lists those as installed — `SELECT … FROM pg_extension
+/// WHERE extname = 'vector'` probes from PG clients (mailrs embed
+/// round-12) answer truthfully about capability presence.
+fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("extname", DataType::Text, false),
+        ColumnSchema::new("extversion", DataType::Text, false),
+        ColumnSchema::new("extnamespace", DataType::Text, false),
+    ];
+    let exts: &[(&str, &str)] = &[("plpgsql", "1.0"), ("vector", "0.8.0"), ("pg_trgm", "1.6")];
+    let rows = exts
+        .iter()
+        .enumerate()
+        .map(|(i, (name, ver))| {
+            Row::new(alloc::vec![
+                Value::BigInt(16384 + i as i64),
+                Value::Text((*name).into()),
+                Value::Text((*ver).into()),
+                Value::Text("pg_catalog".into()),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
 fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
@@ -13458,6 +13531,22 @@ pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result
                     substitute_expr(e, params)?;
                 }
             }
+            // ON CONFLICT DO UPDATE assignments / WHERE can carry
+            // placeholders too (`… DO UPDATE SET reason = $2` —
+            // mailrs embed round-12).
+            if let Some(clause) = &mut ins.on_conflict
+                && let spg_sql::ast::OnConflictAction::Update {
+                    assignments,
+                    where_,
+                } = &mut clause.action
+            {
+                for (_, e) in assignments.iter_mut() {
+                    substitute_expr(e, params)?;
+                }
+                if let Some(w) = where_ {
+                    substitute_expr(w, params)?;
+                }
+            }
         }
         Statement::Update(u) => {
             for (_, e) in &mut u.assignments {
@@ -13824,13 +13913,13 @@ fn value_to_literal(v: Value) -> Literal {
         // engine's coerce_value already accepts that on the
         // text → bytea direction.
         Value::Bytes(b) => Literal::String(eval::format_bytea_hex(&b)),
-        // v7.16.0 — array round-trip for the spg-sqlx Bind
-        // path. Render as PG external form `{a,b,c}`; the
-        // engine's text → array coerce (just below in
-        // coerce_value) accepts it on the matching column type.
-        Value::TextArray(items) => Literal::String(eval::format_text_array(&items)),
-        Value::IntArray(items) => Literal::String(eval::format_int_array(&items)),
-        Value::BigIntArray(items) => Literal::String(eval::format_bigint_array(&items)),
+        // Arrays ride the AST natively (mailrs embed round-12) —
+        // the prior `{a,b,c}` text form only worked where a column
+        // type drove the re-parse; `= ANY($1)` has no column
+        // context and saw a bare Text value.
+        Value::TextArray(items) => Literal::TextArray(items),
+        Value::IntArray(items) => Literal::IntArray(items),
+        Value::BigIntArray(items) => Literal::BigIntArray(items),
         Value::Interval { months, micros } => Literal::Interval {
             months,
             micros,
@@ -13858,6 +13947,38 @@ fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>) {
                 for e in row {
                     rewrite_expr_clock(e, now);
                 }
+            }
+            // `ON CONFLICT … DO UPDATE SET created_at = NOW()` —
+            // the upsert assignments carry clock calls too (mailrs
+            // embed round-12).
+            if let Some(clause) = &mut ins.on_conflict
+                && let spg_sql::ast::OnConflictAction::Update {
+                    assignments,
+                    where_,
+                } = &mut clause.action
+            {
+                for (_, e) in assignments.iter_mut() {
+                    rewrite_expr_clock(e, now);
+                }
+                if let Some(w) = where_ {
+                    rewrite_expr_clock(w, now);
+                }
+            }
+        }
+        // `UPDATE … SET seen_at = NOW() WHERE …` / `DELETE … WHERE
+        // ts < NOW()` (mailrs embed round-12 — previously only
+        // SELECT / INSERT-rows were walked).
+        Statement::Update(u) => {
+            for (_, e) in &mut u.assignments {
+                rewrite_expr_clock(e, now);
+            }
+            if let Some(w) = &mut u.where_ {
+                rewrite_expr_clock(w, now);
+            }
+        }
+        Statement::Delete(d) => {
+            if let Some(w) = &mut d.where_ {
+                rewrite_expr_clock(w, now);
             }
         }
         _ => {}
@@ -16894,6 +17015,9 @@ fn literal_to_value(l: Literal) -> Value {
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,
         Literal::Vector(v) => Value::Vector(v),
+        Literal::TextArray(items) => Value::TextArray(items),
+        Literal::IntArray(items) => Value::IntArray(items),
+        Literal::BigIntArray(items) => Value::BigIntArray(items),
         Literal::Interval { months, micros, .. } => Value::Interval { months, micros },
     }
 }

@@ -18,9 +18,13 @@ use crate::database::Spg;
 use crate::type_info::{Kind, SpgTypeInfo};
 use crate::value::SpgValueRef;
 
-// ---- Vec<i32> / INT[] ----
+// ---- [i32] + Vec<i32> / INT[] ----
+//
+// Encode lives on the unsized slice `[T]`; `Vec<T>` delegates and
+// `&[T]` comes for free through sqlx-core's blanket `Encode for &T` +
+// `Type for &T` impls (mailrs binds `= ANY($1)` params as `&[i64]`).
 
-impl Type<Spg> for Vec<i32> {
+impl Type<Spg> for [i32] {
     fn type_info() -> SpgTypeInfo {
         // No dedicated array kind in the v7.16.0 type_info — the
         // engine stores arrays as IntArray/BigIntArray/TextArray
@@ -34,23 +38,41 @@ impl Type<Spg> for Vec<i32> {
     }
 }
 
-impl<'q> Encode<'q, Spg> for Vec<i32> {
+impl Type<Spg> for Vec<i32> {
+    fn type_info() -> SpgTypeInfo {
+        <[i32] as Type<Spg>>::type_info()
+    }
+    fn compatible(_ty: &SpgTypeInfo) -> bool {
+        true
+    }
+}
+
+impl<'q> Encode<'q, Spg> for [i32] {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
-        // PG external form `{1,2,3}`.
-        let mut s = String::from("{");
-        for (i, v) in self.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&v.to_string());
-        }
-        s.push('}');
+        // Native engine array — `= ANY($1)` and INT[] column coerce
+        // both take it directly (the prior `{1,2,3}` text form only
+        // worked through column-typed coercion; ANY() has no column
+        // context — mailrs embed round-12).
         buf.push(SpgArgumentValue {
-            value: EngineValue::Text(s),
-            type_info: Some(<Vec<i32> as Type<Spg>>::type_info()),
+            value: EngineValue::IntArray(self.iter().map(|v| Some(*v)).collect()),
+            type_info: Some(<[i32] as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
         Ok(IsNull::No)
+    }
+}
+
+impl<'q> Encode<'q, Spg> for Vec<i32> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        self.as_slice().encode_by_ref(buf)
+    }
+}
+
+// sqlx-core's blanket `Encode for &T` requires `T: Sized`, so the
+// borrowed-slice form needs its own impl (delegates to `[i32]`).
+impl<'q> Encode<'q, Spg> for &'q [i32] {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        (**self).encode_by_ref(buf)
     }
 }
 
@@ -70,7 +92,7 @@ impl<'r> Decode<'r, Spg> for Vec<i32> {
 
 // ---- Vec<i64> / BIGINT[] ----
 
-impl Type<Spg> for Vec<i64> {
+impl Type<Spg> for [i64] {
     fn type_info() -> SpgTypeInfo {
         SpgTypeInfo::of(Kind::Text)
     }
@@ -79,22 +101,37 @@ impl Type<Spg> for Vec<i64> {
     }
 }
 
-impl<'q> Encode<'q, Spg> for Vec<i64> {
+impl Type<Spg> for Vec<i64> {
+    fn type_info() -> SpgTypeInfo {
+        <[i64] as Type<Spg>>::type_info()
+    }
+    fn compatible(_ty: &SpgTypeInfo) -> bool {
+        true
+    }
+}
+
+impl<'q> Encode<'q, Spg> for [i64] {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
-        let mut s = String::from("{");
-        for (i, v) in self.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&v.to_string());
-        }
-        s.push('}');
         buf.push(SpgArgumentValue {
-            value: EngineValue::Text(s),
-            type_info: Some(<Vec<i64> as Type<Spg>>::type_info()),
+            value: EngineValue::BigIntArray(self.iter().map(|v| Some(*v)).collect()),
+            type_info: Some(<[i64] as Type<Spg>>::type_info()),
             _phantom: core::marker::PhantomData,
         });
         Ok(IsNull::No)
+    }
+}
+
+impl<'q> Encode<'q, Spg> for Vec<i64> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        self.as_slice().encode_by_ref(buf)
+    }
+}
+
+// sqlx-core's blanket `Encode for &T` requires `T: Sized`, so the
+// borrowed-slice form needs its own impl (delegates to `[i64]`).
+impl<'q> Encode<'q, Spg> for &'q [i64] {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        (**self).encode_by_ref(buf)
     }
 }
 
@@ -112,7 +149,7 @@ impl<'r> Decode<'r, Spg> for Vec<i64> {
 
 // ---- Vec<String> / TEXT[] ----
 
-impl Type<Spg> for Vec<String> {
+impl Type<Spg> for [String] {
     fn type_info() -> SpgTypeInfo {
         SpgTypeInfo::of(Kind::Text)
     }
@@ -121,31 +158,86 @@ impl Type<Spg> for Vec<String> {
     }
 }
 
+impl Type<Spg> for Vec<String> {
+    fn type_info() -> SpgTypeInfo {
+        <[String] as Type<Spg>>::type_info()
+    }
+    fn compatible(_ty: &SpgTypeInfo) -> bool {
+        true
+    }
+}
+
+/// Native engine text array (see the [i32] note — ANY() needs the
+/// real array value, not the `{"a","b"}` external text form).
+fn encode_text_array<'q, S: AsRef<str>>(
+    items: impl Iterator<Item = S>,
+    buf: &mut Vec<SpgArgumentValue<'q>>,
+) -> Result<IsNull, BoxDynError> {
+    buf.push(SpgArgumentValue {
+        value: EngineValue::TextArray(items.map(|v| Some(v.as_ref().to_string())).collect()),
+        type_info: Some(<[String] as Type<Spg>>::type_info()),
+        _phantom: core::marker::PhantomData,
+    });
+    Ok(IsNull::No)
+}
+
+impl<'q> Encode<'q, Spg> for [String] {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        encode_text_array(self.iter(), buf)
+    }
+}
+
 impl<'q> Encode<'q, Spg> for Vec<String> {
     fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
-        // PG external form `{"a","b","c"}` — quote every element
-        // so commas and braces inside payloads survive.
-        let mut s = String::from("{");
-        for (i, v) in self.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push('"');
-            for ch in v.chars() {
-                if ch == '\\' || ch == '"' {
-                    s.push('\\');
-                }
-                s.push(ch);
-            }
-            s.push('"');
-        }
-        s.push('}');
-        buf.push(SpgArgumentValue {
-            value: EngineValue::Text(s),
-            type_info: Some(<Vec<String> as Type<Spg>>::type_info()),
-            _phantom: core::marker::PhantomData,
-        });
-        Ok(IsNull::No)
+        self.as_slice().encode_by_ref(buf)
+    }
+}
+
+// sqlx-core's blanket `Encode for &T` requires `T: Sized`, so the
+// borrowed-slice form needs its own impl (delegates to `[String]`).
+impl<'q> Encode<'q, Spg> for &'q [String] {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        (**self).encode_by_ref(buf)
+    }
+}
+
+// `&[&str]` / `Vec<&str>` — borrowed text arrays bind too.
+
+impl Type<Spg> for [&str] {
+    fn type_info() -> SpgTypeInfo {
+        SpgTypeInfo::of(Kind::Text)
+    }
+    fn compatible(_ty: &SpgTypeInfo) -> bool {
+        true
+    }
+}
+
+impl Type<Spg> for Vec<&str> {
+    fn type_info() -> SpgTypeInfo {
+        <[&str] as Type<Spg>>::type_info()
+    }
+    fn compatible(_ty: &SpgTypeInfo) -> bool {
+        true
+    }
+}
+
+impl<'q> Encode<'q, Spg> for [&str] {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        encode_text_array(self.iter(), buf)
+    }
+}
+
+impl<'q> Encode<'q, Spg> for Vec<&str> {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        self.as_slice().encode_by_ref(buf)
+    }
+}
+
+// sqlx-core's blanket `Encode for &T` requires `T: Sized`, so the
+// borrowed-slice form needs its own impl (delegates to `[&str]`).
+impl<'q> Encode<'q, Spg> for &'q [&str] {
+    fn encode_by_ref(&self, buf: &mut Vec<SpgArgumentValue<'q>>) -> Result<IsNull, BoxDynError> {
+        (**self).encode_by_ref(buf)
     }
 }
 

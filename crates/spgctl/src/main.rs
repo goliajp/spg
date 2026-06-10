@@ -58,6 +58,39 @@ fn main() {
         Some("version") => {
             println!("spg {}", env!("CARGO_PKG_VERSION"));
         }
+        Some("import") => {
+            // Offline bulk-load: open (or create) a catalog file and
+            // execute every statement of a SQL script against it.
+            // The server can be down or absent — this is the
+            // pg_dump → embedded-catalog migration path (mailrs
+            // embed round-12).
+            let mut db_path: Option<String> = None;
+            let mut file: Option<String> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--db" => db_path = args.next(),
+                    "--file" => file = args.next(),
+                    other => {
+                        die(&format!("import: unknown arg {other:?}"), 2);
+                    }
+                }
+            }
+            let (Some(db_path), Some(file)) = (db_path, file) else {
+                die(
+                    "usage: spg import --db <catalog.spg> --file <script.sql>",
+                    2,
+                );
+                return;
+            };
+            match import_script(&db_path, &file) {
+                Ok((stmts, affected)) => {
+                    println!(
+                        "imported {stmts} statements ({affected} rows affected) into {db_path}"
+                    );
+                }
+                Err(e) => die(&format!("import failed: {e}"), 1),
+            }
+        }
         Some(verb @ ("backup" | "restore")) => {
             let Some(src) = args.next() else {
                 die(&format!("usage: spg {verb} <src> <dst>"), 2);
@@ -1493,6 +1526,36 @@ fn format_value(v: &WireValue) -> String {
             s
         }
     }
+}
+
+/// `spg import` — execute a multi-statement SQL script against an
+/// on-disk catalog, creating it when absent. Statements run in file
+/// order; the first error aborts with the failing statement's index
+/// and a snippet (WAL keeps everything already executed — re-running
+/// after a fix re-applies from the top, so import into a FRESH
+/// catalog or make the script idempotent).
+fn import_script(db_path: &str, file: &str) -> Result<(usize, usize), String> {
+    let script = std::fs::read_to_string(file).map_err(|e| format!("read {file:?}: {e}"))?;
+    let mut db =
+        spg_embedded::Database::open_path(db_path).map_err(|e| format!("open {db_path:?}: {e}"))?;
+    let mut stmts = 0usize;
+    let mut affected = 0usize;
+    for (i, stmt) in spg_embedded::split_statements(&script).iter().enumerate() {
+        match db.execute(stmt) {
+            Ok(spg_embedded::QueryResult::CommandOk { affected: n, .. }) => {
+                stmts += 1;
+                affected += n;
+            }
+            Ok(_) => {
+                stmts += 1;
+            }
+            Err(e) => {
+                let snippet: String = stmt.trim().chars().take(120).collect();
+                return Err(format!("statement #{}: {e:?}\n  {snippet}…", i + 1));
+            }
+        }
+    }
+    Ok((stmts, affected))
 }
 
 #[cfg(test)]

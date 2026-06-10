@@ -59,21 +59,39 @@ fn drop_releases_lock() {
 }
 
 #[test]
-fn force_unlock_clears_stale_lock() {
+fn force_unlock_clears_live_lock() {
     let p = tmpdb("force");
-    // Manually create a stale lock dir.
+    // Manually create a lock dir owned by a LIVE pid (our own) —
+    // the round-12 liveness probe must treat it as held.
     let mut lock_path = p.clone();
     let name = lock_path.file_name().unwrap().to_os_string();
     let mut s = name.clone();
     s.push(".lock");
     lock_path.set_file_name(s);
     std::fs::create_dir_all(&lock_path).unwrap();
+    std::fs::write(lock_path.join("pid"), std::process::id().to_string()).unwrap();
     // Now confirm open fails…
     assert!(Database::open_path(&p).is_err());
     // …and force_unlock clears it.
     Database::force_unlock(&p).unwrap();
     assert!(!lock_path.exists());
     // …and a clean open now succeeds.
+    let _db = Database::open_path(&p).unwrap();
+}
+
+#[test]
+fn stale_lock_without_owner_is_reclaimed() {
+    // Round-12: a lock dir with no recorded owner pid (crash between
+    // mkdir and pid write, or a pre-round-12 leftover) is stale by
+    // definition — open reclaims it instead of erroring (a SIGKILL'd
+    // mail server must not need manual lock surgery to restart).
+    let p = tmpdb("stale");
+    let mut lock_path = p.clone();
+    let name = lock_path.file_name().unwrap().to_os_string();
+    let mut s = name.clone();
+    s.push(".lock");
+    lock_path.set_file_name(s);
+    std::fs::create_dir_all(&lock_path).unwrap();
     let _db = Database::open_path(&p).unwrap();
 }
 
