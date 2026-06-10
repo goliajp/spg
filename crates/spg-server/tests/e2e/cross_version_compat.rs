@@ -1,16 +1,3 @@
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::doc_markdown,
-    clippy::doc_overindented_list_items,
-    clippy::manual_assert,
-    clippy::uninlined_format_args,
-    clippy::unnecessary_debug_formatting,
-    clippy::unreadable_literal,
-    unused_mut,
-    unused_variables
-)]
-
 //! v4.31 — cross-version snapshot + WAL compatibility gate.
 //!
 //! Walks `xtests/compat-fixtures/<version>/` directories. Each
@@ -34,14 +21,13 @@
 //! adds the directory here. The test then guards every prior
 //! version.
 
+use crate::common;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use spg_wire::{Frame, Op, WireValue, build_query, encode, parse_data_row, parse_data_row_batch};
-
-mod common;
 
 fn local_spawn(
     db: &std::path::Path,

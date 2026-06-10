@@ -513,3 +513,21 @@ mod e2e_window;
 mod e2e_window_ext;
 #[allow(clippy::doc_markdown, clippy::float_cmp, clippy::uninlined_format_args)]
 mod e2e_window_frames;
+
+#[allow(unsafe_code)]
+mod chaos_compact_atomic;
+#[allow(unsafe_code)]
+mod chaos_wal_compression_torn_write;
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::doc_overindented_list_items,
+    clippy::manual_assert,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_debug_formatting,
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
+)]
+mod cross_version_compat;

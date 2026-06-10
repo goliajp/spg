@@ -21,16 +21,13 @@
 //! until the next CHECKPOINT writes them into the manifest. A
 //! crash between compaction and CHECKPOINT must roll back cleanly.
 
-#![allow(unsafe_code)]
-
+use crate::common;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use spg_wire::{Op, build_query, encode, parse_data_row_batch, parse_error_response};
-
-mod common;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
