@@ -118,7 +118,13 @@ fn percentile(samples: &mut [u64], p: f64) -> u64 {
     samples[idx.min(samples.len() - 1)]
 }
 
-fn summary(backend: &str, concurrency: usize, workload: &'static str, mut lats: Vec<u64>, elapsed: Duration) -> Stats {
+fn summary(
+    backend: &str,
+    concurrency: usize,
+    workload: &'static str,
+    mut lats: Vec<u64>,
+    elapsed: Duration,
+) -> Stats {
     let n = lats.len() as f64;
     let elapsed_s = elapsed.as_secs_f64().max(1e-9);
     Stats {
@@ -262,7 +268,12 @@ async fn spg_pool_mixed(pool: &SpgPool, iters: usize, rows: i32, concur: usize) 
 // AsyncReadHandle bare fan-out (escape-hatch baseline)
 // -----------------------------------------------------------------
 
-async fn read_handle_pk_select(db: &AsyncDatabase, iters: usize, rows: i32, concur: usize) -> Stats {
+async fn read_handle_pk_select(
+    db: &AsyncDatabase,
+    iters: usize,
+    rows: i32,
+    concur: usize,
+) -> Stats {
     let sem = Arc::new(Semaphore::new(concur));
     let lats = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(iters)));
     let t0 = Instant::now();
@@ -449,7 +460,9 @@ fn print_markdown_table(results: &[Stats]) {
             .then(a.workload.cmp(b.workload))
             .then(a.concurrency.cmp(&b.concurrency))
     });
-    println!("| Backend | Workload | Concurrency | Throughput (q/s) | p50 (us) | p99 (us) | p999 (us) | Elapsed (ms) |");
+    println!(
+        "| Backend | Workload | Concurrency | Throughput (q/s) | p50 (us) | p99 (us) | p999 (us) | Elapsed (ms) |"
+    );
     println!("|---|---|---:|---:|---:|---:|---:|---:|");
     for s in &sorted {
         if s.available {
@@ -579,7 +592,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         eprintln!("[skipped] PG container not reachable at {PG_URL}");
-        eprintln!("         (run `docker compose -f xbench/competitor/docker-compose.yml up -d postgres` to enable)");
+        eprintln!(
+            "         (run `docker compose -f xbench/competitor/docker-compose.yml up -d postgres` to enable)"
+        );
         for &concur in CONCURRENCIES {
             for workload in ["pk-select", "range-scan", "mixed-9to1"] {
                 results.push(Stats::unavailable("PgPool", concur, workload));

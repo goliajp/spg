@@ -11,10 +11,10 @@
 
 use spg_embedded::retention_sweep_once;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-fn make_chunk(wal_dir: &PathBuf, age_secs: i64, lsn: u64) -> PathBuf {
+fn make_chunk(wal_dir: &Path, age_secs: i64, lsn: u64) -> PathBuf {
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_micros()) as i64;
