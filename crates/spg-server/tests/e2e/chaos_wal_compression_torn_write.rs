@@ -14,8 +14,7 @@
 //!   4. Verify replay surfaces (N-1) committed rows. The trailing
 //!      torn record is dropped without crashing recovery.
 
-#![allow(unsafe_code)]
-
+use crate::common;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -23,8 +22,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use spg_wire::{Op, build_query, encode, parse_data_row_batch, parse_error_response};
-
-mod common;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
