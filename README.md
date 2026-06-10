@@ -165,10 +165,14 @@ operator playbook.
 
 ### Tests
 
+The surface is split into five categories — lint / unit / e2e / gates /
+biz — with a fast and a `--full` tier; see [`docs/TESTING.md`](docs/TESTING.md).
+
 ```sh
-cargo test --workspace          # everything
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all --check
+scripts/gate.sh all              # full battery (fast tier)
+scripts/gate.sh e2e              # one category
+scripts/gate.sh gates --full     # long-running perf tiers
+scripts/test-on-mini.sh e2e      # offload a category to the LAN testbed
 ```
 
 ## Status
