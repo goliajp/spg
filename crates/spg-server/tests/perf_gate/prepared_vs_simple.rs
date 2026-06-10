@@ -1,20 +1,8 @@
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::similar_names,
-    clippy::uninlined_format_args,
-    clippy::unreadable_literal,
-    unused_variables
-)]
-
 //! v6.1.1 — micro-bench comparing PG-wire Simple Query (Q) vs
 //! Extended Query (Parse / Bind / Execute) for a point-SELECT.
 //!
 //! Ignored by default — invoke with
-//!   cargo test --release -p spg-server --test perf_prepared_vs_simple \
+//!   cargo test --release -p spg-server --test perf_gate \
 //!     -- --ignored --nocapture
 //!
 //! The Extended Query path caches the parsed AST under the
@@ -28,7 +16,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
     common::ServerBuilder::new()
@@ -203,6 +191,7 @@ fn vec_literal(rng_seed: u64, dim: usize) -> String {
 #[test]
 #[ignore]
 fn perf_prepared_vs_simple_select_p50() {
+    let _lock = crate::perf_lock();
     const N: usize = 5_000;
     const WARMUP: usize = 200;
 
@@ -284,6 +273,7 @@ fn perf_prepared_vs_simple_select_p50() {
 #[test]
 #[ignore]
 fn perf_prepared_vs_simple_vector_knn_p50() {
+    let _lock = crate::perf_lock();
     const N: usize = 1_000;
     const WARMUP: usize = 50;
     const DIM: usize = 128;

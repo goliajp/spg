@@ -1654,7 +1654,7 @@ SQL surface, no wire frame, and no catalog snapshot bump. The
 single-writer / RwLock-reader concurrency model documented in
 the engine docs is frozen as-is for v6.x.
 
-Bench harness: `crates/spg-server/tests/perf_concurrency.rs`
+Bench harness: `crates/spg-server/tests/perf_gate/concurrency.rs`
 (`#[ignore]`). Runs 8 / 16 / 32 concurrent native-wire clients
 under SELECT-only and mixed (75% SELECT / 25% INSERT) workloads;
 emits aggregate ops/sec + p99 latency per client count + per

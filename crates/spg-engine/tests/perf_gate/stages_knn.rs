@@ -1,20 +1,10 @@
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::similar_names,
-    clippy::unreadable_literal
-)]
-
 //! v6.1.2 perf exploration — stage-level timing for vector kNN.
 //!
 //! Sits *inside* the engine (no pgwire / TCP / wire encoding) and
 //! decomposes a prepared-statement kNN query into its measurable
 //! sub-stages so we can see where the 287µs pgwire p50 actually
 //! goes. Ignored by default — invoke with
-//!   cargo test --release -p spg-engine --test perf_stages_knn \
+//!   cargo test --release -p spg-engine --test perf_gate \
 //!     -- --ignored --nocapture
 
 extern crate alloc;
@@ -102,6 +92,7 @@ fn perf_stages_knn_p50_hnsw_100k() {
 }
 
 fn run_stage_bench(with_hnsw: bool, label: &str, rows: usize) {
+    let _lock = crate::perf_lock();
     let (mut eng, stmt) = setup_engine(with_hnsw, rows);
 
     // Pre-build all query vectors so seeding doesn't leak into timing.

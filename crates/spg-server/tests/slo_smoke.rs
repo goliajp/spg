@@ -1,3 +1,7 @@
+// Timing-sensitive perf/SLO target — meaningless under debug
+// codegen, so it only compiles in release (matches the
+// perf_gate convention).
+#![cfg(not(debug_assertions))]
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,

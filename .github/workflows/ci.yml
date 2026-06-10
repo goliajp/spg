@@ -112,11 +112,18 @@ jobs:
   perf_gate:
     name: perf_gate (release)
     runs-on: ubuntu-latest
-    # Every stone crate's `tests/perf_gate.rs` is wrapped in
+    # Every crate's perf_gate target is wrapped in
     # `#![cfg(not(debug_assertions))]`, so the workspace-wide debug
     # `test` job above produces empty perf_gate binaries. This job is
     # the real gate — release build, one crate at a time so a single
     # failure points at exactly which gate regressed.
+    #
+    # v7.21 — the standalone perf_* binaries (join_reorder /
+    # plan_cache / stages_knn in spg-engine; 1b_rows / concurrency /
+    # sq8 / parallel_freezer / prefetch / prepared_vs_simple in
+    # spg-server) were folded into per-crate perf_gate targets, so
+    # spg-server joined the loop. Fast tier runs here; the
+    # `#[ignore]`d full tier is `scripts/gate.sh gates --full`.
     #
     # Same gate policy as prod_ready / slo_smoke: PRs + integration /
     # release lines. Skipped on plain feature/bugfix pushes.
@@ -130,10 +137,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --release perf_gate × stone crates
+      - name: cargo test --release perf_gate × crates
         run: |
           set -euo pipefail
-          for crate in spg-audit spg-crypto spg-engine spg-sql spg-storage spg-wire spgctl; do
+          for crate in spg-audit spg-crypto spg-engine spg-sql spg-storage spg-wire spgctl spg-server; do
             echo "::group::perf_gate ${crate}"
             cargo test --release -p "${crate}" --test perf_gate --locked -- --test-threads=1 --nocapture
             echo "::endgroup::"

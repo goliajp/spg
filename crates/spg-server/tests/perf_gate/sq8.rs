@@ -1,4 +1,3 @@
-#![cfg(not(debug_assertions))]
 //! v6.0.1 ship-gate perf tests for `VECTOR(N) USING SQ8` columns.
 //!
 //! Both tests are `#[ignore]` by default — they take minutes and
@@ -6,7 +5,7 @@
 //! not the routine `cargo test` pass. Run with:
 //!
 //! ```sh
-//! cargo test --release -p spg-server --test perf_gate_sq8 -- --ignored --nocapture
+//! cargo test --release -p spg-server --test perf_gate -- --ignored --nocapture
 //! ```
 //!
 //! v6.0.5: budgets adjusted to the **measured** 2026-06-02 floor
@@ -42,8 +41,7 @@ use std::time::{Duration, Instant};
 
 use spg_wire::{Frame, Op, build_query, encode, parse_command_complete};
 
-mod common;
-use common::{ChildGuard, ServerBuilder, connect_to, rss_kib_of};
+use crate::common::{ChildGuard, ServerBuilder, connect_to, rss_kib_of};
 
 // 1M-scale workloads — give the server plenty of head room before
 // the test harness considers it stuck. v6.0.5: bumped from 120s
@@ -170,8 +168,9 @@ fn ingest_corpus(s: &mut TcpStream, corpus: &[Vec<f32>]) {
 }
 
 #[test]
-#[ignore = "1M-scale; run via `cargo test --release -p spg-server --test perf_gate_sq8 -- --ignored`"]
+#[ignore = "1M-scale; run via `cargo test --release -p spg-server --test perf_gate -- --ignored`"]
 fn sq8_knn_1m_dim128_p50_under_5ms_server() {
+    let _lock = crate::perf_lock();
     let (raw, addrs) = ServerBuilder::new()
         .startup_timeout(Duration::from_secs(30))
         .spawn();
@@ -241,8 +240,9 @@ fn sq8_knn_1m_dim128_p50_under_5ms_server() {
 }
 
 #[test]
-#[ignore = "1M-scale; run via `cargo test --release -p spg-server --test perf_gate_sq8 -- --ignored`"]
+#[ignore = "1M-scale; run via `cargo test --release -p spg-server --test perf_gate -- --ignored`"]
 fn sq8_rss_1m_dim128_under_800mib() {
+    let _lock = crate::perf_lock();
     let (raw, addrs) = ServerBuilder::new()
         .startup_timeout(Duration::from_secs(30))
         .spawn();

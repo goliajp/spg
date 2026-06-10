@@ -1,13 +1,3 @@
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::similar_names,
-    clippy::uninlined_format_args
-)]
-
 //! v6.2.3 ship-gate: the 5-table JOIN reorder must produce ≥ 10×
 //! speedup vs the source order on a workload where source order
 //! materialises an early cross-product.
@@ -86,6 +76,7 @@ fn five_table_join_sql() -> &'static str {
 
 #[test]
 fn five_table_join_speedup_vs_source_order() {
+    let _lock = crate::perf_lock();
     let mut eng_with_stats = setup_engine(true);
     let mut eng_no_stats = setup_engine(false);
     let sql = five_table_join_sql();

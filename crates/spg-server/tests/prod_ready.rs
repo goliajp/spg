@@ -225,8 +225,8 @@ fn row_3_9_cargo_deny_config_and_ci_present() {
 
 #[test]
 fn row_3_11_fuzz_harnesses_present() {
-    let sql_fuzz = workspace_root().join("crates/spg-sql/tests/fuzz.rs");
-    let wire_fuzz = workspace_root().join("crates/spg-server/tests/e2e_fuzz.rs");
+    let sql_fuzz = workspace_root().join("crates/spg-sql/tests/e2e/fuzz.rs");
+    let wire_fuzz = workspace_root().join("crates/spg-server/tests/e2e/e2e_fuzz.rs");
     assert!(
         sql_fuzz.exists(),
         "SQL fuzz harness must exist at {}",
@@ -247,7 +247,7 @@ fn row_3_11_fuzz_harnesses_present() {
 
 #[test]
 fn row_8_4_snapshot_backwards_compat_test_present() {
-    let p = workspace_root().join("crates/spg-server/tests/cross_version_compat.rs");
+    let p = workspace_root().join("crates/spg-server/tests/e2e/cross_version_compat.rs");
     assert!(p.exists(), "cross_version_compat.rs missing");
     let src = std::fs::read_to_string(&p).unwrap();
     assert!(src.contains("fn every_fixture_restores_and_verifies"));
@@ -315,7 +315,7 @@ fn row_2_5_restore_drill_doc_present() {
 
 #[test]
 fn row_2_6_restore_drill_e2e_test_present() {
-    let p = workspace_root().join("crates/spg-server/tests/e2e_restore_drill.rs");
+    let p = workspace_root().join("crates/spg-server/tests/e2e/e2e_restore_drill.rs");
     let src = std::fs::read_to_string(&p)
         .unwrap_or_else(|_| panic!("e2e_restore_drill.rs missing at {}", p.display()));
     assert!(
@@ -403,7 +403,7 @@ fn row_7_6_changelog_present() {
 /// PROD_READY row stays evidence-linked.
 #[test]
 fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
-    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let p = workspace_root().join("crates/spg-server/tests/e2e/e2e_chaos.rs");
     let src = std::fs::read_to_string(&p)
         .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", p.display()));
     assert!(
@@ -420,7 +420,7 @@ fn row_1_9_partial_fsync_recovery_covered_by_e2e_chaos() {
 /// engine + server source.
 #[test]
 fn row_1_8_storage_crc32_present_and_chaos_tested() {
-    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_chaos.rs");
     let chaos_src = std::fs::read_to_string(&chaos_path)
         .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", chaos_path.display()));
     assert!(
@@ -455,7 +455,7 @@ fn row_1_8_storage_crc32_present_and_chaos_tested() {
 /// no duplicates and no gaps.
 #[test]
 fn row_2_9_netsplit_chaos_covered_by_e2e() {
-    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos_netsplit.rs");
+    let p = workspace_root().join("crates/spg-server/tests/e2e/e2e_chaos_netsplit.rs");
     let src = std::fs::read_to_string(&p)
         .unwrap_or_else(|_| panic!("e2e_chaos_netsplit.rs missing at {}", p.display()));
     assert!(
@@ -470,7 +470,7 @@ fn row_2_9_netsplit_chaos_covered_by_e2e() {
 /// extension.
 #[test]
 fn row_4_7_replication_lag_metric_covered_by_e2e() {
-    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos_netsplit.rs");
+    let p = workspace_root().join("crates/spg-server/tests/e2e/e2e_chaos_netsplit.rs");
     let src = std::fs::read_to_string(&p)
         .unwrap_or_else(|_| panic!("e2e_chaos_netsplit.rs missing at {}", p.display()));
     assert!(
@@ -507,7 +507,7 @@ fn row_4_7_replication_lag_metric_covered_by_e2e() {
 /// plus the observability source declaring both series.
 #[test]
 fn row_4_6_per_table_metrics_covered_by_e2e() {
-    let test_path = workspace_root().join("crates/spg-server/tests/e2e_table_metrics.rs");
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_table_metrics.rs");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|_| panic!("e2e_table_metrics.rs missing at {}", test_path.display()));
     for needle in [
@@ -546,7 +546,7 @@ fn row_4_6_per_table_metrics_covered_by_e2e() {
 /// present and the dispatch code declares the knobs.
 #[test]
 fn row_1_11_in_memory_consistency_covered_by_e2e() {
-    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_chaos.rs");
     let chaos_src = std::fs::read_to_string(&chaos_path)
         .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", chaos_path.display()));
     assert!(
@@ -594,7 +594,7 @@ fn row_1_11_in_memory_consistency_covered_by_e2e() {
 /// real SIGTERM path; main.rs declares the env var + signal install.
 #[test]
 fn row_2_7_graceful_shutdown_covered_by_e2e() {
-    let test_path = workspace_root().join("crates/spg-server/tests/e2e_graceful_shutdown.rs");
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_graceful_shutdown.rs");
     let src = std::fs::read_to_string(&test_path).unwrap_or_else(|_| {
         panic!(
             "e2e_graceful_shutdown.rs missing at {}",
@@ -622,7 +622,7 @@ fn row_2_7_graceful_shutdown_covered_by_e2e() {
 /// test asserts both above- and below-threshold paths.
 #[test]
 fn row_4_5_slow_query_log_covered_by_e2e() {
-    let test_path = workspace_root().join("crates/spg-server/tests/e2e_slow_query_log.rs");
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_slow_query_log.rs");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|_| panic!("e2e_slow_query_log.rs missing at {}", test_path.display()));
     assert!(
@@ -646,7 +646,7 @@ fn row_4_5_slow_query_log_covered_by_e2e() {
 /// while reads still serve. Evidence: e2e + statvfs wiring.
 #[test]
 fn row_5_7_disk_watermark_covered_by_e2e() {
-    let test_path = workspace_root().join("crates/spg-server/tests/e2e_disk_watermark.rs");
+    let test_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_disk_watermark.rs");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|_| panic!("e2e_disk_watermark.rs missing at {}", test_path.display()));
     assert!(
@@ -669,7 +669,7 @@ fn row_5_7_disk_watermark_covered_by_e2e() {
 /// as a presence check.
 #[test]
 fn row_1_10_disk_full_covered_by_e2e_chaos() {
-    let p = workspace_root().join("crates/spg-server/tests/e2e_chaos.rs");
+    let p = workspace_root().join("crates/spg-server/tests/e2e/e2e_chaos.rs");
     let src = std::fs::read_to_string(&p)
         .unwrap_or_else(|_| panic!("e2e_chaos.rs missing at {}", p.display()));
     assert!(
@@ -871,12 +871,19 @@ fn row_9_2_perf_gates_present() {
         "spg-audit",
         "spg-engine",
         "spgctl",
+        // v7.21 — spg-server gained a merged perf_gate target when
+        // the standalone perf_* binaries were folded in.
+        "spg-server",
     ] {
-        let p = root.join(format!("crates/{crate_name}/tests/perf_gate.rs"));
+        // Either layout is canonical: single-file target or the
+        // merged-directory target (tests/perf_gate/main.rs).
+        let single = root.join(format!("crates/{crate_name}/tests/perf_gate.rs"));
+        let merged = root.join(format!("crates/{crate_name}/tests/perf_gate/main.rs"));
         assert!(
-            p.exists(),
-            "perf_gate.rs missing for {crate_name}; expected at {}",
-            p.display()
+            single.exists() || merged.exists(),
+            "perf_gate target missing for {crate_name}; expected {} or {}",
+            single.display(),
+            merged.display()
         );
     }
 }
@@ -1002,7 +1009,7 @@ fn row_2_10_fast_restart_at_scale_covered_by_e2e() {
     );
 
     // e2e_manifest.rs has the CI gate + the #[ignore]-marked 100M release-process gate.
-    let e2e_path = workspace_root().join("crates/spg-server/tests/e2e_manifest.rs");
+    let e2e_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_manifest.rs");
     let e2e_src = std::fs::read_to_string(&e2e_path)
         .unwrap_or_else(|_| panic!("e2e_manifest.rs missing at {}", e2e_path.display()));
     for fn_name in [
@@ -1104,7 +1111,7 @@ fn row_1_12_async_commit_durability_window_covered_by_e2e() {
     }
 
     // e2e_async_commit.rs pins functional invariants (sync vs async visibility).
-    let async_e2e_path = workspace_root().join("crates/spg-server/tests/e2e_async_commit.rs");
+    let async_e2e_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_async_commit.rs");
     let async_e2e_src = std::fs::read_to_string(&async_e2e_path).unwrap_or_else(|_| {
         panic!(
             "e2e_async_commit.rs missing at {}",
@@ -1123,7 +1130,7 @@ fn row_1_12_async_commit_durability_window_covered_by_e2e() {
     }
 
     // e2e_flusher.rs pins the env-knob parser + lifecycle + lag metrics.
-    let flusher_e2e_path = workspace_root().join("crates/spg-server/tests/e2e_flusher.rs");
+    let flusher_e2e_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_flusher.rs");
     let flusher_e2e_src = std::fs::read_to_string(&flusher_e2e_path)
         .unwrap_or_else(|_| panic!("e2e_flusher.rs missing at {}", flusher_e2e_path.display()));
     for fn_name in [
@@ -1141,7 +1148,7 @@ fn row_1_12_async_commit_durability_window_covered_by_e2e() {
     }
 
     // e2e_chaos_async_commit.rs pins the bounded-loss invariant.
-    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e_chaos_async_commit.rs");
+    let chaos_path = workspace_root().join("crates/spg-server/tests/e2e/e2e_chaos_async_commit.rs");
     let chaos_src = std::fs::read_to_string(&chaos_path).unwrap_or_else(|_| {
         panic!(
             "e2e_chaos_async_commit.rs missing at {}",
@@ -1200,7 +1207,7 @@ fn row_5_5_per_query_memory_cap_covered_by_e2e() {
         "main.rs must parse the SPG_MAX_QUERY_BYTES knob"
     );
     let e2e = std::fs::read_to_string(
-        workspace_root().join("crates/spg-server/tests/e2e_query_budget.rs"),
+        workspace_root().join("crates/spg-server/tests/e2e/e2e_query_budget.rs"),
     )
     .expect("e2e_query_budget.rs");
     assert!(
@@ -1216,7 +1223,7 @@ fn row_5_5_per_query_memory_cap_covered_by_e2e() {
 #[test]
 fn row_5_6_memory_exhaustion_survives_covered_by_e2e() {
     let e2e = std::fs::read_to_string(
-        workspace_root().join("crates/spg-server/tests/e2e_query_budget.rs"),
+        workspace_root().join("crates/spg-server/tests/e2e/e2e_query_budget.rs"),
     )
     .expect("e2e_query_budget.rs");
     assert!(
@@ -1237,8 +1244,8 @@ fn row_5_6_memory_exhaustion_survives_covered_by_e2e() {
 #[test]
 fn row_6_11_vector_encoding_alternatives_covered_by_e2e() {
     for path in [
-        "crates/spg-server/tests/e2e_sq8.rs",
-        "crates/spg-server/tests/e2e_half.rs",
+        "crates/spg-server/tests/e2e/e2e_sq8.rs",
+        "crates/spg-server/tests/e2e/e2e_half.rs",
     ] {
         let body = std::fs::read_to_string(workspace_root().join(path))
             .unwrap_or_else(|_| panic!("{path} missing"));
@@ -1255,7 +1262,7 @@ fn row_6_11_vector_encoding_alternatives_covered_by_e2e() {
 /// present.
 #[test]
 fn row_6_12_vector_knn_1m_scale_perf_gate_present() {
-    let path = "crates/spg-server/tests/perf_gate_sq8.rs";
+    let path = "crates/spg-server/tests/perf_gate/sq8.rs";
     let body = std::fs::read_to_string(workspace_root().join(path))
         .unwrap_or_else(|_| panic!("{path} missing"));
     assert!(
@@ -1274,7 +1281,7 @@ fn row_6_12_vector_knn_1m_scale_perf_gate_present() {
 /// directions.
 #[test]
 fn row_6_13_alter_index_rebuild_covered_by_e2e() {
-    let path = "crates/spg-server/tests/e2e_alter_rebuild.rs";
+    let path = "crates/spg-server/tests/e2e/e2e_alter_rebuild.rs";
     let body = std::fs::read_to_string(workspace_root().join(path)).expect("e2e_alter_rebuild.rs");
     assert!(
         body.contains("ALTER INDEX") && body.contains("REBUILD"),
