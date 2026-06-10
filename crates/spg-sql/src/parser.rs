@@ -6135,6 +6135,24 @@ impl Parser {
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
+        // v7.20 — PG reserves the table-constraint keywords, so a
+        // BARE `UNIQUE` / `PRIMARY` / … in column position is a
+        // malformed constraint clause (e.g. `UNIQUE a` missing its
+        // parens), not a column named "unique". Since v7.17's
+        // unknown-type leniency (`user_type_ref`) such a clause
+        // would otherwise parse as a column with a user-defined
+        // type — silently accepting invalid DDL. Quoted
+        // identifiers ("unique" / `unique`) remain valid names.
+        if let Token::Ident(s) = self.peek()
+            && ["unique", "primary", "foreign", "constraint", "check", "references", "exclude"]
+                .iter()
+                .any(|kw| s.eq_ignore_ascii_case(kw))
+        {
+            return Err(self.err(alloc::format!(
+                "unexpected reserved keyword '{s}' at start of column definition \
+                 (malformed table constraint?)"
+            )));
+        }
         let name = self.expect_ident_like()?;
         let (
             ty,
