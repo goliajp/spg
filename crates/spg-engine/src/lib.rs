@@ -7387,12 +7387,48 @@ impl Engine {
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
         let mut projected_rows: alloc::vec::Vec<Row> =
             alloc::vec::Vec::with_capacity(filtered.len());
-        for row in &filtered {
-            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
-            for p in &projection {
-                vals.push(eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?);
+        // v7.19 P5 — Set-Returning-Function in projection
+        // position (PG `SELECT unnest(arr) FROM t` shape). When a
+        // SELECT item evaluates to a top-level unnest(arr) call,
+        // expand it: for each input row, evaluate the array, emit
+        // one output row per element, broadcasting non-SRF
+        // projections from the same input row. Multi-SRF + LCM
+        // padding stays a documented carve-out; mailrs uses
+        // single-SRF for redirect_uris.
+        let srf_position = projection.iter().position(|p| is_top_level_unnest(&p.expr));
+        if let Some(srf_idx) = srf_position {
+            let srf_arg = top_level_unnest_arg(&projection[srf_idx].expr)
+                .expect("checked by is_top_level_unnest above");
+            for row in &filtered {
+                let arr_val =
+                    eval::eval_expr(srf_arg, row, &scan_ctx).map_err(EngineError::Eval)?;
+                let elements = array_value_to_elements(&arr_val)?;
+                // Empty array → zero rows for this input row (PG
+                // semantics: `SELECT unnest('{}'::int[])` returns
+                // 0 rows, not a single NULL row).
+                for elem in elements {
+                    let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+                    for (i, p) in projection.iter().enumerate() {
+                        if i == srf_idx {
+                            vals.push(elem.clone());
+                        } else {
+                            vals.push(
+                                eval::eval_expr(&p.expr, row, &scan_ctx)
+                                    .map_err(EngineError::Eval)?,
+                            );
+                        }
+                    }
+                    projected_rows.push(Row::new(vals));
+                }
             }
-            projected_rows.push(Row::new(vals));
+        } else {
+            for row in &filtered {
+                let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+                for p in &projection {
+                    vals.push(eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?);
+                }
+                projected_rows.push(Row::new(vals));
+            }
         }
         // ORDER BY / LIMIT — apply on the projected rows (cheap;
         // unnest result sets are small by design).
@@ -7793,6 +7829,14 @@ impl Engine {
         }
 
         let projection = build_projection(&stmt.items, schema_cols, alias)?;
+        // v7.19 P5 — single-table SELECT path for SRF
+        // `SELECT unnest(arr) FROM t` shape. Detect a top-level
+        // unnest in the projection list. When present, the
+        // per-row processor emits one output row per array
+        // element (broadcasting non-SRF projections from the
+        // same input row). Empty / NULL arrays emit zero rows
+        // for that input — PG semantics.
+        let srf_position = projection.iter().position(|p| is_top_level_unnest(&p.expr));
 
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
@@ -7812,16 +7856,34 @@ impl Engine {
                     return Ok(());
                 }
             }
-            let mut values = Vec::with_capacity(projection.len());
-            for p in &projection {
-                values.push(eval::eval_expr(&p.expr, row, &ctx)?);
-            }
             let order_keys = if stmt.order_by.is_empty() {
                 Vec::new()
             } else {
                 build_order_keys(&stmt.order_by, row, &ctx)?
             };
-            tagged.push((order_keys, Row::new(values)));
+            if let Some(srf_idx) = srf_position {
+                let srf_arg = top_level_unnest_arg(&projection[srf_idx].expr)
+                    .expect("checked by is_top_level_unnest above");
+                let arr_val = eval::eval_expr(srf_arg, row, &ctx)?;
+                let elements = array_value_to_elements(&arr_val)?;
+                for elem in elements {
+                    let mut values = Vec::with_capacity(projection.len());
+                    for (i, p) in projection.iter().enumerate() {
+                        if i == srf_idx {
+                            values.push(elem.clone());
+                        } else {
+                            values.push(eval::eval_expr(&p.expr, row, &ctx)?);
+                        }
+                    }
+                    tagged.push((order_keys.clone(), Row::new(values)));
+                }
+            } else {
+                let mut values = Vec::with_capacity(projection.len());
+                for p in &projection {
+                    values.push(eval::eval_expr(&p.expr, row, &ctx)?);
+                }
+                tagged.push((order_keys, Row::new(values)));
+            }
             Ok(())
         };
         if let Some(rows) = &indexed_rows {
@@ -17386,6 +17448,69 @@ fn render_function_args(args: &[spg_sql::ast::FunctionArg]) -> alloc::string::St
     }
     out.push(')');
     out
+}
+
+/// v7.19 P5 — true iff `expr` is `unnest(arg)` at the top level
+/// (case-insensitive). Used by `exec_select_cancel`'s
+/// projection loop to detect Set-Returning-Function rows that
+/// need per-row expansion. Only the top-level call counts —
+/// `coalesce(unnest(arr), 'x')` is NOT a SRF row from the
+/// projection's perspective; it would surface as an "unknown
+/// function" mismatch downstream, which is what we want
+/// (multi-SRF / nested SRF is documented carve-out for v7.19).
+fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
+    match expr {
+        spg_sql::ast::Expr::FunctionCall { name, args } => {
+            name.eq_ignore_ascii_case("unnest") && args.len() == 1
+        }
+        _ => false,
+    }
+}
+
+/// v7.19 P5 — extract the array argument out of a top-level
+/// `unnest(arg)` call. `None` if `expr` isn't a `unnest` call
+/// of arity 1 (mirrors `is_top_level_unnest`).
+fn top_level_unnest_arg(expr: &spg_sql::ast::Expr) -> Option<&spg_sql::ast::Expr> {
+    match expr {
+        spg_sql::ast::Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("unnest") && args.len() == 1 =>
+        {
+            Some(&args[0])
+        }
+        _ => None,
+    }
+}
+
+/// v7.19 P5 — turn an array-typed `Value` into the element list
+/// `unnest()` projection emits. NULL → empty list (PG: `unnest(NULL)
+/// = (no rows)`). Non-array values fall through to a type-mismatch
+/// error.
+fn array_value_to_elements(v: &Value) -> Result<Vec<Value>, EngineError> {
+    match v {
+        Value::Null => Ok(Vec::new()),
+        Value::TextArray(items) => Ok(items
+            .iter()
+            .map(|opt| {
+                opt.as_ref()
+                    .map(|s| Value::Text(s.clone()))
+                    .unwrap_or(Value::Null)
+            })
+            .collect()),
+        Value::IntArray(items) => Ok(items
+            .iter()
+            .map(|opt| opt.map(Value::Int).unwrap_or(Value::Null))
+            .collect()),
+        Value::BigIntArray(items) => Ok(items
+            .iter()
+            .map(|opt| opt.map(Value::BigInt).unwrap_or(Value::Null))
+            .collect()),
+        other => Err(EngineError::Eval(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "unnest() expects an array argument, got {:?}",
+                other.data_type()
+            ),
+        })),
+    }
 }
 
 #[cfg(test)]

@@ -157,10 +157,9 @@ run_case "D-pre.2.subscript" \
   "CREATE TABLE oc_e (id INT, redirect_uris TEXT[]); INSERT INTO oc_e VALUES (1, '{a,b,c}'); SELECT redirect_uris[1] FROM oc_e;"
 run_case "D-pre.2.array_agg" \
   "CREATE TABLE oc_f (id INT, val TEXT); INSERT INTO oc_f VALUES (1,'a'),(1,'b'); SELECT array_agg(val) FROM oc_f;"
-# Docketed: projection-position unnest (mailrs doesn't use this shape;
-# uncomment when a real user fixture exercises it).
-# run_case "D-pre.2.unnest_projection" \
-#   "CREATE TABLE oc_c (id INT, redirect_uris TEXT[]); INSERT INTO oc_c VALUES (1, '{a,b,c}'); SELECT unnest(redirect_uris) FROM oc_c;"
+# v7.19 P5 — projection-position unnest shipped; probe active.
+run_case "D-pre.2.unnest_projection" \
+  "CREATE TABLE oc_c (id INT, redirect_uris TEXT[]); INSERT INTO oc_c VALUES (1, '{a,b,c}'); SELECT unnest(redirect_uris) FROM oc_c;"
 
 # --- mailrs D-pre #3 reverse (BYTEA wire) ---
 echo "[panel] D-pre #3 BYTEA"
