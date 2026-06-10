@@ -197,23 +197,13 @@ jobs:
     # — a stock PG schema that worked yesterday but parser-fails
     # today — flips this gate red.
     #
-    # The harness pulls `goliakk/spg:7.17.0` by default; bump the
-    # --image arg here when a newer release image is published.
-    # Master/main + PRs targeting them run the gate so a regression
-    # can't merge silently; develop/release/hotfix lines also run.
-    #
-    # continue-on-error: the harness's current SPG image baseline
-    # (goliakk/spg:7.17.0) is the published release predating the
-    # v7.18 develop changes; it has 4 known D-pre #3 bytea
-    # failures that v7.18's T10-A/T10-B commits already fix on
-    # develop. When the v7.18 release image is published, bump the
-    # --image arg above to goliakk/spg:7.18.0 (or whatever the
-    # next release tag is) and drop continue-on-error so the gate
-    # becomes hard. Until then, the report uploads as a CI
-    # artifact and the v7.17.0 baseline lives at
-    # scripts/dropin-acceptance-report-v7.17.0-baseline.md as the
-    # checked-in reference.
-    continue-on-error: true
+    # v7.19 — HARD GATE. goliakk/spg:7.19.0 passes the full
+    # 38-case panel (36 dialect cases incl. the unnest-projection
+    # case + 2 mailrs fixtures) at 38/38; the checked-in
+    # reference is scripts/dropin-acceptance-report-v7.19.0.md.
+    # Any case that flips ✅→❌ between releases is a release
+    # blocker. Bump the --image arg when the next release image
+    # is published.
     if: |
       github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
@@ -226,7 +216,7 @@ jobs:
       - name: drop-in acceptance harness
         run: |
           scripts/dropin-acceptance.sh \
-            --image goliakk/spg:7.17.0 \
+            --image goliakk/spg:7.19.0 \
             --port 25433 \
             --fixture scripts/fixtures/mailrs-pg-extensions.sql \
             --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
