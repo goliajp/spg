@@ -9142,11 +9142,18 @@ mod tests {
     }
 
     #[test]
-    fn create_table_unknown_type_errors() {
-        // v4.9: JSON is now real; pick an actually unsupported keyword
-        // (XML never landed and isn't planned).
-        let err = parse_statement("CREATE TABLE x (a xml)").unwrap_err();
-        assert!(err.message.contains("unsupported column type"));
+    fn create_table_unknown_type_defers_to_engine() {
+        // v4.9 picked XML as a parse-time "unsupported column
+        // type" probe. v7.17.0 Phase 1.4 changed the contract:
+        // an unknown type ident parses as Text + `user_type_ref`
+        // so CREATE TABLE can resolve user-defined enum / domain
+        // types — rejection of truly-unknown types moved to the
+        // engine's catalog lookup.
+        let stmt = parse_statement("CREATE TABLE x (a xml)").unwrap();
+        let Statement::CreateTable(t) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(t.columns[0].user_type_ref.as_deref(), Some("xml"));
     }
 
     #[test]
