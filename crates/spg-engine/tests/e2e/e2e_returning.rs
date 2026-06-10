@@ -65,7 +65,9 @@ fn insert_returning_aliased_expr() {
         "INSERT INTO mb VALUES (1, 100) RETURNING id, uidnext - 1 AS prev_uid",
     );
     assert_eq!(vals.len(), 1);
-    assert_eq!(cols, vec!["?column?".to_string(), "prev_uid".to_string()]);
+    // bare column refs inherit the schema column name (PG names
+    // `RETURNING id` "id"; pre-round-12 SPG said "?column?").
+    assert_eq!(cols, vec!["id".to_string(), "prev_uid".to_string()]);
     assert_eq!(vals[0], vec![Value::Int(1), Value::Int(99)]);
 }
 

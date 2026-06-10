@@ -219,13 +219,38 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
                 return Box::pin(stream::iter(std::iter::once(Err(Error::Encode(e)))));
             }
         };
-        let outcome_fut = async move { run_one(self, &sql, arguments).await };
+        let outcome_fut = async move {
+            match arguments {
+                // Bind parameters imply exactly one statement (PG
+                // rejects multi-statement extended queries too).
+                Some(args) => run_one(self, &sql, Some(args)).await.map(|o| vec![o]),
+                // No parameters = sqlx's simple-query / `raw_sql`
+                // path. PG executes every `;`-separated statement of
+                // the message server-side inside ONE implicit
+                // transaction; `Database::execute_script` owns both
+                // the splitting and the transaction semantics
+                // (mailrs embed round-12 + v7.21 polish).
+                None => Ok(self
+                    .inner
+                    .execute_script(&sql)
+                    .await
+                    .map_err(engine_to_sqlx)?
+                    .into_iter()
+                    .map(outcome_from)
+                    .collect()),
+            }
+        };
         Box::pin(stream::once(outcome_fut).flat_map(|outcome| {
             let items: Vec<Result<either::Either<SpgQueryResult, SpgRow>, Error>> = match outcome {
-                Ok(Outcome::Affected(qr)) => vec![Ok(either::Either::Left(qr))],
-                Ok(Outcome::Rows(rows)) => rows
+                Ok(outcomes) => outcomes
                     .into_iter()
-                    .map(|r| Ok(either::Either::Right(r)))
+                    .flat_map(|o| match o {
+                        Outcome::Affected(qr) => vec![Ok(either::Either::Left(qr))],
+                        Outcome::Rows(rows) => rows
+                            .into_iter()
+                            .map(|r| Ok(either::Either::Right(r)))
+                            .collect::<Vec<_>>(),
+                    })
                     .collect(),
                 Err(e) => vec![Err(e)],
             };
@@ -380,16 +405,20 @@ async fn run_one(
             db.execute(sql).await.map_err(engine_to_sqlx)?
         }
     };
+    Ok(outcome_from(result))
+}
+
+fn outcome_from(result: EngineQueryResult) -> Outcome {
     match result {
         EngineQueryResult::Rows { columns, rows } => {
             let row_values: Vec<Vec<spg_embedded::Value>> =
                 rows.into_iter().map(|r| r.values).collect();
-            Ok(Outcome::Rows(build_rows(&columns, row_values)))
+            Outcome::Rows(build_rows(&columns, row_values))
         }
-        EngineQueryResult::CommandOk { affected, .. } => Ok(Outcome::Affected(
-            SpgQueryResult::new(u64::try_from(affected).unwrap_or(0)),
-        )),
-        _ => Ok(Outcome::Affected(SpgQueryResult::default())),
+        EngineQueryResult::CommandOk { affected, .. } => {
+            Outcome::Affected(SpgQueryResult::new(u64::try_from(affected).unwrap_or(0)))
+        }
+        _ => Outcome::Affected(SpgQueryResult::default()),
     }
 }
 

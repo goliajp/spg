@@ -58,6 +58,39 @@ fn main() {
         Some("version") => {
             println!("spg {}", env!("CARGO_PKG_VERSION"));
         }
+        Some("import") => {
+            // Offline bulk-load: open (or create) a catalog file and
+            // execute every statement of a SQL script against it.
+            // The server can be down or absent — this is the
+            // pg_dump → embedded-catalog migration path (mailrs
+            // embed round-12).
+            let mut db_path: Option<String> = None;
+            let mut file: Option<String> = None;
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--db" => db_path = args.next(),
+                    "--file" => file = args.next(),
+                    other => {
+                        die(&format!("import: unknown arg {other:?}"), 2);
+                    }
+                }
+            }
+            let (Some(db_path), Some(file)) = (db_path, file) else {
+                die(
+                    "usage: spg import --db <catalog.spg> --file <script.sql>",
+                    2,
+                );
+                return;
+            };
+            match import_script(&db_path, &file) {
+                Ok((stmts, affected)) => {
+                    println!(
+                        "imported {stmts} statements ({affected} rows affected) into {db_path}"
+                    );
+                }
+                Err(e) => die(&format!("import failed: {e}"), 1),
+            }
+        }
         Some(verb @ ("backup" | "restore")) => {
             let Some(src) = args.next() else {
                 die(&format!("usage: spg {verb} <src> <dst>"), 2);
@@ -1495,6 +1528,68 @@ fn format_value(v: &WireValue) -> String {
     }
 }
 
+/// `spg import` — execute a multi-statement SQL script against an
+/// on-disk catalog, creating it when absent. Statements run in file
+/// order inside ONE transaction: the first error aborts with the
+/// failing statement's index + a snippet and rolls the whole import
+/// back, so a failed import leaves the catalog exactly as it was —
+/// fix the script and re-run (v7.21 polish; previously a failed
+/// import left a half-applied prefix behind). A script that carries
+/// its own BEGIN/COMMIT (`pg_dump --single-transaction` output) owns
+/// its boundaries and runs unwrapped.
+fn import_script(db_path: &str, file: &str) -> Result<(usize, usize), String> {
+    let script = std::fs::read_to_string(file).map_err(|e| format!("read {file:?}: {e}"))?;
+    let mut db =
+        spg_embedded::Database::open_path(db_path).map_err(|e| format!("open {db_path:?}: {e}"))?;
+    let statements = spg_embedded::split_statements(&script);
+    let script_owns_tx = statements.iter().any(|s| {
+        let head = s
+            .split(|c: char| c.is_whitespace() || c == ';')
+            .find(|w| !w.is_empty())
+            .map(str::to_ascii_lowercase);
+        matches!(
+            head.as_deref(),
+            Some("begin" | "start" | "commit" | "end" | "rollback" | "savepoint" | "release")
+        )
+    });
+    let wrap = statements.len() > 1 && !script_owns_tx;
+    if wrap {
+        db.execute("BEGIN").map_err(|e| format!("BEGIN: {e:?}"))?;
+    }
+    let mut stmts = 0usize;
+    let mut affected = 0usize;
+    for (i, stmt) in statements.iter().enumerate() {
+        match db.execute(stmt) {
+            Ok(spg_embedded::QueryResult::CommandOk { affected: n, .. }) => {
+                stmts += 1;
+                affected += n;
+            }
+            Ok(_) => {
+                stmts += 1;
+            }
+            Err(e) => {
+                if wrap {
+                    let _ = db.execute("ROLLBACK");
+                }
+                let snippet: String = stmt.trim().chars().take(120).collect();
+                return Err(format!(
+                    "statement #{}: {e:?}\n  {snippet}…{}",
+                    i + 1,
+                    if wrap {
+                        "\n  (import rolled back — the catalog is unchanged)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+    }
+    if wrap {
+        db.execute("COMMIT").map_err(|e| format!("COMMIT: {e:?}"))?;
+    }
+    Ok((stmts, affected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,6 +1609,41 @@ mod tests {
             name
         ));
         p
+    }
+
+    #[test]
+    fn import_script_is_atomic_on_failure() {
+        let db = tmp_path("import-atomic");
+        let script = tmp_path("import-atomic-sql");
+        std::fs::write(
+            &script,
+            "CREATE TABLE good (id INT NOT NULL);\n\
+             INSERT INTO good VALUES (1);\n\
+             INSERT INTO no_such_table VALUES (1);",
+        )
+        .unwrap();
+        let err = import_script(db.to_str().unwrap(), script.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("statement #3"), "got: {err}");
+        assert!(err.contains("rolled back"), "got: {err}");
+        // The failed import must leave nothing behind — `good` was
+        // rolled back with the rest of the script.
+        let mut reopened = spg_embedded::Database::open_path(&db).unwrap();
+        assert!(
+            reopened.query("SELECT id FROM good").is_err(),
+            "half-applied import survived"
+        );
+        drop(reopened);
+        // A clean script then applies fully.
+        std::fs::write(
+            &script,
+            "CREATE TABLE good (id INT NOT NULL);\nINSERT INTO good VALUES (1);",
+        )
+        .unwrap();
+        let (stmts, affected) =
+            import_script(db.to_str().unwrap(), script.to_str().unwrap()).unwrap();
+        assert_eq!((stmts, affected), (2, 1));
+        let mut reopened = spg_embedded::Database::open_path(&db).unwrap();
+        assert_eq!(reopened.query("SELECT id FROM good").unwrap().len(), 1);
     }
 
     #[test]

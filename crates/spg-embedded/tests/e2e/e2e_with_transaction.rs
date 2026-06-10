@@ -89,6 +89,117 @@ fn with_transaction_works_on_persistent_db() {
 }
 
 #[test]
+fn rolled_back_transaction_stays_rolled_back_after_reopen() {
+    // The WAL must not resurrect a rolled-back transaction's writes
+    // on replay. mailrs embed round-12 polish: the in-memory rollback
+    // path was covered, the durable one (snapshot + WAL replay after
+    // a reopen) was not — and the file-backed pool is exactly what a
+    // cutover production box runs.
+    let dir = std::env::temp_dir().join(format!(
+        "spg-embed-tx-rollback-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("spg.db");
+    {
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        let r: Result<(), EngineError> = db.with_transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)")?;
+            Err(EngineError::Unsupported("force rollback".into()))
+        });
+        assert!(r.is_err());
+        // Explicit statement-level form too (the sqlx adapter path).
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.execute("ROLLBACK").unwrap();
+        assert!(
+            db.query("SELECT id FROM t").unwrap().is_empty(),
+            "rolled-back rows visible before reopen"
+        );
+    }
+    let mut db = Database::open_path(&db_path).unwrap();
+    let got = db.query("SELECT id FROM t").unwrap();
+    assert!(
+        got.is_empty(),
+        "WAL replay resurrected rolled-back rows: {got:?}"
+    );
+}
+
+#[test]
+fn committed_transaction_survives_process_crash() {
+    // Counterpart of the rollback test: a COMMITted transaction must
+    // be durable the moment commit returns — not only after a
+    // graceful Drop/checkpoint. `mem::forget` skips Drop, simulating
+    // SIGKILL; the reopen must replay the committed writes from WAL.
+    let dir = std::env::temp_dir().join(format!(
+        "spg-embed-tx-crash-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("spg.db");
+    {
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("COMMIT").unwrap();
+        std::mem::forget(db); // crash: no Drop, no checkpoint
+    }
+    // The leaked lock names a live pid (ours); clear it the way an
+    // operator would.
+    Database::force_unlock(&db_path).unwrap();
+    let mut db = Database::open_path(&db_path).unwrap();
+    let got = db.query("SELECT id FROM t").unwrap();
+    assert_eq!(got.len(), 1, "committed tx lost across crash: {got:?}");
+}
+
+#[test]
+fn savepoint_rollback_shapes_the_replayed_transaction() {
+    // ROLLBACK TO SAVEPOINT must truncate the tx WAL buffer so the
+    // replayed transaction matches what the engine committed. The
+    // surviving row carries a ';' inside a string literal to pin the
+    // record's script-splitting on replay.
+    let dir = std::env::temp_dir().join(format!(
+        "spg-embed-tx-savepoint-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("spg.db");
+    {
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL, note TEXT)")
+            .unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a;b')").unwrap();
+        db.execute("SAVEPOINT s1").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'discarded')").unwrap();
+        db.execute("ROLLBACK TO SAVEPOINT s1").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'kept')").unwrap();
+        db.execute("COMMIT").unwrap();
+        std::mem::forget(db); // crash — recovery must come from WAL
+    }
+    Database::force_unlock(&db_path).unwrap();
+    let mut db = Database::open_path(&db_path).unwrap();
+    let got = db.query("SELECT id FROM t ORDER BY id").unwrap();
+    let ids: Vec<_> = got.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        ids,
+        vec![Value::Int(1), Value::Int(3)],
+        "replayed tx must reflect the savepoint rollback"
+    );
+}
+
+#[test]
 fn nested_with_transaction_surfaces_engine_error() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
