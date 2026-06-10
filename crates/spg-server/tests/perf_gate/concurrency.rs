@@ -19,15 +19,13 @@
 //! so it doesn't belong in the default sweep. Run with
 //!
 //! ```sh
-//! cargo test -p spg-server --test perf_concurrency --release -- --ignored --nocapture
+//! cargo test -p spg-server --test perf_gate --release -- --ignored --nocapture
 //! ```
 //!
 //! The output is consumed by the v6.9.1 ship-rollup decision
 //! between (a) entering Choice A — parallel prepare under
 //! `engine.read()` + install-phase OCC retry — and (b) deferring
 //! Choice A to a future v6.x revisit.
-
-#![allow(clippy::uninlined_format_args, unsafe_code)]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -37,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use spg_wire::{Op, build_query, encode, parse_error_response};
 
-mod common;
+use crate::common;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WARMUP_ROWS: i64 = 5_000;
@@ -191,6 +189,7 @@ fn run_mixed(addr: &str, n_clients: usize, seed_id: u64) -> (f64, Duration) {
 #[test]
 #[ignore]
 fn concurrency_bench() {
+    let _lock = crate::perf_lock();
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     let wal = dir.join("wal.log");

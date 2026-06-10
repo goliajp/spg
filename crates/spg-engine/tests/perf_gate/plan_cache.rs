@@ -37,6 +37,7 @@ const HIT_RUNS: u32 = 200;
 
 #[test]
 fn prepare_cached_hit_under_1_3_of_cold_path() {
+    let _lock = crate::perf_lock();
     let mut eng = build_5_table_engine();
 
     // The SQL: 5-table INNER JOIN, definitely runs through reorder.

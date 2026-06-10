@@ -1,15 +1,3 @@
-#![cfg(not(debug_assertions))]
-// Test-gate allow-list — see crates/spg-crypto/tests/perf_gate.rs.
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::useless_conversion,
-    clippy::similar_names
-)]
-
 //! Regression-catch perf gate for `spg-engine`. Budgets in `BUDGETS.md`.
 
 use std::time::Instant;
@@ -32,6 +20,7 @@ fn fresh_engine() -> Engine {
 
 #[test]
 fn execute_select_where_under_budget() {
+    let _lock = crate::perf_lock();
     let mut eng = fresh_engine();
     let iters: u32 = 200;
     let start = Instant::now();

@@ -22,13 +22,11 @@
 //!     rows (default 1_000_000 — _not_ literally a billion, see
 //!     the env-knob doc — and the L2 120 s ceiling is enforced
 //!     against this scale). Run with
-//!     `cargo test -p spg-server --test perf_1b_rows --release -- --ignored`.
+//!     `cargo test -p spg-server --test perf_gate --release -- --ignored`.
 //!
 //! The "1B" in the file name reflects the L2 design language;
 //! the operator-tunable knob lets the gate fit CI hardware
 //! without rewriting the harness.
-
-#![allow(clippy::uninlined_format_args, unsafe_code)]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -37,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use spg_wire::{Op, build_query, encode, parse_error_response};
 
-mod common;
+use crate::common;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const FREEZE_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -240,6 +238,7 @@ fn run_pipeline_and_measure_cold_start(rows: i64, db: &Path, wal: &Path) -> Dura
 /// post-restart cold tier where every probed PK resolves.
 #[test]
 fn pipeline_sanity_50k_rows() {
+    let _lock = crate::perf_lock();
     let dir = unique_tmpdir("sanity");
     let db = dir.join("spg.db");
     let wal = dir.join("wal.log");
@@ -254,7 +253,7 @@ fn pipeline_sanity_50k_rows() {
 }
 
 /// v6.7.7 L2 ship gate. Run via
-/// `cargo test -p spg-server --test perf_1b_rows --release -- --ignored`.
+/// `cargo test -p spg-server --test perf_gate --release -- --ignored`.
 ///
 /// The row count is operator-tunable via `SPG_PERF_1B_ROW_BUDGET`
 /// (default 1_000_000). The L2 design names "1B-row" but real
@@ -266,6 +265,7 @@ fn pipeline_sanity_50k_rows() {
 #[test]
 #[ignore]
 fn cold_start_under_120s() {
+    let _lock = crate::perf_lock();
     let rows: i64 = std::env::var("SPG_PERF_1B_ROW_BUDGET")
         .ok()
         .and_then(|s| s.parse().ok())

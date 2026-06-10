@@ -159,18 +159,12 @@ fn measure_prepare_wall(cat: &Catalog, workers: usize, reps: usize) -> std::time
     best
 }
 
-/// `#[ignore]` because the perf gate is sensitive to CPU
-/// contention from other tests running in parallel (cargo test's
-/// default thread pool fans out across cores). Run explicitly:
-///
-/// ```sh
-/// cargo test -p spg-server --test perf_parallel_freezer --release -- --ignored
-/// ```
-///
-/// Matches the pattern used by `tests/perf_1b_rows` (v6.7.7).
+/// fast-tier ship-gate. CPU contention from sibling tests is
+/// handled by `crate::perf_lock()` serialisation, so this no
+/// longer needs `#[ignore]` to defend its timing.
 #[test]
-#[ignore]
 fn four_worker_speedup_at_least_2x() {
+    let _lock = crate::perf_lock();
     let base = build_populated_catalog();
 
     // Prepare-only timing — the parallelisable half of the freeze
