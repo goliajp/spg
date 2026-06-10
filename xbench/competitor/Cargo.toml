@@ -41,58 +41,72 @@ criterion = { workspace = true }
 [[bin]]
 name = "smoke"
 path = "src/smoke.rs"
+test = false
 
 [[bin]]
 name = "latency"
 path = "src/bin/latency.rs"
+test = false
 
 [[bin]]
 name = "throughput"
 path = "src/bin/throughput.rs"
+test = false
 
 [[bin]]
 name = "vector_knn"
 path = "src/bin/vector_knn.rs"
+test = false
 
 [[bin]]
 name = "memory"
 path = "src/bin/memory.rs"
+test = false
 
 [[bin]]
 name = "large_data"
 path = "src/bin/large_data.rs"
+test = false
 
 [[bin]]
 name = "soak"
 path = "src/bin/soak.rs"
+test = false
 
 [[bin]]
 name = "concurrent"
 path = "src/bin/concurrent.rs"
+test = false
 
 [[bin]]
 name = "repl_bench"
 path = "src/bin/repl_bench.rs"
+test = false
 
 [[bin]]
 name = "backup_bench"
 path = "src/bin/backup_bench.rs"
+test = false
 
 [[bin]]
 name = "bake_segment"
 path = "src/bin/bake_segment.rs"
+test = false
 
 [[bin]]
 name = "cold_tier_pk_bench"
 path = "src/bin/cold_tier_pk_bench.rs"
+test = false
 
 [[bin]]
 name = "sqlx_pool_concurrent_reads"
 path = "src/bin/sqlx_pool_concurrent_reads.rs"
+test = false
 
 [[bin]]
 name = "profile_breakdown"
 path = "src/bin/profile_breakdown.rs"
+test = false
 
 [lints.rust]
 unsafe_code     = "deny"
