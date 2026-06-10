@@ -5,8 +5,6 @@
 //! `--to-audit-entry` variant (resolve N from an audit-chain
 //! entry hash) is STABILITY § "Out of v6.10".
 
-#![allow(clippy::uninlined_format_args)]
-
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 

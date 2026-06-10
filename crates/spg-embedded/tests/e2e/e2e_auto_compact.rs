@@ -68,8 +68,11 @@ fn freezer_produces_segments_then_compacts_them() {
     // auto-compact, the population must stay near the threshold
     // (we allow a small overshoot — compact runs after freeze,
     // not interleaved with it).
+    // 2 s window: 2000 rows / 20-row batches / 10 ms tick ≈ 1 s
+    // to demote everything, +1 s of post-settle observation. (Was
+    // a 5 s window — the single largest cost of this binary.)
     let mut max_seen = 0usize;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         let count = {
             let g = db.lock().unwrap();

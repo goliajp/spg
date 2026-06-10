@@ -1,12 +1,3 @@
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::similar_names,
-    clippy::uninlined_format_args
-)]
-
 //! v6.2.4 — EXPLAIN ANALYZE per-operator stats.
 
 use spg_engine::{Engine, QueryResult};

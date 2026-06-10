@@ -9,8 +9,6 @@
 //!      mention of the table the WAL inserts into) → `FAIL …`
 //!      on stderr, exit 1.
 
-#![allow(clippy::uninlined_format_args)]
-
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
