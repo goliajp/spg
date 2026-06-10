@@ -25,6 +25,7 @@
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::doc_markdown,
+    clippy::too_many_lines,
     clippy::uninlined_format_args,
     clippy::unused_io_amount
 )]
@@ -125,6 +126,69 @@ fn main() {
         let (a, b, c) = pcts(lat);
         println!("| durable execute (file+fsync) | {a} | {b} | {c} |");
         drop(db);
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    // 5. UPDATE-by-PK on a 5000-row table (the mixed-bench write
+    //    shape) — sync engine only, isolates the mutation cost.
+    {
+        use spg_engine::Engine;
+        let mut eng = Engine::new();
+        eng.execute("CREATE TABLE b (id INT NOT NULL, v INT NOT NULL)")
+            .unwrap();
+        eng.execute("CREATE INDEX b_id ON b (id)").unwrap();
+        for i in 0..5000 {
+            eng.execute(&format!("INSERT INTO b VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let mut lat = Vec::with_capacity(ITERS);
+        for i in 0..ITERS {
+            let sql = format!("UPDATE b SET v = v + 1 WHERE id = {}", i % 5000);
+            let t0 = Instant::now();
+            eng.execute(&sql).unwrap();
+            lat.push(t0.elapsed().as_micros() as u64);
+        }
+        let (a, b, c) = pcts(lat);
+        println!("| UPDATE-by-PK 5k rows (engine) | {a} | {b} | {c} |");
+    }
+
+    // 6. Same UPDATE through AsyncDatabase — full sqlx-shape
+    //    write path INCLUDING the per-commit fsync (synchronous
+    //    commit; the SPG_SYNCHRONOUS_COMMIT OnceLock was already
+    //    pinned "on" by stage 4b, so this stage can't flip it).
+    //    Gap vs stage 5 ≈ fsync + adapter overhead. Single-task
+    //    serial, so group commit can't amortise here — see the
+    //    mixed bench for the concurrent shape.
+    {
+        use spg_embedded_tokio::AsyncDatabase;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let tmpdir = std::env::temp_dir().join(format!("spg-prof-upd-{}", std::process::id()));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let db_path = tmpdir.join("u.db");
+        let mut lat = Vec::with_capacity(ITERS.min(1000));
+        rt.block_on(async {
+            let db = AsyncDatabase::open_path(&db_path).await.unwrap();
+            db.execute("CREATE TABLE b (id INT NOT NULL, v INT NOT NULL)")
+                .await
+                .unwrap();
+            db.execute("CREATE INDEX b_id ON b (id)").await.unwrap();
+            for i in 0..5000 {
+                db.execute(&format!("INSERT INTO b VALUES ({i}, {i})"))
+                    .await
+                    .unwrap();
+            }
+            for i in 0..ITERS.min(1000) {
+                let sql = format!("UPDATE b SET v = v + 1 WHERE id = {}", i % 5000);
+                let t0 = Instant::now();
+                db.execute(&sql).await.unwrap();
+                lat.push(t0.elapsed().as_micros() as u64);
+            }
+        });
+        let (a, b, c) = pcts(lat);
+        println!("| UPDATE-by-PK via AsyncDatabase | {a} | {b} | {c} |");
         let _ = std::fs::remove_dir_all(&tmpdir);
     }
 
