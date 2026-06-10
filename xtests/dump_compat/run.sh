@@ -40,6 +40,14 @@ start_server() {
         sleep 0.4
     else
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        # Kill any stale HOST-side listener on $PORT (orphaned
+        # local-build server) — otherwise `docker run -p` fails
+        # and psql silently talks to the stale process. Same
+        # guard as data_compat/run.sh (2026-06-10 drift).
+        if lsof -ti :$PORT >/dev/null 2>&1; then
+            lsof -ti :$PORT | xargs kill -9 2>/dev/null || true
+            sleep 0.3
+        fi
         docker run -d --name "$CONTAINER" \
             -e POSTGRES_DB=app -e POSTGRES_USER=u -e POSTGRES_PASSWORD=p \
             -p "$PORT:5432" "goliakk/spg:$VERSION" >/dev/null
