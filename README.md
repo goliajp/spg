@@ -146,17 +146,22 @@ spg pitr-restore \
 spg prune-pitr --dir /backups/spg-2026-06-10 --retention-hours 24
 ```
 
-Wire an external archival command via `SPG_PITR_ARCHIVE_CMD`
-(invoked by `backup-pitr` with the chunk path as `$1`):
+v7.19 — rotation, retention, and archival run **in-engine**.
+Set the env vars at boot; no cron needed:
 
 ```sh
-export SPG_PITR_ARCHIVE_CMD='aws s3 cp "$1" s3://my-backups/spg/'
-spg backup-pitr --src ./spg.db --dst /backups/spg-now
+SPG_PITR_RETENTION_HOURS=24                              # retention thread on
+SPG_PITR_ARCHIVE_CMD='aws s3 cp "$1" s3://my-backups/spg/'  # archive-then-delete
 ```
+
+The WAL rotates into immutable chunk files at every checkpoint;
+the retention thread archives + sweeps old chunks; a failed
+archive command leaves the chunk on disk with a loud warning
+(PG `archive_command` semantics).
 
 SLA defaults: **RPO ≤ 1s**, **RTO ≤ 10min**, **retention 24h**.
 See [`PG_MIGRATION.md`](PG_MIGRATION.md#backup--pitr-v718) for the full
-operator playbook and the cron-friendly retention pattern.
+operator playbook.
 
 ### Tests
 
