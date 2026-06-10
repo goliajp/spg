@@ -91,18 +91,38 @@ fn writes_recoverable_when_drop_is_skipped() {
 }
 
 #[test]
-fn explicit_checkpoint_truncates_wal() {
+fn explicit_checkpoint_rotates_wal_chunk() {
+    // v7.19 — checkpoint rotates the WAL chunk instead of
+    // truncating: the chunk holding the pre-checkpoint records
+    // stays on disk (the retention thread sweeps it later) and a
+    // fresh empty chunk becomes the active one. Confirms the
+    // PITR-compatible rotation behaviour replaced the v7.18
+    // single-file truncate.
     let dir = unique_tmpdir("checkpoint");
     let db_path = dir.join("spg.db");
-    let wal_path = dir.join("spg.db.wal");
+    let wal_dir = dir.join("spg.db.wal");
     let mut db = Database::open_path(&db_path).unwrap();
     db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
-    let wal_size_before = std::fs::metadata(&wal_path).unwrap().len();
-    assert!(wal_size_before > 0);
+    let chunks_before: Vec<_> = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("wal"))
+        .collect();
+    assert_eq!(chunks_before.len(), 1, "one active chunk before checkpoint");
+    let pre_chunk_size = chunks_before[0].metadata().unwrap().len();
+    assert!(pre_chunk_size > 0);
     db.checkpoint().unwrap();
-    let wal_size_after = std::fs::metadata(&wal_path).unwrap().len();
-    assert_eq!(wal_size_after, 0, "checkpoint truncates WAL");
+    let chunks_after: Vec<_> = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("wal"))
+        .collect();
+    assert_eq!(
+        chunks_after.len(),
+        2,
+        "checkpoint rotates — pre-checkpoint chunk stays + new active chunk added"
+    );
     // Snapshot now carries the table state.
     let snap = std::fs::read(&db_path).unwrap();
     assert!(!snap.is_empty());

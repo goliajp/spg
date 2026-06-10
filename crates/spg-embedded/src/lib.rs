@@ -129,7 +129,7 @@ fn wal_render_with_params(stmt: &mut ParsedStatement, params: &[Value]) {
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -213,6 +213,101 @@ fn encode_v3_auto_commit(sql: &str) -> Vec<u8> {
     out.push(WAL_V3_TYPE_AUTO_COMMIT_SQL);
     out.extend_from_slice(payload);
     out
+}
+
+/// v7.19 — replay every record from `wal_bytes` whose
+/// `commit_lsn` is strictly greater than `floor_lsn`. v3 records
+/// (no LSN) and v4 records with `commit_lsn <= floor_lsn` are
+/// skipped — the snapshot loaded ahead of this call already
+/// reflects them, and re-applying would DuplicateTable /
+/// double-insert. v3 records inside the legacy migration chunk
+/// always apply because the migration sets `floor_lsn = 0` and
+/// v3 records carry no LSN to compare; the pre-migration
+/// behaviour (every record replays) is what the migration
+/// preserves.
+///
+/// Returns the count of records successfully applied. Same
+/// torn-tail semantics as `replay_wal_into_engine`.
+fn replay_wal_filtered(
+    wal_bytes: &[u8],
+    engine: &mut Engine,
+    floor_lsn: u64,
+) -> Result<usize, String> {
+    let records = match parse_wal_records(wal_bytes) {
+        Ok(r) => r,
+        Err(e) => return Err(e),
+    };
+    let mut applied = 0usize;
+    for r in &records {
+        // Skip markers + non-SQL records.
+        if r.type_byte == WAL_V3_TYPE_DURABILITY_CHECKPOINT
+            || r.type_byte == WAL_V4_TYPE_CHECKPOINT_MARKER
+        {
+            continue;
+        }
+        // v4 SQL records carry an LSN. Apply iff strictly above
+        // the snapshot floor.
+        if r.type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL {
+            if let Some(lsn) = r.commit_lsn {
+                if lsn <= floor_lsn {
+                    continue;
+                }
+            }
+        }
+        // v3 records (type 0x01, no LSN) always apply — the
+        // legacy migration path is the only place they appear,
+        // and floor_lsn=0 there.
+        let sql = match std::str::from_utf8(r.sql) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("non-UTF-8 SQL at offset {}: {e}", r.offset)),
+        };
+        engine.execute(sql).map_err(|e| {
+            format!("WAL replay: apply {sql:?} at offset {} rejected: {e:?}", r.offset)
+        })?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// v7.19 — WAL chunk filename format. Zero-padded 16-digit
+/// hex on both parts so default lexicographic sort matches
+/// numeric order, with the unix_us prefix coming first so
+/// the on-disk listing is chronological too.
+fn chunk_filename(unix_us: i64, leading_lsn: u64) -> String {
+    // Negative timestamps shouldn't happen in practice (we sit
+    // post-1970), but clamp to 0 so the zero-padded
+    // representation stays sortable.
+    let us = unix_us.max(0) as u64;
+    format!("{us:016x}_{leading_lsn:016x}.wal")
+}
+
+/// v7.19 — filename used for the legacy single-file WAL when
+/// `open_path` migrates a v7.18-layout database into the new
+/// chunk directory. Lexicographically smallest possible value
+/// so subsequent chunks sort after it.
+fn legacy_chunk_filename() -> String {
+    chunk_filename(0, 0)
+}
+
+/// v7.19 — list every `.wal` file in `wal_dir` in
+/// lexicographic order (which doubles as chunk-creation
+/// order thanks to the zero-padded filename format).
+fn sorted_wal_chunks(wal_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let read_dir = match std::fs::read_dir(wal_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(e) => return Err(e),
+    };
+    for entry in read_dir {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("wal") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 /// v7.18 PITR — encode one v4 `checkpoint_marker` record. Layout:
@@ -613,14 +708,24 @@ pub struct Database {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // `wal_path` is read at boot; kept for Drop/diag introspection.
+#[allow(dead_code)] // `wal_dir`/`current_chunk_path` are read at boot; kept for Drop/diag introspection.
 struct PersistenceCtx {
     db_path: PathBuf,
-    wal_path: PathBuf,
+    /// v7.19 — WAL chunk directory at `<db_path>.wal/`.
+    /// Replaces the v7.18 single-file `<db_path>.wal` layout.
+    /// Each chunk file inside is named
+    /// `<unix_us>_<leading_lsn>.wal` (zero-padded to 16 digits
+    /// so default-lex sort = LSN order).
+    wal_dir: PathBuf,
+    /// Path of the currently-open chunk file inside `wal_dir`.
+    /// Rotated at checkpoint and whenever `wal_len` crosses
+    /// `checkpoint_threshold_bytes`.
+    current_chunk_path: PathBuf,
+    /// Append-only handle on `current_chunk_path`.
     wal: File,
-    /// Cached WAL file length so each `execute()` doesn't have
-    /// to stat. Refreshed on append + on `checkpoint()` (which
-    /// truncates back to 0).
+    /// Cached length of the current chunk so `execute()` skips
+    /// a `stat()` per write. Refreshed on append + reset to 0
+    /// on rotation.
     wal_len: u64,
     checkpoint_threshold_bytes: u64,
     /// v7.1.4 — `<db_path>.spg/segments/` directory. Cold-tier
@@ -676,6 +781,9 @@ impl Database {
     /// point use `checkpoint()` explicitly.
     pub fn open_path(db_path: impl AsRef<Path>) -> Result<Self, EngineError> {
         let db_path = db_path.as_ref().to_path_buf();
+        // v7.19 — WAL is a directory of chunk files. Legacy
+        // single-file path stays variable-named `wal_path` for
+        // the backward-compat migration block below.
         let wal_path = {
             let mut p = db_path.clone();
             let name = p
@@ -689,6 +797,7 @@ impl Database {
             p.set_file_name(name);
             p
         };
+        let wal_dir = wal_path.clone();
         if let Some(parent) = db_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -795,29 +904,98 @@ impl Database {
                 }
             }
         }
+        // v7.19 — chunked WAL on-disk layout.
+        //
+        // Three cases handled here:
+        //
+        // 1. wal_dir exists as a DIRECTORY → scan its
+        //    `<unix_us>_<leading_lsn>.wal` chunks (sorted
+        //    lexicographically = chunk-creation order), replay
+        //    them in sequence, advance the LSN watermark to the
+        //    max commit_lsn seen.
+        //
+        // 2. wal_path exists as a FILE → legacy v7.18 layout.
+        //    Migrate it: create `wal_dir/`, move the single file
+        //    inside as `0000000000000000_0000000000000000.wal`,
+        //    then fall through to case 1's replay loop.
+        //
+        // 3. Neither exists → fresh database; create wal_dir.
         let mut initial_lsn: u64 = 0;
-        if wal_path.exists() {
-            let wal_bytes = std::fs::read(&wal_path).map_err(io_err)?;
-            if !wal_bytes.is_empty() {
-                replay_wal_into_engine(&wal_bytes, &mut engine)
-                    .map_err(|m| EngineError::Storage(spg_storage::StorageError::Corrupt(m)))?;
-                // v7.18 PITR — recover the commit-LSN watermark so
-                // the new session does not re-issue an LSN that
-                // already lives in the WAL. parse_wal_records yields
-                // None for v3 records (they predate the LSN field);
-                // an empty / v3-only WAL leaves the counter at 0.
-                if let Ok(records) = parse_wal_records(&wal_bytes) {
-                    if let Some(max) = records.iter().filter_map(|r| r.commit_lsn).max() {
+        if wal_path.is_file() {
+            // Case 2: legacy single-file WAL migration.
+            let legacy_bytes = std::fs::read(&wal_path).map_err(io_err)?;
+            std::fs::remove_file(&wal_path).map_err(io_err)?;
+            std::fs::create_dir_all(&wal_dir).map_err(io_err)?;
+            if !legacy_bytes.is_empty() {
+                let migrated = wal_dir.join(legacy_chunk_filename());
+                std::fs::write(&migrated, &legacy_bytes).map_err(io_err)?;
+            }
+        } else if !wal_dir.exists() {
+            // Case 3: fresh database.
+            std::fs::create_dir_all(&wal_dir).map_err(io_err)?;
+        }
+        // Cases 1 + 2 share replay logic now that wal_dir is
+        // guaranteed to exist (and may be empty for case 3).
+        //
+        // Two-pass replay so we don't double-apply records the
+        // snapshot already reflects:
+        //
+        // 1. Find the highest commit_lsn carried by a
+        //    checkpoint_marker across all chunks. That LSN is the
+        //    snapshot's high-water mark — anything ≤ it is
+        //    already in `<db_path>` and replaying it would
+        //    DuplicateTable / double-insert.
+        // 2. Replay only records strictly above that LSN.
+        //
+        // Case 2 migration (legacy single-file WAL) lands here
+        // too: the migrated chunk has no marker so the LSN floor
+        // is 0 and every record applies — exactly the v7.18
+        // behaviour the migration is supposed to preserve.
+        let chunk_paths = sorted_wal_chunks(&wal_dir).map_err(io_err)?;
+        let mut snapshot_lsn: u64 = 0;
+        for chunk in &chunk_paths {
+            let bytes = std::fs::read(chunk).map_err(io_err)?;
+            if let Ok(records) = parse_wal_records(&bytes) {
+                for r in &records {
+                    if r.type_byte == WAL_V4_TYPE_CHECKPOINT_MARKER {
+                        if let Some(l) = r.commit_lsn {
+                            if l > snapshot_lsn {
+                                snapshot_lsn = l;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for chunk in &chunk_paths {
+            let bytes = std::fs::read(chunk).map_err(io_err)?;
+            if bytes.is_empty() {
+                continue;
+            }
+            replay_wal_filtered(&bytes, &mut engine, snapshot_lsn)
+                .map_err(|m| EngineError::Storage(spg_storage::StorageError::Corrupt(m)))?;
+            if let Ok(records) = parse_wal_records(&bytes) {
+                if let Some(max) = records.iter().filter_map(|r| r.commit_lsn).max() {
+                    if max > initial_lsn {
                         initial_lsn = max;
                     }
                 }
             }
         }
+        // Open the "current" chunk — either the last existing
+        // chunk file (so subsequent appends extend it until the
+        // size threshold rotates) or a fresh first chunk.
+        let now_us = wall_clock_micros();
+        let current_chunk_path = if let Some(last) = chunk_paths.last() {
+            last.clone()
+        } else {
+            wal_dir.join(chunk_filename(now_us, initial_lsn + 1))
+        };
         let wal = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
-            .open(&wal_path)
+            .open(&current_chunk_path)
             .map_err(io_err)?;
         let wal_len = wal.metadata().map_err(io_err)?.len();
         Ok(Self {
@@ -825,7 +1003,8 @@ impl Database {
             commit_lsn: AtomicU64::new(initial_lsn),
             persistence: Some(PersistenceCtx {
                 db_path,
-                wal_path,
+                wal_dir,
+                current_chunk_path,
                 wal,
                 wal_len,
                 checkpoint_threshold_bytes: default_checkpoint_threshold_bytes(),
@@ -951,24 +1130,32 @@ impl Database {
             std::fs::write(&m_tmp, &m_bytes).map_err(io_err)?;
             std::fs::rename(&m_tmp, &m_path).map_err(io_err)?;
         }
-        // v7.18 PITR — append a checkpoint marker BEFORE truncating
-        // so backup tooling that copies the WAL between snapshot
-        // rotations sees the (lsn, ts, snapshot_path) triple that
-        // anchors restore-to-time. The marker rides the WAL's
-        // existing CRC-protected v3 envelope under the new v4 type
-        // byte 0x11; replay dispatch (and `revert_wal_to_seq`)
-        // already skip it. The truncate below then drops both the
-        // SQL records the snapshot superseded AND this marker —
-        // PITR retention work (P4/P6) intercepts the WAL before
-        // this point to archive both pieces together.
+        // v7.19 — append a checkpoint marker to the current chunk
+        // (anchors restore-to-time backups), then rotate to a
+        // fresh chunk file. Old chunks stay on disk and become
+        // input to the retention thread (P3) + spgctl backup-pitr
+        // (P6). The single-file `set_len(0)` truncate the v7.18
+        // path used is gone — that path silently discarded WAL
+        // history between checkpoint and the operator's next cron
+        // run, which is exactly what PITR was meant to fix.
         let marker_lsn = self.commit_lsn.load(Ordering::SeqCst);
         let marker_ts = wall_clock_micros();
         let marker = encode_v4_checkpoint_marker(marker_lsn, marker_ts, &p.db_path);
         p.wal.write_all(&marker).map_err(io_err)?;
         p.wal.sync_data().map_err(io_err)?;
-        p.wal.set_len(0).map_err(io_err)?;
-        p.wal.seek(SeekFrom::Start(0)).map_err(io_err)?;
-        p.wal.sync_data().map_err(io_err)?;
+        // Close the active chunk by replacing the handle. The
+        // OpenOptions append+create combo creates the new chunk
+        // file fresh; `wal_len` resets to 0 ready for the next
+        // execute()'s record.
+        let new_chunk_path = p.wal_dir.join(chunk_filename(marker_ts, marker_lsn + 1));
+        let new_handle = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&new_chunk_path)
+            .map_err(io_err)?;
+        p.current_chunk_path = new_chunk_path;
+        p.wal = new_handle;
         p.wal_len = 0;
         Ok(())
     }
@@ -1677,7 +1864,23 @@ pub fn revert_wal_to_seq(
     to_seq: u64,
     out_db_path: impl AsRef<Path>,
 ) -> Result<u64, EngineError> {
-    let wal_bytes = std::fs::read(wal_path.as_ref()).map_err(io_err)?;
+    // v7.19 — accept either a single-file legacy WAL (v7.18 and
+    // earlier layout) or a chunked WAL directory (v7.19+). For a
+    // directory, concatenate every `.wal` chunk in sorted order
+    // — the same order open_path replays them in — so revert
+    // sees the full record stream.
+    let path = wal_path.as_ref();
+    let wal_bytes = if path.is_dir() {
+        let mut combined = Vec::new();
+        let chunks = sorted_wal_chunks(path).map_err(io_err)?;
+        for chunk in chunks {
+            let bytes = std::fs::read(&chunk).map_err(io_err)?;
+            combined.extend_from_slice(&bytes);
+        }
+        combined
+    } else {
+        std::fs::read(path).map_err(io_err)?
+    };
     let mut engine = Engine::new();
     let mut applied = 0u64;
     let mut cur = 0usize;
