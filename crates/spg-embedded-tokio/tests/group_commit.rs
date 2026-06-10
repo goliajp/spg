@@ -18,10 +18,7 @@ fn unique_dir(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let p = std::env::temp_dir().join(format!(
-        "spg-gc-{}-{name}-{nanos}",
-        std::process::id()
-    ));
+    let p = std::env::temp_dir().join(format!("spg-gc-{}-{name}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -31,7 +28,9 @@ async fn concurrent_writes_share_fsync() {
     let dir = unique_dir("share");
     let db_path = dir.join("gc.db");
     let db = AsyncDatabase::open_path(&db_path).await.unwrap();
-    db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
 
     // 64 concurrent single-row INSERTs. Under v7.19 (one fsync
     // each, ~4 ms serial) this takes ≥ 64 × 4 ms ≈ 256 ms.
@@ -80,7 +79,9 @@ async fn durability_survives_reopen() {
     let db_path = dir.join("gc.db");
     {
         let db = AsyncDatabase::open_path(&db_path).await.unwrap();
-        db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)")
+            .await
+            .unwrap();
         let mut tasks = Vec::new();
         for i in 0..32 {
             let db = db.clone();
@@ -111,7 +112,9 @@ async fn wal_lsns_stay_monotonic_under_concurrency() {
     let dir = unique_dir("order");
     let db_path = dir.join("gc.db");
     let db = AsyncDatabase::open_path(&db_path).await.unwrap();
-    db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     let mut tasks = Vec::new();
     for i in 0..32 {
         let db = db.clone();
