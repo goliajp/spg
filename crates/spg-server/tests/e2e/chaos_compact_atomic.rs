@@ -238,6 +238,12 @@ fn manifest_swap_is_atomic_under_crash() {
         let mut s = TcpStream::connect(&addrs.native).unwrap();
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         let after = count_present_pks(&mut s, 0..12);
+        // Drop the client socket BEFORE the graceful stop — the
+        // SIGTERM drain waits for active_connections to hit zero,
+        // so a still-open client burns the full 30 s shutdown
+        // deadline (this was ~30 s of this test's pre-v7.20.1
+        // runtime).
+        drop(s);
         graceful_stop(&mut raw);
         assert_eq!(
             after, 12,
@@ -304,6 +310,9 @@ fn checkpoint_after_compact_commits_merged_segment() {
         let mut s = TcpStream::connect(&addrs.native).unwrap();
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         let after = count_present_pks(&mut s, 0..12);
+        // Same as manifest_swap_is_atomic_under_crash: close the
+        // client before SIGTERM or the drain waits 30 s for it.
+        drop(s);
         graceful_stop(&mut raw);
         assert_eq!(
             after, 12,
