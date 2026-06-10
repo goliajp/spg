@@ -25,7 +25,7 @@ use sqlx_core::executor::Executor;
 use sqlx_core::transaction::Transaction;
 
 use spg_embedded::QueryResult as EngineQueryResult;
-use spg_embedded_tokio::{AsyncDatabase, AsyncReadHandle};
+use spg_embedded_tokio::AsyncDatabase;
 
 use crate::column::SpgColumn;
 use crate::database::Spg;
@@ -35,45 +35,50 @@ use crate::query_result::SpgQueryResult;
 use crate::row::SpgRow;
 use crate::type_info::SpgTypeInfo;
 
+/// v7.20 P3 — cached per-connection statement: the parse +
+/// readonly classification + prepare-time transforms run once
+/// per distinct SQL string. Repeated `query!()` call sites (the
+/// sqlx norm — fixed SQL, varying binds) hit the cache and pay
+/// zero parses.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedStmt {
+    pub(crate) readonly: bool,
+    pub(crate) stmt: std::sync::Arc<spg_embedded::Statement>,
+}
+
+/// Cap on the per-connection statement cache. Sqlx apps use a
+/// finite set of static SQL strings; 256 is far above any real
+/// workload. On overflow the cache clears wholesale (simple +
+/// predictable; an LRU would buy nothing at this size).
+const STMT_CACHE_CAP: usize = 256;
+
 /// One sqlx connection backed by an in-process SPG.
 ///
-/// Holds two engine handles:
-///
 /// - `inner: AsyncDatabase` — writer path. Used for DDL / DML /
-///   transaction control and for statements running inside a
-///   transaction (where snapshot semantics would conflict with
-///   the user's TX isolation).
-///
-/// - `read_handle: Option<AsyncReadHandle>` — readonly fan-out
-///   path. Lazily built on the first readonly statement seen,
-///   refreshed per statement so each SELECT sees the latest
-///   committed state (PG read-committed default).
-///
-/// Both handles share the same underlying engine (the
-/// `AsyncDatabase` and the read handle clone the same `Arc` —
-/// snapshots are cheap trie-root clones).
+///   transaction control and statements inside a transaction.
+/// - readonly statements run INLINE on the async executor
+///   (v7.20 P3): per-statement snapshot via
+///   `clone_snapshot_inline` (~0 µs Arc bump) + static
+///   `Database::*_on_snapshot` calls (~2 µs CPU). No
+///   spawn_blocking on the read path — profile_breakdown
+///   measured the 3× thread-hop round-trips at 15-48 µs against
+///   2 µs of actual work.
 #[derive(Debug)]
 pub struct SpgConnection {
     pub(crate) inner: AsyncDatabase,
-    /// v7.18 — lazy fan-out reader. `None` until the connection
-    /// runs its first readonly statement outside a transaction.
-    /// `refresh()` is called per-statement so writes committed
-    /// elsewhere become visible without manual intervention.
-    pub(crate) read_handle: Option<AsyncReadHandle>,
+    /// v7.20 P3 — per-connection statement cache.
+    pub(crate) stmt_cache: HashMap<String, CachedStmt>,
     pub(crate) tx_depth: usize,
     pub(crate) pending_rollback: bool,
 }
 
 impl Clone for SpgConnection {
     fn clone(&self) -> Self {
-        // The read_handle holds a snapshot frozen at its own
-        // creation time; cloning a connection should NOT inherit
-        // that snapshot — the clone gets a fresh None and will
-        // lazy-init its own. Same `inner` (the AsyncDatabase is
-        // `Arc`-shared by design) so writes are still consistent.
+        // Fresh cache per clone — Statements are cheap to
+        // rebuild and the cache is an optimisation, not state.
         Self {
             inner: self.inner.clone(),
-            read_handle: None,
+            stmt_cache: HashMap::new(),
             tx_depth: self.tx_depth,
             pending_rollback: self.pending_rollback,
         }
@@ -87,37 +92,46 @@ impl SpgConnection {
     pub fn new(inner: AsyncDatabase) -> Self {
         Self {
             inner,
-            read_handle: None,
+            stmt_cache: HashMap::new(),
             tx_depth: 0,
             pending_rollback: false,
         }
     }
 
     /// Borrow the underlying `AsyncDatabase`. Lets advanced
-    /// callers reach for the spg-embedded API directly. The
-    /// per-connection [`AsyncReadHandle`] used for readonly
-    /// fan-out is internal — sqlx code paths don't need to
-    /// know it exists.
+    /// callers reach for the spg-embedded API directly.
     #[must_use]
     pub const fn engine(&self) -> &AsyncDatabase {
         &self.inner
     }
 
-    /// v7.18 — return a `&mut AsyncReadHandle` with a snapshot
-    /// refreshed to the engine's latest committed state. Lazily
-    /// constructs the handle on first call; subsequent calls
-    /// refresh the existing one (cheap — clone_snapshot is an
-    /// Arc-clone of the trie roots). Used by the routing
-    /// helper below for every readonly statement so the
-    /// connection sees the same read-committed view a PG client
-    /// would see across statement boundaries.
-    pub(crate) async fn fresh_read_handle(&mut self) -> &mut AsyncReadHandle {
-        if let Some(rh) = self.read_handle.as_mut() {
-            rh.refresh().await;
-        } else {
-            self.read_handle = Some(self.inner.read_handle().await);
+    /// v7.20 P3 — look up (or build + cache) the parsed statement
+    /// + readonly classification for `sql`. One parse per
+    /// distinct SQL string per connection.
+    pub(crate) async fn cached_stmt(
+        &mut self,
+        sql: &str,
+    ) -> Result<CachedStmt, spg_embedded::EngineError> {
+        if let Some(c) = self.stmt_cache.get(sql) {
+            return Ok(c.clone());
         }
-        self.read_handle.as_mut().expect("set above")
+        let readonly = spg_embedded::Engine::is_readonly_sql(sql);
+        // Build the prepared Statement against a current snapshot
+        // (prepare-time transforms read the catalog for JOIN
+        // reorder). The AST stays valid across snapshots — schema
+        // drift surfaces at execute time exactly like PG's
+        // "cached plan must not change result type".
+        let snap = self.inner.clone_snapshot_inline().await;
+        let stmt = spg_embedded::Database::prepare_on_snapshot(&snap, sql)?;
+        let cached = CachedStmt {
+            readonly,
+            stmt: std::sync::Arc::new(stmt),
+        };
+        if self.stmt_cache.len() >= STMT_CACHE_CAP {
+            self.stmt_cache.clear();
+        }
+        self.stmt_cache.insert(sql.to_string(), cached.clone());
+        Ok(cached)
     }
 }
 
@@ -327,27 +341,34 @@ async fn run_one(
     sql: &str,
     arguments: Option<crate::SpgArguments<'_>>,
 ) -> Result<Outcome, Error> {
-    // v7.18 routing decision. Inside a transaction the writer
-    // lock has to stay held end-to-end so the user's isolation
-    // contract holds; we never route to the snapshot path
-    // there. Outside a transaction, parse the SQL and look at
-    // `Statement::is_readonly()`. A parse error falls through
-    // to the writer path so the user sees the same parse error
-    // they'd get from a simple-query SELECT (no behaviour
-    // change vs pre-v7.18 for unsupported syntax).
+    // v7.18 routing + v7.20 P3 inline read path. Inside a
+    // transaction the writer lock has to stay held end-to-end so
+    // the user's isolation contract holds; we never route to the
+    // snapshot path there. Outside a transaction the cached
+    // statement's readonly flag decides. A parse error falls
+    // through to the writer path so the user sees the same parse
+    // error they'd get from a simple-query SELECT.
     let in_tx = conn.tx_depth > 0;
-    let use_readonly = !in_tx && spg_embedded::Engine::is_readonly_sql(sql);
+    let cached = if in_tx {
+        None
+    } else {
+        // Parse + classify once per distinct SQL per connection.
+        conn.cached_stmt(sql).await.ok()
+    };
 
-    let result: EngineQueryResult = if use_readonly {
-        let rh = conn.fresh_read_handle().await;
-        if let Some(args) = arguments {
-            let stmt = rh.prepare(sql).await.map_err(engine_to_sqlx)?;
-            rh.execute_prepared(&stmt, args.into_engine_values())
-                .await
-                .map_err(engine_to_sqlx)?
-        } else {
-            rh.query(sql).await.map_err(engine_to_sqlx)?
-        }
+    let result: EngineQueryResult = if let Some(c) = cached.filter(|c| c.readonly) {
+        // v7.20 P3 — readonly statements run INLINE on the async
+        // executor: snapshot clone is an Arc bump (~0 µs), the
+        // prepared execute is ~2 µs CPU. No spawn_blocking, no
+        // thread hop. Per-statement snapshot = PG read-committed.
+        let snap = conn.inner.clone_snapshot_inline().await;
+        let params = arguments.map(crate::SpgArguments::into_engine_values);
+        spg_embedded::Database::execute_prepared_on_snapshot(
+            &snap,
+            &c.stmt,
+            params.as_deref().unwrap_or(&[]),
+        )
+        .map_err(engine_to_sqlx)?
     } else {
         let db = &conn.inner;
         if let Some(args) = arguments {
