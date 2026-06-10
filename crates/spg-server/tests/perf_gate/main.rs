@@ -11,7 +11,7 @@
 //! fast tier (non-ignored, run by `scripts/gate.sh gates`):
 //!   - `one_b_rows::pipeline_sanity_50k_rows` — ingest→freeze→
 //!     compact→restart pipeline sanity at 50K rows
-//!   - `parallel_freezer::four_worker_speedup_at_least_2x` —
+//!   - `parallel_freezer::four_worker_prepare_speedup_scales` —
 //!     v6.7.4 ship-gate
 //!   - `prefetch::four_worker_pool_speedup_at_least_1_3x` —
 //!     v6.7.6 ship-gate
