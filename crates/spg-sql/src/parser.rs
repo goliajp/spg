@@ -6144,9 +6144,17 @@ impl Parser {
         // type — silently accepting invalid DDL. Quoted
         // identifiers ("unique" / `unique`) remain valid names.
         if let Token::Ident(s) = self.peek()
-            && ["unique", "primary", "foreign", "constraint", "check", "references", "exclude"]
-                .iter()
-                .any(|kw| s.eq_ignore_ascii_case(kw))
+            && [
+                "unique",
+                "primary",
+                "foreign",
+                "constraint",
+                "check",
+                "references",
+                "exclude",
+            ]
+            .iter()
+            .any(|kw| s.eq_ignore_ascii_case(kw))
         {
             return Err(self.err(alloc::format!(
                 "unexpected reserved keyword '{s}' at start of column definition \
