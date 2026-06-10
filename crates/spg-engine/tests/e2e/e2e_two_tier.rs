@@ -1,10 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::uninlined_format_args
-)]
-
 //! v5.1: two-tier (hot + cold) read path end-to-end through
 //! `Engine::execute`. Exercises the four corner cases the v5.1
 //! ship gate calls out:

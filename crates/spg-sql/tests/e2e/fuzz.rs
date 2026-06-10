@@ -1,11 +1,3 @@
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::doc_markdown,
-    clippy::uninlined_format_args,
-    clippy::unusual_byte_groupings
-)]
-
 //! v4.31 SQL parser fuzz — randomized inputs against
 //! `parser::parse_statement`. The parser must never panic; an
 //! adversarial input may legitimately error, just not crash the
