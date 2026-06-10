@@ -215,6 +215,132 @@ fn encode_v3_auto_commit(sql: &str) -> Vec<u8> {
     out
 }
 
+/// v7.19 P3 — retention sweep loop. Runs in a dedicated thread
+/// spawned by `Database::open_path` when `SPG_PITR_RETENTION_HOURS`
+/// is set to a non-zero value. Wakes every
+/// `SPG_PITR_RETENTION_CHECK_SEC` (default 60 s), enumerates chunks
+/// under `wal_dir`, archives via `SPG_PITR_ARCHIVE_CMD` if set, and
+/// deletes anything older than `retention_hours`.
+///
+/// Loud-failure posture matches PG's `archive_command`: if the
+/// archive command returns non-zero, the chunk stays on disk and
+/// a warning prints to stderr. The retention sweep doesn't delete
+/// a chunk it failed to archive.
+fn retention_sweep_loop(
+    wal_dir: PathBuf,
+    retention_hours: u64,
+    check_interval: std::time::Duration,
+    archive_cmd: Option<String>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::SeqCst) {
+        if let Err(e) = retention_sweep_once(&wal_dir, retention_hours, archive_cmd.as_deref()) {
+            eprintln!("spg-embedded: retention sweep error: {e}");
+        }
+        // Sleep in short ticks so shutdown isn't blocked on a
+        // 60 s naptime when Drop signals.
+        let mut elapsed = std::time::Duration::ZERO;
+        let tick = std::time::Duration::from_millis(250);
+        while elapsed < check_interval {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(tick);
+            elapsed += tick;
+        }
+    }
+}
+
+/// v7.19 P3 — one retention sweep pass over `wal_dir`. Extracted
+/// from the loop so tests can drive it directly. Public so the
+/// e2e_pitr_retention integration test (and any future operator
+/// tooling that wants synchronous retention) can call it.
+pub fn retention_sweep_once(
+    wal_dir: &Path,
+    retention_hours: u64,
+    archive_cmd: Option<&str>,
+) -> std::io::Result<()> {
+    if !wal_dir.exists() {
+        return Ok(());
+    }
+    let now_us = wall_clock_micros();
+    let cutoff_us = (now_us as i128 - (retention_hours as i128 * 3_600 * 1_000_000)) as i64;
+    let chunks = sorted_wal_chunks(wal_dir)?;
+    for chunk in chunks {
+        // Don't sweep the most-recent chunk; it's the live one
+        // execute() is appending to. Compare against the largest
+        // filename-prefix unix_us.
+        let stem = match chunk.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let chunk_us: i64 = stem
+            .split_once('_')
+            .and_then(|(prefix, _)| i64::from_str_radix(prefix, 16).ok())
+            .unwrap_or(0);
+        if chunk_us >= cutoff_us {
+            continue;
+        }
+        // Archive first if requested.
+        if let Some(cmd) = archive_cmd {
+            if !cmd.is_empty() {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .arg("--")
+                    .arg(&chunk)
+                    .output()?;
+                if !output.status.success() {
+                    eprintln!(
+                        "spg-embedded: SPG_PITR_ARCHIVE_CMD failed for {} (exit {}); chunk stays on disk",
+                        chunk.display(),
+                        output.status.code().unwrap_or(-1)
+                    );
+                    continue;
+                }
+            }
+        }
+        // Delete the chunk + its sibling .checksum if present.
+        if let Err(e) = std::fs::remove_file(&chunk) {
+            eprintln!(
+                "spg-embedded: retention remove {} failed: {e}",
+                chunk.display()
+            );
+            continue;
+        }
+        let mut cs = chunk.clone();
+        let mut name = cs
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".checksum");
+        cs.set_file_name(name);
+        let _ = std::fs::remove_file(&cs);
+    }
+    Ok(())
+}
+
+fn pitr_retention_hours() -> u64 {
+    std::env::var("SPG_PITR_RETENTION_HOURS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn pitr_retention_check_sec() -> u64 {
+    std::env::var("SPG_PITR_RETENTION_CHECK_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(60)
+}
+
+fn pitr_archive_cmd() -> Option<String> {
+    std::env::var("SPG_PITR_ARCHIVE_CMD")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// v7.19 — replay every record from `wal_bytes` whose
 /// `commit_lsn` is strictly greater than `floor_lsn`. v3 records
 /// (no LSN) and v4 records with `commit_lsn <= floor_lsn` are
@@ -721,6 +847,16 @@ struct PersistenceCtx {
     /// Rotated at checkpoint and whenever `wal_len` crosses
     /// `checkpoint_threshold_bytes`.
     current_chunk_path: PathBuf,
+    /// v7.19 P3 — retention sweeper handle. `Some` when
+    /// `SPG_PITR_RETENTION_HOURS > 0` at open_path time; `None`
+    /// when retention is disabled (the default; v7.18 behaviour
+    /// preserved). The thread polls `wal_dir` every
+    /// `SPG_PITR_RETENTION_CHECK_SEC` seconds, archives via
+    /// `SPG_PITR_ARCHIVE_CMD` if set, then deletes chunks older
+    /// than the retention window. Signalled to exit via
+    /// `retention_shutdown` on Drop.
+    retention_shutdown: Option<Arc<AtomicBool>>,
+    retention_thread: Option<std::thread::JoinHandle<()>>,
     /// Append-only handle on `current_chunk_path`.
     wal: File,
     /// Cached length of the current chunk so `execute()` skips
@@ -998,6 +1134,34 @@ impl Database {
             .open(&current_chunk_path)
             .map_err(io_err)?;
         let wal_len = wal.metadata().map_err(io_err)?.len();
+        // v7.19 P3 — spawn retention sweep thread when the
+        // operator opted in via SPG_PITR_RETENTION_HOURS > 0.
+        // Otherwise stay on the v7.18 behaviour (chunks accumulate
+        // until something else — backup-pitr archival, manual
+        // cleanup — moves them).
+        let retention_hours = pitr_retention_hours();
+        let (retention_shutdown, retention_thread) = if retention_hours > 0 {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_clone = Arc::clone(&shutdown);
+            let wal_dir_clone = wal_dir.clone();
+            let check_interval = std::time::Duration::from_secs(pitr_retention_check_sec());
+            let archive_cmd = pitr_archive_cmd();
+            let handle = std::thread::Builder::new()
+                .name("spg-pitr-retention".into())
+                .spawn(move || {
+                    retention_sweep_loop(
+                        wal_dir_clone,
+                        retention_hours,
+                        check_interval,
+                        archive_cmd,
+                        shutdown_clone,
+                    );
+                })
+                .map_err(io_err)?;
+            (Some(shutdown), Some(handle))
+        } else {
+            (None, None)
+        };
         Ok(Self {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
@@ -1011,6 +1175,8 @@ impl Database {
                 cold_segments_dir,
                 cold_segment_paths,
                 lock_path,
+                retention_shutdown,
+                retention_thread,
             }),
         })
     }
@@ -1988,6 +2154,20 @@ impl Drop for Database {
                     "spg-embedded: final checkpoint on Drop failed: {e:?} \
                      (WAL is intact; next open_path will replay)"
                 );
+            }
+        }
+        // v7.19 P3 — signal the retention thread to exit, then
+        // wait for it. Done BEFORE the lock release so the
+        // background thread doesn't outlive the database handle.
+        // The signal + join pair lives behind take() because Drop
+        // takes `&mut self` and we need to move the thread handle
+        // out.
+        if let Some(ctx) = self.persistence.as_mut() {
+            if let Some(shutdown) = ctx.retention_shutdown.take() {
+                shutdown.store(true, Ordering::SeqCst);
+            }
+            if let Some(handle) = ctx.retention_thread.take() {
+                let _ = handle.join();
             }
         }
         // v7.17.0 Phase 6.2 — release the cross-process lock on
