@@ -143,6 +143,27 @@ impl AsyncDatabase {
         .expect("spawn_blocking join")
     }
 
+    /// v7.21 — run a multi-statement script with PG simple-query
+    /// semantics (one implicit transaction; see
+    /// `spg_embedded::Database::execute_script`). The write lock is
+    /// held across the WHOLE script: the engine's transaction slot
+    /// is shared, so releasing the lock mid-script would let another
+    /// writer's statements join the script's implicit transaction.
+    ///
+    /// # Errors
+    /// Propagates the first failing statement's `EngineError` after
+    /// the implicit rollback.
+    pub async fn execute_script(&self, sql: &str) -> Result<Vec<QueryResult>, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_write();
+            guard.execute_script(&sql)
+        })
+        .await
+        .expect("spawn_blocking join")
+    }
+
     /// Run a SELECT and return rows as `Vec<Vec<Value>>`. Same
     /// dispatch shape as `execute` — lock + spawn_blocking.
     ///

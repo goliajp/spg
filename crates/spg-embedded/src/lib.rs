@@ -180,6 +180,21 @@ const WAL_V4_EXTRA_HEADER: usize = 16;
 /// dispatch skips it (same as the v3 durability marker).
 const WAL_V4_TYPE_CHECKPOINT_MARKER: u8 = 0x11;
 
+/// v7.21 (mailrs embed round-12 polish) — one COMMITted explicit
+/// transaction, flushed atomically at COMMIT time. Payload = the
+/// transaction's bind-final mutation statements joined with `";\n"`;
+/// replay re-splits via [`split_statements`] and applies in order.
+/// Same 16-byte (commit_lsn, commit_unix_us) prefix as the v4
+/// auto-commit record. The record is CRC-framed like every other
+/// record, so replay applies the whole transaction or — torn tail —
+/// none of it; a transaction can never half-resurrect.
+///
+/// Why it exists: in-transaction mutations only touch the engine's
+/// shadow catalog (`modified_catalog: false`), so the per-statement
+/// auto-commit append never fired and a COMMIT followed by a crash
+/// (no graceful Drop checkpoint) lost the transaction.
+const WAL_V4_TYPE_TX_COMMIT_SQL: u8 = 0x12;
+
 /// v7.1 — auto-checkpoint threshold. Once the WAL grows past
 /// this many bytes, the next successful `execute()` call ends
 /// with a `checkpoint()` so the WAL stays bounded. Tunable via
@@ -633,7 +648,7 @@ fn replay_wal_filtered(
         }
         // v4 SQL records carry an LSN. Apply iff strictly above
         // the snapshot floor.
-        if r.type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL {
+        if r.type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL || r.type_byte == WAL_V4_TYPE_TX_COMMIT_SQL {
             if let Some(lsn) = r.commit_lsn {
                 if lsn <= floor_lsn {
                     continue;
@@ -647,12 +662,17 @@ fn replay_wal_filtered(
             Ok(s) => s,
             Err(e) => return Err(format!("non-UTF-8 SQL at offset {}: {e}", r.offset)),
         };
-        engine.execute(sql).map_err(|e| {
-            format!(
-                "WAL replay: apply {sql:?} at offset {} rejected: {e:?}",
-                r.offset
-            )
-        })?;
+        // v7.21 — a tx-commit record carries the whole transaction
+        // as a `";\n"`-joined script; auto-commit records are a
+        // single statement, for which split_statements is a no-op.
+        for stmt in split_statements(sql) {
+            engine.execute(stmt).map_err(|e| {
+                format!(
+                    "WAL replay: apply {stmt:?} at offset {} rejected: {e:?}",
+                    r.offset
+                )
+            })?;
+        }
         applied += 1;
     }
     Ok(applied)
@@ -758,9 +778,24 @@ fn encode_v4_checkpoint_marker(
 /// readable by the same loop with their original 9-byte header
 /// arithmetic.
 fn encode_v4_auto_commit(sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    encode_v4_sql_record(WAL_V4_TYPE_AUTO_COMMIT_SQL, sql, commit_lsn, commit_unix_us)
+}
+
+/// v7.21 — same envelope, `WAL_V4_TYPE_TX_COMMIT_SQL` type byte.
+/// `script` = the transaction's statements joined with `";\n"`.
+fn encode_v4_tx_commit(script: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    encode_v4_sql_record(
+        WAL_V4_TYPE_TX_COMMIT_SQL,
+        script,
+        commit_lsn,
+        commit_unix_us,
+    )
+}
+
+fn encode_v4_sql_record(type_byte: u8, sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
     let payload = sql.as_bytes();
     let mut crc_buf = Vec::with_capacity(1 + WAL_V4_EXTRA_HEADER + payload.len());
-    crc_buf.push(WAL_V4_TYPE_AUTO_COMMIT_SQL);
+    crc_buf.push(type_byte);
     crc_buf.extend_from_slice(&commit_lsn.to_le_bytes());
     crc_buf.extend_from_slice(&commit_unix_us.to_le_bytes());
     crc_buf.extend_from_slice(payload);
@@ -769,7 +804,7 @@ fn encode_v4_auto_commit(sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec
     let mut out = Vec::with_capacity(4 + 4 + 1 + WAL_V4_EXTRA_HEADER + payload.len());
     out.extend_from_slice(&header);
     out.extend_from_slice(&crc.to_le_bytes());
-    out.push(WAL_V4_TYPE_AUTO_COMMIT_SQL);
+    out.push(type_byte);
     out.extend_from_slice(&commit_lsn.to_le_bytes());
     out.extend_from_slice(&commit_unix_us.to_le_bytes());
     out.extend_from_slice(payload);
@@ -824,13 +859,18 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
                     cur += header_len + rec_len;
                     continue;
                 }
-                WAL_V4_TYPE_AUTO_COMMIT_SQL => {
+                WAL_V4_TYPE_AUTO_COMMIT_SQL | WAL_V4_TYPE_TX_COMMIT_SQL => {
                     // v7.18 PITR — v4 record carries 16 bytes of
                     // (commit_lsn, commit_unix_us) between the type
                     // byte and the SQL payload. Replay reads them but
                     // does not enforce them — the engine doesn't
                     // surface LSN/clock here. Restore tooling
                     // (spgctl) parses them via parse_wal_record below.
+                    //
+                    // v7.21 — tx-commit records (0x12) carry a whole
+                    // transaction as a `";\n"`-joined script;
+                    // split_statements is a no-op on the single-
+                    // statement auto-commit form.
                     let v4_total = header_len + WAL_V4_EXTRA_HEADER + rec_len;
                     if wal_bytes.len() - cur < v4_total {
                         // Torn v4 record at the tail — drop, stop.
@@ -840,9 +880,11 @@ fn replay_wal_into_engine(wal_bytes: &[u8], engine: &mut Engine) -> Result<usize
                     let sql_bytes = &wal_bytes[sql_start..sql_start + rec_len];
                     let sql = std::str::from_utf8(sql_bytes)
                         .map_err(|e| format!("WAL replay: non-UTF-8 SQL at offset {cur}: {e}"))?;
-                    engine.execute(sql).map_err(|e| {
-                        format!("WAL replay: apply {sql:?} at offset {cur} rejected: {e:?}")
-                    })?;
+                    for stmt in split_statements(sql) {
+                        engine.execute(stmt).map_err(|e| {
+                            format!("WAL replay: apply {stmt:?} at offset {cur} rejected: {e:?}")
+                        })?;
+                    }
                     applied += 1;
                     cur += v4_total;
                     continue;
@@ -1002,7 +1044,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                 });
                 cur += header_len + rec_len;
             }
-            WAL_V4_TYPE_AUTO_COMMIT_SQL => {
+            WAL_V4_TYPE_AUTO_COMMIT_SQL | WAL_V4_TYPE_TX_COMMIT_SQL => {
                 let v4_total = header_len + WAL_V4_EXTRA_HEADER + rec_len;
                 if wal_bytes.len() - cur < v4_total {
                     break;
@@ -1091,6 +1133,69 @@ pub struct Database {
     /// reopen never reuses an LSN. In-memory databases start at
     /// 0 and never advance (no WAL = no LSN-meaningful records).
     commit_lsn: AtomicU64,
+    /// v7.21 (round-12 polish) — explicit-transaction WAL buffer.
+    /// `Some` between an engine-accepted BEGIN and its
+    /// COMMIT / ROLLBACK on a persistent database. In-transaction
+    /// mutations only touch the engine's shadow catalog and report
+    /// `modified_catalog: false`, so the per-statement auto-commit
+    /// append never fires for them; their bind-final SQL collects
+    /// here instead and COMMIT flushes the lot as ONE atomic
+    /// `WAL_V4_TYPE_TX_COMMIT_SQL` record (ROLLBACK just drops it).
+    /// Always `None` for in-memory databases.
+    tx_wal: Option<TxWalBuffer>,
+}
+
+/// See [`Database::tx_wal`].
+#[derive(Debug, Default)]
+struct TxWalBuffer {
+    /// Bind-final SQL of every non-read-only statement the engine
+    /// accepted inside the open transaction, in execution order.
+    statements: Vec<String>,
+    /// `(savepoint_name, statements.len() at SAVEPOINT time)` —
+    /// `ROLLBACK TO SAVEPOINT` truncates `statements` back to the
+    /// recorded mark so the WAL record matches what the engine
+    /// keeps. PG name-reuse semantics (latest wins).
+    savepoints: Vec<(String, usize)>,
+}
+
+/// Statement-level transaction-control classification for the WAL
+/// buffer. Runs AFTER the engine accepted the statement, so the
+/// engine stays the single validator — this only mirrors state.
+enum TxControl {
+    Begin,
+    Commit,
+    Rollback,
+    RollbackToSavepoint(String),
+    Savepoint(String),
+    ReleaseSavepoint,
+}
+
+fn tx_control_kind(sql: &str) -> Option<TxControl> {
+    let mut words = sql
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase);
+    let head = words.next()?;
+    match head.as_str() {
+        "begin" | "start" => Some(TxControl::Begin),
+        "commit" | "end" => Some(TxControl::Commit),
+        "savepoint" => words.next().map(TxControl::Savepoint),
+        "release" => Some(TxControl::ReleaseSavepoint),
+        "rollback" => match words.next().as_deref() {
+            // ROLLBACK TO [SAVEPOINT] <name>
+            Some("to") => {
+                let next = words.next()?;
+                let name = if next == "savepoint" {
+                    words.next()?
+                } else {
+                    next
+                };
+                Some(TxControl::RollbackToSavepoint(name))
+            }
+            _ => Some(TxControl::Rollback),
+        },
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1162,6 +1267,7 @@ impl Database {
             engine: Engine::new().with_clock(wall_clock_micros),
             persistence: None,
             commit_lsn: AtomicU64::new(0),
+            tx_wal: None,
         }
     }
 
@@ -1223,18 +1329,7 @@ impl Database {
             p.set_file_name(name);
             p
         };
-        std::fs::create_dir(&lock_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                EngineError::Unsupported(format!(
-                    "database is locked by another process (or stale lock): {}; \
-                     remove the directory manually after confirming no other \
-                     process holds it, or call Database::force_unlock()",
-                    lock_path.display()
-                ))
-            } else {
-                io_err(e)
-            }
-        })?;
+        acquire_path_lock(&lock_path)?;
         let mut engine = if db_path.exists() {
             let bytes = std::fs::read(&db_path).map_err(io_err)?;
             let engine = Engine::restore_envelope(&bytes).map_err(|e| {
@@ -1455,6 +1550,7 @@ impl Database {
         Ok(Self {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
+            tx_wal: None,
             persistence: Some(PersistenceCtx {
                 db_path,
                 wal_dir,
@@ -1628,6 +1724,7 @@ impl Database {
             engine,
             persistence: None,
             commit_lsn: AtomicU64::new(0),
+            tx_wal: None,
         })
     }
 
@@ -1686,25 +1783,102 @@ impl Database {
         sql: &str,
     ) -> Result<(QueryResult, Option<WalTicket>), EngineError> {
         let result = self.engine.execute(sql)?;
-        let mut ticket = None;
-        if self.persistence.is_some()
-            && !sql_is_read_only(sql)
-            && matches!(
-                &result,
-                QueryResult::CommandOk {
-                    modified_catalog: true,
-                    ..
+        let modified = matches!(
+            &result,
+            QueryResult::CommandOk {
+                modified_catalog: true,
+                ..
+            }
+        );
+        let ticket = self.wal_after_ok(sql, modified)?;
+        Ok((result, ticket))
+    }
+
+    /// v7.21 (round-12 polish) — post-engine WAL bookkeeping shared
+    /// by the simple ([`Self::execute_buffered`]) and prepared
+    /// ([`Self::execute_prepared_buffered`]) write paths. `canonical`
+    /// is the replay text (bind-final for prepared statements);
+    /// `modified_catalog` comes from the engine result. Three routes:
+    ///
+    /// - transaction control → maintain [`Self::tx_wal`]: BEGIN opens
+    ///   the buffer, COMMIT flushes it as ONE atomic
+    ///   `WAL_V4_TYPE_TX_COMMIT_SQL` record, ROLLBACK drops it,
+    ///   SAVEPOINT / ROLLBACK TO mark / truncate it. The engine has
+    ///   already accepted the statement, so this only mirrors state.
+    /// - inside an open transaction → buffer the statement (shadow-
+    ///   catalog mutations report `modified_catalog: false`, so the
+    ///   auto-commit arm below can't see them).
+    /// - auto-commit mutation → classic per-statement v4 record.
+    ///
+    /// v7.18 PITR — v4 records carry commit LSN + wall-clock micros.
+    /// The crash window remains one BATCH: replay re-applies
+    /// idempotently exactly as before, and a torn batch tail drops
+    /// cleanly (same torn-write handling).
+    fn wal_after_ok(
+        &mut self,
+        canonical: &str,
+        modified_catalog: bool,
+    ) -> Result<Option<WalTicket>, EngineError> {
+        if self.persistence.is_none() {
+            return Ok(None);
+        }
+        let mut record = None;
+        match tx_control_kind(canonical) {
+            Some(TxControl::Begin) => {
+                self.tx_wal = Some(TxWalBuffer::default());
+            }
+            Some(TxControl::Commit) => {
+                if let Some(buf) = self.tx_wal.take()
+                    && !buf.statements.is_empty()
+                {
+                    let script = buf.statements.join(";\n");
+                    let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+                    record = Some(encode_v4_tx_commit(&script, lsn, wall_clock_micros()));
                 }
-            )
-        {
-            // v7.18 PITR — v4 records carry commit LSN +
-            // wall-clock micros. The crash window remains one
-            // BATCH now instead of one record: replay re-applies
-            // idempotently exactly as before, and a torn batch
-            // tail drops cleanly (same torn-write handling).
-            let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-            let ts = wall_clock_micros();
-            let record = encode_v4_auto_commit(sql, lsn, ts);
+            }
+            Some(TxControl::Rollback) => {
+                self.tx_wal = None;
+            }
+            Some(TxControl::Savepoint(name)) => {
+                if let Some(buf) = &mut self.tx_wal {
+                    // PG name-reuse semantics: latest mark wins.
+                    buf.savepoints.retain(|(n, _)| n != &name);
+                    let mark = buf.statements.len();
+                    buf.savepoints.push((name, mark));
+                }
+            }
+            Some(TxControl::RollbackToSavepoint(name)) => {
+                if let Some(buf) = &mut self.tx_wal
+                    && let Some(pos) = buf.savepoints.iter().position(|(n, _)| n == &name)
+                {
+                    let mark = buf.savepoints[pos].1;
+                    buf.statements.truncate(mark);
+                    // Later savepoints die with the rollback; the
+                    // target itself survives (PG keeps it
+                    // re-rollbackable).
+                    buf.savepoints.truncate(pos + 1);
+                }
+            }
+            Some(TxControl::ReleaseSavepoint) => {
+                // RELEASE folds the savepoint into the enclosing tx —
+                // buffered statements stay. The mark also stays:
+                // marks are only consulted by ROLLBACK TO, which the
+                // engine validates first, so a dangling mark is
+                // unreachable.
+            }
+            None => {
+                if let Some(buf) = &mut self.tx_wal {
+                    if !sql_is_read_only(canonical) {
+                        buf.statements.push(canonical.to_string());
+                    }
+                } else if modified_catalog && !sql_is_read_only(canonical) {
+                    let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+                    record = Some(encode_v4_auto_commit(canonical, lsn, wall_clock_micros()));
+                }
+            }
+        }
+        let mut ticket = None;
+        if let Some(record) = record {
             let p = self.persistence.as_mut().expect("checked above");
             let seq = p.wal.enqueue(&record);
             ticket = Some(WalTicket {
@@ -1715,7 +1889,7 @@ impl Database {
                 self.checkpoint()?;
             }
         }
-        Ok((result, ticket))
+        Ok(ticket)
     }
 
     /// v7.3.0 — typed-row variant of [`Database::query`]. Each
@@ -1904,40 +2078,31 @@ impl Database {
         params: &[Value],
     ) -> Result<(QueryResult, Option<WalTicket>), EngineError> {
         let result = self.engine.execute_prepared(stmt.stmt.clone(), params)?;
-        let mut ticket = None;
+        let modified = matches!(
+            &result,
+            QueryResult::CommandOk {
+                modified_catalog: true,
+                ..
+            }
+        );
         // WAL persistence on the bind-final SQL. Build the
         // canonical Display form by re-printing the
         // placeholder-substituted statement (cheap — the AST
         // is already in hand from execute_prepared's internal
         // clone) so replay's path is identical to the
-        // simple-query path.
+        // simple-query path. v7.21: also when a transaction is
+        // open — in-tx mutations report `modified_catalog: false`
+        // but must reach the tx WAL buffer (see `wal_after_ok`).
+        let mut ticket = None;
         if self.persistence.is_some()
-            && matches!(
-                &result,
-                QueryResult::CommandOk {
-                    modified_catalog: true,
-                    ..
-                }
-            )
+            && (modified
+                || (self.tx_wal.is_some() && !sql_is_read_only(&stmt.sql))
+                || tx_control_kind(&stmt.sql).is_some())
         {
             let mut wal_stmt = stmt.stmt.clone();
             crate::wal_render_with_params(&mut wal_stmt, params);
             let canonical = format!("{wal_stmt}");
-            // v7.18 PITR — prepared path also emits v4 records so
-            // LSN/timestamp coverage is uniform across simple and
-            // extended query.
-            let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-            let ts = wall_clock_micros();
-            let record = encode_v4_auto_commit(&canonical, lsn, ts);
-            let p = self.persistence.as_mut().expect("checked above");
-            let seq = p.wal.enqueue(&record);
-            ticket = Some(WalTicket {
-                group: Arc::clone(&p.wal),
-                seq,
-            });
-            if p.wal.written_len() >= p.checkpoint_threshold_bytes {
-                self.checkpoint()?;
-            }
+            ticket = self.wal_after_ok(&canonical, modified)?;
         }
         Ok((result, ticket))
     }
@@ -2026,6 +2191,55 @@ impl Database {
         Ok(spg_engine::Engine::describe_prepared_on_snapshot(
             snapshot, &stmt,
         ))
+    }
+
+    /// v7.21 (round-12 polish) — run a multi-statement SQL script
+    /// with PG simple-query semantics: the statements execute in
+    /// order inside ONE implicit transaction, so a mid-script error
+    /// rolls back the whole script (PG wraps every simple-query
+    /// message in an implicit transaction). Three exceptions, all
+    /// PG-faithful:
+    ///
+    /// - a script that carries its OWN transaction control
+    ///   (BEGIN / COMMIT / …) runs statement-by-statement — the
+    ///   script owns its boundaries;
+    /// - a script run while the caller already has a transaction
+    ///   open joins that transaction (no nested BEGIN), and the
+    ///   caller's COMMIT / ROLLBACK decides its fate;
+    /// - a single-statement script is plain auto-commit.
+    ///
+    /// Returns one `QueryResult` per executed statement. This is the
+    /// engine behind `sqlx::raw_sql` (mailrs feeds whole
+    /// `init-schema.sql` files through it) and `spgctl import`.
+    ///
+    /// # Errors
+    /// The first failing statement's error propagates after the
+    /// implicit ROLLBACK; nothing from the script remains applied.
+    pub fn execute_script(&mut self, sql: &str) -> Result<Vec<QueryResult>, EngineError> {
+        let stmts = split_statements(sql);
+        let script_owns_tx = stmts.iter().any(|s| tx_control_kind(s).is_some());
+        let wrap = stmts.len() > 1 && !script_owns_tx && !self.engine.in_transaction();
+        if !wrap {
+            let mut out = Vec::with_capacity(stmts.len());
+            for stmt in &stmts {
+                out.push(self.execute(stmt)?);
+            }
+            return Ok(out);
+        }
+        self.execute("BEGIN")?;
+        let mut out = Vec::with_capacity(stmts.len());
+        for stmt in &stmts {
+            match self.execute(stmt) {
+                Ok(r) => out.push(r),
+                Err(e) => {
+                    // Best-effort rollback; surface the script error.
+                    let _ = self.execute("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        self.execute("COMMIT")?;
+        Ok(out)
     }
 
     /// v7.2.0 — run `body` inside an implicit `BEGIN` /
@@ -2401,7 +2615,11 @@ pub fn revert_wal_to_seq(
                 "WAL record at offset {cur}: non-UTF-8 SQL: {e}"
             )))
         })?;
-        engine.execute(sql)?;
+        // v7.21 — tx-commit records carry a multi-statement script;
+        // split_statements is a no-op for single-statement records.
+        for stmt in split_statements(sql) {
+            engine.execute(stmt)?;
+        }
         applied += 1;
     }
     let snapshot = engine.snapshot();
@@ -2459,7 +2677,7 @@ fn decode_wal_record(tail: &[u8]) -> Result<(Vec<u8>, usize), EngineError> {
             let payload = &tail[header_len..header_len + rec_len];
             return Ok((payload.to_vec(), header_len + rec_len));
         }
-        if type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL {
+        if type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL || type_byte == WAL_V4_TYPE_TX_COMMIT_SQL {
             let v4_total = header_len + WAL_V4_EXTRA_HEADER + rec_len;
             if tail.len() < v4_total {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -2525,7 +2743,9 @@ impl Drop for Database {
         if let Some(ctx) = &self.persistence
             && ctx.lock_path.exists()
         {
-            if let Err(e) = std::fs::remove_dir(&ctx.lock_path) {
+            // remove_dir_all: the lock dir carries the owner-pid
+            // record since round-12.
+            if let Err(e) = std::fs::remove_dir_all(&ctx.lock_path) {
                 eprintln!(
                     "spg-embedded: lock release on Drop failed for {}: {e:?}",
                     ctx.lock_path.display()
@@ -2560,7 +2780,7 @@ impl Database {
         if !lock_path.exists() {
             return Ok(());
         }
-        std::fs::remove_dir(&lock_path).map_err(io_err)
+        std::fs::remove_dir_all(&lock_path).map_err(io_err)
     }
 }
 
@@ -2785,9 +3005,252 @@ impl<T: FromSpgValue> FromSpgValue for Option<T> {
     }
 }
 
+/// Acquire the cross-process exclusion lock at `lock_path` (atomic
+/// `mkdir`), recording the owner pid inside. If the lock already
+/// exists, read the recorded pid and probe liveness — a lock left
+/// behind by a killed process (docker SIGKILL, crash) is reclaimed
+/// automatically instead of forcing the operator to delete it by
+/// hand (mailrs embed round-12: a restarted server came up in
+/// degraded mode because the previous instance's lock survived).
+fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
+    for attempt in 0..2 {
+        match std::fs::create_dir(lock_path) {
+            Ok(()) => {
+                // Best-effort owner record; liveness probing treats a
+                // missing pid file as stale (crash between mkdir and
+                // write is indistinguishable from an ancient lock).
+                let _ = std::fs::write(lock_path.join("pid"), std::process::id().to_string());
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                let owner = std::fs::read_to_string(lock_path.join("pid"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let owner_alive = owner.is_some_and(pid_alive);
+                if owner_alive {
+                    return Err(EngineError::Unsupported(format!(
+                        "database is locked by another process (pid {}): {}; \
+                         stop that process first, or call Database::force_unlock()",
+                        owner.unwrap_or(0),
+                        lock_path.display()
+                    )));
+                }
+                // Stale — owner pid dead or unrecorded. Reclaim.
+                eprintln!(
+                    "spg-embedded: reclaiming stale lock {} (owner pid {:?} not alive)",
+                    lock_path.display(),
+                    owner
+                );
+                std::fs::remove_dir_all(lock_path).map_err(io_err)?;
+                // Loop retries the create_dir; a concurrent reclaimer
+                // winning the race surfaces as AlreadyExists on
+                // attempt 1 below.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(EngineError::Unsupported(format!(
+                    "database is locked by another process: {}; \
+                     stop that process first, or call Database::force_unlock()",
+                    lock_path.display()
+                )));
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    unreachable!("acquire_path_lock loop covers both attempts")
+}
+
+/// Probe whether `pid` is a live process. Unix: `ps -p` via the
+/// system binary (std-only — no libc dependency). `ps -p` exits 0
+/// for ANY live pid regardless of owner; `kill -0` was rejected
+/// here because it fails with EPERM on another user's live process,
+/// which would read as "dead" and reclaim a held lock. Probe
+/// failure (no `ps` binary, exec error) conservatively reports
+/// alive so locks are never auto-reclaimed on doubt; non-unix
+/// targets do the same.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    match std::process::Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Split a multi-statement SQL script into individual statements on
+/// top-level `;`, honouring single-quoted strings (with `''`
+/// escapes), double-quoted identifiers, dollar-quoted bodies
+/// (`$tag$ … $tag$`), line comments (`--`) and nested block
+/// comments (`/* … */`). Chunks that contain no statement content
+/// (whitespace / comments only) are dropped. PG's simple-query
+/// protocol does this server-side; the embed path owns it here.
+pub fn split_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut stmts = Vec::new();
+    let mut start = 0usize;
+    let mut has_content = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                has_content = true;
+                // PG escape-string form `E'...'` honours backslash
+                // escapes (`E'a\';b'` is ONE literal) — detect via
+                // the immediately-preceding standalone E/e.
+                let escape_string = i >= 1
+                    && matches!(bytes[i - 1], b'e' | b'E')
+                    && !(i >= 2 && (bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_'));
+                i += 1;
+                while i < bytes.len() {
+                    if escape_string && bytes[i] == b'\\' {
+                        // Skip the escaped byte (covers \' and \\).
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        // `''` is an escaped quote inside the literal.
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                has_content = true;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += 1;
+                }
+            }
+            b'$' => {
+                // Possible dollar-quote opener `$tag$` (tag may be
+                // empty). If the shape doesn't match, it's a plain
+                // `$` (positional param) — fall through.
+                let tag_end = bytes[i + 1..]
+                    .iter()
+                    .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                    .map(|off| i + 1 + off);
+                if let Some(te) = tag_end
+                    && te < bytes.len()
+                    && bytes[te] == b'$'
+                {
+                    has_content = true;
+                    let tag = &sql[i..=te];
+                    // Find the closing `$tag$`.
+                    if let Some(close) = sql[te + 1..].find(tag) {
+                        i = te + 1 + close + tag.len();
+                        continue;
+                    }
+                    // Unterminated — consume the rest; the parser
+                    // will report it.
+                    i = bytes.len();
+                    continue;
+                }
+                has_content = true;
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b';' => {
+                if has_content {
+                    stmts.push(&sql[start..i]);
+                }
+                start = i + 1;
+                has_content = false;
+            }
+            b => {
+                if !b.is_ascii_whitespace() {
+                    has_content = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    if has_content {
+        stmts.push(&sql[start..]);
+    }
+    stmts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_statements_basic_and_trailing() {
+        assert_eq!(
+            split_statements("CREATE TABLE a (x INT); INSERT INTO a VALUES (1)"),
+            vec!["CREATE TABLE a (x INT)", " INSERT INTO a VALUES (1)"]
+        );
+        // whitespace/comment-only chunks drop
+        assert!(split_statements("  ;; -- nothing\n;").is_empty());
+    }
+
+    #[test]
+    fn split_statements_quoting_forms() {
+        // ';' inside a plain literal, a doubled quote, an E-string
+        // backslash escape, a quoted identifier, and a dollar-quoted
+        // body must not split.
+        let cases = [
+            "INSERT INTO t VALUES ('a;b')",
+            "INSERT INTO t VALUES ('it''s; fine')",
+            r"INSERT INTO t VALUES (E'it\'s; fine')",
+            "CREATE TABLE \"odd;name\" (x INT)",
+            "DO $body$ BEGIN PERFORM 1; END $body$",
+            "DO $$ SELECT 1; $$",
+        ];
+        for sql in cases {
+            assert_eq!(split_statements(sql), vec![sql], "must stay whole: {sql}");
+        }
+        // ...and each still splits cleanly from a neighbour.
+        for sql in cases {
+            let script = format!("{sql};\nSELECT 2");
+            assert_eq!(
+                split_statements(&script),
+                vec![sql, "\nSELECT 2"],
+                "must split after: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_statements_comments_hide_semicolons() {
+        let script = "-- c1 ; still comment\nSELECT 1; /* a ; b /* nested ; */ */ SELECT 2";
+        let got = split_statements(script);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].contains("SELECT 1"));
+        assert!(got[1].contains("SELECT 2"));
+    }
 
     #[test]
     fn in_memory_create_insert_select() {

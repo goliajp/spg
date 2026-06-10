@@ -131,6 +131,10 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
             use spg_sql::ast::Literal as L;
             let (ty, nullable) = match lit {
                 L::Null => (DataType::Text, true),
+                // Array literals only enter the AST via the
+                // prepared-bind path; surface as TEXT (no array
+                // DataType in the describe surface yet).
+                L::TextArray(_) | L::IntArray(_) | L::BigIntArray(_) => (DataType::Text, false),
                 // PG-canonical literal-int typing: `pg_typeof(1) =
                 // integer`, `pg_typeof(2147483648) = bigint`. The
                 // engine's runtime Value::Int(i32) flows naturally
