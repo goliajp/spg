@@ -7,8 +7,15 @@
 //! and `workers=4`. Gate: `t1 / t4 >= 1.3` on hosts with >= 4
 //! logical cores; soft 1.05 fallback on 2-core CI.
 //!
-//! fast-tier ship-gate; sibling-test CPU contention is handled
-//! by `crate::perf_lock()` serialisation.
+//! full tier (`#[ignore]`, v7.21): the gate asserts an I/O
+//! property, and it only holds where the storage can actually
+//! serve 4 concurrent readers. On GitHub's shared runners the
+//! Linux `posix_fadvise(DONTNEED)` genuinely drops the page cache
+//! and the network-backed disk INVERTS under 4-way reads
+//! (measured 0.03×); on macOS dev boxes the fadvise is a no-op so
+//! the number is page-cache fiction anyway. Run it on the perf
+//! testbed via `scripts/gate.sh gates --full`, where it measures
+//! real local-NVMe behaviour.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -117,6 +124,7 @@ fn measure(paths: &[(u32, PathBuf)], workers: usize) -> std::time::Duration {
 }
 
 #[test]
+#[ignore = "I/O-topology-sensitive — full tier; see module doc"]
 fn four_worker_pool_speedup_at_least_1_3x() {
     let _lock = crate::perf_lock();
     let dir = unique_tmpdir();
