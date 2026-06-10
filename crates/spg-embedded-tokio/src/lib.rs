@@ -320,6 +320,20 @@ impl AsyncDatabase {
         .expect("spawn_blocking join")
     }
 
+    /// v7.20 P3 — inline snapshot clone for the read fan-out hot
+    /// path. Takes the async read lock (not `blocking_read` +
+    /// `spawn_blocking` — the clone is an Arc-bump of the catalog
+    /// trie roots, ~0 µs per profile_breakdown, far below tokio's
+    /// inline-work threshold). spg-sqlx's per-statement
+    /// read-committed refresh runs through here; pairing it with
+    /// `Database::{prepare,execute_prepared}_on_snapshot` keeps
+    /// the whole readonly statement on the async executor with
+    /// zero thread hops.
+    pub async fn clone_snapshot_inline(&self) -> CatalogSnapshot {
+        let guard = self.inner.read().await;
+        guard.engine().clone_snapshot()
+    }
+
     /// v7.11.2 — fan-out reader. Clones the engine's committed
     /// catalog under the writer lock, releases the lock, and
     /// hands back an `AsyncReadHandle` that runs SELECTs against
