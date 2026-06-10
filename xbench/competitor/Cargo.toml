@@ -90,6 +90,10 @@ path = "src/bin/cold_tier_pk_bench.rs"
 name = "sqlx_pool_concurrent_reads"
 path = "src/bin/sqlx_pool_concurrent_reads.rs"
 
+[[bin]]
+name = "profile_breakdown"
+path = "src/bin/profile_breakdown.rs"
+
 [lints.rust]
 unsafe_code     = "deny"
 unused_must_use = "deny"
