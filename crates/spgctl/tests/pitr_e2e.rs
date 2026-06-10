@@ -175,7 +175,12 @@ fn archive_cmd_failure_records_failed_and_keeps_chunk() {
         .unwrap()
         .filter_map(|e| e.ok())
         .collect();
-    assert_eq!(chunks.len(), 1, "chunk must stay on disk on archive failure");
+    // v7.19 — rotation means ≥1 chunk; the invariant is "chunks
+    // stay on disk despite archive failure", not an exact count.
+    assert!(
+        !chunks.is_empty(),
+        "chunks must stay on disk on archive failure"
+    );
     let _ = fs::remove_dir_all(&bk);
     let _ = fs::remove_file(&db);
 }
@@ -197,14 +202,15 @@ fn restore_round_trip() {
     );
     assert_eq!(code, 0, "backup-pitr: {stderr}, {stdout}");
 
-    // pitr-restore via the binary. Use the chunk that backup
-    // produced.
+    // pitr-restore via the binary. v7.19 — pass the whole chunk
+    // DIRECTORY (backup carries ≥2 chunks after the seed's
+    // checkpoint rotation); pitr-restore walks them in order.
     let wal_chunks: Vec<_> = fs::read_dir(bk.join("wal"))
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .collect();
-    assert_eq!(wal_chunks.len(), 1);
+    assert!(!wal_chunks.is_empty(), "backup must carry chunks");
     let target = unique("rt-target.spg");
     let (code, stdout, stderr) = run_spg(
         &[],
@@ -213,7 +219,7 @@ fn restore_round_trip() {
             "--snapshot",
             bk.join("snapshot.spg").to_str().unwrap(),
             "--wal",
-            wal_chunks[0].to_str().unwrap(),
+            bk.join("wal").to_str().unwrap(),
             "--to",
             "999",
             "--target",

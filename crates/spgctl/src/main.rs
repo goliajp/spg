@@ -491,10 +491,17 @@ fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport,
         };
         let (parse_ok, parse_msg) = match parse_wal_records(&bytes) {
             Ok(recs) => {
-                // Assert LSN monotonic inside the chunk.
+                // Assert SQL-record LSN strictly monotonic inside
+                // the chunk. v7.19 checkpoint markers (0x11) carry
+                // the SAME LSN as the last SQL record they anchor
+                // — skip them in the monotonicity check; only
+                // 0x10 SQL records participate.
                 let mut last: Option<u64> = None;
                 let mut hole_msg: Option<String> = None;
                 for r in &recs {
+                    if r.type_byte != 0x10 {
+                        continue;
+                    }
                     if let Some(l) = r.commit_lsn {
                         if let Some(prev) = last {
                             if l <= prev {
@@ -528,6 +535,18 @@ fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport,
     }
 
     // ---- replay dry-run ----
+    // v7.19 — same snapshot-floor logic pitr_restore and
+    // open_path use: records at or below the highest checkpoint
+    // marker LSN are already inside snapshot.spg and must not
+    // re-apply during the dry-run.
+    let snapshot_floor: u64 = replay_chunks
+        .iter()
+        .filter_map(|chunk| parse_wal_records(chunk).ok())
+        .flatten()
+        .filter(|r| r.type_byte == 0x11)
+        .filter_map(|r| r.commit_lsn)
+        .max()
+        .unwrap_or(0);
     let (replay_ok, replay_msg) = if snapshot_ok {
         match Database::restore(&snapshot_bytes) {
             Ok(mut db) => {
@@ -537,6 +556,13 @@ fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport,
                     match parse_wal_records(chunk) {
                         Ok(recs) => {
                             for r in recs {
+                                if r.type_byte == 0x10 {
+                                    if let Some(lsn) = r.commit_lsn {
+                                        if lsn <= snapshot_floor {
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if r.type_byte == 0x01 || r.type_byte == 0x10 {
                                     let sql = match std::str::from_utf8(r.sql) {
                                         Ok(s) => s,
@@ -615,8 +641,15 @@ fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
     fs::write(&snap_target, &snap_bytes)
         .map_err(|e| format!("write snapshot {}: {e}", snap_target.display()))?;
 
-    // 2) WAL — may be empty / absent (fresh database). Allow
-    //    missing files but error on read failures.
+    // 2) WAL — three source layouts handled:
+    //
+    //    a) v7.19 chunked: `<src>.wal/` is a DIRECTORY of
+    //       `<unix_us>_<lsn>.wal` chunks → copy each chunk
+    //       bit-for-bit, preserving filenames (incremental
+    //       backups skip chunks the dst already holds).
+    //    b) v7.18 legacy: `<src>.wal` is a FILE → wrap its bytes
+    //       into one timestamp-named chunk (the v7.18 behaviour).
+    //    c) absent → fresh database, snapshot-only backup.
     let src_wal = {
         let mut p = src_path.clone();
         let mut name = p
@@ -627,56 +660,98 @@ fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
         p.set_file_name(name);
         p
     };
-    let (wal_bytes, wal_present) = match fs::read(&src_wal) {
-        Ok(b) => (b, true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
-        Err(e) => return Err(format!("read wal {}: {e}", src_wal.display())),
-    };
-
+    let mut copied: u64 = 0;
+    let mut skipped: u64 = 0;
     let mut max_lsn: u64 = 0;
-    if !wal_bytes.is_empty() {
-        let recs: Vec<WalRecord<'_>> = parse_wal_records(&wal_bytes)
-            .map_err(|e| format!("parse wal for naming: {e}"))?;
-        for r in &recs {
-            if let Some(l) = r.commit_lsn {
-                if l > max_lsn {
-                    max_lsn = l;
+    let mut archive_status = ArchiveStatus::NotInvoked;
+    let wal_present;
+    if src_wal.is_dir() {
+        // (a) chunked layout — copy chunks preserving filenames.
+        wal_present = true;
+        let mut entries: Vec<std::path::PathBuf> = fs::read_dir(&src_wal)
+            .map_err(|e| format!("read wal dir {}: {e}", src_wal.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+            .collect();
+        entries.sort();
+        for chunk in entries {
+            let fname = chunk
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default();
+            let target = wal_dir.join(&fname);
+            let bytes =
+                fs::read(&chunk).map_err(|e| format!("read chunk {}: {e}", chunk.display()))?;
+            if bytes.is_empty() {
+                // The live active chunk is empty between a rotation
+                // and the next write; copying it adds noise without
+                // information.
+                skipped += 1;
+                continue;
+            }
+            if let Ok(recs) = parse_wal_records(&bytes) {
+                let recs: Vec<WalRecord<'_>> = recs;
+                for r in &recs {
+                    if let Some(l) = r.commit_lsn {
+                        if l > max_lsn {
+                            max_lsn = l;
+                        }
+                    }
                 }
             }
+            if target.exists() {
+                // Incremental: identical filename = identical chunk
+                // (chunks are immutable once rotated; only the live
+                // chunk grows, and re-copying it is correct).
+                let existing = fs::metadata(&target).map_err(|e| format!("stat: {e}"))?;
+                if existing.len() == bytes.len() as u64 {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            fs::write(&target, &bytes)
+                .map_err(|e| format!("write chunk {}: {e}", target.display()))?;
+            copied += 1;
+            let st = archive_chunk(&target)?;
+            if matches!(st, ArchiveStatus::Failed { .. }) {
+                archive_status = st;
+            } else if !matches!(archive_status, ArchiveStatus::Failed { .. }) {
+                archive_status = st;
+            }
+        }
+    } else {
+        // (b)/(c) legacy single-file or absent.
+        let (wal_bytes, present) = match fs::read(&src_wal) {
+            Ok(b) => (b, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+            Err(e) => return Err(format!("read wal {}: {e}", src_wal.display())),
+        };
+        wal_present = present;
+        if !wal_bytes.is_empty() {
+            let recs: Vec<WalRecord<'_>> = parse_wal_records(&wal_bytes)
+                .map_err(|e| format!("parse wal for naming: {e}"))?;
+            for r in &recs {
+                if let Some(l) = r.commit_lsn {
+                    if l > max_lsn {
+                        max_lsn = l;
+                    }
+                }
+            }
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros());
+            let chunk_path = wal_dir.join(format!("{now_us}_{max_lsn}.wal"));
+            fs::write(&chunk_path, &wal_bytes)
+                .map_err(|e| format!("write chunk {}: {e}", chunk_path.display()))?;
+            copied = 1;
+            archive_status = archive_chunk(&chunk_path)?;
         }
     }
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros());
-    let chunk_name = format!("{now_us}_{max_lsn}.wal");
-    let chunk_path = wal_dir.join(&chunk_name);
-    if !wal_bytes.is_empty() {
-        fs::write(&chunk_path, &wal_bytes)
-            .map_err(|e| format!("write chunk {}: {e}", chunk_path.display()))?;
-    }
-
-    // v7.18 PITR P6 — if SPG_PITR_ARCHIVE_CMD is set, fork it
-    // with the chunk path as $1 so external archival (rclone /
-    // aws s3 cp / restic backup / whatever the operator wires)
-    // happens synchronously inside backup-pitr. Nonzero exit
-    // means archival failed and we report that on the summary
-    // line — same loud failure mode PG's archive_command has.
-    let archive_status = if !wal_bytes.is_empty() {
-        archive_chunk(&chunk_path)?
-    } else {
-        ArchiveStatus::NotInvoked
-    };
 
     Ok(format!(
-        "OK snapshot={} wal_present={} chunk={} max_lsn={} archive={}",
+        "OK snapshot={} wal_present={wal_present} chunks_copied={copied} chunks_skipped={skipped} max_lsn={max_lsn} archive={}",
         snap_target.display(),
-        wal_present,
-        if wal_bytes.is_empty() {
-            "(empty)".to_string()
-        } else {
-            chunk_path.display().to_string()
-        },
-        max_lsn,
         archive_status.describe(),
     ))
 }
@@ -829,9 +904,46 @@ fn pitr_restore(
     let mut db = Database::restore(&snapshot_bytes)
         .map_err(|e| format!("restore snapshot: {e:?}"))?;
 
-    let wal_bytes = fs::read(wal_path).map_err(|e| format!("read wal {wal_path}: {e}"))?;
+    // v7.19 P6 — `--wal` accepts a chunk DIRECTORY (the
+    // backup-pitr `wal/` subdir or a live `<db>.wal/` dir) as
+    // well as a single chunk file. Directory mode concatenates
+    // every chunk in sorted (= LSN) order so the restore walks
+    // the full record stream.
+    let wal_p = std::path::Path::new(wal_path);
+    let wal_bytes = if wal_p.is_dir() {
+        let mut entries: Vec<std::path::PathBuf> = fs::read_dir(wal_p)
+            .map_err(|e| format!("read wal dir {wal_path}: {e}"))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+            .collect();
+        entries.sort();
+        let mut combined = Vec::new();
+        for chunk in entries {
+            let bytes =
+                fs::read(&chunk).map_err(|e| format!("read chunk {}: {e}", chunk.display()))?;
+            combined.extend_from_slice(&bytes);
+        }
+        combined
+    } else {
+        fs::read(wal_p).map_err(|e| format!("read wal {wal_path}: {e}"))?
+    };
     let records: Vec<WalRecord<'_>> =
         parse_wal_records(&wal_bytes).map_err(|e| format!("parse wal: {e}"))?;
+
+    // v7.19 — snapshot floor. checkpoint() rotates chunks instead
+    // of truncating, so the WAL stream may contain records the
+    // snapshot already reflects. The checkpoint markers (0x11)
+    // carry the LSN high-water mark of each snapshot write; records
+    // at or below the highest marker LSN are already inside
+    // snapshot.spg and must not re-apply (DuplicateTable /
+    // double-insert otherwise). Same logic open_path uses.
+    let snapshot_floor: u64 = records
+        .iter()
+        .filter(|r| r.type_byte == 0x11)
+        .filter_map(|r| r.commit_lsn)
+        .max()
+        .unwrap_or(0);
 
     let mut applied: u64 = 0;
     for r in records {
@@ -850,6 +962,12 @@ fn pitr_restore(
                 applied += 1;
             }
             0x10 => {
+                // v7.19 — skip records the snapshot already holds.
+                if let Some(lsn) = r.commit_lsn {
+                    if lsn <= snapshot_floor {
+                        continue;
+                    }
+                }
                 if !target.includes(r.commit_lsn, r.commit_unix_us) {
                     continue;
                 }
@@ -1507,10 +1625,11 @@ mod tests {
             p.set_file_name(name);
             p
         };
-        // Apply writes, then checkpoint() so the snapshot file
-        // is materialised on disk. checkpoint() truncates the
-        // WAL — so the data lives entirely in the snapshot for
-        // this round-trip test.
+        // v7.19 — checkpoint() ROTATES the chunk (keeps history)
+        // instead of truncating. The backup therefore carries the
+        // pre-checkpoint chunk (CREATE + 2 INSERTs + marker), and
+        // pitr_restore's snapshot-floor logic skips the records
+        // the snapshot already reflects.
         let mut db = Database::open_path(&db_path).unwrap();
         db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
         db.execute("INSERT INTO t VALUES (1)").unwrap();
@@ -1535,28 +1654,27 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .collect();
-        // checkpoint() truncated the WAL to 0 bytes before the
-        // backup snapshot was read, so the chunk directory ends
-        // up empty — all data lives in snapshot.spg. Empty WAL
-        // chunks would clutter the backup dir without information
-        // and would still need verifier special-casing later, so
-        // backup_pitr skips them.
-        assert!(chunks.is_empty(), "expected 0 chunks after checkpoint, got {chunks:?}");
+        assert!(
+            !chunks.is_empty(),
+            "v7.19 rotation keeps history — backup must carry ≥1 chunk"
+        );
 
-        // Restore: feed pitr_restore an empty WAL file to confirm
-        // the snapshot-only path also works. Use the source WAL
-        // path (currently empty) for that.
-        let empty_wal = tmp_path("bk-empty-wal");
-        fs::write(&empty_wal, b"").unwrap();
+        // Restore from the backup's chunk directory. The
+        // snapshot-floor logic skips every record at or below the
+        // checkpoint marker, so nothing re-applies and the row
+        // count comes straight from the snapshot.
         let target_path = tmp_path("bk-restore-target");
         let (applied, _) = pitr_restore(
             snap.to_str().unwrap(),
-            empty_wal.to_str().unwrap(),
+            wal_dir.to_str().unwrap(),
             "999",
             target_path.to_str().unwrap(),
         )
         .unwrap();
-        assert_eq!(applied, 0, "empty WAL → nothing to replay");
+        assert_eq!(
+            applied, 0,
+            "all records pre-date the checkpoint marker → snapshot-floor skips them"
+        );
 
         // Verify rows survived in the snapshot itself.
         let mut restored = Database::restore(&fs::read(&target_path).unwrap()).unwrap();
@@ -1571,8 +1689,7 @@ mod tests {
         let _ = fs::remove_dir_all(&backup_dir);
         let _ = fs::remove_file(&target_path);
         let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_file(&wal_path);
-        let _ = fs::remove_file(&empty_wal);
+        let _ = fs::remove_dir_all(&wal_path);
     }
 
     #[test]
@@ -1613,32 +1730,40 @@ mod tests {
         assert!(summary.starts_with("OK "));
 
         // First verify without checksums — must report Missing
-        // for the chunk and NOT-clean.
+        // for every chunk and NOT-clean. v7.19 rotation keeps
+        // history so the backup carries ≥2 chunks here (pre-
+        // checkpoint chunk with CREATE+marker, post-checkpoint
+        // chunk with the 2 INSERTs).
         let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
         assert!(report.snapshot_ok);
         assert!(report.replay_ok, "replay msg: {}", report.replay_msg);
-        assert_eq!(report.chunks.len(), 1);
         assert!(
-            matches!(report.chunks[0].checksum_state, ChecksumState::Missing { .. }),
-            "got: {:?}",
-            report.chunks[0].checksum_state
+            report.chunks.len() >= 2,
+            "v7.19 rotation: expected ≥2 chunks, got {}",
+            report.chunks.len()
         );
+        for c in &report.chunks {
+            assert!(
+                matches!(c.checksum_state, ChecksumState::Missing { .. }),
+                "got: {:?}",
+                c.checksum_state
+            );
+        }
         assert!(!report.is_clean(), "report should not be clean without checksum");
 
         // Now write the checksum file via the flag and verify
         // again — must be clean.
         let report = verify_pitr(backup_dir.to_str().unwrap(), true).unwrap();
-        assert!(matches!(
-            report.chunks[0].checksum_state,
-            ChecksumState::WrittenFresh { .. }
-        ));
+        for c in &report.chunks {
+            assert!(matches!(c.checksum_state, ChecksumState::WrittenFresh { .. }));
+        }
 
         let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
         assert!(report.is_clean(), "report: {}", report.render());
 
         let _ = fs::remove_dir_all(&backup_dir);
         let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_dir_all(&wal_path);
     }
 
     #[test]
@@ -1669,13 +1794,19 @@ mod tests {
         )
         .unwrap();
 
-        // Stamp a phony checksum.
-        let chunks: Vec<_> = fs::read_dir(backup_dir.join("wal"))
+        // Stamp every chunk with a real checksum first, then
+        // corrupt the FIRST chunk's sidecar — verify must flag
+        // exactly that chunk as Mismatch and the report as
+        // not-clean. (v7.19 rotation means ≥2 chunks here.)
+        let _ = verify_pitr(backup_dir.to_str().unwrap(), true).unwrap();
+        let mut chunks: Vec<_> = fs::read_dir(backup_dir.join("wal"))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
             .collect();
-        assert_eq!(chunks.len(), 1);
+        chunks.sort();
+        assert!(!chunks.is_empty());
         let cs_path = {
             let mut p = chunks[0].clone();
             let mut name = p.file_name().unwrap().to_os_string();
@@ -1687,16 +1818,17 @@ mod tests {
             .unwrap();
 
         let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
-        assert!(
-            matches!(report.chunks[0].checksum_state, ChecksumState::Mismatch { .. }),
-            "got: {:?}",
-            report.chunks[0].checksum_state
-        );
+        let mismatches = report
+            .chunks
+            .iter()
+            .filter(|c| matches!(c.checksum_state, ChecksumState::Mismatch { .. }))
+            .count();
+        assert_eq!(mismatches, 1, "exactly the corrupted sidecar flags");
         assert!(!report.is_clean());
 
         let _ = fs::remove_dir_all(&backup_dir);
         let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_dir_all(&wal_path);
     }
 
     #[test]
@@ -1749,14 +1881,11 @@ mod tests {
     fn backup_pitr_handles_missing_wal() {
         use spg_embedded::Database;
         let db_path = tmp_path("bk-no-wal-db");
-        // Touch a snapshot file but never run any writes that
-        // would create the WAL.
-        let mut db = Database::open_path(&db_path).unwrap();
-        // No execute() — Drop will checkpoint an empty engine.
+        // Touch a snapshot file but then wipe the WAL entirely
+        // (v7.19: `<db>.wal/` is a DIRECTORY) to exercise the
+        // snapshot-only branch.
+        let db = Database::open_path(&db_path).unwrap();
         drop(db);
-        // Wipe the .wal file (Drop's empty-checkpoint may have
-        // created it; nuke explicitly to exercise the missing-
-        // WAL branch).
         let wal_path = {
             let mut p = db_path.clone();
             let mut name = p
@@ -1767,7 +1896,9 @@ mod tests {
             p.set_file_name(name);
             p
         };
-        let _ = fs::remove_file(&wal_path);
+        // v7.19 — wal path is a chunk directory; remove it whole.
+        let _ = fs::remove_dir_all(&wal_path);
+        let _ = fs::remove_file(&wal_path); // no-op if it was a dir
 
         let backup_dir = tmp_path("bk-no-wal-dst");
         let summary = backup_pitr(
@@ -1857,6 +1988,6 @@ mod tests {
         let _ = fs::remove_file(&snap_path);
         let _ = fs::remove_file(&target_path);
         let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_dir_all(&wal_path);
     }
 }

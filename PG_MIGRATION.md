@@ -153,30 +153,36 @@ verifiable archival.
 
 ### Operator playbook
 
-Periodic backups (cron / systemd timer):
+**v7.19 — rotation + retention + archival are in-engine.** Set the
+env vars at boot and SPG does the rest; no cron required:
 
 ```sh
-# Every 5 minutes — snapshot + WAL diff into a fresh chunk.
-*/5 * * * * spg backup-pitr \
-    --src /data/spg.db \
-    --dst /backups/spg-$(date +\%Y-\%m-\%d)
+# In the container / unit environment:
+SPG_PITR_RETENTION_HOURS=24        # enables the retention thread
+SPG_PITR_RETENTION_CHECK_SEC=60    # sweep cadence (default 60)
+SPG_PITR_ARCHIVE_CMD='aws s3 cp "$1" s3://my-org-spg/wal/'
+                                   # archive before delete (optional)
+SPG_PITR_CHUNK_BYTES=16777216      # chunk rotation size (default 16 MiB)
 ```
 
-Continuous archival to S3:
+The engine rotates the WAL into immutable chunk files at every
+checkpoint, the retention thread archives + sweeps chunks older
+than the window, and a failed archive command leaves the chunk on
+disk with a loud stderr warning (PG `archive_command` semantics).
+
+Point-in-time base backups (cron optional — for off-host copies):
 
 ```sh
-export SPG_PITR_ARCHIVE_CMD='aws s3 cp "$1" s3://my-org-spg/wal/'
-spg backup-pitr --src /data/spg.db --dst /backups/spg-now
-# stdout includes "archive=ok" or "archive=FAILED exit=… stderr=…"
+# Copies snapshot.spg + every WAL chunk; re-runs skip chunks the
+# dst already holds (incremental by construction).
+spg backup-pitr --src /data/spg.db --dst /backups/spg-rolling
 ```
 
-Retention sweep:
+Manual retention (redundant with the in-engine thread; kept for
+operators who prefer explicit control):
 
 ```sh
-# 24-hour retention. Cron daily.
-0 4 * * * spg prune-pitr \
-    --dir /backups/spg-rolling \
-    --retention-hours 24
+spg prune-pitr --dir /backups/spg-rolling --retention-hours 24
 ```
 
 Restore to a specific moment (after a bad migration / accidental DELETE):
@@ -211,13 +217,19 @@ The `verify-pitr` markdown report uploads cleanly as a CI artifact;
 SPG's own `.github/workflows/ci.yml` runs the harness against the
 mailrs fixture every PR.
 
-### What's NOT in v7.18 PITR scope
+### PITR scope notes (v7.19)
 
-- Multi-database fan-out (each SPG file is single-process; v7.19+ ask)
-- Replication-coupled WAL streaming (logical replication exists separately;
-  PITR ride along is v7.19+)
-- In-engine chunk rotation thread (cron + external archive cover the steady
-  state today; the in-process retention thread lands when scheduled)
+- **In-engine chunk rotation + retention thread: shipped in
+  v7.19** (`SPG_PITR_RETENTION_HOURS` et al above). The v7.18
+  "cron required" carve-out is closed.
+- Multi-database fan-out per SPG file — out of scope **by
+  design**: 1 file ↔ 1 catalog ↔ 1 process owner is the core
+  invariant. Multi-tenant = run multiple SPG containers.
+- Replication-coupled WAL streaming for the spg-server daemon —
+  prerequisite-blocked on moving spg-server onto the chunked-WAL
+  `Database` layer (tracked as the "spg-server on Database"
+  follow-up epic). In-process spg-embedded users get the chunked
+  WAL + retention today.
 
 ## Connecting from existing PG clients (server mode only)
 
