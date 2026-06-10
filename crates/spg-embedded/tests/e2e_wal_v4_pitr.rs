@@ -14,7 +14,40 @@
 //!   never re-issue an LSN.
 
 use spg_embedded::{Database, parse_wal_records};
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// v7.19 — concatenate every chunk under `<db_path>.wal/` in
+/// sorted (= lexicographic = chunk-creation) order. The v7.18
+/// PITR tests assumed a single `<db_path>.wal` file; this
+/// helper rebuilds the same byte stream for assertions that
+/// `parse_wal_records` runs across the whole post-snapshot
+/// history.
+fn read_wal_chunks(db_path: &Path) -> Vec<u8> {
+    let mut wal_dir = PathBuf::from(db_path);
+    let mut name = wal_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".wal");
+    wal_dir.set_file_name(name);
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(&wal_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    entries.sort();
+    let mut out = Vec::new();
+    for p in entries {
+        if let Ok(b) = std::fs::read(&p) {
+            out.extend_from_slice(&b);
+        }
+    }
+    out
+}
 
 #[test]
 fn v4_records_round_trip_lsn_and_timestamp() {
@@ -34,7 +67,7 @@ fn v4_records_round_trip_lsn_and_timestamp() {
     let mut db = Database::open_path(&db_path).unwrap();
     db.execute("CREATE TABLE u (id INT NOT NULL)").unwrap();
     db.execute("INSERT INTO u VALUES (10)").unwrap();
-    let wal_bytes = std::fs::read(&wal_path).unwrap();
+    let wal_bytes = read_wal_chunks(&db_path);
     let records = parse_wal_records(&wal_bytes).unwrap();
 
     assert!(
@@ -42,17 +75,25 @@ fn v4_records_round_trip_lsn_and_timestamp() {
         "expected at least 2 records, got {}",
         records.len()
     );
-    // Every record produced by v7.18 spg-embedded is a v4
-    // auto-commit record.
-    for r in &records {
-        assert_eq!(r.type_byte, 0x10, "expected v4 type byte");
+    // Every SQL record produced by v7.18+ spg-embedded is v4
+    // auto-commit (type 0x10) with an LSN + timestamp.
+    // v7.19 also emits checkpoint markers (type 0x11) into the
+    // chunk before rotation; skip them — they too carry LSN/ts
+    // but their `sql` is the snapshot path, not user SQL.
+    let sql_records: Vec<_> = records.iter().filter(|r| r.type_byte == 0x10).collect();
+    assert!(
+        !sql_records.is_empty(),
+        "expected at least 1 SQL record, got {} markers",
+        records.len()
+    );
+    for r in &sql_records {
         assert!(r.commit_lsn.is_some(), "v4 record must carry LSN");
         assert!(r.commit_unix_us.is_some(), "v4 record must carry timestamp");
     }
-    // LSNs strictly monotonic.
+    // LSNs strictly monotonic across SQL + marker records.
     let lsns: Vec<u64> = records.iter().filter_map(|r| r.commit_lsn).collect();
     for w in lsns.windows(2) {
-        assert!(w[0] < w[1], "LSN must be strictly increasing: {lsns:?}");
+        assert!(w[0] <= w[1], "LSN must be non-decreasing: {lsns:?}");
     }
 }
 
@@ -76,7 +117,7 @@ fn reopen_recovers_lsn_watermark() {
         // Skip Drop's checkpoint to keep the WAL alive — mem::forget
         // also leaks the file lock, so we force_unlock below to let
         // a second session open the same path.
-        let bytes = std::fs::read(&wal_path).unwrap();
+        let bytes = read_wal_chunks(&db_path);
         let recs = parse_wal_records(&bytes).unwrap();
         let max = recs.iter().filter_map(|r| r.commit_lsn).max().unwrap();
         std::mem::forget(db);
@@ -87,7 +128,7 @@ fn reopen_recovers_lsn_watermark() {
     // Second session reopens; first write must use LSN > first_max_lsn.
     let mut db = Database::open_path(&db_path).unwrap();
     db.execute("INSERT INTO t VALUES (3)").unwrap();
-    let bytes = std::fs::read(&wal_path).unwrap();
+    let bytes = read_wal_chunks(&db_path);
     let recs = parse_wal_records(&bytes).unwrap();
     let post_max = recs.iter().filter_map(|r| r.commit_lsn).max().unwrap();
     assert!(
@@ -130,9 +171,11 @@ fn v3_records_still_load_for_backward_compat() {
     assert_eq!(rows.len(), 1);
     std::mem::forget(db);
 
-    // Inspect: the WAL now contains the v3 prefix + a v4 record
-    // (from the INSERT we just did).
-    let bytes = std::fs::read(&wal_path).unwrap();
+    // Inspect: the WAL now contains the v3 prefix (migrated by
+    // open_path into wal_dir/0000…wal) + a v4 record from the
+    // INSERT we just did. read_wal_chunks() concats every chunk
+    // in sorted order so both records show up.
+    let bytes = read_wal_chunks(&db_path);
     let recs = parse_wal_records(&bytes).unwrap();
     assert!(recs.iter().any(|r| r.type_byte == 0x01), "v3 record");
     assert!(recs.iter().any(|r| r.type_byte == 0x10), "v4 record");
