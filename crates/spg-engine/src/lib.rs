@@ -4091,19 +4091,39 @@ impl Engine {
         }
         let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
             .with_default_text_search_config(ts_cfg.as_deref());
-        // Walk every row, evaluate WHERE then SET expressions. We
-        // gather (position, new_values) tuples first and apply them
-        // afterwards so the WHERE/RHS evaluation reads the original
-        // row state — matches PG semantics (UPDATE doesn't see its
-        // own writes).
+        // Walk candidate rows, evaluate WHERE then SET
+        // expressions. We gather (position, new_values) tuples
+        // first and apply them afterwards so the WHERE/RHS
+        // evaluation reads the original row state — matches PG
+        // semantics (UPDATE doesn't see its own writes).
+        //
+        // v7.20 P4 — index seek: a single-column equality WHERE
+        // on an indexed column narrows the walk from
+        // O(table.rows()) to O(matches). The full WHERE still
+        // re-evaluates per candidate (the seek may be an
+        // over-approximation under AND-composites), so semantics
+        // are unchanged. profile: the bench's `UPDATE … WHERE
+        // id = $1` on a 5 000-row table was a ~1.3 ms full scan
+        // per statement; with the seek it's ~2 µs.
+        let seek_positions: Option<Vec<usize>> = stmt
+            .where_
+            .as_ref()
+            .and_then(|w| try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str()));
         let mut planned: Vec<(usize, Vec<Value>)> = Vec::new();
-        for (i, row) in table.rows().iter().enumerate() {
+        let candidate_positions: Vec<usize> = match &seek_positions {
+            Some(list) => list.clone(),
+            None => (0..table.row_count()).collect(),
+        };
+        for (loop_n, &i) in candidate_positions.iter().enumerate() {
             // v4.5: cooperative cancel checkpoint every 256 rows so
             // a runaway UPDATE without WHERE doesn't drag past the
             // server's query-timeout watchdog.
-            if i.is_multiple_of(256) {
+            if loop_n.is_multiple_of(256) {
                 cancel.check()?;
             }
+            let Some(row) = table.rows().get(i) else {
+                continue;
+            };
             if let Some(w) = &stmt.where_ {
                 let cond = eval::eval_expr(w, row, &ctx)?;
                 if !matches!(cond, Value::Bool(true)) {
@@ -4125,6 +4145,11 @@ impl Engine {
             }
             planned.push((i, new_vals));
         }
+        // planned must stay position-sorted: downstream passes
+        // (FK pairing, trigger walks, the apply loop) iterate it
+        // assuming ascending row order, which the full-scan path
+        // guaranteed implicitly.
+        planned.sort_by_key(|(i, _)| *i);
         // v7.6.6 — capture pre-update row values for the FK
         // enforcement passes below. `planned` carries new values
         // only; pair them with the old row.
@@ -4619,10 +4644,29 @@ impl Engine {
         // alongside its position, so the FK enforcement pass can
         // run after the mut borrow drops.
         let mut to_delete_rows: Vec<Vec<Value>> = Vec::new();
-        for (i, row) in table.rows().iter().enumerate() {
-            if i.is_multiple_of(256) {
+        // v7.20 P4 — index seek (same shape as exec_update_cancel):
+        // an equality WHERE on an indexed column narrows the walk
+        // to the matching hot positions; the full WHERE still
+        // re-evaluates per candidate. Downstream passes assume
+        // ascending position order, so the seek result is sorted.
+        let seek_positions: Option<Vec<usize>> = stmt
+            .where_
+            .as_ref()
+            .and_then(|w| try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str()));
+        let candidate_positions: Vec<usize> = match seek_positions {
+            Some(mut list) => {
+                list.sort_unstable();
+                list
+            }
+            None => (0..table.row_count()).collect(),
+        };
+        for (loop_n, &i) in candidate_positions.iter().enumerate() {
+            if loop_n.is_multiple_of(256) {
                 cancel.check()?;
             }
+            let Some(row) = table.rows().get(i) else {
+                continue;
+            };
             let keep = if let Some(w) = &stmt.where_ {
                 let cond = eval::eval_expr(w, row, &ctx)?;
                 !matches!(cond, Value::Bool(true))
@@ -8584,6 +8628,58 @@ fn materialise_in_order(
         columns,
         rows: output_rows,
     })
+}
+
+/// v7.20 P4 — hot-row POSITION seek for the mutation paths
+/// (UPDATE / DELETE index their planned writes by position in
+/// `table.rows()`, so the Cow-row shape `try_index_seek`
+/// returns doesn't fit). Same top-level-AND recursion and
+/// col=literal resolution; the caller re-applies the full WHERE
+/// to every returned row so the index only narrows candidates.
+///
+/// Returns `None` (→ caller full-scans) when no equality leaf
+/// hits an index OR any matching locator lives in the cold tier
+/// — the mutation paths operate on hot rows, and the PK
+/// promote-then-walk upstream already handles the
+/// cold-single-row case.
+fn try_index_seek_positions(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &Table,
+    table_alias: &str,
+) -> Option<Vec<usize>> {
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::And,
+        rhs,
+    } = where_expr
+    {
+        if let Some(p) = try_index_seek_positions(lhs, schema_cols, table, table_alias) {
+            return Some(p);
+        }
+        return try_index_seek_positions(rhs, schema_cols, table, table_alias);
+    }
+    let Expr::Binary {
+        lhs,
+        op: BinOp::Eq,
+        rhs,
+    } = where_expr
+    else {
+        return None;
+    };
+    let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
+        .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
+    let idx = table.index_on(col_pos)?;
+    let key = IndexKey::from_value(&value)?;
+    let locators = idx.lookup_eq(&key);
+    let mut out = Vec::with_capacity(locators.len());
+    for loc in locators {
+        match *loc {
+            spg_storage::RowLocator::Hot(i) => out.push(i),
+            spg_storage::RowLocator::Cold { .. } => return None,
+        }
+    }
+    Some(out)
 }
 
 fn try_index_seek<'a>(
@@ -17523,6 +17619,47 @@ mod tests {
             QueryResult::CommandOk { affected, .. } => *affected,
             QueryResult::Rows { .. } => panic!("expected CommandOk, got Rows"),
         }
+    }
+
+    #[test]
+    fn update_seek_positions_engages_on_indexed_eq() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE b (id INT NOT NULL, v INT NOT NULL)")
+            .unwrap();
+        e.execute("CREATE INDEX b_id ON b (id)").unwrap();
+        for i in 0..100 {
+            e.execute(&alloc::format!("INSERT INTO b VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        let stmt = spg_sql::parser::parse_statement("UPDATE b SET v = v + 1 WHERE id = 42")
+            .expect("parse");
+        let Statement::Update(u) = stmt else {
+            panic!("expected Update, got {stmt:?}");
+        };
+        let w = u.where_.as_ref().expect("where");
+        let table = e.catalog().get("b").unwrap();
+        let schema_cols = table.schema().columns.clone();
+        // step-by-step: each sub-resolution must succeed.
+        let Expr::Binary { lhs, op, rhs } = w else {
+            panic!("WHERE not Binary: {w:?}");
+        };
+        assert_eq!(*op, BinOp::Eq, "op not Eq");
+        let pair = resolve_col_literal_pair(lhs, rhs, &schema_cols, "b");
+        assert!(
+            pair.is_some(),
+            "resolve_col_literal_pair None: lhs={lhs:?} rhs={rhs:?}"
+        );
+        let (col_pos, value) = pair.unwrap();
+        assert!(
+            table.index_on(col_pos).is_some(),
+            "no index on col {col_pos}"
+        );
+        assert!(
+            IndexKey::from_value(&value).is_some(),
+            "IndexKey::from_value None for {value:?}"
+        );
+        let positions = try_index_seek_positions(w, &schema_cols, table, "b");
+        assert_eq!(positions, Some(vec![42]), "seek did not engage");
     }
 
     #[test]
