@@ -1,6 +1,6 @@
 //! v6.7.4 ship-gate #2 — 4-worker prepare-phase speedup (v7.21:
-//! fast-tier floor recalibrated to 1.4×; 2×-class scaling is a
-//! release-bench claim).
+//! full tier — parallel-scaling ratios need dedicated hardware;
+//! 2×-class scaling is a release-bench claim).
 //!
 //! Measures the **prepare phase** of the parallel-freezer path
 //! (`Catalog::prepare_freeze_slice` × N workers vs single
@@ -160,10 +160,16 @@ fn measure_prepare_wall(cat: &Catalog, workers: usize, reps: usize) -> std::time
     best
 }
 
-/// fast-tier ship-gate. CPU contention from sibling tests is
-/// handled by `crate::perf_lock()` serialisation, so this no
-/// longer needs `#[ignore]` to defend its timing.
+/// full tier (`#[ignore]`, v7.21): parallel-scaling ratios are
+/// only measurable on dedicated hardware. The 4-vCPU GitHub
+/// shared runner returned 1.29x and 0.81x on consecutive runs —
+/// a band that straddles the ~1.0x serial-degradation signature
+/// this gate exists to catch, so no threshold makes it meaningful
+/// there. Run on the perf testbed via `scripts/gate.sh gates
+/// --full` (mini steadies at 1.54-1.65x against the host-tiered
+/// floors below).
 #[test]
+#[ignore = "CPU-topology-sensitive — full tier; see gate comment"]
 fn four_worker_prepare_speedup_scales() {
     let _lock = crate::perf_lock();
     let base = build_populated_catalog();
