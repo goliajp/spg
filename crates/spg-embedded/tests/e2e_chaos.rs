@@ -80,9 +80,15 @@ fn reopen_after_truncated_wal_tail_drops_partial_record() {
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     db.execute("INSERT INTO t VALUES (2)").unwrap();
     std::mem::forget(db);
+    // mem::forget leaks the advisory file lock — clear it so the
+    // reopen below doesn't refuse the "crashed" DB.
+    Database::force_unlock(&p).unwrap();
 
-    // Find the WAL file alongside the DB.
-    let wal = wal_path(&p);
+    // v7.19 chunked WAL: `<db>.wal` is a directory of chunk
+    // files. Truncate the NEWEST chunk (largest filename — both
+    // name components are zero-padded hex, so lexicographic =
+    // chronological).
+    let wal = newest_wal_chunk(&p);
     let len = std::fs::metadata(&wal).unwrap().len();
     assert!(len > 10, "WAL should have committed records (len={len})");
     // Truncate off the trailing 4 bytes — guaranteed to leave
@@ -181,6 +187,20 @@ fn wal_path(db_path: &Path) -> PathBuf {
     let mut s = db_path.as_os_str().to_owned();
     s.push(".wal");
     PathBuf::from(s)
+}
+
+/// v7.19 chunked WAL — `<db>.wal/` holds
+/// `<unix_us:016x>_<lsn:016x>.wal` chunk files. Returns the
+/// newest (lexicographically largest) chunk.
+fn newest_wal_chunk(db_path: &Path) -> PathBuf {
+    let dir = wal_path(db_path);
+    let mut chunks: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|c| c.extension().is_some_and(|x| x == "wal"))
+        .collect();
+    chunks.sort();
+    chunks.pop().expect("at least one WAL chunk file")
 }
 
 fn catalog_tmp_path(db_path: &Path) -> PathBuf {
