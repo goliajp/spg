@@ -1,37 +1,62 @@
 # SPG v7.20.0 vs baselines — PG 18 / MySQL 9 / MariaDB 11 / pgvector
 
 v7.20 perf epic results: WAL group-commit (P2) + inline readonly
-path + statement cache (P3). Same harness / host / session as the
-v7.19 baseline file; backends identical.
+path + statement cache (P3) + incremental index maintenance on
+UPDATE (P4b — `update_row` no longer full-rebuilds every index;
+profiled UPDATE-by-PK on a 5k-row table went 984 µs → 2 µs).
+Same harness / host / session as the v7.19 baseline file;
+backends identical.
 
 ## 1. Concurrent sqlx Pool — the v7.20 epic's target quadrants
 
 | Workload @ conn | v7.19 | **v7.20** | Δ | PgPool (wire) |
 |---|---:|---:|---:|---:|
-| pk-select @1 | 22 249 | **33 582** | +51% | 4 269 |
-| pk-select @4 | 28 183 | **51 692** | +83% | 10 331 |
-| pk-select @16 | 21 539 | **58 858** | **+174%** | 17 956 |
-| pk-select @64 | 21 593 | **58 571** | +171% | n/a |
-| range-scan @16 | 20 091 | 18 124 | −10% (noise) | 14 877 |
-| mixed-9to1 @4 | 1 649 | **4 025** | +144% | 9 231 |
-| mixed-9to1 @16 | 1 617 | **7 297** | **+351%** | 17 444 |
-| mixed-9to1 @64 | 1 648 | **6 655** | +304% | n/a |
-| read_handle ceiling @16 | 63 971 | 70 522 | — | — |
+| pk-select @1 | 22 249 | **41 565** | +87% | 4 699 |
+| pk-select @4 | 28 183 | **59 967** | +113% | 10 286 |
+| pk-select @16 | 21 539 | **58 563** | **+172%** | 17 887 |
+| pk-select @64 | 21 593 | **58 916** | +173% | n/a |
+| range-scan @16 | 20 091 | 18 005 | −10% (noise) | 14 683 |
+| mixed-9to1 @4 | 1 649 | **4 935** | +199% | 9 202 |
+| mixed-9to1 @16 | 1 617 | **10 768** | **+566%** | 16 604 |
+| mixed-9to1 @64 | 1 648 | **24 567** | **+1 391%** | n/a |
+| read_handle ceiling @16 | 63 971 | 60 971 | — | — |
+
+Longer runs converge higher: at `--iters 2000 --rows 10000` the
+durable mixed row reaches **17 680 @16 / 44 375 @64** (more
+group-commit windows amortising each F_FULLFSYNC).
+
+## 1b. mixed-9to1 with `SPG_SYNCHRONOUS_COMMIT=off` — the
+durability-EQUAL comparison (PG-in-VM effectively buffers its
+fdatasync, so PG's column is its usual number either way)
+
+| Conn | SPG off | PgPool | ratio |
+|---|---:|---:|---:|
+| 1 | **41 433** | 3 634 | **11.4×** |
+| 4 | **46 023** | 9 235 | **5.0×** |
+| 16 | **37 976** | 18 850 | **2.0×** |
+| 64 | **39 079** | n/a | — |
+
+p99 @16: SPG 723 µs vs PG 2 530 µs.
 
 Headlines:
 
-- **pk-select @16: 58.9k q/s = 3.3× wire-PG, 84% of the
+- **pk-select @16: 58.6k q/s = 3.3× wire-PG, 96% of the
   SPG-private read_handle ceiling.** The stock sqlx adapter is
   now effectively at engine speed — P3 removed all three
   spawn_blocking hops + redundant parses per SELECT.
-- **mixed @16: 7.3k = 4.5× v7.19.** Group-commit shares one
-  fsync across the batch. On this macOS host the number
-  converges at fsync_rate × batch_size where Rust's sync_data
-  is a TRUE F_FULLFSYNC (4.2 ms); the PgPool 17.4k comparator
-  runs fdatasync inside an OrbStack VM — effectively buffered,
-  not durability-equal. Container-vs-container (same VM fs,
-  same fsync semantics) is the fair fight: see image-side
-  numbers after the v7.20.0 release.
+- **mixed: the concurrency story is won.** P4b found the real
+  write-path bottleneck — every UPDATE paid a full
+  `rebuild_indices()` over the whole table (~1 ms at 5k rows).
+  With incremental maintenance the engine-side UPDATE is 2 µs,
+  so the durable number is now fsync-bound only (group-commit
+  amortises it: 24.6k @64, 44.4k @64 on longer runs), and the
+  durability-equal number beats wire-PG at every concurrency.
+- SPG durable mixed runs a TRUE F_FULLFSYNC (4.2 ms on this
+  host); the PgPool comparator runs fdatasync inside an
+  OrbStack VM — effectively buffered, not durability-equal.
+  Container-vs-container (same VM fs, same fsync semantics) is
+  the fair fight: see image-side numbers after the v7.20.0
+  release.
 
 ## 2. Latency — single-row ops (µs, p50, unchanged from v7.19)
 
@@ -86,4 +111,7 @@ cargo build --release -p spg-bench-competitor \
 ./target/release/latency && ./target/release/throughput && \
 ./target/release/vector_knn && \
 ./target/release/sqlx_pool_concurrent_reads --iters 500 --rows 5000
+# §1b durability-equal mode:
+SPG_SYNCHRONOUS_COMMIT=off \
+    ./target/release/sqlx_pool_concurrent_reads --iters 500 --rows 5000
 ```

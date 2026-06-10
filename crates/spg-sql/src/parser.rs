@@ -6135,6 +6135,32 @@ impl Parser {
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
+        // v7.20 — PG reserves the table-constraint keywords, so a
+        // BARE `UNIQUE` / `PRIMARY` / … in column position is a
+        // malformed constraint clause (e.g. `UNIQUE a` missing its
+        // parens), not a column named "unique". Since v7.17's
+        // unknown-type leniency (`user_type_ref`) such a clause
+        // would otherwise parse as a column with a user-defined
+        // type — silently accepting invalid DDL. Quoted
+        // identifiers ("unique" / `unique`) remain valid names.
+        if let Token::Ident(s) = self.peek()
+            && [
+                "unique",
+                "primary",
+                "foreign",
+                "constraint",
+                "check",
+                "references",
+                "exclude",
+            ]
+            .iter()
+            .any(|kw| s.eq_ignore_ascii_case(kw))
+        {
+            return Err(self.err(alloc::format!(
+                "unexpected reserved keyword '{s}' at start of column definition \
+                 (malformed table constraint?)"
+            )));
+        }
         let name = self.expect_ident_like()?;
         let (
             ty,
@@ -9124,11 +9150,18 @@ mod tests {
     }
 
     #[test]
-    fn create_table_unknown_type_errors() {
-        // v4.9: JSON is now real; pick an actually unsupported keyword
-        // (XML never landed and isn't planned).
-        let err = parse_statement("CREATE TABLE x (a xml)").unwrap_err();
-        assert!(err.message.contains("unsupported column type"));
+    fn create_table_unknown_type_defers_to_engine() {
+        // v4.9 picked XML as a parse-time "unsupported column
+        // type" probe. v7.17.0 Phase 1.4 changed the contract:
+        // an unknown type ident parses as Text + `user_type_ref`
+        // so CREATE TABLE can resolve user-defined enum / domain
+        // types — rejection of truly-unknown types moved to the
+        // engine's catalog lookup.
+        let stmt = parse_statement("CREATE TABLE x (a xml)").unwrap();
+        let Statement::CreateTable(t) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(t.columns[0].user_type_ref.as_deref(), Some("xml"));
     }
 
     #[test]

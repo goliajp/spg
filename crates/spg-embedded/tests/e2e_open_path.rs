@@ -82,6 +82,9 @@ fn writes_recoverable_when_drop_is_skipped() {
         // durability guarantee.
         std::mem::forget(db);
     }
+    // mem::forget leaks the advisory file lock; clear it the way
+    // a post-crash operator would so the reopen isn't refused.
+    Database::force_unlock(&db_path).unwrap();
     let mut db = Database::open_path(&db_path).unwrap();
     let got = db.query("SELECT count(*) FROM t").unwrap();
     match &got[0][0] {

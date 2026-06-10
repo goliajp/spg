@@ -105,9 +105,9 @@ impl SpgConnection {
         &self.inner
     }
 
-    /// v7.20 P3 — look up (or build + cache) the parsed statement
-    /// + readonly classification for `sql`. One parse per
-    /// distinct SQL string per connection.
+    /// v7.20 P3 — look up (or build + cache) the parsed
+    /// statement and readonly classification for `sql`. One
+    /// parse per distinct SQL string per connection.
     pub(crate) async fn cached_stmt(
         &mut self,
         sql: &str,
