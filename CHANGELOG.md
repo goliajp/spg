@@ -8,6 +8,70 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.21.0] — 2026-06-11 (mailrs embed round-12 closures + embedded tx crash durability)
+
+The real sqlx-embed cutover round. mailrs ran its actual test suites
+(181 mailbox + 159 outbound-queue + 853 server) against
+`SpgPool::connect_in_memory()` and surfaced everything the psql
+text-replay harness structurally couldn't see.
+
+### Added
+
+- **spg-sqlx**: `Option<T>` binds (`impl_encode_for_option!`),
+  borrowed-slice binds (`&[i64]` etc. for `= ANY($1)`), native
+  engine-array values through the prepared-bind path,
+  `sqlx::raw_sql` multi-statement scripts.
+- **spg-embedded**: `Database::execute_script` — PG simple-query
+  semantics (whole script in ONE implicit transaction; joins a
+  caller-open tx; defers to script-owned BEGIN/COMMIT). `pub
+  split_statements` (quote / dollar-quote / `E'...'` / nested-comment
+  aware). Catalog lock records the owner pid and auto-reclaims stale
+  locks left by SIGKILL'd processes (`ps -p` liveness probe).
+- **spgctl**: `spg import --db <catalog> --file <script.sql>` —
+  offline pg_dump → embedded-catalog bulk load, atomic per script.
+- **SQL surface**: bitwise `|` `&` `~` on integers,
+  `EXTRACT(EPOCH FROM …)`, `pg_extension` catalog table (bare and
+  qualified), bare `pg_*` catalog-name resolution.
+
+### Fixed
+
+- **Embedded transaction crash durability**: in-transaction
+  mutations never reached the WAL (shadow-catalog writes report
+  `modified_catalog: false`), so a COMMIT followed by a crash lost
+  the whole transaction — only a graceful `Drop` checkpoint
+  persisted it. COMMIT now flushes the buffered transaction as ONE
+  atomic `WAL_V4_TYPE_TX_COMMIT_SQL` (0x12) record: replay applies
+  the whole transaction or none of it; `ROLLBACK TO SAVEPOINT`
+  truncates the buffer to match engine state. (spg-server's wire
+  path was audited and is unaffected — it WALs and replays the
+  transaction-verb stream itself.)
+- `ON CONFLICT … DO UPDATE` worked on no UNIQUE shape: uniqueness
+  enforcement ran before conflict resolution and errored first.
+  Both passes moved below the conflict filter (PG order).
+- `INSERT … RETURNING <col>` typed the output TEXT named
+  `?column?`; bare column refs now inherit the schema column's
+  name + type.
+- Placeholder and `NOW()` resolution cover `ON CONFLICT`
+  assignments/WHERE, `UPDATE` assignments/WHERE, `DELETE` WHERE.
+- `UPDATE`/`DELETE` `WHERE … IN (SELECT …)` subqueries materialise
+  before the row walk (the v4.10 SELECT-only pass extended).
+- TEXT[] WAL rendering escapes embedded single quotes (replay
+  parsed the old form as invalid SQL).
+
+### Changed
+
+- Test surface reorganised into five categories
+  (lint / unit / e2e / gates / biz) behind `scripts/gate.sh`, with
+  fast/full tiers; standalone `perf_*` binaries folded into
+  per-crate `perf_gate` targets; `scripts/test-on-mini.sh` offloads
+  the cargo categories to the LAN testbed. See `docs/TESTING.md`.
+- WAL format gains record type 0x12 (tx-commit). Older binaries
+  cannot read WALs containing it (newer binaries read old WALs
+  unchanged) — hence the minor-version bump.
+
+*(CHANGELOG gap: 7.17.0–7.20.0 shipped without entries here; per
+the header, master commits are the source of truth for those.)*
+
 ## [7.16.2] — 2026-06-07 (mailrs round-10 closures: DO blocks + information_schema + SELECT INTO + table/index RENAME)
 
 The "mailrs migrate-042 unblocks + DO blocks stop silently no-op'ing" patch.
