@@ -4171,6 +4171,47 @@ impl Parser {
         Some(alloc::format!("{prefix}{normalised}"))
     }
 
+    /// Unqualified PG meta-table names (`FROM pg_extension`, `FROM
+    /// pg_class`) resolve the same way: PG puts `pg_catalog` at the
+    /// implicit front of every search_path, so a bare reference to a
+    /// known catalog table always means the catalog table. Only the
+    /// names the engine actually synthesises are recognised — any
+    /// other `pg_*` ident stays a user table (mailrs embed round-12).
+    fn try_peek_meta_bare(&mut self) -> Option<String> {
+        const PG_META_TABLES: &[&str] = &[
+            "pg_attribute",
+            "pg_class",
+            "pg_constraint",
+            "pg_database",
+            "pg_extension",
+            "pg_index",
+            "pg_indexes",
+            "pg_matviews",
+            "pg_namespace",
+            "pg_proc",
+            "pg_roles",
+            "pg_settings",
+            "pg_type",
+            "pg_user",
+            "pg_views",
+        ];
+        let name = match self.tokens.get(self.pos) {
+            Some(Token::Ident(s)) => s.to_ascii_lowercase(),
+            _ => return None,
+        };
+        // A following dot means this ident is a schema qualifier,
+        // not a table name — let the qualified path handle it.
+        if matches!(self.tokens.get(self.pos + 1), Some(Token::Dot)) {
+            return None;
+        }
+        if !PG_META_TABLES.contains(&name.as_str()) {
+            return None;
+        }
+        self.advance();
+        let bare = name.strip_prefix("pg_").unwrap_or(&name);
+        Some(alloc::format!("__spg_pg_{bare}"))
+    }
+
     /// Consume a bare ident if its lowercase matches `kw`, else err.
     fn expect_keyword_ident(&mut self, kw: &str) -> Result<(), ParseError> {
         match self.advance() {
@@ -6928,6 +6969,8 @@ impl Parser {
         // clashing with any user-defined `columns` table.
         let name = if let Some(synth) = self.try_peek_meta_qualified() {
             synth
+        } else if let Some(synth) = self.try_peek_meta_bare() {
+            synth
         } else {
             self.expect_ident_like()?
         };
@@ -7195,6 +7238,15 @@ impl Parser {
                 let e = self.parse_expr(8)?;
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
+                    expr: Box::new(e),
+                })
+            }
+            Token::Tilde => {
+                self.advance();
+                // Bitwise NOT binds like unary minus.
+                let e = self.parse_expr(8)?;
+                Ok(Expr::Unary {
+                    op: UnOp::BitNot,
                     expr: Box::new(e),
                 })
             }
@@ -8007,10 +8059,11 @@ impl Parser {
             "minute" => ExtractField::Minute,
             "second" => ExtractField::Second,
             "microsecond" | "microseconds" => ExtractField::Microsecond,
+            "epoch" => ExtractField::Epoch,
             other => {
                 return Err(self.err(format!(
                     "unknown EXTRACT field {other:?}; \
-                     supported: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MICROSECOND"
+                     supported: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MICROSECOND, EPOCH"
                 )));
             }
         };
@@ -8452,6 +8505,11 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // `||` sits beside `+`/`-` (matches PG conceptually — concat groups
         // by the same level as binary additive arithmetic).
         Token::Concat => (BinOp::Concat, 6),
+        // Bitwise `|` / `&` ride the same rung as `||` — PG groups
+        // all "other" operators between additive and comparison, so
+        // `flags & $1 = 0` parses as `(flags & $1) = 0`.
+        Token::Pipe => (BinOp::BitOr, 6),
+        Token::Amp => (BinOp::BitAnd, 6),
         Token::Star => (BinOp::Mul, 7),
         Token::Slash => (BinOp::Div, 7),
         // v4.14: JSON path ops bind tighter than comparisons (4)

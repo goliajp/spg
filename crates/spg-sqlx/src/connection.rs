@@ -219,13 +219,36 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
                 return Box::pin(stream::iter(std::iter::once(Err(Error::Encode(e)))));
             }
         };
-        let outcome_fut = async move { run_one(self, &sql, arguments).await };
+        let outcome_fut = async move {
+            match arguments {
+                // Bind parameters imply exactly one statement (PG
+                // rejects multi-statement extended queries too).
+                Some(args) => run_one(self, &sql, Some(args)).await.map(|o| vec![o]),
+                // No parameters = sqlx's simple-query / `raw_sql`
+                // path. PG executes every `;`-separated statement in
+                // the string server-side; mirror that by splitting
+                // here and running them sequentially (mailrs embed
+                // round-12 — schema scripts via `sqlx::raw_sql`).
+                None => {
+                    let mut outcomes = Vec::new();
+                    for stmt in spg_embedded::split_statements(&sql) {
+                        outcomes.push(run_one(self, stmt, None).await?);
+                    }
+                    Ok(outcomes)
+                }
+            }
+        };
         Box::pin(stream::once(outcome_fut).flat_map(|outcome| {
             let items: Vec<Result<either::Either<SpgQueryResult, SpgRow>, Error>> = match outcome {
-                Ok(Outcome::Affected(qr)) => vec![Ok(either::Either::Left(qr))],
-                Ok(Outcome::Rows(rows)) => rows
+                Ok(outcomes) => outcomes
                     .into_iter()
-                    .map(|r| Ok(either::Either::Right(r)))
+                    .flat_map(|o| match o {
+                        Outcome::Affected(qr) => vec![Ok(either::Either::Left(qr))],
+                        Outcome::Rows(rows) => rows
+                            .into_iter()
+                            .map(|r| Ok(either::Either::Right(r)))
+                            .collect::<Vec<_>>(),
+                    })
                     .collect(),
                 Err(e) => vec![Err(e)],
             };

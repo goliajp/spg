@@ -138,6 +138,12 @@ pub enum Token {
     Colon,
     /// Standard SQL string concatenation `||`.
     Concat,
+    /// Bitwise OR `|` (single pipe — `||` lexes as Concat first).
+    Pipe,
+    /// Bitwise AND `&` (single amp — `&&` lexes as InetOverlap first).
+    Amp,
+    /// Bitwise NOT `~` (prefix).
+    Tilde,
     /// `IS` keyword — postfix `IS NULL` / `IS NOT NULL` predicates.
     Is,
     Between,
@@ -494,6 +500,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 out.push(Token::Concat);
                 i += 2;
             }
+            // Bitwise operators (PG integer ops; mailrs IMAP flag
+            // masks: `flags | $1`, `flags & ~$1`).
+            b'|' => {
+                single(&mut out, Token::Pipe, &mut i);
+            }
+            b'~' => {
+                single(&mut out, Token::Tilde, &mut i);
+            }
             b'>' => {
                 if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=') {
                     // v7.17.0 Phase 3.P0-47 — PG INET `>>=` contains-or-equal.
@@ -515,6 +529,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 // v7.17.0 Phase 3.P0-47 — PG INET network overlap `&&`.
                 out.push(Token::InetOverlap);
                 i += 2;
+            }
+            b'&' => {
+                single(&mut out, Token::Amp, &mut i);
             }
             b'!' if peek_eq(bytes, i + 1, b'=') => {
                 out.push(Token::NotEq);
