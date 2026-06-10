@@ -1021,14 +1021,38 @@ fn lex_escape_string(input: &str, start: usize) -> Result<(Token, usize), LexErr
         if b == b'\\' && i + 1 < bytes.len() {
             let n = bytes[i + 1];
             match n {
-                b'\\' => { s.push('\\'); i += 2; }
-                b'\'' => { s.push('\''); i += 2; }
-                b'"' => { s.push('"'); i += 2; }
-                b'n' => { s.push('\n'); i += 2; }
-                b'r' => { s.push('\r'); i += 2; }
-                b't' => { s.push('\t'); i += 2; }
-                b'b' => { s.push('\u{0008}'); i += 2; }
-                b'f' => { s.push('\u{000C}'); i += 2; }
+                b'\\' => {
+                    s.push('\\');
+                    i += 2;
+                }
+                b'\'' => {
+                    s.push('\'');
+                    i += 2;
+                }
+                b'"' => {
+                    s.push('"');
+                    i += 2;
+                }
+                b'n' => {
+                    s.push('\n');
+                    i += 2;
+                }
+                b'r' => {
+                    s.push('\r');
+                    i += 2;
+                }
+                b't' => {
+                    s.push('\t');
+                    i += 2;
+                }
+                b'b' => {
+                    s.push('\u{0008}');
+                    i += 2;
+                }
+                b'f' => {
+                    s.push('\u{000C}');
+                    i += 2;
+                }
                 b'0' if i + 2 >= bytes.len() || !bytes[i + 2].is_ascii_digit() => {
                     s.push('\0');
                     i += 2;
@@ -1465,10 +1489,7 @@ mod tests {
     fn pg_escape_string_supports_basic_escapes() {
         // \n / \t / \' / \\ — the PG standard set.
         let toks = tokenize(r"E'a\nb\tc\'d\\e'").expect("E-string lexes");
-        assert_eq!(
-            toks,
-            vec![Token::String("a\nb\tc'd\\e".into()), Token::Eof]
-        );
+        assert_eq!(toks, vec![Token::String("a\nb\tc'd\\e".into()), Token::Eof]);
     }
 
     #[test]

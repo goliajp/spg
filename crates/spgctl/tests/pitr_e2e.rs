@@ -100,7 +100,10 @@ fn verify_pitr_passes_clean_after_backup() {
 
     // First verify — should report Missing checksum and exit 1.
     let (code, stdout, _) = run_spg(&[], &["verify-pitr", "--dir", bk.to_str().unwrap()]);
-    assert_eq!(code, 1, "expected verify to fail without checksum: {stdout}");
+    assert_eq!(
+        code, 1,
+        "expected verify to fail without checksum: {stdout}"
+    );
 
     // Verify with --write-missing-checksums creates the file and reports clean.
     let (code, stdout, _) = run_spg(
@@ -122,7 +125,10 @@ fn verify_pitr_passes_clean_after_backup() {
     let _ = fs::remove_file(&db);
     let _ = fs::remove_file({
         let mut p = db.clone();
-        let mut name = p.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+        let mut name = p
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
         name.push(".wal");
         p.set_file_name(name);
         p
