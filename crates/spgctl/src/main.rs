@@ -230,9 +230,7 @@ fn main() {
             };
             match pitr_restore(&snapshot_path, &wal_path, &to_arg, &target_path) {
                 Ok((applied, target_descr)) => {
-                    println!(
-                        "OK applied={applied} target={target_descr} → {target_path}"
-                    );
+                    println!("OK applied={applied} target={target_descr} → {target_path}");
                 }
                 Err(msg) => die(&format!("pitr-restore failed: {msg}"), 1),
             }
@@ -399,7 +397,9 @@ impl VerifyReport {
                     format!("checksum-MISMATCH expected={expected} actual={actual}")
                 }
                 ChecksumState::Missing { actual } => {
-                    format!("checksum-MISSING actual={actual} (rerun with --write-missing-checksums)")
+                    format!(
+                        "checksum-MISSING actual={actual} (rerun with --write-missing-checksums)"
+                    )
                 }
             };
             out.push_str(&format!(
@@ -429,11 +429,7 @@ fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport,
                 format!("{} bytes deserialize cleanly", bytes.len()),
                 bytes,
             ),
-            Err(e) => (
-                false,
-                format!("deserialize failed: {e:?}"),
-                Vec::new(),
-            ),
+            Err(e) => (false, format!("deserialize failed: {e:?}"), Vec::new()),
         },
         Err(e) => (false, format!("read failed: {e}"), Vec::new()),
     };
@@ -470,7 +466,9 @@ fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport,
             Ok(expected) => {
                 let expected = expected.trim().to_string();
                 if expected.eq_ignore_ascii_case(&actual_hash) {
-                    ChecksumState::Match { hex: actual_hash.clone() }
+                    ChecksumState::Match {
+                        hex: actual_hash.clone(),
+                    }
                 } else {
                     ChecksumState::Mismatch {
                         expected,
@@ -482,9 +480,13 @@ fn verify_pitr(dir: &str, write_missing_checksums: bool) -> Result<VerifyReport,
                 if write_missing_checksums {
                     fs::write(&cs_path, format!("{actual_hash}\n"))
                         .map_err(|e| format!("write checksum {}: {e}", cs_path.display()))?;
-                    ChecksumState::WrittenFresh { hex: actual_hash.clone() }
+                    ChecksumState::WrittenFresh {
+                        hex: actual_hash.clone(),
+                    }
                 } else {
-                    ChecksumState::Missing { actual: actual_hash.clone() }
+                    ChecksumState::Missing {
+                        actual: actual_hash.clone(),
+                    }
                 }
             }
             Err(e) => return Err(format!("read checksum {}: {e}", cs_path.display())),
@@ -713,10 +715,11 @@ fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
             fs::write(&target, &bytes)
                 .map_err(|e| format!("write chunk {}: {e}", target.display()))?;
             copied += 1;
+            // Failure is sticky on the summary line: once any
+            // chunk's archival fails, keep that FAILED status
+            // even if later chunks succeed.
             let st = archive_chunk(&target)?;
-            if matches!(st, ArchiveStatus::Failed { .. }) {
-                archive_status = st;
-            } else if !matches!(archive_status, ArchiveStatus::Failed { .. }) {
+            if !matches!(archive_status, ArchiveStatus::Failed { .. }) {
                 archive_status = st;
             }
         }
@@ -729,8 +732,8 @@ fn backup_pitr(src: &str, dst: &str) -> Result<String, String> {
         };
         wal_present = present;
         if !wal_bytes.is_empty() {
-            let recs: Vec<WalRecord<'_>> = parse_wal_records(&wal_bytes)
-                .map_err(|e| format!("parse wal for naming: {e}"))?;
+            let recs: Vec<WalRecord<'_>> =
+                parse_wal_records(&wal_bytes).map_err(|e| format!("parse wal for naming: {e}"))?;
             for r in &recs {
                 if let Some(l) = r.commit_lsn {
                     if l > max_lsn {
@@ -786,7 +789,13 @@ fn archive_chunk(chunk_path: &std::path::Path) -> Result<ArchiveStatus, String> 
         Ok(ArchiveStatus::Ok)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let snippet: String = stderr.lines().next().unwrap_or("").chars().take(200).collect();
+        let snippet: String = stderr
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect();
         Ok(ArchiveStatus::Failed {
             exit_code: output.status.code().unwrap_or(-1),
             stderr_snippet: snippet,
@@ -899,10 +908,10 @@ fn pitr_restore(
     use spg_embedded::{Database, WalRecord, parse_wal_records};
 
     let target = parse_restore_target(to_arg)?;
-    let snapshot_bytes = fs::read(snapshot_path)
-        .map_err(|e| format!("read snapshot {snapshot_path}: {e}"))?;
-    let mut db = Database::restore(&snapshot_bytes)
-        .map_err(|e| format!("restore snapshot: {e:?}"))?;
+    let snapshot_bytes =
+        fs::read(snapshot_path).map_err(|e| format!("read snapshot {snapshot_path}: {e}"))?;
+    let mut db =
+        Database::restore(&snapshot_bytes).map_err(|e| format!("restore snapshot: {e:?}"))?;
 
     // v7.19 P6 — `--wal` accepts a chunk DIRECTORY (the
     // backup-pitr `wal/` subdir or a live `<db>.wal/` dir) as
@@ -987,8 +996,7 @@ fn pitr_restore(
     }
 
     let final_snapshot = db.snapshot();
-    fs::write(target_path, &final_snapshot)
-        .map_err(|e| format!("write {target_path}: {e}"))?;
+    fs::write(target_path, &final_snapshot).map_err(|e| format!("write {target_path}: {e}"))?;
     Ok((applied, target.describe()))
 }
 
@@ -1041,12 +1049,24 @@ fn parse_restore_target(s: &str) -> Result<RestoreTarget, String> {
         let date: Vec<&str> = parts[0].split('-').collect();
         let time: Vec<&str> = parts[1].split(':').collect();
         if date.len() == 3 && time.len() == 3 {
-            let y: i64 = date[0].parse().map_err(|_| format!("bad year: {}", date[0]))?;
-            let mo: i64 = date[1].parse().map_err(|_| format!("bad month: {}", date[1]))?;
-            let d: i64 = date[2].parse().map_err(|_| format!("bad day: {}", date[2]))?;
-            let h: i64 = time[0].parse().map_err(|_| format!("bad hour: {}", time[0]))?;
-            let mi: i64 = time[1].parse().map_err(|_| format!("bad minute: {}", time[1]))?;
-            let se: i64 = time[2].parse().map_err(|_| format!("bad second: {}", time[2]))?;
+            let y: i64 = date[0]
+                .parse()
+                .map_err(|_| format!("bad year: {}", date[0]))?;
+            let mo: i64 = date[1]
+                .parse()
+                .map_err(|_| format!("bad month: {}", date[1]))?;
+            let d: i64 = date[2]
+                .parse()
+                .map_err(|_| format!("bad day: {}", date[2]))?;
+            let h: i64 = time[0]
+                .parse()
+                .map_err(|_| format!("bad hour: {}", time[0]))?;
+            let mi: i64 = time[1]
+                .parse()
+                .map_err(|_| format!("bad minute: {}", time[1]))?;
+            let se: i64 = time[2]
+                .parse()
+                .map_err(|_| format!("bad second: {}", time[2]))?;
             // Days-from-civil from Howard Hinnant's date algorithms
             // (public domain). y, mo, d are calendar values; output
             // is days since 1970-01-01 UTC. Works for any positive
@@ -1639,11 +1659,7 @@ mod tests {
 
         // Backup → backup_dir.
         let backup_dir = tmp_path("bk-dst-dir");
-        let summary = backup_pitr(
-            db_path.to_str().unwrap(),
-            backup_dir.to_str().unwrap(),
-        )
-        .unwrap();
+        let summary = backup_pitr(db_path.to_str().unwrap(), backup_dir.to_str().unwrap()).unwrap();
         assert!(summary.starts_with("OK "), "bad summary: {summary}");
         let snap = backup_dir.join("snapshot.spg");
         let wal_dir = backup_dir.join("wal");
@@ -1722,11 +1738,7 @@ mod tests {
         Database::force_unlock(&db_path).unwrap();
 
         let backup_dir = tmp_path("vf-bk-dir");
-        let summary = backup_pitr(
-            db_path.to_str().unwrap(),
-            backup_dir.to_str().unwrap(),
-        )
-        .unwrap();
+        let summary = backup_pitr(db_path.to_str().unwrap(), backup_dir.to_str().unwrap()).unwrap();
         assert!(summary.starts_with("OK "));
 
         // First verify without checksums — must report Missing
@@ -1749,13 +1761,19 @@ mod tests {
                 c.checksum_state
             );
         }
-        assert!(!report.is_clean(), "report should not be clean without checksum");
+        assert!(
+            !report.is_clean(),
+            "report should not be clean without checksum"
+        );
 
         // Now write the checksum file via the flag and verify
         // again — must be clean.
         let report = verify_pitr(backup_dir.to_str().unwrap(), true).unwrap();
         for c in &report.chunks {
-            assert!(matches!(c.checksum_state, ChecksumState::WrittenFresh { .. }));
+            assert!(matches!(
+                c.checksum_state,
+                ChecksumState::WrittenFresh { .. }
+            ));
         }
 
         let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
@@ -1788,11 +1806,7 @@ mod tests {
         Database::force_unlock(&db_path).unwrap();
 
         let backup_dir = tmp_path("vf-bad-bk-dir");
-        backup_pitr(
-            db_path.to_str().unwrap(),
-            backup_dir.to_str().unwrap(),
-        )
-        .unwrap();
+        backup_pitr(db_path.to_str().unwrap(), backup_dir.to_str().unwrap()).unwrap();
 
         // Stamp every chunk with a real checksum first, then
         // corrupt the FIRST chunk's sidecar — verify must flag
@@ -1814,8 +1828,11 @@ mod tests {
             p.set_file_name(name);
             p
         };
-        fs::write(&cs_path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n")
-            .unwrap();
+        fs::write(
+            &cs_path,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
 
         let report = verify_pitr(backup_dir.to_str().unwrap(), false).unwrap();
         let mismatches = report
@@ -1901,11 +1918,7 @@ mod tests {
         let _ = fs::remove_file(&wal_path); // no-op if it was a dir
 
         let backup_dir = tmp_path("bk-no-wal-dst");
-        let summary = backup_pitr(
-            db_path.to_str().unwrap(),
-            backup_dir.to_str().unwrap(),
-        )
-        .unwrap();
+        let summary = backup_pitr(db_path.to_str().unwrap(), backup_dir.to_str().unwrap()).unwrap();
         assert!(summary.contains("wal_present=false"), "summary: {summary}");
         let wal_dir = backup_dir.join("wal");
         // wal/ subdir created but empty.

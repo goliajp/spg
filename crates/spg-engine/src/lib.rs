@@ -17772,7 +17772,9 @@ mod tests {
         // the mailrs D-pre #3 reverse-acceptance gap.
         let e = Engine::new();
         let r = e.execute_readonly("SELECT 'hello'::bytea").unwrap();
-        let QueryResult::Rows { rows, .. } = r else { panic!("expected Rows") };
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!("expected Rows")
+        };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Bytes(b"hello".to_vec()));
     }
@@ -17783,10 +17785,10 @@ mod tests {
         // (literal 10 chars), then ::bytea reads it as PG hex
         // form bytea literal → 4 bytes.
         let e = Engine::new();
-        let r = e
-            .execute_readonly(r"SELECT E'\\xdeadbeef'::bytea")
-            .unwrap();
-        let QueryResult::Rows { rows, .. } = r else { panic!("expected Rows") };
+        let r = e.execute_readonly(r"SELECT E'\\xdeadbeef'::bytea").unwrap();
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!("expected Rows")
+        };
         assert_eq!(
             rows[0].values[0],
             Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
@@ -17802,7 +17804,9 @@ mod tests {
         let r = e
             .execute_readonly("SELECT octet_length('hello'::bytea)")
             .unwrap();
-        let QueryResult::Rows { rows, .. } = r else { panic!("expected Rows") };
+        let QueryResult::Rows { rows, .. } = r else {
+            panic!("expected Rows")
+        };
         match &rows[0].values[0] {
             Value::Int(n) => assert_eq!(*n, 5),
             Value::BigInt(n) => assert_eq!(*n, 5),
@@ -17847,10 +17851,7 @@ mod tests {
         let stmt = e.prepare("INSERT INTO t VALUES ($1)").unwrap();
         let err = Engine::execute_readonly_prepared_on_snapshot(&snapshot, stmt, &[Value::Int(1)])
             .unwrap_err();
-        assert!(
-            matches!(&err, EngineError::WriteRequired),
-            "got: {err}"
-        );
+        assert!(matches!(&err, EngineError::WriteRequired), "got: {err}");
     }
 
     #[test]

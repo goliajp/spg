@@ -187,7 +187,9 @@ async fn read_handle_prepare_then_execute_prepared() {
 #[tokio::test]
 async fn read_handle_execute_prepared_rejects_writes() {
     let db = AsyncDatabase::open_in_memory();
-    db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     let h = db.read_handle().await;
     let stmt = h.prepare("INSERT INTO t VALUES ($1)").await.unwrap();
     let err = h
@@ -219,14 +221,13 @@ async fn read_handle_prepared_frozen_view() {
     // committed after the handle was taken are invisible until
     // refresh().
     let db = AsyncDatabase::open_in_memory();
-    db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1)").await.unwrap();
     let h = db.read_handle().await;
     db.execute("INSERT INTO t VALUES (2)").await.unwrap();
-    let stmt = h
-        .prepare("SELECT id FROM t WHERE id = $1")
-        .await
-        .unwrap();
+    let stmt = h.prepare("SELECT id FROM t WHERE id = $1").await.unwrap();
     let QueryResult::Rows { rows, .. } = h
         .execute_prepared(&stmt, vec![Value::Int(2)])
         .await
