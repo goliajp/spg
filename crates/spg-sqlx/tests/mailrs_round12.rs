@@ -84,6 +84,29 @@ async fn raw_sql_runs_multi_statement_scripts() {
     assert_eq!(n.0, 2);
 }
 
+/// Gap 3 polish (v7.21) — a failing multi-statement script rolls
+/// back as a unit. PG wraps every simple-query message in an
+/// implicit transaction; a script that dies at statement N must not
+/// leave statements 1..N-1 applied (half a schema is worse than no
+/// schema for a bootstrap path).
+#[tokio::test]
+async fn raw_sql_script_rolls_back_atomically() {
+    let p = pool().await;
+    let r = sqlx::raw_sql(
+        "CREATE TABLE t3b (id BIGINT);\n\
+         INSERT INTO t3b VALUES (1);\n\
+         INSERT INTO no_such_table VALUES (1);",
+    )
+    .execute(&p)
+    .await;
+    assert!(r.is_err(), "script must fail at statement #3");
+    let probe = sqlx::query("SELECT COUNT(*) FROM t3b").fetch_one(&p).await;
+    assert!(
+        probe.is_err(),
+        "t3b survived the rollback — the script applied partially"
+    );
+}
+
 /// Gap 4 — `INSERT … RETURNING id` must carry the schema column's
 /// type (BIGINT), not default to TEXT; sqlx type-checks the decode.
 #[tokio::test]

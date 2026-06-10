@@ -225,17 +225,19 @@ impl<'c> Executor<'c> for &'c mut SpgConnection {
                 // rejects multi-statement extended queries too).
                 Some(args) => run_one(self, &sql, Some(args)).await.map(|o| vec![o]),
                 // No parameters = sqlx's simple-query / `raw_sql`
-                // path. PG executes every `;`-separated statement in
-                // the string server-side; mirror that by splitting
-                // here and running them sequentially (mailrs embed
-                // round-12 — schema scripts via `sqlx::raw_sql`).
-                None => {
-                    let mut outcomes = Vec::new();
-                    for stmt in spg_embedded::split_statements(&sql) {
-                        outcomes.push(run_one(self, stmt, None).await?);
-                    }
-                    Ok(outcomes)
-                }
+                // path. PG executes every `;`-separated statement of
+                // the message server-side inside ONE implicit
+                // transaction; `Database::execute_script` owns both
+                // the splitting and the transaction semantics
+                // (mailrs embed round-12 + v7.21 polish).
+                None => Ok(self
+                    .inner
+                    .execute_script(&sql)
+                    .await
+                    .map_err(engine_to_sqlx)?
+                    .into_iter()
+                    .map(outcome_from)
+                    .collect()),
             }
         };
         Box::pin(stream::once(outcome_fut).flat_map(|outcome| {
@@ -403,16 +405,20 @@ async fn run_one(
             db.execute(sql).await.map_err(engine_to_sqlx)?
         }
     };
+    Ok(outcome_from(result))
+}
+
+fn outcome_from(result: EngineQueryResult) -> Outcome {
     match result {
         EngineQueryResult::Rows { columns, rows } => {
             let row_values: Vec<Vec<spg_embedded::Value>> =
                 rows.into_iter().map(|r| r.values).collect();
-            Ok(Outcome::Rows(build_rows(&columns, row_values)))
+            Outcome::Rows(build_rows(&columns, row_values))
         }
-        EngineQueryResult::CommandOk { affected, .. } => Ok(Outcome::Affected(
-            SpgQueryResult::new(u64::try_from(affected).unwrap_or(0)),
-        )),
-        _ => Ok(Outcome::Affected(SpgQueryResult::default())),
+        EngineQueryResult::CommandOk { affected, .. } => {
+            Outcome::Affected(SpgQueryResult::new(u64::try_from(affected).unwrap_or(0)))
+        }
+        _ => Outcome::Affected(SpgQueryResult::default()),
     }
 }
 

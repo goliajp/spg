@@ -8508,6 +8508,15 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // Bitwise `|` / `&` ride the same rung as `||` — PG groups
         // all "other" operators between additive and comparison, so
         // `flags & $1 = 0` parses as `(flags & $1) = 0`.
+        //
+        // Known divergence (the same one `||` has carried since v1):
+        // SPG's rung 6 TIES with `+ -`, while PG binds generic
+        // operators LOOSER than additive — `a & b + 1` is
+        // `(a & b) + 1` here vs `a & (b + 1)` in PG. Parenthesise
+        // mixed bitwise/arithmetic. Keeping every generic operator
+        // on one shared rung is deliberate: splitting bitwise off
+        // would fix that case but skew `a || b & c`, which PG
+        // left-folds at a single level.
         Token::Pipe => (BinOp::BitOr, 6),
         Token::Amp => (BinOp::BitAnd, 6),
         Token::Star => (BinOp::Mul, 7),

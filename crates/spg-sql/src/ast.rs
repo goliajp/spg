@@ -3818,10 +3818,17 @@ impl fmt::Display for Literal {
                         Some(s) => {
                             f.write_str("\"")?;
                             for c in s.chars() {
-                                if c == '"' || c == '\\' {
-                                    f.write_str("\\")?;
+                                match c {
+                                    // array-element escapes
+                                    '"' | '\\' => write!(f, "\\{c}")?,
+                                    // the OUTER wrapper is a SQL string
+                                    // literal — embedded quotes must
+                                    // double, or the rendered form
+                                    // (WAL replay parses it back) is
+                                    // invalid SQL
+                                    '\'' => f.write_str("''")?,
+                                    _ => write!(f, "{c}")?,
                                 }
-                                write!(f, "{c}")?;
                             }
                             f.write_str("\"")?;
                         }

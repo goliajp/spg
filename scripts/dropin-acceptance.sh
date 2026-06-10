@@ -226,6 +226,21 @@ run_case "stock.transaction_commit" \
 run_case "stock.transaction_rollback" \
   "CREATE TABLE tx2 (id INT); BEGIN; INSERT INTO tx2 VALUES (1); ROLLBACK; SELECT count(*) FROM tx2;"
 
+# --- mailrs embed round-12 shapes (staged) ---
+# Shipped on develop post-v7.20; ACTIVATE (uncomment) when the CI
+# `--image` bumps to the first release carrying round-12 — they fail
+# against goliakk/spg:7.19.0 by construction. Wire-level mirrors of
+# crates/spg-sqlx/tests/mailrs_round12.rs; see
+# .claude/notes/mailrs-embed-round12-gaps-and-fixes.md.
+#run_case "round12.upsert_via_unique_index" \
+#  "CREATE TABLE r12_a (id SERIAL PRIMARY KEY, email TEXT NOT NULL, reason TEXT NOT NULL DEFAULT ''); CREATE UNIQUE INDEX r12_a_email ON r12_a (email); INSERT INTO r12_a (email, reason) VALUES ('a@x', 'first') ON CONFLICT (email) DO UPDATE SET reason = 'second'; INSERT INTO r12_a (email, reason) VALUES ('a@x', 'third') ON CONFLICT (email) DO UPDATE SET reason = 'second'; SELECT reason FROM r12_a;"
+#run_case "round12.bitwise_flag_math" \
+#  "CREATE TABLE r12_b (id INT, flags INTEGER NOT NULL DEFAULT 0); INSERT INTO r12_b VALUES (1, 5); UPDATE r12_b SET flags = flags | 2 WHERE id = 1; UPDATE r12_b SET flags = flags & ~4 WHERE id = 1; SELECT flags FROM r12_b WHERE (flags & 1) != 0;"
+#run_case "round12.extract_epoch" \
+#  "SELECT EXTRACT(EPOCH FROM TIMESTAMP '2026-01-01 00:00:00')::BIGINT;"
+#run_case "round12.update_where_in_subquery" \
+#  "CREATE TABLE r12_d (id INT, state TEXT); INSERT INTO r12_d VALUES (1,'queued'),(2,'queued'),(3,'done'); UPDATE r12_d SET state = 'claimed' WHERE id IN (SELECT id FROM r12_d WHERE state = 'queued') RETURNING id; SELECT count(*) FROM r12_d WHERE state = 'claimed';"
+
 # --- Fixture mode — apply each --fixture SQL file as a single chunk ---
 FIXTURE_REPORT=""
 if [ "${#FIXTURES[@]}" -gt 0 ]; then

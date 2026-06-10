@@ -162,3 +162,37 @@ fn prepared_dml_persists_via_wal() {
     assert_eq!(rows[0], vec![Value::Int(1), Value::Text("one".into())]);
     assert_eq!(rows[1], vec![Value::Int(2), Value::Text("two".into())]);
 }
+
+#[test]
+fn text_array_bind_with_quote_survives_wal_replay() {
+    // v7.21 polish — the WAL's bind-final render wraps TEXT[] values
+    // in a single-quoted PG external form; an element containing a
+    // quote must double it or the replayed SQL is unparseable.
+    // mem::forget skips Drop's checkpoint so recovery genuinely
+    // comes from WAL replay, not the snapshot.
+    let dir = Scratch::new("wal-textarray-quote");
+    let path = dir.child("db");
+    {
+        let mut db = Database::open_path(&path).unwrap();
+        db.execute("CREATE TABLE ta (id INT NOT NULL, tags TEXT[])")
+            .unwrap();
+        let stmt = db.prepare("INSERT INTO ta VALUES ($1, $2)").unwrap();
+        db.execute_prepared(
+            &stmt,
+            &[
+                Value::Int(1),
+                Value::TextArray(vec![Some("it's".into()), Some("a\\b\"c".into()), None]),
+            ],
+        )
+        .unwrap();
+        std::mem::forget(db);
+    }
+    Database::force_unlock(&path).unwrap();
+    let mut db = Database::open_path(&path).unwrap();
+    let rows = db.query("SELECT tags FROM ta WHERE id = 1").unwrap();
+    assert_eq!(
+        rows[0][0],
+        Value::TextArray(vec![Some("it's".into()), Some("a\\b\"c".into()), None]),
+        "TEXT[] with quote/backslash must round-trip through WAL replay"
+    );
+}
