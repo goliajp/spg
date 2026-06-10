@@ -59,6 +59,17 @@ start_server() {
         sleep 0.4
     else
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        # A stale HOST-side listener on $PORT (e.g. an orphaned
+        # local-build spg-server whose trap never fired) makes
+        # `docker run -p` fail; psql would then silently talk to
+        # the stale server and row counts accumulate across runs
+        # — exactly the 2x/3x drift seen on 2026-06-10. Kill it.
+        if lsof -ti :$PORT >/dev/null 2>&1; then
+            lsof -ti :$PORT | xargs kill -9 2>/dev/null || true
+            sleep 0.3
+        fi
+        # No >/dev/null on stderr: a failed `docker run` must be
+        # loud, not swallowed.
         docker run -d --name "$CONTAINER" \
             -e POSTGRES_DB=app -e POSTGRES_USER=u -e POSTGRES_PASSWORD=p \
             -p "$PORT:5432" "goliakk/spg:$VERSION" >/dev/null
