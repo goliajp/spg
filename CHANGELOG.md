@@ -8,6 +8,24 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.25.2] — 2026-06-11 (mailrs round-19: correlated subqueries in GROUP BY select lists)
+
+### Fixed
+
+- A correlated scalar subquery in the SELECT list (or HAVING /
+  aggregate ORDER BY) of a GROUP BY query died with "subquery
+  reached row eval" once a row formed a group — empty tables masked
+  it. The aggregate rewriter now descends into subquery bodies and
+  replaces group-key references with the synthetic group columns;
+  aggregate::run takes the engine's correlated evaluator for
+  synth-row expressions. Covers the round-19 B report too (LEFT
+  JOIN alias aggregates under the full CTE-chain search shape — the
+  two failures masked each other across dispatch paths).
+- New SEEDED composite regression (mailrs's suggestion): the full
+  search/inbox shape with rows present, on both the direct and
+  prepared/readonly paths — empty-table gates had declared victory
+  twice.
+
 ## [7.25.1] — 2026-06-11 (mailrs round-18: placeholders + clock calls reach CTE bodies)
 
 ### Fixed
