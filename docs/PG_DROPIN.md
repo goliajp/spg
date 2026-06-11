@@ -116,6 +116,24 @@ with per-case pass/fail + first ERROR line on any failure.
 Exit code: 0 all pass / 1 any fail / 2 harness error — wire it
 straight into your CI.
 
+### Migrating data: `spg import` takes stock pg_dump output
+
+v7.22 — an **unmodified** `pg_dump` of your database (default
+format with `COPY … FROM stdin` data blocks, or `--column-inserts`)
+loads straight into an embedded catalog, atomically:
+
+```sh
+pg_dump --no-owner --no-privileges mydb > dump.sql
+spg import --db ./mydb.spgdb --file dump.sql
+```
+
+PG 18 emission shapes (`\restrict` wrappers, named inline NOT NULL
+constraints, identity columns, `UNIQUE NULLS NOT DISTINCT`,
+schema-qualified types/opclasses) parse as-is; serial/identity
+columns keep numbering after import. The dump-compat gate loads
+every fixture through BOTH the wire and this import path on every
+release.
+
 ## Current fixtures (regressions are release-blocking)
 
 | Fixture | Source | What it proves |
@@ -142,6 +160,13 @@ of them, ping the issue tracker and we'll discuss scope:
 - Row-Level Security
 - Full `pg_catalog.*` introspection (subset works for
   Rails/ActiveRecord/sqlx; full coverage isn't promised)
+- Generated **expression** columns (`GENERATED … AS (expr) STORED`)
+  — rejected with a clear error. Identity columns
+  (`GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`) ARE supported
+  (v7.22), with one leniency: ALWAYS doesn't reject explicit
+  values (SPG treats both flavours as BY DEFAULT).
+- `TIMESTAMP '…'` / typed-literal syntax (cast via `::timestamptz`
+  or use a plain string against a typed column instead)
 
 If a feature isn't in the drop-in promise AND isn't in the
 carve-out list, that's a real gap — file it.
