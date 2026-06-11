@@ -1966,7 +1966,13 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
         partition_by: Vec<Expr>,
-        order_by: Vec<(Expr, bool /* desc */)>,
+        /// v7.24.1 — third slot: explicit NULLS FIRST/LAST
+        /// (None = PG default, same contract as [`OrderBy`]).
+        order_by: Vec<(
+            Expr,
+            bool,         /* desc */
+            Option<bool>, /* nulls_first */
+        )>,
         /// v4.20 explicit frame. `None` means "use the default":
         /// whole-partition when unordered, running aggregate from
         /// partition start through current row when ordered.
@@ -3762,13 +3768,18 @@ impl fmt::Display for Expr {
                         f.write_str(" ")?;
                     }
                     f.write_str("ORDER BY ")?;
-                    for (i, (e, desc)) in order_by.iter().enumerate() {
+                    for (i, (e, desc, nulls_first)) in order_by.iter().enumerate() {
                         if i > 0 {
                             f.write_str(", ")?;
                         }
                         write!(f, "{e}")?;
                         if *desc {
                             f.write_str(" DESC")?;
+                        }
+                        match nulls_first {
+                            Some(true) => f.write_str(" NULLS FIRST")?,
+                            Some(false) => f.write_str(" NULLS LAST")?,
+                            None => {}
                         }
                     }
                 }

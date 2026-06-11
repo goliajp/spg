@@ -291,7 +291,7 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
             for p in partition_by {
                 collect_expr(p, out);
             }
-            for (o, _) in order_by {
+            for (o, _, _) in order_by {
                 collect_expr(o, out);
             }
         }

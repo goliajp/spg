@@ -8384,7 +8384,10 @@ impl Engine {
                     combined_vals.extend(right.values.iter().cloned());
                     let combined = Row::new(combined_vals);
                     let keep = if let Some(on_expr) = peer.on {
-                        let cond = eval::eval_expr(on_expr, &combined, &ctx)?;
+                        // v7.24.1 — correlated-aware (subqueries in
+                        // ON referencing earlier join columns).
+                        let cond =
+                            self.eval_expr_with_correlated(on_expr, &combined, &ctx, cancel, None)?;
                         matches!(cond, Value::Bool(true))
                     } else {
                         true
@@ -9790,16 +9793,16 @@ impl Engine {
                 unreachable!("collect_window_nodes pushes only WindowFunction");
             };
             // Compute (partition_key, order_key, original_index) for each row.
-            let mut indexed: Vec<(Vec<Value>, Vec<(Value, bool)>, usize)> =
+            let mut indexed: Vec<(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)> =
                 Vec::with_capacity(n_rows);
             for (i, row) in filtered.iter().enumerate() {
                 let pkey: Vec<Value> = partition_by
                     .iter()
                     .map(|p| eval::eval_expr(p, row, &ctx))
                     .collect::<Result<_, _>>()?;
-                let okey: Vec<(Value, bool)> = order_by
+                let okey: Vec<(Value, bool, Option<bool>)> = order_by
                     .iter()
-                    .map(|(e, desc)| eval::eval_expr(e, row, &ctx).map(|v| (v, *desc)))
+                    .map(|(e, desc, nf)| eval::eval_expr(e, row, &ctx).map(|v| (v, *desc, *nf)))
                     .collect::<Result<_, _>>()?;
                 indexed.push((pkey, okey, i));
             }
@@ -10338,6 +10341,16 @@ impl Engine {
         if let Some(w) = &mut stmt.where_ {
             self.resolve_expr_subqueries(w, cancel)?;
         }
+        // v7.24.1 — JOIN ON conditions can carry subqueries too;
+        // they were never walked, so even an UNCORRELATED subquery
+        // in ON hit "subquery reached row eval".
+        if let Some(from) = &mut stmt.from {
+            for j in &mut from.joins {
+                if let Some(on) = &mut j.on {
+                    self.resolve_expr_subqueries(on, cancel)?;
+                }
+            }
+        }
         if let Some(gs) = &mut stmt.group_by {
             for g in gs {
                 self.resolve_expr_subqueries(g, cancel)?;
@@ -10404,7 +10417,7 @@ impl Engine {
                 for p in partition_by {
                     self.resolve_expr_subqueries(p, cancel)?;
                 }
-                for (e, _) in order_by {
+                for (e, _, _) in order_by {
                     self.resolve_expr_subqueries(e, cancel)?;
                 }
             }
@@ -10822,7 +10835,7 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
         } => {
             args.iter().any(|a| expr_refers_to(a, target))
                 || partition_by.iter().any(|p| expr_refers_to(p, target))
-                || order_by.iter().any(|(o, _)| expr_refers_to(o, target))
+                || order_by.iter().any(|(o, _, _)| expr_refers_to(o, target))
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
         Expr::Array(items) => items.iter().any(|e| expr_refers_to(e, target)),
@@ -12578,7 +12591,7 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
             for p in partition_by {
                 substitute_in_expr(p, row, ctx, outer_alias);
             }
-            for (o, _) in order_by {
+            for (o, _, _) in order_by {
                 substitute_in_expr(o, row, ctx, outer_alias);
             }
         }
@@ -12758,10 +12771,14 @@ fn partition_key_cmp(a: &[Value], b: &[Value]) -> core::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
-fn order_key_cmp(a: &[(Value, bool)], b: &[(Value, bool)]) -> core::cmp::Ordering {
-    for ((va, desc), (vb, _)) in a.iter().zip(b.iter()) {
-        let c = value_cmp(va, vb);
-        let c = if *desc { c.reverse() } else { c };
+fn order_key_cmp(
+    a: &[(Value, bool, Option<bool>)],
+    b: &[(Value, bool, Option<bool>)],
+) -> core::cmp::Ordering {
+    // v7.24.1 — per-key DESC + effective NULLS placement (shared
+    // contract with order_by_value_cmp).
+    for ((va, desc, nf), (vb, _, _)) in a.iter().zip(b.iter()) {
+        let c = order_by_value_cmp(*desc, *nf, va, vb);
         if c != core::cmp::Ordering::Equal {
             return c;
         }
@@ -12969,7 +12986,7 @@ fn compute_window_partition(
     ordered: bool,
     frame: Option<&WindowFrame>,
     null_treatment: spg_sql::ast::NullTreatment,
-    slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)],
+    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
     filtered_rows: &[&Row],
     ctx: &EvalContext<'_>,
     out_vals: &mut [Value],
@@ -12984,7 +13001,7 @@ fn compute_window_partition(
             Ok(())
         }
         "rank" => {
-            let mut prev_key: Option<&[(Value, bool)]> = None;
+            let mut prev_key: Option<&[(Value, bool, Option<bool>)]> = None;
             let mut current_rank: i64 = 1;
             for (i, (_, okey, idx)) in slice.iter().enumerate() {
                 if let Some(p) = prev_key
@@ -13001,7 +13018,7 @@ fn compute_window_partition(
             Ok(())
         }
         "dense_rank" => {
-            let mut prev_key: Option<&[(Value, bool)]> = None;
+            let mut prev_key: Option<&[(Value, bool, Option<bool>)]> = None;
             let mut current_rank: i64 = 0;
             for (_, okey, idx) in slice {
                 if prev_key.is_none_or(|p| order_key_cmp(p, okey) != core::cmp::Ordering::Equal) {
@@ -13301,7 +13318,7 @@ fn compute_window_partition(
             // (rank - 1) / (n - 1) where rank is the standard RANK().
             // Single-row partitions get 0.
             let n = slice.len();
-            let mut prev_key: Option<&[(Value, bool)]> = None;
+            let mut prev_key: Option<&[(Value, bool, Option<bool>)]> = None;
             let mut current_rank: i64 = 1;
             for (i, (_, okey, idx)) in slice.iter().enumerate() {
                 if let Some(p) = prev_key
@@ -13409,7 +13426,7 @@ fn effective_frame(
 fn frame_bounds_for_row(
     eff: &(FrameKind, FrameBound, FrameBound),
     i: usize,
-    slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)],
+    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
 ) -> (usize, usize) {
     let (kind, start, end) = eff;
     let n = slice.len();
@@ -13478,7 +13495,10 @@ fn frame_bounds_for_row(
 /// BY key as `slice[i]`. Slice is already sorted by partition then
 /// order, so peers are contiguous.
 #[allow(clippy::type_complexity)]
-fn peer_group_start(slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)], i: usize) -> usize {
+fn peer_group_start(
+    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
+    i: usize,
+) -> usize {
     let key = &slice[i].1;
     let mut j = i;
     while j > 0 && order_key_cmp(&slice[j - 1].1, key) == core::cmp::Ordering::Equal {
@@ -13490,7 +13510,10 @@ fn peer_group_start(slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)], i: usize)
 /// Find the inclusive index of the last row with the same ORDER
 /// BY key as `slice[i]`.
 #[allow(clippy::type_complexity)]
-fn peer_group_end(slice: &[(Vec<Value>, Vec<(Value, bool)>, usize)], i: usize) -> usize {
+fn peer_group_end(
+    slice: &[(Vec<Value>, Vec<(Value, bool, Option<bool>)>, usize)],
+    i: usize,
+) -> usize {
     let key = &slice[i].1;
     let mut j = i;
     while j + 1 < slice.len() && order_key_cmp(&slice[j + 1].1, key) == core::cmp::Ordering::Equal {
@@ -13556,7 +13579,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
         } => {
             args.iter().any(expr_has_subquery)
                 || partition_by.iter().any(expr_has_subquery)
-                || order_by.iter().any(|(e, _)| expr_has_subquery(e))
+                || order_by.iter().any(|(e, _, _)| expr_has_subquery(e))
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
         Expr::Array(items) => items.iter().any(expr_has_subquery),
@@ -13779,7 +13802,7 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
             for p in partition_by {
                 rewrite_column_in_expr(p, old, new);
             }
-            for (o, _) in order_by {
+            for (o, _, _) in order_by {
                 rewrite_column_in_expr(o, old, new);
             }
         }
@@ -14005,7 +14028,7 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
             for p in partition_by {
                 substitute_expr(p, params)?;
             }
-            for (e, _) in order_by {
+            for (e, _, _) in order_by {
                 substitute_expr(e, params)?;
             }
         }
@@ -14383,7 +14406,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             for p in partition_by {
                 rewrite_expr_clock(p, now);
             }
-            for (e, _) in order_by {
+            for (e, _, _) in order_by {
                 rewrite_expr_clock(e, now);
             }
         }

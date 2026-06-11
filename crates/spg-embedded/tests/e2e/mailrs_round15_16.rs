@@ -254,3 +254,52 @@ fn pg_trigger_reports_registration_and_enabled_state() {
     );
     assert_eq!(r[0][0], Value::Text("D".into()));
 }
+
+/// v7.24.1 follow-up — the two scope-cut items from round-16 A/B:
+/// NULLS placement inside OVER (…), and subqueries in JOIN ON.
+#[test]
+fn window_order_by_nulls_and_join_on_subqueries() {
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE a (id BIGINT, v BIGINT)").unwrap();
+    db.execute("CREATE TABLE b (id BIGINT, w BIGINT)").unwrap();
+    db.execute("CREATE TABLE c (id BIGINT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1, 10), (2, NULL), (3, 30)")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1, 1), (3, 1)").unwrap();
+    db.execute("INSERT INTO c VALUES (1)").unwrap();
+    // NULLS LAST inside OVER: v DESC = 30, 10, NULL → ranks 1, 2, 3.
+    let r = rows_of(
+        &mut db,
+        "SELECT id, row_number() OVER (ORDER BY v DESC NULLS LAST) FROM a ORDER BY id",
+    );
+    assert_eq!(
+        r.iter().map(|x| x[1].clone()).collect::<Vec<_>>(),
+        vec![Value::BigInt(2), Value::BigInt(3), Value::BigInt(1)]
+    );
+    // …and NULLS FIRST flips it: NULL, 30, 10 → id 2 gets rank 1.
+    let r = rows_of(
+        &mut db,
+        "SELECT id, row_number() OVER (ORDER BY v DESC NULLS FIRST) FROM a ORDER BY id",
+    );
+    assert_eq!(
+        r.iter().map(|x| x[1].clone()).collect::<Vec<_>>(),
+        vec![Value::BigInt(3), Value::BigInt(1), Value::BigInt(2)]
+    );
+    // Uncorrelated subquery in JOIN ON.
+    let r = rows_of(
+        &mut db,
+        "SELECT a.id FROM a JOIN b ON b.id = a.id AND b.w IN (SELECT id FROM c) ORDER BY a.id",
+    );
+    assert_eq!(
+        r.iter().map(|x| x[0].clone()).collect::<Vec<_>>(),
+        vec![Value::BigInt(1), Value::BigInt(3)]
+    );
+    // Correlated EXISTS in JOIN ON.
+    let r = rows_of(
+        &mut db,
+        "SELECT a.id FROM a JOIN b ON b.id = a.id AND EXISTS \
+         (SELECT 1 FROM c WHERE c.id = a.id)",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::BigInt(1));
+}

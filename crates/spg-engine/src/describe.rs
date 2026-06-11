@@ -474,7 +474,7 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             for p in partition_by {
                 walk_expr(p, f);
             }
-            for (o, _) in order_by {
+            for (o, _, _) in order_by {
                 walk_expr(o, f);
             }
         }
