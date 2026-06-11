@@ -13909,28 +13909,71 @@ pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result
     Ok(())
 }
 
-fn substitute_select(s: &mut SelectStatement, params: &[Value]) -> Result<(), EngineError> {
+/// v7.25.1 (mailrs round-18) — THE canonical mutable traversal of
+/// every expression slot in a SelectStatement, including every
+/// nested SelectStatement (CTE bodies, UNION peers, LATERAL derived
+/// tables) and the JOIN ON conditions. Round-12 #7b and round-18
+/// were both "a hand-rolled Select walker forgot one subtree";
+/// every whole-statement rewrite pass (placeholders, clock) must go
+/// through here so a new AST slot only needs adding once.
+/// Expression-INTERNAL recursion (into subquery nodes inside an
+/// Expr) stays the visitor's own responsibility.
+fn walk_select_exprs_mut(
+    s: &mut SelectStatement,
+    f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    for cte in &mut s.ctes {
+        walk_select_exprs_mut(&mut cte.body, f)?;
+    }
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
-            substitute_expr(expr, params)?;
+            f(expr)?;
+        }
+    }
+    if let Some(from) = &mut s.from {
+        if let Some(sub) = &mut from.primary.lateral_subquery {
+            walk_select_exprs_mut(sub, f)?;
+        }
+        for j in &mut from.joins {
+            if let Some(sub) = &mut j.table.lateral_subquery {
+                walk_select_exprs_mut(sub, f)?;
+            }
+            if let Some(on) = &mut j.on {
+                f(on)?;
+            }
         }
     }
     if let Some(w) = &mut s.where_ {
-        substitute_expr(w, params)?;
+        f(w)?;
     }
     if let Some(gs) = &mut s.group_by {
         for g in gs {
-            substitute_expr(g, params)?;
+            f(g)?;
         }
     }
     if let Some(h) = &mut s.having {
-        substitute_expr(h, params)?;
+        f(h)?;
     }
     for o in &mut s.order_by {
-        substitute_expr(&mut o.expr, params)?;
+        f(&mut o.expr)?;
     }
     for (_, peer) in &mut s.unions {
-        substitute_select(peer, params)?;
+        walk_select_exprs_mut(peer, f)?;
+    }
+    Ok(())
+}
+
+fn substitute_select(s: &mut SelectStatement, params: &[Value]) -> Result<(), EngineError> {
+    walk_select_exprs_mut(s, &mut |e| substitute_expr(e, params))?;
+    // v7.25.1 — LIMIT/OFFSET placeholders inside CTE bodies and
+    // UNION peers resolve through their own recursion (the walker
+    // above only visits Expr slots), so handle them per nested
+    // statement here.
+    for cte in &mut s.ctes {
+        resolve_limit_offset_placeholders(&mut cte.body, params)?;
+    }
+    for (_, peer) in &mut s.unions {
+        resolve_limit_offset_placeholders(peer, params)?;
     }
     // v7.9.24 — LIMIT $N / OFFSET $N placeholder resolution.
     // mailrs H2. After this pass each LIMIT/OFFSET that was a
@@ -13941,6 +13984,27 @@ fn substitute_select(s: &mut SelectStatement, params: &[Value]) -> Result<(), En
     }
     if let Some(le) = s.offset {
         s.offset = Some(resolve_limit_placeholder(le, params)?);
+    }
+    Ok(())
+}
+
+/// v7.25.1 — recursive LIMIT/OFFSET placeholder resolution for
+/// nested statements (CTE bodies / UNION peers).
+fn resolve_limit_offset_placeholders(
+    s: &mut SelectStatement,
+    params: &[Value],
+) -> Result<(), EngineError> {
+    if let Some(le) = s.limit {
+        s.limit = Some(resolve_limit_placeholder(le, params)?);
+    }
+    if let Some(le) = s.offset {
+        s.offset = Some(resolve_limit_placeholder(le, params)?);
+    }
+    for cte in &mut s.ctes {
+        resolve_limit_offset_placeholders(&mut cte.body, params)?;
+    }
+    for (_, peer) in &mut s.unions {
+        resolve_limit_offset_placeholders(peer, params)?;
     }
     Ok(())
 }
@@ -14332,28 +14396,14 @@ fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>) {
 }
 
 fn rewrite_select_clock(s: &mut SelectStatement, now: i64) {
-    for item in &mut s.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            rewrite_expr_clock(expr, now);
-        }
-    }
-    if let Some(w) = &mut s.where_ {
-        rewrite_expr_clock(w, now);
-    }
-    if let Some(gs) = &mut s.group_by {
-        for g in gs {
-            rewrite_expr_clock(g, now);
-        }
-    }
-    if let Some(h) = &mut s.having {
-        rewrite_expr_clock(h, now);
-    }
-    for o in &mut s.order_by {
-        rewrite_expr_clock(&mut o.expr, now);
-    }
-    for (_, peer) in &mut s.unions {
-        rewrite_select_clock(peer, now);
-    }
+    // v7.25.1 (round-18) — shared traversal: CTE bodies, LATERAL
+    // subqueries, JOIN ON, and UNION peers all get the clock
+    // rewrite (NOW() inside a CTE previously survived to eval as
+    // "unknown function `now`").
+    let _ = walk_select_exprs_mut(s, &mut |e| {
+        rewrite_expr_clock(e, now);
+        Ok(())
+    });
 }
 
 /// v3.0.3 hot path: every recursion lands in exactly one `match` arm.

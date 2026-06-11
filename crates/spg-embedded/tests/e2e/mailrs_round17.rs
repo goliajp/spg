@@ -122,3 +122,51 @@ fn inbox_list_shape_composes() {
     assert_eq!(r[0][1], Value::BigInt(2));
     assert_eq!(r[0][2], Value::BigInt(1));
 }
+
+/// Round-18 — placeholders and clock calls inside CTE bodies (and
+/// the collateral subtrees the shared walker now covers: JOIN ON
+/// placeholders, LIMIT $N inside a CTE).
+#[test]
+fn round18_placeholders_and_clock_inside_ctes() {
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE t (n BIGINT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    // The verbatim round-18 repro.
+    let stmt = db
+        .prepare("WITH a AS (SELECT n FROM t WHERE n = $1) SELECT n FROM a")
+        .unwrap();
+    let r = db.execute_prepared(&stmt, &[Value::BigInt(1)]).unwrap();
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+        }
+        other => panic!("{other:?}"),
+    }
+    // The clock twin: NOW() inside the CTE body.
+    let r = rows_of(
+        &mut db,
+        "WITH a AS (SELECT n FROM t WHERE n < EXTRACT(EPOCH FROM NOW())) SELECT COUNT(*) FROM a",
+    );
+    assert_eq!(r[0][0], Value::BigInt(2));
+    // JOIN ON placeholder (collateral the shared walker closes).
+    db.execute("CREATE TABLE u (n BIGINT)").unwrap();
+    db.execute("INSERT INTO u VALUES (1)").unwrap();
+    let stmt = db
+        .prepare("SELECT t.n FROM t JOIN u ON u.n = t.n AND t.n = $1")
+        .unwrap();
+    let r = db.execute_prepared(&stmt, &[Value::BigInt(1)]).unwrap();
+    match r {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    // LIMIT $N inside the CTE body.
+    let stmt = db
+        .prepare("WITH a AS (SELECT n FROM t ORDER BY n LIMIT $1) SELECT COUNT(*) FROM a")
+        .unwrap();
+    let r = db.execute_prepared(&stmt, &[Value::BigInt(1)]).unwrap();
+    match r {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows[0].values[0], Value::BigInt(1)),
+        other => panic!("{other:?}"),
+    }
+}
