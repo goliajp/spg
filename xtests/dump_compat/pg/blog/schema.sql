@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict GpNPeY7AftpkitnEUW6PDsbqJVVfhictN6YNR7QXnBOPteeEKcIUgeZfcZo2XYE
+\restrict h46NNBMwx8s25tJuLfriprczzaBkAHr68Yo4rX5KEzwb0uRf7Sestlbct5FIGts
 
 -- Dumped from database version 18.4 (Debian 18.4-1.pgdg13+1)
 -- Dumped by pg_dump version 18.4 (Debian 18.4-1.pgdg13+1)
@@ -221,5 +221,5 @@ ALTER TABLE ONLY public.posts
 -- PostgreSQL database dump complete
 --
 
-\unrestrict GpNPeY7AftpkitnEUW6PDsbqJVVfhictN6YNR7QXnBOPteeEKcIUgeZfcZo2XYE
+\unrestrict h46NNBMwx8s25tJuLfriprczzaBkAHr68Yo4rX5KEzwb0uRf7Sestlbct5FIGts
 

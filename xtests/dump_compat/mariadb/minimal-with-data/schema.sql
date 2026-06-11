@@ -27,8 +27,8 @@ CREATE TABLE `posts` (
 LOCK TABLES `posts` WRITE;
 /*!40000 ALTER TABLE `posts` DISABLE KEYS */;
 INSERT INTO `posts` VALUES
-(1,'Hello, world','first post','intro,hello','2026-06-11 01:38:20'),
-(2,'Quotes \'matter\'','and; semicolons too','edge-cases','2026-06-11 01:38:20');
+(1,'Hello, world','first post','intro,hello','2026-06-11 03:58:27'),
+(2,'Quotes \'matter\'','and; semicolons too','edge-cases','2026-06-11 03:58:27');
 /*!40000 ALTER TABLE `posts` ENABLE KEYS */;
 UNLOCK TABLES;
 /*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;

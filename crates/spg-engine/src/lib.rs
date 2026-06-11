@@ -7156,7 +7156,8 @@ impl Engine {
             stmt.limit_literal().and_then(|n| usize::try_from(n).ok());
         for (_key, body) in seg.scan() {
             let (row, _consumed) =
-                spg_storage::decode_row_body_dense(&body, &schema).map_err(EngineError::Storage)?;
+                spg_storage::decode_row_body_dense(&body, &schema, seg.long_strings())
+                    .map_err(EngineError::Storage)?;
             if let Some(where_expr) = &stmt.where_ {
                 let cond = self.eval_expr_simple(where_expr, &row, &ctx)?;
                 if !matches!(cond, Value::Bool(true)) {
