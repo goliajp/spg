@@ -240,7 +240,7 @@ struct Edge {
 /// its leaf clauses. Each leaf becomes its own [`Edge`] so the
 /// optimizer can pull tight predicates earlier in the plan tree.
 /// Non-AND expressions return a single-element vec.
-fn split_and_conjunctions(expr: &Expr) -> Vec<&Expr> {
+pub(crate) fn split_and_conjunctions(expr: &Expr) -> Vec<&Expr> {
     use spg_sql::ast::BinOp;
     let mut out: Vec<&Expr> = Vec::new();
     let mut stack: Vec<&Expr> = alloc::vec![expr];

@@ -8318,6 +8318,102 @@ impl Engine {
         Ok((rows, cols))
     }
 
+    /// v7.28 (round-22) — materialise a plain table ref with
+    /// single-table predicates pushed BELOW the clone: an indexed
+    /// `col = literal` narrows to the matching row ids before any
+    /// row is cloned, the rest filter linearly. A correlated
+    /// subquery body like `… JOIN messages m2 ON …
+    /// WHERE m2.thread_id = '<outer>'` runs per GROUP — without
+    /// this it cloned + scanned the full 24k-row table 23.5k times.
+    /// Falls back to the plain path for non-table refs.
+    fn materialise_table_ref_filtered(
+        &self,
+        tref: &TableRef,
+        preds: &[&Expr],
+    ) -> Result<(Vec<Row>, Vec<ColumnSchema>), EngineError> {
+        if preds.is_empty()
+            || tref.unnest_expr.is_some()
+            || tref.lateral_subquery.is_some()
+            || tref.as_of_segment.is_some()
+        {
+            return self.materialise_table_ref(tref);
+        }
+        let Some(table) = self.active_catalog().get(&tref.name) else {
+            return self.materialise_table_ref(tref);
+        };
+        let cols = table.schema().columns.clone();
+        let alias = tref.alias.as_deref().unwrap_or(tref.name.as_str());
+        // Index seek on the first `col = literal` predicate with a
+        // BTree on that column.
+        let mut seeded: Option<Vec<usize>> = None;
+        for p in preds {
+            if let Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::Eq,
+                rhs,
+            } = p
+            {
+                let pair = match (lhs.as_ref(), rhs.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(l)) | (Expr::Literal(l), Expr::Column(c)) => {
+                        Some((c, l))
+                    }
+                    _ => None,
+                };
+                if let Some((c, l)) = pair
+                    && c.qualifier
+                        .as_deref()
+                        .is_none_or(|q| q.eq_ignore_ascii_case(alias))
+                    && let Some(pos) = cols.iter().position(|s| s.name == c.name)
+                    && let Some(idx) = table.index_on(pos)
+                    && let Some(key) = spg_storage::IndexKey::from_value(&eval::literal_to_value(l))
+                {
+                    let mut ids = Vec::new();
+                    let mut all_hot = true;
+                    for loc in idx.lookup_eq(&key) {
+                        match *loc {
+                            spg_storage::RowLocator::Hot(i) => ids.push(i),
+                            _ => {
+                                all_hot = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_hot {
+                        seeded = Some(ids);
+                        break;
+                    }
+                }
+            }
+        }
+        let ctx = EvalContext::new(&cols, Some(alias));
+        let mut out: Vec<Row> = Vec::new();
+        let push_if = |row: &Row, out: &mut Vec<Row>| -> Result<(), EngineError> {
+            for p in preds {
+                let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
+                if !matches!(v, Value::Bool(true)) {
+                    return Ok(());
+                }
+            }
+            out.push(row.clone());
+            Ok(())
+        };
+        match seeded {
+            Some(ids) => {
+                for i in ids {
+                    if let Some(row) = table.rows().get(i) {
+                        push_if(&row, &mut out)?;
+                    }
+                }
+            }
+            None => {
+                for row in table.rows().iter() {
+                    push_if(&row, &mut out)?;
+                }
+            }
+        }
+        Ok((out, cols))
+    }
+
     /// v7.17.0 Phase 3.P0-43 — materialise a `FROM` with one or more
     /// JOINs into `(combined_schema, filtered_rows)`. The combined
     /// schema uses composite `alias.col` column names so the
@@ -8329,19 +8425,172 @@ impl Engine {
     /// `exec_select_with_window`; both paths used to inline the
     /// same nested-loop logic and the window path rejected JOIN
     /// outright.
+    /// v7.28 (round-22) — resolve a Column reference against a
+    /// composite ("alias.col") schema slice. Bare names match a
+    /// unique ".col" suffix.
+    fn composite_col_pos(schema: &[ColumnSchema], c: &spg_sql::ast::ColumnName) -> Option<usize> {
+        if let Some(q) = &c.qualifier {
+            let composite = alloc::format!("{q}.{}", c.name);
+            return schema.iter().position(|s| s.name == composite);
+        }
+        let suffix = alloc::format!(".{}", c.name);
+        let mut hits = schema
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.name.ends_with(&suffix) || s.name == c.name);
+        let first = hits.next();
+        if hits.next().is_some() {
+            return None; // ambiguous — leave to the residual evaluator
+        }
+        first.map(|(i, _)| i)
+    }
+
+    /// v7.28 (round-22) — resolve a Column against ONE peer's own
+    /// columns (right side of a join): `alias.col` or a bare name.
+    fn peer_col_pos(
+        peer_alias: &str,
+        peer_cols: &[ColumnSchema],
+        c: &spg_sql::ast::ColumnName,
+    ) -> Option<usize> {
+        if let Some(q) = &c.qualifier
+            && !q.eq_ignore_ascii_case(peer_alias)
+        {
+            return None;
+        }
+        peer_cols.iter().position(|s| s.name == c.name)
+    }
+
+    /// v7.28 (round-22) — drop the VALUES of columns the statement
+    /// never references (schema and positions stay; the value
+    /// becomes NULL, so a 30 KB body column costs nothing through
+    /// the join pipeline instead of being cloned per row).
+    fn null_out_unreferenced(
+        rows: &mut [Row],
+        cols: &[ColumnSchema],
+        alias: &str,
+        needed: &alloc::collections::BTreeSet<(String, String)>,
+    ) {
+        let keep: Vec<bool> = cols
+            .iter()
+            .map(|c| needed.contains(&(alias.to_string(), c.name.clone())))
+            .collect();
+        if keep.iter().all(|k| *k) {
+            return;
+        }
+        for row in rows.iter_mut() {
+            for (i, k) in keep.iter().enumerate() {
+                if !*k && i < row.values.len() {
+                    row.values[i] = Value::Null;
+                }
+            }
+        }
+    }
+
     fn build_joined_filtered_rows(
         &self,
         from: &FromClause,
         where_: Option<&Expr>,
         cancel: CancelToken<'_>,
+        needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
     ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
-        let (primary_rows, primary_cols) = self.materialise_table_ref(&from.primary)?;
         let primary_alias = from
             .primary
             .alias
             .as_deref()
             .unwrap_or(from.primary.name.as_str())
             .to_string();
+        // v7.28 (round-22) — single-table predicate pushdown. WHERE
+        // conjuncts whose every column is QUALIFIED with one table's
+        // alias filter that table BEFORE the join (with an index
+        // seek when one matches `col = literal`). Only the primary
+        // and INNER peers are eligible — pre-filtering a LEFT peer
+        // would change which rows NULL-extend. Pushed conjuncts stay
+        // in WHERE too (idempotent), so correctness never depends on
+        // the pushdown.
+        let mut primary_preds: Vec<&Expr> = Vec::new();
+        let mut peer_preds: Vec<Vec<&Expr>> = alloc::vec![Vec::new(); from.joins.len()];
+        if let Some(w) = where_ {
+            for sub in reorder::split_and_conjunctions(w) {
+                if expr_has_subquery(sub) || aggregate::contains_aggregate(sub) {
+                    continue;
+                }
+                let mut quals: Vec<&str> = Vec::new();
+                let mut all_qualified = true;
+                collect_column_qualifiers(sub, &mut quals, &mut all_qualified);
+                if !all_qualified || quals.is_empty() {
+                    continue;
+                }
+                let q0 = quals[0];
+                if !quals.iter().all(|q| q.eq_ignore_ascii_case(q0)) {
+                    continue;
+                }
+                if q0.eq_ignore_ascii_case(&primary_alias) {
+                    primary_preds.push(sub);
+                    continue;
+                }
+                for (i, j) in from.joins.iter().enumerate() {
+                    if matches!(j.kind, JoinKind::Inner)
+                        && j.table.lateral_subquery.is_none()
+                        && q0.eq_ignore_ascii_case(
+                            j.table.alias.as_deref().unwrap_or(j.table.name.as_str()),
+                        )
+                    {
+                        peer_preds[i].push(sub);
+                        break;
+                    }
+                }
+            }
+        }
+        // v7.28 (round-22) — table-order swap: when the primary has
+        // no pushed predicate but an INNER peer does, start from the
+        // filtered peer instead. Equi-joins commute; output columns
+        // resolve by composite name, so downstream projection is
+        // order-independent. (A correlated subquery body like
+        // `FROM email_analysis e2 JOIN messages m2 … WHERE
+        // m2.thread_id = '<outer>'` otherwise clones the whole
+        // unfiltered primary once per outer group.)
+        let mut from_owned;
+        let mut from = from;
+        // Safety: swapping reorders which table joins FIRST, so it is
+        // only legal when the FIRST join's ON references no table
+        // beyond {primary, first peer} (a later peer's ON may name
+        // the original primary, which must already be in the
+        // combined row when that peer joins). Restrict to i == 0 AND
+        // an ON whose qualifiers all live in those two tables.
+        if primary_preds.is_empty()
+            && let Some(j0) = from.joins.first()
+            && matches!(j0.kind, JoinKind::Inner)
+            && j0.table.lateral_subquery.is_none()
+            && !peer_preds[0].is_empty()
+        {
+            let peer_alias = j0.table.alias.as_deref().unwrap_or(j0.table.name.as_str());
+            let on_safe = j0.on.as_ref().is_some_and(|on| {
+                let mut quals: Vec<&str> = Vec::new();
+                let mut all_q = true;
+                collect_column_qualifiers(on, &mut quals, &mut all_q);
+                all_q
+                    && quals.iter().all(|q| {
+                        q.eq_ignore_ascii_case(&primary_alias) || q.eq_ignore_ascii_case(peer_alias)
+                    })
+            });
+            if on_safe {
+                from_owned = from.clone();
+                core::mem::swap(&mut from_owned.primary, &mut from_owned.joins[0].table);
+                primary_preds = peer_preds[0].drain(..).collect();
+                from = &from_owned;
+            }
+        }
+        let primary_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str())
+            .to_string();
+        let (mut primary_rows, primary_cols) =
+            self.materialise_table_ref_filtered(&from.primary, &primary_preds)?;
+        if let Some(needed) = needed {
+            Self::null_out_unreferenced(&mut primary_rows, &primary_cols, &primary_alias, needed);
+        }
         // v7.17.0 Phase 3.P0-41 — LATERAL peers can't be
         // pre-materialised because their rows depend on outer
         // columns. For each peer, build either an eager
@@ -8370,9 +8619,38 @@ impl Engine {
                     kind: j.kind,
                     on: j.on.as_ref(),
                     lateral: Some(inner_box.as_ref()),
+                    join_table: None,
                 });
             } else {
-                let (rows, cols) = self.materialise_table_ref(&j.table)?;
+                let pidx = from
+                    .joins
+                    .iter()
+                    .position(|jj| core::ptr::eq(jj, j))
+                    .unwrap_or(0);
+                // v7.28 - defer materialisation for plain tables with
+                // no pushed predicate: the index-nested-loop path may
+                // avoid cloning the table entirely.
+                let plain = j.table.unnest_expr.is_none() && j.table.as_of_segment.is_none();
+                if plain
+                    && peer_preds[pidx].is_empty()
+                    && let Some(t) = self.active_catalog().get(&j.table.name)
+                {
+                    joined.push(JoinedPeer {
+                        eager_rows: None,
+                        cols: t.schema().columns.clone(),
+                        alias: a,
+                        kind: j.kind,
+                        on: j.on.as_ref(),
+                        lateral: None,
+                        join_table: Some(j.table.name.clone()),
+                    });
+                    continue;
+                }
+                let (mut rows, cols) =
+                    self.materialise_table_ref_filtered(&j.table, &peer_preds[pidx])?;
+                if let Some(needed) = needed {
+                    Self::null_out_unreferenced(&mut rows, &cols, &a, needed);
+                }
                 joined.push(JoinedPeer {
                     eager_rows: Some(rows),
                     cols,
@@ -8380,6 +8658,7 @@ impl Engine {
                     kind: j.kind,
                     on: j.on.as_ref(),
                     lateral: None,
+                    join_table: Some(j.table.name.clone()),
                 });
             }
         }
@@ -8408,7 +8687,232 @@ impl Engine {
         for peer in &joined {
             let right_arity = peer.cols.len();
             let mut next: Vec<Row> = Vec::new();
+            // v7.28 (round-22) — hash equi-join. The old path CLONED
+            // the full combined row for EVERY (left, right) pair and
+            // then evaluated ON — O(L×R) row materialisations (a
+            // 24k × 6k LEFT JOIN = 1.5e8 multi-KB clones; the inbox
+            // query never returned). Extract `left_col = right_col`
+            // conjuncts from ON, build a hash on the (smaller,
+            // already-materialised) right side, and only materialise
+            // matching pairs. Residual ON conjuncts evaluate on the
+            // candidates. NULL keys never match (SQL equality).
+            let mut eq_pairs: Vec<(usize, usize)> = Vec::new(); // (left combined pos, right peer pos)
+            let mut residual: Vec<&Expr> = Vec::new();
+            if let (Some(on_expr), None) = (peer.on, peer.lateral) {
+                for sub in reorder::split_and_conjunctions(on_expr) {
+                    let mut matched = None;
+                    if let Expr::Binary {
+                        lhs,
+                        op: spg_sql::ast::BinOp::Eq,
+                        rhs,
+                    } = sub
+                        && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+                    {
+                        let left_slice = &combined_schema[..consumed_cols];
+                        if let (Some(l), Some(r)) = (
+                            Self::composite_col_pos(left_slice, a),
+                            Self::peer_col_pos(&peer.alias, &peer.cols, b),
+                        ) {
+                            matched = Some((l, r));
+                        } else if let (Some(l), Some(r)) = (
+                            Self::composite_col_pos(left_slice, b),
+                            Self::peer_col_pos(&peer.alias, &peer.cols, a),
+                        ) {
+                            matched = Some((l, r));
+                        }
+                    }
+                    match matched {
+                        Some(pair) => eq_pairs.push(pair),
+                        None => residual.push(sub),
+                    }
+                }
+            }
+            // v7.28 (round-22) - index-nested-loop: when the working
+            // set is small and the peer's join column has a BTree,
+            // seek per left row instead of materialising the whole
+            // peer table (a correlated subquery body otherwise
+            // clones the full table once per outer group).
+            const INL_MAX_LEFT: usize = 1024;
+            if let Some(tname) = &peer.join_table
+                && peer.eager_rows.is_none()
+                && !eq_pairs.is_empty()
+                && working.len() <= INL_MAX_LEFT
+                && let Some(table) = self.active_catalog().get(tname)
+                && let Some(idx) = peer
+                    .cols
+                    .iter()
+                    .position(|c| c.name == peer.cols[eq_pairs[0].1].name)
+                    .and_then(|pos| table.index_on(pos))
+            {
+                let (lpos0, _) = eq_pairs[0];
+                for left in &working {
+                    cancel.check()?;
+                    let mut left_matched = false;
+                    let key_v = left.values.get(lpos0).cloned().unwrap_or(Value::Null);
+                    if !matches!(key_v, Value::Null)
+                        && let Some(key) = spg_storage::IndexKey::from_value(&key_v)
+                    {
+                        for loc in idx.lookup_eq(&key) {
+                            let right = match *loc {
+                                spg_storage::RowLocator::Hot(i) => match table.rows().get(i) {
+                                    Some(r) => r,
+                                    None => continue,
+                                },
+                                _ => continue,
+                            };
+                            // Remaining eq pairs + residual ON check on
+                            // the candidate only.
+                            let mut ok = true;
+                            for (lp, rp) in eq_pairs.iter().skip(1) {
+                                let lv = left.values.get(*lp);
+                                let rv = right.values.get(*rp);
+                                let eq = match (lv, rv) {
+                                    (Some(a), Some(b)) => {
+                                        !matches!(a, Value::Null)
+                                            && !matches!(b, Value::Null)
+                                            && value_cmp(a, b) == core::cmp::Ordering::Equal
+                                    }
+                                    _ => false,
+                                };
+                                if !eq {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if !ok {
+                                continue;
+                            }
+                            let mut combined_vals = left.values.clone();
+                            combined_vals.extend(right.values.iter().cloned());
+                            let combined = Row::new(combined_vals);
+                            let keep = if residual.is_empty() {
+                                true
+                            } else {
+                                let mut k = true;
+                                for r in &residual {
+                                    let cond = self.eval_expr_with_correlated(
+                                        r, &combined, &ctx, cancel, None,
+                                    )?;
+                                    if !matches!(cond, Value::Bool(true)) {
+                                        k = false;
+                                        break;
+                                    }
+                                }
+                                k
+                            };
+                            if keep {
+                                next.push(combined);
+                                left_matched = true;
+                            }
+                        }
+                    }
+                    if !left_matched && matches!(peer.kind, JoinKind::Left) {
+                        let mut combined_vals = left.values.clone();
+                        for _ in 0..right_arity {
+                            combined_vals.push(Value::Null);
+                        }
+                        next.push(Row::new(combined_vals));
+                    }
+                }
+                working = next;
+                consumed_cols += right_arity;
+                continue;
+            }
+            // Deferred peer that didn't take the INL path: materialise
+            // now (no pushed predicate, full table).
+            let lazy_rows: Option<Vec<Row>> = if peer.eager_rows.is_none() && peer.lateral.is_none()
+            {
+                let tname = peer.join_table.as_deref().unwrap_or("");
+                let mut rows: Vec<Row> = self
+                    .active_catalog()
+                    .get(tname)
+                    .map(|t| t.rows().iter().cloned().collect())
+                    .unwrap_or_default();
+                if let Some(needed) = needed {
+                    Self::null_out_unreferenced(&mut rows, &peer.cols, &peer.alias, needed);
+                }
+                Some(rows)
+            } else {
+                None
+            };
+            let eager_view: Option<&Vec<Row>> = peer.eager_rows.as_ref().or(lazy_rows.as_ref());
+            if !eq_pairs.is_empty() && peer.lateral.is_none() {
+                let rights = eager_view.expect("non-lateral peer eager");
+                let mut table: alloc::collections::BTreeMap<String, Vec<usize>> =
+                    alloc::collections::BTreeMap::new();
+                let mut keybuf: Vec<Value> = Vec::with_capacity(eq_pairs.len());
+                'build: for (ri, right) in rights.iter().enumerate() {
+                    keybuf.clear();
+                    for (_, rpos) in &eq_pairs {
+                        let v = right.values.get(*rpos).cloned().unwrap_or(Value::Null);
+                        if matches!(v, Value::Null) {
+                            continue 'build;
+                        }
+                        keybuf.push(v);
+                    }
+                    table
+                        .entry(aggregate::encode_key(&keybuf))
+                        .or_default()
+                        .push(ri);
+                }
+                for left in &working {
+                    cancel.check()?;
+                    let mut left_matched = false;
+                    keybuf.clear();
+                    let mut left_has_null = false;
+                    for (lpos, _) in &eq_pairs {
+                        let v = left.values.get(*lpos).cloned().unwrap_or(Value::Null);
+                        if matches!(v, Value::Null) {
+                            left_has_null = true;
+                            break;
+                        }
+                        keybuf.push(v);
+                    }
+                    if !left_has_null
+                        && let Some(cands) = table.get(&aggregate::encode_key(&keybuf))
+                    {
+                        for &ri in cands {
+                            let right = &rights[ri];
+                            let mut combined_vals = left.values.clone();
+                            combined_vals.extend(right.values.iter().cloned());
+                            let combined = Row::new(combined_vals);
+                            let keep = if residual.is_empty() {
+                                true
+                            } else {
+                                let mut ok = true;
+                                for r in &residual {
+                                    let cond = self.eval_expr_with_correlated(
+                                        r, &combined, &ctx, cancel, None,
+                                    )?;
+                                    if !matches!(cond, Value::Bool(true)) {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                ok
+                            };
+                            if keep {
+                                next.push(combined);
+                                left_matched = true;
+                            }
+                        }
+                    }
+                    if !left_matched && matches!(peer.kind, JoinKind::Left) {
+                        let mut combined_vals = left.values.clone();
+                        for _ in 0..right_arity {
+                            combined_vals.push(Value::Null);
+                        }
+                        next.push(Row::new(combined_vals));
+                    }
+                }
+                working = next;
+                consumed_cols += right_arity;
+                debug_assert!(consumed_cols <= combined_schema.len());
+                continue;
+            }
+            // Fallback: nested loop (lateral peers, non-equi ON).
             for left in &working {
+                cancel.check()?;
                 let mut left_matched = false;
                 let per_left_rrows: alloc::borrow::Cow<'_, [Row]> = match peer.lateral {
                     Some(inner) => {
@@ -8420,7 +8924,7 @@ impl Engine {
                         alloc::borrow::Cow::Owned(rows)
                     }
                     None => {
-                        let r = peer.eager_rows.as_ref().expect("non-lateral peer eager");
+                        let r = eager_view.expect("non-lateral peer eager");
                         alloc::borrow::Cow::Borrowed(r.as_slice())
                     }
                 };
@@ -8566,8 +9070,16 @@ impl Engine {
         // of Phase 3.P0-41.) Downstream we still handle aggregate /
         // projection / ORDER BY / DISTINCT / LIMIT inline because
         // those depend on the SelectStatement's items list.
-        let (combined_schema, filtered) =
-            self.build_joined_filtered_rows(from, stmt.where_.as_ref(), cancel)?;
+        let (combined_schema, filtered) = {
+            let mut needed = alloc::collections::BTreeSet::new();
+            let prunable = collect_qualified_refs(stmt, &mut needed).is_some();
+            self.build_joined_filtered_rows(
+                from,
+                stmt.where_.as_ref(),
+                cancel,
+                if prunable { Some(&needed) } else { None },
+            )?
+        };
         let ctx = EvalContext::new(&combined_schema, None);
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
@@ -9810,7 +10322,7 @@ impl Engine {
             filtered = owned;
         } else {
             let (combined_schema, rows) =
-                self.build_joined_filtered_rows(from, stmt.where_.as_ref(), cancel)?;
+                self.build_joined_filtered_rows(from, stmt.where_.as_ref(), cancel, None)?;
             schema_cols_owned = combined_schema;
             alias_opt = None;
             filtered = rows;
@@ -10874,6 +11386,191 @@ fn from_refers_to(from: &FromClause, target: &str) -> bool {
     from.joins
         .iter()
         .any(|j| j.table.name.eq_ignore_ascii_case(target))
+}
+
+/// v7.28 (round-22) — collect every QUALIFIED column referenced
+/// anywhere in a SELECT (subquery bodies included). Returns None
+/// when a wildcard or a bare column name makes static attribution
+/// unsafe — callers then keep every column.
+fn collect_qualified_refs(
+    stmt: &SelectStatement,
+    out: &mut alloc::collections::BTreeSet<(String, String)>,
+) -> Option<()> {
+    for item in &stmt.items {
+        match item {
+            SelectItem::Wildcard => return None,
+            SelectItem::Expr { expr, .. } => collect_qualified_refs_expr(expr, out)?,
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        collect_qualified_refs_expr(w, out)?;
+    }
+    if let Some(from) = &stmt.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                collect_qualified_refs_expr(on, out)?;
+            }
+            if j.table.lateral_subquery.is_some() {
+                return None;
+            }
+        }
+    }
+    if let Some(gs) = &stmt.group_by {
+        for g in gs {
+            collect_qualified_refs_expr(g, out)?;
+        }
+    }
+    if let Some(h) = &stmt.having {
+        collect_qualified_refs_expr(h, out)?;
+    }
+    for o in &stmt.order_by {
+        collect_qualified_refs_expr(&o.expr, out)?;
+    }
+    for (_, peer) in &stmt.unions {
+        collect_qualified_refs(peer, out)?;
+    }
+    for cte in &stmt.ctes {
+        collect_qualified_refs(&cte.body, out)?;
+    }
+    Some(())
+}
+
+fn collect_qualified_refs_expr(
+    e: &Expr,
+    out: &mut alloc::collections::BTreeSet<(String, String)>,
+) -> Option<()> {
+    // Two passes so the column and subquery visitors don't both
+    // capture `out` mutably.
+    let mut cols: Vec<spg_sql::ast::ColumnName> = Vec::new();
+    let mut subs: Vec<&SelectStatement> = Vec::new();
+    visit_expr_columns_and_subqueries(
+        e,
+        &mut |c: &spg_sql::ast::ColumnName| cols.push(c.clone()),
+        &mut |sub| subs.push(sub),
+    );
+    for c in cols {
+        match c.qualifier {
+            Some(q) => {
+                out.insert((q, c.name));
+            }
+            None => return None,
+        }
+    }
+    for sub in subs {
+        collect_qualified_refs(sub, out)?;
+    }
+    Some(())
+}
+
+/// Immutable walk over an Expr visiting every Column and every
+/// nested SelectStatement (v7.28).
+fn visit_expr_columns_and_subqueries<'a>(
+    e: &'a Expr,
+    on_col: &mut impl FnMut(&'a spg_sql::ast::ColumnName),
+    on_sub: &mut impl FnMut(&'a SelectStatement),
+) {
+    match e {
+        Expr::Column(c) => on_col(c),
+        Expr::ScalarSubquery(s) => on_sub(s),
+        Expr::Exists { subquery, .. } => on_sub(subquery),
+        Expr::InSubquery { expr, subquery, .. } => {
+            visit_expr_columns_and_subqueries(expr, on_col, on_sub);
+            on_sub(subquery);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            visit_expr_columns_and_subqueries(lhs, on_col, on_sub);
+            visit_expr_columns_and_subqueries(rhs, on_col, on_sub);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            visit_expr_columns_and_subqueries(expr, on_col, on_sub);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            visit_expr_columns_and_subqueries(expr, on_col, on_sub);
+            visit_expr_columns_and_subqueries(pattern, on_col, on_sub);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                visit_expr_columns_and_subqueries(a, on_col, on_sub);
+            }
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            visit_expr_columns_and_subqueries(call, on_col, on_sub);
+            for o in order_by {
+                visit_expr_columns_and_subqueries(&o.expr, on_col, on_sub);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                visit_expr_columns_and_subqueries(op, on_col, on_sub);
+            }
+            for (w, t) in branches {
+                visit_expr_columns_and_subqueries(w, on_col, on_sub);
+                visit_expr_columns_and_subqueries(t, on_col, on_sub);
+            }
+            if let Some(eb) = else_branch {
+                visit_expr_columns_and_subqueries(eb, on_col, on_sub);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            visit_expr_columns_and_subqueries(target, on_col, on_sub);
+            visit_expr_columns_and_subqueries(index, on_col, on_sub);
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) => {}
+        // Exotic nodes (window etc.) — visit nothing extra; their
+        // columns are caught when the caller bails on bare names
+        // elsewhere, and window queries skip pruning entirely at
+        // the call sites.
+        _ => {
+            // Exotic node (window function etc.): report an
+            // unattributable marker so callers disable pruning.
+            static BAIL: spg_sql::ast::ColumnName = spg_sql::ast::ColumnName {
+                qualifier: None,
+                name: String::new(),
+            };
+            on_col(&BAIL);
+        }
+    }
+}
+
+/// v7.28 (round-22) — collect every Column qualifier in an expr;
+/// `all_qualified` flips false on any bare column (those can't be
+/// attributed to one table safely, so the pushdown skips them).
+fn collect_column_qualifiers<'e>(e: &'e Expr, out: &mut Vec<&'e str>, all_qualified: &mut bool) {
+    if let Expr::Column(c) = e {
+        match &c.qualifier {
+            Some(q) => out.push(q.as_str()),
+            None => *all_qualified = false,
+        }
+        return;
+    }
+    // Reuse the canonical immutable walk via describe's walker shape:
+    // recurse the common containers.
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_column_qualifiers(lhs, out, all_qualified);
+            collect_column_qualifiers(rhs, out, all_qualified);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_column_qualifiers(expr, out, all_qualified);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_column_qualifiers(expr, out, all_qualified);
+            collect_column_qualifiers(pattern, out, all_qualified);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_column_qualifiers(a, out, all_qualified);
+            }
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) => {}
+        // Anything exotic (CASE, subquery, window, arrays…):
+        // conservatively mark unattributable.
+        _ => *all_qualified = false,
+    }
 }
 
 fn expr_refers_to(e: &Expr, target: &str) -> bool {
@@ -12436,6 +13133,9 @@ struct JoinedPeer<'a> {
     kind: JoinKind,
     on: Option<&'a Expr>,
     lateral: Option<&'a SelectStatement>,
+    /// v7.28 (round-22) — plain-table name for the index-nested-loop
+    /// path. None for unnest/lateral.
+    join_table: Option<String>,
 }
 
 /// v7.17.0 Phase 3.P0-41 — synthesise a column name for a LATERAL
