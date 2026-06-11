@@ -5534,6 +5534,17 @@ impl Engine {
                     })
                 })?;
                 let is_pk = matches!(tc, spg_sql::ast::TableConstraint::PrimaryKey { .. });
+                // v7.22 (mailrs round-13 gap 6) — carry the parsed
+                // NULLS NOT DISTINCT flag through the ALTER path;
+                // it was hardcoded false here while the CREATE
+                // TABLE path honoured it since v7.13.
+                let nnd = matches!(
+                    tc,
+                    spg_sql::ast::TableConstraint::Unique {
+                        nulls_not_distinct: true,
+                        ..
+                    }
+                );
                 match tc {
                     spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
                     | spg_sql::ast::TableConstraint::Unique { columns, .. } => {
@@ -5566,7 +5577,7 @@ impl Engine {
                                 spg_storage::UniquenessConstraint {
                                     is_primary_key: is_pk,
                                     columns: positions.clone(),
-                                    nulls_not_distinct: false,
+                                    nulls_not_distinct: nnd,
                                 },
                             );
                             // PK implies NOT NULL on referenced cols.
