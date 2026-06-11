@@ -25,7 +25,12 @@ use std::time::{Duration, Instant};
 use spg_wire::{Op, build_query, encode, parse_data_row_batch, parse_error_response};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
-const REPLICATION_TIMEOUT: Duration = Duration::from_secs(20);
+// v7.28 — 60 s: this is a liveness guard, not a timing assertion.
+// Under a full parallel suite (320 tests + several child servers)
+// the follower bootstrap was starved past 20 s twice (single-run
+// completes in ~1.4 s); the deadline only exists to fail hung
+// replication, so headroom is free.
+const REPLICATION_TIMEOUT: Duration = Duration::from_secs(60);
 const N_ROWS: i64 = 30;
 
 fn unique_tmpdir(label: &str) -> PathBuf {
