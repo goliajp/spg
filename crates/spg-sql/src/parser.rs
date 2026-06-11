@@ -8497,7 +8497,14 @@ impl Parser {
     #[allow(clippy::type_complexity)] // (partitions, ordered-keys-with-desc) is the natural shape
     fn parse_over_clause(
         &mut self,
-    ) -> Result<(Vec<Expr>, Vec<(Expr, bool)>, Option<WindowFrame>), ParseError> {
+    ) -> Result<
+        (
+            Vec<Expr>,
+            Vec<(Expr, bool, Option<bool>)>,
+            Option<WindowFrame>,
+        ),
+        ParseError,
+    > {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after OVER, got {:?}", self.peek())));
         }
@@ -8543,7 +8550,9 @@ impl Parser {
                 } else {
                     false
                 };
-                order_by.push((e, desc));
+                // v7.24.1 — NULLS FIRST/LAST inside OVER (…).
+                let nulls_first = self.parse_optional_nulls_placement()?;
+                order_by.push((e, desc, nulls_first));
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                     continue;
