@@ -332,7 +332,10 @@ pub fn run(
             })
             .collect::<Result<_, _>>()?
     };
-    let agg_types: Vec<DataType> = agg_specs.iter().map(infer_agg_type).collect();
+    let agg_types: Vec<DataType> = agg_specs
+        .iter()
+        .map(|spec| infer_agg_type(spec, schema_cols))
+        .collect();
     let mut synth_schema: Vec<ColumnSchema> = Vec::new();
     for (i, ty) in group_types.iter().enumerate() {
         synth_schema.push(ColumnSchema::new(format!("__grp_{i}"), *ty, true));
@@ -933,28 +936,34 @@ fn finalize(name: &str, st: &AggState) -> Value {
     }
 }
 
-fn infer_agg_type(spec: &AggSpec) -> DataType {
+fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
+    // v7.26 (round-20 C) — the argument's statically-derived shape
+    // types MIN/MAX/SUM/array_agg properly; RowDescription used to
+    // report TEXT for these, breaking every sqlx typed decode.
+    let arg_ty = spec
+        .arg
+        .as_ref()
+        .and_then(|a| crate::describe::describe_expr(a, schema_cols))
+        .map(|shape| shape.ty);
     match spec.name.as_str() {
-        // count/count_star are exact integer counts; sum widens to BigInt
-        // and reports as such even for Float input (the value column is
-        // nullable so the wire layer surfaces the Float at runtime).
-        "count" | "count_star" | "sum" => DataType::BigInt,
+        "count" | "count_star" => DataType::BigInt,
+        "sum" => match arg_ty {
+            Some(DataType::Float) => DataType::Float,
+            _ => DataType::BigInt,
+        },
         "avg" => DataType::Float,
         // v7.17.0 — string_agg always returns TEXT.
         "string_agg" => DataType::Text,
-        // v7.17.0 — array_agg's declared output type can't be
-        // known without inspecting the argument's expression
-        // shape. Default to TextArray; finalize widens to
-        // IntArray / BigIntArray when the actual elements are
-        // numeric. Downstream column metadata reports TextArray
-        // which is the lowest common denominator.
-        "array_agg" => DataType::TextArray,
+        "array_agg" => match arg_ty {
+            Some(DataType::Int | DataType::SmallInt) => DataType::IntArray,
+            Some(DataType::BigInt) => DataType::BigIntArray,
+            _ => DataType::TextArray,
+        },
         // v7.17.0 — boolean aggregates always return BOOL (nullable
         // — empty / all-NULL group → NULL).
         "bool_and" | "bool_or" => DataType::Bool,
-        // min/max: we don't know the input type without probing — default
-        // to Text and let downstream rendering coerce.
-        _ => DataType::Text,
+        // min/max and anything pass-through: the argument's shape.
+        _ => arg_ty.unwrap_or(DataType::Text),
     }
 }
 
@@ -964,9 +973,14 @@ fn agg_or_group_type(e: &Expr, synth: &[ColumnSchema]) -> DataType {
     {
         return s.ty;
     }
-    // Compound expression — fall back to Text (matches build_projection
-    // behaviour for non-column expressions in the non-aggregate path).
-    DataType::Text
+    // v7.26 (round-20 C) — compound expressions over aggregates
+    // (COALESCE(BOOL_OR(…), false), (array_agg(…))[1], CASE …)
+    // derive their shape statically against the synth schema; the
+    // old Text fallback broke sqlx typed decodes of exactly these
+    // columns.
+    crate::describe::describe_expr(e, synth)
+        .map(|shape| shape.ty)
+        .unwrap_or(DataType::Text)
 }
 
 fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {

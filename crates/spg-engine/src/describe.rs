@@ -217,6 +217,66 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
         // breaks `sqlx::query_as::<_, (chrono::NaiveDateTime,)>(
         // "SELECT now()")` and every similar typed-decode pattern.
         Expr::FunctionCall { name, args } => function_return_shape(name, args, schema_cols),
+        // v7.26 (round-20 C) — aggregate modifiers delegate to the
+        // inner call (DISTINCT / internal ORDER BY don't change the
+        // output type).
+        Expr::AggregateOrdered { call, .. } => describe_expr(call, schema_cols),
+        // CASE — unify on the first THEN branch's shape (PG unifies
+        // across branches; first-branch is the pragmatic subset).
+        Expr::Case {
+            branches,
+            else_branch,
+            ..
+        } => {
+            let probe = branches
+                .first()
+                .map(|(_, t)| t)
+                .or(else_branch.as_deref())?;
+            let inner = describe_expr(probe, schema_cols)?;
+            Some(ExprShape {
+                name: "case".to_string(),
+                ty: inner.ty,
+                nullable: true,
+            })
+        }
+        // Binary — comparisons/logic → BOOL; everything else takes
+        // the left operand's shape (PG's numeric promotion is finer,
+        // but lhs covers the aggregate/projection metadata cases).
+        Expr::Binary { lhs, op, rhs: _ } => {
+            use spg_sql::ast::BinOp as B;
+            match op {
+                B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::And | B::Or => {
+                    Some(ExprShape {
+                        name: "?column?".to_string(),
+                        ty: DataType::Bool,
+                        nullable: true,
+                    })
+                }
+                _ => {
+                    let inner = describe_expr(lhs, schema_cols)?;
+                    Some(ExprShape {
+                        name: "?column?".to_string(),
+                        ty: inner.ty,
+                        nullable: true,
+                    })
+                }
+            }
+        }
+        // (array_agg(…))[1] — element type of the array.
+        Expr::ArraySubscript { target, .. } => {
+            let inner = describe_expr(target, schema_cols)?;
+            let elem = match inner.ty {
+                DataType::IntArray => DataType::Int,
+                DataType::BigIntArray => DataType::BigInt,
+                DataType::TextArray => DataType::Text,
+                other => other,
+            };
+            Some(ExprShape {
+                name: "?column?".to_string(),
+                ty: elem,
+                nullable: true,
+            })
+        }
         _ => None,
     }
 }
@@ -341,6 +401,24 @@ fn function_return_shape(
         }
         "make_date" | "to_date" => (DataType::Date, true),
         "date_part" | "extract" => (DataType::Float, true),
+        // v7.26 (round-20 C) — remaining aggregate signatures
+        // (count / ts_rank were already mapped above). PG types
+        // these from the aggregate's declaration; SPG used to
+        // default them to TEXT, breaking sqlx typed decodes.
+        "bool_and" | "bool_or" | "every" => (DataType::Bool, true),
+        "string_agg" => (DataType::Text, true),
+        "array_agg" => {
+            let elem = args
+                .first()
+                .and_then(|a| describe_expr(a, schema_cols))
+                .map(|s| s.ty);
+            let ty = match elem {
+                Some(DataType::Int | DataType::SmallInt) => DataType::IntArray,
+                Some(DataType::BigInt) => DataType::BigIntArray,
+                _ => DataType::TextArray,
+            };
+            (ty, true)
+        }
         // Pass-through aggregates / conditionals: derive the type
         // from the first arg.
         "sum" | "avg" | "max" | "min" | "abs" | "floor" | "ceil" | "ceiling" | "round"
