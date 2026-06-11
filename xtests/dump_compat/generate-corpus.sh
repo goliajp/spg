@@ -172,8 +172,12 @@ dump_pg() {
         -e POSTGRES_USER=u -e POSTGRES_PASSWORD=p -e POSTGRES_DB=app \
         "$PG_IMAGE" >/dev/null
     # Wait for ready
-    for i in $(seq 1 30); do
-        if docker exec "$container" pg_isready -U u >/dev/null 2>&1; then break; fi
+    # postgres containers initdb then RESTART before POSTGRES_DB
+    # exists; pg_isready answers during phase one. Probe the target
+    # database with a real query instead (same fix as the mysql 8.4
+    # readiness race).
+    for i in $(seq 1 60); do
+        if docker exec -e PGPASSWORD=p "$container" psql -U u -d app -c 'SELECT 1' >/dev/null 2>&1; then break; fi
         sleep 1
     done
     echo "$seed" | docker exec -i -e PGPASSWORD=p "$container" psql -U u -d app -v ON_ERROR_STOP=1 >/dev/null
@@ -200,8 +204,12 @@ dump_pg_with_data() {
     docker run -d --name "$container" \
         -e POSTGRES_USER=u -e POSTGRES_PASSWORD=p -e POSTGRES_DB=app \
         "$PG_IMAGE" >/dev/null
-    for i in $(seq 1 30); do
-        if docker exec "$container" pg_isready -U u >/dev/null 2>&1; then break; fi
+    # postgres containers initdb then RESTART before POSTGRES_DB
+    # exists; pg_isready answers during phase one. Probe the target
+    # database with a real query instead (same fix as the mysql 8.4
+    # readiness race).
+    for i in $(seq 1 60); do
+        if docker exec -e PGPASSWORD=p "$container" psql -U u -d app -c 'SELECT 1' >/dev/null 2>&1; then break; fi
         sleep 1
     done
     echo "$seed" | docker exec -i -e PGPASSWORD=p "$container" psql -U u -d app -v ON_ERROR_STOP=1 >/dev/null
@@ -288,6 +296,11 @@ INSERT INTO groups (name, domain) VALUES ('staff', NULL), ('ops', 'a.com');
 INSERT INTO encryption_keys (group_id, key_type, clean_text) VALUES
     (1, 'pgp', 'semi;colon and tab\t inside'),
     (2, 'smime', NULL);
+-- v7.23 (round-14) — a 1 MiB body: real mail dumps carry thousands
+-- of >64KiB TEXT cells; this row pins the storage codec + COPY
+-- paths through the gate.
+INSERT INTO encryption_keys (group_id, key_type, clean_text)
+    VALUES (1, 'pgp', repeat('Z', 1048576));
 EOF
 )
 

@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 8mPAUZ5xQLxa7triifBJ4FVt4Ndqwd4H4geTotEL6NUi32BT9dojWyLGfTrUrhb
+\restrict j5Wn4EWiSwshoizbH43JRRJ8iwqhaAMh8Q0L90qIxMTxgbRHIaKXTrpRrbCUaSR
 
 -- Dumped from database version 18.4 (Debian 18.4-1.pgdg13+1)
 -- Dumped by pg_dump version 18.4 (Debian 18.4-1.pgdg13+1)
@@ -168,5 +168,5 @@ ALTER TABLE ONLY public.topics
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 8mPAUZ5xQLxa7triifBJ4FVt4Ndqwd4H4geTotEL6NUi32BT9dojWyLGfTrUrhb
+\unrestrict j5Wn4EWiSwshoizbH43JRRJ8iwqhaAMh8Q0L90qIxMTxgbRHIaKXTrpRrbCUaSR
 

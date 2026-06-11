@@ -111,6 +111,16 @@ pub const SEGMENT_MAGIC: [u8; 8] = *b"SPGSEG\x01\x00";
 /// parser path with zero changes.
 pub const SEGMENT_MAGIC_V2: [u8; 8] = *b"SPGSEG\x02\x00";
 
+/// v7.23 (mailrs round-14) — inner-format v3 magic. Identical to
+/// the v1 layout EXCEPT the dense row bodies use the escaped
+/// short-string codec (`spg-storage`'s `STR_LEN_ESCAPE`): TEXT
+/// cells above 64 KiB encode as `[u16 0xFFFF][u32 real_len]`. v1
+/// inner bytes keep plain-u16 decoding (0xFFFF is a legitimate
+/// length there). The v2 COMPRESSION envelope is orthogonal — it
+/// may wrap either inner format; readers unwrap then dispatch on
+/// the inner magic.
+pub const SEGMENT_MAGIC_V3: [u8; 8] = *b"SPGSEG\x03\x00";
+
 /// v6.7.1 — BRIN sidecar tag inside the v2 envelope's inner bytes.
 /// Distinguishes "inner is plain v1 bytes" (current) from "inner is
 /// `[BRIN_SIDECAR_MAGIC][u32 brin_section_len][BRIN entries][v1 segment bytes]`".
@@ -301,6 +311,10 @@ where
     // the final row count for that page is known.
     let mut bloom = BloomFilter::with_target_fp_rate(num_rows_hint, bloom_target_fp);
     let mut pages: Vec<Vec<u8>> = Vec::new();
+    // v7.23 — cumulative byte length of `pages` (jumbo pages make
+    // the region variable-width; offsets in the page index are
+    // exact, not page_size multiples).
+    let mut pages_bytes_total: usize = 0;
     let mut page_index: Vec<PageIndexEntry> = Vec::new();
     let mut row_bytes_in_page: Vec<Vec<u8>> = Vec::new();
     let mut first_pk_in_page: Option<u64> = None;
@@ -343,27 +357,40 @@ where
             row_bytes_in_page.iter().map(Vec::len).sum::<usize>() + row_bytes.len();
         let proposed_size = 4 + proposed_offsets_bytes + proposed_rows_bytes;
         if proposed_size > page_size_bytes as usize {
-            if row_bytes_in_page.is_empty() {
-                // Single row larger than the whole page — caller
-                // must use a bigger page_size_bytes or smaller
-                // rows. Surface as bad shape rather than silently
-                // bloating the page.
-                return Err(SegmentError::BadShape(format!(
-                    "row of {} bytes doesn't fit in page of {page_size_bytes} bytes",
-                    row_bytes.len()
-                )));
+            // Finalise the current page (if any) first.
+            if !row_bytes_in_page.is_empty() {
+                let page_file_offset =
+                    u32::try_from(pages_bytes_total).expect("pages region fits u32");
+                page_index.push(PageIndexEntry {
+                    first_pk: first_pk_in_page.expect("page is non-empty"),
+                    file_offset: page_file_offset,
+                });
+                let finalised = serialise_page(&row_bytes_in_page, page_size_bytes as usize);
+                pages_bytes_total += finalised.len();
+                pages.push(finalised);
+                row_bytes_in_page.clear();
+                first_pk_in_page = None;
             }
-            // Finalise current page.
-            let page_file_offset =
-                u32::try_from(pages.len() * page_size_bytes as usize).expect("page count fits u32");
-            page_index.push(PageIndexEntry {
-                first_pk: first_pk_in_page.expect("page is non-empty"),
-                file_offset: page_file_offset,
-            });
-            let finalised = serialise_page(&row_bytes_in_page, page_size_bytes as usize);
-            pages.push(finalised);
-            row_bytes_in_page.clear();
-            first_pk_in_page = None;
+            // v7.23 (round-14) — a single row larger than the page
+            // becomes its own UNPADDED jumbo page (mail bodies /
+            // document text routinely exceed any sane page size,
+            // and rows are indivisible). Page boundaries are read
+            // from the page index offsets, which jumbo pages keep
+            // exact; v1 fixed-width files satisfy the same offsets,
+            // so the reader has no per-version branch.
+            if 4 + 4 + row_bytes.len() > page_size_bytes as usize {
+                let page_file_offset =
+                    u32::try_from(pages_bytes_total).expect("pages region fits u32");
+                page_index.push(PageIndexEntry {
+                    first_pk: key,
+                    file_offset: page_file_offset,
+                });
+                let natural = 4 + 4 + row_bytes.len();
+                let jumbo = serialise_page(core::slice::from_ref(&row_bytes), natural);
+                pages_bytes_total += jumbo.len();
+                pages.push(jumbo);
+                continue;
+            }
         }
         // Now add to the (possibly fresh) current page.
         if first_pk_in_page.is_none() {
@@ -371,16 +398,16 @@ where
         }
         row_bytes_in_page.push(row_bytes);
     }
-    // Finalise the last page (always non-empty since num_rows >= 1
-    // and the loop wrote at least one row).
+    // Finalise the last page (empty when the final row closed as a
+    // jumbo page).
     if !row_bytes_in_page.is_empty() {
-        let page_file_offset =
-            u32::try_from(pages.len() * page_size_bytes as usize).expect("page count fits u32");
+        let page_file_offset = u32::try_from(pages_bytes_total).expect("pages region fits u32");
         page_index.push(PageIndexEntry {
             first_pk: first_pk_in_page.expect("trailing page is non-empty"),
             file_offset: page_file_offset,
         });
         let final_page = serialise_page(&row_bytes_in_page, page_size_bytes as usize);
+        pages_bytes_total += final_page.len();
         pages.push(final_page);
     }
     let num_pages = u32::try_from(pages.len()).map_err(|_| {
@@ -404,10 +431,13 @@ where
             + bloom_bytes.len()
             + 4
             + page_index_bytes.len()
-            + pages.len() * page_size_bytes as usize
+            + pages_bytes_total
             + FOOTER_LEN,
     );
-    out.extend_from_slice(&SEGMENT_MAGIC);
+    // v7.23 — new segments carry the V3 inner magic: row bodies use
+    // the escaped string codec (TEXT > 64 KiB). Layout is otherwise
+    // byte-identical to v1.
+    out.extend_from_slice(&SEGMENT_MAGIC_V3);
     let body_start = out.len();
     out.extend_from_slice(&num_rows_u32.to_le_bytes());
     out.extend_from_slice(&num_pages.to_le_bytes());
@@ -427,7 +457,15 @@ where
     );
     out.extend_from_slice(&page_index_bytes);
     for page in &pages {
-        debug_assert_eq!(page.len(), page_size_bytes as usize, "page is fixed-size");
+        // v7.23 — pages are page_size-wide EXCEPT jumbo pages
+        // (single rows larger than the page), which are exactly
+        // their natural size. Offsets in the page index are exact
+        // either way.
+        debug_assert!(
+            page.len() == page_size_bytes as usize || page.len() > page_size_bytes as usize,
+            "page neither fixed-size nor jumbo: {} vs {page_size_bytes}",
+            page.len()
+        );
         out.extend_from_slice(page);
     }
     // CRC32 covers everything from `num_rows` (body_start) through
@@ -551,6 +589,9 @@ struct SegmentMetadata {
     meta: SegmentMeta,
     bloom: BloomFilter,
     page_index: Vec<PageIndexEntry>,
+    /// v7.23 — true when the inner magic is V3 (escaped string
+    /// codec in row bodies).
+    long_strings: bool,
     /// File offset where the first page starts. The metadata hides
     /// the variable-length bloom + page-index sections behind
     /// this anchor.
@@ -571,7 +612,8 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
     }
     let mut magic = [0u8; 8];
     magic.copy_from_slice(&bytes[..8]);
-    if magic != SEGMENT_MAGIC {
+    let long_strings = magic == SEGMENT_MAGIC_V3;
+    if magic != SEGMENT_MAGIC && !long_strings {
         return Err(SegmentError::BadMagic { got: magic });
     }
     // Header parse.
@@ -609,16 +651,35 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
     }
     let page_index = parse_page_index(&bytes[page_index_off..page_index_off + page_index_len])?;
     let pages_start_offset = page_index_off + page_index_len;
+    // v7.23 — jumbo pages make the pages region variable-width, so
+    // the exact-length check from fixed-width days only holds for
+    // v1 inner files. For both formats the structural invariants
+    // are: every indexed page offset lies inside the pages region,
+    // and the region ends exactly at the footer.
     let pages_total_bytes = num_pages as usize * page_size_bytes as usize;
     let expected_total = pages_start_offset + pages_total_bytes + FOOTER_LEN;
-    if bytes.len() != expected_total {
+    let exact_len_applies = !long_strings;
+    if pages_start_offset + FOOTER_LEN > bytes.len()
+        || page_index
+            .iter()
+            .any(|e| pages_start_offset + e.file_offset as usize >= bytes.len() - FOOTER_LEN + 1)
+    {
+        return Err(SegmentError::BadShape(format!(
+            "segment: page index points past the {} input bytes",
+            bytes.len()
+        )));
+    }
+    if exact_len_applies && bytes.len() != expected_total {
         return Err(SegmentError::BadShape(format!(
             "segment: input is {} bytes, header implies {expected_total}",
             bytes.len()
         )));
     }
     // CRC footer check (body excludes magic + the CRC itself).
-    let stored_crc_off = expected_total - FOOTER_LEN;
+    // v7.23 — the footer sits at the END of the input; for v1 that
+    // coincides with the fixed-width expected_total, for V3 (jumbo
+    // pages) only the input length is authoritative.
+    let stored_crc_off = bytes.len() - FOOTER_LEN;
     let stored_crc = u32::from_le_bytes([
         bytes[stored_crc_off],
         bytes[stored_crc_off + 1],
@@ -645,6 +706,7 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
         bloom,
         page_index,
         pages_start_offset,
+        long_strings,
     })
 }
 
@@ -679,8 +741,14 @@ fn segment_lookup(metadata: &SegmentMetadata, bytes: &[u8], key: u64) -> Option<
     };
     let entry = metadata.page_index[candidate];
     let page_off = metadata.pages_start_offset + entry.file_offset as usize;
-    let page_end = page_off + metadata.meta.page_size_bytes as usize;
-    if page_end > bytes.len() - FOOTER_LEN {
+    // v7.23 — page boundaries come from the index offsets (jumbo
+    // pages are wider than page_size_bytes; v1 fixed-width files
+    // satisfy the same arithmetic, no version branch needed).
+    let page_end = match metadata.page_index.get(candidate + 1) {
+        Some(next) => metadata.pages_start_offset + next.file_offset as usize,
+        None => bytes.len() - FOOTER_LEN,
+    };
+    if page_end > bytes.len() - FOOTER_LEN || page_off >= page_end {
         return None;
     }
     let page = &bytes[page_off..page_end];
@@ -692,10 +760,16 @@ fn segment_scan<'a>(
     metadata: &'a SegmentMetadata,
     bytes: &'a [u8],
 ) -> impl Iterator<Item = (u64, Vec<u8>)> + 'a {
-    let page_size = metadata.meta.page_size_bytes as usize;
-    (0..metadata.meta.num_pages as usize).flat_map(move |i| {
-        let off = metadata.pages_start_offset + i * page_size;
-        let page = &bytes[off..off + page_size];
+    // v7.23 — walk pages by their index offsets (see
+    // segment_lookup; jumbo pages are variable-width).
+    let pages_end = bytes.len() - FOOTER_LEN;
+    (0..metadata.page_index.len()).flat_map(move |i| {
+        let off = metadata.pages_start_offset + metadata.page_index[i].file_offset as usize;
+        let end = match metadata.page_index.get(i + 1) {
+            Some(next) => metadata.pages_start_offset + next.file_offset as usize,
+            None => pages_end,
+        };
+        let page = &bytes[off..end.min(pages_end)];
         decode_page_iter(page)
     })
 }
@@ -943,6 +1017,14 @@ impl<'a> SegmentReader<'a> {
         &self.metadata.meta
     }
 
+    /// v7.23 — true when this segment's row bodies use the escaped
+    /// string codec (inner magic V3). Callers thread this into
+    /// `decode_row_body_dense`.
+    #[must_use]
+    pub fn long_strings(&self) -> bool {
+        self.metadata.long_strings
+    }
+
     /// Bloom-only check — `false` means the key is definitely not
     /// in this segment (no false negatives); `true` means it
     /// *might* be (false-positive rate per the embedded bloom's
@@ -1022,6 +1104,14 @@ impl OwnedSegment {
     #[must_use]
     pub fn meta(&self) -> &SegmentMeta {
         &self.metadata.meta
+    }
+
+    /// v7.23 — true when this segment's row bodies use the escaped
+    /// string codec (inner magic V3). Callers thread this into
+    /// `decode_row_body_dense`.
+    #[must_use]
+    pub fn long_strings(&self) -> bool {
+        self.metadata.long_strings
     }
 
     #[must_use]
@@ -1281,16 +1371,24 @@ mod tests {
 
     #[test]
     fn legacy_v1_segments_still_load_via_from_bytes() {
-        // A v6.6 binary must still read v1-magic files written by a
-        // pre-v6.6 binary.
+        // A v7.23 binary must still read v1-magic files written by a
+        // pre-v7.23 binary. Since v7.23 the encoder emits V3, so the
+        // v1 fixture is built by patching the magic back — legal
+        // because (a) the CRC footer excludes the magic and (b) a
+        // short-row segment's byte layout is identical between v1
+        // and V3 (the escape codec only changes payloads >= 64 KiB,
+        // and page offsets stay page_size multiples without jumbo
+        // pages).
         let rows = build_rows(100);
-        let (v1_bytes, _) =
+        let (mut v1_bytes, _) =
             encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
-        // Confirm the bytes start with the v1 magic (no envelope).
-        assert_eq!(&v1_bytes[..8], &SEGMENT_MAGIC);
-        // OwnedSegment::from_bytes should handle these unchanged.
+        assert_eq!(&v1_bytes[..8], &SEGMENT_MAGIC_V3, "encoder emits V3");
+        v1_bytes[..8].copy_from_slice(&SEGMENT_MAGIC);
+        // OwnedSegment::from_bytes should handle these unchanged —
+        // and report the old string codec.
         let seg = OwnedSegment::from_bytes(v1_bytes).expect("v1 still parses");
         assert_eq!(seg.meta().num_rows, 100);
+        assert!(!seg.long_strings(), "v1 magic = plain-u16 strings");
     }
 
     #[test]
@@ -1439,14 +1537,28 @@ mod tests {
     }
 
     #[test]
-    fn large_payload_spanning_one_page_each_is_rejected_if_too_big() {
-        // One row that's larger than the page (256 default min) —
-        // writer must refuse, not silently bloat the page.
-        let rows = vec![(1u64, vec![0u8; 8192])];
-        match encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES) {
-            Err(SegmentError::BadShape(_)) => {}
-            other => panic!("expected BadShape for too-large row, got {other:?}"),
-        }
+    fn large_payload_becomes_a_jumbo_page_and_reads_back() {
+        // v7.23 (round-14) — a row larger than the page used to be
+        // REJECTED, which meant the freezer could never move a big
+        // mail body to the cold tier. It now lands in its own
+        // unpadded jumbo page; lookup and scan read it back exactly.
+        let rows = vec![
+            (1u64, vec![0xABu8; 8192]),
+            (2u64, vec![7u8; 16]),
+            (3u64, vec![0xCDu8; 70_000]),
+        ];
+        let (bytes, meta) =
+            encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("jumbo encode");
+        assert_eq!(meta.num_rows, 3);
+        let seg = OwnedSegment::from_bytes(bytes).expect("parses");
+        assert_eq!(seg.lookup(1).expect("pk 1").len(), 8192);
+        assert_eq!(seg.lookup(2).expect("pk 2").len(), 16);
+        let big = seg.lookup(3).expect("pk 3");
+        assert_eq!(big.len(), 70_000);
+        assert!(big.iter().all(|b| *b == 0xCD));
+        // Scan order + payload integrity across the mixed layout.
+        let scanned: Vec<(u64, usize)> = seg.scan().map(|(k, p)| (k, p.len())).collect();
+        assert_eq!(scanned, vec![(1, 8192), (2, 16), (3, 70_000)]);
     }
 
     // --- OwnedSegment (v5.1 catalog cold-tier wrapper) -----------

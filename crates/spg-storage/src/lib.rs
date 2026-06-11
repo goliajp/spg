@@ -5142,7 +5142,7 @@ impl Catalog {
         let u64_key = index_key_as_u64(key)?;
         let seg = self.cold_segments.get(segment_id as usize)?.as_ref()?;
         let payload = seg.lookup(u64_key)?;
-        let (row, _) = decode_row_body_dense(&payload, &t.schema).ok()?;
+        let (row, _) = decode_row_body_dense(&payload, &t.schema, seg.long_strings()).ok()?;
         Some(row)
     }
 
@@ -5204,7 +5204,8 @@ impl Catalog {
                     let Some(payload) = seg.lookup(u64_key) else {
                         continue;
                     };
-                    let (row, _) = decode_row_body_dense(&payload, &t.schema).ok()?;
+                    let (row, _) =
+                        decode_row_body_dense(&payload, &t.schema, seg.long_strings()).ok()?;
                     return Some(row);
                 }
             }
@@ -5274,7 +5275,7 @@ impl Catalog {
                  but the segment's bloom/page lookup didn't return a row"
             ))
         })?;
-        let (row, _consumed) = decode_row_body_dense(&payload, &schema)?;
+        let (row, _consumed) = decode_row_body_dense(&payload, &schema, seg.long_strings())?;
         // Insert the promoted row into the hot tier. `Table::insert`
         // appends to `self.rows`, adds a `Hot(new_idx)` locator to
         // every BTree index covering the row's keyed columns, and
@@ -6175,7 +6176,15 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     v34-and-below catalogs deserialise every column as
 ///     `is_unsigned = false`, preserving the prior silent-
 ///     accept behaviour for negative inserts on UNSIGNED columns.
-const FILE_VERSION: u8 = 45;
+/// v46 introduces (v7.23, mailrs round-14):
+///   * Escaped short-string codec — `write_str` lengths >= 0xFFFF
+///     emit `[u16 0xFFFF][u32 real_len]` so TEXT cells (mail bodies,
+///     document text) above 64 KiB encode instead of panicking.
+///     One-way upgrade: v45-and-below readers reject v46 catalogs
+///     loudly via the version gate; v46 readers decode v45 catalogs
+///     with the plain-u16 rules (0xFFFF is a legitimate length
+///     there).
+const FILE_VERSION: u8 = 46;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6842,6 +6851,9 @@ impl Catalog {
                 "unsupported file version: {version} (supported: {MIN_SUPPORTED_FILE_VERSION}..={FILE_VERSION})"
             )));
         }
+        // v7.23 — string decoding is version-gated (see
+        // STR_LEN_ESCAPE).
+        cur.long_strings = version >= 46;
         let table_count = cur.read_u32()? as usize;
         let mut cat = Self::new();
         for _ in 0..table_count {
@@ -7357,7 +7369,7 @@ fn deserialize_rows(
     let mut hot_bytes: u64 = 0;
     for _ in 0..row_count {
         let tail = &cur.buf[cur.pos..];
-        let (row, consumed) = decode_row_body_dense(tail, &t.schema)?;
+        let (row, consumed) = decode_row_body_dense(tail, &t.schema, cur.long_strings)?;
         cur.pos += consumed;
         // v5.2.1: account for hot bytes as we go; the snapshot's row
         // block bytes are exactly what `encode_row_body_dense` would
@@ -7893,8 +7905,17 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         // 8-byte body: i64 / f64 / Timestamp.
         Value::BigInt(_) | Value::Float(_) | Value::Timestamp(_) => 8,
         Value::Bool(_) => 1,
-        // Text/Varchar/Char/Json share the [u16 len][utf-8] layout.
-        Value::Text(s) | Value::Json(s) => 2 + s.len(),
+        // Text/Varchar/Char/Json share the [u16 len][utf-8] layout;
+        // v7.23 — texts >= 64 KiB take the 6-byte escape header
+        // (these sizes feed the freezer's hot-bytes budget, so the
+        // estimate must not undercount).
+        Value::Text(s) | Value::Json(s) => {
+            if s.len() >= STR_LEN_ESCAPE as usize {
+                6 + s.len()
+            } else {
+                2 + s.len()
+            }
+        }
         // [u32 dim][f32 * dim]
         Value::Vector(vec) => 4 + 4 * vec.len(),
         // v6.0.1: SQ8 cell on-disk shape — [u32 dim][f32 min]
@@ -8066,8 +8087,9 @@ pub fn encode_row_body_dense(row: &Row, schema: &TableSchema) -> Vec<u8> {
 pub fn decode_row_body_dense(
     bytes: &[u8],
     schema: &TableSchema,
+    long_strings: bool,
 ) -> Result<(Row, usize), StorageError> {
-    let mut cur = Cursor::new(bytes);
+    let mut cur = Cursor::new(bytes).with_long_strings(long_strings);
     let bitmap_bytes = schema.columns.len().div_ceil(8);
     let mut bitmap_buf = [0u8; 32];
     if bitmap_bytes > bitmap_buf.len() {
@@ -8756,9 +8778,30 @@ fn write_u16(out: &mut Vec<u8>, n: u16) {
 fn write_u32(out: &mut Vec<u8>, n: u32) {
     out.extend_from_slice(&n.to_le_bytes());
 }
+/// v7.23 (mailrs round-14) — sentinel for the escape form of the
+/// short-string codec: a u16 length of `0xFFFF` means "the REAL
+/// length follows as a u32". Strings of length `>= 0xFFFF` take the
+/// escape form (including exactly 65 535, so the sentinel is
+/// unambiguous within v46+ payloads); shorter strings keep the
+/// 2-byte header — zero overhead for identifiers and typical text.
+/// Pre-v46 catalogs (and pre-V3 segments) may legitimately contain
+/// a plain length of 0xFFFF, so DECODING is gated on the container
+/// version (`Cursor::long_strings`); encoding always emits the v46
+/// form because every new container carries the new version mark.
+const STR_LEN_ESCAPE: u16 = u16::MAX;
+
 fn write_str(out: &mut Vec<u8>, s: &str) {
-    let len = u16::try_from(s.len()).expect("identifier / text fits in u16");
-    write_u16(out, len);
+    if s.len() >= STR_LEN_ESCAPE as usize {
+        // Real mail bodies / document text routinely exceed 64 KiB
+        // (mailrs round-14: the old `fits in u16` expect PANICKED —
+        // after the INSERT was acknowledged — at the next snapshot
+        // encode).
+        let len = u32::try_from(s.len()).expect("text fits in u32 (4 GiB cap)");
+        write_u16(out, STR_LEN_ESCAPE);
+        write_u32(out, len);
+    } else {
+        write_u16(out, s.len() as u16);
+    }
     out.extend_from_slice(s.as_bytes());
 }
 
@@ -8799,11 +8842,27 @@ fn write_index_key(out: &mut Vec<u8>, key: &IndexKey) {
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// v7.23 (round-14) — true when the container declares the v46+
+    /// string codec (catalog `FILE_VERSION >= 46` / segment magic
+    /// V3): a u16 length of [`STR_LEN_ESCAPE`] escapes to a u32 real
+    /// length. False for older containers, where 0xFFFF is a
+    /// legitimate plain length.
+    long_strings: bool,
 }
 
 impl<'a> Cursor<'a> {
     const fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            long_strings: false,
+        }
+    }
+
+    /// v7.23 — builder for version-gated string decoding.
+    const fn with_long_strings(mut self, on: bool) -> Self {
+        self.long_strings = on;
+        self
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], StorageError> {
@@ -8860,7 +8919,13 @@ impl<'a> Cursor<'a> {
         Ok(f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
     fn read_str(&mut self) -> Result<String, StorageError> {
-        let len = self.read_u16()? as usize;
+        let short = self.read_u16()?;
+        let len = if self.long_strings && short == STR_LEN_ESCAPE {
+            // v7.23 escape form — real length follows as u32.
+            self.read_u32()? as usize
+        } else {
+            short as usize
+        };
         let bytes = self.take(len)?;
         core::str::from_utf8(bytes)
             .map(String::from)
@@ -9466,6 +9531,109 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
     use alloc::vec;
+
+    /// v7.23 (mailrs round-14) — the escaped short-string codec.
+    /// Boundary cases: 0xFFFE stays plain-u16, 0xFFFF and above take
+    /// the escape form, round-trips are exact at 1 MiB.
+    #[test]
+    fn escaped_string_codec_round_trips_large_text() {
+        for len in [0usize, 1, 65_534, 65_535, 65_536, 1_048_576] {
+            let s: String = "x".repeat(len);
+            let mut buf = Vec::new();
+            write_str(&mut buf, &s);
+            let expected_header = if len >= STR_LEN_ESCAPE as usize { 6 } else { 2 };
+            assert_eq!(buf.len(), expected_header + len, "header width for {len}");
+            let mut cur = Cursor::new(&buf).with_long_strings(true);
+            assert_eq!(cur.read_str().unwrap().len(), len, "round-trip {len}");
+        }
+    }
+
+    /// Pre-v46 containers may carry a PLAIN length of exactly 0xFFFF
+    /// — the decoder must not treat it as an escape there.
+    #[test]
+    fn plain_u16_len_ffff_decodes_under_old_rules() {
+        let s = "y".repeat(65_535);
+        let mut buf = Vec::new();
+        // Hand-encode the OLD form: plain u16 length.
+        write_u16(&mut buf, 65_535);
+        buf.extend_from_slice(s.as_bytes());
+        let mut old = Cursor::new(&buf); // long_strings = false
+        assert_eq!(old.read_str().unwrap(), s);
+    }
+
+    /// End-to-end: a catalog holding a 1 MiB TEXT row snapshots and
+    /// reloads — the exact shape that panicked at 7.22's graceful
+    /// close ("identifier / text fits in u16").
+    #[test]
+    fn snapshot_round_trips_megabyte_text_row() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "mail",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("body", DataType::Text, false),
+            ],
+        ))
+        .unwrap();
+        let body = "m".repeat(1_048_576);
+        cat.get_mut("mail")
+            .unwrap()
+            .insert(Row::new(vec![Value::BigInt(1), Value::Text(body.clone())]))
+            .unwrap();
+        let bytes = cat.serialize();
+        let re = Catalog::deserialize(&bytes).unwrap();
+        let t = re.get("mail").unwrap();
+        match &t.rows.get(0).unwrap().values[1] {
+            Value::Text(s) => assert_eq!(s.len(), body.len()),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Cold tier: a segment holding a > 64 KiB TEXT row encodes (V3
+    /// magic) and looks up; a hand-built V1 segment with a legal
+    /// 0xFFFF-length text still decodes under old rules.
+    #[test]
+    fn segment_v3_round_trips_large_text_rows() {
+        let schema = TableSchema::new(
+            "mail",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("body", DataType::Text, false),
+            ],
+        );
+        let big = "b".repeat(200_000);
+        let rows: Vec<(u64, Vec<u8>)> = (0u64..3)
+            .map(|i| {
+                let row = Row::new(vec![
+                    Value::BigInt(i.cast_signed()),
+                    Value::Text(big.clone()),
+                ]);
+                (i, encode_row_body_dense(&row, &schema))
+            })
+            .collect();
+        let (bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
+        assert_eq!(&bytes[..8], b"SPGSEG\x03\x00", "new segments are V3");
+        let seg = OwnedSegment::from_bytes(bytes).unwrap();
+        assert!(seg.long_strings());
+        let payload = seg.lookup(1).expect("pk 1 present");
+        let (row, _) = decode_row_body_dense(&payload, &schema, seg.long_strings()).unwrap();
+        match &row.values[1] {
+            Value::Text(s) => assert_eq!(s.len(), big.len()),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Index keys derive from TEXT columns — a > 64 KiB key must
+    /// round-trip through the v9 tagged index-key codec too.
+    #[test]
+    fn index_key_round_trips_large_text() {
+        let key = IndexKey::Text("k".repeat(100_000));
+        let mut buf = Vec::new();
+        write_index_key(&mut buf, &key);
+        let mut cur = Cursor::new(&buf).with_long_strings(true);
+        let back = cur.read_index_key().unwrap();
+        assert_eq!(back, key);
+    }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
