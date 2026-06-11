@@ -1804,6 +1804,11 @@ pub struct OrderBy {
     pub expr: Expr,
     /// `false` = ASC (default), `true` = DESC.
     pub desc: bool,
+    /// v7.24 (mailrs round-16 A) — explicit `NULLS FIRST` /
+    /// `NULLS LAST`. `None` = PG default (NULLS LAST for ASC,
+    /// NULLS FIRST for DESC); the engine resolves the effective
+    /// value via `nulls_first.unwrap_or(desc)`.
+    pub nulls_first: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1931,6 +1936,16 @@ pub enum Expr {
     FunctionCall {
         name: String,
         args: Vec<Expr>,
+    },
+    /// v7.24 (mailrs round-16 A) — an aggregate call with an
+    /// internal ordering: `array_agg(x ORDER BY y DESC NULLS LAST)`.
+    /// Wraps the plain [`Expr::FunctionCall`] so every existing
+    /// FunctionCall consumer stays untouched; only the aggregate
+    /// executor (and the expression walkers) know the wrapper.
+    /// Non-aggregate evaluation contexts reject it at eval time.
+    AggregateOrdered {
+        call: Box<Expr>,
+        order_by: Vec<OrderBy>,
     },
     /// SQL `LIKE` predicate. `pattern` evaluates to text at runtime;
     /// wildcards are `%` (any run) and `_` (one char), backslash escapes
@@ -3547,6 +3562,11 @@ impl fmt::Display for SelectStatement {
                 if o.desc {
                     f.write_str(" DESC")?;
                 }
+                match o.nulls_first {
+                    Some(true) => f.write_str(" NULLS FIRST")?,
+                    Some(false) => f.write_str(" NULLS LAST")?,
+                    None => {}
+                }
             }
         }
         if let Some(n) = &self.limit {
@@ -3661,6 +3681,28 @@ impl fmt::Display for Expr {
                 UnOp::BitNot => write!(f, "(~{expr})"),
             },
             Self::Cast { expr, target } => write!(f, "({expr}::{target})"),
+            Self::AggregateOrdered { call, order_by } => {
+                // Render as `name(args ORDER BY …)` — peel the inner
+                // call's closing paren so the keys sit inside it.
+                let inner = alloc::format!("{call}");
+                let body = inner.strip_suffix(')').unwrap_or(&inner);
+                write!(f, "{body} ORDER BY ")?;
+                for (i, o) in order_by.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", o.expr)?;
+                    if o.desc {
+                        f.write_str(" DESC")?;
+                    }
+                    match o.nulls_first {
+                        Some(true) => f.write_str(" NULLS FIRST")?,
+                        Some(false) => f.write_str(" NULLS LAST")?,
+                        None => {}
+                    }
+                }
+                f.write_str(")")
+            }
             Self::IsNull { expr, negated } => {
                 if *negated {
                     write!(f, "({expr} IS NOT NULL)")

@@ -251,6 +251,12 @@ fn collect_table_ref(t: &TableRef, out: &mut Vec<String>) {
 
 fn collect_expr(e: &Expr, out: &mut Vec<String>) {
     match e {
+        Expr::AggregateOrdered { call, order_by } => {
+            collect_expr(call, out);
+            for o in order_by {
+                collect_expr(&o.expr, out);
+            }
+        }
         Expr::ScalarSubquery(inner) => collect_from_select(inner, out),
         Expr::Exists { subquery, .. } => collect_from_select(subquery, out),
         Expr::InSubquery { expr, subquery, .. } => {

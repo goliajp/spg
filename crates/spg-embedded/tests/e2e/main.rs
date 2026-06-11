@@ -20,3 +20,4 @@ mod e2e_wal_v4_pitr;
 mod e2e_with_transaction;
 mod mailrs_round13;
 mod mailrs_round14;
+mod mailrs_round15_16;

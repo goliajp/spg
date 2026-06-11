@@ -148,6 +148,9 @@ impl core::fmt::Display for EvalError {
 
 pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
     match expr {
+        Expr::AggregateOrdered { .. } => Err(EvalError::TypeMismatch {
+            detail: "aggregate ORDER BY is only valid inside an aggregating SELECT".into(),
+        }),
         Expr::Literal(l) => Ok(literal_to_value(l)),
         Expr::Column(c) => resolve_column(c, row, ctx),
         Expr::Placeholder(n) => {
@@ -2050,6 +2053,14 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
         // … || ' ' || … || …)` runs end-to-end against a tsvector
         // column with Porter stemming + standard english stopwords.
         "to_tsvector" => fts_to_tsvector(args, ctx),
+        // v7.24 (round-16 C) — setweight(tsvector, 'A'..'D'): label
+        // every lexeme. mailrs's migrate-016 search trigger builds
+        // its vector as setweight(to_tsvector(…),'A') || ….
+        "setweight" => fts_setweight(args),
+        // v7.24 (round-15) — string_to_array(text, delim): inverse
+        // of array_to_string. PG semantics: NULL text → NULL,
+        // '' → empty array, NULL delim → one element per char.
+        "string_to_array" => fn_string_to_array(args),
         "plainto_tsquery" => fts_plainto_tsquery(args, ctx),
         "phraseto_tsquery" => fts_phraseto_tsquery(args, ctx),
         "websearch_to_tsquery" => fts_websearch_to_tsquery(args, ctx),
@@ -2262,6 +2273,91 @@ fn fts_to_tsvector(args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalE
         None => Ok(Value::Null),
         Some(t) => Ok(Value::TsVector(crate::fts::to_tsvector(config, &t))),
     }
+}
+
+/// v7.24 (round-16 C) — `setweight(tsvector, "char")`. Relabels
+/// every lexeme with the given PG weight letter (A=3 B=2 C=1 D=0).
+fn fts_setweight(args: &[Value]) -> Result<Value, EvalError> {
+    let [vec_arg, weight_arg] = args else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("setweight expects 2 arguments, got {}", args.len()),
+        });
+    };
+    if matches!(vec_arg, Value::Null) || matches!(weight_arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::TsVector(lexemes) = vec_arg else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "setweight expects a tsvector, got {:?}",
+                vec_arg.data_type()
+            ),
+        });
+    };
+    let Value::Text(w) = weight_arg else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "setweight expects a weight letter, got {:?}",
+                weight_arg.data_type()
+            ),
+        });
+    };
+    let weight = match w.to_ascii_uppercase().as_str() {
+        "A" => 3,
+        "B" => 2,
+        "C" => 1,
+        "D" => 0,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("unrecognized weight: {other:?} (expected A, B, C or D)"),
+            });
+        }
+    };
+    let mut out = lexemes.clone();
+    for lex in &mut out {
+        lex.weight = weight;
+    }
+    Ok(Value::TsVector(out))
+}
+
+/// v7.24 (round-15) — `string_to_array(text, delimiter)`.
+fn fn_string_to_array(args: &[Value]) -> Result<Value, EvalError> {
+    let [text_arg, delim_arg] = args else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("string_to_array expects 2 arguments, got {}", args.len()),
+        });
+    };
+    let text = match text_arg {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(t) => t,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("string_to_array expects text, got {:?}", other.data_type()),
+            });
+        }
+    };
+    // PG (9.1+): empty input → empty array, regardless of delimiter.
+    if text.is_empty() {
+        return Ok(Value::TextArray(Vec::new()));
+    }
+    let parts: Vec<Option<String>> = match delim_arg {
+        // NULL delimiter → one element per character.
+        Value::Null => text.chars().map(|c| Some(c.to_string())).collect(),
+        Value::Text(d) if d.is_empty() => alloc::vec![Some(text.clone())],
+        Value::Text(d) => text
+            .split(d.as_str())
+            .map(|p| Some(p.to_string()))
+            .collect(),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "string_to_array delimiter must be text, got {:?}",
+                    other.data_type()
+                ),
+            });
+        }
+    };
+    Ok(Value::TextArray(parts))
 }
 
 fn fts_plainto_tsquery(args: &[Value], ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
@@ -6826,7 +6922,44 @@ const fn cmp_to_bool(op: BinOp, ord: core::cmp::Ordering) -> bool {
 /// SQL `||` string concatenation. Operands are coerced to text via the same
 /// rule as `::text` cast. NULL propagates (handled above; this function only
 /// runs with non-NULL operands).
+/// v7.24 (round-16 C) — `tsvector || tsvector`. PG semantics: the
+/// right side's positions shift by the left side's max position;
+/// lexemes present on both sides merge (positions concatenated,
+/// the higher weight wins — SPG models weight per lexeme, PG per
+/// position, so the stronger label is the faithful collapse).
+fn tsvector_concat(l: &[spg_storage::TsLexeme], r: &[spg_storage::TsLexeme]) -> Value {
+    let shift = l
+        .iter()
+        .flat_map(|x| x.positions.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let mut out: Vec<spg_storage::TsLexeme> = l.to_vec();
+    for lex in r {
+        let shifted: Vec<u16> = lex
+            .positions
+            .iter()
+            .map(|p| p.saturating_add(shift))
+            .collect();
+        if let Some(existing) = out.iter_mut().find(|x| x.word == lex.word) {
+            existing.positions.extend(shifted);
+            existing.positions.sort_unstable();
+            existing.weight = existing.weight.max(lex.weight);
+        } else {
+            out.push(spg_storage::TsLexeme {
+                word: lex.word.clone(),
+                positions: shifted,
+                weight: lex.weight,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.word.cmp(&b.word));
+    Value::TsVector(out)
+}
+
 fn text_concat(l: &Value, r: &Value) -> Value {
+    if let (Value::TsVector(a), Value::TsVector(b)) = (l, r) {
+        return tsvector_concat(a, b);
+    }
     // v7.11.8 — PG `||` overloads: TEXT[] || TEXT[] = concatenated array;
     // TEXT[] || TEXT (or TEXT || TEXT[]) prepends/appends the single
     // element. NULL || anything = NULL (PG semantics for arrays;
