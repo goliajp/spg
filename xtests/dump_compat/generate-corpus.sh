@@ -301,6 +301,11 @@ INSERT INTO encryption_keys (group_id, key_type, clean_text) VALUES
 -- paths through the gate.
 INSERT INTO encryption_keys (group_id, key_type, clean_text)
     VALUES (1, 'pgp', repeat('Z', 1048576));
+-- v7.27 (round-21) — a >64KiB BYTEA cell: the round-14 TEXT escape
+-- missed the BYTEA arm and the twin fired in a prod migration.
+ALTER TABLE encryption_keys ADD COLUMN IF NOT EXISTS key_blob BYTEA;
+INSERT INTO encryption_keys (group_id, key_type, clean_text, key_blob)
+    VALUES (2, 'pgp', 'big-blob-row', decode(repeat('QUFB', 30000), 'base64'));
 EOF
 )
 

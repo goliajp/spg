@@ -3063,6 +3063,34 @@ impl<T: FromSpgValue> FromSpgValue for Option<T> {
 /// automatically instead of forcing the operator to delete it by
 /// hand (mailrs embed round-12: a restarted server came up in
 /// degraded mode because the previous instance's lock survived).
+/// v7.27 (mailrs round-21 B) — the prober's environment identity:
+/// `(hostname, boot-or-container id)`. A pid is only meaningful
+/// inside the PID namespace that recorded it; mailrs's recovery
+/// window saw "locked by pid 1" from a STOPPED container because
+/// the prober's pid 1 (its own init) was alive. When the lock's
+/// identity differs from ours, liveness is UNDECIDABLE and we
+/// refuse honestly instead of guessing in either direction.
+fn host_identity() -> (String, String) {
+    let hostname = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    // Linux boot id; containers share the host kernel's boot id, so
+    // hostname (= container id by default) is the namespace
+    // discriminator and boot id catches host reboots / pid reuse.
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .or_else(|_| {
+            std::process::Command::new("sysctl")
+                .args(["-n", "kern.bootsessionuuid"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
+        .unwrap_or_default();
+    (hostname, boot_id)
+}
+
 fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
     for attempt in 0..2 {
         match std::fs::create_dir(lock_path) {
@@ -3070,13 +3098,46 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
                 // Best-effort owner record; liveness probing treats a
                 // missing pid file as stale (crash between mkdir and
                 // write is indistinguishable from an ancient lock).
-                let _ = std::fs::write(lock_path.join("pid"), std::process::id().to_string());
+                // v7.27 — lines 2+3 record the owner's environment
+                // identity (hostname, boot id) so a prober in a
+                // different namespace refuses instead of misreading
+                // the pid.
+                let (host, boot) = host_identity();
+                let _ = std::fs::write(
+                    lock_path.join("pid"),
+                    format!("{}\n{host}\n{boot}\n", std::process::id()),
+                );
                 return Ok(());
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                let owner = std::fs::read_to_string(lock_path.join("pid"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let record = std::fs::read_to_string(lock_path.join("pid")).unwrap_or_default();
+                let mut lines = record.lines();
+                let owner = lines.next().and_then(|s| s.trim().parse::<u32>().ok());
+                let lock_host = lines.next().unwrap_or("").trim().to_string();
+                let lock_boot = lines.next().unwrap_or("").trim().to_string();
+                // v7.27 — identity check BEFORE the pid probe. A pid
+                // recorded in another namespace is undecidable both
+                // ways (a stale lock can look held, a held lock can
+                // look stale — the unsafe direction). Old-format
+                // locks (pid only) keep the legacy same-host
+                // assumption.
+                if !lock_host.is_empty() {
+                    let (my_host, my_boot) = host_identity();
+                    let same_env = lock_host == my_host
+                        && (lock_boot.is_empty() || my_boot.is_empty() || lock_boot == my_boot);
+                    if !same_env {
+                        return Err(EngineError::Unsupported(format!(
+                            "database lock {} was taken in a different host/container \
+                             (owner: pid {} on {:?}; we are {:?}) — liveness is \
+                             undecidable from here. If you are sure the owner is gone, \
+                             call Database::force_unlock() or `spg import --force-unlock`.",
+                            lock_path.display(),
+                            owner.unwrap_or(0),
+                            lock_host,
+                            my_host
+                        )));
+                    }
+                }
                 let owner_alive = owner.is_some_and(pid_alive);
                 if owner_alive {
                     return Err(EngineError::Unsupported(format!(

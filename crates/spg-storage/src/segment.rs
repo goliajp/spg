@@ -121,6 +121,12 @@ pub const SEGMENT_MAGIC_V2: [u8; 8] = *b"SPGSEG\x02\x00";
 /// the inner magic.
 pub const SEGMENT_MAGIC_V3: [u8; 8] = *b"SPGSEG\x03\x00";
 
+/// v7.27 (mailrs round-21) — inner-format v4 magic: row bodies use
+/// the FULL escaped-length codec (BYTEA cells, TEXT[] elements and
+/// ts lexemes escape too, not just short strings). Maps onto
+/// catalog codec_version 47; V3 maps to 46, V1 to legacy 0.
+pub const SEGMENT_MAGIC_V4: [u8; 8] = *b"SPGSEG\x04\x00";
+
 /// v6.7.1 — BRIN sidecar tag inside the v2 envelope's inner bytes.
 /// Distinguishes "inner is plain v1 bytes" (current) from "inner is
 /// `[BRIN_SIDECAR_MAGIC][u32 brin_section_len][BRIN entries][v1 segment bytes]`".
@@ -434,10 +440,11 @@ where
             + pages_bytes_total
             + FOOTER_LEN,
     );
-    // v7.23 — new segments carry the V3 inner magic: row bodies use
-    // the escaped string codec (TEXT > 64 KiB). Layout is otherwise
+    // v7.27 — new segments carry the V4 inner magic: row bodies use
+    // the full escaped-length codec (strings since V3; BYTEA,
+    // TEXT[] elements and ts lexemes since V4). Layout is otherwise
     // byte-identical to v1.
-    out.extend_from_slice(&SEGMENT_MAGIC_V3);
+    out.extend_from_slice(&SEGMENT_MAGIC_V4);
     let body_start = out.len();
     out.extend_from_slice(&num_rows_u32.to_le_bytes());
     out.extend_from_slice(&num_pages.to_le_bytes());
@@ -589,9 +596,10 @@ struct SegmentMetadata {
     meta: SegmentMeta,
     bloom: BloomFilter,
     page_index: Vec<PageIndexEntry>,
-    /// v7.23 — true when the inner magic is V3 (escaped string
-    /// codec in row bodies).
-    long_strings: bool,
+    /// v7.23/v7.27 — codec version implied by the inner magic
+    /// (V1 → 0 legacy, V3 → 46, V4 → 47). Threaded into
+    /// `decode_row_body_dense`.
+    codec_version: u8,
     /// File offset where the first page starts. The metadata hides
     /// the variable-length bloom + page-index sections behind
     /// this anchor.
@@ -612,10 +620,15 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
     }
     let mut magic = [0u8; 8];
     magic.copy_from_slice(&bytes[..8]);
-    let long_strings = magic == SEGMENT_MAGIC_V3;
-    if magic != SEGMENT_MAGIC && !long_strings {
+    let codec_version: u8 = if magic == SEGMENT_MAGIC_V4 {
+        47
+    } else if magic == SEGMENT_MAGIC_V3 {
+        46
+    } else if magic == SEGMENT_MAGIC {
+        0
+    } else {
         return Err(SegmentError::BadMagic { got: magic });
-    }
+    };
     // Header parse.
     let num_rows = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
     let num_pages = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
@@ -658,7 +671,7 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
     // and the region ends exactly at the footer.
     let pages_total_bytes = num_pages as usize * page_size_bytes as usize;
     let expected_total = pages_start_offset + pages_total_bytes + FOOTER_LEN;
-    let exact_len_applies = !long_strings;
+    let exact_len_applies = codec_version == 0;
     if pages_start_offset + FOOTER_LEN > bytes.len()
         || page_index
             .iter()
@@ -705,7 +718,7 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
         meta,
         bloom,
         page_index,
-        long_strings,
+        codec_version,
         pages_start_offset,
     })
 }
@@ -1017,12 +1030,12 @@ impl<'a> SegmentReader<'a> {
         &self.metadata.meta
     }
 
-    /// v7.23 — true when this segment's row bodies use the escaped
-    /// string codec (inner magic V3). Callers thread this into
+    /// v7.23/v7.27 — the codec version implied by this segment's
+    /// inner magic (0 legacy / 46 / 47). Callers thread this into
     /// `decode_row_body_dense`.
     #[must_use]
-    pub fn long_strings(&self) -> bool {
-        self.metadata.long_strings
+    pub fn codec_version(&self) -> u8 {
+        self.metadata.codec_version
     }
 
     /// Bloom-only check — `false` means the key is definitely not
@@ -1106,12 +1119,12 @@ impl OwnedSegment {
         &self.metadata.meta
     }
 
-    /// v7.23 — true when this segment's row bodies use the escaped
-    /// string codec (inner magic V3). Callers thread this into
+    /// v7.23/v7.27 — the codec version implied by this segment's
+    /// inner magic (0 legacy / 46 / 47). Callers thread this into
     /// `decode_row_body_dense`.
     #[must_use]
-    pub fn long_strings(&self) -> bool {
-        self.metadata.long_strings
+    pub fn codec_version(&self) -> u8 {
+        self.metadata.codec_version
     }
 
     #[must_use]
@@ -1382,13 +1395,13 @@ mod tests {
         let rows = build_rows(100);
         let (mut v1_bytes, _) =
             encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).expect("encode");
-        assert_eq!(&v1_bytes[..8], &SEGMENT_MAGIC_V3, "encoder emits V3");
+        assert_eq!(&v1_bytes[..8], &SEGMENT_MAGIC_V4, "encoder emits V4");
         v1_bytes[..8].copy_from_slice(&SEGMENT_MAGIC);
         // OwnedSegment::from_bytes should handle these unchanged —
         // and report the old string codec.
         let seg = OwnedSegment::from_bytes(v1_bytes).expect("v1 still parses");
         assert_eq!(seg.meta().num_rows, 100);
-        assert!(!seg.long_strings(), "v1 magic = plain-u16 strings");
+        assert_eq!(seg.codec_version(), 0, "v1 magic = legacy plain-u16 rules");
     }
 
     #[test]
