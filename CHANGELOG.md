@@ -8,6 +8,36 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.27.0] — 2026-06-12 (mailrs round-21: the full u16-length sweep + namespace-aware locks)
+
+Round-14's escape codec covered TEXT and missed every other
+u16-length cell; the BYTEA twin panicked mailrs's production
+migration window (clean rollback, ~10 min downtime). This sweeps
+the class and hardens the recovery path that made the incident
+worse.
+
+### Fixed
+
+- **BYTEA cells, TEXT[] elements, tsvector lexemes and tsquery
+  terms above 64 KiB** encode on every path (snapshot, WAL replay,
+  cold segments, import): escaped lengths under FILE_VERSION 47 /
+  segment inner magic V4 (one-way upgrade, same posture as v46).
+  A live engine storing such a cell no longer panics at the next
+  snapshot encode. Seeded > 64 KiB gates at every layer: storage
+  unit, embedded e2e (the verbatim ALTER … USING decode()
+  migration), dropin panel (server path), dump-compat rich corpus.
+- **Lock liveness across container namespaces**: the lock records
+  (pid, hostname, boot id); a prober in a different host/container
+  now refuses with "liveness undecidable — use force_unlock"
+  instead of misreading pid 1 (or, in the unsafe direction,
+  reclaiming a live owner whose pid is unused in the prober's
+  namespace). Old single-line locks keep the same-host behaviour.
+
+### Added
+
+- `spg import --force-unlock` — clear a dead owner's lock in a
+  recovery window without raw `rm -rf`.
+
 ## [7.26.0] — 2026-06-11 (mailrs round-20: typed aggregate columns + honest missing-column errors)
 
 ### Fixed
