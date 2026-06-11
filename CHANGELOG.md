@@ -8,6 +8,29 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.25.0] — 2026-06-11 (mailrs round-17: the inbox query parses — ILIKE, DISTINCT aggregates, CAST(x AS t), CTE chains)
+
+Prod's inbox list was served entirely from mailrs's in-process
+cache; the SQL behind it could not parse, so the first cache flush
+or cold start would have taken the inbox down. All four shapes from
+the bisection:
+
+### Added
+
+- `ILIKE` / `NOT ILIKE` — case-insensitive LIKE (both operands
+  fold).
+- `DISTINCT` inside aggregates: `COUNT(DISTINCT x)`,
+  `string_agg(DISTINCT s, ',' [ORDER BY …])`, and
+  `COUNT(DISTINCT CASE … END)` (the inbox counter shape).
+- `CAST(expr AS type)` — the standard form, lowered onto the same
+  node as `::` (shared target table).
+
+### Fixed
+
+- **A CTE can reference an earlier CTE** (`WITH a AS (…), b AS
+  (SELECT … FROM a)`): non-recursive CTE bodies now execute against
+  the accumulated catalog instead of the base engine.
+
 ## [7.24.1] — 2026-06-11 (rounds 15+16 follow-up: NULLS inside OVER, subqueries in JOIN ON)
 
 ### Fixed
