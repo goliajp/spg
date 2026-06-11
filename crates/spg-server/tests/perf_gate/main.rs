@@ -49,6 +49,8 @@ fn perf_lock() -> MutexGuard<'static, ()> {
 
 #[allow(clippy::uninlined_format_args, unsafe_code)]
 mod concurrency;
+#[path = "inbox_25k.rs"]
+mod inbox_25k;
 #[allow(clippy::uninlined_format_args, unsafe_code)]
 mod one_b_rows;
 mod parallel_freezer;

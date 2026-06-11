@@ -8680,11 +8680,22 @@ impl Engine {
             }
         }
         let ctx = EvalContext::new(&combined_schema, None);
+        // v7.28 (round-22) - intermediate-row ceiling: a join whose
+        // working set explodes errors instead of eating the host
+        // (mailrs watched RSS climb to 7 GiB of 15 before a manual
+        // restart). The ceiling is per join STAGE, not per query.
+        const MAX_JOIN_INTERMEDIATE_ROWS: usize = 4_000_000;
         let mut working: Vec<Row> = primary_rows;
         // Track the per-row width consumed by the outer left side so
         // each lateral evaluation sees the correct schema slice.
         let mut consumed_cols = primary_cols.len();
         for peer in &joined {
+            if working.len() > MAX_JOIN_INTERMEDIATE_ROWS {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "join intermediate result exceeds {MAX_JOIN_INTERMEDIATE_ROWS} rows ({} so far) - add join predicates",
+                    working.len()
+                )));
+            }
             let right_arity = peer.cols.len();
             let mut next: Vec<Row> = Vec::new();
             // v7.28 (round-22) — hash equi-join. The old path CLONED
@@ -8955,6 +8966,12 @@ impl Engine {
                 }
             }
             working = next;
+            if working.len() > MAX_JOIN_INTERMEDIATE_ROWS {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "join intermediate result exceeds {MAX_JOIN_INTERMEDIATE_ROWS} rows ({} so far) - add join predicates",
+                    working.len()
+                )));
+            }
             consumed_cols += right_arity;
             debug_assert!(consumed_cols <= combined_schema.len());
         }
