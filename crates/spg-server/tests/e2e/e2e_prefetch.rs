@@ -147,7 +147,7 @@ fn sequential_scan_triggers_prefetch() {
 
     // Phase 1: populate + freeze + CHECKPOINT so the manifest
     // lists ≥ 2 cold segments.
-    let mut expected_hits: u64 = 0;
+    let expected_hits: u64;
     {
         let (mut raw, addrs) = common::ServerBuilder::new()
             .arg_path(&db)
