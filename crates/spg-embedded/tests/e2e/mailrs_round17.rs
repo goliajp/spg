@@ -170,3 +170,92 @@ fn round18_placeholders_and_clock_inside_ctes() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Round-19 — GROUP-BY-eval resolver holes that only fire with rows
+/// present (empty-table gates declared victory twice; this one is
+/// SEEDED and runs on both the direct and prepared/readonly paths,
+/// per mailrs's suggestion).
+#[test]
+fn round19_seeded_group_eval_composite() {
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE messages (id BIGINT, thread_id TEXT, mailbox_id BIGINT, subject TEXT, internal_date BIGINT, search_vector tsvector)").unwrap();
+    db.execute("CREATE TABLE mailboxes (id BIGINT, name TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE email_analysis (message_id BIGINT, requires_action BOOLEAN, category TEXT)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO messages VALUES (1, 'th-1', 1, 'invoice due', 100, to_tsvector('simple','invoice due'))").unwrap();
+    db.execute("INSERT INTO messages VALUES (2, 'th-1', 1, 're: invoice', 200, to_tsvector('simple','re invoice'))").unwrap();
+    db.execute("INSERT INTO mailboxes VALUES (1, 'INBOX')")
+        .unwrap();
+    db.execute("INSERT INTO email_analysis VALUES (1, true, 'billing'), (2, false, 'billing2')")
+        .unwrap();
+
+    // Round-19 A verbatim shape: correlated scalar subquery in the
+    // SELECT list of a GROUP BY query (group key referenced inside
+    // the body). Three of these sit in mailrs's real query.
+    let r = rows_of(
+        &mut db,
+        "SELECT m.thread_id, \
+         COALESCE((SELECT e2.category FROM email_analysis e2 JOIN messages m2 \
+                   ON e2.message_id = m2.id WHERE m2.thread_id = m.thread_id \
+                   ORDER BY m2.internal_date DESC LIMIT 1), 'general') \
+         FROM messages m GROUP BY m.thread_id",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(
+        r[0][1],
+        Value::Text("billing2".into()),
+        "latest message's category"
+    );
+
+    // The full search_conversations shape (round-19 B): CTE chain +
+    // JOIN + LEFT JOIN + DISTINCT/BOOL_OR/array_agg(ORDER BY)/
+    // ts_rank aggregates + the A-shape subquery column + HAVING and
+    // ORDER BY referencing LEFT-JOIN-alias aggregates.
+    let sql = "WITH matched AS (SELECT DISTINCT thread_id FROM messages \
+                 WHERE search_vector @@ plainto_tsquery('simple', 'invoice')), \
+       cands AS (SELECT m.id, m.thread_id FROM messages m \
+                 WHERE m.thread_id IN (SELECT thread_id FROM matched)) \
+     SELECT m.thread_id, COUNT(DISTINCT m.id), MAX(m.internal_date), \
+            COALESCE(BOOL_OR(ea.requires_action), false), \
+            COALESCE((SELECT e2.category FROM email_analysis e2 JOIN messages m2 \
+                      ON e2.message_id = m2.id WHERE m2.thread_id = m.thread_id \
+                      ORDER BY m2.internal_date DESC LIMIT 1), 'general'), \
+            array_agg(m.subject ORDER BY m.internal_date DESC NULLS LAST), \
+            MAX(ts_rank(m.search_vector, plainto_tsquery('simple','invoice'))), \
+            mb.name, \
+            COUNT(DISTINCT CASE WHEN ea.requires_action THEN CAST(m.id AS TEXT) END) \
+     FROM messages m JOIN cands c ON c.id = m.id \
+       JOIN mailboxes mb ON mb.id = m.mailbox_id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+     GROUP BY m.thread_id, mb.name \
+     HAVING COUNT(DISTINCT m.id) > 0 AND COALESCE(BOOL_OR(ea.requires_action), false) \
+     ORDER BY COALESCE(BOOL_OR(ea.requires_action), false) DESC, \
+              MAX(m.internal_date) DESC NULLS LAST";
+    let check = |rows: &[Vec<Value>]| {
+        assert_eq!(rows.len(), 1, "one group row");
+        assert_eq!(rows[0][0], Value::Text("th-1".into()));
+        assert_eq!(rows[0][1], Value::BigInt(2), "COUNT(DISTINCT m.id)");
+        assert_eq!(
+            rows[0][3],
+            Value::Bool(true),
+            "BOOL_OR over LEFT JOIN alias"
+        );
+        assert_eq!(rows[0][4], Value::Text("billing2".into()), "A-shape column");
+        assert_eq!(rows[0][8], Value::BigInt(1), "DISTINCT CASE counter");
+    };
+    let direct = rows_of(&mut db, sql);
+    check(&direct);
+    // Prepared/readonly (sqlx inline) path.
+    let stmt = db.prepare(sql).unwrap();
+    let snap = db.engine().clone_snapshot();
+    match Database::execute_prepared_on_snapshot(&snap, &stmt, &[]).unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            let vals: Vec<Vec<Value>> = rows.into_iter().map(|r| r.values).collect();
+            check(&vals);
+        }
+        other => panic!("{other:?}"),
+    }
+}

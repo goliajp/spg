@@ -200,6 +200,7 @@ pub fn run(
     rows: &[&Row],
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
+    correlated_eval: Option<&dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Result<Value, EvalError>>,
 ) -> Result<AggResult, EvalError> {
     let ctx = EvalContext::new(schema_cols, table_alias);
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
@@ -409,7 +410,10 @@ pub fn run(
     let mut out_rows: Vec<Row> = Vec::new();
     for srow in synth_rows {
         if let Some(h) = &having_rewritten {
-            let cond = eval::eval_expr(h, &srow, &synth_ctx)?;
+            let cond = match correlated_eval {
+                Some(f) if crate::expr_has_subquery(h) => f(h, &srow, &synth_ctx)?,
+                _ => eval::eval_expr(h, &srow, &synth_ctx)?,
+            };
             if !matches!(cond, Value::Bool(true)) {
                 continue;
             }
@@ -418,7 +422,12 @@ pub fn run(
         for item in &stmt.items {
             if let SelectItem::Expr { expr, .. } = item {
                 let rewritten = rewrite_expr(expr, &group_exprs, &agg_specs);
-                values.push(eval::eval_expr(&rewritten, &srow, &synth_ctx)?);
+                values.push(match correlated_eval {
+                    Some(f) if crate::expr_has_subquery(&rewritten) => {
+                        f(&rewritten, &srow, &synth_ctx)?
+                    }
+                    _ => eval::eval_expr(&rewritten, &srow, &synth_ctx)?,
+                });
             }
         }
         kept_synth.push(srow);
@@ -446,7 +455,10 @@ pub fn run(
             .map(|(s, o)| {
                 let mut keys = Vec::with_capacity(rewritten.len());
                 for e in &rewritten {
-                    keys.push(eval::eval_expr(e, &s, &synth_ctx)?);
+                    keys.push(match correlated_eval {
+                        Some(f) if crate::expr_has_subquery(e) => f(e, &s, &synth_ctx)?,
+                        _ => eval::eval_expr(e, &s, &synth_ctx)?,
+                    });
                 }
                 Ok::<_, EvalError>((keys, o))
             })
@@ -1088,15 +1100,32 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             field: *field,
             source: Box::new(rewrite_expr(source, group_exprs, aggs)),
         },
-        // v4.10 subquery + v4.12 window / Literal / Column —
-        // clone-pass (these don't participate in aggregate rewrite).
-        Expr::ScalarSubquery(_)
-        | Expr::Exists { .. }
-        | Expr::InSubquery { .. }
-        | Expr::WindowFunction { .. }
-        | Expr::Literal(_)
-        | Expr::Placeholder(_)
-        | Expr::Column(_) => e.clone(),
+        // v7.25.2 (round-19 A) — subquery nodes: rewrite group-key
+        // references INSIDE the body to `__grp_N` so the correlated
+        // resolver can substitute them against the synthesised group
+        // row (aggs are NOT matched inside the body — a COUNT in the
+        // subquery is the subquery's own aggregate).
+        Expr::ScalarSubquery(s) => {
+            Expr::ScalarSubquery(Box::new(rewrite_group_keys_in_select(s, group_exprs)))
+        }
+        Expr::Exists { subquery, negated } => Expr::Exists {
+            subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
+            negated: *negated,
+        },
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
+            subquery: Box::new(rewrite_group_keys_in_select(subquery, group_exprs)),
+            negated: *negated,
+        },
+        // v4.12 window / Literal / Column — clone-pass (these don't
+        // participate in aggregate rewrite).
+        Expr::WindowFunction { .. } | Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {
+            e.clone()
+        }
         // v7.10.10 — recurse children for array nodes.
         Expr::Array(items) => Expr::Array(
             items
@@ -1141,6 +1170,22 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                 .map(|e| Box::new(rewrite_expr(e, group_exprs, aggs))),
         },
     }
+}
+
+/// v7.25.2 (round-19 A) — rewrite group-key references inside a
+/// subquery body to `__grp_N` synthetic columns (aggregates are
+/// not touched: empty spec list). Runs through the canonical
+/// Select walker so every expression slot is covered.
+fn rewrite_group_keys_in_select(
+    s: &spg_sql::ast::SelectStatement,
+    group_exprs: &[Expr],
+) -> spg_sql::ast::SelectStatement {
+    let mut out = s.clone();
+    let _ = crate::walk_select_exprs_mut(&mut out, &mut |e| {
+        *e = rewrite_expr(e, group_exprs, &[]);
+        Ok(())
+    });
+    out
 }
 
 /// Canonical string key for a tuple of group values. Used as map key.
