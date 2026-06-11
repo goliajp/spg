@@ -64,6 +64,33 @@ Caveat: `biz` needs Docker (its harnesses run psql from the postgres:15
 image) and a `.git` dir for `git rev-parse` — neither exists on the
 testbed mirror, so run biz locally.
 
+## Acceptance-shape conventions (rounds 12-20 lessons)
+
+Any new SQL-shape regression (a customer round, a dialect gap, a
+dropin probe) follows three rules. Each exists because its absence
+shipped a bug:
+
+1. **Seeded.** Empty-table cases declared victory twice (rounds
+   17/18 parse-level gates masked the rows-present eval bugs of
+   round 19). Insert 2-3 rows that exercise the shape — including a
+   NULL where ordering/aggregation semantics differ.
+2. **Multi-path.** The engine has three dispatch families and they
+   do not share pre-execution passes uniformly: direct
+   `execute()`, prepared / readonly-on-snapshot (the sqlx inline
+   path), and the wire server (pgwire). Round 16's correlated-EXISTS
+   gap and round 18's CTE placeholders were path-local. Pin at
+   least direct + prepared in the embed e2e; promote the shape to
+   `scripts/dropin-acceptance.sh` (psql against the docker image =
+   the server path) — see the "rounds 13-20" panel section there
+   for the pattern, including `run_case_expect` (value-asserted,
+   not rc-only) and `run_case_expect_tolerant` (for
+   "rejection IS the assertion" cases).
+3. **Typed.** Column TypeInfo is part of the behaviour: round 20's
+   aggregate-columns-as-TEXT broke every sqlx decode while all
+   VALUES were correct. When the shape produces aggregate or
+   expression columns, decode into the real Rust tuple in a
+   spg-sqlx test (`tests/mailrs_round20.rs` is the template).
+
 ## Release battery
 
 Before any release ack, all of the following must be green (see
