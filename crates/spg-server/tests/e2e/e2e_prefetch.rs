@@ -202,9 +202,20 @@ fn sequential_scan_triggers_prefetch() {
         .spawn();
     let _guard = common::ChildGuard(raw);
     let http_addr = addrs.http.as_ref().expect("http listener");
-    let body = http_get_body(http_addr, "/metrics");
-    let hits = metric_value(&body, "spg_cold_prefetch_hits_total")
-        .expect("spg_cold_prefetch_hits_total metric present");
+    // The boot prefetch pool is asynchronous — under a loaded host
+    // the last worker may still be counting when /metrics is first
+    // scraped. Poll to the expected value instead of asserting a
+    // single early sample (v7.22; this was the suite's top flake).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let hits = loop {
+        let body = http_get_body(http_addr, "/metrics");
+        let h = metric_value(&body, "spg_cold_prefetch_hits_total")
+            .expect("spg_cold_prefetch_hits_total metric present");
+        if h >= expected_hits || Instant::now() > deadline {
+            break h;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
         hits, expected_hits,
         "prefetch hits {hits} ≠ on-disk segment count {expected_hits}"
