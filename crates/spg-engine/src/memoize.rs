@@ -61,6 +61,18 @@ pub struct MemoizeCache {
     /// amortised for the common front-half-hit pattern of nested-
     /// loop correlated subqueries.
     entries: VecDeque<(CacheKey, Value)>,
+    /// v7.29 (round-22 phase 3) - batch-evaluated correlated scalar
+    /// subqueries: subquery repr -> Some((outer column, key -> value
+    /// map built in ONE pass)) or None when the shape can't batch
+    /// (so we don't re-analyse it per row). Turns 23.5k per-group
+    /// executions into one grouped scan + 23.5k lookups.
+    pub group_maps: alloc::collections::BTreeMap<
+        String,
+        Option<(
+            spg_sql::ast::ColumnName,
+            alloc::collections::BTreeMap<String, Value>,
+        )>,
+    >,
     max_entries: usize,
     max_bytes: usize,
     current_bytes: usize,
@@ -83,6 +95,7 @@ impl MemoizeCache {
             current_bytes: 0,
             hit_count: 0,
             miss_count: 0,
+            group_maps: alloc::collections::BTreeMap::new(),
         }
     }
 

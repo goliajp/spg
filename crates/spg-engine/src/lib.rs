@@ -7592,8 +7592,12 @@ impl Engine {
         // unnest(ARRAY[…])` either errored at projection time or
         // returned the wrong shape.
         if aggregate::uses_aggregate(stmt) {
+            // v7.29 — a per-query memo so correlated scalar
+            // subqueries batch-evaluate once (group map) instead of
+            // executing per group.
+            let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
             let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
-                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                     .map_err(|err| match err {
                         EngineError::Eval(ev) => ev,
                         other => eval::EvalError::TypeMismatch {
@@ -7827,8 +7831,12 @@ impl Engine {
         // time. GROUP BY / HAVING / ORDER BY over the aggregate
         // output all ride through `aggregate::run`.
         if aggregate::uses_aggregate(stmt) {
+            // v7.29 — a per-query memo so correlated scalar
+            // subqueries batch-evaluate once (group map) instead of
+            // executing per group.
+            let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
             let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
-                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                     .map_err(|err| match err {
                         EngineError::Eval(ev) => ev,
                         other => eval::EvalError::TypeMismatch {
@@ -8081,8 +8089,12 @@ impl Engine {
                     filtered.push(row);
                 }
             }
+            // v7.29 — a per-query memo so correlated scalar
+            // subqueries batch-evaluate once (group map) instead of
+            // executing per group.
+            let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
             let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
-                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                     .map_err(|err| match err {
                         EngineError::Eval(ev) => ev,
                         other => eval::EvalError::TypeMismatch {
@@ -9102,8 +9114,12 @@ impl Engine {
         // joined+filtered rows.
         if aggregate::uses_aggregate(stmt) {
             let refs: Vec<&Row> = filtered.iter().collect();
+            // v7.29 — a per-query memo so correlated scalar
+            // subqueries batch-evaluate once (group map) instead of
+            // executing per group.
+            let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
             let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
-                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
                     .map_err(|err| match err {
                         EngineError::Eval(ev) => ev,
                         other => eval::EvalError::TypeMismatch {
@@ -11105,6 +11121,39 @@ impl Engine {
                 }
             }
             Expr::ScalarSubquery(inner) => {
+                // v7.29 (round-22 phase 3) — batch path first: a
+                // correlated scalar of the `inner_col = outer_col
+                // [ORDER BY … LIMIT 1]` shape evaluates ONCE as a
+                // grouped scan; per-row resolution becomes a map
+                // lookup. 23.5k per-group executions (~900 ms) became
+                // one scan + lookups.
+                if memo.is_some() {
+                    let repr = alloc::format!("{}", **inner);
+                    let entry_known = memo
+                        .as_ref()
+                        .is_some_and(|m| m.group_maps.contains_key(&repr));
+                    if !entry_known {
+                        let built = self.try_batch_correlated_scalar(inner, cancel)?;
+                        if let Some(m) = memo.as_deref_mut() {
+                            m.group_maps.insert(repr.clone(), built);
+                        }
+                    }
+                    if let Some(m) = memo.as_deref_mut()
+                        && let Some(Some((outer_col, map))) = m.group_maps.get(&repr)
+                    {
+                        let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
+                            .map_err(EngineError::Eval)?;
+                        let v = if matches!(key_v, Value::Null) {
+                            Value::Null
+                        } else {
+                            map.get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        };
+                        *e = value_to_literal_expr(v)?;
+                        return Ok(());
+                    }
+                }
                 // v6.2.6 — Memoize: build the cache key from the
                 // pre-substitution subquery repr + the outer row's
                 // values. Two outer rows with identical correlated
@@ -13267,6 +13316,217 @@ fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row, outer_schema: &[Colum
             }
         }
         _ => {}
+    }
+}
+
+impl Engine {
+    /// v7.29 (round-22 phase 3) — try to batch-evaluate a correlated
+    /// scalar subquery of the shape
+    ///   (SELECT expr FROM … WHERE inner_preds AND inner_col = outer_col
+    ///    [ORDER BY o [DESC]] [LIMIT 1])
+    /// by running the subquery ONCE without the correlation and
+    /// folding rows into a key→value map (group top-1 when ordered).
+    /// Returns None when the shape doesn't qualify; correctness then
+    /// falls back to per-row execution.
+    fn try_batch_correlated_scalar(
+        &self,
+        inner: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<
+        Option<(
+            spg_sql::ast::ColumnName,
+            alloc::collections::BTreeMap<String, Value>,
+        )>,
+        EngineError,
+    > {
+        use spg_sql::ast::{BinOp, SelectItem as SI};
+        if !inner.ctes.is_empty()
+            || !inner.unions.is_empty()
+            || inner.group_by.is_some()
+            || inner.having.is_some()
+            || inner.distinct
+            || inner.items.len() != 1
+            || inner.order_by.len() > 1
+            || inner.offset.is_some()
+        {
+            return Ok(None);
+        }
+        // LIMIT must be absent or literally 1 (top-1 semantics).
+        if let Some(le) = inner.limit
+            && le.as_literal() != Some(1)
+        {
+            return Ok(None);
+        }
+        let Some(from) = &inner.from else {
+            return Ok(None);
+        };
+        if from.primary.lateral_subquery.is_some() || from.primary.unnest_expr.is_some() {
+            return Ok(None);
+        }
+        // Inner alias set.
+        let mut inner_aliases: Vec<String> = Vec::new();
+        inner_aliases.push(
+            from.primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone()),
+        );
+        for j in &from.joins {
+            if j.table.lateral_subquery.is_some() || j.table.unnest_expr.is_some() {
+                return Ok(None);
+            }
+            inner_aliases.push(
+                j.table
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| j.table.name.clone()),
+            );
+        }
+        let is_inner = |c: &spg_sql::ast::ColumnName| -> bool {
+            match &c.qualifier {
+                Some(q) => inner_aliases.iter().any(|a| a.eq_ignore_ascii_case(q)),
+                None => false,
+            }
+        };
+        let is_outer = |c: &spg_sql::ast::ColumnName| -> bool {
+            match &c.qualifier {
+                Some(q) => !inner_aliases.iter().any(|a| a.eq_ignore_ascii_case(q)),
+                // Synthetic group columns arrive bare after the
+                // aggregate rewrite.
+                None => c.name.starts_with("__grp_") || c.name.starts_with("__agg_"),
+            }
+        };
+        // Every expression OTHER than the correlation conjunct must be
+        // fully inner (qualified to inner aliases).
+        let all_inner = |e: &Expr| -> bool {
+            let mut cols: Vec<spg_sql::ast::ColumnName> = Vec::new();
+            let mut subs: Vec<&SelectStatement> = Vec::new();
+            visit_expr_columns_and_subqueries(e, &mut |c| cols.push(c.clone()), &mut |sub| {
+                subs.push(sub)
+            });
+            subs.is_empty() && cols.iter().all(|c| is_inner(c) && !c.name.is_empty())
+        };
+        let Some(w) = &inner.where_ else {
+            return Ok(None);
+        };
+        let conjuncts = reorder::split_and_conjunctions(w);
+        let mut corr: Option<(spg_sql::ast::ColumnName, spg_sql::ast::ColumnName)> = None; // (inner, outer)
+        let mut rest: Vec<&Expr> = Vec::new();
+        for c in conjuncts {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::Eq,
+                rhs,
+            } = c
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let pair = if is_inner(a) && is_outer(b) {
+                    Some((a.clone(), b.clone()))
+                } else if is_inner(b) && is_outer(a) {
+                    Some((b.clone(), a.clone()))
+                } else {
+                    None
+                };
+                if let Some(p) = pair {
+                    if corr.is_some() {
+                        return Ok(None); // more than one correlation
+                    }
+                    corr = Some(p);
+                    continue;
+                }
+            }
+            if !all_inner(c) {
+                return Ok(None);
+            }
+            rest.push(c);
+        }
+        let Some((inner_col, outer_col)) = corr else {
+            return Ok(None);
+        };
+        let SI::Expr { expr: out_expr, .. } = &inner.items[0] else {
+            return Ok(None);
+        };
+        if !all_inner(out_expr) {
+            return Ok(None);
+        }
+        let order = inner.order_by.first();
+        if let Some(o) = order
+            && !all_inner(&o.expr)
+        {
+            return Ok(None);
+        }
+        // Build the batch statement: SELECT inner_col, [order], expr
+        // FROM … WHERE rest — no correlation, no order, no limit.
+        let mut batch = inner.clone();
+        batch.limit = None;
+        batch.offset = None;
+        batch.order_by = Vec::new();
+        batch.where_ = rest
+            .iter()
+            .map(|e| (*e).clone())
+            .reduce(|a, b| Expr::Binary {
+                lhs: alloc::boxed::Box::new(a),
+                op: BinOp::And,
+                rhs: alloc::boxed::Box::new(b),
+            });
+        let mut items: Vec<SI> = alloc::vec![SI::Expr {
+            expr: Expr::Column(inner_col),
+            alias: None,
+        }];
+        if let Some(o) = order {
+            items.push(SI::Expr {
+                expr: o.expr.clone(),
+                alias: None,
+            });
+        }
+        items.push(SI::Expr {
+            expr: out_expr.clone(),
+            alias: None,
+        });
+        batch.items = items;
+        let r = self.exec_select_cancel(&batch, cancel)?;
+        let QueryResult::Rows { rows, .. } = r else {
+            return Ok(None);
+        };
+        let has_order = order.is_some();
+        let (desc, nf) = order
+            .map(|o| (o.desc, o.nulls_first))
+            .unwrap_or((false, None));
+        let mut best: alloc::collections::BTreeMap<String, (Option<Value>, Value)> =
+            alloc::collections::BTreeMap::new();
+        for row in rows {
+            let key_v = row.values.first().cloned().unwrap_or(Value::Null);
+            if matches!(key_v, Value::Null) {
+                continue;
+            }
+            let key = aggregate::encode_key(core::slice::from_ref(&key_v));
+            let (ord_v, out_v) = if has_order {
+                (
+                    Some(row.values.get(1).cloned().unwrap_or(Value::Null)),
+                    row.values.get(2).cloned().unwrap_or(Value::Null),
+                )
+            } else {
+                (None, row.values.get(1).cloned().unwrap_or(Value::Null))
+            };
+            match best.get(&key) {
+                None => {
+                    best.insert(key, (ord_v, out_v));
+                }
+                Some((cur_ord, _)) if has_order => {
+                    // The sorted-first row wins: candidate beats the
+                    // incumbent when it compares LESS under the key's
+                    // ordering.
+                    let cand = ord_v.clone().unwrap_or(Value::Null);
+                    let cur = cur_ord.clone().unwrap_or(Value::Null);
+                    if order_by_value_cmp(desc, nf, &cand, &cur) == core::cmp::Ordering::Less {
+                        best.insert(key, (ord_v, out_v));
+                    }
+                }
+                Some(_) => {} // unordered: first row stands (any row is valid)
+            }
+        }
+        let map = best.into_iter().map(|(k, (_, v))| (k, v)).collect();
+        Ok(Some((outer_col, map)))
     }
 }
 
