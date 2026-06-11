@@ -93,6 +93,32 @@ mysql -h 127.0.0.1 -P 3306 -u spg -e "SHOW DATABASES"
 mysql -h 127.0.0.1 -P 3306 -u spg < your-init-schema.sql
 ```
 
+## Migrating data: `spg import` takes stock mysqldump output
+
+v7.22 — an **unmodified** `mysqldump` (or `mariadb-dump`) file,
+schema AND data sections, loads straight into an embedded catalog:
+
+```sh
+mysqldump -u root -p mydb > dump.sql
+spg import --db ./mydb.spgdb --file dump.sql
+```
+
+The data sections work as emitted: `/*!40000 …*/` executable
+conditional comments (FOREIGN_KEY_CHECKS off, DISABLE/ENABLE KEYS),
+`LOCK TABLES` wrappers, multi-row INSERT packing, and — the subtle
+one — MySQL backslash string escapes (`\'`). SPG switches its
+string-literal lexing per session on the dump's own `SET sql_mode`
+preamble, so MySQL escapes and PG's literal-backslash semantics
+coexist without flags. The dump-compat gate loads mysql:8.4 and
+mariadb:11.4 fixtures (schema and with-data) through `spg import`
+on every release.
+
+Note: feeding mysqldump DATA through **psql** does not work — psql
+itself splits statements with PG string rules and shreds
+backslash-escaped INSERTs before they reach any server. That's a
+transport property, not an SPG gap; use `spg import` or the mysql
+wire listener.
+
 If it loads, you're drop-in. If it doesn't, the harness will
 soon (T11+ MySQL panel) tell you which clause SPG needs to
 add — and a fixture PR keeps the coverage from regressing once
