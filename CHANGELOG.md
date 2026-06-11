@@ -8,6 +8,21 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.25.1] — 2026-06-11 (mailrs round-18: placeholders + clock calls reach CTE bodies)
+
+### Fixed
+
+- `$N` placeholders inside a CTE body were never substituted
+  (`PlaceholderOutOfRange` on first bound execution) and `NOW()`
+  inside a CTE survived to eval as "unknown function". Both
+  whole-statement rewrite passes now run through ONE canonical
+  Select traversal (`walk_select_exprs_mut`: CTE bodies, UNION
+  peers, LATERAL derived tables, JOIN ON) — ending the
+  hand-rolled-walker-misses-a-subtree bug class (round-12 #7b,
+  round-18). The sweep also closed `$N` in JOIN ON, clock calls in
+  LATERAL bodies, and `LIMIT $N`/`OFFSET $N` inside CTE bodies and
+  UNION peers.
+
 ## [7.25.0] — 2026-06-11 (mailrs round-17: the inbox query parses — ILIKE, DISTINCT aggregates, CAST(x AS t), CTE chains)
 
 Prod's inbox list was served entirely from mailrs's in-process
