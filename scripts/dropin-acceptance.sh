@@ -134,6 +134,52 @@ echo "=== PG dialect panel ==="
 
 # --- mailrs D-pre #1 reverse (tsvector ops) ---
 echo "[panel] D-pre #1 tsvector"
+# v7.27 — value-asserting variant: the statement's LAST output line
+# (psql -t -A) must equal the expectation. rc=0 alone lets silently
+# wrong results pass; the rounds 12-20 lesson is that seeded cases
+# with value checks catch what empty-table smoke cases miss.
+run_case_expect() {
+  local name="$1"
+  local sql="$2"
+  local want="$3"
+  local out rc got
+  out=$(echo "$sql" | $PSQL -t -A 2>&1)
+  rc=$?
+  got=$(echo "$out" | grep -v '^$' | tail -1 | tr -s ' ')
+  if [ "$rc" -eq 0 ] && [ "$got" = "$want" ]; then
+    PASS_COUNT=$((PASS_COUNT+1))
+    CASES+=("$name|PASS|")
+  else
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    local detail
+    if [ "$rc" -ne 0 ]; then
+      detail=$(echo "$out" | grep -E "^(ERROR|psql: error)" | head -1 | tr -s ' ')
+    else
+      detail="expected [$want] got [$got]"
+    fi
+    CASES+=("$name|FAIL|$detail")
+  fi
+}
+
+# Tolerant variant: statement errors do NOT stop the chunk (for
+# cases whose assertion is "the bad statement is rejected and the
+# final state proves it").
+run_case_expect_tolerant() {
+  local name="$1"
+  local sql="$2"
+  local want="$3"
+  local out got
+  out=$(echo "$sql" | ${PSQL/ON_ERROR_STOP=on/ON_ERROR_STOP=off} -t -A 2>&1)
+  got=$(echo "$out" | grep -vE '^$|^ERROR' | tail -1 | tr -s ' ')
+  if [ "$got" = "$want" ]; then
+    PASS_COUNT=$((PASS_COUNT+1))
+    CASES+=("$name|PASS|")
+  else
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    CASES+=("$name|FAIL|expected [$want] got [$got]")
+  fi
+}
+
 run_case "D-pre.1.to_tsvector" \
   "CREATE TABLE m1a (id INT, sv tsvector); INSERT INTO m1a VALUES (1, to_tsvector('english', 'hello world'));"
 run_case "D-pre.1.match_plainto" \
@@ -237,6 +283,56 @@ run_case "round12.extract_epoch" \
   "CREATE TABLE r12_c (id INT, created_at TIMESTAMPTZ); INSERT INTO r12_c VALUES (1, '2026-01-01 00:00:00+00'); SELECT EXTRACT(EPOCH FROM created_at)::BIGINT FROM r12_c;"
 run_case "round12.update_where_in_subquery" \
   "CREATE TABLE r12_d (id INT, state TEXT); INSERT INTO r12_d VALUES (1,'queued'),(2,'queued'),(3,'done'); UPDATE r12_d SET state = 'claimed' WHERE id IN (SELECT id FROM r12_d WHERE state = 'queued') RETURNING id; SELECT count(*) FROM r12_d WHERE state = 'claimed';"
+
+# --- rounds 13-20 shapes (universalised 2026-06-11) ---
+# Wire-mode (pgwire) mirrors of the embed e2e suites
+# crates/spg-embedded/tests/e2e/mailrs_round{13,14,15_16,17}.rs and
+# crates/spg-sqlx/tests/mailrs_round20.rs. Every case is SEEDED and
+# value-asserted: empty-table rc-only cases declared victory twice
+# during rounds 17-19. The typed-decode axis lives in the sqlx gate
+# (server-side RowDescription shares the same describe path).
+echo "[panel] rounds 13-20 (seeded, value-asserted)"
+run_case_expect "round13.serial_continuity_multirow" \
+  "CREATE TABLE r13_a (id BIGSERIAL PRIMARY KEY, v BIGINT); INSERT INTO r13_a (v) VALUES (10), (20); INSERT INTO r13_a (v) VALUES (30); SELECT max(id) FROM r13_a;" \
+  "3"
+# The duplicate INSERT is EXPECTED to error (that's the assertion);
+# run without ON_ERROR_STOP so the trailing count still executes.
+run_case_expect_tolerant "round13.inline_pk_enforces" \
+  "CREATE TABLE r13_b (id BIGINT PRIMARY KEY, v TEXT); INSERT INTO r13_b VALUES (1,'a'); INSERT INTO r13_b VALUES (1,'dup'); SELECT count(*) FROM r13_b;" \
+  "1"
+run_case_expect "round14.text_above_64k" \
+  "CREATE TABLE r14_a (id BIGINT, body TEXT); INSERT INTO r14_a VALUES (1, repeat('x', 70000)); SELECT length(body) FROM r14_a;" \
+  "70000"
+run_case_expect "round15.string_to_array" \
+  "SELECT (string_to_array('a,b,c', ','))[2];" \
+  "b"
+run_case_expect "round16.order_by_nulls_first" \
+  "CREATE TABLE r16_a (id BIGINT, ts BIGINT); INSERT INTO r16_a VALUES (1,200),(2,NULL),(3,100); SELECT id FROM r16_a ORDER BY ts ASC NULLS FIRST LIMIT 1;" \
+  "2"
+run_case_expect "round16.array_agg_internal_order" \
+  "CREATE TABLE r16_b (lvl TEXT, score BIGINT); INSERT INTO r16_b VALUES ('high',90),('low',10),('mid',NULL),('top',95); SELECT (array_agg(lvl ORDER BY score DESC NULLS LAST))[1] FROM r16_b;" \
+  "top"
+run_case_expect "round16.setweight_trigger_fires" \
+  "CREATE TABLE r16_c (s TEXT, sv tsvector); CREATE OR REPLACE FUNCTION r16_f() RETURNS trigger LANGUAGE plpgsql AS \$\$ BEGIN NEW.sv := setweight(to_tsvector('simple', COALESCE(NEW.s,'')), 'A'); RETURN NEW; END; \$\$; CREATE TRIGGER r16_tr BEFORE INSERT ON r16_c FOR EACH ROW EXECUTE FUNCTION r16_f(); INSERT INTO r16_c (s) VALUES ('hello world'); SELECT count(*) FROM r16_c WHERE sv @@ plainto_tsquery('simple','hello');" \
+  "1"
+run_case_expect "round16.correlated_not_exists_join" \
+  "CREATE TABLE r16_m (id BIGSERIAL PRIMARY KEY, size BIGINT, fid BIGINT); CREATE TABLE r16_ac (message_id BIGINT); CREATE TABLE r16_fo (id BIGINT PRIMARY KEY, name TEXT); INSERT INTO r16_m (size, fid) VALUES (10,1),(0,1),(20,1); INSERT INTO r16_ac VALUES (1); INSERT INTO r16_fo VALUES (1,'inbox'); SELECT m.id FROM r16_m m JOIN r16_fo f ON f.id = m.fid WHERE m.size > 0 AND NOT EXISTS (SELECT 1 FROM r16_ac ac WHERE ac.message_id = m.id) ORDER BY m.id DESC;" \
+  "3"
+run_case_expect "round17.ilike" \
+  "CREATE TABLE r17_a (s TEXT); INSERT INTO r17_a VALUES ('Hello World'),('goodbye'),(NULL); SELECT count(*) FROM r17_a WHERE s ILIKE '%hello%';" \
+  "1"
+run_case_expect "round17.distinct_agg_case_cast" \
+  "CREATE TABLE r17_b (t TEXT, sender TEXT, unread BIGINT); INSERT INTO r17_b VALUES ('t1','alice',1),('t1','alice',0),('t1','bob',1),('t2','carol',0); SELECT COUNT(DISTINCT CASE WHEN unread = 1 THEN CAST(sender AS TEXT) END) FROM r17_b WHERE t = 't1';" \
+  "2"
+run_case_expect "round17.cte_chain" \
+  "CREATE TABLE r17_c (id BIGINT, thread BIGINT, body TEXT); INSERT INTO r17_c VALUES (1,10,'invoice'),(2,10,'other'),(3,20,'x'); WITH matched AS (SELECT thread FROM r17_c WHERE body ILIKE '%invoice%'), cands AS (SELECT id FROM r17_c WHERE thread IN (SELECT thread FROM matched)) SELECT COUNT(*) FROM cands;" \
+  "2"
+run_case_expect "round19.correlated_scalar_in_group_by" \
+  "CREATE TABLE r19_m (id BIGINT, thread_id TEXT, internal_date BIGINT); CREATE TABLE r19_e (message_id BIGINT, category TEXT); INSERT INTO r19_m VALUES (1,'th1',100),(2,'th1',200),(3,'th2',50); INSERT INTO r19_e VALUES (1,'old'),(2,'new'),(3,'t2c'); SELECT COALESCE((SELECT e2.category FROM r19_e e2 JOIN r19_m m2 ON e2.message_id = m2.id WHERE m2.thread_id = m.thread_id ORDER BY m2.internal_date DESC LIMIT 1), 'general') FROM r19_m m GROUP BY m.thread_id ORDER BY m.thread_id LIMIT 1;" \
+  "new"
+run_case_expect "round20.aggregate_group_composite" \
+  "CREATE TABLE r20_m (id BIGSERIAL PRIMARY KEY, t TEXT, d BIGINT, pin BOOLEAN, score REAL); INSERT INTO r20_m (t,d,pin,score) VALUES ('th',100,true,0.5),('th',200,false,0.9); SELECT COUNT(DISTINCT id) || '/' || MAX(d) || '/' || COALESCE(BOOL_OR(pin), false) || '/' || COALESCE(MAX(score), 0.0) FROM r20_m GROUP BY t;" \
+  "2/200/true/0.9"
 
 # --- Fixture mode — apply each --fixture SQL file as a single chunk ---
 FIXTURE_REPORT=""
