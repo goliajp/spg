@@ -195,12 +195,20 @@ pub struct AggResult {
 /// Execute aggregate logic against an already-WHERE-filtered iterator of
 /// rows. `table_alias` is the alias accepted by column resolution.
 #[allow(clippy::too_many_lines)]
+/// v7.25.2 (round-19 A) — caller-injected evaluator for synth-row
+/// expressions that still carry subquery nodes after the rewrite
+/// (correlated subqueries in the select list / HAVING / aggregate
+/// ORDER BY of a GROUP BY query). The engine passes its
+/// correlated-aware evaluator; pure-library callers pass None and
+/// surviving subqueries keep erroring loudly.
+pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Result<Value, EvalError>;
+
 pub fn run(
     stmt: &SelectStatement,
     rows: &[&Row],
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
-    correlated_eval: Option<&dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Result<Value, EvalError>>,
+    correlated_eval: Option<CorrelatedEval<'_>>,
 ) -> Result<AggResult, EvalError> {
     let ctx = EvalContext::new(schema_cols, table_alias);
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
