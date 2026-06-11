@@ -6560,6 +6560,30 @@ impl Engine {
                 nulls_not_distinct: nnd,
             });
         }
+        // v7.24 (round-16 collateral) — inline `PRIMARY KEY` column
+        // constraints used to build only the implicit BTree index;
+        // uniqueness was NEVER registered, so duplicate keys were
+        // silently accepted (table-level PRIMARY KEY did enforce).
+        // Register the same UniquenessConstraint the table-level
+        // form gets, unless one already covers the column set.
+        if !inline_pk_columns.is_empty() {
+            let mut positions = Vec::with_capacity(inline_pk_columns.len());
+            for n in &inline_pk_columns {
+                if let Some(pos) = schema.columns.iter().position(|c| c.name == *n) {
+                    positions.push(pos);
+                }
+            }
+            if !uc_storage
+                .iter()
+                .any(|uc| uc.is_primary_key || uc.columns == positions)
+            {
+                uc_storage.push(spg_storage::UniquenessConstraint {
+                    is_primary_key: true,
+                    columns: positions,
+                    nulls_not_distinct: false,
+                });
+            }
+        }
         schema.uniqueness_constraints = uc_storage.clone();
         schema.checks = check_exprs;
         self.active_catalog_mut().create_table(schema)?;
@@ -6818,6 +6842,15 @@ impl Engine {
         // Stage 1 — parse + AUTO_INC + coerce all rows under the
         // single mutable borrow.
         let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(stmt.rows.len());
+        // v7.24 (round-16 collateral) — statement-scoped serial
+        // cursors. next_auto_value() is a max+1 scan over COMMITTED
+        // rows; multi-row `INSERT … VALUES (…),(…)` computed it per
+        // tuple BEFORE any insertion, so every row drew the SAME id
+        // (then sailed through, compounding with the inline-PK
+        // enforcement gap). First use per column seeds from the
+        // table; subsequent rows increment.
+        let mut auto_cursors: alloc::collections::BTreeMap<usize, i64> =
+            alloc::collections::BTreeMap::new();
         for tuple in stmt.rows {
             if tuple.len() != expected_tuple_len {
                 return Err(EngineError::Storage(StorageError::ArityMismatch {
@@ -6841,12 +6874,16 @@ impl Engine {
                         None => resolve_column_default_free(col, clock)?,
                     };
                     if col.auto_increment && raw.is_null() {
-                        let next = table.next_auto_value(i).ok_or_else(|| {
-                            EngineError::Unsupported(alloc::format!(
-                                "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                col.name
-                            ))
-                        })?;
+                        let next = match auto_cursors.get(&i) {
+                            Some(n) => *n,
+                            None => table.next_auto_value(i).ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                    col.name
+                                ))
+                            })?,
+                        };
+                        auto_cursors.insert(i, next + 1);
                         raw = Value::BigInt(next);
                     }
                     let coerced = coerce_value(raw, col.ty, &col.name, i)?;
@@ -6863,12 +6900,16 @@ impl Engine {
                 for (i, (col, expr)) in column_meta.iter().zip(tuple).enumerate() {
                     let mut raw = literal_expr_to_value(expr)?;
                     if col.auto_increment && raw.is_null() {
-                        let next = table.next_auto_value(i).ok_or_else(|| {
-                            EngineError::Unsupported(alloc::format!(
-                                "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                col.name
-                            ))
-                        })?;
+                        let next = match auto_cursors.get(&i) {
+                            Some(n) => *n,
+                            None => table.next_auto_value(i).ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                    col.name
+                                ))
+                            })?,
+                        };
+                        auto_cursors.insert(i, next + 1);
                         raw = Value::BigInt(next);
                     }
                     let coerced = coerce_value(raw, col.ty, &col.name, i)?;
@@ -7598,10 +7639,20 @@ impl Engine {
                 }
             }
         } else {
+            // v7.24 (round-16 B) — select-list subqueries resolve
+            // per row (correlated-aware; plain exprs take the fast
+            // path inside).
+            let mut proj_memo = memoize::MemoizeCache::default();
             for row in &filtered {
                 let mut vals = alloc::vec::Vec::with_capacity(projection.len());
                 for p in &projection {
-                    vals.push(eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?);
+                    vals.push(self.eval_expr_with_correlated(
+                        &p.expr,
+                        row,
+                        &scan_ctx,
+                        cancel,
+                        Some(&mut proj_memo),
+                    )?);
                 }
                 projected_rows.push(Row::new(vals));
             }
@@ -7631,10 +7682,8 @@ impl Engine {
                 .collect::<Result<_, _>>()?;
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
-                    let mut cmp = value_cmp(ka, kb);
-                    if stmt.order_by[idx].desc {
-                        cmp = cmp.reverse();
-                    }
+                    let o = &stmt.order_by[idx];
+                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
                     if cmp != core::cmp::Ordering::Equal {
                         return cmp;
                     }
@@ -7775,10 +7824,18 @@ impl Engine {
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
         let mut projected_rows: alloc::vec::Vec<Row> =
             alloc::vec::Vec::with_capacity(filtered.len());
+        let mut proj_memo = memoize::MemoizeCache::default();
         for row in &filtered {
             let mut vals = alloc::vec::Vec::with_capacity(projection.len());
             for p in &projection {
-                vals.push(eval::eval_expr(&p.expr, row, &scan_ctx).map_err(EngineError::Eval)?);
+                // v7.24 (round-16 B) — correlated-aware.
+                vals.push(self.eval_expr_with_correlated(
+                    &p.expr,
+                    row,
+                    &scan_ctx,
+                    cancel,
+                    Some(&mut proj_memo),
+                )?);
             }
             projected_rows.push(Row::new(vals));
         }
@@ -7804,10 +7861,8 @@ impl Engine {
                 .collect::<Result<_, _>>()?;
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
-                    let mut cmp = value_cmp(ka, kb);
-                    if stmt.order_by[idx].desc {
-                        cmp = cmp.reverse();
-                    }
+                    let o = &stmt.order_by[idx];
+                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
                     if cmp != core::cmp::Ordering::Equal {
                         return cmp;
                     }
@@ -7885,7 +7940,7 @@ impl Engine {
         // nested-loop join executor. Single-table FROM stays on the
         // existing scan + index-seek path.
         if !from.joins.is_empty() {
-            return self.exec_joined_select(stmt, from);
+            return self.exec_joined_select(stmt, from, cancel);
         }
         // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>`. Synthesise a
         // single-column table at SELECT entry by evaluating the
@@ -8056,7 +8111,8 @@ impl Engine {
             } else {
                 let mut values = Vec::with_capacity(projection.len());
                 for p in &projection {
-                    values.push(eval::eval_expr(&p.expr, row, &ctx)?);
+                    // v7.24 (round-16 B) — correlated-aware.
+                    values.push(self.eval_expr_with_correlated(&p.expr, row, &ctx, cancel, None)?);
                 }
                 tagged.push((order_keys, Row::new(values)));
             }
@@ -8232,6 +8288,7 @@ impl Engine {
         &self,
         from: &FromClause,
         where_: Option<&Expr>,
+        cancel: CancelToken<'_>,
     ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
         let (primary_rows, primary_cols) = self.materialise_table_ref(&from.primary)?;
         let primary_alias = from
@@ -8350,9 +8407,21 @@ impl Engine {
             debug_assert!(consumed_cols <= combined_schema.len());
         }
         let mut filtered: Vec<Row> = Vec::new();
+        // v7.24 (round-16 B) — the joined WHERE filter ran the plain
+        // row evaluator, so a correlated EXISTS/IN/scalar subquery
+        // under a JOIN hit "subquery reached row eval". Route through
+        // the correlated-aware evaluator (memoized, same as the
+        // single-table path).
+        let mut memo = memoize::MemoizeCache::default();
         for row in working {
             if let Some(where_expr) = where_ {
-                let cond = eval::eval_expr(where_expr, &row, &ctx)?;
+                let cond = self.eval_expr_with_correlated(
+                    where_expr,
+                    &row,
+                    &ctx,
+                    cancel,
+                    Some(&mut memo),
+                )?;
                 if !matches!(cond, Value::Bool(true)) {
                     continue;
                 }
@@ -8440,6 +8509,7 @@ impl Engine {
         &self,
         stmt: &SelectStatement,
         from: &FromClause,
+        cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         // v7.17.0 Phase 3.P0-43 + P0-41 — delegate the join +
         // WHERE materialisation to the shared helper so the LATERAL
@@ -8449,7 +8519,7 @@ impl Engine {
         // projection / ORDER BY / DISTINCT / LIMIT inline because
         // those depend on the SelectStatement's items list.
         let (combined_schema, filtered) =
-            self.build_joined_filtered_rows(from, stmt.where_.as_ref())?;
+            self.build_joined_filtered_rows(from, stmt.where_.as_ref(), cancel)?;
         let ctx = EvalContext::new(&combined_schema, None);
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
@@ -8465,10 +8535,19 @@ impl Engine {
 
         let projection = build_projection(&stmt.items, &combined_schema, "")?;
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
+        let mut proj_memo = memoize::MemoizeCache::default();
         for row in &filtered {
             let mut values = Vec::with_capacity(projection.len());
             for p in &projection {
-                values.push(eval::eval_expr(&p.expr, row, &ctx)?);
+                // v7.24 (round-16 B) — select-list subqueries under a
+                // JOIN go through the correlated-aware evaluator too.
+                values.push(self.eval_expr_with_correlated(
+                    &p.expr,
+                    row,
+                    &ctx,
+                    cancel,
+                    Some(&mut proj_memo),
+                )?);
             }
             let order_keys = if stmt.order_by.is_empty() {
                 Vec::new()
@@ -9673,7 +9752,7 @@ impl Engine {
             filtered = owned;
         } else {
             let (combined_schema, rows) =
-                self.build_joined_filtered_rows(from, stmt.where_.as_ref())?;
+                self.build_joined_filtered_rows(from, stmt.where_.as_ref(), cancel)?;
             schema_cols_owned = combined_schema;
             alias_opt = None;
             filtered = rows;
@@ -9898,6 +9977,16 @@ impl Engine {
                 // function-name introspection (ORM / pgAdmin).
                 "__spg_pg_proc" => {
                     let (schema, rows) = synth_pg_proc(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.24 (round-16 D) — pg_catalog.pg_trigger. The
+                // round-16 "why doesn't prod fire the trigger"
+                // question was unanswerable because triggers had NO
+                // introspection surface; tgname/tgenabled plus the
+                // pragmatic relname/timing/events/function columns
+                // make "is it registered and enabled" a one-liner.
+                "__spg_pg_trigger" => {
+                    let (schema, rows) = synth_pg_trigger(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-52 — pg_catalog.pg_namespace
@@ -10278,6 +10367,12 @@ impl Engine {
             return Ok(());
         }
         match e {
+            Expr::AggregateOrdered { call, order_by } => {
+                self.resolve_expr_subqueries(call, cancel)?;
+                for o in order_by.iter_mut() {
+                    self.resolve_expr_subqueries(&mut o.expr, cancel)?;
+                }
+            }
             Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr_subqueries(lhs, cancel)?;
                 self.resolve_expr_subqueries(rhs, cancel)?;
@@ -10388,6 +10483,18 @@ impl Engine {
         mut memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<(), EngineError> {
         match e {
+            Expr::AggregateOrdered { call, order_by } => {
+                self.resolve_correlated_in_expr(call, row, ctx, cancel, memo.as_deref_mut())?;
+                for o in order_by.iter_mut() {
+                    self.resolve_correlated_in_expr(
+                        &mut o.expr,
+                        row,
+                        ctx,
+                        cancel,
+                        memo.as_deref_mut(),
+                    )?;
+                }
+            }
             Expr::ScalarSubquery(inner) => {
                 // v6.2.6 — Memoize: build the cache key from the
                 // pre-substitution subquery repr + the outer row's
@@ -10691,6 +10798,9 @@ fn from_refers_to(from: &FromClause, target: &str) -> bool {
 
 fn expr_refers_to(e: &Expr, target: &str) -> bool {
     match e {
+        Expr::AggregateOrdered { call, order_by } => {
+            expr_refers_to(call, target) || order_by.iter().any(|o| expr_refers_to(&o.expr, target))
+        }
         Expr::ScalarSubquery(s) => select_refers_to(s, target),
         Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
             select_refers_to(subquery, target)
@@ -11030,6 +11140,37 @@ fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
 ///   * prokind (Text) — 'f' function, 'a' aggregate, 'w' window
 ///   * pronargs (SmallInt) — declared arg count (-1 for variadic)
 ///   * prorettype (BigInt) — return type OID (matches synth_pg_type)
+/// v7.24 (round-16 D) — synthesise `pg_catalog.pg_trigger` from the
+/// live catalog. PG-shaped core columns (tgname, tgenabled with
+/// 'O'/'D') plus pragmatic text columns PG keeps relational
+/// (relname, timing, events, function) so health checks don't need
+/// oid joins.
+fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("tgname", DataType::Text, false),
+        ColumnSchema::new("relname", DataType::Text, false),
+        ColumnSchema::new("tgenabled", DataType::Text, false),
+        ColumnSchema::new("timing", DataType::Text, false),
+        ColumnSchema::new("events", DataType::Text, false),
+        ColumnSchema::new("function", DataType::Text, false),
+    ];
+    let rows: Vec<Row> = cat
+        .triggers()
+        .iter()
+        .map(|t| {
+            Row::new(alloc::vec![
+                Value::Text(t.name.clone()),
+                Value::Text(t.table.clone()),
+                Value::Text(if t.enabled { "O".into() } else { "D".into() }),
+                Value::Text(t.timing.clone()),
+                Value::Text(t.events.join(" OR ")),
+                Value::Text(t.function.clone()),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
 fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
@@ -12333,9 +12474,13 @@ fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row, outer_schema: &[Colum
 }
 
 fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row, ctx: &EvalContext<'_>) {
-    let Some(outer_alias) = ctx.table_alias else {
-        return;
-    };
+    // v7.24 (round-16 B) — joined outer contexts carry no single
+    // table alias; their schemas use composite "alias.column" names
+    // instead. Pass an unmatchable alias and let the composite
+    // lookup in substitute_in_expr do the work (a correlated EXISTS
+    // under a JOIN previously skipped substitution entirely and
+    // died with "unknown table qualifier").
+    let outer_alias = ctx.table_alias.unwrap_or("");
     substitute_in_select(stmt, row, ctx, outer_alias);
 }
 
@@ -12372,14 +12517,24 @@ fn substitute_in_select(
 fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alias: &str) {
     if let Expr::Column(c) = e
         && let Some(qual) = &c.qualifier
-        && qual.eq_ignore_ascii_case(outer_alias)
     {
-        // Look up the column's index in the outer schema.
-        if let Some(idx) = ctx
-            .columns
-            .iter()
-            .position(|sc| sc.name.eq_ignore_ascii_case(&c.name))
-        {
+        // Look up the column's index in the outer schema: plain name
+        // when the qualifier is the outer table's alias, composite
+        // "alias.column" for joined outer schemas (v7.24).
+        let idx = if !outer_alias.is_empty() && qual.eq_ignore_ascii_case(outer_alias) {
+            ctx.columns
+                .iter()
+                .position(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+        } else {
+            None
+        }
+        .or_else(|| {
+            let composite = alloc::format!("{qual}.{name}", name = c.name);
+            ctx.columns
+                .iter()
+                .position(|sc| sc.name.eq_ignore_ascii_case(&composite))
+        });
+        if let Some(idx) = idx {
             let v = row.values.get(idx).cloned().unwrap_or(Value::Null);
             if let Ok(lit) = value_to_literal_expr(v) {
                 *e = lit;
@@ -12388,6 +12543,12 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
         }
     }
     match e {
+        Expr::AggregateOrdered { call, order_by } => {
+            substitute_in_expr(call, row, ctx, outer_alias);
+            for o in order_by.iter_mut() {
+                substitute_in_expr(&mut o.expr, row, ctx, outer_alias);
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
             substitute_in_expr(lhs, row, ctx, outer_alias);
             substitute_in_expr(rhs, row, ctx, outer_alias);
@@ -12484,6 +12645,9 @@ fn select_has_window(stmt: &SelectStatement) -> bool {
 fn expr_has_window(e: &Expr) -> bool {
     match e {
         Expr::WindowFunction { .. } => true,
+        Expr::AggregateOrdered { call, order_by } => {
+            expr_has_window(call) || order_by.iter().any(|o| expr_has_window(&o.expr))
+        }
         Expr::Binary { lhs, rhs, .. } => expr_has_window(lhs) || expr_has_window(rhs),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
             expr_has_window(expr)
@@ -12728,6 +12892,41 @@ fn generate_series_timestamps(
 }
 
 #[allow(clippy::match_same_arms)] // explicit arms per type document the supported pairs
+/// v7.24 (round-16 A) — per-key ORDER BY comparator honouring DESC
+/// and the effective NULLS placement (explicit NULLS FIRST/LAST,
+/// else the PG default: NULLS LAST for ASC, NULLS FIRST for DESC).
+/// NULL placement is absolute — it does not flip with DESC.
+pub(crate) fn order_by_value_cmp(
+    desc: bool,
+    nulls_first: Option<bool>,
+    a: &Value,
+    b: &Value,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let nf = nulls_first.unwrap_or(desc);
+    match (matches!(a, Value::Null), matches!(b, Value::Null)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nf {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nf {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let c = value_cmp(a, b);
+            if desc { c.reverse() } else { c }
+        }
+    }
+}
+
 fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (a, b) {
@@ -13339,6 +13538,9 @@ fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
 fn expr_has_subquery(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::AggregateOrdered { call, order_by } => {
+            expr_has_subquery(call) || order_by.iter().any(|o| expr_has_subquery(&o.expr))
+        }
         Expr::Binary { lhs, rhs, .. } => expr_has_subquery(lhs) || expr_has_subquery(rhs),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
             expr_has_subquery(expr)
@@ -13537,6 +13739,12 @@ fn rewrite_column_in_source(
 /// qualifier present is either redundant or wrong.
 fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
     match e {
+        Expr::AggregateOrdered { call, order_by } => {
+            rewrite_column_in_expr(call, old, new);
+            for o in order_by.iter_mut() {
+                rewrite_column_in_expr(&mut o.expr, old, new);
+            }
+        }
         Expr::Column(c) => {
             if c.name.eq_ignore_ascii_case(old) {
                 c.name = new.to_string();
@@ -13756,6 +13964,12 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
         return Ok(());
     }
     match e {
+        Expr::AggregateOrdered { call, order_by } => {
+            substitute_expr(call, params)?;
+            for o in order_by.iter_mut() {
+                substitute_expr(&mut o.expr, params)?;
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
             substitute_expr(lhs, params)?;
             substitute_expr(rhs, params)?;
@@ -14123,6 +14337,12 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         return;
     }
     match e {
+        Expr::AggregateOrdered { call, order_by } => {
+            rewrite_expr_clock(call, now);
+            for o in order_by.iter_mut() {
+                rewrite_expr_clock(&mut o.expr, now);
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
             rewrite_expr_clock(lhs, now);
             rewrite_expr_clock(rhs, now);
@@ -14389,7 +14609,22 @@ fn build_order_keys(
     let mut keys = Vec::with_capacity(order_by.len());
     for o in order_by {
         let v = eval::eval_expr(&o.expr, row, ctx)?;
-        keys.push(value_to_order_key(&v)?);
+        // v7.24 (round-16 A) — explicit NULLS FIRST/LAST. The f64
+        // packing sorts ascending THEN applies the per-key DESC
+        // reverse, so a NULL must land at +INF exactly when the
+        // effective placement agrees with the reverse direction:
+        // nf == desc → +INF (ASC default last / DESC default
+        // first), nf != desc → -INF (the explicit flips).
+        if matches!(v, Value::Null) {
+            let nf = o.nulls_first.unwrap_or(o.desc);
+            keys.push(if nf == o.desc {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            });
+        } else {
+            keys.push(value_to_order_key(&v)?);
+        }
     }
     Ok(keys)
 }

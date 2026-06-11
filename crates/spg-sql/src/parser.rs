@@ -4328,6 +4328,7 @@ impl Parser {
             "pg_proc",
             "pg_roles",
             "pg_settings",
+            "pg_trigger",
             "pg_type",
             "pg_user",
             "pg_views",
@@ -4420,7 +4421,13 @@ impl Parser {
                 } else {
                     false
                 };
-                keys.push(OrderBy { expr, desc });
+                // v7.24 (round-16 A) — explicit NULLS FIRST/LAST.
+                let nulls_first = self.parse_optional_nulls_placement()?;
+                keys.push(OrderBy {
+                    expr,
+                    desc,
+                    nulls_first,
+                });
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                 } else {
@@ -5558,6 +5565,22 @@ impl Parser {
     /// reserved tokens; NULLS / FIRST / LAST are bare idents.
     /// We accept and discard them since single-column BTree
     /// stores rows in natural key order today.
+    /// v7.24 (round-16 A) — `NULLS FIRST` / `NULLS LAST` after an
+    /// ORDER BY key. Returns None when absent.
+    fn parse_optional_nulls_placement(&mut self) -> Result<Option<bool>, ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("nulls")) {
+            return Ok(None);
+        }
+        self.advance();
+        match self.advance() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("first") => Ok(Some(true)),
+            Token::Ident(s) if s.eq_ignore_ascii_case("last") => Ok(Some(false)),
+            other => Err(self.err(alloc::format!(
+                "expected FIRST or LAST after NULLS, got {other:?}"
+            ))),
+        }
+    }
+
     fn consume_optional_index_column_qualifiers(&mut self) {
         loop {
             match self.peek() {
@@ -8685,9 +8708,53 @@ impl Parser {
             }
             // Function call. PG-style: zero-or-more comma-separated args.
             let mut args = Vec::new();
+            let mut agg_order_by: Vec<OrderBy> = Vec::new();
             if !matches!(self.peek(), Token::RParen) {
                 loop {
                     args.push(self.parse_expr(0)?);
+                    // v7.24 (round-16 A) — aggregate-internal
+                    // ordering: `array_agg(x ORDER BY y DESC NULLS
+                    // LAST)`. Keys close the argument list.
+                    if matches!(self.peek(), Token::Order) {
+                        self.advance();
+                        if !matches!(self.peek(), Token::By) {
+                            return Err(self.err(format!(
+                                "expected BY after ORDER in aggregate args, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        loop {
+                            let expr = self.parse_expr(0)?;
+                            let desc = if matches!(self.peek(), Token::Desc) {
+                                self.advance();
+                                true
+                            } else if matches!(self.peek(), Token::Asc) {
+                                self.advance();
+                                false
+                            } else {
+                                false
+                            };
+                            let nulls_first = self.parse_optional_nulls_placement()?;
+                            agg_order_by.push(OrderBy {
+                                expr,
+                                desc,
+                                nulls_first,
+                            });
+                            if matches!(self.peek(), Token::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' after aggregate ORDER BY, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        break;
+                    }
                     match self.peek() {
                         Token::Comma => {
                             self.advance();
@@ -8721,6 +8788,12 @@ impl Parser {
                     order_by,
                     frame,
                     null_treatment,
+                });
+            }
+            if !agg_order_by.is_empty() {
+                return Ok(Expr::AggregateOrdered {
+                    call: Box::new(Expr::FunctionCall { name: first, args }),
+                    order_by: agg_order_by,
                 });
             }
             return Ok(Expr::FunctionCall { name: first, args });

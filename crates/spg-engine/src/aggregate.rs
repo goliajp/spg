@@ -61,6 +61,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::FunctionCall { name, args } => {
             is_aggregate_name(name) || args.iter().any(contains_aggregate)
         }
+        Expr::AggregateOrdered { .. } => true,
         Expr::Binary { lhs, rhs, .. } => contains_aggregate(lhs) || contains_aggregate(rhs),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
             contains_aggregate(expr)
@@ -140,6 +141,10 @@ struct AggState {
     /// PG behaviour when no `ORDER BY` is given inside the
     /// aggregate call.
     items: Vec<Value>,
+    /// v7.24 (round-16 A) — per-item ORDER BY key tuples, parallel
+    /// to `items` (pushed under the same skip/keep conditions).
+    /// Empty when the aggregate carries no internal ordering.
+    item_keys: Vec<Vec<Value>>,
     /// v7.17.0 — captured separator for string_agg. PG accepts a
     /// non-constant separator expression but in practice every
     /// caller passes a literal; the engine snapshots the last
@@ -164,6 +169,12 @@ struct AggSpec {
     /// per-row evaluation can re-use the same separator
     /// expression across calls.
     arg2: Option<Expr>,
+    /// v7.24 (round-16 A) — aggregate-internal ORDER BY keys
+    /// (`array_agg(x ORDER BY y DESC NULLS LAST)`). Empty for the
+    /// plain form. Only the collection aggregates honour it;
+    /// other aggregates are order-insensitive and ignore it (PG
+    /// accepts the syntax everywhere too).
+    order_by: Vec<spg_sql::ast::OrderBy>,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -260,7 +271,24 @@ pub fn run(
                 None => None,
                 Some(e) => Some(eval::eval_expr(e, row, &ctx)?),
             };
-            update_state(&mut entry.1[i], &spec.name, &arg_val, arg2_val.as_ref())?;
+            // v7.24 (round-16 A) — aggregate-internal ORDER BY:
+            // evaluate the key tuple against the source row.
+            let order_keys = if spec.order_by.is_empty() {
+                None
+            } else {
+                let mut keys = Vec::with_capacity(spec.order_by.len());
+                for o in &spec.order_by {
+                    keys.push(eval::eval_expr(&o.expr, row, &ctx)?);
+                }
+                Some(keys)
+            };
+            update_state(
+                &mut entry.1[i],
+                &spec.name,
+                &arg_val,
+                arg2_val.as_ref(),
+                order_keys,
+            )?;
         }
     }
 
@@ -294,7 +322,36 @@ pub fn run(
         let mut values: Vec<Value> = Vec::with_capacity(synth_schema.len());
         values.extend(gvals.iter().cloned());
         for (i, st) in states.iter().enumerate() {
-            values.push(finalize(&agg_specs[i].name, st));
+            // v7.24 (round-16 A) — order the collected items per the
+            // aggregate-internal ORDER BY before finalize consumes
+            // them.
+            let st_sorted;
+            let st_final: &AggState =
+                if !agg_specs[i].order_by.is_empty() && st.item_keys.len() == st.items.len() {
+                    let mut idx: Vec<usize> = (0..st.items.len()).collect();
+                    let ob = &agg_specs[i].order_by;
+                    idx.sort_by(|&x, &y| {
+                        for (k, o) in ob.iter().enumerate() {
+                            let cmp = crate::order_by_value_cmp(
+                                o.desc,
+                                o.nulls_first,
+                                &st.item_keys[x][k],
+                                &st.item_keys[y][k],
+                            );
+                            if cmp != core::cmp::Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        core::cmp::Ordering::Equal
+                    });
+                    let mut sorted = st.clone();
+                    sorted.items = idx.iter().map(|&j| st.items[j].clone()).collect();
+                    st_sorted = sorted;
+                    &st_sorted
+                } else {
+                    st
+                };
+            values.push(finalize(&agg_specs[i].name, st_final));
         }
         synth_rows.push(Row::new(values));
     }
@@ -361,7 +418,11 @@ pub fn run(
             .iter()
             .map(|o| rewrite_expr(&o.expr, &group_exprs, &agg_specs))
             .collect();
-        let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+        let keys_meta: Vec<(bool, Option<bool>)> = stmt
+            .order_by
+            .iter()
+            .map(|o| (o.desc, o.nulls_first))
+            .collect();
         let mut tagged: Vec<(Vec<Value>, Row)> = kept_synth
             .into_iter()
             .zip(out_rows)
@@ -376,8 +437,8 @@ pub fn run(
         tagged.sort_by(|a, b| {
             use core::cmp::Ordering;
             for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
-                let cmp = value_cmp(ka, kb);
-                let cmp = if descs[i] { cmp.reverse() } else { cmp };
+                let (desc, nf) = keys_meta[i];
+                let cmp = crate::order_by_value_cmp(desc, nf, ka, kb);
                 if cmp != Ordering::Equal {
                     return cmp;
                 }
@@ -449,6 +510,43 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
 
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
+        // v7.24 (round-16 A) — ordered aggregate: register the inner
+        // call's spec with the ordering attached.
+        Expr::AggregateOrdered { call, order_by } => {
+            if let Expr::FunctionCall { name, args } = call.as_ref() {
+                let lower = name.to_ascii_lowercase();
+                if is_aggregate_name(&lower) {
+                    let canonical = if lower == "every" {
+                        "bool_and".to_string()
+                    } else {
+                        lower
+                    };
+                    let spec = AggSpec {
+                        name: canonical,
+                        arg: args.first().cloned(),
+                        arg2: if name.eq_ignore_ascii_case("string_agg") {
+                            args.get(1).cloned()
+                        } else {
+                            None
+                        },
+                        order_by: order_by.clone(),
+                    };
+                    if !out.iter().any(|s| {
+                        s.name == spec.name
+                            && s.arg == spec.arg
+                            && s.arg2 == spec.arg2
+                            && s.order_by == spec.order_by
+                    }) {
+                        out.push(spec);
+                    }
+                    return;
+                }
+            }
+            collect_aggregates(call, out);
+            for o in order_by {
+                collect_aggregates(&o.expr, out);
+            }
+        }
         Expr::FunctionCall { name, args } => {
             let lower = name.to_ascii_lowercase();
             if is_aggregate_name(&lower) {
@@ -477,11 +575,14 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     name: canonical,
                     arg: arg.clone(),
                     arg2: arg2.clone(),
+                    order_by: Vec::new(),
                 };
-                if !out
-                    .iter()
-                    .any(|s| s.name == spec.name && s.arg == spec.arg && s.arg2 == spec.arg2)
-                {
+                if !out.iter().any(|s| {
+                    s.name == spec.name
+                        && s.arg == spec.arg
+                        && s.arg2 == spec.arg2
+                        && s.order_by == spec.order_by
+                }) {
                     out.push(spec);
                 }
                 // Don't recurse into the arg — nested aggregates are
@@ -552,6 +653,7 @@ fn update_state(
     name: &str,
     v: &Value,
     arg2: Option<&Value>,
+    order_keys: Option<Vec<Value>>,
 ) -> Result<(), EvalError> {
     let is_null = matches!(v, Value::Null);
     match name {
@@ -624,6 +726,9 @@ fn update_state(
             }
             if let Value::Text(s) = v {
                 st.items.push(Value::Text(s.clone()));
+                if let Some(k) = order_keys {
+                    st.item_keys.push(k);
+                }
                 st.count += 1;
             } else {
                 return Err(EvalError::TypeMismatch {
@@ -638,6 +743,9 @@ fn update_state(
         // rows must match (PG also rejects mixed-type array_agg).
         "array_agg" => {
             st.items.push(v.clone());
+            if let Some(k) = order_keys {
+                st.item_keys.push(k);
+            }
             st.count += 1;
         }
         // v7.17.0 — bool_and(p): TRUE iff every non-NULL input is
@@ -817,6 +925,34 @@ fn agg_or_group_type(e: &Expr, synth: &[ColumnSchema]) -> DataType {
 }
 
 fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
+    // v7.24 (round-16 A) — ordered aggregate: match on the inner
+    // call PLUS the ordering keys.
+    if let Expr::AggregateOrdered { call, order_by } = e
+        && let Expr::FunctionCall { name, args } = call.as_ref()
+    {
+        let lower = name.to_ascii_lowercase();
+        if is_aggregate_name(&lower) {
+            let canonical: &str = if lower == "every" { "bool_and" } else { &lower };
+            let arg = args.first().cloned();
+            let arg2 = if lower == "string_agg" {
+                args.get(1).cloned()
+            } else {
+                None
+            };
+            for (i, spec) in aggs.iter().enumerate() {
+                if spec.name == canonical
+                    && spec.arg == arg
+                    && spec.arg2 == arg2
+                    && spec.order_by == *order_by
+                {
+                    return Expr::Column(spg_sql::ast::ColumnName {
+                        qualifier: None,
+                        name: format!("__agg_{i}"),
+                    });
+                }
+            }
+        }
+    }
     // Match aggregate FunctionCalls first — they sit outside group_by.
     if let Expr::FunctionCall { name, args } = e {
         let lower = name.to_ascii_lowercase();
@@ -842,7 +978,11 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                 lower.as_str()
             };
             for (i, spec) in aggs.iter().enumerate() {
-                if spec.name == canonical && spec.arg == arg && spec.arg2 == arg2 {
+                if spec.name == canonical
+                    && spec.arg == arg
+                    && spec.arg2 == arg2
+                    && spec.order_by.is_empty()
+                {
                     return Expr::Column(spg_sql::ast::ColumnName {
                         qualifier: None,
                         name: format!("__agg_{i}"),
@@ -862,6 +1002,17 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
     }
     // Recurse into children.
     match e {
+        Expr::AggregateOrdered { call, order_by } => Expr::AggregateOrdered {
+            call: Box::new(rewrite_expr(call, group_exprs, aggs)),
+            order_by: order_by
+                .iter()
+                .map(|o| spg_sql::ast::OrderBy {
+                    expr: rewrite_expr(&o.expr, group_exprs, aggs),
+                    desc: o.desc,
+                    nulls_first: o.nulls_first,
+                })
+                .collect(),
+        },
         Expr::Binary { lhs, op, rhs } => Expr::Binary {
             lhs: Box::new(rewrite_expr(lhs, group_exprs, aggs)),
             op: *op,
