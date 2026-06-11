@@ -8,6 +8,30 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.26.0] — 2026-06-11 (mailrs round-20: typed aggregate columns + honest missing-column errors)
+
+### Fixed
+
+- **Aggregate / expression output columns reported TEXT** in
+  RowDescription — `MAX(bigint)`, `COUNT(DISTINCT …)`, `BOOL_OR`,
+  `COALESCE(MAX(real), 0.0)`, `(array_agg(…))[1]`, CASE — breaking
+  every sqlx typed decode over the embed path. Types now derive
+  statically at three layers (describe, aggregate output schema,
+  compound output expressions).
+- **Honest missing-column errors on joined aliases**: a qualified
+  reference to a column that doesn't exist on a KNOWN join alias
+  reported "unknown table qualifier" — which sent two rounds
+  hunting a resolver bug when the actual cause was a fixture column
+  missing from mailrs's init-schema (round-20 B root cause,
+  upstream of SPG). It now reports `column "alias.col" not found`.
+
+### Added
+
+- spg-sqlx typed composite gate: the verbatim mailrs
+  search_conversations SQL, seeded, decoded into the exact
+  16-column typed tuple — pins this round plus the round-17/18/19
+  shapes on the sqlx dispatch path.
+
 ## [7.25.2] — 2026-06-11 (mailrs round-19: correlated subqueries in GROUP BY select lists)
 
 ### Fixed
