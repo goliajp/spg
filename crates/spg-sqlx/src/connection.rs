@@ -386,14 +386,52 @@ async fn run_one(
         // executor: snapshot clone is an Arc bump (~0 µs), the
         // prepared execute is ~2 µs CPU. No spawn_blocking, no
         // thread hop. Per-statement snapshot = PG read-committed.
+        //
+        // v7.28 (round-22) — INLINE WITH A BUDGET. Inline is perfect
+        // at 2 µs and fatal at 60 s: four slow inbox queries
+        // saturated mailrs's entire tokio worker pool, starving
+        // every other endpoint including /logout. The inline run is
+        // bounded (SPG_SQLX_INLINE_BUDGET_MS, default 25 ms); on
+        // budget expiry the SAME snapshot + statement re-runs to
+        // completion on the blocking pool, off the async workers.
         let snap = conn.inner.clone_snapshot_inline().await;
         let params = arguments.map(crate::SpgArguments::into_engine_values);
-        spg_embedded::Database::execute_prepared_on_snapshot(
+        let budget_ms: u64 = std::env::var("SPG_SQLX_INLINE_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(25);
+        let inline = spg_embedded::Database::execute_prepared_on_snapshot_with_budget(
             &snap,
             &c.stmt,
             params.as_deref().unwrap_or(&[]),
-        )
-        .map_err(engine_to_sqlx)?
+            budget_ms.saturating_mul(1_000),
+        );
+        match inline {
+            Ok(r) => r,
+            Err(spg_embedded::EngineError::Cancelled) => {
+                // The embed-side slow-query signal: one line per
+                // escape, mirroring the server's slow_query_log.
+                eprintln!(
+                    "spg-sqlx: readonly query exceeded the {budget_ms} ms inline budget; \
+                     continuing on the blocking pool: {}",
+                    &sql[..sql.len().min(120)]
+                );
+                let stmt = c.stmt.clone();
+                let params_owned: Vec<spg_embedded::Value> =
+                    params.as_deref().unwrap_or(&[]).to_vec();
+                tokio::task::spawn_blocking(move || {
+                    spg_embedded::Database::execute_prepared_on_snapshot(
+                        &snap,
+                        &stmt,
+                        &params_owned,
+                    )
+                })
+                .await
+                .map_err(|e| Error::Protocol(format!("blocking-pool join: {e}")))?
+                .map_err(engine_to_sqlx)?
+            }
+            Err(e) => return Err(engine_to_sqlx(e)),
+        }
     } else {
         let db = &conn.inner;
         if let Some(args) = arguments {

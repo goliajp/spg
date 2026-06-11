@@ -102,3 +102,21 @@ async fn missing_joined_column_reports_column_not_found() {
     assert!(msg.contains("ea.no_such_column"), "{msg}");
     assert!(!msg.contains("unknown table qualifier"), "{msg}");
 }
+
+/// Round-22 — the readonly-inline budget: a query that blows the
+/// inline budget still completes (escaping to the blocking pool)
+/// and returns correct results.
+#[tokio::test]
+async fn inline_budget_escape_completes() {
+    // Force an aggressively small budget so even modest queries
+    // escape; correctness must be unaffected.
+    unsafe { std::env::set_var("SPG_SQLX_INLINE_BUDGET_MS", "0") };
+    let pool = seeded_pool().await;
+    let rows: Vec<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE id > $1")
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].0, 2);
+    unsafe { std::env::remove_var("SPG_SQLX_INLINE_BUDGET_MS") };
+}

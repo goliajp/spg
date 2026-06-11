@@ -2175,6 +2175,43 @@ impl Database {
         )
     }
 
+    /// v7.28 (round-22) — deadline-bounded variant of
+    /// [`Database::execute_prepared_on_snapshot`]. Returns
+    /// `EngineError::Cancelled` once the budget elapses; the
+    /// sqlx driver uses this to keep readonly-INLINE execution
+    /// from monopolising the caller's async runtime (four slow
+    /// inbox queries saturated mailrs's whole tokio pool) and
+    /// re-runs over the blocking pool on timeout.
+    ///
+    /// # Errors
+    /// `EngineError::Cancelled` on budget expiry; engine errors
+    /// otherwise.
+    pub fn execute_prepared_on_snapshot_with_budget(
+        snapshot: &CatalogSnapshot,
+        stmt: &Statement,
+        params: &[Value],
+        budget_us: u64,
+    ) -> Result<QueryResult, EngineError> {
+        fn mono_now_us() -> u64 {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            // Monotonic enough for a per-call relative budget: the
+            // engine only compares (now - start) against the budget
+            // within one call.
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+                .unwrap_or(0)
+        }
+        let deadline = mono_now_us().saturating_add(budget_us);
+        let token = spg_engine::CancelToken::none().with_deadline(mono_now_us, deadline);
+        spg_engine::Engine::execute_readonly_prepared_on_snapshot_with_cancel(
+            snapshot,
+            stmt.stmt.clone(),
+            params,
+            token,
+        )
+    }
+
     /// v7.18 — describe a SQL string against a
     /// `CatalogSnapshot`. Mirror of [`Database::describe`] on
     /// the readonly path. Pure function on the snapshot's
