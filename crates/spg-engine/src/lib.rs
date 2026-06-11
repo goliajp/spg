@@ -7592,8 +7592,23 @@ impl Engine {
         // unnest(ARRAY[…])` either errored at projection time or
         // returned the wrong shape.
         if aggregate::uses_aggregate(stmt) {
+            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                    .map_err(|err| match err {
+                        EngineError::Eval(ev) => ev,
+                        other => eval::EvalError::TypeMismatch {
+                            detail: alloc::format!("{other}"),
+                        },
+                    })
+            };
             let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
-            let mut agg = aggregate::run(stmt, &filtered_refs, &schema_cols, Some(&alias))?;
+            let mut agg = aggregate::run(
+                stmt,
+                &filtered_refs,
+                &schema_cols,
+                Some(&alias),
+                Some(&agg_correlated),
+            )?;
             apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
@@ -7812,8 +7827,23 @@ impl Engine {
         // time. GROUP BY / HAVING / ORDER BY over the aggregate
         // output all ride through `aggregate::run`.
         if aggregate::uses_aggregate(stmt) {
+            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                    .map_err(|err| match err {
+                        EngineError::Eval(ev) => ev,
+                        other => eval::EvalError::TypeMismatch {
+                            detail: alloc::format!("{other}"),
+                        },
+                    })
+            };
             let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
-            let mut agg = aggregate::run(stmt, &filtered_refs, &schema_cols, Some(&alias))?;
+            let mut agg = aggregate::run(
+                stmt,
+                &filtered_refs,
+                &schema_cols,
+                Some(&alias),
+                Some(&agg_correlated),
+            )?;
             apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
@@ -8051,7 +8081,22 @@ impl Engine {
                     filtered.push(row);
                 }
             }
-            let mut agg = aggregate::run(stmt, &filtered, schema_cols, Some(alias))?;
+            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                    .map_err(|err| match err {
+                        EngineError::Eval(ev) => ev,
+                        other => eval::EvalError::TypeMismatch {
+                            detail: alloc::format!("{other}"),
+                        },
+                    })
+            };
+            let mut agg = aggregate::run(
+                stmt,
+                &filtered,
+                schema_cols,
+                Some(alias),
+                Some(&agg_correlated),
+            )?;
             apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
@@ -8528,7 +8573,17 @@ impl Engine {
         // joined+filtered rows.
         if aggregate::uses_aggregate(stmt) {
             let refs: Vec<&Row> = filtered.iter().collect();
-            let mut agg = aggregate::run(stmt, &refs, &combined_schema, None)?;
+            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+                self.eval_expr_with_correlated(e, r, c, cancel, None)
+                    .map_err(|err| match err {
+                        EngineError::Eval(ev) => ev,
+                        other => eval::EvalError::TypeMismatch {
+                            detail: alloc::format!("{other}"),
+                        },
+                    })
+            };
+            let mut agg =
+                aggregate::run(stmt, &refs, &combined_schema, None, Some(&agg_correlated))?;
             apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
             return Ok(QueryResult::Rows {
                 columns: agg.columns,
@@ -12540,6 +12595,22 @@ fn substitute_in_select(
 }
 
 fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alias: &str) {
+    // v7.25.2 (round-19 A) — bare synthetic columns. The aggregate
+    // rewriter replaces group-key references INSIDE subquery bodies
+    // with `__grp_N` so a correlated subquery in a GROUP BY select
+    // list can resolve against the synthesised group row. The names
+    // are engine-generated, so they can't shadow user columns.
+    if let Expr::Column(c) = e
+        && c.qualifier.is_none()
+        && (c.name.starts_with("__grp_") || c.name.starts_with("__agg_"))
+        && let Some(idx) = ctx.columns.iter().position(|sc| sc.name == c.name)
+    {
+        let v = row.values.get(idx).cloned().unwrap_or(Value::Null);
+        if let Ok(lit) = value_to_literal_expr(v) {
+            *e = lit;
+            return;
+        }
+    }
     if let Expr::Column(c) = e
         && let Some(qual) = &c.qualifier
     {
@@ -13570,7 +13641,7 @@ fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
     any
 }
 
-fn expr_has_subquery(e: &Expr) -> bool {
+pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
         Expr::AggregateOrdered { call, order_by, .. } => {
@@ -13918,7 +13989,7 @@ pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result
 /// through here so a new AST slot only needs adding once.
 /// Expression-INTERNAL recursion (into subquery nodes inside an
 /// Expr) stays the visitor's own responsibility.
-fn walk_select_exprs_mut(
+pub(crate) fn walk_select_exprs_mut(
     s: &mut SelectStatement,
     f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
