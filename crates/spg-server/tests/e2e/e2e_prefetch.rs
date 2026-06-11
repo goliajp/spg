@@ -95,32 +95,40 @@ fn metric_value(body: &str, name: &str) -> Option<u64> {
     None
 }
 
+/// Row count of `SELECT * FROM spg_stat_segment` = LIVE cold
+/// segments per the catalog (tombstoned segments keep disk files
+/// but leave the manifest — exactly what the boot prefetch walks).
+fn count_stat_segment_rows(s: &mut TcpStream) -> u64 {
+    send_query(s, "SELECT * FROM spg_stat_segment");
+    let mut total = 0u64;
+    loop {
+        let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
+        s.read_exact(&mut header).unwrap();
+        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let op = Op::from_byte(header[4]).unwrap();
+        let mut body = vec![0u8; len];
+        if len > 0 {
+            s.read_exact(&mut body).unwrap();
+        }
+        match op {
+            Op::DataRow => total += 1,
+            Op::DataRowBatch => {
+                let f = spg_wire::Frame { op, payload: body };
+                total += spg_wire::parse_data_row_batch(&f)
+                    .map(|r| r.len() as u64)
+                    .unwrap_or(0);
+            }
+            Op::CommandComplete => break,
+            _ => continue,
+        }
+    }
+    total
+}
+
 fn wait_for_cold_segments(s: &mut TcpStream, want: usize) {
     let deadline = Instant::now() + REPLICATION_TIMEOUT;
     loop {
-        send_query(s, "SELECT * FROM spg_stat_segment");
-        let mut total = 0usize;
-        loop {
-            let mut header = [0u8; spg_wire::FRAME_HEADER_LEN];
-            s.read_exact(&mut header).unwrap();
-            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-            let op = Op::from_byte(header[4]).unwrap();
-            let mut body = vec![0u8; len];
-            if len > 0 {
-                s.read_exact(&mut body).unwrap();
-            }
-            match op {
-                Op::DataRow => total += 1,
-                Op::DataRowBatch => {
-                    let f = spg_wire::Frame { op, payload: body };
-                    total += spg_wire::parse_data_row_batch(&f)
-                        .map(|r| r.len())
-                        .unwrap_or(0);
-                }
-                Op::CommandComplete => break,
-                _ => continue,
-            }
-        }
+        let total = count_stat_segment_rows(s) as usize;
         if total >= want {
             return;
         }
@@ -139,6 +147,7 @@ fn sequential_scan_triggers_prefetch() {
 
     // Phase 1: populate + freeze + CHECKPOINT so the manifest
     // lists ≥ 2 cold segments.
+    let mut expected_hits: u64 = 0;
     {
         let (mut raw, addrs) = common::ServerBuilder::new()
             .arg_path(&db)
@@ -162,6 +171,14 @@ fn sequential_scan_triggers_prefetch() {
             }
             wait_for_cold_segments(&mut s, 2);
             exec_ok(&mut s, "CHECKPOINT");
+            // The boot prefetch pool walks the MANIFEST's live
+            // segments — counting `seg_*.spg` files over-counts
+            // whenever auto-compaction retired a segment whose disk
+            // file is still present (tombstoned slots keep their
+            // files; see EmbeddedMetrics::cold_segments). Take the
+            // expected count from the live catalog instead — this
+            // was the suite's recurring "hits 3 ≠ 4" flake.
+            expected_hits = count_stat_segment_rows(&mut s);
         }
         let _ = raw.kill();
         let _ = raw.wait();
@@ -170,26 +187,9 @@ fn sequential_scan_triggers_prefetch() {
     // Phase 2: restart from db_path. Boot path runs the prefetch
     // pool over the manifest-listed segments → metric increments
     // by the segment count.
-    let segments_dir = {
-        let parent = db.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let stem = db.file_stem().unwrap().to_string_lossy().into_owned();
-        parent.join(format!("{stem}.spg")).join("segments")
-    };
-    let expected_hits = std::fs::read_dir(&segments_dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("seg_") && n.ends_with(".spg"))
-                })
-                .count()
-        })
-        .unwrap_or(0) as u64;
     assert!(
         expected_hits >= 2,
-        "phase-1 didn't leave ≥ 2 cold segments on disk"
+        "phase-1 didn't leave ≥ 2 live cold segments"
     );
 
     let (mut raw, addrs) = common::ServerBuilder::new()
