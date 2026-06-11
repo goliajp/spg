@@ -1,6 +1,6 @@
 # SPG dump-compat report
 
-Generated 2026-06-11T08:10:01Z against SPG `7.24.1`.
+Generated 2026-06-11T08:27:58Z against SPG `local-build`.
 
 | Dialect | App | Status | Stmts pass/total | First error |
 |---|---|---|---:|---|
@@ -18,3 +18,22 @@ Generated 2026-06-11T08:10:01Z against SPG `7.24.1`.
 | mariadb | forum | PASS | 29/29 |  |
 | mariadb | minimal-with-data | SKIP(wire) | - | mysql data via psql is a transport mismatch; covered by import pass |
 | mariadb | minimal | PASS | 24/24 |  |
+
+## Embed import pass (`spg import`)
+
+| Dialect | App | Import |
+|---|---|---|
+| pg | blog | PASS |
+| pg | forum | PASS |
+| pg | minimal-with-data | PASS |
+| pg | minimal | PASS |
+| pg | rich-with-data | PASS |
+| pg | rich | PASS |
+| mysql | blog | PASS |
+| mysql | forum | PASS |
+| mysql | minimal-with-data | PASS |
+| mysql | minimal | PASS |
+| mariadb | blog | PASS |
+| mariadb | forum | PASS |
+| mariadb | minimal-with-data | PASS |
+| mariadb | minimal | PASS |
