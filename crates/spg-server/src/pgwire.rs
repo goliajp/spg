@@ -1487,19 +1487,6 @@ fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
 // nodes into the AST inside the engine — no SQL re-parse per
 // Execute. See `Engine::execute_prepared`.
 
-/// True when `s` parses as a decimal integer or float. Used by
-/// `handle_copy_from_stdin`'s row-construction path to decide
-/// whether to emit a bind parameter as a bare literal vs a
-/// SQL-quoted string. (The Extended Query Bind path no longer
-/// uses this — it builds typed `Value`s directly.)
-fn looks_numeric(s: &str) -> bool {
-    let s = s.trim();
-    if s.is_empty() {
-        return false;
-    }
-    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn handle_execute(
     body: &[u8],
@@ -2349,70 +2336,22 @@ fn read_json_value_as_sql(
 }
 
 /// PG COPY text format: tab-separated cells, `\N` for NULL,
-/// backslash escapes \\b \f \n \r \t \v. We decode each cell into
-/// a SQL-literal-ready string (quoted; backslashes preserved as
-/// literal text) — the engine parser sees regular VALUES syntax.
+/// backslash escapes \\b \f \n \r \t \v. v7.22 — delegates to the
+/// shared `spg_engine::copy` helper (single home with the embed
+/// import path).
 fn decode_copy_text_row(line: &str) -> Vec<Option<String>> {
-    line.split('\t')
-        .map(|cell| {
-            if cell == "\\N" {
-                None
-            } else {
-                let mut out = String::with_capacity(cell.len());
-                let mut chars = cell.chars();
-                while let Some(c) = chars.next() {
-                    if c == '\\'
-                        && let Some(n) = chars.next()
-                    {
-                        out.push(match n {
-                            'b' => '\u{08}',
-                            'f' => '\u{0c}',
-                            'n' => '\n',
-                            'r' => '\r',
-                            't' => '\t',
-                            'v' => '\u{0b}',
-                            '\\' => '\\',
-                            other => other,
-                        });
-                    } else {
-                        out.push(c);
-                    }
-                }
-                Some(out)
-            }
-        })
-        .collect()
+    spg_engine::copy::decode_copy_text_row(line)
 }
 
 /// Build `INSERT INTO <table> VALUES (...)` from a decoded row.
-/// Numeric-looking cells go in bare so the engine sees an INT/FLOAT
-/// literal; everything else is single-quoted with SQL escape.
+/// v7.22 — delegates to `spg_engine::copy` (shared with the embed
+/// import path; the stricter numeric check there also keeps
+/// leading-zero codes ("0042") and float-ish words ("inf") quoted
+/// instead of lossy bare literals). The wire path carries no
+/// per-COPY column list (v7.15 scope note) — `None` emits the
+/// positional form.
 fn build_copy_insert(table: &str, values: &[Option<String>]) -> String {
-    let mut sql = format!("INSERT INTO {table} VALUES (");
-    for (i, v) in values.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        match v {
-            None => sql.push_str("NULL"),
-            Some(s) => {
-                if looks_numeric(s) || matches!(s.as_str(), "true" | "false" | "TRUE" | "FALSE") {
-                    sql.push_str(s);
-                } else {
-                    sql.push('\'');
-                    for ch in s.chars() {
-                        if ch == '\'' {
-                            sql.push('\'');
-                        }
-                        sql.push(ch);
-                    }
-                    sql.push('\'');
-                }
-            }
-        }
-    }
-    sql.push(')');
-    sql
+    spg_engine::copy::build_copy_insert(table, None, values)
 }
 
 /// COPY TO STDOUT — server runs `SELECT * FROM <table>`, sends

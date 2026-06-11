@@ -1559,7 +1559,7 @@ fn import_script(db_path: &str, file: &str) -> Result<(usize, usize), String> {
     let mut stmts = 0usize;
     let mut affected = 0usize;
     for (i, stmt) in statements.iter().enumerate() {
-        match db.execute(stmt) {
+        match db.execute_dump_statement(stmt) {
             Ok(spg_embedded::QueryResult::CommandOk { affected: n, .. }) => {
                 stmts += 1;
                 affected += n;

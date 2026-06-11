@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod aggregate;
+pub mod copy;
 pub mod describe;
 pub mod eval;
 pub mod fts;
@@ -613,6 +614,15 @@ pub struct Engine {
     /// Monotonic counter for `alloc_tx_id`. Starts at 1 — slot 0 is
     /// reserved for `IMPLICIT_TX`.
     next_tx_id: u64,
+    /// v7.22 (round-13 T3) — session string-literal dialect. `false`
+    /// (default) = PG semantics (backslash literal, `''` escape);
+    /// `true` = MySQL semantics (`\'` etc.). Flipped by the
+    /// deterministic session signals each dump emits: `SET sql_mode`
+    /// (only MySQL clients/dumps send it) turns it on,
+    /// `SET standard_conforming_strings = on` (every pg_dump
+    /// preamble) turns it off. The plan cache is cleared on every
+    /// flip — the same SQL text lexes differently per dialect.
+    backslash_escapes: bool,
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
@@ -831,6 +841,7 @@ impl Engine {
             catalog: Catalog::new(),
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
+            backslash_escapes: false,
             next_tx_id: 1,
             clock: None,
             salt_fn: None,
@@ -1018,6 +1029,7 @@ impl Engine {
             catalog,
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
+            backslash_escapes: false,
             next_tx_id: 1,
             clock: None,
             salt_fn: None,
@@ -1081,6 +1093,7 @@ impl Engine {
                     catalog,
                     tx_catalogs: BTreeMap::new(),
                     current_tx: None,
+                    backslash_escapes: false,
                     next_tx_id: 1,
                     clock: None,
                     salt_fn: None,
@@ -1651,7 +1664,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
-        let mut stmt = parser::parse_statement(sql)?;
+        let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
         if let Statement::Select(s) = &mut stmt {
@@ -1769,7 +1782,7 @@ impl Engine {
     ///
     /// Pgwire's `Parse` (P) message lands here.
     pub fn prepare(&self, sql: &str) -> Result<Statement, ParseError> {
-        let mut stmt = parser::parse_statement(sql)?;
+        let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(&mut stmt, now_micros);
         if let Statement::Select(s) = &mut stmt {
@@ -2768,6 +2781,26 @@ impl Engine {
                 // caller knows enabling checks revealed orphans.
                 let _ = self.drain_pending_foreign_keys();
             }
+        }
+        // v7.22 (round-13 T3) — string-literal dialect signals.
+        // `SET sql_mode = …` is something only MySQL clients and
+        // mysqldump preambles emit → MySQL escape semantics.
+        // `SET standard_conforming_strings = on|off` is PG's own
+        // switch for exactly this behaviour (every pg_dump preamble
+        // sets it to on). The same SQL text lexes differently per
+        // dialect, so a flip invalidates the plan cache.
+        let new_escapes = if key == "sql_mode" {
+            Some(true)
+        } else if key == "standard_conforming_strings" {
+            Some(value_off)
+        } else {
+            None
+        };
+        if let Some(flag) = new_escapes
+            && flag != self.backslash_escapes
+        {
+            self.backslash_escapes = flag;
+            self.plan_cache.clear();
         }
         self.session_params.insert(key, normalised);
     }
@@ -5761,6 +5794,58 @@ impl Engine {
                         )));
                     }
                 }
+            }
+            spg_sql::ast::AlterTableTarget::SetColumnAutoIncrement { column, seq_name } => {
+                // pg_dump's identity form names an IMPLICIT sequence
+                // (`… AS IDENTITY ( SEQUENCE NAME s … )`) that never
+                // gets its own CREATE SEQUENCE statement, while the
+                // data section still calls `setval(s, …)`. Make the
+                // sequence exist (idempotent) so those calls land.
+                if let Some(seq) = seq_name {
+                    let _ = self.exec_create_sequence(spg_sql::ast::CreateSequenceStatement {
+                        name: seq,
+                        if_not_exists: true,
+                        temporary: false,
+                        data_type: None,
+                        options: spg_sql::ast::SequenceOptions::default(),
+                    })?;
+                }
+                // v7.22 (round-13 T2) — pg_dump's serial/identity
+                // spellings (`SET DEFAULT nextval(…)` / `ADD
+                // GENERATED … AS IDENTITY`) lower here: flip the
+                // column's auto-increment flag so post-import
+                // INSERTs without an explicit value keep numbering
+                // (max+1 semantics; the dump's setval() calls are
+                // no-ops by construction).
+                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: s.name.into(),
+                    })
+                })?;
+                let pos = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&column))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "ALTER COLUMN {column:?}: no such column on {:?}",
+                            s.name
+                        ))
+                    })?;
+                let col = &table.schema().columns[pos];
+                if !matches!(
+                    col.ty,
+                    spg_storage::DataType::SmallInt
+                        | spg_storage::DataType::Int
+                        | spg_storage::DataType::BigInt
+                ) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "auto-increment applies to integer columns only ({column:?} is {:?})",
+                        col.ty
+                    )));
+                }
+                table.schema_mut().columns[pos].auto_increment = true;
             }
             spg_sql::ast::AlterTableTarget::RenameTable { new } => {
                 // v7.16.2 — table-level rename (mailrs round-10
