@@ -8372,7 +8372,7 @@ impl Engine {
                     for loc in idx.lookup_eq(&key) {
                         match *loc {
                             spg_storage::RowLocator::Hot(i) => ids.push(i),
-                            _ => {
+                            spg_storage::RowLocator::Cold { .. } => {
                                 all_hot = false;
                                 break;
                             }
@@ -8401,13 +8401,13 @@ impl Engine {
             Some(ids) => {
                 for i in ids {
                     if let Some(row) = table.rows().get(i) {
-                        push_if(&row, &mut out)?;
+                        push_if(row, &mut out)?;
                     }
                 }
             }
             None => {
                 for row in table.rows().iter() {
-                    push_if(&row, &mut out)?;
+                    push_if(row, &mut out)?;
                 }
             }
         }
@@ -8769,7 +8769,7 @@ impl Engine {
                                     Some(r) => r,
                                     None => continue,
                                 },
-                                _ => continue,
+                                spg_storage::RowLocator::Cold { .. } => continue,
                             };
                             // Remaining eq pairs + residual ON check on
                             // the candidate only.
