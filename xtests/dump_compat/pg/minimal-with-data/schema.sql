@@ -2,14 +2,15 @@
 -- PostgreSQL database dump
 --
 
-\restrict KYyYjAhHFEyHIGbwyWVWPdqFONX4LmHKVIKjbOR9QeZqkIopQl6OsQG8u4mwXWN
+\restrict zgvSnJX87tM5zKj4fUaR7cx1e5x8tWcZRSEZEz8KWgglhdGlBWCSfaXtHpNAoAh
 
--- Dumped from database version 15.18 (Debian 15.18-1.pgdg13+1)
--- Dumped by pg_dump version 15.18 (Debian 15.18-1.pgdg13+1)
+-- Dumped from database version 18.4 (Debian 18.4-1.pgdg13+1)
+-- Dumped by pg_dump version 18.4 (Debian 18.4-1.pgdg13+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SELECT pg_catalog.set_config('search_path', '', false);
@@ -80,10 +81,10 @@ ALTER TABLE ONLY public.posts ALTER COLUMN id SET DEFAULT nextval('public.posts_
 --
 
 COPY public.posts (id, title, body, tags, created_at) FROM stdin;
-1	Hello, world	first post	{intro,hello}	2026-06-06 12:50:59.447392+00
-2	Second post	body two	{follow-up}	2026-06-06 12:50:59.447392+00
-3	Tab\\thandling	COPY round-trip must escape \\t \\n \\\\ safely	{}	2026-06-06 12:50:59.447392+00
-4	Quotes 'matter'	and so do backslashes \\\\	{edge-cases}	2026-06-06 12:50:59.447392+00
+1	Hello, world	first post	{intro,hello}	2026-06-11 01:38:01.912978+00
+2	Second post	body two	{follow-up}	2026-06-11 01:38:01.912978+00
+3	Tab\\thandling	COPY round-trip must escape \\t \\n \\\\ safely	{}	2026-06-11 01:38:01.912978+00
+4	Quotes 'matter'	and so do backslashes \\\\	{edge-cases}	2026-06-11 01:38:01.912978+00
 \.
 
 
@@ -113,5 +114,5 @@ CREATE INDEX idx_posts_created ON public.posts USING btree (created_at DESC);
 -- PostgreSQL database dump complete
 --
 
-\unrestrict KYyYjAhHFEyHIGbwyWVWPdqFONX4LmHKVIKjbOR9QeZqkIopQl6OsQG8u4mwXWN
+\unrestrict zgvSnJX87tM5zKj4fUaR7cx1e5x8tWcZRSEZEz8KWgglhdGlBWCSfaXtHpNAoAh
 

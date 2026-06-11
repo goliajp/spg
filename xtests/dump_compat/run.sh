@@ -24,6 +24,20 @@ cleanup() {
     if [[ "$VERSION" == "local-build" ]]; then
         [[ -n "${LOCAL_PID:-}" ]] && kill "$LOCAL_PID" 2>/dev/null || true
         wait "${LOCAL_PID:-0}" 2>/dev/null || true
+        # v7.22 — SIGTERM drains gracefully; the next start_server
+        # must not race the bind. Wait for the port to actually
+        # free, escalate to -9 if the drain hangs. Without this the
+        # new server fails to bind, dies silently, and psql talks
+        # to the PREVIOUS fixture's server ("table already exists"
+        # ghosts across fixtures).
+        for _ in $(seq 1 50); do
+            lsof -ti :"$PORT" >/dev/null 2>&1 || break
+            sleep 0.2
+        done
+        if lsof -ti :"$PORT" >/dev/null 2>&1; then
+            lsof -ti :"$PORT" | xargs kill -9 2>/dev/null || true
+            sleep 0.3
+        fi
     else
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     fi
@@ -112,10 +126,67 @@ for dialect in pg mysql mariadb; do
         app=$(basename "$app_dir")
         file="$app_dir/schema.sql"
         [[ -f "$file" ]] || continue
+        # v7.22 — mysql/mariadb WITH-DATA fixtures skip the psql
+        # wire pass: psql splits client-side with PG string
+        # semantics, and mysqldump data uses backslash escapes —
+        # psql itself shreds the INSERTs before SPG ever sees them
+        # (a transport mismatch, not an SPG gap; no real MySQL
+        # workload arrives via psql). They run in the import pass
+        # below, which is dialect-aware.
+        if [[ "$dialect" != "pg" && "$app" == *-with-data ]]; then
+            printf '| %s | %s | SKIP(wire) | - | mysql data via psql is a transport mismatch; covered by import pass |\n' \
+                "$dialect" "$app" >> "$REPORT"
+            continue
+        fi
         run_one "$dialect" "$app" "$file" >> "$REPORT"
     done
 done
 
+# v7.22 (round-13) — second pass: the EMBED path. Every fixture must
+# ALSO load via `spg import` with zero preprocessing. psql hides
+# `\`-meta-lines client-side and the server intercepts COPY / SET
+# before the engine parser, so the wire pass alone structurally
+# misses embed-only gaps — that is exactly how the round-13 list
+# stayed invisible while this gate showed 10/10. local-build mode
+# only (the import binary builds from the workspace; docker-tag mode
+# stays wire-only).
+if [[ "$VERSION" == "local-build" ]]; then
+    (cd "$ROOT" && cargo build --release -p spgctl -q)
+    SPG_BIN="$ROOT/target/release/spg"
+    {
+        echo
+        echo "## Embed import pass (\`spg import\`)"
+        echo
+        echo "| Dialect | App | Import |"
+        echo "|---|---|---|"
+    } >> "$REPORT"
+    IMPORT_SCRATCH=$(mktemp -d)
+    for dialect in pg mysql mariadb; do
+        for app_dir in "$HERE/$dialect"/*/; do
+            app=$(basename "$app_dir")
+            file="$app_dir/schema.sql"
+            [[ -f "$file" ]] || continue
+            tmpdb="$IMPORT_SCRATCH/${dialect}-${app}.spgdb"
+            if out=$("$SPG_BIN" import --db "$tmpdb" --file "$file" 2>&1); then
+                printf '| %s | %s | PASS |\n' "$dialect" "$app" >> "$REPORT"
+            else
+                err=$(echo "$out" | head -2 | tr '\n' ' ' | head -c 180 | sed 's/|/\\|/g')
+                printf '| %s | %s | FAIL: %s |\n' "$dialect" "$app" "$err" >> "$REPORT"
+            fi
+        done
+    done
+    rm -rf "$IMPORT_SCRATCH"
+fi
+
 echo
 echo "report written to $REPORT"
 cat "$REPORT"
+
+# Gate exit code: any FAIL row (wire or import) fails the run —
+# previously this script always exited 0 and the four-gate protocol
+# leaned on a human reading the table.
+FAILS=$(grep -c '| FAIL' "$REPORT" || true)
+if [[ "$FAILS" -gt 0 ]]; then
+    echo "dump-compat: $FAILS failing fixture(s)" >&2
+    exit 1
+fi

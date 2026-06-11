@@ -719,7 +719,10 @@ fn apply_function(name: &str, args: &[Value], ctx: &EvalContext<'_>) -> Result<V
             })?;
             Ok(Value::BigInt(v))
         }
-        "length" => {
+        // v7.22 (round-13) — char_length / character_length are the
+        // SQL-standard spellings PG accepts everywhere; pg_dump
+        // CHECK predicates carry them verbatim.
+        "length" | "char_length" | "character_length" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("length() takes 1 arg, got {}", args.len()),

@@ -236,9 +236,22 @@ impl fmt::Display for LexError {
     }
 }
 
-/// Tokenize `input` into a `Vec<Token>` ending in `Token::Eof`.
-#[allow(clippy::too_many_lines)] // big match — splitting would obscure the dispatch table
+/// Tokenize `input` into a `Vec<Token>` ending in `Token::Eof`,
+/// with PG string semantics (backslash is a literal byte inside
+/// `'…'`; `''` is the only escape).
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_with(input, false)
+}
+
+/// v7.22 (round-13 T3) — dialect-aware tokenizer entry. With
+/// `backslash_escapes = true`, plain `'…'` strings honour MySQL /
+/// pre-9.1-PG backslash escapes (`\'` `\\` `\n` …, the same decode
+/// the `E'…'` form uses). mysqldump ALWAYS emits `\'`-escaped data
+/// sections, and pg_dump ALWAYS announces PG semantics via
+/// `SET standard_conforming_strings = on` — the engine flips this
+/// flag off/on from those deterministic session signals.
+#[allow(clippy::too_many_lines)] // big match — splitting would obscure the dispatch table
+pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>, LexError> {
     let bytes = input.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::new();
@@ -304,7 +317,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 i += 2;
             }
             b'\'' => {
-                let (tok, consumed) = lex_quoted(input, i, b'\'', false)?;
+                let (tok, consumed) = if backslash_escapes {
+                    // MySQL-dialect session: plain strings decode
+                    // backslash escapes — same machinery as E'…'.
+                    lex_escape_string(input, i)?
+                } else {
+                    lex_quoted(input, i, b'\'', false)?
+                };
                 out.push(tok);
                 i += consumed;
             }

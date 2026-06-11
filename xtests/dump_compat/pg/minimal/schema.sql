@@ -2,14 +2,15 @@
 -- PostgreSQL database dump
 --
 
-\restrict At2xJZXy7rmicnDEnDaNIWAhxeeEwZgxW8cT9ltvhjAOJ6lb0P9Q5O9gD9C2a2w
+\restrict aMHu2cMkRjvsemNuSkBEiiQyL0ZIq8nKymkbuCVrwArkq1AN68Nz3BwwcD7SQ0A
 
--- Dumped from database version 15.18 (Debian 15.18-1.pgdg13+1)
--- Dumped by pg_dump version 15.18 (Debian 15.18-1.pgdg13+1)
+-- Dumped from database version 18.4 (Debian 18.4-1.pgdg13+1)
+-- Dumped by pg_dump version 18.4 (Debian 18.4-1.pgdg13+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SELECT pg_catalog.set_config('search_path', '', false);
@@ -94,5 +95,5 @@ CREATE INDEX idx_posts_created ON public.posts USING btree (created_at DESC);
 -- PostgreSQL database dump complete
 --
 
-\unrestrict At2xJZXy7rmicnDEnDaNIWAhxeeEwZgxW8cT9ltvhjAOJ6lb0P9Q5O9gD9C2a2w
+\unrestrict aMHu2cMkRjvsemNuSkBEiiQyL0ZIq8nKymkbuCVrwArkq1AN68Nz3BwwcD7SQ0A
 

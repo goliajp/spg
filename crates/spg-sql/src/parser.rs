@@ -150,9 +150,16 @@ pub fn parse_expression(input: &str) -> Result<Expr, ParseError> {
 }
 
 /// Parse exactly one statement, swallow an optional trailing `;`, and require
-/// the token stream to end there.
+/// the token stream to end there. PG string semantics.
 pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
-    let tokens = lexer::tokenize(input)?;
+    parse_statement_with(input, false)
+}
+
+/// v7.22 (round-13 T3) — dialect-aware entry: `backslash_escapes`
+/// selects MySQL-style string lexing (see `lexer::tokenize_with`).
+/// The engine threads its session flag through here.
+pub fn parse_statement_with(input: &str, backslash_escapes: bool) -> Result<Statement, ParseError> {
+    let tokens = lexer::tokenize_with(input, backslash_escapes)?;
     let mut p = Parser::new(tokens);
     let stmt = p.parse_one_statement()?;
     if matches!(p.peek(), Token::Semicolon) {
@@ -220,6 +227,62 @@ impl Parser {
                 _ => self.advance(),
             };
         }
+    }
+
+    /// v7.22 (round-13 T2) — consume to the statement boundary like
+    /// `consume_until_statement_boundary`, but pick out the sequence
+    /// name on the way: either `SEQUENCE NAME <ident>` (identity
+    /// columns) or the first string literal (`nextval('<seq>')`).
+    /// Schema qualifiers and `::regclass` casts are stripped.
+    fn scan_sequence_name_until_boundary(&mut self) -> Option<String> {
+        let mut seq: Option<String> = None;
+        let mut after_sequence_kw = false;
+        let mut after_name_kw = false;
+        loop {
+            match self.peek().clone() {
+                Token::Semicolon | Token::Eof => break,
+                Token::Ident(s) | Token::QuotedIdent(s) => {
+                    if after_name_kw && seq.is_none() {
+                        self.advance();
+                        let mut name = s;
+                        // `SEQUENCE NAME public.groups_id_seq` — keep
+                        // the bare name, drop qualifiers.
+                        while matches!(self.peek(), Token::Dot) {
+                            self.advance();
+                            if let Token::Ident(n) | Token::QuotedIdent(n) = self.advance() {
+                                name = n;
+                            }
+                        }
+                        seq = Some(name);
+                        after_name_kw = false;
+                        continue;
+                    }
+                    if after_sequence_kw && s.eq_ignore_ascii_case("name") {
+                        after_name_kw = true;
+                        after_sequence_kw = false;
+                    } else {
+                        after_sequence_kw = s.eq_ignore_ascii_case("sequence");
+                    }
+                    self.advance();
+                }
+                Token::String(s) => {
+                    if seq.is_none() {
+                        // `nextval('public.groups_id_seq'::regclass)`
+                        let bare = s
+                            .rsplit_once('.')
+                            .map_or_else(|| s.clone(), |(_, b)| b.to_string());
+                        seq = Some(bare);
+                    }
+                    self.advance();
+                }
+                _ => {
+                    after_sequence_kw = false;
+                    after_name_kw = false;
+                    self.advance();
+                }
+            }
+        }
+        seq
     }
 
     fn expect_ident_like(&mut self) -> Result<String, ParseError> {
@@ -4009,11 +4072,43 @@ impl Parser {
                     // DEFAULT / SET NOT NULL / DROP NOT NULL as
                     // engine no-ops by consuming the tail.
                     Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
-                        // ALTER COLUMN col SET DEFAULT … / SET NOT
-                        // NULL — accept as a no-op on SPG (BIGSERIAL
-                        // already auto-increments; nullability change
-                        // would need row scan — deferred).
-                        self.consume_until_statement_boundary();
+                        // v7.22 (round-13 T2) — `SET DEFAULT
+                        // nextval('…')` is how pg_dump spells a
+                        // SERIAL column (plain integer in CREATE
+                        // TABLE + this ALTER). It used to be
+                        // swallowed as a no-op, which silently
+                        // STRIPPED auto-increment from imported
+                        // schemas — the first post-import INSERT
+                        // without an explicit id then violated NOT
+                        // NULL. Lower it to the auto-increment
+                        // marker instead.
+                        let is_default_nextval =
+                            matches!(self.tokens.get(self.pos + 1), Some(Token::Default))
+                                && matches!(
+                                    self.tokens.get(self.pos + 2),
+                                    Some(Token::Ident(f)) if f.eq_ignore_ascii_case("nextval")
+                                );
+                        // Capture the nextval target so the engine
+                        // can guarantee the sequence exists.
+                        let seq_name = if is_default_nextval {
+                            self.scan_sequence_name_until_boundary()
+                        } else {
+                            self.consume_until_statement_boundary();
+                            None
+                        };
+                        if is_default_nextval {
+                            return Ok(alloc::vec![
+                                crate::ast::AlterTableTarget::SetColumnAutoIncrement {
+                                    column: col_name,
+                                    seq_name,
+                                }
+                            ]);
+                        }
+                        // Other SET DEFAULT … / SET NOT NULL forms
+                        // stay engine no-ops (real defaults arrive
+                        // inline in CREATE TABLE in every dump;
+                        // nullability change would need a row scan
+                        // — deferred).
                         return Ok(Vec::new());
                     }
                     Token::Ident(s) if s.eq_ignore_ascii_case("drop") => {
@@ -4021,9 +4116,35 @@ impl Parser {
                         self.consume_until_statement_boundary();
                         return Ok(Vec::new());
                     }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
+                        // v7.22 (round-13 T2) — `ALTER COLUMN c ADD
+                        // GENERATED { ALWAYS | BY DEFAULT } AS
+                        // IDENTITY ( … )`: pg_dump's spelling for
+                        // identity columns. Same auto-increment
+                        // lowering as the nextval default; the
+                        // sequence options inside the parens are
+                        // no-ops under SPG's max+1 semantics.
+                        let is_generated = matches!(
+                            self.tokens.get(self.pos + 1),
+                            Some(Token::Ident(g)) if g.eq_ignore_ascii_case("generated")
+                        );
+                        if !is_generated {
+                            return Err(self.err(alloc::format!(
+                                "expected GENERATED after ALTER COLUMN {col_name} ADD, got {:?}",
+                                self.tokens.get(self.pos + 1)
+                            )));
+                        }
+                        let seq_name = self.scan_sequence_name_until_boundary();
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::SetColumnAutoIncrement {
+                                column: col_name,
+                                seq_name,
+                            }
+                        ]);
+                    }
                     other => {
                         return Err(self.err(alloc::format!(
-                            "expected TYPE / SET / DROP after ALTER COLUMN <name>, got {other:?}"
+                            "expected TYPE / SET / DROP / ADD after ALTER COLUMN <name>, got {other:?}"
                         )));
                     }
                 }
@@ -4095,6 +4216,14 @@ impl Parser {
                 // SECURITY. v7.16.1 only matches TRIGGER (mailrs's
                 // pg_dump output) — anything else falls through to
                 // the catch-all error below.
+                // v7.22 (round-13 T3) — mysqldump wraps every data
+                // section in `/*!40000 ALTER TABLE t DISABLE KEYS */`
+                // + ENABLE KEYS (a MyISAM index-rebuild hint). SPG
+                // maintains indexes incrementally — engine no-op.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("keys")) {
+                    self.advance();
+                    return Ok(Vec::new());
+                }
                 if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("trigger")) {
                     return Err(self.err(alloc::format!(
                         "expected TRIGGER after {}, got {:?}",
@@ -6311,6 +6440,81 @@ impl Parser {
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint")) {
                 self.advance();
                 let _name = self.expect_ident_like()?;
+                continue;
+            }
+            // v7.22 (round-13 T2) — inline `GENERATED { ALWAYS |
+            // BY DEFAULT } AS IDENTITY [(seq options)]` (PG 10+;
+            // the modern replacement for SERIAL in hand-written
+            // schemas). Both flavours map onto the auto-increment
+            // machinery — SPG's serial semantics ≈ BY DEFAULT;
+            // ALWAYS's reject-explicit-values nuance is documented
+            // leniency. Generated EXPRESSION columns
+            // (`AS (expr) STORED`) are not supported: error loudly
+            // instead of silently storing NULLs.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("generated")) {
+                self.advance();
+                match self.peek().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("always") => {
+                        self.advance();
+                    }
+                    // `BY` is a reserved keyword token (GROUP BY).
+                    Token::By => {
+                        self.advance();
+                        if !matches!(self.peek(), Token::Default) {
+                            return Err(self.err(alloc::format!(
+                                "expected DEFAULT after GENERATED BY, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ALWAYS or BY DEFAULT after GENERATED, got {other:?}"
+                        )));
+                    }
+                }
+                if !matches!(self.peek(), Token::As) {
+                    return Err(self.err(alloc::format!(
+                        "expected AS after GENERATED ALWAYS/BY DEFAULT, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(
+                        "generated expression columns (GENERATED … AS (expr) STORED) \
+                         are not supported"
+                            .into(),
+                    ));
+                }
+                self.expect_keyword_ident("identity")?;
+                // Optional `(START WITH 1 INCREMENT BY 1 …)` —
+                // consume the balanced parens and discard (SPG's
+                // auto-increment is max+1-scan based).
+                if matches!(self.peek(), Token::LParen) {
+                    let mut depth = 0usize;
+                    loop {
+                        match self.advance() {
+                            Token::LParen => depth += 1,
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            Token::Eof => {
+                                return Err(self.err(
+                                    "unterminated sequence-options parens after IDENTITY".into(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                auto_increment = true;
+                // PG identity columns are implicitly NOT NULL.
+                nullable = false;
                 continue;
             }
             // v7.17.0 Phase 2.1 — MySQL `ON UPDATE

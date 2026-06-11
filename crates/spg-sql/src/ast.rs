@@ -631,6 +631,21 @@ pub enum AlterTableTarget {
     /// column referenced by a function body update the function
     /// body separately.
     RenameColumn { old: String, new: String },
+    /// v7.22 (round-13 T2) — mark a column auto-incrementing.
+    /// pg_dump splits SERIAL/IDENTITY columns into a plain integer
+    /// column plus either `ALTER COLUMN c SET DEFAULT nextval(…)`
+    /// (serial) or `ALTER COLUMN c ADD GENERATED … AS IDENTITY (…)`
+    /// (identity); both lower to this. SPG's auto-increment is
+    /// max+1-scan based, so the dump's `setval(…)` calls stay
+    /// no-ops without losing the sequence position.
+    SetColumnAutoIncrement {
+        column: String,
+        /// The implicit sequence pg_dump names for an identity
+        /// column (`ADD GENERATED … ( SEQUENCE NAME s … )`) or the
+        /// nextval target for a serial default. The engine creates
+        /// it if absent so the dump's later `setval(s, …)` lands.
+        seq_name: Option<String>,
+    },
     /// v7.16.2 — `ALTER TABLE old RENAME TO new`. Renames the
     /// table itself (mailrs round-10 A.5 carve-out — mailrs's
     /// migrate-042 uses it). The engine moves the table entry
@@ -3261,6 +3276,19 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         }
         AlterTableTarget::AddTableConstraint(tc) => {
             write!(f, "ADD {tc}")
+        }
+        AlterTableTarget::SetColumnAutoIncrement { column, seq_name } => {
+            // Round-trip-safe spelling: re-parsing this form lowers
+            // back to SetColumnAutoIncrement (the nextval default is
+            // how pg_dump says "serial").
+            let seq = seq_name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{column}_seq"));
+            write!(
+                f,
+                "ALTER COLUMN {} SET DEFAULT nextval('{seq}')",
+                quote_ident(column)
+            )
         }
         AlterTableTarget::RenameColumn { old, new } => {
             write!(

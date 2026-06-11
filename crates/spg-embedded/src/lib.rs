@@ -2222,14 +2222,14 @@ impl Database {
         if !wrap {
             let mut out = Vec::with_capacity(stmts.len());
             for stmt in &stmts {
-                out.push(self.execute(stmt)?);
+                out.push(self.execute_dump_statement(stmt)?);
             }
             return Ok(out);
         }
         self.execute("BEGIN")?;
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
-            match self.execute(stmt) {
+            match self.execute_dump_statement(stmt) {
                 Ok(r) => out.push(r),
                 Err(e) => {
                     // Best-effort rollback; surface the script error.
@@ -2240,6 +2240,57 @@ impl Database {
         }
         self.execute("COMMIT")?;
         Ok(out)
+    }
+
+    /// v7.22 (round-13 T2) — execute one `split_statements` chunk,
+    /// lowering a `COPY … FROM stdin;` block (statement + its data
+    /// lines, as one chunk) to per-row INSERTs through the shared
+    /// `spg_engine::copy` helpers. Default-format pg_dump emits
+    /// COPY blocks, so the zero-change import promise needs this on
+    /// the embed path; non-COPY statements pass straight through to
+    /// [`Self::execute`]. Public so `spgctl import` can keep its
+    /// per-statement error indexing while sharing the lowering.
+    ///
+    /// # Errors
+    /// Engine errors propagate; for COPY the failing row's INSERT
+    /// error carries the synthesized statement context.
+    pub fn execute_dump_statement(&mut self, stmt: &str) -> Result<QueryResult, EngineError> {
+        // Strip pg_dump's `-- Data for Name: …;` banner (it carries
+        // semicolons of its own) before splitting head from data.
+        let stmt_clean = strip_leading_sql_noise(stmt);
+        let head_is_copy = stmt_clean
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("copy"));
+        if head_is_copy
+            && let Some((head, data)) = stmt_clean.split_once(';')
+            && let Some(spec) = spg_engine::copy::parse_copy_from_stdin_head(head)
+        {
+            let mut affected: usize = 0;
+            for line in data.lines() {
+                // Empty fragments only occur at the chunk boundary
+                // (the remainder of the COPY line right after `;`);
+                // data rows are whole non-empty lines.
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                if line.is_empty() {
+                    continue;
+                }
+                let values = spg_engine::copy::decode_copy_text_row(line);
+                let insert = spg_engine::copy::build_copy_insert(
+                    &spec.table,
+                    spec.columns.as_deref(),
+                    &values,
+                );
+                match self.execute(&insert)? {
+                    QueryResult::CommandOk { affected: n, .. } => affected += n,
+                    _ => affected += 1,
+                }
+            }
+            return Ok(QueryResult::CommandOk {
+                affected,
+                modified_catalog: false,
+            });
+        }
+        self.execute(stmt)
     }
 
     /// v7.2.0 — run `body` inside an implicit `BEGIN` /
@@ -3086,13 +3137,57 @@ fn pid_alive(_pid: u32) -> bool {
     true
 }
 
+/// Strip leading whitespace, `--` line comments and NON-conditional
+/// block comments from a chunk so statement-head checks (COPY
+/// detection most notably) see the first real token. pg_dump
+/// prefixes every data block with a `-- Data for Name: …;` banner —
+/// which itself contains semicolons, so head checks must run on the
+/// stripped text. MySQL executable conditional comments (`/*!`) are
+/// content and stay.
+/// v7.22 — see `split_statements`' `mysql_escapes` tracking. Only
+/// short chunks are inspected (the signal statements are one-liners;
+/// COPY data blocks are skipped by the length guard).
+fn note_dialect_signals(chunk: &str, mysql_escapes: &mut bool) {
+    if chunk.len() > 4096 {
+        return;
+    }
+    let lower = chunk.to_ascii_lowercase();
+    if lower.contains("sql_mode") {
+        *mysql_escapes = true;
+    } else if lower.contains("standard_conforming_strings") {
+        *mysql_escapes = lower.contains("off");
+    }
+}
+
+fn strip_leading_sql_noise(mut s: &str) -> &str {
+    loop {
+        let t = s.trim_start();
+        if let Some(rest) = t.strip_prefix("--") {
+            s = rest.split_once('\n').map_or("", |(_, r)| r);
+            continue;
+        }
+        if t.starts_with("/*") && !t.starts_with("/*!") {
+            match t.find("*/") {
+                Some(e) => {
+                    s = &t[e + 2..];
+                    continue;
+                }
+                None => return "",
+            }
+        }
+        return t;
+    }
+}
+
 /// Split a multi-statement SQL script into individual statements on
 /// top-level `;`, honouring single-quoted strings (with `''`
 /// escapes), double-quoted identifiers, dollar-quoted bodies
-/// (`$tag$ … $tag$`), line comments (`--`) and nested block
-/// comments (`/* … */`). Chunks that contain no statement content
-/// (whitespace / comments only) are dropped. PG's simple-query
-/// protocol does this server-side; the embed path owns it here.
+/// (`$tag$ … $tag$`), line comments (`--`) and MySQL executable
+/// conditional comments (`/*!… */` stay statement content; plain
+/// nested block comments don't). Chunks that contain no statement
+/// content (whitespace / comments only) are dropped. PG's
+/// simple-query protocol does this server-side; the embed path owns
+/// it here.
 ///
 /// v7.22 (mailrs round-13 gap 1) — psql meta-command lines are
 /// dropped for client parity: a line whose first non-whitespace
@@ -3106,6 +3201,14 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     let mut stmts = Vec::new();
     let mut start = 0usize;
     let mut has_content = false;
+    // v7.22 (round-13 T3) — stream-tracked string dialect, mirroring
+    // the engine's session flag: a statement mentioning `sql_mode`
+    // (mysqldump preamble, often inside `/*!…*/`) switches plain
+    // strings to backslash-escape scanning;
+    // `standard_conforming_strings` (pg_dump preamble) switches
+    // back. Without this the scanner ends a MySQL `'…\'…'` literal
+    // early and splits inside data.
+    let mut mysql_escapes = false;
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
@@ -3122,10 +3225,13 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                 has_content = true;
                 // PG escape-string form `E'...'` honours backslash
                 // escapes (`E'a\';b'` is ONE literal) — detect via
-                // the immediately-preceding standalone E/e.
-                let escape_string = i >= 1
-                    && matches!(bytes[i - 1], b'e' | b'E')
-                    && !(i >= 2 && (bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_'));
+                // the immediately-preceding standalone E/e. MySQL
+                // dialect sessions treat EVERY plain string that way.
+                let escape_string = mysql_escapes
+                    || (i >= 1
+                        && matches!(bytes[i - 1], b'e' | b'E')
+                        && !(i >= 2
+                            && (bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_')));
                 i += 1;
                 while i < bytes.len() {
                     if escape_string && bytes[i] == b'\\' {
@@ -3183,6 +3289,14 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                 }
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // v7.22 (round-13 T3) — MySQL conditional comments
+                // `/*!40101 … */` are EXECUTABLE (mysqldump wraps
+                // its whole preamble + DISABLE KEYS hints in them);
+                // they must stay statement content for the engine,
+                // not be skipped as commentary.
+                if i + 2 < bytes.len() && bytes[i + 2] == b'!' {
+                    has_content = true;
+                }
                 let mut depth = 1usize;
                 i += 2;
                 while i < bytes.len() && depth > 0 {
@@ -3200,7 +3314,50 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
             }
             b';' => {
                 if has_content {
-                    stmts.push(&sql[start..i]);
+                    let head = &sql[start..i];
+                    // v7.22 (round-13 T2) — a `COPY … FROM stdin;`
+                    // statement owns its following data block
+                    // through the `\.` terminator line (data lines
+                    // may contain `;`, so generic splitting would
+                    // shred them). Swallow head + data into ONE
+                    // chunk; `execute_script` lowers it to INSERTs.
+                    // pg_dump prefixes the COPY with a comment
+                    // banner — strip it before the head check.
+                    let head_clean = strip_leading_sql_noise(head);
+                    let is_copy_head = head_clean
+                        .get(..4)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("copy"))
+                        && spg_engine::copy::parse_copy_from_stdin_head(head_clean).is_some();
+                    if is_copy_head {
+                        // Scan whole lines after the ';' until the
+                        // `\.` terminator (or EOF — torn dumps lose
+                        // their tail, same as psql would error).
+                        let mut j = i + 1;
+                        let data_end;
+                        loop {
+                            if j >= bytes.len() {
+                                data_end = bytes.len();
+                                break;
+                            }
+                            let line_end = sql[j..].find('\n').map_or(bytes.len(), |off| j + off);
+                            if sql[j..line_end].trim_end_matches('\r').trim() == "\\." {
+                                data_end = j;
+                                i = line_end; // bottom i += 1 skips \n
+                                break;
+                            }
+                            j = line_end + 1;
+                        }
+                        stmts.push(&sql[start..data_end]);
+                        if data_end == bytes.len() {
+                            i = bytes.len();
+                        }
+                        start = i + 1;
+                        has_content = false;
+                        i += 1;
+                        continue;
+                    }
+                    note_dialect_signals(head, &mut mysql_escapes);
+                    stmts.push(head);
                 }
                 start = i + 1;
                 has_content = false;
