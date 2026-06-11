@@ -8,6 +8,36 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.23.0] — 2026-06-11 (mailrs round-14: TEXT > 64 KiB — storage codec + jumbo segment pages)
+
+### Fixed
+
+- **The u16 short-string codec panicked on TEXT above 64 KiB** —
+  and the panic site was the snapshot encode, so a live embedded
+  database ACCEPTED the INSERT and died at the next checkpoint or
+  graceful close ("identifier / text fits in u16"). Real mail
+  bodies are routinely 100 KiB–several MiB. v46 catalogs use an
+  escaped codec (`[u16 0xFFFF][u32 real_len]`, zero overhead below
+  64 KiB); decoding is version-gated so pre-v46 catalogs with a
+  legitimate 0xFFFF length stay readable. One-way upgrade with a
+  loud version error on old binaries (same posture as WAL 0x12);
+  a 7.22 victim database (WAL holds the big row, snapshot never
+  succeeded) recovers automatically on first open under 7.23.
+- **The freezer rejected rows wider than a segment page**, so big
+  mail could never reach the cold tier (hot tier pinned forever).
+  V3 segments give oversized rows their own unpadded jumbo pages;
+  page boundaries now come from the page-index offsets (v1
+  fixed-width files satisfy the same arithmetic — no reader
+  version branch). Index keys derived from big TEXT ride the same
+  codec.
+
+### Changed
+
+- dump-compat `rich` fixture carries a 1 MiB TEXT row emitted by
+  PG 18 itself; both gate passes (wire + import) load it.
+- Corpus generator: postgres containers get the same real-query
+  readiness probe mysql 8.4 needed (two-phase first boot).
+
 ## [7.22.0] — 2026-06-11 (mailrs round-13: stock dumps import as-is — PG 18 pg_dump + mysqldump/mariadb-dump)
 
 The prod-cutover round. mailrs's dry-run fed an unmodified PG 18.4
