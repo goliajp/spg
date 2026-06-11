@@ -8,6 +8,47 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.24.0] — 2026-06-11 (mailrs rounds 15+16: first production hours — NULLS placement, correlated subqueries under JOIN, search-trigger eval)
+
+mailrs went live on spg-embedded; the first hours surfaced two
+every-60-seconds errors and the D-pre-revert blockers. The
+investigation also flushed out two serious silent-correctness bugs.
+
+### Fixed
+
+- **`ORDER BY … NULLS FIRST/LAST`** parses and sorts on every path
+  (top-level, aggregate output, window-free scans); PG defaults
+  preserved (NULLS LAST for ASC, FIRST for DESC), explicit clause
+  places NULLs absolutely.
+- **Aggregate-internal ORDER BY** — `array_agg(x ORDER BY y DESC
+  NULLS LAST)` (and string_agg/…): previously the syntax didn't
+  even parse.
+- **Correlated subqueries under JOIN and in select lists**: the
+  joined WHERE filter and the join/scan projections ran the plain
+  row evaluator, so a correlated EXISTS died with "subquery reached
+  row eval — engine resolver bug". Outer-column substitution also
+  learned joined schemas' composite "alias.column" names.
+- **Multi-row `INSERT … VALUES` drew the SAME serial id for every
+  row** (max+1 computed before any insertion) — statement-scoped
+  cursors now increment per row.
+- **Inline `PRIMARY KEY` never enforced uniqueness** — it built the
+  implicit index but registered no constraint; duplicates were
+  silently accepted (pg_dump catalogs were immune: they emit the
+  table-level ALTER form, which always enforced).
+
+### Added
+
+- `string_to_array(text, delim)` with PG semantics ('' → {}, NULL
+  text → NULL, NULL delim → per-char split).
+- `setweight(tsvector, 'A'..'D')` and `tsvector || tsvector`
+  (positions shift, shared lexemes merge, stronger weight wins) —
+  tsvector search triggers (mailrs migrate-016) evaluate and rank.
+- `pg_catalog.pg_trigger` introspection (tgname, relname,
+  tgenabled 'O'/'D', timing, events, function) — "is the trigger
+  registered and enabled" is now a one-line health check. The
+  round-16-D audit found NO silent no-fire path on 7.23: every
+  registration shape fires, and broken bodies fail INSERTs loudly.
+
 ## [7.23.0] — 2026-06-11 (mailrs round-14: TEXT > 64 KiB — storage codec + jumbo segment pages)
 
 ### Fixed
