@@ -8,6 +8,58 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.22.0] — 2026-06-11 (mailrs round-13: stock dumps import as-is — PG 18 pg_dump + mysqldump/mariadb-dump)
+
+The prod-cutover round. mailrs's dry-run fed an unmodified PG 18.4
+pg_dump (606 MB, 65k statements) to `spg import` and hit 7 parse
+failures; this release closes those and everything adjacent on both
+dump families. The dump-compat gate now loads every fixture through
+the wire AND the embed import path — the structural shadow that let
+these gaps hide behind a 10/10 gate is gone.
+
+### Fixed — the round-13 seven (PG 18 emission shapes)
+
+psql meta-lines (`\restrict`/`\unrestrict`); `SET param = on`;
+inline `CONSTRAINT <name> NOT NULL`; schema-qualified column types
+(`public.vector(N)`); named table-level CHECK/UNIQUE/PRIMARY KEY in
+CREATE TABLE; `ALTER … ADD CONSTRAINT n UNIQUE NULLS NOT DISTINCT`
+(the engine's ALTER path also CARRIES the flag now — it hardcoded
+false, so the NULL=NULL semantics genuinely enforce);
+schema-qualified opclasses in CREATE INDEX
+(`public.vector_cosine_ops`, `public.gin_trgm_ops`).
+
+### Added
+
+- **`spg import` takes default-format pg_dump**: `COPY … FROM
+  stdin` data blocks lower to INSERTs through the shared
+  `spg_engine::copy` module (statement splitter is COPY-aware —
+  data lines may contain `;`). The wire COPY path delegates to the
+  same helpers (its old numeric heuristic let "0042"/"inf" through
+  as lossy bare literals).
+- **Serial/identity columns survive import**: `ALTER COLUMN c SET
+  DEFAULT nextval('s')` was swallowed as a no-op since v7.14 —
+  every imported schema silently LOST auto-increment and the first
+  application INSERT without an id died on NOT NULL. It now lowers
+  to the auto-increment marker, as does `ADD GENERATED … AS
+  IDENTITY (…)` (the named implicit sequence is created so the
+  dump's `setval()` lands). Inline `GENERATED … AS IDENTITY` parses
+  in CREATE TABLE; generated EXPRESSION columns reject loudly.
+- **mysqldump / mariadb-dump data sections import as-is**:
+  per-session string-literal dialect (MySQL backslash escapes vs PG
+  literal-backslash) switched by each dump's own deterministic
+  signals (`SET sql_mode` ↔ `SET standard_conforming_strings`);
+  executable `/*!…*/` conditional comments survive statement
+  splitting; `ALTER TABLE … DISABLE/ENABLE KEYS` accepted as a
+  no-op. `char_length`/`character_length` aliases.
+
+### Changed
+
+- dump-compat corpus regenerated from postgres:18 / mysql:8.4 /
+  mariadb:11.4 with a new `rich` PG app (named CHECKs, NULLS NOT
+  DISTINCT, identity, enum, qualified trgm opclasses) and
+  mysql/mariadb with-data fixtures; `run.sh` gained the embed
+  import pass, a real exit code, and a restart-race fix.
+
 ## [7.21.0] — 2026-06-11 (mailrs embed round-12 closures + embedded tx crash durability)
 
 The real sqlx-embed cutover round. mailrs ran its actual test suites
