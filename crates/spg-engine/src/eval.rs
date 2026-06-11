@@ -6310,7 +6310,7 @@ pub fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
     Some(out)
 }
 
-fn literal_to_value(l: &Literal) -> Value {
+pub(crate) fn literal_to_value(l: &Literal) -> Value {
     match l {
         Literal::Integer(n) => {
             if let Ok(small) = i32::try_from(*n) {

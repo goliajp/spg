@@ -1211,7 +1211,7 @@ fn rewrite_group_keys_in_select(
 }
 
 /// Canonical string key for a tuple of group values. Used as map key.
-fn encode_key(vals: &[Value]) -> String {
+pub(crate) fn encode_key(vals: &[Value]) -> String {
     let mut out = String::new();
     for v in vals {
         match v {
