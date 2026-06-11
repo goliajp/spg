@@ -662,7 +662,7 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
     if pages_start_offset + FOOTER_LEN > bytes.len()
         || page_index
             .iter()
-            .any(|e| pages_start_offset + e.file_offset as usize >= bytes.len() - FOOTER_LEN + 1)
+            .any(|e| pages_start_offset + e.file_offset as usize > bytes.len() - FOOTER_LEN)
     {
         return Err(SegmentError::BadShape(format!(
             "segment: page index points past the {} input bytes",
@@ -705,8 +705,8 @@ fn parse_segment_metadata(bytes: &[u8]) -> Result<SegmentMetadata, SegmentError>
         meta,
         bloom,
         page_index,
-        pages_start_offset,
         long_strings,
+        pages_start_offset,
     })
 }
 
