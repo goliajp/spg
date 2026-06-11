@@ -43,6 +43,7 @@ async fn seeded_pool() -> SpgPool {
 /// mailrs's exact typed tuple — every column that used to arrive as
 /// TEXT (i64 / bool / f32 aggregates) must decode.
 #[tokio::test]
+#[allow(clippy::type_complexity)] // the 16-column tuple IS the point: mailrs's exact decode shape
 async fn search_conversations_typed_tuple_decodes() {
     let pool = seeded_pool().await;
     let rows: Vec<(
