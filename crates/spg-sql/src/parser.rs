@@ -167,6 +167,15 @@ struct Parser {
     pos: usize,
 }
 
+/// v7.22 (round-13 gap 5) — the kind keyword after `CONSTRAINT
+/// <name>` in a CREATE TABLE column list. FOREIGN KEY is not here:
+/// it keeps its dedicated path (`parse_table_level_fk`).
+enum NamedTableConstraintKind {
+    Check,
+    Unique,
+    PrimaryKey,
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, pos: 0 }
@@ -3139,6 +3148,13 @@ impl Parser {
             }
             Token::Integer(n) => Ok(crate::ast::SetValue::Number(n.to_string())),
             Token::Float(f) => Ok(crate::ast::SetValue::Number(f.to_string())),
+            // v7.22 (mailrs round-13 gap 2) — PG boolean parameter
+            // spellings that lex as keyword tokens, not idents:
+            // `SET standard_conforming_strings = on` is in every
+            // pg_dump preamble (`off` already lexes as an ident).
+            Token::On => Ok(crate::ast::SetValue::Ident("on".to_string())),
+            Token::True => Ok(crate::ast::SetValue::Ident("true".to_string())),
+            Token::False => Ok(crate::ast::SetValue::Ident("false".to_string())),
             // v7.14.0 — MySQL session/user variable RHS
             // (e.g. `SET OLD_FOREIGN_KEY_CHECKS = @@FOREIGN_KEY_CHECKS`).
             // Wrap as Ident so the SET handler can record it; the
@@ -3806,16 +3822,14 @@ impl Parser {
                     {
                         self.advance(); // CONSTRAINT
                         let _name = self.expect_ident_like()?;
-                        self.advance(); // UNIQUE
-                        let cols = self.parse_paren_ident_list("UNIQUE")?;
+                        // v7.22 (mailrs round-13 gap 6) — delegate so
+                        // the optional `NULLS [NOT] DISTINCT` modifier
+                        // parses here too (pg_dump emits the ALTER
+                        // form; semantics enforced by the engine
+                        // since v7.13).
+                        let uc = self.parse_table_level_unique()?;
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(
-                                crate::ast::TableConstraint::Unique {
-                                    name: None,
-                                    columns: cols,
-                                    nulls_not_distinct: false,
-                                }
-                            )
+                            crate::ast::AlterTableTarget::AddTableConstraint(uc)
                         ]);
                     }
                     if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("check"))
@@ -3868,16 +3882,10 @@ impl Parser {
                         ]);
                     }
                     Token::Ident(s) if s.eq_ignore_ascii_case("unique") => {
-                        self.advance();
-                        let cols = self.parse_paren_ident_list("UNIQUE")?;
+                        // v7.22 — delegate (NULLS [NOT] DISTINCT).
+                        let uc = self.parse_table_level_unique()?;
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(
-                                crate::ast::TableConstraint::Unique {
-                                    name: None,
-                                    columns: cols,
-                                    nulls_not_distinct: false,
-                                }
-                            )
+                            crate::ast::AlterTableTarget::AddTableConstraint(uc)
                         ]);
                     }
                     _ => {}
@@ -4648,6 +4656,20 @@ impl Parser {
                 if let Some(uc) = self.parse_mysql_inline_key()? {
                     table_constraints.push(uc);
                 }
+            } else if let Some(kind) = self.peek_named_table_constraint_kind() {
+                // v7.22 (mailrs round-13 gap 5) — `CONSTRAINT <name>
+                // { CHECK | UNIQUE | PRIMARY KEY }`: every pg_dump'd
+                // CHECK is named, and the named-CONSTRAINT arm used
+                // to accept FOREIGN KEY only. The name is accepted
+                // and discarded — same handling as every other SPG
+                // constraint name.
+                self.advance(); // CONSTRAINT
+                let _name = self.expect_ident_like()?;
+                table_constraints.push(match kind {
+                    NamedTableConstraintKind::Check => self.parse_table_level_check()?,
+                    NamedTableConstraintKind::Unique => self.parse_table_level_unique()?,
+                    NamedTableConstraintKind::PrimaryKey => self.parse_table_level_primary_key()?,
+                });
             } else if self.peek_constraint_or_fk_start() {
                 foreign_keys.push(self.parse_table_level_fk()?);
             } else {
@@ -5103,6 +5125,30 @@ impl Parser {
         matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("check"))
     }
 
+    /// v7.22 (round-13 gap 5) — `Some(kind)` when the next tokens are
+    /// `CONSTRAINT <name> { CHECK | UNIQUE | PRIMARY }`. FOREIGN stays
+    /// on the dedicated FK path (`parse_table_level_fk` consumes its
+    /// own CONSTRAINT prefix).
+    fn peek_named_table_constraint_kind(&self) -> Option<NamedTableConstraintKind> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint")) {
+            return None;
+        }
+        // tokens[pos+1] is the constraint name (any ident-like);
+        // tokens[pos+2] is the kind keyword.
+        match self.tokens.get(self.pos + 2) {
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("check") => {
+                Some(NamedTableConstraintKind::Check)
+            }
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("unique") => {
+                Some(NamedTableConstraintKind::Unique)
+            }
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("primary") => {
+                Some(NamedTableConstraintKind::PrimaryKey)
+            }
+            _ => None,
+        }
+    }
+
     fn parse_paren_ident_list(&mut self, ctx: &str) -> Result<Vec<String>, ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(alloc::format!(
@@ -5507,6 +5553,30 @@ impl Parser {
             // metric from the query operator (`<->` / `<#>` /
             // `<=>`), so for those callers the opclass stays
             // informational.
+            // v7.22 (mailrs round-13 gap 7) — pg_dump qualifies the
+            // opclass: `(embedding public.vector_cosine_ops)`. Strip
+            // the schema and dispatch on the bare opclass, the same
+            // treatment table/type names get.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(_) | Token::QuotedIdent(_))
+                ) && matches!(self.tokens.get(self.pos + 2), Some(Token::Dot))
+                    && matches!(
+                        self.tokens.get(self.pos + 3),
+                        Some(Token::Ident(op) | Token::QuotedIdent(op))
+                            if is_vector_opclass_name(op)
+                    ) =>
+            {
+                self.advance(); // column name
+                self.advance(); // schema qualifier
+                self.advance(); // dot
+                let op_tok = self.advance();
+                if let Token::Ident(op) | Token::QuotedIdent(op) = op_tok {
+                    opclass = Some(op.to_ascii_lowercase());
+                }
+                (s, None)
+            }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     self.tokens.get(self.pos + 1),
@@ -5726,7 +5796,7 @@ impl Parser {
         ),
         ParseError,
     > {
-        let ty_ident = match self.advance() {
+        let mut ty_ident = match self.advance() {
             Token::Ident(s) => s,
             other => {
                 return Err(ParseError {
@@ -5735,6 +5805,14 @@ impl Parser {
                 });
             }
         };
+        // v7.22 (mailrs round-13 gap 4) — schema-qualified type names:
+        // pg_dump qualifies extension types (`public.vector(1024)`).
+        // SPG is single-namespace; drop the schema and resolve the
+        // bare type — same treatment table names already get.
+        while matches!(self.peek(), Token::Dot) {
+            self.advance();
+            ty_ident = self.expect_ident_like()?;
+        }
         let mut implied_auto_increment = false;
         let mut implied_not_null = false;
         let mut user_type_ref: Option<String> = None;
@@ -6225,6 +6303,16 @@ impl Parser {
         let mut check: Option<Expr> = None;
         let mut on_update_runtime: Option<Expr> = None;
         loop {
+            // v7.22 (mailrs round-13 gap 3) — PG 18 catalogs
+            // not-null constraints by name and pg_dump emits them
+            // inline: `id bigint CONSTRAINT contacts_id_not_null1
+            // NOT NULL`. Accept and discard the name; whatever
+            // constraint follows is parsed by the arms below.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint")) {
+                self.advance();
+                let _name = self.expect_ident_like()?;
+                continue;
+            }
             // v7.17.0 Phase 2.1 — MySQL `ON UPDATE
             // CURRENT_TIMESTAMP[(N)]`. Only CURRENT_TIMESTAMP
             // is accepted today. The "ON" token is an Ident

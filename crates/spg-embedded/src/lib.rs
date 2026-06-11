@@ -3093,6 +3093,14 @@ fn pid_alive(_pid: u32) -> bool {
 /// comments (`/* … */`). Chunks that contain no statement content
 /// (whitespace / comments only) are dropped. PG's simple-query
 /// protocol does this server-side; the embed path owns it here.
+///
+/// v7.22 (mailrs round-13 gap 1) — psql meta-command lines are
+/// dropped for client parity: a line whose first non-whitespace
+/// byte is `\` BETWEEN statements (PG 18's pg_dump wraps scripts in
+/// `\restrict` / `\unrestrict`) never reaches the parser, the same
+/// way psql consumes `\`-lines client-side and never sends them. A
+/// mid-statement backslash stays an ordinary byte — pg_dump only
+/// emits meta-commands between statements.
 pub fn split_statements(sql: &str) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut stmts = Vec::new();
@@ -3101,6 +3109,15 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
+            b'\\' if !has_content => {
+                // Start-of-statement `\` = psql meta-command line.
+                // Consume through end-of-line; restart the chunk
+                // after it so the line never lands in the output.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                start = if i < bytes.len() { i + 1 } else { i };
+            }
             b'\'' => {
                 has_content = true;
                 // PG escape-string form `E'...'` honours backslash
@@ -3241,6 +3258,18 @@ mod tests {
                 "must split after: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn split_statements_drops_psql_meta_lines() {
+        // v7.22 round-13 gap 1 — PG 18 pg_dump wraps scripts in
+        // `\restrict` / `\unrestrict`; psql parity = the lines never
+        // reach the parser.
+        let script = "\\restrict TOKEN123\nSELECT 1;\n\\unrestrict TOKEN123\nSELECT 2;\n\\.\n";
+        assert_eq!(split_statements(script), vec!["SELECT 1", "SELECT 2"]);
+        // Mid-statement backslash is NOT a meta-command.
+        let s2 = r"SELECT E'a\\b'";
+        assert_eq!(split_statements(s2), vec![s2]);
     }
 
     #[test]
