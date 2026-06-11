@@ -8,6 +8,18 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.24.1] — 2026-06-11 (rounds 15+16 follow-up: NULLS inside OVER, subqueries in JOIN ON)
+
+### Fixed
+
+- `OVER (… ORDER BY x NULLS FIRST/LAST)` — window ordering keys now
+  carry the placement clause (same semantics as the top-level
+  ORDER BY fix in 7.24.0).
+- Subqueries inside `JOIN … ON` conditions: even uncorrelated ones
+  previously died with "subquery reached row eval" (the resolver
+  never walked join on-exprs); correlated ones run per combined
+  row, matching the joined-WHERE behaviour.
+
 ## [7.24.0] — 2026-06-11 (mailrs rounds 15+16: first production hours — NULLS placement, correlated subqueries under JOIN, search-trigger eval)
 
 mailrs went live on spg-embedded; the first hours surfaced two
