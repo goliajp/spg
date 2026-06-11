@@ -8,6 +8,50 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.28.0] — 2026-06-12 (mailrs round-22: the executor round — joins stop being O(L×R))
+
+Production data (24k rows) took the inbox query from "parses,
+binds, types" to "never returns" (CPU 366%, 7 GiB RSS, no kill
+switch on the embed path). This release is about the EXECUTOR.
+
+### Performance (measured on a 24k-row prod-shaped catalog, release)
+
+- Hash equi-join (ON `a = b` conjuncts; residual conjuncts evaluate
+  on candidates; NULL keys never match); non-equi/lateral keep the
+  nested loop.
+- Single-table predicate pushdown below the row clone, with index
+  seeks for `col = literal` (primary + INNER peers only).
+- Table-order swap: a filtered first INNER peer leads the join
+  (guarded: only when its ON references no later table).
+- Index-nested-loop for small working sets (≤1024 rows): seek the
+  peer's BTree instead of materialising the table — a correlated
+  subquery body no longer clones the full table once per group.
+- Unreferenced-column elision: columns a statement never reads
+  (collected through subquery bodies) carry NULL through the join
+  instead of being cloned (~700 MB of clone traffic per inbox
+  query came from a 30 KB body column nobody read).
+
+Inbox query (17 columns, 3 correlated subqueries, 23.5k groups):
+**never returns → ~1.1 s**. `JOIN … LIMIT 5`: 691 → 74 ms.
+
+### Bounds + budget (the embed-side kill switches)
+
+- Join intermediate-row ceiling (4M rows/stage) errors instead of
+  eating the host. (The SERVER already had allocator ceilings,
+  watchdogs and slow-query logs; these apply to embedded now.)
+- readonly-inline budget (`SPG_SQLX_INLINE_BUDGET_MS`, default
+  25 ms): a slow readonly query escapes to the blocking pool
+  instead of starving the caller's tokio workers; one log line per
+  escape (the embed slow-query signal).
+- New `Database::execute_prepared_on_snapshot_with_budget`.
+
+### Gates
+
+- `perf_gate::inbox_25k` — seeded 25k-row panel: the full inbox
+  shape under 4 s, `JOIN … LIMIT` under 1 s (engine-level,
+  absolute budgets).
+- sqlx `inline_budget_escape_completes`.
+
 ## [7.27.0] — 2026-06-12 (mailrs round-21: the full u16-length sweep + namespace-aware locks)
 
 Round-14's escape codec covered TEXT and missed every other
