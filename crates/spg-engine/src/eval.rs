@@ -6409,6 +6409,18 @@ fn resolve_column(c: &ColumnName, row: &Row, ctx: &EvalContext<'_>) -> Result<Va
         if let Some(pos) = ctx.columns.iter().position(|s| s.name == composite) {
             return Ok(row.values[pos].clone());
         }
+        // v7.26 (round-20 B) — when the qualifier IS a known table
+        // alias in a joined schema (composite "alias.x" columns
+        // exist) but THIS column isn't among them, the honest error
+        // is "column does not exist", not "unknown table
+        // qualifier". The misleading message sent mailrs hunting a
+        // resolver bug when their fixture was missing a column.
+        let prefix = alloc::format!("{q}.");
+        if ctx.columns.iter().any(|sc| sc.name.starts_with(&prefix)) {
+            return Err(EvalError::ColumnNotFound {
+                name: alloc::format!("{q}.{name}", name = c.name),
+            });
+        }
         let expected = ctx.table_alias.ok_or_else(|| EvalError::UnknownQualifier {
             qualifier: q.clone(),
         })?;
