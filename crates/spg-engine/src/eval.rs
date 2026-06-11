@@ -199,6 +199,7 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             expr,
             pattern,
             negated,
+            case_insensitive,
         } => {
             let v = eval_expr(expr, row, ctx)?;
             let p = eval_expr(pattern, row, ctx)?;
@@ -212,7 +213,13 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                     });
                 }
             };
-            let m = like_match(&text, &pat);
+            // v7.25 (round-17) — ILIKE folds both operands (PG
+            // lowercases per the default collation).
+            let m = if *case_insensitive {
+                like_match(&text.to_lowercase(), &pat.to_lowercase())
+            } else {
+                like_match(&text, &pat)
+            };
             Ok(Value::Bool(if *negated { !m } else { m }))
         }
         Expr::Extract { field, source } => {

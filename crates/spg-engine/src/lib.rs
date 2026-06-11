@@ -10122,7 +10122,19 @@ impl Engine {
             let (columns, rows) = if cte.recursive {
                 self.materialise_recursive_cte(cte, &catalog, cancel)?
             } else {
-                let body_result = self.exec_select_cancel(&cte.body, cancel)?;
+                // v7.25 (round-17) — run the body against the
+                // ACCUMULATED catalog so a CTE can reference every
+                // CTE declared before it (`WITH a AS (…), b AS
+                // (SELECT … FROM a)`). Executing on `self` lost the
+                // already-materialised CTE tables.
+                let mut cte_engine = Engine::restore(catalog.clone());
+                if let Some(c) = self.clock {
+                    cte_engine = cte_engine.with_clock(c);
+                }
+                if let Some(f) = self.salt_fn {
+                    cte_engine = cte_engine.with_salt_fn(f);
+                }
+                let body_result = cte_engine.exec_select_cancel(&cte.body, cancel)?;
                 let QueryResult::Rows { columns, rows } = body_result else {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "CTE {:?} body did not return rows",
@@ -10380,7 +10392,7 @@ impl Engine {
             return Ok(());
         }
         match e {
-            Expr::AggregateOrdered { call, order_by } => {
+            Expr::AggregateOrdered { call, order_by, .. } => {
                 self.resolve_expr_subqueries(call, cancel)?;
                 for o in order_by.iter_mut() {
                     self.resolve_expr_subqueries(&mut o.expr, cancel)?;
@@ -10496,7 +10508,7 @@ impl Engine {
         mut memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<(), EngineError> {
         match e {
-            Expr::AggregateOrdered { call, order_by } => {
+            Expr::AggregateOrdered { call, order_by, .. } => {
                 self.resolve_correlated_in_expr(call, row, ctx, cancel, memo.as_deref_mut())?;
                 for o in order_by.iter_mut() {
                     self.resolve_correlated_in_expr(
@@ -10811,7 +10823,7 @@ fn from_refers_to(from: &FromClause, target: &str) -> bool {
 
 fn expr_refers_to(e: &Expr, target: &str) -> bool {
     match e {
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             expr_refers_to(call, target) || order_by.iter().any(|o| expr_refers_to(&o.expr, target))
         }
         Expr::ScalarSubquery(s) => select_refers_to(s, target),
@@ -12556,7 +12568,7 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
         }
     }
     match e {
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_in_expr(call, row, ctx, outer_alias);
             for o in order_by.iter_mut() {
                 substitute_in_expr(&mut o.expr, row, ctx, outer_alias);
@@ -12658,7 +12670,7 @@ fn select_has_window(stmt: &SelectStatement) -> bool {
 fn expr_has_window(e: &Expr) -> bool {
     match e {
         Expr::WindowFunction { .. } => true,
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             expr_has_window(call) || order_by.iter().any(|o| expr_has_window(&o.expr))
         }
         Expr::Binary { lhs, rhs, .. } => expr_has_window(lhs) || expr_has_window(rhs),
@@ -13561,7 +13573,7 @@ fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
 fn expr_has_subquery(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             expr_has_subquery(call) || order_by.iter().any(|o| expr_has_subquery(&o.expr))
         }
         Expr::Binary { lhs, rhs, .. } => expr_has_subquery(lhs) || expr_has_subquery(rhs),
@@ -13762,7 +13774,7 @@ fn rewrite_column_in_source(
 /// qualifier present is either redundant or wrong.
 fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
     match e {
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             rewrite_column_in_expr(call, old, new);
             for o in order_by.iter_mut() {
                 rewrite_column_in_expr(&mut o.expr, old, new);
@@ -13987,7 +13999,7 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
         return Ok(());
     }
     match e {
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_expr(call, params)?;
             for o in order_by.iter_mut() {
                 substitute_expr(&mut o.expr, params)?;
@@ -14360,7 +14372,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         return;
     }
     match e {
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             rewrite_expr_clock(call, now);
             for o in order_by.iter_mut() {
                 rewrite_expr_clock(&mut o.expr, now);

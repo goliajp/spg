@@ -1946,6 +1946,10 @@ pub enum Expr {
     AggregateOrdered {
         call: Box<Expr>,
         order_by: Vec<OrderBy>,
+        /// v7.25 (round-17) — `COUNT(DISTINCT x)` /
+        /// `string_agg(DISTINCT s, ',')`. The wrapper carries every
+        /// aggregate modifier so plain FunctionCall stays untouched.
+        distinct: bool,
     },
     /// SQL `LIKE` predicate. `pattern` evaluates to text at runtime;
     /// wildcards are `%` (any run) and `_` (one char), backslash escapes
@@ -1954,6 +1958,9 @@ pub enum Expr {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
+        /// v7.25 (mailrs round-17) — `ILIKE`: case-insensitive
+        /// match. PG folds both operands.
+        case_insensitive: bool,
     },
     /// v4.12 window function call: `name(args) OVER (PARTITION BY
     /// ... ORDER BY ...)`. Supports `ROW_NUMBER` / `RANK` /
@@ -3687,12 +3694,25 @@ impl fmt::Display for Expr {
                 UnOp::BitNot => write!(f, "(~{expr})"),
             },
             Self::Cast { expr, target } => write!(f, "({expr}::{target})"),
-            Self::AggregateOrdered { call, order_by } => {
-                // Render as `name(args ORDER BY …)` — peel the inner
-                // call's closing paren so the keys sit inside it.
+            Self::AggregateOrdered {
+                call,
+                order_by,
+                distinct,
+            } => {
+                // Render as `name([DISTINCT ]args [ORDER BY …])` —
+                // peel the inner call's parens to splice modifiers.
                 let inner = alloc::format!("{call}");
                 let body = inner.strip_suffix(')').unwrap_or(&inner);
-                write!(f, "{body} ORDER BY ")?;
+                let (head, args_part) = body.split_once('(').unwrap_or((body, ""));
+                write!(f, "{head}(")?;
+                if *distinct {
+                    f.write_str("DISTINCT ")?;
+                }
+                write!(f, "{args_part}")?;
+                if order_by.is_empty() {
+                    return f.write_str(")");
+                }
+                f.write_str(" ORDER BY ")?;
                 for (i, o) in order_by.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
@@ -3730,12 +3750,15 @@ impl fmt::Display for Expr {
                 expr,
                 pattern,
                 negated,
+                case_insensitive,
             } => {
-                if *negated {
-                    write!(f, "({expr} NOT LIKE {pattern})")
-                } else {
-                    write!(f, "({expr} LIKE {pattern})")
-                }
+                let op = match (negated, case_insensitive) {
+                    (false, false) => "LIKE",
+                    (true, false) => "NOT LIKE",
+                    (false, true) => "ILIKE",
+                    (true, true) => "NOT ILIKE",
+                };
+                write!(f, "({expr} {op} {pattern})")
             }
             Self::Extract { field, source } => write!(f, "EXTRACT({field} FROM {source})"),
             Self::WindowFunction {
