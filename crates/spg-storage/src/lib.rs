@@ -5142,7 +5142,7 @@ impl Catalog {
         let u64_key = index_key_as_u64(key)?;
         let seg = self.cold_segments.get(segment_id as usize)?.as_ref()?;
         let payload = seg.lookup(u64_key)?;
-        let (row, _) = decode_row_body_dense(&payload, &t.schema, seg.long_strings()).ok()?;
+        let (row, _) = decode_row_body_dense(&payload, &t.schema, seg.codec_version()).ok()?;
         Some(row)
     }
 
@@ -5205,7 +5205,7 @@ impl Catalog {
                         continue;
                     };
                     let (row, _) =
-                        decode_row_body_dense(&payload, &t.schema, seg.long_strings()).ok()?;
+                        decode_row_body_dense(&payload, &t.schema, seg.codec_version()).ok()?;
                     return Some(row);
                 }
             }
@@ -5275,7 +5275,7 @@ impl Catalog {
                  but the segment's bloom/page lookup didn't return a row"
             ))
         })?;
-        let (row, _consumed) = decode_row_body_dense(&payload, &schema, seg.long_strings())?;
+        let (row, _consumed) = decode_row_body_dense(&payload, &schema, seg.codec_version())?;
         // Insert the promoted row into the hot tier. `Table::insert`
         // appends to `self.rows`, adds a `Hot(new_idx)` locator to
         // every BTree index covering the row's keyed columns, and
@@ -6184,7 +6184,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     loudly via the version gate; v46 readers decode v45 catalogs
 ///     with the plain-u16 rules (0xFFFF is a legitimate length
 ///     there).
-const FILE_VERSION: u8 = 46;
+/// v47 introduces (v7.27, mailrs round-21):
+///   * Escaped lengths for the REMAINING u16-length cell payloads —
+///     BYTEA cells, TEXT[] elements, tsvector lexemes and tsquery
+///     terms — the same `[u16 0xFFFF][u32 real_len]` escape v46
+///     gave short strings. Round-14 fixed TEXT and missed these;
+///     round-21 fired the BYTEA twin during a production migration.
+///     One-way upgrade, same posture as v46.
+const FILE_VERSION: u8 = 47;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;
@@ -6851,9 +6858,9 @@ impl Catalog {
                 "unsupported file version: {version} (supported: {MIN_SUPPORTED_FILE_VERSION}..={FILE_VERSION})"
             )));
         }
-        // v7.23 — string decoding is version-gated (see
-        // STR_LEN_ESCAPE).
-        cur.long_strings = version >= 46;
+        // v7.23/v7.27 — escape decoding is version-gated (see
+        // STR_LEN_ESCAPE / Cursor::codec_version).
+        cur.codec_version = version;
         let table_count = cur.read_u32()? as usize;
         let mut cat = Self::new();
         for _ in 0..table_count {
@@ -7369,7 +7376,7 @@ fn deserialize_rows(
     let mut hot_bytes: u64 = 0;
     for _ in 0..row_count {
         let tail = &cur.buf[cur.pos..];
-        let (row, consumed) = decode_row_body_dense(tail, &t.schema, cur.long_strings)?;
+        let (row, consumed) = decode_row_body_dense(tail, &t.schema, cur.codec_version)?;
         cur.pos += consumed;
         // v5.2.1: account for hot bytes as we go; the snapshot's row
         // block bytes are exactly what `encode_row_body_dense` would
@@ -8087,9 +8094,9 @@ pub fn encode_row_body_dense(row: &Row, schema: &TableSchema) -> Vec<u8> {
 pub fn decode_row_body_dense(
     bytes: &[u8],
     schema: &TableSchema,
-    long_strings: bool,
+    codec_version: u8,
 ) -> Result<(Row, usize), StorageError> {
-    let mut cur = Cursor::new(bytes).with_long_strings(long_strings);
+    let mut cur = Cursor::new(bytes).with_codec_version(codec_version);
     let bitmap_bytes = schema.columns.len().div_ceil(8);
     let mut bitmap_buf = [0u8; 32];
     if bitmap_bytes > bitmap_buf.len() {
@@ -8187,11 +8194,10 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         (Value::Json(s), DataType::Json | DataType::Jsonb) => write_str(out, s),
         // v7.10.4: BYTEA shares the [u16 len][bytes] shape with
         // Text but writes raw bytes (no UTF-8 invariant).
-        (Value::Bytes(b), DataType::Bytes) => {
-            let len = u16::try_from(b.len()).expect("BYTEA cell ≤ 64 KiB");
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(b);
-        }
+        // v7.27 (round-21) — BYTEA takes the escaped length: round-14
+        // moved TEXT to the escape codec and missed this arm; the
+        // twin fired during mailrs's production migration window.
+        (Value::Bytes(b), DataType::Bytes) => write_bytes_escaped(out, b),
         // v7.10.9: TEXT[] dense body — [u16 count][per element:
         // u8 null flag + (when non-null) u16 len + utf-8 bytes].
         (Value::TextArray(items), DataType::TextArray) => {
@@ -8202,9 +8208,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                     None => out.push(1),
                     Some(s) => {
                         out.push(0);
-                        let len = u16::try_from(s.len()).expect("TEXT[] element ≤ 64 KiB");
-                        out.extend_from_slice(&len.to_le_bytes());
-                        out.extend_from_slice(s.as_bytes());
+                        write_bytes_escaped(out, s.as_bytes());
                     }
                 }
             }
@@ -8466,9 +8470,7 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
         // the WAL `auto_commit_sql` shape elsewhere, hence 14.)
         Value::Bytes(b) => {
             out.push(14);
-            let len = u16::try_from(b.len()).expect("BYTEA value ≤ 64 KiB");
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(b);
+            write_bytes_escaped(out, b);
         }
         // v7.10.9: TEXT[] — [u8 tag=15][u16 count][per elem: u8
         // null + (if non-null) u16 len + utf-8 bytes].
@@ -8481,9 +8483,7 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
                     None => out.push(1),
                     Some(s) => {
                         out.push(0);
-                        let len = u16::try_from(s.len()).expect("TEXT[] element ≤ 64 KiB");
-                        out.extend_from_slice(&len.to_le_bytes());
-                        out.extend_from_slice(s.as_bytes());
+                        write_bytes_escaped(out, s.as_bytes());
                     }
                 }
             }
@@ -8707,9 +8707,8 @@ fn write_tsvector_body(out: &mut Vec<u8>, lexs: &[TsLexeme]) {
     let count = u16::try_from(lexs.len()).expect("tsvector ≤ 65k lexemes");
     out.extend_from_slice(&count.to_le_bytes());
     for l in lexs {
-        let wlen = u16::try_from(l.word.len()).expect("tsvector word ≤ 64 KiB");
-        out.extend_from_slice(&wlen.to_le_bytes());
-        out.extend_from_slice(l.word.as_bytes());
+        // v7.27 — escaped length (codec sweep, round-21).
+        write_bytes_escaped(out, l.word.as_bytes());
         let plen = u16::try_from(l.positions.len()).expect("tsvector pos count ≤ 65k");
         out.extend_from_slice(&plen.to_le_bytes());
         for p in &l.positions {
@@ -8726,9 +8725,8 @@ fn write_tsquery_body(out: &mut Vec<u8>, ast: &TsQueryAst) {
     match ast {
         TsQueryAst::Term { word, weight_mask } => {
             out.push(0);
-            let len = u16::try_from(word.len()).expect("tsquery term ≤ 64 KiB");
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(word.as_bytes());
+            // v7.27 — escaped length (codec sweep, round-21).
+            write_bytes_escaped(out, word.as_bytes());
             out.push(*weight_mask);
         }
         TsQueryAst::And(a, b) => {
@@ -8786,9 +8784,24 @@ fn write_u32(out: &mut Vec<u8>, n: u32) {
 /// 2-byte header — zero overhead for identifiers and typical text.
 /// Pre-v46 catalogs (and pre-V3 segments) may legitimately contain
 /// a plain length of 0xFFFF, so DECODING is gated on the container
-/// version (`Cursor::long_strings`); encoding always emits the v46
+/// version (`Cursor::codec_version`); encoding always emits the v46
 /// form because every new container carries the new version mark.
 const STR_LEN_ESCAPE: u16 = u16::MAX;
+
+/// v7.27 (round-21) — escaped length for RAW BYTE payloads (BYTEA
+/// cells, TEXT[] elements when paired with their own validity
+/// rules): same sentinel scheme as [`write_str`], decoding gated on
+/// codec_version >= 47.
+fn write_bytes_escaped(out: &mut Vec<u8>, b: &[u8]) {
+    if b.len() >= STR_LEN_ESCAPE as usize {
+        let len = u32::try_from(b.len()).expect("cell fits in u32 (4 GiB cap)");
+        write_u16(out, STR_LEN_ESCAPE);
+        write_u32(out, len);
+    } else {
+        write_u16(out, b.len() as u16);
+    }
+    out.extend_from_slice(b);
+}
 
 fn write_str(out: &mut Vec<u8>, s: &str) {
     if s.len() >= STR_LEN_ESCAPE as usize {
@@ -8842,12 +8855,13 @@ fn write_index_key(out: &mut Vec<u8>, key: &IndexKey) {
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
-    /// v7.23 (round-14) — true when the container declares the v46+
-    /// string codec (catalog `FILE_VERSION >= 46` / segment magic
-    /// V3): a u16 length of [`STR_LEN_ESCAPE`] escapes to a u32 real
-    /// length. False for older containers, where 0xFFFF is a
-    /// legitimate plain length.
-    long_strings: bool,
+    /// v7.23/v7.27 — the container's codec version (catalog
+    /// FILE_VERSION, or the segment magic mapped onto it). Gates
+    /// length-escape decoding: >= 46 strings escape via
+    /// [`STR_LEN_ESCAPE`], >= 47 BYTEA / TEXT[] elements / ts
+    /// lexemes escape too. 0 = legacy (plain u16 everywhere —
+    /// 0xFFFF is a legitimate length there).
+    codec_version: u8,
 }
 
 impl<'a> Cursor<'a> {
@@ -8855,13 +8869,13 @@ impl<'a> Cursor<'a> {
         Self {
             buf,
             pos: 0,
-            long_strings: false,
+            codec_version: 0,
         }
     }
 
-    /// v7.23 — builder for version-gated string decoding.
-    const fn with_long_strings(mut self, on: bool) -> Self {
-        self.long_strings = on;
+    /// v7.23/v7.27 — builder for version-gated escape decoding.
+    const fn with_codec_version(mut self, v: u8) -> Self {
+        self.codec_version = v;
         self
     }
 
@@ -8918,9 +8932,31 @@ impl<'a> Cursor<'a> {
         let s = self.take(4)?;
         Ok(f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
+    /// v7.27 — length field with the >=47 escape (BYTEA cells,
+    /// TEXT[] elements, ts lexemes/terms).
+    fn read_len_escaped_v47(&mut self) -> Result<usize, StorageError> {
+        let short = self.read_u16()?;
+        if self.codec_version >= 47 && short == STR_LEN_ESCAPE {
+            Ok(self.read_u32()? as usize)
+        } else {
+            Ok(short as usize)
+        }
+    }
+
+    /// v7.27 — string whose length uses the >=47 escape (TEXT[]
+    /// elements, ts lexemes/terms — payloads that were plain u16
+    /// through v46).
+    fn read_str_escaped_v47(&mut self) -> Result<String, StorageError> {
+        let len = self.read_len_escaped_v47()?;
+        let bytes = self.take(len)?;
+        core::str::from_utf8(bytes)
+            .map(String::from)
+            .map_err(|_| StorageError::Corrupt("invalid UTF-8 in cell payload".into()))
+    }
+
     fn read_str(&mut self) -> Result<String, StorageError> {
         let short = self.read_u16()?;
-        let len = if self.long_strings && short == STR_LEN_ESCAPE {
+        let len = if self.codec_version >= 46 && short == STR_LEN_ESCAPE {
             // v7.23 escape form — real length follows as u32.
             self.read_u32()? as usize
         } else {
@@ -9035,7 +9071,8 @@ impl<'a> Cursor<'a> {
             // v7.10.4: BYTEA on-disk is [u16 len][bytes]. Same wire
             // shape as Text, but read as raw Vec<u8>.
             DataType::Bytes => {
-                let len = self.read_u16()? as usize;
+                // v7.27 (round-21) — escaped length at >= 47.
+                let len = self.read_len_escaped_v47()?;
                 let bytes = self.take(len)?.to_vec();
                 Ok(Value::Bytes(bytes))
             }
@@ -9045,7 +9082,7 @@ impl<'a> Cursor<'a> {
                 let mut items: Vec<Option<String>> = Vec::with_capacity(count);
                 for _ in 0..count {
                     match self.read_u8()? {
-                        0 => items.push(Some(self.read_str()?)),
+                        0 => items.push(Some(self.read_str_escaped_v47()?)),
                         1 => items.push(None),
                         other => {
                             return Err(StorageError::Corrupt(format!(
@@ -9251,7 +9288,7 @@ impl<'a> Cursor<'a> {
         let count = self.read_u16()? as usize;
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            let word = self.read_str()?;
+            let word = self.read_str_escaped_v47()?;
             let pos_count = self.read_u16()? as usize;
             let mut positions = Vec::with_capacity(pos_count);
             for _ in 0..pos_count {
@@ -9272,7 +9309,7 @@ impl<'a> Cursor<'a> {
         let tag = self.read_u8()?;
         match tag {
             0 => {
-                let word = self.read_str()?;
+                let word = self.read_str_escaped_v47()?;
                 let weight_mask = self.read_u8()?;
                 Ok(TsQueryAst::Term { word, weight_mask })
             }
@@ -9357,7 +9394,8 @@ impl<'a> Cursor<'a> {
             }
             // v7.10.4: tag 14 — BYTEA. [u16 len][bytes].
             14 => {
-                let len = self.read_u16()? as usize;
+                // v7.27 (round-21) — escaped length at >= 47.
+                let len = self.read_len_escaped_v47()?;
                 let bytes = self.take(len)?.to_vec();
                 Ok(Value::Bytes(bytes))
             }
@@ -9368,7 +9406,7 @@ impl<'a> Cursor<'a> {
                 let mut items: Vec<Option<String>> = Vec::with_capacity(count);
                 for _ in 0..count {
                     match self.read_u8()? {
-                        0 => items.push(Some(self.read_str()?)),
+                        0 => items.push(Some(self.read_str_escaped_v47()?)),
                         1 => items.push(None),
                         other => {
                             return Err(StorageError::Corrupt(format!(
@@ -9532,6 +9570,62 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
+    /// v7.27 (mailrs round-21) — the remaining u16 cells take the
+    /// escape: a > 64 KiB BYTEA cell and a > 64 KiB TEXT[] element
+    /// round-trip through snapshot serialise/deserialise (the BYTEA
+    /// twin of round-14 fired during a production migration).
+    #[test]
+    fn snapshot_round_trips_large_bytea_and_text_array_element() {
+        let mut cat = Catalog::new();
+        cat.create_table(TableSchema::new(
+            "q",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("data", DataType::Bytes, true),
+                ColumnSchema::new("uris", DataType::TextArray, true),
+            ],
+        ))
+        .unwrap();
+        let big_blob = alloc::vec![0xAB_u8; 200_000];
+        let big_elem = "u".repeat(100_000);
+        cat.get_mut("q")
+            .unwrap()
+            .insert(Row::new(alloc::vec![
+                Value::BigInt(1),
+                Value::Bytes(big_blob.clone()),
+                Value::TextArray(alloc::vec![Some(big_elem.clone()), None, Some("s".into())]),
+            ]))
+            .unwrap();
+        let bytes = cat.serialize();
+        let re = Catalog::deserialize(&bytes).unwrap();
+        let row = re.get("q").unwrap().rows.get(0).unwrap().clone();
+        match &row.values[1] {
+            Value::Bytes(b) => assert_eq!(b.len(), big_blob.len()),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+        match &row.values[2] {
+            Value::TextArray(items) => {
+                assert_eq!(items[0].as_ref().unwrap().len(), big_elem.len());
+                assert!(items[1].is_none());
+            }
+            other => panic!("expected TextArray, got {other:?}"),
+        }
+    }
+
+    /// Pre-v47 containers carry PLAIN u16 lengths for these cells —
+    /// 0xFFFF must not be treated as an escape there.
+    #[test]
+    fn plain_u16_bytea_len_ffff_decodes_under_v46_rules() {
+        let payload = alloc::vec![7_u8; 65_535];
+        let mut buf = Vec::new();
+        write_u16(&mut buf, 65_535);
+        buf.extend_from_slice(&payload);
+        let mut cur = Cursor::new(&buf).with_codec_version(46);
+        let len = cur.read_len_escaped_v47().unwrap();
+        assert_eq!(len, 65_535);
+        assert_eq!(cur.take(len).unwrap().len(), 65_535);
+    }
+
     /// v7.23 (mailrs round-14) — the escaped short-string codec.
     /// Boundary cases: 0xFFFE stays plain-u16, 0xFFFF and above take
     /// the escape form, round-trips are exact at 1 MiB.
@@ -9543,7 +9637,7 @@ mod tests {
             write_str(&mut buf, &s);
             let expected_header = if len >= STR_LEN_ESCAPE as usize { 6 } else { 2 };
             assert_eq!(buf.len(), expected_header + len, "header width for {len}");
-            let mut cur = Cursor::new(&buf).with_long_strings(true);
+            let mut cur = Cursor::new(&buf).with_codec_version(FILE_VERSION);
             assert_eq!(cur.read_str().unwrap().len(), len, "round-trip {len}");
         }
     }
@@ -9557,7 +9651,7 @@ mod tests {
         // Hand-encode the OLD form: plain u16 length.
         write_u16(&mut buf, 65_535);
         buf.extend_from_slice(s.as_bytes());
-        let mut old = Cursor::new(&buf); // long_strings = false
+        let mut old = Cursor::new(&buf); // codec_version = 0 (legacy rules)
         assert_eq!(old.read_str().unwrap(), s);
     }
 
@@ -9612,11 +9706,11 @@ mod tests {
             })
             .collect();
         let (bytes, _) = encode_segment(rows.into_iter(), 0.01, SEGMENT_PAGE_BYTES).unwrap();
-        assert_eq!(&bytes[..8], b"SPGSEG\x03\x00", "new segments are V3");
+        assert_eq!(&bytes[..8], b"SPGSEG\x04\x00", "new segments are V4");
         let seg = OwnedSegment::from_bytes(bytes).unwrap();
-        assert!(seg.long_strings());
+        assert!(seg.codec_version() >= 47);
         let payload = seg.lookup(1).expect("pk 1 present");
-        let (row, _) = decode_row_body_dense(&payload, &schema, seg.long_strings()).unwrap();
+        let (row, _) = decode_row_body_dense(&payload, &schema, seg.codec_version()).unwrap();
         match &row.values[1] {
             Value::Text(s) => assert_eq!(s.len(), big.len()),
             other => panic!("expected Text, got {other:?}"),
@@ -9630,7 +9724,7 @@ mod tests {
         let key = IndexKey::Text("k".repeat(100_000));
         let mut buf = Vec::new();
         write_index_key(&mut buf, &key);
-        let mut cur = Cursor::new(&buf).with_long_strings(true);
+        let mut cur = Cursor::new(&buf).with_codec_version(FILE_VERSION);
         let back = cur.read_index_key().unwrap();
         assert_eq!(back, key);
     }

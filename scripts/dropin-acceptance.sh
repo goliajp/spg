@@ -300,6 +300,12 @@ run_case_expect "round13.serial_continuity_multirow" \
 run_case_expect_tolerant "round13.inline_pk_enforces" \
   "CREATE TABLE r13_b (id BIGINT PRIMARY KEY, v TEXT); INSERT INTO r13_b VALUES (1,'a'); INSERT INTO r13_b VALUES (1,'dup'); SELECT count(*) FROM r13_b;" \
   "1"
+run_case_expect "round21.bytea_above_64k" \
+  "CREATE TABLE r21_a (id BIGINT, data BYTEA); INSERT INTO r21_a VALUES (1, decode(repeat('QUFB', 30000), 'base64')); SELECT length(data) FROM r21_a;" \
+  "90000"
+run_case_expect "round21.text_array_elem_above_64k" \
+  "CREATE TABLE r21_b (id BIGINT, uris TEXT[]); INSERT INTO r21_b VALUES (1, ARRAY[repeat('u', 80000), 'small']); SELECT length(uris[1]) FROM r21_b;" \
+  "80000"
 run_case_expect "round14.text_above_64k" \
   "CREATE TABLE r14_a (id BIGINT, body TEXT); INSERT INTO r14_a VALUES (1, repeat('x', 70000)); SELECT length(body) FROM r14_a;" \
   "70000"

@@ -66,10 +66,16 @@ fn main() {
             // embed round-12).
             let mut db_path: Option<String> = None;
             let mut file: Option<String> = None;
+            let mut force_unlock = false;
             while let Some(a) = args.next() {
                 match a.as_str() {
                     "--db" => db_path = args.next(),
                     "--file" => file = args.next(),
+                    // v7.27 (round-21 B) — recovery-window ergonomics:
+                    // clear a lock whose owner is gone (e.g. a stopped
+                    // container whose pid is meaningless here) without
+                    // raw `rm -rf` on the data dir.
+                    "--force-unlock" => force_unlock = true,
                     other => {
                         die(&format!("import: unknown arg {other:?}"), 2);
                     }
@@ -77,11 +83,17 @@ fn main() {
             }
             let (Some(db_path), Some(file)) = (db_path, file) else {
                 die(
-                    "usage: spg import --db <catalog.spg> --file <script.sql>",
+                    "usage: spg import --db <catalog.spg> --file <script.sql> [--force-unlock]",
                     2,
                 );
                 return;
             };
+            if force_unlock {
+                if let Err(e) = spg_embedded::Database::force_unlock(&db_path) {
+                    die(&format!("--force-unlock failed: {e}"), 1);
+                }
+                eprintln!("spg import: cleared lock for {db_path} (--force-unlock)");
+            }
             match import_script(&db_path, &file) {
                 Ok((stmts, affected)) => {
                     println!(
