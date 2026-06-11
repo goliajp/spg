@@ -440,7 +440,7 @@ fn walk_select(s: &SelectStatement, f: &mut impl FnMut(&Expr)) {
 fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     f(e);
     match e {
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered { call, order_by, .. } => {
             walk_expr(call, f);
             for o in order_by {
                 walk_expr(&o.expr, f);

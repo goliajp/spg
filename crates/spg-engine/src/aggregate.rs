@@ -21,7 +21,7 @@
 //! `avg(int|bigint)` returns `Float`.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -141,6 +141,10 @@ struct AggState {
     /// PG behaviour when no `ORDER BY` is given inside the
     /// aggregate call.
     items: Vec<Value>,
+    /// v7.25 (round-17) — per-group dedupe set for DISTINCT
+    /// aggregates (encoded values; NULLs never reach it because
+    /// the caller's skip runs after the per-aggregate NULL rules).
+    seen: BTreeSet<String>,
     /// v7.24 (round-16 A) — per-item ORDER BY key tuples, parallel
     /// to `items` (pushed under the same skip/keep conditions).
     /// Empty when the aggregate carries no internal ordering.
@@ -169,6 +173,9 @@ struct AggSpec {
     /// per-row evaluation can re-use the same separator
     /// expression across calls.
     arg2: Option<Expr>,
+    /// v7.25 (round-17) — `COUNT(DISTINCT x)` & friends: dedupe
+    /// the input stream per group before accumulation.
+    distinct: bool,
     /// v7.24 (round-16 A) — aggregate-internal ORDER BY keys
     /// (`array_agg(x ORDER BY y DESC NULLS LAST)`). Empty for the
     /// plain form. Only the collection aggregates honour it;
@@ -282,6 +289,16 @@ pub fn run(
                 }
                 Some(keys)
             };
+            // v7.25 (round-17) — DISTINCT: drop repeated inputs
+            // before they reach the accumulator. NULLs flow through
+            // (each aggregate's own NULL rule applies; PG also
+            // treats NULL as a single distinct value for array_agg).
+            if spec.distinct {
+                let key = encode_key(core::slice::from_ref(&arg_val));
+                if !entry.1[i].seen.insert(key) {
+                    continue;
+                }
+            }
             update_state(
                 &mut entry.1[i],
                 &spec.name,
@@ -512,7 +529,11 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
         // v7.24 (round-16 A) — ordered aggregate: register the inner
         // call's spec with the ordering attached.
-        Expr::AggregateOrdered { call, order_by } => {
+        Expr::AggregateOrdered {
+            call,
+            order_by,
+            distinct,
+        } => {
             if let Expr::FunctionCall { name, args } = call.as_ref() {
                 let lower = name.to_ascii_lowercase();
                 if is_aggregate_name(&lower) {
@@ -529,12 +550,14 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         } else {
                             None
                         },
+                        distinct: *distinct,
                         order_by: order_by.clone(),
                     };
                     if !out.iter().any(|s| {
                         s.name == spec.name
                             && s.arg == spec.arg
                             && s.arg2 == spec.arg2
+                            && s.distinct == spec.distinct
                             && s.order_by == spec.order_by
                     }) {
                         out.push(spec);
@@ -575,12 +598,14 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     name: canonical,
                     arg: arg.clone(),
                     arg2: arg2.clone(),
+                    distinct: false,
                     order_by: Vec::new(),
                 };
                 if !out.iter().any(|s| {
                     s.name == spec.name
                         && s.arg == spec.arg
                         && s.arg2 == spec.arg2
+                        && !s.distinct
                         && s.order_by == spec.order_by
                 }) {
                     out.push(spec);
@@ -927,7 +952,11 @@ fn agg_or_group_type(e: &Expr, synth: &[ColumnSchema]) -> DataType {
 fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
     // v7.24 (round-16 A) — ordered aggregate: match on the inner
     // call PLUS the ordering keys.
-    if let Expr::AggregateOrdered { call, order_by } = e
+    if let Expr::AggregateOrdered {
+        call,
+        order_by,
+        distinct,
+    } = e
         && let Expr::FunctionCall { name, args } = call.as_ref()
     {
         let lower = name.to_ascii_lowercase();
@@ -943,6 +972,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                 if spec.name == canonical
                     && spec.arg == arg
                     && spec.arg2 == arg2
+                    && spec.distinct == *distinct
                     && spec.order_by == *order_by
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
@@ -981,6 +1011,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                 if spec.name == canonical
                     && spec.arg == arg
                     && spec.arg2 == arg2
+                    && !spec.distinct
                     && spec.order_by.is_empty()
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
@@ -1002,8 +1033,13 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
     }
     // Recurse into children.
     match e {
-        Expr::AggregateOrdered { call, order_by } => Expr::AggregateOrdered {
+        Expr::AggregateOrdered {
+            call,
+            order_by,
+            distinct,
+        } => Expr::AggregateOrdered {
             call: Box::new(rewrite_expr(call, group_exprs, aggs)),
+            distinct: *distinct,
             order_by: order_by
                 .iter()
                 .map(|o| spg_sql::ast::OrderBy {
@@ -1041,10 +1077,12 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             expr,
             pattern,
             negated,
+            case_insensitive,
         } => Expr::Like {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
             pattern: Box::new(rewrite_expr(pattern, group_exprs, aggs)),
             negated: *negated,
+            case_insensitive: *case_insensitive,
         },
         Expr::Extract { field, source } => Expr::Extract {
             field: *field,

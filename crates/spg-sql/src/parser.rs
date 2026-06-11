@@ -7716,6 +7716,92 @@ impl Parser {
 
     /// Postfix operators on an atom: `::TYPE` cast and `IS [NOT] NULL`.
     /// Both bind tighter than any binary op.
+    /// Shared cast-target parser for postfix `::TYPE` and the
+    /// standard `CAST(expr AS TYPE)` form (v7.25, round-17).
+    fn parse_cast_target(&mut self) -> Result<CastTarget, ParseError> {
+        let target = match self.advance() {
+            Token::Ident(s) => match s.to_ascii_lowercase().as_str() {
+                "int" | "integer" | "int4" => {
+                    if matches!(self.peek(), Token::LBracket)
+                        && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+                    {
+                        self.advance();
+                        self.advance();
+                        CastTarget::IntArray
+                    } else {
+                        CastTarget::Int
+                    }
+                }
+                "bigint" | "int8" => {
+                    if matches!(self.peek(), Token::LBracket)
+                        && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+                    {
+                        self.advance();
+                        self.advance();
+                        CastTarget::BigIntArray
+                    } else {
+                        CastTarget::BigInt
+                    }
+                }
+                "float" | "double" | "real" => CastTarget::Float,
+                "text" => {
+                    // v7.10.11 — `::TEXT[]` widens to TextArray.
+                    if matches!(self.peek(), Token::LBracket)
+                        && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
+                    {
+                        self.advance();
+                        self.advance();
+                        CastTarget::TextArray
+                    } else {
+                        CastTarget::Text
+                    }
+                }
+                "bool" | "boolean" => CastTarget::Bool,
+                "vector" => CastTarget::Vector,
+                "date" => CastTarget::Date,
+                "timestamp" | "datetime" => CastTarget::Timestamp,
+                "timestamptz" => CastTarget::Timestamptz,
+                "interval" => CastTarget::Interval,
+                "json" => CastTarget::Json,
+                "jsonb" => CastTarget::Jsonb,
+                "regtype" => CastTarget::RegType,
+                "regclass" => CastTarget::RegClass,
+                // v7.12.0 — `::tsvector` / `::tsquery`.
+                // Engine decodes the LHS text via the PG
+                // external form parser.
+                "tsvector" => CastTarget::TsVector,
+                "tsquery" => CastTarget::TsQuery,
+                // v7.17.0 — `::uuid`. Engine decodes the LHS
+                // text via `spg_storage::parse_uuid_str`.
+                "uuid" => CastTarget::Uuid,
+                // v7.18 — `::bytea`. Engine decodes the LHS
+                // text via the PG hex form (`'\xdeadbeef'`)
+                // or escape form (`'\\x05\\x00'`). Closes
+                // mailrs D-pre #3 reverse-acceptance gap.
+                "bytea" => CastTarget::Bytea,
+                // v7.17.0 Phase 3.P0-47 — `::inet` / `::cidr` /
+                // `::macaddr`. SPG stores these as Text (Phase 7);
+                // the cast is a no-op passthrough so containment
+                // and overlap operators can read the textual form.
+                "inet" | "cidr" | "macaddr" => CastTarget::Text,
+                other => {
+                    return Err(ParseError {
+                        message: format!("unsupported cast target `::{other}`"),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            },
+            Token::Interval => CastTarget::Interval,
+            other => {
+                return Err(ParseError {
+                    message: format!("expected type ident after `::`, got {other:?}"),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
+        };
+        Ok(target)
+    }
+
     fn finish_postfix_casts(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         loop {
             if matches!(self.peek(), Token::DoubleColon) {
@@ -7724,86 +7810,7 @@ impl Parser {
                 // target set to include INTERVAL (reserved Token),
                 // TIMESTAMPTZ, and PG catalog regtype / regclass.
                 // mailrs follow-up H3a + H3b.
-                let target = match self.advance() {
-                    Token::Ident(s) => match s.to_ascii_lowercase().as_str() {
-                        "int" | "integer" | "int4" => {
-                            if matches!(self.peek(), Token::LBracket)
-                                && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
-                            {
-                                self.advance();
-                                self.advance();
-                                CastTarget::IntArray
-                            } else {
-                                CastTarget::Int
-                            }
-                        }
-                        "bigint" | "int8" => {
-                            if matches!(self.peek(), Token::LBracket)
-                                && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
-                            {
-                                self.advance();
-                                self.advance();
-                                CastTarget::BigIntArray
-                            } else {
-                                CastTarget::BigInt
-                            }
-                        }
-                        "float" | "double" | "real" => CastTarget::Float,
-                        "text" => {
-                            // v7.10.11 — `::TEXT[]` widens to TextArray.
-                            if matches!(self.peek(), Token::LBracket)
-                                && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
-                            {
-                                self.advance();
-                                self.advance();
-                                CastTarget::TextArray
-                            } else {
-                                CastTarget::Text
-                            }
-                        }
-                        "bool" | "boolean" => CastTarget::Bool,
-                        "vector" => CastTarget::Vector,
-                        "date" => CastTarget::Date,
-                        "timestamp" | "datetime" => CastTarget::Timestamp,
-                        "timestamptz" => CastTarget::Timestamptz,
-                        "interval" => CastTarget::Interval,
-                        "json" => CastTarget::Json,
-                        "jsonb" => CastTarget::Jsonb,
-                        "regtype" => CastTarget::RegType,
-                        "regclass" => CastTarget::RegClass,
-                        // v7.12.0 — `::tsvector` / `::tsquery`.
-                        // Engine decodes the LHS text via the PG
-                        // external form parser.
-                        "tsvector" => CastTarget::TsVector,
-                        "tsquery" => CastTarget::TsQuery,
-                        // v7.17.0 — `::uuid`. Engine decodes the LHS
-                        // text via `spg_storage::parse_uuid_str`.
-                        "uuid" => CastTarget::Uuid,
-                        // v7.18 — `::bytea`. Engine decodes the LHS
-                        // text via the PG hex form (`'\xdeadbeef'`)
-                        // or escape form (`'\\x05\\x00'`). Closes
-                        // mailrs D-pre #3 reverse-acceptance gap.
-                        "bytea" => CastTarget::Bytea,
-                        // v7.17.0 Phase 3.P0-47 — `::inet` / `::cidr` /
-                        // `::macaddr`. SPG stores these as Text (Phase 7);
-                        // the cast is a no-op passthrough so containment
-                        // and overlap operators can read the textual form.
-                        "inet" | "cidr" | "macaddr" => CastTarget::Text,
-                        other => {
-                            return Err(ParseError {
-                                message: format!("unsupported cast target `::{other}`"),
-                                token_pos: self.pos.saturating_sub(1),
-                            });
-                        }
-                    },
-                    Token::Interval => CastTarget::Interval,
-                    other => {
-                        return Err(ParseError {
-                            message: format!("expected type ident after `::`, got {other:?}"),
-                            token_pos: self.pos.saturating_sub(1),
-                        });
-                    }
-                };
+                let target = self.parse_cast_target()?;
                 expr = Expr::Cast {
                     expr: Box::new(expr),
                     target,
@@ -7866,6 +7873,7 @@ impl Parser {
             let negated = if matches!(self.peek(), Token::Not) {
                 let next = self.tokens.get(self.pos + 1);
                 matches!(next, Some(Token::Between | Token::In | Token::Like))
+                    || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike"))
             } else {
                 false
             };
@@ -7889,6 +7897,20 @@ impl Parser {
                     expr: Box::new(expr),
                     pattern: Box::new(pattern),
                     negated,
+                    case_insensitive: false,
+                };
+                continue;
+            }
+            // v7.25 (round-17) — ILIKE: case-insensitive LIKE. The
+            // keyword reaches us as a plain identifier.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ilike")) {
+                self.advance();
+                let pattern = self.parse_expr(5)?;
+                expr = Expr::Like {
+                    expr: Box::new(expr),
+                    pattern: Box::new(pattern),
+                    negated,
+                    case_insensitive: true,
                 };
                 continue;
             }
@@ -8718,9 +8740,37 @@ impl Parser {
             // Function call. PG-style: zero-or-more comma-separated args.
             let mut args = Vec::new();
             let mut agg_order_by: Vec<OrderBy> = Vec::new();
+            // v7.25 (round-17) — `COUNT(DISTINCT x)` and friends.
+            let agg_distinct = if matches!(self.peek(), Token::Distinct) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             if !matches!(self.peek(), Token::RParen) {
                 loop {
                     args.push(self.parse_expr(0)?);
+                    // v7.25 (round-17) — standard `CAST(expr AS type)`.
+                    // The `::` cast already worked; this lowers the
+                    // function form onto the same Expr::Cast node.
+                    if first.eq_ignore_ascii_case("cast")
+                        && args.len() == 1
+                        && matches!(self.peek(), Token::As)
+                    {
+                        self.advance();
+                        let target = self.parse_cast_target()?;
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' to close CAST, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        return Ok(Expr::Cast {
+                            expr: Box::new(args.pop().expect("one arg")),
+                            target,
+                        });
+                    }
                     // v7.24 (round-16 A) — aggregate-internal
                     // ordering: `array_agg(x ORDER BY y DESC NULLS
                     // LAST)`. Keys close the argument list.
@@ -8799,10 +8849,11 @@ impl Parser {
                     null_treatment,
                 });
             }
-            if !agg_order_by.is_empty() {
+            if !agg_order_by.is_empty() || agg_distinct {
                 return Ok(Expr::AggregateOrdered {
                     call: Box::new(Expr::FunctionCall { name: first, args }),
                     order_by: agg_order_by,
+                    distinct: agg_distinct,
                 });
             }
             return Ok(Expr::FunctionCall { name: first, args });
