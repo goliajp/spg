@@ -309,6 +309,12 @@ fn collect_expr(e: &Expr, out: &mut Vec<String>) {
             collect_expr(expr, out);
             collect_expr(array, out);
         }
+        Expr::InList { expr, list, .. } => {
+            collect_expr(expr, out);
+            for item in list {
+                collect_expr(item, out);
+            }
+        }
         Expr::Case {
             operand,
             branches,
