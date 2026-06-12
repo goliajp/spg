@@ -1680,6 +1680,17 @@ impl Database {
         }
     }
 
+    /// v7.31 (memory campaign, round-26 ask 1/ask 4) — per-bucket
+    /// memory snapshot for the embedding host. Poll it from prod to
+    /// see where resident bytes live (rows / representation /
+    /// indexes per table) and to drive host-side shedding before
+    /// the kernel does it. Same numbers as the server path's
+    /// `SELECT * FROM spg_memory_stats`.
+    #[must_use]
+    pub fn memory_stats(&self) -> spg_engine::MemoryStats {
+        self.engine.memory_stats()
+    }
+
     /// v7.1 — flush a fresh catalog snapshot to `db_path` and
     /// truncate the WAL. Idempotent; cheap when nothing has
     /// happened since the last checkpoint. No-op when the
