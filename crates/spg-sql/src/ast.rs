@@ -3471,7 +3471,23 @@ impl fmt::Display for FkAction {
 
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", quote_ident(&self.name), self.ty)?;
+        // v7.30.1 (mailrs round-24 class audit) — the type position
+        // must re-parse to the same ColumnDef: a user-defined type
+        // reference and the MySQL inline ENUM / SET value lists all
+        // lower `ty` to Text, so rendering `ty` lost them.
+        write!(f, "{}", quote_ident(&self.name))?;
+        if let Some(ut) = &self.user_type_ref {
+            write!(f, " {}", quote_ident(ut))?;
+        } else if let Some(variants) = &self.inline_enum_variants {
+            write_variant_list(f, "ENUM", variants)?;
+        } else if let Some(variants) = &self.inline_set_variants {
+            write_variant_list(f, "SET", variants)?;
+        } else {
+            write!(f, " {}", self.ty)?;
+        }
+        if self.is_unsigned {
+            f.write_str(" UNSIGNED")?;
+        }
         // v7.17.0 Phase 2.5 — render COLLATE for round-trippable
         // DDL. Only emits when non-default so the typical output
         // stays unchanged.
@@ -3488,8 +3504,33 @@ impl fmt::Display for ColumnDef {
         if !self.nullable {
             f.write_str(" NOT NULL")?;
         }
+        // v7.30.1 (mailrs round-24 class audit) — inline PRIMARY KEY
+        // is NOT lifted to a table-level constraint at parse time
+        // (unlike UNIQUE / CHECK), so the WAL round trip of a
+        // prepared CREATE TABLE silently dropped the primary key.
+        if self.is_primary_key {
+            f.write_str(" PRIMARY KEY")?;
+        }
+        // The parser accepts only CURRENT_TIMESTAMP here (stored as
+        // now()), so that spelling is the lossless round trip.
+        if self.on_update_runtime.is_some() {
+            f.write_str(" ON UPDATE CURRENT_TIMESTAMP")?;
+        }
         Ok(())
     }
+}
+
+/// v7.30.1 — `ENUM('a', 'b')` / `SET('a', 'b')` inline value-list
+/// types (MySQL flavour; `ty` is Text underneath).
+fn write_variant_list(f: &mut fmt::Formatter<'_>, kw: &str, variants: &[String]) -> fmt::Result {
+    write!(f, " {kw}(")?;
+    for (i, v) in variants.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "'{}'", v.replace('\'', "''"))?;
+    }
+    f.write_str(")")
 }
 
 impl fmt::Display for InsertStatement {
@@ -3525,8 +3566,71 @@ impl fmt::Display for InsertStatement {
                 f.write_str(")")?;
             }
         }
+        // v7.30.1 (mailrs round-24) — ON CONFLICT must survive the
+        // Display round trip: WAL persistence renders the bind-final
+        // AST through this impl, and a replayed bare INSERT turns a
+        // legal upsert no-op into a UNIQUE violation that refuses to
+        // open the catalog.
+        if let Some(oc) = &self.on_conflict {
+            write!(f, " {oc}")?;
+        }
+        write_returning(self.returning.as_deref(), f)?;
         Ok(())
     }
+}
+
+/// v7.30.1 (mailrs round-24) — render the ON CONFLICT clause the
+/// parser produced, so the AST→SQL round trip preserves upsert
+/// semantics (WAL replay depends on it).
+impl fmt::Display for OnConflictClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ON CONFLICT")?;
+        if !self.target_columns.is_empty() {
+            f.write_str(" (")?;
+            for (i, c) in self.target_columns.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(&quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        match &self.action {
+            OnConflictAction::Nothing => f.write_str(" DO NOTHING"),
+            OnConflictAction::Update {
+                assignments,
+                where_,
+            } => {
+                f.write_str(" DO UPDATE SET ")?;
+                for (i, (col, expr)) in assignments.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} = {expr}", quote_ident(col))?;
+                }
+                if let Some(w) = where_ {
+                    write!(f, " WHERE {w}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// v7.30.1 (mailrs round-24) — shared `RETURNING <projection>`
+/// tail for the three DML Display impls.
+fn write_returning(ret: Option<&[SelectItem]>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let Some(items) = ret else {
+        return Ok(());
+    };
+    f.write_str(" RETURNING ")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{item}")?;
+    }
+    Ok(())
 }
 
 impl fmt::Display for UpdateStatement {
@@ -3541,6 +3645,7 @@ impl fmt::Display for UpdateStatement {
         if let Some(w) = &self.where_ {
             write!(f, " WHERE {w}")?;
         }
+        write_returning(self.returning.as_deref(), f)?;
         Ok(())
     }
 }
@@ -3551,12 +3656,40 @@ impl fmt::Display for DeleteStatement {
         if let Some(w) = &self.where_ {
             write!(f, " WHERE {w}")?;
         }
+        write_returning(self.returning.as_deref(), f)?;
         Ok(())
     }
 }
 
 impl fmt::Display for SelectStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // v7.30.1 (mailrs round-24 class audit) — the WITH clause
+        // must survive the round trip; a CTE-using statement
+        // re-parsed without it references undefined tables.
+        if !self.ctes.is_empty() {
+            f.write_str("WITH ")?;
+            if self.ctes.iter().any(|c| c.recursive) {
+                f.write_str("RECURSIVE ")?;
+            }
+            for (i, cte) in self.ctes.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(&quote_ident(&cte.name))?;
+                if !cte.column_overrides.is_empty() {
+                    f.write_str(" (")?;
+                    for (ci, c) in cte.column_overrides.iter().enumerate() {
+                        if ci > 0 {
+                            f.write_str(", ")?;
+                        }
+                        f.write_str(&quote_ident(c))?;
+                    }
+                    f.write_str(")")?;
+                }
+                write!(f, " AS ({})", cte.body)?;
+            }
+            f.write_str(" ")?;
+        }
         write_bare_select(self, f)?;
         for (kind, peer) in &self.unions {
             f.write_str(match kind {
@@ -3582,11 +3715,24 @@ impl fmt::Display for SelectStatement {
                 }
             }
         }
-        if let Some(n) = &self.limit {
-            write!(f, " LIMIT {n}")?;
-        }
-        if let Some(o) = &self.offset {
-            write!(f, " OFFSET {o}")?;
+        // v7.30.1 (mailrs round-24 class audit) — WITH TIES only
+        // exists in the FETCH FIRST spelling; rendering it as LIMIT
+        // dropped the tie-extension semantics on replay. The parser
+        // accepts OFFSET before FETCH, so keep that order here.
+        if self.limit_with_ties {
+            if let Some(o) = &self.offset {
+                write!(f, " OFFSET {o}")?;
+            }
+            if let Some(n) = &self.limit {
+                write!(f, " FETCH FIRST {n} ROWS WITH TIES")?;
+            }
+        } else {
+            if let Some(n) = &self.limit {
+                write!(f, " LIMIT {n}")?;
+            }
+            if let Some(o) = &self.offset {
+                write!(f, " OFFSET {o}")?;
+            }
         }
         Ok(())
     }
@@ -3621,6 +3767,12 @@ fn write_bare_select_body(s: &SelectStatement, f: &mut fmt::Formatter<'_>) -> fm
             }
             write!(f, "{g}")?;
         }
+    } else if s.group_by_all {
+        // v7.30.1 (mailrs round-24 class audit) — the GROUP BY ALL
+        // shortcut parses to group_by: None + this flag; dropping
+        // it turned an aggregate query into a bare projection on
+        // re-parse.
+        f.write_str(" GROUP BY ALL")?;
     }
     if let Some(h) = &s.having {
         write!(f, " HAVING {h}")?;
@@ -3662,7 +3814,53 @@ impl fmt::Display for FromClause {
 
 impl fmt::Display for TableRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // v7.30.1 (mailrs round-24 class audit) — the dynamic
+        // table-ref shapes must round-trip: rendering only the
+        // (synthetic) name turned LATERAL / unnest() /
+        // generate_series() into references to nonexistent tables
+        // on re-parse.
+        if let Some(inner) = &self.lateral_subquery {
+            write!(f, "LATERAL ({inner})")?;
+            if let Some(a) = &self.alias {
+                write!(f, " AS {}", quote_ident(a))?;
+            }
+            return Ok(());
+        }
+        if let Some(expr) = &self.unnest_expr {
+            write!(f, "UNNEST({expr})")?;
+            if let Some(a) = &self.alias {
+                write!(f, " AS {}", quote_ident(a))?;
+                if !self.unnest_column_aliases.is_empty() {
+                    f.write_str(" (")?;
+                    for (i, c) in self.unnest_column_aliases.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        f.write_str(&quote_ident(c))?;
+                    }
+                    f.write_str(")")?;
+                }
+            }
+            return Ok(());
+        }
+        if let Some(args) = &self.generate_series_args {
+            f.write_str("generate_series(")?;
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{a}")?;
+            }
+            f.write_str(")")?;
+            if let Some(a) = &self.alias {
+                write!(f, " AS {}", quote_ident(a))?;
+            }
+            return Ok(());
+        }
         write!(f, "{}", quote_ident(&self.name))?;
+        if let Some(seg) = self.as_of_segment {
+            write!(f, " AS OF SEGMENT {seg}")?;
+        }
         if let Some(a) = &self.alias {
             write!(f, " AS {}", quote_ident(a))?;
         }
@@ -3767,7 +3965,7 @@ impl fmt::Display for Expr {
                 partition_by,
                 order_by,
                 frame,
-                null_treatment: _,
+                null_treatment,
             } => {
                 write!(f, "{name}(")?;
                 for (i, a) in args.iter().enumerate() {
@@ -3776,7 +3974,14 @@ impl fmt::Display for Expr {
                     }
                     write!(f, "{a}")?;
                 }
-                f.write_str(") OVER (")?;
+                f.write_str(")")?;
+                // v7.30.1 (mailrs round-24 class audit) — IGNORE
+                // NULLS sits between the arg list and OVER; dropping
+                // it reverted replayed queries to RESPECT NULLS.
+                if matches!(null_treatment, NullTreatment::Ignore) {
+                    f.write_str(" IGNORE NULLS")?;
+                }
+                f.write_str(" OVER (")?;
                 if !partition_by.is_empty() {
                     f.write_str("PARTITION BY ")?;
                     for (i, p) in partition_by.iter().enumerate() {
