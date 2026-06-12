@@ -419,6 +419,19 @@ pub fn run(
         .having
         .as_ref()
         .map(|h| rewrite_expr(h, &group_exprs, &agg_specs));
+    // v7.30 (phase 3e-1) - rewrite SELECT items ONCE. This ran per
+    // GROUP (23.5k x 9 items of AST cloning = ~48% of the inbox
+    // query in sampled stacks); the rewrite is group-independent.
+    // Stable addresses also let the per-expression subquery plans
+    // (v7.29 3c) hit across groups instead of rebuilding.
+    let items_rewritten: alloc::vec::Vec<Option<Expr>> = stmt
+        .items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, .. } => Some(rewrite_expr(expr, &group_exprs, &agg_specs)),
+            SelectItem::Wildcard => None,
+        })
+        .collect();
     let mut kept_synth: Vec<Row> = Vec::new();
     let mut out_rows: Vec<Row> = Vec::new();
     for srow in synth_rows {
@@ -432,16 +445,11 @@ pub fn run(
             }
         }
         let mut values: Vec<Value> = Vec::with_capacity(columns.len());
-        for item in &stmt.items {
-            if let SelectItem::Expr { expr, .. } = item {
-                let rewritten = rewrite_expr(expr, &group_exprs, &agg_specs);
-                values.push(match correlated_eval {
-                    Some(f) if crate::expr_has_subquery(&rewritten) => {
-                        f(&rewritten, &srow, &synth_ctx)?
-                    }
-                    _ => eval::eval_expr(&rewritten, &srow, &synth_ctx)?,
-                });
-            }
+        for rewritten in items_rewritten.iter().flatten() {
+            values.push(match correlated_eval {
+                Some(f) if crate::expr_has_subquery(rewritten) => f(rewritten, &srow, &synth_ctx)?,
+                _ => eval::eval_expr(rewritten, &srow, &synth_ctx)?,
+            });
         }
         kept_synth.push(srow);
         out_rows.push(Row::new(values));
