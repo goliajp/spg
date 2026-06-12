@@ -172,7 +172,28 @@ pub fn parse_statement_with(input: &str, backslash_escapes: bool) -> Result<Stat
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// v7.30.2 (mailrs round-25 ask 2) — live nesting depth of the
+    /// mutually recursive expr/select parsers. Bounded so a deeply
+    /// nested input returns a parse error instead of overflowing
+    /// the stack (embed hosts die on overflow — it is an abort,
+    /// not a catchable error).
+    nest_depth: usize,
 }
+
+/// Max expr/select parser nesting (parens, subqueries, CASE, …).
+/// Real SQL nests a few dozen levels at the extreme. Each nesting
+/// level costs a parse_expr→parse_unary→parse_atom frame chain —
+/// over 10 KiB in debug builds (parse_atom is a giant match) — so
+/// 64 is the highest budget that stays comfortably inside a 2 MiB
+/// worker stack in BOTH debug and release builds.
+const MAX_NEST_DEPTH: usize = 64;
+
+/// Max consecutive binary operators at ONE precedence level
+/// (`a OR b OR c …`, `1+1+1…`). The chain builds iteratively at
+/// parse time but evaluates and drops recursively — depth beyond
+/// this overflows 2 MiB worker stacks (debug eval frames run
+/// multiple KiB). `IN (…)` lists are flat and unaffected.
+const MAX_BINARY_CHAIN: usize = 256;
 
 /// v7.22 (round-13 gap 5) — the kind keyword after `CONSTRAINT
 /// <name>` in a CREATE TABLE column list. FOREIGN KEY is not here:
@@ -185,7 +206,24 @@ enum NamedTableConstraintKind {
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            nest_depth: 0,
+        }
+    }
+
+    /// v7.30.2 (mailrs round-25 ask 2) — bump the expr/select
+    /// nesting depth, erroring out cleanly past the budget.
+    fn enter_nested(&mut self) -> Result<(), ParseError> {
+        self.nest_depth += 1;
+        if self.nest_depth > MAX_NEST_DEPTH {
+            self.nest_depth -= 1;
+            return Err(self.err(alloc::format!(
+                "statement nests deeper than {MAX_NEST_DEPTH} levels"
+            )));
+        }
+        Ok(())
     }
 
     fn peek(&self) -> &Token {
@@ -4385,6 +4423,16 @@ impl Parser {
     }
 
     fn parse_select_stmt(&mut self) -> Result<Statement, ParseError> {
+        // v7.30.2 (mailrs round-25 ask 2) — derived tables /
+        // subqueries recurse through here without passing
+        // parse_expr; share the same nesting budget.
+        self.enter_nested()?;
+        let r = self.parse_select_stmt_inner();
+        self.nest_depth -= 1;
+        r
+    }
+
+    fn parse_select_stmt_inner(&mut self) -> Result<Statement, ParseError> {
         // Caller dispatches on Token::Select; the inner helper handles
         // the rest. ORDER BY / LIMIT bind at this top level; UNION peers
         // get a fresh bare-select parse and may not have their own ORDER
@@ -7483,10 +7531,30 @@ impl Parser {
 
     /// Pratt loop. `min_prec` is the minimum binary-op precedence we'll accept.
     fn parse_expr(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        // v7.30.2 (mailrs round-25 ask 2) — nesting budget: a parse
+        // error beats a stack overflow (an overflow aborts the
+        // embedding host process).
+        self.enter_nested()?;
+        let r = self.parse_expr_inner(min_prec);
+        self.nest_depth -= 1;
+        r
+    }
+
+    fn parse_expr_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_unary()?;
+        let mut chain_len = 0usize;
         while let Some((op, prec)) = binop_from(self.peek()) {
             if prec < min_prec {
                 break;
+            }
+            // v7.30.2 (mailrs round-25 ask 2) — the chain builds
+            // iteratively but evaluates and drops recursively;
+            // depth beyond the budget overflows worker stacks.
+            chain_len += 1;
+            if chain_len > MAX_BINARY_CHAIN {
+                return Err(self.err(alloc::format!(
+                    "more than {MAX_BINARY_CHAIN} chained binary operators; rewrite long OR-equality chains as IN (…)"
+                )));
             }
             self.advance();
             // v7.10.12 — `x <op> ANY(arr)` / `x <op> ALL(arr)`.
@@ -8201,31 +8269,17 @@ impl Parser {
             }
         }
         self.advance(); // ')'
-        let target = Box::new(expr);
-        let combined = if elements.is_empty() {
-            Expr::Literal(Literal::Bool(false))
-        } else {
-            let mut iter = elements.into_iter();
-            let first = iter.next().unwrap();
-            let mut acc = Expr::Binary {
-                lhs: target.clone(),
-                op: BinOp::Eq,
-                rhs: Box::new(first),
-            };
-            for elt in iter {
-                acc = Expr::Binary {
-                    lhs: Box::new(acc),
-                    op: BinOp::Or,
-                    rhs: Box::new(Expr::Binary {
-                        lhs: target.clone(),
-                        op: BinOp::Eq,
-                        rhs: Box::new(elt),
-                    }),
-                };
-            }
-            acc
-        };
-        Ok(maybe_not(combined, negated))
+        // v7.30.2 (mailrs round-25) — flat InList node instead of a
+        // left-deep OR-Eq chain: chain depth scaled with the element
+        // count and overflowed the stack (eval + drop are recursive).
+        if elements.is_empty() {
+            return Ok(maybe_not(Expr::Literal(Literal::Bool(false)), negated));
+        }
+        Ok(Expr::InList {
+            expr: Box::new(expr),
+            list: elements,
+            negated,
+        })
     }
 
     /// Parse a pgvector array literal `[ x1, x2, ... ]`. The opening `[` is
@@ -9153,6 +9207,46 @@ mod tests {
 
     fn parse(s: &str) -> Statement {
         parse_statement(s).expect("parse ok")
+    }
+
+    // v7.30.2 (mailrs round-25 ask 2) — nesting / chain budgets must
+    // surface as parse errors, never stack overflows (embed hosts
+    // abort on overflow).
+    #[test]
+    fn nesting_budget_errors_cleanly() {
+        let depth = MAX_NEST_DEPTH + 50;
+        let sql = format!("SELECT {}1{}", "(".repeat(depth), ")".repeat(depth));
+        let err = parse_statement(&sql).expect_err("must reject");
+        assert!(err.message.contains("nests deeper"), "{err:?}");
+        // Within budget still parses.
+        let sql = format!("SELECT {}1{}", "(".repeat(48), ")".repeat(48));
+        parse(&sql);
+    }
+
+    #[test]
+    fn binary_chain_budget_errors_cleanly() {
+        let sql = format!("SELECT 1{}", " + 1".repeat(MAX_BINARY_CHAIN + 50));
+        let err = parse_statement(&sql).expect_err("must reject");
+        assert!(err.message.contains("chained binary"), "{err:?}");
+        // Within budget still parses (chain depth ≤ budget is safe
+        // for recursive eval/drop on 2 MiB stacks).
+        let sql = format!("SELECT 1{}", " + 1".repeat(200));
+        parse(&sql);
+    }
+
+    #[test]
+    fn in_list_unaffected_by_chain_budget() {
+        // Flat InList: 20k elements parse fine and stay flat.
+        let items: alloc::vec::Vec<String> = (0..20_000).map(|k| k.to_string()).collect();
+        let sql = format!("SELECT 1 WHERE 5 IN ({})", items.join(","));
+        let Statement::Select(s) = parse(&sql) else {
+            panic!("expected select")
+        };
+        let Some(Expr::InList { list, negated, .. }) = s.where_ else {
+            panic!("expected flat InList, got {:?}", s.where_)
+        };
+        assert_eq!(list.len(), 20_000);
+        assert!(!negated);
     }
 
     fn lit_int(n: i64) -> Expr {

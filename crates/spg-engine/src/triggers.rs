@@ -734,6 +734,12 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
             substitute_locals(expr, locals);
             substitute_locals(array, locals);
         }
+        Expr::InList { expr, list, .. } => {
+            substitute_locals(expr, locals);
+            for item in list {
+                substitute_locals(item, locals);
+            }
+        }
         Expr::Case {
             operand,
             branches,
@@ -853,6 +859,12 @@ fn substitute_new_old(
         Expr::AnyAll { expr, array, .. } => {
             substitute_new_old(expr, new_row, old_row, columns)?;
             substitute_new_old(array, new_row, old_row, columns)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            substitute_new_old(expr, new_row, old_row, columns)?;
+            for item in list {
+                substitute_new_old(item, new_row, old_row, columns)?;
+            }
         }
         Expr::Case {
             operand,

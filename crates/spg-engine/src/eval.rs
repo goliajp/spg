@@ -256,11 +256,63 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             extract_field(*field, &v)
         }
         // v4.10: subquery nodes should have been resolved into
-        // Literal / Binary-Eq-OR chains by Engine::resolve_select_subqueries
+        // Literal / InList nodes by Engine::resolve_select_subqueries
         // before the row loop. Anything reaching here is a bug.
         Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
             Err(EvalError::TypeMismatch {
                 detail: "subquery reached row eval — engine resolver bug".into(),
+            })
+        }
+        // v7.30.2 (mailrs round-25) — flat `expr [NOT] IN (a, b, …)`.
+        // Iterative scan with PG three-valued logic: TRUE on the first
+        // Eq match; if nothing matched, NULL when the needle is NULL or
+        // any comparison was NULL; FALSE otherwise. Empty list (only
+        // reachable via an empty subquery result) is FALSE / TRUE even
+        // for a NULL needle — no comparison ever happens.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = eval_expr(expr, row, ctx)?;
+            let needle_null = matches!(needle, Value::Null);
+            let mut saw_null = needle_null && !list.is_empty();
+            let mut matched = false;
+            if !needle_null {
+                for item in list {
+                    let v = eval_expr(item, row, ctx)?;
+                    if matches!(v, Value::Null) {
+                        saw_null = true;
+                        continue;
+                    }
+                    match apply_binary(BinOp::Eq, needle.clone(), v)? {
+                        Value::Bool(true) => {
+                            matched = true;
+                            break;
+                        }
+                        Value::Bool(false) => {}
+                        Value::Null => saw_null = true,
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: format!(
+                                    "IN comparison didn't return Bool: {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            let inner = if matched {
+                Value::Bool(true)
+            } else if saw_null {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+            Ok(match (negated, inner) {
+                (true, Value::Bool(b)) => Value::Bool(!b),
+                (_, v) => v,
             })
         }
         // v4.12: window functions should have been rewritten into
@@ -7579,7 +7631,7 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
 }
 
 // SQL three-valued AND / OR.
-fn and_3vl(l: Value, r: Value) -> Result<Value, EvalError> {
+pub(crate) fn and_3vl(l: Value, r: Value) -> Result<Value, EvalError> {
     match (l, r) {
         (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
         (Value::Bool(true), Value::Bool(true)) => Ok(Value::Bool(true)),
