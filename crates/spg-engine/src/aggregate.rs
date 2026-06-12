@@ -248,33 +248,50 @@ pub fn run(
         key_order.push(String::new());
     }
 
+    // v7.30 (perf campaign) - hoist the per-row work that doesn't
+    // depend on the row: which group exprs need collation folding
+    // (none, for most queries - the old code cloned the whole
+    // group_vals vec per row just in case).
+    let ci_positions: Vec<usize> = group_exprs
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| {
+            matches!(
+                eval::column_collation(g, &ctx),
+                Some(spg_storage::Collation::CaseInsensitive)
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
     for row in rows {
         let group_vals: Vec<Value> = group_exprs
             .iter()
             .map(|g| eval::eval_expr(g, row, &ctx))
             .collect::<Result<_, _>>()?;
-        // v7.17.0 Phase 2.5b — case-insensitive group keying.
-        // For each group_expr that's a column reference on a
-        // CaseInsensitive text column, fold the corresponding
-        // value before encoding the key. Display value
-        // (`group_vals`) stays original — only the key folds.
-        let mut key_vals = group_vals.clone();
-        for (i, g) in group_exprs.iter().enumerate() {
-            if matches!(
-                eval::column_collation(g, &ctx),
-                Some(spg_storage::Collation::CaseInsensitive)
-            ) {
+        // v7.17.0 Phase 2.5b — case-insensitive group keying: fold
+        // only the ci columns, and only when any exist. Display
+        // value (`group_vals`) stays original — only the key folds.
+        let key = if ci_positions.is_empty() {
+            encode_key(&group_vals)
+        } else {
+            let mut key_vals = group_vals.clone();
+            for &i in &ci_positions {
                 if let Value::Text(s) = &key_vals[i] {
                     key_vals[i] = Value::Text(s.to_ascii_lowercase());
                 }
             }
-        }
-        let key = encode_key(&key_vals);
-        let entry = groups.entry(key.clone()).or_insert_with(|| {
-            key_order.push(key.clone());
-            let init: Vec<AggState> = (0..agg_specs.len()).map(|_| AggState::default()).collect();
-            (group_vals.clone(), init)
-        });
+            encode_key(&key_vals)
+        };
+        // entry_ref: no per-row key clone on the (dominant) hit path.
+        let entry = match groups.entry_ref(key.as_str()) {
+            hashbrown::hash_map::EntryRef::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::EntryRef::Vacant(v) => {
+                key_order.push(key.clone());
+                let init: Vec<AggState> =
+                    (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                v.insert((group_vals.clone(), init))
+            }
+        };
         for (i, spec) in agg_specs.iter().enumerate() {
             let arg_val = match &spec.arg {
                 None => Value::Bool(true), // count_star: sentinel non-null
