@@ -2010,6 +2010,19 @@ pub enum Expr {
         subquery: Box<SelectStatement>,
         negated: bool,
     },
+    /// v7.30.2 (mailrs round-25) — `expr [NOT] IN (a, b, …)` as a FLAT
+    /// list. Both the parser's literal-list path and the engine's
+    /// IN-subquery materialisation used to desugar into a left-deep
+    /// OR-Eq chain, so expression depth scaled with the element count
+    /// — a 24k-row subquery result overflowed the 2 MiB worker stack
+    /// (recursive eval AND recursive Box drop) and aborted embedding
+    /// host processes. The flat node keeps depth constant: eval is an
+    /// iterative scan with PG three-valued logic, drop is a Vec drop.
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
     /// `EXTRACT(<field> FROM <source>)` — pull an integer component
     /// out of a `DATE` or `TIMESTAMP`. Parsed as its own AST node
     /// because the `FROM` keyword is what separates the two halves,
@@ -4045,6 +4058,21 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "({expr} IN ({subquery}))")
                 }
+            }
+            Self::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let kw = if *negated { " NOT IN (" } else { " IN (" };
+                write!(f, "({expr}{kw}")?;
+                for (i, e) in list.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                f.write_str("))")
             }
             Self::Array(items) => {
                 f.write_str("ARRAY[")?;

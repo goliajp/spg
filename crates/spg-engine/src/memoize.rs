@@ -77,6 +77,25 @@ pub type ExprPlan = (
     spg_sql::ast::Expr,
 );
 
+/// v7.30.2 (mailrs round-25) - canonicalised membership set for a
+/// large all-literal `IN` list. Integer literals canonicalise to
+/// i64 (cross-width `Int = BigInt` stays correct); string literals
+/// stay verbatim. Mixed or exotic families are not eligible and
+/// keep the linear `apply_binary` scan.
+#[derive(Debug, Clone)]
+pub enum InListSet {
+    Int(alloc::collections::BTreeSet<i64>),
+    Text(alloc::collections::BTreeSet<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct InListSetEntry {
+    pub set: InListSet,
+    /// The list carried a NULL literal: a non-matching needle
+    /// yields NULL, not FALSE (SQL three-valued logic).
+    pub has_null: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoizeCache {
     /// LRU front = most recently used. Stored as a `VecDeque` so
@@ -92,6 +111,16 @@ pub struct MemoizeCache {
     pub group_maps: alloc::collections::BTreeMap<String, Option<alloc::rc::Rc<GroupMap>>>,
     /// v7.29 (3c) - host-expression ptr -> (subquery count, plan).
     pub expr_plans: alloc::collections::BTreeMap<usize, ExprPlan>,
+    /// v7.30.2 (mailrs round-25) - InList node ptr -> membership set
+    /// for large all-literal `IN` lists, built once per row loop.
+    /// Turns the O(rows × list) membership scan into
+    /// O(rows × log list). `None` = analysed, not eligible.
+    pub in_sets: alloc::collections::BTreeMap<usize, Option<InListSetEntry>>,
+    /// v7.30.2 (mailrs round-25) - host-expression ptr -> "contains
+    /// a subquery node". The walk is O(tree) and a materialised IN
+    /// list makes the tree huge — caching it makes the per-row
+    /// dispatch O(log n) instead of O(24k list elements).
+    pub has_subquery: alloc::collections::BTreeMap<usize, bool>,
     max_entries: usize,
     max_bytes: usize,
     current_bytes: usize,
@@ -116,6 +145,8 @@ impl MemoizeCache {
             miss_count: 0,
             group_maps: alloc::collections::BTreeMap::new(),
             expr_plans: alloc::collections::BTreeMap::new(),
+            in_sets: alloc::collections::BTreeMap::new(),
+            has_subquery: alloc::collections::BTreeMap::new(),
         }
     }
 
