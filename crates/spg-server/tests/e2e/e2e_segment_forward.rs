@@ -446,18 +446,32 @@ fn resumable_after_disconnect() {
             &follower_wal,
             master_addrs.repl.as_ref().unwrap(),
         );
-        let _follower_guard = common::ChildGuard(raw);
+        let mut follower_guard = common::ChildGuard(raw);
         let mut fs = common::connect_to(&follower_addrs.native);
         fs.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         // The follower should already serve every PK from disk
         // (cold tier was rehydrated via manifest at boot).
         let deadline = Instant::now() + REPLICATION_TIMEOUT;
         loop {
-            if count_reachable_pks(&mut fs, 0..N_ROWS) == Some(N_ROWS as usize) {
+            let reachable = count_reachable_pks(&mut fs, 0..N_ROWS);
+            if reachable == Some(N_ROWS as usize) {
                 break;
             }
             if Instant::now() > deadline {
-                panic!("phase-2 follower never re-bootstrapped");
+                // v7.30 forensics — this stalled 4 times under the
+                // fully parallel suite and never solo; capture what
+                // the follower actually said before dying.
+                drop(fs);
+                let _ = follower_guard.0.kill();
+                let mut err = String::new();
+                if let Some(mut pipe) = follower_guard.0.stderr.take() {
+                    use std::io::Read;
+                    let _ = pipe.read_to_string(&mut err);
+                }
+                panic!(
+                    "phase-2 follower never re-bootstrapped \
+                     (reachable={reachable:?} of {N_ROWS}); follower stderr:\n{err}"
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
