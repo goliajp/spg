@@ -1,21 +1,21 @@
 name: CI
 
-# git-flow trigger map. Heavy gates (prod_ready, slo_smoke, perf_gate,
-# release-build) gate by branch via `if:` so feature/bugfix pushes get
-# fast feedback while release/hotfix + integration lines (develop, master)
-# run the full battery. See .claude/git-flow.md for the mapping table.
+# git-flow trigger map — push-only, no PRs. All merges happen locally
+# via `git flow {feature,bugfix,release,hotfix} finish`; what reaches
+# origin is already-merged history. Heavy gates (prod_ready, slo_smoke,
+# perf_gate, release-build) gate by branch via `if:` so feature/bugfix
+# pushes get fast feedback while release/hotfix + integration lines
+# (develop, master) run the full battery. See .claude/git-flow.md for
+# the mapping table.
 on:
   push:
     branches:
       - master
-      - main
       - develop
       - 'release/**'
       - 'hotfix/**'
       - 'feature/**'
       - 'bugfix/**'
-  pull_request:
-    branches: [master, main, develop]
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,13 +72,11 @@ jobs:
     # the gate now actually runs (45 / 45 on master CI as of v7.12.7),
     # so the v7.11.x `continue-on-error` soft-fail is gone.
     #
-    # Skipped on plain feature/bugfix pushes — runs on every PR (so the
-    # gate fires before merge to develop/master) and on any push to
-    # integration / release lines.
+    # Skipped on plain feature/bugfix pushes — runs on any push to
+    # integration / release lines, i.e. right after a git-flow finish
+    # merge lands.
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
@@ -95,11 +93,9 @@ jobs:
     # on a normal runner. SLO ceilings are intentionally loose
     # (~2-3× v4.27 baseline) so shared-runner noise doesn't false-alarm.
     #
-    # Same gate policy as prod_ready: PRs + integration/release pushes only.
+    # Same gate policy as prod_ready: integration/release pushes only.
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
@@ -125,12 +121,10 @@ jobs:
     # spg-server joined the loop. Fast tier runs here; the
     # `#[ignore]`d full tier is `scripts/gate.sh gates --full`.
     #
-    # Same gate policy as prod_ready / slo_smoke: PRs + integration /
-    # release lines. Skipped on plain feature/bugfix pushes.
+    # Same gate policy as prod_ready / slo_smoke: integration / release
+    # lines. Skipped on plain feature/bugfix pushes.
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
@@ -212,9 +206,7 @@ jobs:
     # blocker. Bump the --image arg when the next release image
     # is published.
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
@@ -240,27 +232,21 @@ jobs:
     runs-on: ubuntu-latest
     # Catches optimization-only bugs and confirms the production binary
     # still links cleanly. Runs on anything that will land on master:
-    # master/main push, release/** + hotfix/** push, and PRs targeting
-    # master/main. Skipped on feature/develop to keep their CI quick.
+    # master push, release/** + hotfix/** push. Skipped on
+    # feature/develop to keep their CI quick.
     if: |
-      (github.event_name == 'push' && (
-        github.ref == 'refs/heads/master' ||
-        github.ref == 'refs/heads/main' ||
-        startsWith(github.ref, 'refs/heads/release/') ||
-        startsWith(github.ref, 'refs/heads/hotfix/')
-      )) ||
-      (github.event_name == 'pull_request' && (
-        github.base_ref == 'master' || github.base_ref == 'main'
-      ))
+      github.ref == 'refs/heads/master' ||
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release -p spg-server
         run: cargo build --release -p spg-server --locked
       - name: Upload spg-server binary
-        # Only upload on master/main pushes — release/hotfix branches
+        # Only upload on master pushes — release/hotfix branches
         # produce the same binary but it's the master tag that we keep.
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+        if: github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@v4
         with:
           name: spg-server-linux-amd64
