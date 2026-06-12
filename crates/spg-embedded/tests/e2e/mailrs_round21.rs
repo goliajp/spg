@@ -126,3 +126,64 @@ fn same_host_stale_lock_still_reclaims() {
     let mut db = Database::open_path(&db_path).unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
 }
+
+/// Round-23a — BIGSERIAL sequence addressability. The pg_dump
+/// import idiom: restore rows with explicit ids, then
+/// `setval(pg_get_serial_sequence(…), max_id)` so subsequent
+/// app INSERTs don't collide with restored PKs.
+#[test]
+fn implicit_serial_sequence_addressable_after_import() {
+    let mut db = spg_embedded::Database::open_in_memory();
+    db.execute("CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, subject TEXT)")
+        .unwrap();
+    // Restored rows carry explicit ids (as a dump does).
+    db.execute("INSERT INTO messages (id, subject) VALUES (1,'a'),(2,'b'),(24304,'z')")
+        .unwrap();
+    // The dump's setval line — nested pg_get_serial_sequence form.
+    let r = db
+        .execute("SELECT setval(pg_get_serial_sequence('messages','id'), 24304, true)")
+        .unwrap();
+    match r {
+        spg_embedded::QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_embedded::Value::Int(24304));
+        }
+        other => panic!("{other:?}"),
+    }
+    // App-style INSERT (no id) must continue ABOVE the restored max.
+    db.execute("INSERT INTO messages (subject) VALUES ('new')")
+        .unwrap();
+    let r = db.execute("SELECT MAX(id) FROM messages").unwrap();
+    match r {
+        spg_embedded::QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_embedded::Value::BigInt(24305));
+        }
+        other => panic!("{other:?}"),
+    }
+    // currval/nextval address the implicit sequence directly.
+    let r = db.execute("SELECT nextval('messages_id_seq')").unwrap();
+    match r {
+        spg_embedded::QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_embedded::Value::Int(24305));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Round-23a — a table whose sequence was NEVER addressed keeps the
+/// exact pre-7.29 max+1 behaviour.
+#[test]
+fn unaddressed_serial_keeps_max_plus_one() {
+    let mut db = spg_embedded::Database::open_in_memory();
+    db.execute("CREATE TABLE t (id BIGSERIAL PRIMARY KEY, x TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t (x) VALUES ('a'),('b')").unwrap();
+    db.execute("DELETE FROM t WHERE id = 2").unwrap();
+    db.execute("INSERT INTO t (x) VALUES ('c')").unwrap();
+    let r = db.execute("SELECT MAX(id) FROM t").unwrap();
+    match r {
+        spg_embedded::QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_embedded::Value::BigInt(2));
+        }
+        other => panic!("{other:?}"),
+    }
+}
