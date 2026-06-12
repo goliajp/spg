@@ -8861,8 +8861,11 @@ impl Engine {
             let eager_view: Option<&Vec<Row>> = peer.eager_rows.as_ref().or(lazy_rows.as_ref());
             if !eq_pairs.is_empty() && peer.lateral.is_none() {
                 let rights = eager_view.expect("non-lateral peer eager");
-                let mut table: alloc::collections::BTreeMap<String, Vec<usize>> =
-                    alloc::collections::BTreeMap::new();
+                // v7.29 - hashbrown over BTreeMap: the ordered map
+                // paid O(log n) string comparisons per insert/probe
+                // (24k-row build sides spent ~100 ms in it).
+                let mut table: hashbrown::HashMap<String, Vec<usize>> =
+                    hashbrown::HashMap::with_capacity(rights.len());
                 let mut keybuf: Vec<Value> = Vec::with_capacity(eq_pairs.len());
                 'build: for (ri, right) in rights.iter().enumerate() {
                     keybuf.clear();
@@ -13332,13 +13335,7 @@ impl Engine {
         &self,
         inner: &SelectStatement,
         cancel: CancelToken<'_>,
-    ) -> Result<
-        Option<(
-            spg_sql::ast::ColumnName,
-            alloc::collections::BTreeMap<String, Value>,
-        )>,
-        EngineError,
-    > {
+    ) -> Result<Option<memoize::GroupMap>, EngineError> {
         use spg_sql::ast::{BinOp, SelectItem as SI};
         if !inner.ctes.is_empty()
             || !inner.unions.is_empty()

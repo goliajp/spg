@@ -21,7 +21,7 @@
 //! `avg(int|bigint)` returns `Float`.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -235,7 +235,9 @@ pub fn run(
 
     // Map group key (vec of values, encoded as canonical string) -> group state.
     // Order of insertion is preserved via a parallel Vec of keys.
-    let mut groups: BTreeMap<String, (Vec<Value>, Vec<AggState>)> = BTreeMap::new();
+    // v7.29 - hash map (output order rides key_order, not map order).
+    let mut groups: hashbrown::HashMap<String, (Vec<Value>, Vec<AggState>)> =
+        hashbrown::HashMap::new();
     let mut key_order: Vec<String> = Vec::new();
     // When there are no GROUP BY exprs *and* there is at least one aggregate,
     // every row collapses into a single anonymous group keyed by "".

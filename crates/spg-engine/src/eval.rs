@@ -191,6 +191,35 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
         Expr::FunctionCall { name, args } => {
+            // v7.29 (round-22 phase 3) - prefix fast path: LEFT(col, n)
+            // on a TEXT column borrows the cell and clones only the
+            // prefix. The generic path clones the WHOLE cell first -
+            // a LEFT(body, 120) over 24k x 30 KB rows spent 383 ms
+            // copying bytes it then threw away (7 ms without LEFT).
+            if args.len() == 2
+                && name.eq_ignore_ascii_case("left")
+                && let Expr::Column(c) = &args[0]
+                && let Some(cell) = resolve_column_borrowed(c, row, ctx)?
+            {
+                {
+                    match cell {
+                        Value::Null => return Ok(Value::Null),
+                        Value::Text(t) => {
+                            let n_v = eval_expr(&args[1], row, ctx)?;
+                            if let Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) = n_v {
+                                let n = match n_v {
+                                    Value::SmallInt(x) => i64::from(x),
+                                    Value::Int(x) => i64::from(x),
+                                    Value::BigInt(x) => x,
+                                    _ => 0,
+                                };
+                                return Ok(Value::Text(text_prefix_chars(t, n)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let evaluated: Result<Vec<Value>, _> =
                 args.iter().map(|a| eval_expr(a, row, ctx)).collect();
             apply_function(name, &evaluated?, ctx)
@@ -6397,6 +6426,47 @@ fn collation_fold_for_compare(
         other => other,
     };
     (fold(l), fold(r))
+}
+
+/// v7.29 - borrow a column cell without cloning (the prefix fast
+/// path for LEFT). Mirrors resolve_column's lookup; returns Ok(None)
+/// when the reference can't be attributed (caller falls back to the
+/// generic owned path, which will surface the proper error).
+fn resolve_column_borrowed<'r>(
+    c: &ColumnName,
+    row: &'r Row,
+    ctx: &EvalContext<'_>,
+) -> Result<Option<&'r Value>, EvalError> {
+    if let Some(q) = &c.qualifier {
+        let composite = alloc::format!("{q}.{name}", name = c.name);
+        if let Some(pos) = ctx.columns.iter().position(|s| s.name == composite) {
+            return Ok(row.values.get(pos));
+        }
+    }
+    if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
+        return Ok(row.values.get(pos));
+    }
+    Ok(None)
+}
+
+/// First `n` CHARACTERS of `t` (PG LEFT semantics; negative n means
+/// all but the last |n|), cloning only the prefix bytes.
+fn text_prefix_chars(t: &str, n: i64) -> String {
+    if n >= 0 {
+        let n = usize::try_from(n).unwrap_or(usize::MAX);
+        match t.char_indices().nth(n) {
+            Some((byte_idx, _)) => t[..byte_idx].into(),
+            None => t.into(),
+        }
+    } else {
+        let drop_tail = usize::try_from(-n).unwrap_or(usize::MAX);
+        let total = t.chars().count();
+        let keep = total.saturating_sub(drop_tail);
+        match t.char_indices().nth(keep) {
+            Some((byte_idx, _)) => t[..byte_idx].into(),
+            None => t.into(),
+        }
+    }
 }
 
 fn resolve_column(c: &ColumnName, row: &Row, ctx: &EvalContext<'_>) -> Result<Value, EvalError> {
