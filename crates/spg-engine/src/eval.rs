@@ -6445,6 +6445,23 @@ fn composite_eq(schema_name: &str, qualifier: &str, name: &str) -> bool {
         && schema_name[qualifier.len() + 1..] == *name
 }
 
+/// v7.30 (perf campaign) - position-only resolution for bind-once
+/// fast paths (aggregate row loop). Same lookup order as
+/// resolve_column's happy paths: composite "alias.col", then the
+/// bare name.
+pub(crate) fn find_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<usize> {
+    if let Some(q) = &c.qualifier {
+        if let Some(pos) = ctx
+            .columns
+            .iter()
+            .position(|s| composite_eq(&s.name, q, &c.name))
+        {
+            return Some(pos);
+        }
+    }
+    ctx.columns.iter().position(|s| s.name == c.name)
+}
+
 fn resolve_column_borrowed<'r>(
     c: &ColumnName,
     row: &'r Row,

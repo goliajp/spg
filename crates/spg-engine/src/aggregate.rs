@@ -252,6 +252,29 @@ pub fn run(
     // depend on the row: which group exprs need collation folding
     // (none, for most queries - the old code cloned the whole
     // group_vals vec per row just in case).
+    // v7.30 (perf campaign) - the no-tax row loop. When a group
+    // expr or an aggregate argument is a bare column reference
+    // (the overwhelmingly common shape), bind its position ONCE
+    // and read row cells by offset in the loop - no per-row tree
+    // walk, no owned-Value clone out of resolve_column. Anything
+    // more complex keeps the eval path.
+    let col_pos = |e: &Expr| -> Option<usize> {
+        // Qualified references only: the bare-name resolver carries
+        // alias/ambiguity logic the bind-once path must not fork.
+        if let Expr::Column(c) = e
+            && c.qualifier.is_some()
+        {
+            eval::find_column_pos(c, &ctx)
+        } else {
+            None
+        }
+    };
+    let group_pos: Vec<Option<usize>> = group_exprs.iter().map(col_pos).collect();
+    let all_groups_bound = group_pos.iter().all(Option::is_some);
+    let arg_pos: Vec<Option<usize>> = agg_specs
+        .iter()
+        .map(|spec| spec.arg.as_ref().and_then(|e| col_pos(e)))
+        .collect();
     let ci_positions: Vec<usize> = group_exprs
         .iter()
         .enumerate()
@@ -264,6 +287,67 @@ pub fn run(
         .map(|(i, _)| i)
         .collect();
     for row in rows {
+        // Fast key: bound positions + no ci folding -> encode
+        // straight from borrowed cells; group_vals materialise
+        // only when the group is NEW.
+        if all_groups_bound && ci_positions.is_empty() && !group_exprs.is_empty() {
+            let refs: Vec<&Value> = group_pos
+                .iter()
+                .map(|p| row.values.get(p.unwrap()).unwrap_or(&Value::Null))
+                .collect();
+            let key = encode_key_refs(&refs);
+            let entry = match groups.entry_ref(key.as_str()) {
+                hashbrown::hash_map::EntryRef::Occupied(o) => o.into_mut(),
+                hashbrown::hash_map::EntryRef::Vacant(v) => {
+                    key_order.push(key.clone());
+                    let init: Vec<AggState> =
+                        (0..agg_specs.len()).map(|_| AggState::default()).collect();
+                    let owned: Vec<Value> = refs.iter().map(|v| (*v).clone()).collect();
+                    v.insert((owned, init))
+                }
+            };
+            for (i, spec) in agg_specs.iter().enumerate() {
+                let arg_owned: Value;
+                let arg_ref: &Value = match (&arg_pos[i], &spec.arg) {
+                    (Some(p), _) => row.values.get(*p).unwrap_or(&Value::Null),
+                    (None, None) => {
+                        arg_owned = Value::Bool(true);
+                        &arg_owned
+                    }
+                    (None, Some(e)) => {
+                        arg_owned = eval::eval_expr(e, row, &ctx)?;
+                        &arg_owned
+                    }
+                };
+                let arg2_val = match &spec.arg2 {
+                    None => None,
+                    Some(e) => Some(eval::eval_expr(e, row, &ctx)?),
+                };
+                let order_keys = if spec.order_by.is_empty() {
+                    None
+                } else {
+                    let mut keys = Vec::with_capacity(spec.order_by.len());
+                    for o in &spec.order_by {
+                        keys.push(eval::eval_expr(&o.expr, row, &ctx)?);
+                    }
+                    Some(keys)
+                };
+                if spec.distinct {
+                    let dkey = encode_key_refs(core::slice::from_ref(&arg_ref));
+                    if !entry.1[i].seen.insert(dkey) {
+                        continue;
+                    }
+                }
+                update_state(
+                    &mut entry.1[i],
+                    &spec.name,
+                    arg_ref,
+                    arg2_val.as_ref(),
+                    order_keys,
+                )?;
+            }
+            continue;
+        }
         let group_vals: Vec<Value> = group_exprs
             .iter()
             .map(|g| eval::eval_expr(g, row, &ctx))
@@ -1238,115 +1322,130 @@ fn rewrite_group_keys_in_select(
 }
 
 /// Canonical string key for a tuple of group values. Used as map key.
+/// Per-value group-key encoding (shared by owned and borrowed paths).
+fn encode_one(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("N|"),
+        Value::SmallInt(n) => {
+            out.push('s');
+            out.push_str(&n.to_string());
+            out.push('|');
+        }
+        Value::Int(n) => {
+            out.push('I');
+            out.push_str(&n.to_string());
+            out.push('|');
+        }
+        Value::BigInt(n) => {
+            out.push('B');
+            out.push_str(&n.to_string());
+            out.push('|');
+        }
+        Value::Float(x) => {
+            out.push('F');
+            out.push_str(&x.to_string());
+            out.push('|');
+        }
+        Value::Bool(b) => {
+            out.push(if *b { 'T' } else { 'f' });
+            out.push('|');
+        }
+        Value::Text(s) => {
+            out.push('S');
+            out.push_str(s);
+            out.push('|');
+        }
+        Value::Vector(v) => {
+            out.push('V');
+            for x in v {
+                out.push_str(&x.to_string());
+                out.push(',');
+            }
+            out.push('|');
+        }
+        // v6.0.1: GROUP BY on a `VECTOR(N) USING SQ8` column.
+        // Two cells with byte-identical `(min, max, bytes)`
+        // share the same group; equivalence is byte-equality
+        // (same as f32 grouping today — neither path tries to
+        // normalise nan/-0).
+        Value::Sq8Vector(q) => {
+            out.push('Q');
+            out.push_str(&q.min.to_string());
+            out.push('@');
+            out.push_str(&q.max.to_string());
+            out.push(':');
+            for b in &q.bytes {
+                out.push_str(&b.to_string());
+                out.push(',');
+            }
+            out.push('|');
+        }
+        // v6.0.3: GROUP BY on a `VECTOR(N) USING HALF` column.
+        // Byte-equality over the raw u16 bits; matches the SQ8
+        // path's byte-key model.
+        Value::HalfVector(h) => {
+            out.push('H');
+            for b in &h.bytes {
+                out.push_str(&b.to_string());
+                out.push(',');
+            }
+            out.push('|');
+        }
+        Value::Numeric { scaled, scale } => {
+            out.push('D');
+            out.push_str(&scaled.to_string());
+            out.push('@');
+            out.push_str(&scale.to_string());
+            out.push('|');
+        }
+        Value::Date(d) => {
+            out.push('d');
+            out.push_str(&d.to_string());
+            out.push('|');
+        }
+        Value::Timestamp(t) => {
+            out.push('t');
+            out.push_str(&t.to_string());
+            out.push('|');
+        }
+        Value::Interval { months, micros } => {
+            out.push('i');
+            out.push_str(&months.to_string());
+            out.push('m');
+            out.push_str(&micros.to_string());
+            out.push('|');
+        }
+        Value::Json(s) => {
+            out.push('j');
+            out.push_str(s);
+            out.push('|');
+        }
+        // v7.5.0 — Value is #[non_exhaustive] for downstream
+        // forward-compat. Any future variant lacking explicit
+        // handling here will share a debug-derived group key,
+        // which is observably wrong but won't crash.
+        _ => {
+            out.push('?');
+            out.push_str(&format!("{v:?}"));
+            out.push('|');
+        }
+    }
+}
+
+/// v7.30 (perf campaign) - encode from borrowed cells without
+/// materialising an owned Vec<Value> first.
+fn encode_key_refs(vals: &[&Value]) -> String {
+    let mut out = String::new();
+    for v in vals {
+        encode_one(&mut out, v);
+    }
+    out
+}
+
 pub(crate) fn encode_key(vals: &[Value]) -> String {
     let mut out = String::new();
     for v in vals {
-        match v {
-            Value::Null => out.push_str("N|"),
-            Value::SmallInt(n) => {
-                out.push('s');
-                out.push_str(&n.to_string());
-                out.push('|');
-            }
-            Value::Int(n) => {
-                out.push('I');
-                out.push_str(&n.to_string());
-                out.push('|');
-            }
-            Value::BigInt(n) => {
-                out.push('B');
-                out.push_str(&n.to_string());
-                out.push('|');
-            }
-            Value::Float(x) => {
-                out.push('F');
-                out.push_str(&x.to_string());
-                out.push('|');
-            }
-            Value::Bool(b) => {
-                out.push(if *b { 'T' } else { 'f' });
-                out.push('|');
-            }
-            Value::Text(s) => {
-                out.push('S');
-                out.push_str(s);
-                out.push('|');
-            }
-            Value::Vector(v) => {
-                out.push('V');
-                for x in v {
-                    out.push_str(&x.to_string());
-                    out.push(',');
-                }
-                out.push('|');
-            }
-            // v6.0.1: GROUP BY on a `VECTOR(N) USING SQ8` column.
-            // Two cells with byte-identical `(min, max, bytes)`
-            // share the same group; equivalence is byte-equality
-            // (same as f32 grouping today — neither path tries to
-            // normalise nan/-0).
-            Value::Sq8Vector(q) => {
-                out.push('Q');
-                out.push_str(&q.min.to_string());
-                out.push('@');
-                out.push_str(&q.max.to_string());
-                out.push(':');
-                for b in &q.bytes {
-                    out.push_str(&b.to_string());
-                    out.push(',');
-                }
-                out.push('|');
-            }
-            // v6.0.3: GROUP BY on a `VECTOR(N) USING HALF` column.
-            // Byte-equality over the raw u16 bits; matches the SQ8
-            // path's byte-key model.
-            Value::HalfVector(h) => {
-                out.push('H');
-                for b in &h.bytes {
-                    out.push_str(&b.to_string());
-                    out.push(',');
-                }
-                out.push('|');
-            }
-            Value::Numeric { scaled, scale } => {
-                out.push('D');
-                out.push_str(&scaled.to_string());
-                out.push('@');
-                out.push_str(&scale.to_string());
-                out.push('|');
-            }
-            Value::Date(d) => {
-                out.push('d');
-                out.push_str(&d.to_string());
-                out.push('|');
-            }
-            Value::Timestamp(t) => {
-                out.push('t');
-                out.push_str(&t.to_string());
-                out.push('|');
-            }
-            Value::Interval { months, micros } => {
-                out.push('i');
-                out.push_str(&months.to_string());
-                out.push('m');
-                out.push_str(&micros.to_string());
-                out.push('|');
-            }
-            Value::Json(s) => {
-                out.push('j');
-                out.push_str(s);
-                out.push('|');
-            }
-            // v7.5.0 — Value is #[non_exhaustive] for downstream
-            // forward-compat. Any future variant lacking explicit
-            // handling here will share a debug-derived group key,
-            // which is observably wrong but won't crash.
-            _ => {
-                out.push('?');
-                out.push_str(&format!("{v:?}"));
-                out.push('|');
-            }
-        }
+        encode_one(&mut out, v);
     }
     out
 }
