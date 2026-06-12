@@ -11,6 +11,7 @@ categories   = ["database-implementations"]
 keywords     = ["spg", "sql", "engine", "executor", "no-std"]
 
 [dependencies]
+hashbrown    = { workspace = true }
 spg-crypto  = { workspace = true }
 spg-sql     = { workspace = true }
 spg-storage = { workspace = true }

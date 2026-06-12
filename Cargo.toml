@@ -31,6 +31,7 @@ repository   = "https://github.com/goliajp/spg"
 # matters because criterion's stats / sample analysis can shift
 # percentages between minor releases.
 [workspace.dependencies]
+hashbrown   = { version = "0.15", default-features = false, features = ["default-hasher"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 # v7.8.1 — internal crates declared once here so `cargo publish` sees
 # `version = "X.Y"` alongside the `path = …`. crates.io strips paths

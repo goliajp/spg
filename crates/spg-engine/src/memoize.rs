@@ -54,6 +54,13 @@ pub struct CacheKey {
     pub outer_values: Vec<Value>,
 }
 
+/// v7.29 - one batch-evaluated correlated subquery: the outer key
+/// column and the key -> value map.
+pub type GroupMap = (
+    spg_sql::ast::ColumnName,
+    alloc::collections::BTreeMap<String, Value>,
+);
+
 #[derive(Debug, Clone)]
 pub struct MemoizeCache {
     /// LRU front = most recently used. Stored as a `VecDeque` so
@@ -66,13 +73,7 @@ pub struct MemoizeCache {
     /// map built in ONE pass)) or None when the shape can't batch
     /// (so we don't re-analyse it per row). Turns 23.5k per-group
     /// executions into one grouped scan + 23.5k lookups.
-    pub group_maps: alloc::collections::BTreeMap<
-        String,
-        Option<(
-            spg_sql::ast::ColumnName,
-            alloc::collections::BTreeMap<String, Value>,
-        )>,
-    >,
+    pub group_maps: alloc::collections::BTreeMap<String, Option<GroupMap>>,
     max_entries: usize,
     max_bytes: usize,
     current_bytes: usize,
