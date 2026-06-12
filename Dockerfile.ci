@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1.7
+#
+# CI-only assembly image. Packages PREBUILT binaries (cargo build
+# --release on the runner, rust-cache hot) into the same runtime
+# shape as the production image, so the drop-in acceptance panel
+# exercises the candidate commit instead of a previously published
+# image. A from-source docker build here would discard the runner's
+# cargo cache and add 15+ min per run.
+#
+# Keep the runtime contract below in lockstep with the `runtime`
+# stage of ./Dockerfile (ports, /data volume, env defaults, user,
+# entrypoint, CMD).
+#
+# Build (from repo root):
+#   cargo build --release --locked --bin spg-server --bin spg --bin pg_isready
+#   mkdir -p target/ci-image
+#   cp target/release/spg-server target/release/spg target/release/pg_isready target/ci-image/
+#   docker build -f Dockerfile.ci -t spg-candidate:ci target/ci-image
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY spg-server /usr/local/bin/spg-server
+COPY spg        /usr/local/bin/spg
+COPY pg_isready /usr/local/bin/pg_isready
+
+EXPOSE 5432
+EXPOSE 5544
+VOLUME ["/data"]
+WORKDIR /data
+USER nonroot:nonroot
+
+ENV SPG_PG_ADDR=0.0.0.0:5432
+ENTRYPOINT ["/usr/local/bin/spg-server"]
+CMD ["0.0.0.0:5544", "/data/spg.db", "-", "/data/wal.log"]
