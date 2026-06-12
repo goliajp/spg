@@ -8,6 +8,54 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.29.0] — 2026-06-12 (round-22 phase 3 + round-23: ceiling-first — the executor keeps cutting, import goes linear)
+
+Ceiling-first: "差不多" is not survival. Phase 3 keeps cutting
+toward beating PG on the inbox shape; round-23 turned a live
+customer import from a one-hour quadratic into seconds.
+
+### Executor phase 3 (warm inbox on the 24k catalog: 1.07 s → ~320 ms)
+
+- Correlated scalar subqueries batch-evaluate: the
+  `inner_col = outer_col [ORDER BY … LIMIT 1]` shape runs ONCE as a
+  grouped scan into a key→value map; per-row resolution is a probe.
+  A/B on 24k groups: 101 ms vs 116.7 s forced per-row (~1150×).
+- Per-expression subquery plans: zero AST formatting in the row
+  loop (the Display-keyed cache cost ~24% of the query), and plan
+  templates carry hollowed subquery bodies so per-row tree clones
+  stop copying whole subquery ASTs.
+- LEFT(col, n) borrows the cell and clones only the prefix
+  (390 → 14 ms over 24k × 30 KB rows).
+- Hash maps replace BTreeMap<String> in the join build and
+  aggregate grouping.
+
+### Import (mailrs round-23b): O(n²) → O(n)
+
+- Uniqueness enforcement (constraints AND unique indexes) folds
+  existing keys into a hash set once per statement instead of
+  scanning the whole table per inserted row: 12,500 rows 163 s →
+  44 ms; 25,000 rows 142 ms, linear. Collation folding,
+  NULLS [NOT] DISTINCT, partial-index predicates unchanged.
+- Remaining small-radius quadratics (composite-FK, composite
+  ON CONFLICT, cascade child scans) are filed; the deferred-index
+  bulk-load path stays on the docket.
+
+### BIGSERIAL sequence addressability (mailrs round-23a)
+
+- Implicit `<table>_<column>_seq` materialises on first address —
+  pre-7.29 data directories upgrade with no migration.
+- `pg_get_serial_sequence()`, nested
+  `setval(pg_get_serial_sequence(…), n)`, nextval/currval, and
+  ALTER SEQUENCE all land; auto-assign floors at the sequence so
+  post-restore INSERTs continue above restored ids. Unaddressed
+  tables keep exact pre-7.29 max+1 behaviour.
+
+### Correctness
+
+- ON CONFLICT respects `UNIQUE NULLS NOT DISTINCT` (NULL-bearing
+  keys conflict under that declaration; previously the seed-row
+  replay idiom either errored or silently duplicated).
+
 ## [7.28.0] — 2026-06-12 (mailrs round-22: the executor round — joins stop being O(L×R))
 
 Production data (24k rows) took the inbox query from "parses,
