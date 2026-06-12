@@ -9631,6 +9631,14 @@ impl Engine {
                 stmt.limit_literal(),
             );
             let ctx = EvalContext::new(&agg.synth_schema, None);
+            // Memoized path on purpose. Bypassing the batch (memo
+            // None) was measured at 715 ms — 12.8 ms PER direct eval:
+            // the join-shaped inner subquery takes no index seek
+            // (seeded lookups demand all-hot locators, and the e2
+            // JOIN m2 inner shape re-runs the full join pipeline per
+            // row). One all-keys batch ≈ 15 ms total stays the best
+            // available until inner subplans can index-probe like
+            // PG's SubPlan (knife: keyed single-probe execution).
             let mut memo = memoize::MemoizeCache::default();
             for (ri, srow) in agg.synth_rows.iter().enumerate() {
                 cancel.check()?;
