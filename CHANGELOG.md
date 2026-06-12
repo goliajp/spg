@@ -8,7 +8,48 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.30.0] — 2026-06-12 (perf campaign, first cut: the real-stakes board)
+## [7.30.1] — 2026-06-12 (HOTFIX — mailrs round-24: WAL durability, P0)
+
+A routine `INSERT … ON CONFLICT DO NOTHING` through the prepared
+path (sqlx / extended protocol on embed) was serialised into the
+WAL **without the ON CONFLICT clause**: at runtime it was a legal
+no-op, on crash replay it became a UNIQUE violation, and the open
+path classified that as catalog corruption — the database refused
+to start (confirmed on 7.27.0 and 7.30.0; manual WAL surgery was
+the only rescue).
+
+### Fixed
+
+- **AST→SQL Display fidelity (the whole class).** WAL persistence
+  renders the bind-final AST via `Display`; every clause Display
+  dropped was a silent semantics change on crash replay. Now
+  rendered: `ON CONFLICT (…) DO NOTHING / DO UPDATE SET … WHERE …`,
+  `RETURNING` (INSERT/UPDATE/DELETE), `WITH [RECURSIVE]` CTEs,
+  `FETCH FIRST … ROWS WITH TIES`, `GROUP BY ALL`, `LATERAL (…)`,
+  `UNNEST(…)`, `generate_series(…)`, `AS OF SEGMENT n`,
+  window-function `IGNORE NULLS`, column-level `PRIMARY KEY`,
+  MySQL `UNSIGNED` / `ENUM(…)` / `SET(…)` / user-type refs /
+  `ON UPDATE CURRENT_TIMESTAMP`. Round-trip corpus extended to
+  cover each form.
+- **Replay rejects no longer brick the catalog.** A statement the
+  engine rejects during boot replay is quarantined — written to a
+  `quarantine-<ts>.log` beside the WAL chunks for forensics, logged
+  loudly on stderr — and the boot continues. Framing / CRC / UTF-8
+  damage still classifies as corruption. This also un-bricks
+  catalogs whose WAL was already written by ≤7.30.0 with the
+  stripped form: they now boot on first open under 7.30.1, with the
+  stripped no-op quarantined. Same policy on the spg-server replay
+  path.
+
+### Operational notes
+
+- Mitigation on ≤7.30.0 embed: `Database::checkpoint()` is public —
+  a periodic explicit checkpoint truncates the WAL and bounds the
+  crash-replay exposure window to writes since the last checkpoint.
+- Known, separate: server-mode extended-protocol writes do not
+  reach the server WAL at all (verified while auditing this round;
+  embed is unaffected). Tracked as P0 backlog, not part of this
+  hotfix.
 
 Measured same-machine, same data (103.6 MB prod-shaped dump,
 24k messages), against PostgreSQL 18.4:
