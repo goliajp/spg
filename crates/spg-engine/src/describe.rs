@@ -576,6 +576,12 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_expr(expr, f);
             walk_expr(array, f);
         }
+        Expr::InList { expr, list, .. } => {
+            walk_expr(expr, f);
+            for item in list {
+                walk_expr(item, f);
+            }
+        }
         Expr::Case {
             operand,
             branches,

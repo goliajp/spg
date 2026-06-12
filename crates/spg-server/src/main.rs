@@ -1068,6 +1068,21 @@ fn run(
         engine = engine.with_max_query_rows(n);
     }
 
+    // v7.30.3 (mailrs round-26) — wire the same SPG_MAX_QUERY_BYTES
+    // value into the engine's approximate join-materialisation
+    // budget. The allocator-level budget above (`alloc_budget`)
+    // stays the precise outer layer; the engine-level meter errors
+    // with the actionable QueryBytesExceeded message before the
+    // allocator has to trip the cancel flag.
+    let engine_byte_cap: Option<usize> = match limits.max_query_bytes {
+        Some(0) => None,
+        Some(n) => usize::try_from(n).ok(),
+        None => usize::try_from(DEFAULT_MAX_QUERY_BYTES).ok(),
+    };
+    if let Some(n) = engine_byte_cap {
+        engine = engine.with_max_query_bytes(n);
+    }
+
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;

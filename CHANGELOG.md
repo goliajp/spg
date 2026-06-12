@@ -8,6 +8,95 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.30.3] — 2026-06-13 (HOTFIX — mailrs round-26: bounded join memory, P1 incident)
+
+First prod boot on 7.30.2 (mailrs v1.7.153) froze a 15 GiB no-swap
+EC2 host for ~25 min: the meili backfill shape
+`SELECT … FROM messages m JOIN mailboxes mb ON … WHERE m.id > $1
+ORDER BY m.id ASC LIMIT $2` materialised the FULL join — ≈2× every
+mail body (measured: 210 MB peak for a 100 MB table; GBs on prod
+mail) — before LIMIT truncated to 1000 rows. Anonymous memory sat
+just under the OOM-kill threshold while reclaim evicted every code
+page: userland livelock, SSH banner timeouts, hard reboot required.
+
+### Fixed
+
+- **Bounded execution for the backfill shape.** A single INNER
+  equi-join with a literal LIMIT (no aggregates / DISTINCT /
+  GROUP BY) now streams the primary table row-by-row against a
+  hash of the peer and feeds a `LIMIT+OFFSET`-bounded top-N heap:
+  peak memory scales with the answer, not the table. Order, tie,
+  OFFSET, NULL-key, and keyset-cursor semantics pinned against the
+  general path across all three dispatch families (engine e2e,
+  spg-sqlx prepared with the verbatim mailrs statement, dropin
+  wire panel).
+- **Per-query byte budget on join materialisation (round-26 ask 3,
+  round-22 ask 2).** The engine meters approximate bytes at every
+  point the join pipeline clones rows and fails the query with
+  `QueryBytesExceeded` — an actionable error instead of host
+  reclaim livelock. Embed reads `SPG_MAX_QUERY_BYTES` (default ON
+  at 256 MiB, parity with the server's allocator-level budget;
+  `0` disables). The server wires the same value into the engine
+  as an inner layer under its existing precise allocator budget.
+  NOT applied to WAL replay — recovery never fails on a tuning
+  knob.
+
+### Added
+
+- **Memory regression gate** (`spg-engine` perf_gate
+  `round26_mem`): peak-tracking allocator asserts the backfill
+  shape peaks < 64 MiB over a 100 MiB-body table. Verified RED on
+  7.30.2 (210 MB peak) and green here — this is the gate that
+  would have caught the incident before it shipped.
+
+## [7.30.2] — 2026-06-13 (HOTFIX — mailrs round-25: IN-list stack overflow, P0)
+
+A mailbox search (UNION-of-matchers CTE + thread expansion through
+nested `IN (subquery)`) aborted the embedding host process with
+`fatal runtime error: stack overflow` whenever the search matched
+rows. `IN (subquery)` materialised the inner result into a
+left-deep OR-equality chain, so expression depth scaled with the
+inner ROW COUNT — 24k matches built a 24k-deep tree, and both the
+recursive evaluator and the recursive `Box` drop blew the 2 MiB
+worker stack. In embed mode a stack overflow is an abort, not a
+catchable error: one user search took down the whole host.
+
+### Fixed
+
+- **Flat `IN` lists (the structural fix).** New `Expr::InList`
+  AST node with a `Vec` payload: the parser's literal-list path
+  and the engine's IN-subquery materialisation both produce it.
+  Evaluation is an iterative scan with PG three-valued logic;
+  drop is a `Vec` drop. Depth no longer scales with element
+  count — the round-25 search returns rows at any match count
+  (verified on the 24k-row perf catalog, 2 MiB stack: 0-match
+  231 ms, mid-selectivity 233 ms, all-24k-match 650 ms).
+- **Membership-set evaluation for large `IN` lists.** All-literal
+  lists of ≥64 elements build a canonicalised set once per row
+  loop (integer family normalised to i64, text verbatim) and
+  probe it per row — O(rows × log list) instead of the
+  O(rows × list) linear scan (which would have been ~6 s at 24k×24k).
+  Mixed/exotic literal families and cross-family needles keep the
+  coercing linear scan, so semantics are unchanged.
+- **Per-expression dispatch caching.** The per-row "does this
+  WHERE contain a subquery" walk re-traversed the materialised
+  24k-element list every row; the answer is now cached by
+  expression address in the per-query memo (2.26 s → 650 ms on
+  the all-match search).
+
+### Added (defense in depth — round-25 ask 2)
+
+- **Parser nesting budget (64).** Deeply nested parens /
+  subqueries / CASE now return a parse error instead of
+  overflowing the parser's own stack.
+- **Binary-chain budget (256).** `a OR b OR c …` chains beyond
+  256 operators at one precedence level return a parse error
+  (the chain evaluates and drops recursively; past the budget it
+  would overflow a 2 MiB worker stack). `IN (…)` lists are flat
+  and unaffected at any size.
+
+---
+
 ## [7.30.1] — 2026-06-12 (HOTFIX — mailrs round-24: WAL durability, P0)
 
 A routine `INSERT … ON CONFLICT DO NOTHING` through the prepared
