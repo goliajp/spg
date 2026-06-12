@@ -8,6 +8,47 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.30.3] — 2026-06-13 (HOTFIX — mailrs round-26: bounded join memory, P1 incident)
+
+First prod boot on 7.30.2 (mailrs v1.7.153) froze a 15 GiB no-swap
+EC2 host for ~25 min: the meili backfill shape
+`SELECT … FROM messages m JOIN mailboxes mb ON … WHERE m.id > $1
+ORDER BY m.id ASC LIMIT $2` materialised the FULL join — ≈2× every
+mail body (measured: 210 MB peak for a 100 MB table; GBs on prod
+mail) — before LIMIT truncated to 1000 rows. Anonymous memory sat
+just under the OOM-kill threshold while reclaim evicted every code
+page: userland livelock, SSH banner timeouts, hard reboot required.
+
+### Fixed
+
+- **Bounded execution for the backfill shape.** A single INNER
+  equi-join with a literal LIMIT (no aggregates / DISTINCT /
+  GROUP BY) now streams the primary table row-by-row against a
+  hash of the peer and feeds a `LIMIT+OFFSET`-bounded top-N heap:
+  peak memory scales with the answer, not the table. Order, tie,
+  OFFSET, NULL-key, and keyset-cursor semantics pinned against the
+  general path across all three dispatch families (engine e2e,
+  spg-sqlx prepared with the verbatim mailrs statement, dropin
+  wire panel).
+- **Per-query byte budget on join materialisation (round-26 ask 3,
+  round-22 ask 2).** The engine meters approximate bytes at every
+  point the join pipeline clones rows and fails the query with
+  `QueryBytesExceeded` — an actionable error instead of host
+  reclaim livelock. Embed reads `SPG_MAX_QUERY_BYTES` (default ON
+  at 256 MiB, parity with the server's allocator-level budget;
+  `0` disables). The server wires the same value into the engine
+  as an inner layer under its existing precise allocator budget.
+  NOT applied to WAL replay — recovery never fails on a tuning
+  knob.
+
+### Added
+
+- **Memory regression gate** (`spg-engine` perf_gate
+  `round26_mem`): peak-tracking allocator asserts the backfill
+  shape peaks < 64 MiB over a 100 MiB-body table. Verified RED on
+  7.30.2 (210 MB peak) and green here — this is the gate that
+  would have caught the incident before it shipped.
+
 ## [7.30.2] — 2026-06-13 (HOTFIX — mailrs round-25: IN-list stack overflow, P0)
 
 A mailbox search (UNION-of-matchers CTE + thread expansion through

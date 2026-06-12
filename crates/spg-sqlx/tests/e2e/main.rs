@@ -7,6 +7,7 @@ mod e2e_describe_real;
 mod e2e_uuid_sqlx;
 mod e2e_vector_tsvector;
 mod fetch;
+mod mailrs_round26;
 mod smoke;
 mod snapshot_routing;
 mod types;
