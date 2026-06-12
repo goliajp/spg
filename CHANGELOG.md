@@ -8,6 +8,38 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.30.0] — 2026-06-12 (perf campaign, first cut: the real-stakes board)
+
+Measured same-machine, same data (103.6 MB prod-shaped dump,
+24k messages), against PostgreSQL 18.4:
+
+| quadrant | SPG embedded | SPG server (wire) | PG 18.4 |
+|---|---|---|---|
+| import | **0.69 s** | **~0.93 s** | 1.16 s |
+| inbox SELECT (warm) | **~130 ms** | ~130 ms | 54 ms |
+
+Import is WON on both paths (1.7× / 1.25×). The SELECT gap keeps
+closing — this release carries the next three knives:
+
+- Aggregate item rewrite hoisted out of the group loop (it ran
+  once per GROUP per item — 23.5k × 9 redundant AST clones,
+  ~48% of the query in sampled stacks).
+- Zero-allocation composite column matching: resolve_column
+  formatted a fresh `alias.column` String per column reference
+  per row (~290k formats per query) to compare against joined
+  schemas; now compares segments in place.
+- Bind-once aggregate row loop: qualified column references in
+  group keys and aggregate arguments resolve to schema positions
+  once; rows read cells by offset, group keys encode from
+  borrowed cells, no per-row owned-Value clones.
+
+Inbox trajectory across the campaign so far: 1.07 s (7.28) →
+~320 ms (7.29) → **~130 ms**, with the remaining account fully
+decomposed (join materialisation ~32 ms paid once outside and
+once inside each batched subquery; aggregate states ~23 ms;
+physical floor ~5 ms). The deferred-materialisation knife lands
+next.
+
 ## [7.29.0] — 2026-06-12 (round-22 phase 3 + round-23: ceiling-first — the executor keeps cutting, import goes linear)
 
 Ceiling-first: "差不多" is not survival. Phase 3 keeps cutting
