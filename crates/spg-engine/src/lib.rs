@@ -3275,6 +3275,9 @@ impl Engine {
         s: spg_sql::ast::AlterSequenceStatement,
     ) -> Result<QueryResult, EngineError> {
         use spg_sql::ast::SeqBound;
+        // v7.29 (round-23a) - implicit serial sequences materialise
+        // on first address, ALTER SEQUENCE included.
+        self.ensure_implicit_sequence(&s.name);
         let cat = self.active_catalog_mut();
         if !cat.sequences().contains_key(&s.name) {
             if s.if_exists {
@@ -3396,6 +3399,35 @@ impl Engine {
                 if lc == "nextval" || lc == "currval" || lc == "setval" {
                     let v = self.eval_sequence_call(&lc, args)?;
                     *expr = Expr::Literal(value_to_literal(v));
+                } else if lc == "pg_get_serial_sequence" && args.len() == 2 {
+                    // v7.29 (round-23a) — resolves to the implicit
+                    // sequence name so the pg_dump idiom
+                    // `setval(pg_get_serial_sequence('t','c'), n)`
+                    // works (the setval arm receives a literal).
+                    let lit = |e: &Expr| -> Option<String> {
+                        match e {
+                            Expr::Literal(spg_sql::ast::Literal::String(v)) => {
+                                let t = v.strip_prefix("public.").unwrap_or(v).trim_matches('"');
+                                Some(t.to_string())
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let (Some(t), Some(c)) = (lit(&args[0]), lit(&args[1])) {
+                        let is_serial = self.active_catalog().get(&t).is_some_and(|tb| {
+                            tb.schema()
+                                .columns
+                                .iter()
+                                .any(|col| col.name == c && col.auto_increment)
+                        });
+                        *expr = if is_serial {
+                            Expr::Literal(spg_sql::ast::Literal::String(alloc::format!(
+                                "public.{t}_{c}_seq"
+                            )))
+                        } else {
+                            Expr::Literal(spg_sql::ast::Literal::Null)
+                        };
+                    }
                 }
                 Ok(())
             }
@@ -3423,6 +3455,54 @@ impl Engine {
             // (no sequence_resolver attached).
             _ => Ok(()),
         }
+    }
+
+    /// v7.29 (mailrs round-23a) — SERIAL/BIGSERIAL columns get their
+    /// PG-style implicit sequence `<table>_<column>_seq` ON FIRST
+    /// ADDRESS rather than at CREATE TABLE time, so pre-7.29 data
+    /// directories gain addressability without a storage migration.
+    /// The sequence is born synced to the column's current MAX so
+    /// `nextval` immediately after creation continues the series.
+    fn ensure_implicit_sequence(&mut self, seq_name: &str) {
+        if self.active_catalog().sequences().contains_key(seq_name) {
+            return;
+        }
+        let Some(rest) = seq_name.strip_suffix("_seq") else {
+            return;
+        };
+        let mut found: Option<(String, String, i64)> = None;
+        for tname in self.active_catalog().table_names() {
+            let Some(table) = self.active_catalog().get(&tname) else {
+                continue;
+            };
+            for (i, col) in table.schema().columns.iter().enumerate() {
+                if col.auto_increment && alloc::format!("{tname}_{}", col.name) == rest {
+                    let next = table.next_auto_value(i).unwrap_or(1);
+                    found = Some((tname.clone(), col.name.clone(), next - 1));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some((tname, cname, last)) = found else {
+            return;
+        };
+        let def = spg_storage::SequenceDef {
+            name: seq_name.to_string(),
+            data_type: spg_storage::SequenceDataType::BigInt,
+            start: 1,
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            cache: 1,
+            cycle: false,
+            owned_by: Some((tname, cname)),
+            last_value: last.max(0),
+            is_called: last > 0,
+        };
+        let _ = self.active_catalog_mut().create_sequence(def, true);
     }
 
     /// v7.17.0 Phase 1.1 — evaluate a single nextval/currval/
@@ -3470,6 +3550,7 @@ impl Engine {
                 )));
             }
         };
+        self.ensure_implicit_sequence(&seq_name);
         match op {
             "nextval" => {
                 let v = self
@@ -6776,6 +6857,33 @@ impl Engine {
                 .enumerate()
                 .filter_map(|(i, col)| col.inline_set_variants.as_ref().map(|vs| (i, vs.clone())))
                 .collect();
+        // v7.29 (round-23a) - when the column's implicit sequence
+        // exists (born on first nextval/setval address), a setval
+        // above the table MAX moves the next auto-assigned id:
+        // assign from max(table_max + 1, last_value + 1). Tables
+        // whose sequence was never addressed keep the bare max+1
+        // path (identical pre-7.29 behaviour, no lookup cost
+        // beyond one map probe per auto column per statement).
+        let mut seq_floors: alloc::collections::BTreeMap<usize, i64> =
+            alloc::collections::BTreeMap::new();
+        for (i, col) in pre_borrow_column_meta.iter().enumerate() {
+            if col.auto_increment
+                && let Some(sd) = self.active_catalog().sequences().get(&alloc::format!(
+                    "{}_{}_seq",
+                    stmt.table,
+                    col.name
+                ))
+            {
+                // is_called=false (fresh RESTART / setval(_, false))
+                // means the NEXT value is last_value itself.
+                let floor = if sd.is_called {
+                    sd.last_value + 1
+                } else {
+                    sd.last_value
+                };
+                seq_floors.insert(i, floor);
+            }
+        }
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -6876,12 +6984,15 @@ impl Engine {
                     if col.auto_increment && raw.is_null() {
                         let next = match auto_cursors.get(&i) {
                             Some(n) => *n,
-                            None => table.next_auto_value(i).ok_or_else(|| {
-                                EngineError::Unsupported(alloc::format!(
-                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                    col.name
-                                ))
-                            })?,
+                            None => {
+                                let base = table.next_auto_value(i).ok_or_else(|| {
+                                    EngineError::Unsupported(alloc::format!(
+                                        "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                        col.name
+                                    ))
+                                })?;
+                                base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
+                            }
                         };
                         auto_cursors.insert(i, next + 1);
                         raw = Value::BigInt(next);
@@ -6902,12 +7013,15 @@ impl Engine {
                     if col.auto_increment && raw.is_null() {
                         let next = match auto_cursors.get(&i) {
                             Some(n) => *n,
-                            None => table.next_auto_value(i).ok_or_else(|| {
-                                EngineError::Unsupported(alloc::format!(
-                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                    col.name
-                                ))
-                            })?,
+                            None => {
+                                let base = table.next_auto_value(i).ok_or_else(|| {
+                                    EngineError::Unsupported(alloc::format!(
+                                        "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                        col.name
+                                    ))
+                                })?;
+                                base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
+                            }
                         };
                         auto_cursors.insert(i, next + 1);
                         raw = Value::BigInt(next);
