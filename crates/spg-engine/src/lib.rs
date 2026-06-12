@@ -1752,14 +1752,28 @@ impl Engine {
     /// v4.2: cap result-set size. Applied after the executor
     /// materialises rows but before they leave the engine — wrapping
     /// every Rows-returning exec_* function would scatter the check.
+    ///
+    /// v7.31 (memory campaign, bucket A) — the same choke point now
+    /// also enforces the BYTE budget on the final result set, so
+    /// single-table and aggregate paths (which don't route through
+    /// the join materialiser's incremental accounting) still cannot
+    /// hand the host an unbounded result. Intermediate single-table
+    /// clones are the 7.31.x follow-up (design doc, bucket A).
     fn enforce_row_limit(
         &self,
         result: Result<QueryResult, EngineError>,
     ) -> Result<QueryResult, EngineError> {
-        if let (Ok(QueryResult::Rows { rows, .. }), Some(cap)) = (&result, self.max_query_rows)
-            && rows.len() > cap
-        {
-            return Err(EngineError::RowLimitExceeded(cap));
+        if let Ok(QueryResult::Rows { rows, .. }) = &result {
+            if let Some(cap) = self.max_query_rows
+                && rows.len() > cap
+            {
+                return Err(EngineError::RowLimitExceeded(cap));
+            }
+            if let Some(byte_cap) = self.max_query_bytes
+                && approx_rows_bytes(rows) > byte_cap
+            {
+                return Err(EngineError::QueryBytesExceeded(byte_cap));
+            }
         }
         result
     }
@@ -2370,6 +2384,97 @@ impl Engine {
     /// before any index registered a locator). The walk is
     /// O(tables × indices × keys); cached per call, not across
     /// calls — re-walked on every `SELECT * FROM spg_stat_segment`.
+    /// v7.31 (memory campaign) — walk the committed catalog and
+    /// build the per-bucket memory snapshot. O(rows + index
+    /// entries): operator/monitoring surface, not a query path.
+    pub fn memory_stats(&self) -> MemoryStats {
+        let mut tables: Vec<TableMemoryStats> = Vec::new();
+        let (mut total_enc, mut total_res, mut total_idx) = (0u64, 0u64, 0u64);
+        for tname in self.catalog.table_names() {
+            if is_internal_table_name(&tname) {
+                continue;
+            }
+            let Some(t) = self.catalog.get(&tname) else {
+                continue;
+            };
+            let resident: u64 = t.rows().iter().map(|r| approx_row_bytes(r) as u64).sum();
+            let mut idx_bytes: u64 = 0;
+            for idx in t.indices() {
+                idx_bytes += match &idx.kind {
+                    spg_storage::IndexKind::BTree(map) => {
+                        let mut b: u64 = 0;
+                        for (_, locs) in map.iter() {
+                            b += (core::mem::size_of::<spg_storage::IndexKey>()
+                                + 24
+                                + locs.len() * core::mem::size_of::<spg_storage::RowLocator>())
+                                as u64;
+                        }
+                        b
+                    }
+                    // Parametric estimate: per node, the dense
+                    // layer-0 neighbour list dominates.
+                    spg_storage::IndexKind::Nsw(g) => {
+                        (g.levels.len() * (g.m_max_0 * 8 + 16)) as u64
+                    }
+                    // BRIN is block-range metadata — flat token.
+                    _ => 1024,
+                };
+            }
+            total_enc += t.hot_bytes();
+            total_res += resident;
+            total_idx += idx_bytes;
+            tables.push(TableMemoryStats {
+                name: tname.clone(),
+                hot_rows: t.rows().len() as u64,
+                cold_rows: t.cold_row_count(),
+                hot_encoded_bytes: t.hot_bytes(),
+                approx_resident_bytes: resident,
+                index_count: t.indices().len() as u64,
+                approx_index_bytes: idx_bytes,
+            });
+        }
+        MemoryStats {
+            tables,
+            total_hot_encoded_bytes: total_enc,
+            total_approx_resident_bytes: total_res,
+            total_approx_index_bytes: total_idx,
+            max_query_bytes: self.max_query_bytes,
+        }
+    }
+
+    /// v7.31 — `SELECT * FROM spg_memory_stats`: one row per user
+    /// table (same numbers as `Engine::memory_stats()`), so the
+    /// server path gets the meter through plain SQL.
+    fn exec_spg_memory_stats(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("table_name", DataType::Text, false),
+            ColumnSchema::new("hot_rows", DataType::BigInt, false),
+            ColumnSchema::new("cold_rows", DataType::BigInt, false),
+            ColumnSchema::new("hot_encoded_bytes", DataType::BigInt, false),
+            ColumnSchema::new("approx_resident_bytes", DataType::BigInt, false),
+            ColumnSchema::new("index_count", DataType::BigInt, false),
+            ColumnSchema::new("approx_index_bytes", DataType::BigInt, false),
+        ];
+        #[allow(clippy::cast_possible_wrap)]
+        let rows: Vec<Row> = self
+            .memory_stats()
+            .tables
+            .into_iter()
+            .map(|t| {
+                Row::new(alloc::vec![
+                    Value::Text(t.name),
+                    Value::BigInt(t.hot_rows as i64),
+                    Value::BigInt(t.cold_rows as i64),
+                    Value::BigInt(t.hot_encoded_bytes as i64),
+                    Value::BigInt(t.approx_resident_bytes as i64),
+                    Value::BigInt(t.index_count as i64),
+                    Value::BigInt(t.approx_index_bytes as i64),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
     fn exec_spg_stat_segment(&self) -> QueryResult {
         let columns = alloc::vec![
             ColumnSchema::new("segment_id", DataType::BigInt, false),
@@ -7553,6 +7658,8 @@ impl Engine {
                 // v6.5.0 — observability v2 virtual tables.
                 "spg_stat_replication" => return Ok(self.exec_spg_stat_replication()),
                 "spg_stat_segment" => return Ok(self.exec_spg_stat_segment()),
+                // v7.31 — memory-campaign bucket meters.
+                "spg_memory_stats" => return Ok(self.exec_spg_memory_stats()),
                 "spg_stat_query" => return Ok(self.exec_spg_stat_query()),
                 "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
                 "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
@@ -9800,6 +9907,46 @@ impl Ord for TopNEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         Self::cmp_keys(&self.keys, &other.keys).then(self.seq.cmp(&other.seq))
     }
+}
+
+/// v7.31 (memory campaign — ceiling-first / never-die, design v1) —
+/// per-table slice of the engine's resident-memory accounting.
+/// `hot_encoded_bytes` is the storage layer's maintained meter (what
+/// the rows encode to); `approx_resident_bytes` is what they COST in
+/// RAM (per-cell enum slots + heap payloads via `approx_row_bytes`)
+/// — the gap between the two is the representation multiplier the
+/// round-26 report measured at ~11× end-to-end.
+#[derive(Debug, Clone)]
+pub struct TableMemoryStats {
+    pub name: String,
+    pub hot_rows: u64,
+    /// Cached cold-row count (refreshed by ANALYZE — see
+    /// `Table::cold_row_count`'s staleness contract).
+    pub cold_rows: u64,
+    pub hot_encoded_bytes: u64,
+    pub approx_resident_bytes: u64,
+    pub index_count: u64,
+    /// BTree indices are walked entry-by-entry (operator surface,
+    /// not a hot path); NSW graphs and BRIN are parametric
+    /// ESTIMATES until spg-storage carries its own byte meters
+    /// (7.31.x follow-up in the design doc).
+    pub approx_index_bytes: u64,
+}
+
+/// v7.31 — whole-engine memory snapshot: the polling form of the
+/// round-26 ask-4 watermark signal. Hosts compare
+/// `total_approx_resident_bytes` (+ their own WAL/file accounting)
+/// against their deployment ceiling and shed/shrink before the
+/// kernel does it for them.
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    pub tables: Vec<TableMemoryStats>,
+    pub total_hot_encoded_bytes: u64,
+    pub total_approx_resident_bytes: u64,
+    pub total_approx_index_bytes: u64,
+    /// The active per-query materialisation budget (bucket A), so a
+    /// monitoring host sees ceiling and usage through one call.
+    pub max_query_bytes: Option<usize>,
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is

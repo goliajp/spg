@@ -92,6 +92,7 @@ mod e2e_materialized_view;
     clippy::uninlined_format_args
 )]
 mod e2e_memoize;
+mod e2e_memory_stats;
 mod e2e_merge;
 mod e2e_mod;
 mod e2e_multi_col_index;
