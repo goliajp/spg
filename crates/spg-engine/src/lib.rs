@@ -11092,10 +11092,57 @@ impl Engine {
         row: &Row,
         ctx: &EvalContext<'_>,
         cancel: CancelToken<'_>,
-        memo: Option<&mut memoize::MemoizeCache>,
+        mut memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<Value, EngineError> {
         if !expr_has_subquery(expr) {
             return eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval);
+        }
+        // v7.29 (3c) - per-expression plan: the batch maps for this
+        // host expression's scalar subqueries are looked up by the
+        // expression's ADDRESS (stable across the row loop), so the
+        // hot path does zero AST formatting. Building the plan (and
+        // its Display-keyed group maps) happens once per expression.
+        if let Some(m) = memo.as_deref_mut() {
+            let key = expr as *const Expr as usize;
+            let mut subs: Vec<&SelectStatement> = Vec::new();
+            collect_scalar_subqueries(expr, &mut subs);
+            let plan_ok = match m.expr_plans.get(&key) {
+                Some((count, _)) => *count == subs.len(),
+                None => false,
+            };
+            if !plan_ok && !subs.is_empty() {
+                let mut plan: Vec<Option<alloc::rc::Rc<memoize::GroupMap>>> =
+                    Vec::with_capacity(subs.len());
+                for sub in &subs {
+                    let repr = alloc::format!("{sub}");
+                    if !m.group_maps.contains_key(&repr) {
+                        let built = self
+                            .try_batch_correlated_scalar(sub, cancel)?
+                            .map(alloc::rc::Rc::new);
+                        m.group_maps.insert(repr.clone(), built);
+                    }
+                    plan.push(m.group_maps.get(&repr).cloned().flatten());
+                }
+                m.expr_plans.insert(key, (subs.len(), plan));
+            }
+            if let Some((_, plan)) = m.expr_plans.get(&key)
+                && !plan.is_empty()
+                && plan.iter().all(|p| p.is_some())
+            {
+                // Fast path: every scalar subquery resolves via its
+                // map; clone once, splice values, eval. Exists/IN
+                // subqueries (if any) still drop to the resolver.
+                let plan = plan.clone();
+                let mut e = expr.clone();
+                let mut idx = 0usize;
+                let ok = splice_planned_subqueries(&mut e, &plan, &mut idx, row, ctx)?;
+                if ok {
+                    if expr_has_subquery(&e) {
+                        self.resolve_correlated_in_expr(&mut e, row, ctx, cancel, memo)?;
+                    }
+                    return eval::eval_expr(&e, row, ctx).map_err(EngineError::Eval);
+                }
+            }
         }
         let mut e = expr.clone();
         self.resolve_correlated_in_expr(&mut e, row, ctx, cancel, memo)?;
@@ -11136,14 +11183,17 @@ impl Engine {
                         .as_ref()
                         .is_some_and(|m| m.group_maps.contains_key(&repr));
                     if !entry_known {
-                        let built = self.try_batch_correlated_scalar(inner, cancel)?;
+                        let built = self
+                            .try_batch_correlated_scalar(inner, cancel)?
+                            .map(alloc::rc::Rc::new);
                         if let Some(m) = memo.as_deref_mut() {
                             m.group_maps.insert(repr.clone(), built);
                         }
                     }
                     if let Some(m) = memo.as_deref_mut()
-                        && let Some(Some((outer_col, map))) = m.group_maps.get(&repr)
+                        && let Some(Some(gm)) = m.group_maps.get(&repr)
                     {
+                        let (outer_col, map) = gm.as_ref();
                         let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
                             .map_err(EngineError::Eval)?;
                         let v = if matches!(key_v, Value::Null) {
@@ -13524,6 +13574,150 @@ impl Engine {
         }
         let map = best.into_iter().map(|(k, (_, v))| (k, v)).collect();
         Ok(Some((outer_col, map)))
+    }
+}
+
+/// v7.29 (3c) — pre-order collection of SCALAR subquery nodes in a
+/// host expression (no descent into subquery bodies). The splice
+/// walk below uses the same order; the pair must stay in lockstep.
+fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
+    match e {
+        Expr::ScalarSubquery(s) => out.push(s),
+        Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_scalar_subqueries(lhs, out);
+            collect_scalar_subqueries(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_scalar_subqueries(expr, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_scalar_subqueries(expr, out);
+            collect_scalar_subqueries(pattern, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_scalar_subqueries(a, out);
+            }
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            collect_scalar_subqueries(call, out);
+            for o in order_by {
+                collect_scalar_subqueries(&o.expr, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                collect_scalar_subqueries(op, out);
+            }
+            for (w, t) in branches {
+                collect_scalar_subqueries(w, out);
+                collect_scalar_subqueries(t, out);
+            }
+            if let Some(eb) = else_branch {
+                collect_scalar_subqueries(eb, out);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            collect_scalar_subqueries(target, out);
+            collect_scalar_subqueries(index, out);
+        }
+        _ => {}
+    }
+}
+
+/// v7.29 (3c) — splice the i-th scalar subquery's batched value into
+/// the cloned tree (same pre-order as collect_scalar_subqueries).
+/// Returns Ok(false) if a literal conversion fails (caller falls
+/// back to the resolver path).
+fn splice_planned_subqueries(
+    e: &mut Expr,
+    plan: &[Option<alloc::rc::Rc<memoize::GroupMap>>],
+    idx: &mut usize,
+    row: &Row,
+    ctx: &EvalContext<'_>,
+) -> Result<bool, EngineError> {
+    match e {
+        Expr::ScalarSubquery(_) => {
+            let Some(Some(gm)) = plan.get(*idx) else {
+                return Ok(false);
+            };
+            *idx += 1;
+            let (outer_col, map) = gm.as_ref();
+            let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
+                .map_err(EngineError::Eval)?;
+            let v = if matches!(key_v, Value::Null) {
+                Value::Null
+            } else {
+                map.get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            *e = value_to_literal_expr(v)?;
+            Ok(true)
+        }
+        Expr::Exists { .. } | Expr::InSubquery { .. } => Ok(true),
+        Expr::Binary { lhs, rhs, .. } => Ok(splice_planned_subqueries(lhs, plan, idx, row, ctx)?
+            && splice_planned_subqueries(rhs, plan, idx, row, ctx)?),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            splice_planned_subqueries(expr, plan, idx, row, ctx)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            Ok(splice_planned_subqueries(expr, plan, idx, row, ctx)?
+                && splice_planned_subqueries(pattern, plan, idx, row, ctx)?)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args.iter_mut() {
+                if !splice_planned_subqueries(a, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            if !splice_planned_subqueries(call, plan, idx, row, ctx)? {
+                return Ok(false);
+            }
+            for o in order_by.iter_mut() {
+                if !splice_planned_subqueries(&mut o.expr, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                if !splice_planned_subqueries(op, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            for (w, t) in branches.iter_mut() {
+                if !splice_planned_subqueries(w, plan, idx, row, ctx)?
+                    || !splice_planned_subqueries(t, plan, idx, row, ctx)?
+                {
+                    return Ok(false);
+                }
+            }
+            if let Some(eb) = else_branch {
+                if !splice_planned_subqueries(eb, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expr::ArraySubscript { target, index } => {
+            Ok(splice_planned_subqueries(target, plan, idx, row, ctx)?
+                && splice_planned_subqueries(index, plan, idx, row, ctx)?)
+        }
+        _ => Ok(true),
     }
 }
 
