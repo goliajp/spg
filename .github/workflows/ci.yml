@@ -26,7 +26,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install rustfmt
         run: rustup component add rustfmt
       - name: cargo fmt --check
@@ -36,7 +36,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install clippy
         run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
@@ -47,7 +47,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --workspace
         run: cargo build --workspace --locked
@@ -81,7 +81,7 @@ jobs:
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --release --test prod_ready
         run: cargo test --release -p spg-server --test prod_ready --locked
@@ -100,7 +100,7 @@ jobs:
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --release --test slo_smoke
         run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
@@ -129,7 +129,7 @@ jobs:
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --release perf_gate × crates
         run: |
@@ -144,7 +144,7 @@ jobs:
     name: cargo-audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -155,7 +155,7 @@ jobs:
     # v4.31: license allowlist + duplicate-version check via cargo-deny.
     # Config in deny.toml.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   secret_scan:
@@ -181,7 +181,7 @@ jobs:
     # issuing service (verified) plus genuinely-novel matches
     # the action's analyzers don't recognise (unknown).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
       - name: trufflehog scan
         uses: trufflesecurity/trufflehog@main
@@ -211,7 +211,7 @@ jobs:
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: drop-in acceptance harness
         run: |
           scripts/dropin-acceptance.sh \
@@ -222,7 +222,7 @@ jobs:
             --report ./dropin-acceptance-report.md
       - name: Upload drop-in acceptance report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dropin-acceptance-report
           path: ./dropin-acceptance-report.md
@@ -239,7 +239,7 @@ jobs:
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release -p spg-server
         run: cargo build --release -p spg-server --locked
@@ -247,7 +247,7 @@ jobs:
         # Only upload on master pushes — release/hotfix branches
         # produce the same binary but it's the master tag that we keep.
         if: github.ref == 'refs/heads/master'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spg-server-linux-amd64
           path: target/release/spg-server
