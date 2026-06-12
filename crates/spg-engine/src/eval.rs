@@ -6432,14 +6432,30 @@ fn collation_fold_for_compare(
 /// path for LEFT). Mirrors resolve_column's lookup; returns Ok(None)
 /// when the reference can't be attributed (caller falls back to the
 /// generic owned path, which will surface the proper error).
+/// v7.30 (perf campaign) - zero-allocation composite-name match:
+/// does `schema_name` equal `qualifier ++ '.' ++ name`? The old path
+/// FORMATTED a fresh String per column reference per row (~290k
+/// format+compare pairs per 24k-row aggregate query) - the single
+/// hottest residue on the inbox profile.
+#[inline]
+fn composite_eq(schema_name: &str, qualifier: &str, name: &str) -> bool {
+    schema_name.len() == qualifier.len() + 1 + name.len()
+        && schema_name.as_bytes()[qualifier.len()] == b'.'
+        && schema_name[..qualifier.len()] == *qualifier
+        && schema_name[qualifier.len() + 1..] == *name
+}
+
 fn resolve_column_borrowed<'r>(
     c: &ColumnName,
     row: &'r Row,
     ctx: &EvalContext<'_>,
 ) -> Result<Option<&'r Value>, EvalError> {
     if let Some(q) = &c.qualifier {
-        let composite = alloc::format!("{q}.{name}", name = c.name);
-        if let Some(pos) = ctx.columns.iter().position(|s| s.name == composite) {
+        if let Some(pos) = ctx
+            .columns
+            .iter()
+            .position(|s| composite_eq(&s.name, q, &c.name))
+        {
             return Ok(row.values.get(pos));
         }
     }
@@ -6475,8 +6491,13 @@ fn resolve_column(c: &ColumnName, row: &Row, ctx: &EvalContext<'_>) -> Result<Va
         // composite column names "alias.column" so we look that up
         // directly. Falls back to the single-table case below if the
         // composite isn't present.
-        let composite = alloc::format!("{q}.{name}", name = c.name);
-        if let Some(pos) = ctx.columns.iter().position(|s| s.name == composite) {
+        // v7.30 - zero-alloc composite match (was a String format
+        // per column reference per row).
+        if let Some(pos) = ctx
+            .columns
+            .iter()
+            .position(|s| composite_eq(&s.name, q, &c.name))
+        {
             return Ok(row.values[pos].clone());
         }
         // v7.26 (round-20 B) — when the qualifier IS a known table
