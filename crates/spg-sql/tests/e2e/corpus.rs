@@ -38,6 +38,30 @@ const CORPUS: &[&str] = &[
     "INSERT INTO t VALUES ('it''s', 1 + 2)",
     "INSERT INTO logs VALUES (NULL, 'event', FALSE)",
     "INSERT INTO foo VALUES (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+    // --- v7.30.1 (mailrs round-24): clauses the WAL round trip used
+    // to drop. Every entry here was once rendered WITHOUT the clause
+    // in question, so crash replay changed statement semantics.
+    "INSERT INTO t (a, b) VALUES ('x', 'y') ON CONFLICT DO NOTHING",
+    "INSERT INTO t (a, b) VALUES ('x', 'y') ON CONFLICT (a, b) DO NOTHING",
+    "INSERT INTO t (a, b) VALUES ('x', 'y') ON CONFLICT (a) DO UPDATE SET b = 'z'",
+    "INSERT INTO t (a, b) VALUES ('x', 'y') ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE t.a <> 'frozen'",
+    "INSERT INTO t (a) VALUES ('x') RETURNING id",
+    "INSERT INTO t (a) SELECT a FROM src WHERE a <> '' ON CONFLICT DO NOTHING",
+    "UPDATE t SET a = 'x' WHERE id = 1 RETURNING id, a",
+    "DELETE FROM t WHERE id = 1 RETURNING id",
+    "WITH recent AS (SELECT id FROM msgs WHERE ts > 5) SELECT * FROM recent",
+    "WITH RECURSIVE walk (n) AS (SELECT 1) SELECT n FROM walk",
+    "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT x FROM a",
+    "SELECT id FROM msgs ORDER BY score DESC FETCH FIRST 5 ROWS WITH TIES",
+    "SELECT id FROM msgs ORDER BY score DESC OFFSET 10 FETCH FIRST 5 ROWS WITH TIES",
+    "SELECT kind, COUNT(*) FROM msgs GROUP BY ALL",
+    "SELECT v FROM UNNEST(ARRAY['a', 'b']) AS u",
+    "SELECT n FROM generate_series(1, 10) AS n",
+    "SELECT n FROM generate_series(1, 10, 2) AS n",
+    "SELECT x FROM t AS o INNER JOIN LATERAL (SELECT o.id AS x) AS l ON TRUE",
+    "SELECT LAG(v) IGNORE NULLS OVER (ORDER BY ts) FROM samples",
+    "CREATE TABLE pk (id INT PRIMARY KEY, name TEXT NOT NULL)",
+    "CREATE TABLE ints (n INT UNSIGNED NOT NULL)",
 ];
 
 #[test]
