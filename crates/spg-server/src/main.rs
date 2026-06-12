@@ -3491,6 +3491,20 @@ fn wal_volume_free_bytes(path: &Path) -> std::io::Result<u64> {
 /// new v3 kinds (like `durability_checkpoint`) extend the namespace
 /// without inflating this function past the per-function line
 /// budget.
+/// v7.30.1 (mailrs round-24 ask 2) — run one replayed statement;
+/// an engine REJECT is quarantined (loud stderr line, replay
+/// continues) instead of failing the boot. "One statement failed
+/// to replay" ≠ "the WAL is corrupt" — framing and CRC damage
+/// still error out in the callers.
+fn replay_execute_quarantining(engine: &mut Engine, sql: &str, frame_off: usize) {
+    if let Err(e) = engine.execute(sql) {
+        eprintln!(
+            "spg-server: WAL replay QUARANTINED statement at offset {frame_off} \
+             (boot continues): {sql:?} rejected: {e:?}"
+        );
+    }
+}
+
 fn dispatch_v3_record(
     tag: u8,
     payload: &[u8],
@@ -3502,9 +3516,7 @@ fn dispatch_v3_record(
             let sql = core::str::from_utf8(payload).map_err(|_| {
                 std::io::Error::other("v3 auto_commit_sql payload has non-UTF-8 SQL")
             })?;
-            engine
-                .execute(sql)
-                .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+            replay_execute_quarantining(engine, sql, frame_off);
             Ok(true)
         }
         WAL_V3_TYPE_COMPRESSED_SQL => {
@@ -3534,9 +3546,7 @@ fn dispatch_v3_record(
                     "WAL compressed_sql at offset {frame_off}: decompressed bytes are not valid UTF-8"
                 ))
             })?;
-            engine
-                .execute(sql)
-                .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+            replay_execute_quarantining(engine, sql, frame_off);
             Ok(true)
         }
         WAL_V3_TYPE_DURABILITY_CHECKPOINT => {
@@ -3657,9 +3667,7 @@ fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize>
         } else {
             let sql = core::str::from_utf8(payload)
                 .map_err(|_| std::io::Error::other("WAL entry has non-UTF-8 SQL"))?;
-            engine
-                .execute(sql)
-                .map_err(|e| std::io::Error::other(format!("WAL replay rejected {sql:?}: {e}")))?;
+            replay_execute_quarantining(engine, sql, frame_off);
             true
         };
         cur += len;

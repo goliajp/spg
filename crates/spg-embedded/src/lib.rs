@@ -636,6 +636,7 @@ fn replay_wal_filtered(
     wal_bytes: &[u8],
     engine: &mut Engine,
     floor_lsn: u64,
+    quarantine: &mut Vec<QuarantinedStmt>,
 ) -> Result<usize, String> {
     let records = parse_wal_records(wal_bytes)?;
     let mut applied = 0usize;
@@ -665,17 +666,40 @@ fn replay_wal_filtered(
         // v7.21 — a tx-commit record carries the whole transaction
         // as a `";\n"`-joined script; auto-commit records are a
         // single statement, for which split_statements is a no-op.
+        //
+        // v7.30.1 (mailrs round-24 ask 2) — a statement the engine
+        // REJECTS is quarantined, not fatal: "one statement failed
+        // to replay" ≠ "the catalog is corrupt". Framing damage
+        // (parse_wal_records / non-UTF-8 above) still errors — that
+        // IS corruption. Subsequent statements of a tx script keep
+        // applying: the bricking class is a no-op-at-runtime
+        // statement that re-applies non-idempotently, and skipping
+        // just it reconstructs the runtime state.
         for stmt in split_statements(sql) {
-            engine.execute(stmt).map_err(|e| {
-                format!(
-                    "WAL replay: apply {stmt:?} at offset {} rejected: {e:?}",
-                    r.offset
-                )
-            })?;
+            if let Err(e) = engine.execute(stmt) {
+                quarantine.push(QuarantinedStmt {
+                    offset: r.offset,
+                    sql: stmt.to_string(),
+                    error: format!("{e:?}"),
+                });
+            }
         }
         applied += 1;
     }
     Ok(applied)
+}
+
+/// v7.30.1 (mailrs round-24 ask 2) — one statement that failed to
+/// re-apply during boot replay. Kept for forensics in a
+/// `quarantine-*.log` beside the WAL chunks; the boot continues.
+struct QuarantinedStmt {
+    offset: usize,
+    sql: String,
+    error: String,
+}
+
+fn format_quarantine_line(q: &QuarantinedStmt) -> String {
+    format!("offset {}: {}\n  rejected: {}\n", q.offset, q.sql, q.error)
 }
 
 /// v7.19 — WAL chunk filename format. Zero-padded 16-digit
@@ -1464,12 +1488,13 @@ impl Database {
                 }
             }
         }
+        let mut quarantined: Vec<QuarantinedStmt> = Vec::new();
         for chunk in &chunk_paths {
             let bytes = std::fs::read(chunk).map_err(io_err)?;
             if bytes.is_empty() {
                 continue;
             }
-            replay_wal_filtered(&bytes, &mut engine, snapshot_lsn)
+            replay_wal_filtered(&bytes, &mut engine, snapshot_lsn, &mut quarantined)
                 .map_err(|m| EngineError::Storage(spg_storage::StorageError::Corrupt(m)))?;
             if let Ok(records) = parse_wal_records(&bytes) {
                 if let Some(max) = records.iter().filter_map(|r| r.commit_lsn).max() {
@@ -1477,6 +1502,33 @@ impl Database {
                         initial_lsn = max;
                     }
                 }
+            }
+        }
+        // v7.30.1 (mailrs round-24 ask 2) — replay rejects no longer
+        // brick the open. Persist the rejected statements beside the
+        // WAL chunks for forensics and say so loudly; the boot
+        // continues with every other record applied.
+        if !quarantined.is_empty() {
+            let mut body = String::new();
+            for q in &quarantined {
+                body.push_str(&format_quarantine_line(q));
+            }
+            let qpath = wal_dir.join(format!(
+                "quarantine-{:016x}.log",
+                wall_clock_micros().max(0) as u64
+            ));
+            match std::fs::write(&qpath, &body) {
+                Ok(()) => eprintln!(
+                    "spg-embedded: WAL replay quarantined {} statement(s) — boot continues; \
+                     forensics at {}",
+                    quarantined.len(),
+                    qpath.display()
+                ),
+                Err(e) => eprintln!(
+                    "spg-embedded: WAL replay quarantined {} statement(s) — boot continues; \
+                     quarantine file write FAILED ({e}), entries follow:\n{body}",
+                    quarantined.len()
+                ),
             }
         }
         // Open the "current" chunk — either the last existing
