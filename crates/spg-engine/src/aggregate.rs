@@ -87,6 +87,9 @@ pub fn contains_aggregate(e: &Expr) -> bool {
             contains_aggregate(target) || contains_aggregate(index)
         }
         Expr::AnyAll { expr, array, .. } => contains_aggregate(expr) || contains_aggregate(array),
+        Expr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
         // v7.13.0 — CASE WHEN … END. Recurse into operand,
         // every (WHEN, THEN) pair, and the ELSE branch.
         Expr::Case {
@@ -763,6 +766,12 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             collect_aggregates(expr, out);
             collect_aggregates(pattern, out);
         }
+        Expr::InList { expr, list, .. } => {
+            collect_aggregates(expr, out);
+            for item in list {
+                collect_aggregates(item, out);
+            }
+        }
         Expr::Extract { source, .. } => collect_aggregates(source, out),
         // v4.10 subquery + v4.12 window / Literal / Column —
         // non-recursing leaves for the aggregate collector.
@@ -1280,6 +1289,18 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             op: *op,
             array: Box::new(rewrite_expr(array, group_exprs, aggs)),
             is_any: *is_any,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
+            list: list
+                .iter()
+                .map(|item| rewrite_expr(item, group_exprs, aggs))
+                .collect(),
+            negated: *negated,
         },
         Expr::Case {
             operand,

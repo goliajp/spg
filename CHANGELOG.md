@@ -8,6 +8,54 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.30.2] — 2026-06-13 (HOTFIX — mailrs round-25: IN-list stack overflow, P0)
+
+A mailbox search (UNION-of-matchers CTE + thread expansion through
+nested `IN (subquery)`) aborted the embedding host process with
+`fatal runtime error: stack overflow` whenever the search matched
+rows. `IN (subquery)` materialised the inner result into a
+left-deep OR-equality chain, so expression depth scaled with the
+inner ROW COUNT — 24k matches built a 24k-deep tree, and both the
+recursive evaluator and the recursive `Box` drop blew the 2 MiB
+worker stack. In embed mode a stack overflow is an abort, not a
+catchable error: one user search took down the whole host.
+
+### Fixed
+
+- **Flat `IN` lists (the structural fix).** New `Expr::InList`
+  AST node with a `Vec` payload: the parser's literal-list path
+  and the engine's IN-subquery materialisation both produce it.
+  Evaluation is an iterative scan with PG three-valued logic;
+  drop is a `Vec` drop. Depth no longer scales with element
+  count — the round-25 search returns rows at any match count
+  (verified on the 24k-row perf catalog, 2 MiB stack: 0-match
+  231 ms, mid-selectivity 233 ms, all-24k-match 650 ms).
+- **Membership-set evaluation for large `IN` lists.** All-literal
+  lists of ≥64 elements build a canonicalised set once per row
+  loop (integer family normalised to i64, text verbatim) and
+  probe it per row — O(rows × log list) instead of the
+  O(rows × list) linear scan (which would have been ~6 s at 24k×24k).
+  Mixed/exotic literal families and cross-family needles keep the
+  coercing linear scan, so semantics are unchanged.
+- **Per-expression dispatch caching.** The per-row "does this
+  WHERE contain a subquery" walk re-traversed the materialised
+  24k-element list every row; the answer is now cached by
+  expression address in the per-query memo (2.26 s → 650 ms on
+  the all-match search).
+
+### Added (defense in depth — round-25 ask 2)
+
+- **Parser nesting budget (64).** Deeply nested parens /
+  subqueries / CASE now return a parse error instead of
+  overflowing the parser's own stack.
+- **Binary-chain budget (256).** `a OR b OR c …` chains beyond
+  256 operators at one precedence level return a parse error
+  (the chain evaluates and drops recursively; past the budget it
+  would overflow a 2 MiB worker stack). `IN (…)` lists are flat
+  and unaffected at any size.
+
+---
+
 ## [7.30.1] — 2026-06-12 (HOTFIX — mailrs round-24: WAL durability, P0)
 
 A routine `INSERT … ON CONFLICT DO NOTHING` through the prepared

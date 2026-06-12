@@ -11163,6 +11163,14 @@ impl Engine {
             | Expr::Literal(_)
             | Expr::Placeholder(_)
             | Expr::Column(_) => {}
+            // v7.30.2 — list elements can carry scalar subqueries
+            // (`x IN (1, (SELECT …))`).
+            Expr::InList { expr, list, .. } => {
+                self.resolve_expr_subqueries(expr, cancel)?;
+                for item in list {
+                    self.resolve_expr_subqueries(item, cancel)?;
+                }
+            }
             // v7.10.10 — recurse children.
             Expr::Array(items) => {
                 for elem in items {
@@ -11212,7 +11220,33 @@ impl Engine {
         cancel: CancelToken<'_>,
         mut memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<Value, EngineError> {
-        if !expr_has_subquery(expr) {
+        // v7.30.2 (mailrs round-25) — the has-subquery walk is
+        // O(tree) and a materialised `IN (…)` list makes the tree
+        // huge; cache the answer per expression address so the
+        // per-row dispatch stops re-walking 24k list elements.
+        let has_subq = if let Some(m) = memo.as_deref_mut() {
+            let key = core::ptr::from_ref::<Expr>(expr) as usize;
+            match m.has_subquery.get(&key) {
+                Some(b) => *b,
+                None => {
+                    let b = expr_has_subquery(expr);
+                    m.has_subquery.insert(key, b);
+                    b
+                }
+            }
+        } else {
+            expr_has_subquery(expr)
+        };
+        if !has_subq {
+            // A large materialised `IN (…)` list inside the WHERE
+            // makes the plain eval O(rows × list); route through the
+            // per-query membership set (built once, keyed by node
+            // address) when one is reachable on the AND spine.
+            if let Some(m) = memo.as_deref_mut()
+                && expr_may_use_in_set(expr)
+            {
+                return eval_with_in_sets(expr, row, ctx, m);
+            }
             return eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval);
         }
         // v7.29 (3c) - per-expression plan: the batch maps for this
@@ -11460,6 +11494,12 @@ impl Engine {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
                 self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
             }
+            Expr::InList { expr, list, .. } => {
+                self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
+                for item in list {
+                    self.resolve_correlated_in_expr(item, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+            }
             Expr::Case {
                 operand,
                 branches,
@@ -11551,36 +11591,21 @@ impl Engine {
                         columns.len()
                     )));
                 }
-                // Build the same OR-Eq chain the parse-time literal-list
-                // path constructs, with each value lifted into a Literal.
-                let mut acc: Option<Expr> = None;
+                // v7.30.2 (mailrs round-25) — flat InList, NOT an OR-Eq
+                // chain: chain depth scaled with the inner result's ROW
+                // COUNT, so one 24k-match search overflowed the worker
+                // stack (recursive eval + recursive Box drop) and
+                // aborted the embedding host process.
+                let mut list: Vec<Expr> = Vec::with_capacity(rows.len());
                 for row in rows {
                     let v = row.values.into_iter().next().unwrap_or(Value::Null);
-                    let lit = value_to_literal_expr(v)?;
-                    let cmp = Expr::Binary {
-                        lhs: expr.clone(),
-                        op: BinOp::Eq,
-                        rhs: Box::new(lit),
-                    };
-                    acc = Some(match acc {
-                        None => cmp,
-                        Some(prev) => Expr::Binary {
-                            lhs: Box::new(prev),
-                            op: BinOp::Or,
-                            rhs: Box::new(cmp),
-                        },
-                    });
+                    list.push(value_to_literal_expr(v)?);
                 }
-                let combined = acc.unwrap_or(Expr::Literal(Literal::Bool(false)));
-                let final_expr = if *negated {
-                    Expr::Unary {
-                        op: UnOp::Not,
-                        expr: Box::new(combined),
-                    }
-                } else {
-                    combined
-                };
-                Ok(Some(final_expr))
+                Ok(Some(Expr::InList {
+                    expr: expr.clone(),
+                    list,
+                    negated: *negated,
+                }))
             }
             _ => Ok(None),
         }
@@ -11848,6 +11873,9 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
         Expr::Array(items) => items.iter().any(|e| expr_refers_to(e, target)),
+        Expr::InList { expr, list, .. } => {
+            expr_refers_to(expr, target) || list.iter().any(|e| expr_refers_to(e, target))
+        }
         Expr::ArraySubscript { target: t, index } => {
             expr_refers_to(t, target) || expr_refers_to(index, target)
         }
@@ -13752,6 +13780,12 @@ fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>
             collect_scalar_subqueries(target, out);
             collect_scalar_subqueries(index, out);
         }
+        Expr::InList { expr, list, .. } => {
+            collect_scalar_subqueries(expr, out);
+            for item in list {
+                collect_scalar_subqueries(item, out);
+            }
+        }
         _ => {}
     }
 }
@@ -13809,6 +13843,12 @@ fn hollow_scalar_subqueries(e: &mut Expr) {
         Expr::ArraySubscript { target, index } => {
             hollow_scalar_subqueries(target);
             hollow_scalar_subqueries(index);
+        }
+        Expr::InList { expr, list, .. } => {
+            hollow_scalar_subqueries(expr);
+            for item in list.iter_mut() {
+                hollow_scalar_subqueries(item);
+            }
         }
         _ => {}
     }
@@ -13901,7 +13941,137 @@ fn splice_planned_subqueries(
             Ok(splice_planned_subqueries(target, plan, idx, row, ctx)?
                 && splice_planned_subqueries(index, plan, idx, row, ctx)?)
         }
+        Expr::InList { expr, list, .. } => {
+            if !splice_planned_subqueries(expr, plan, idx, row, ctx)? {
+                return Ok(false);
+            }
+            for item in list.iter_mut() {
+                if !splice_planned_subqueries(item, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
         _ => Ok(true),
+    }
+}
+
+/// v7.30.2 (mailrs round-25) — minimum element count before an
+/// all-literal `IN` list gets a per-query membership set. Below
+/// this the linear scan wins on build cost.
+const INLIST_SET_THRESHOLD: usize = 64;
+
+/// Cheap pre-check: is a set-eligible `IN` list reachable on the
+/// AND spine of this expression? Anything else keeps the plain
+/// `eval_expr` path untouched.
+fn expr_may_use_in_set(e: &Expr) -> bool {
+    match e {
+        Expr::InList { list, .. } => list.len() >= INLIST_SET_THRESHOLD,
+        Expr::Binary {
+            lhs,
+            op: BinOp::And,
+            rhs,
+        } => expr_may_use_in_set(lhs) || expr_may_use_in_set(rhs),
+        _ => false,
+    }
+}
+
+/// Analyse an `IN` list for set eligibility: every element a literal,
+/// all of one family (integer or string, NULLs tracked separately).
+fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry> {
+    let mut has_null = false;
+    let mut ints: alloc::collections::BTreeSet<i64> = alloc::collections::BTreeSet::new();
+    let mut texts: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    for item in list {
+        let Expr::Literal(lit) = item else {
+            return None;
+        };
+        match lit {
+            Literal::Null => has_null = true,
+            Literal::Integer(i) => {
+                ints.insert(*i);
+            }
+            Literal::String(s) => {
+                texts.insert(s.clone());
+            }
+            _ => return None,
+        }
+        if !ints.is_empty() && !texts.is_empty() {
+            return None;
+        }
+    }
+    let set = if !ints.is_empty() {
+        memoize::InListSet::Int(ints)
+    } else if !texts.is_empty() {
+        memoize::InListSet::Text(texts)
+    } else {
+        return None;
+    };
+    Some(memoize::InListSetEntry { set, has_null })
+}
+
+/// Subquery-free eval that serves large all-literal `IN` lists from
+/// a per-query membership set (cached in the memo by node address).
+/// Walks only the AND spine; every other node — and every needle
+/// whose runtime family doesn't match the set — falls through to
+/// `eval_expr`, so coercion and error semantics stay identical.
+fn eval_with_in_sets(
+    e: &Expr,
+    row: &Row,
+    ctx: &EvalContext<'_>,
+    m: &mut memoize::MemoizeCache,
+) -> Result<Value, EngineError> {
+    match e {
+        Expr::Binary {
+            lhs,
+            op: BinOp::And,
+            rhs,
+        } => {
+            // Mirror eval_expr: both sides evaluate (no short
+            // circuit), then SQL three-valued AND.
+            let l = eval_with_in_sets(lhs, row, ctx, m)?;
+            let r = eval_with_in_sets(rhs, row, ctx, m)?;
+            eval::and_3vl(l, r).map_err(EngineError::Eval)
+        }
+        Expr::InList {
+            expr: lhs,
+            list,
+            negated,
+        } if list.len() >= INLIST_SET_THRESHOLD => {
+            let key = core::ptr::from_ref::<Expr>(e) as usize;
+            let Some(entry) = m
+                .in_sets
+                .entry(key)
+                .or_insert_with(|| build_in_list_set(list))
+            else {
+                return eval::eval_expr(e, row, ctx).map_err(EngineError::Eval);
+            };
+            let needle = eval::eval_expr(lhs, row, ctx).map_err(EngineError::Eval)?;
+            let contained = match (&needle, &entry.set) {
+                // Non-empty list + NULL needle → NULL (negation of
+                // NULL is still NULL).
+                (Value::Null, _) => return Ok(Value::Null),
+                (Value::SmallInt(n), memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
+                (Value::Int(n), memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
+                (Value::BigInt(n), memoize::InListSet::Int(s)) => s.contains(n),
+                (Value::Text(t), memoize::InListSet::Text(s)) => s.contains(t.as_str()),
+                // Cross-family needle (e.g. Float vs integer list):
+                // keep apply_binary's coercion / error behaviour.
+                _ => return eval::eval_expr(e, row, ctx).map_err(EngineError::Eval),
+            };
+            let inner = if contained {
+                Value::Bool(true)
+            } else if entry.has_null {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+            Ok(match (negated, inner) {
+                (true, Value::Bool(b)) => Value::Bool(!b),
+                (_, v) => v,
+            })
+        }
+        _ => eval::eval_expr(e, row, ctx).map_err(EngineError::Eval),
     }
 }
 
@@ -14048,6 +14218,12 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
             substitute_in_expr(expr, row, ctx, outer_alias);
             substitute_in_expr(array, row, ctx, outer_alias);
         }
+        Expr::InList { expr, list, .. } => {
+            substitute_in_expr(expr, row, ctx, outer_alias);
+            for item in list {
+                substitute_in_expr(item, row, ctx, outer_alias);
+            }
+        }
         Expr::Case {
             operand,
             branches,
@@ -14112,6 +14288,9 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::Array(items) => items.iter().any(expr_has_window),
         Expr::ArraySubscript { target, index } => expr_has_window(target) || expr_has_window(index),
         Expr::AnyAll { expr, array, .. } => expr_has_window(expr) || expr_has_window(array),
+        Expr::InList { expr, list, .. } => {
+            expr_has_window(expr) || list.iter().any(expr_has_window)
+        }
         Expr::Case {
             operand,
             branches,
@@ -15022,6 +15201,9 @@ pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
             expr_has_subquery(target) || expr_has_subquery(index)
         }
         Expr::AnyAll { expr, array, .. } => expr_has_subquery(expr) || expr_has_subquery(array),
+        Expr::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
         Expr::Case {
             operand,
             branches,
@@ -15253,6 +15435,12 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
         Expr::AnyAll { expr, array, .. } => {
             rewrite_column_in_expr(expr, old, new);
             rewrite_column_in_expr(array, old, new);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_column_in_expr(expr, old, new);
+            for item in list {
+                rewrite_column_in_expr(item, old, new);
+            }
         }
         Expr::Case {
             operand,
@@ -15546,6 +15734,12 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
         Expr::AnyAll { expr, array, .. } => {
             substitute_expr(expr, params)?;
             substitute_expr(array, params)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            substitute_expr(expr, params)?;
+            for item in list {
+                substitute_expr(item, params)?;
+            }
         }
         Expr::Case {
             operand,
@@ -15908,6 +16102,12 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         Expr::AnyAll { expr, array, .. } => {
             rewrite_expr_clock(expr, now);
             rewrite_expr_clock(array, now);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_expr_clock(expr, now);
+            for item in list {
+                rewrite_expr_clock(item, now);
+            }
         }
         Expr::Case {
             operand,
