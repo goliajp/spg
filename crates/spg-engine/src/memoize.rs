@@ -61,6 +61,14 @@ pub type GroupMap = (
     alloc::collections::BTreeMap<String, Value>,
 );
 
+/// v7.29 (3c) - per-expression resolution plan: for the i-th scalar
+/// subquery node (pre-order) of a host expression, the shared batch
+/// map (None = unbatchable, resolve per row). Keyed by the HOST
+/// expression's address - callers guarantee the expression outlives
+/// the per-query memo (aggregate items / WHERE trees do). The stored
+/// subquery count guards against address reuse.
+pub type ExprPlan = (usize, alloc::vec::Vec<Option<alloc::rc::Rc<GroupMap>>>);
+
 #[derive(Debug, Clone)]
 pub struct MemoizeCache {
     /// LRU front = most recently used. Stored as a `VecDeque` so
@@ -73,7 +81,9 @@ pub struct MemoizeCache {
     /// map built in ONE pass)) or None when the shape can't batch
     /// (so we don't re-analyse it per row). Turns 23.5k per-group
     /// executions into one grouped scan + 23.5k lookups.
-    pub group_maps: alloc::collections::BTreeMap<String, Option<GroupMap>>,
+    pub group_maps: alloc::collections::BTreeMap<String, Option<alloc::rc::Rc<GroupMap>>>,
+    /// v7.29 (3c) - host-expression ptr -> (subquery count, plan).
+    pub expr_plans: alloc::collections::BTreeMap<usize, ExprPlan>,
     max_entries: usize,
     max_bytes: usize,
     current_bytes: usize,
@@ -97,6 +107,7 @@ impl MemoizeCache {
             hit_count: 0,
             miss_count: 0,
             group_maps: alloc::collections::BTreeMap::new(),
+            expr_plans: alloc::collections::BTreeMap::new(),
         }
     }
 
