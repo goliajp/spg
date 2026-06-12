@@ -289,20 +289,29 @@ pub fn run(
         })
         .map(|(i, _)| i)
         .collect();
+    // v7.31 (perf 3e) — per-row scratch buffers. The fast path used
+    // to allocate a key String (and a refs Vec) for EVERY row just
+    // to probe the group map; hits — the overwhelming case — now
+    // touch the allocator zero times.
+    let mut keybuf_s = String::new();
+    let mut dkeybuf = String::new();
+    let mut refs: Vec<&Value> = Vec::with_capacity(group_pos.len());
     for row in rows {
         // Fast key: bound positions + no ci folding -> encode
         // straight from borrowed cells; group_vals materialise
         // only when the group is NEW.
         if all_groups_bound && ci_positions.is_empty() && !group_exprs.is_empty() {
-            let refs: Vec<&Value> = group_pos
-                .iter()
-                .map(|p| row.values.get(p.unwrap()).unwrap_or(&Value::Null))
-                .collect();
-            let key = encode_key_refs(&refs);
-            let entry = match groups.entry_ref(key.as_str()) {
+            refs.clear();
+            refs.extend(
+                group_pos
+                    .iter()
+                    .map(|p| row.values.get(p.unwrap()).unwrap_or(&Value::Null)),
+            );
+            encode_key_refs_into(&refs, &mut keybuf_s);
+            let entry = match groups.entry_ref(keybuf_s.as_str()) {
                 hashbrown::hash_map::EntryRef::Occupied(o) => o.into_mut(),
                 hashbrown::hash_map::EntryRef::Vacant(v) => {
-                    key_order.push(key.clone());
+                    key_order.push(keybuf_s.clone());
                     let init: Vec<AggState> =
                         (0..agg_specs.len()).map(|_| AggState::default()).collect();
                     let owned: Vec<Value> = refs.iter().map(|v| (*v).clone()).collect();
@@ -336,10 +345,11 @@ pub fn run(
                     Some(keys)
                 };
                 if spec.distinct {
-                    let dkey = encode_key_refs(core::slice::from_ref(&arg_ref));
-                    if !entry.1[i].seen.insert(dkey) {
+                    encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
+                    if entry.1[i].seen.contains(dkeybuf.as_str()) {
                         continue;
                     }
+                    entry.1[i].seen.insert(dkeybuf.clone());
                 }
                 update_state(
                     &mut entry.1[i],
@@ -1461,6 +1471,18 @@ pub(crate) fn encode_key_refs(vals: &[&Value]) -> String {
         encode_one(&mut out, v);
     }
     out
+}
+
+/// v7.31 (perf 3e) — encode into a caller-owned scratch buffer.
+/// The per-row key paths (group hash, DISTINCT set, join build/
+/// probe) ran 24k+ String allocations per query through the
+/// allocator just to LOOK UP a map; the scratch form allocates
+/// only when a map actually has to take ownership (vacant insert).
+pub(crate) fn encode_key_refs_into(vals: &[&Value], out: &mut String) {
+    out.clear();
+    for v in vals {
+        encode_one(out, v);
+    }
 }
 
 pub(crate) fn encode_key(vals: &[Value]) -> String {
