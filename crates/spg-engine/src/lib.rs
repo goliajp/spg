@@ -9328,6 +9328,10 @@ impl Engine {
                 let mut table: hashbrown::HashMap<String, Vec<usize>> =
                     hashbrown::HashMap::with_capacity(n_rights);
                 let mut keybuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
+                // v7.31 (perf 3e) — scratch key buffer: build inserts
+                // allocate only on vacant, probes never allocate (the
+                // old code built a fresh String for all 24k probes).
+                let mut keystr = String::new();
                 'build: for ri in 0..n_rights {
                     let Some(right) = rights_src.get(ri) else {
                         continue;
@@ -9339,10 +9343,8 @@ impl Engine {
                             _ => continue 'build,
                         }
                     }
-                    table
-                        .entry(aggregate::encode_key_refs(&keybuf))
-                        .or_default()
-                        .push(ri);
+                    aggregate::encode_key_refs_into(&keybuf, &mut keystr);
+                    table.entry_ref(keystr.as_str()).or_default().push(ri);
                 }
                 let mut probebuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
                 for tuple in working.chunks(stride) {
@@ -9359,9 +9361,10 @@ impl Engine {
                             }
                         }
                     }
-                    if !left_has_null
-                        && let Some(cands) = table.get(&aggregate::encode_key_refs(&probebuf))
-                    {
+                    if !left_has_null {
+                        aggregate::encode_key_refs_into(&probebuf, &mut keystr);
+                    }
+                    if !left_has_null && let Some(cands) = table.get(keystr.as_str()) {
                         for &ri in cands {
                             let keep = if residual.is_empty() {
                                 true
