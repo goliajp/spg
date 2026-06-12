@@ -67,7 +67,15 @@ pub type GroupMap = (
 /// expression's address - callers guarantee the expression outlives
 /// the per-query memo (aggregate items / WHERE trees do). The stored
 /// subquery count guards against address reuse.
-pub type ExprPlan = (usize, alloc::vec::Vec<Option<alloc::rc::Rc<GroupMap>>>);
+/// (subquery count, per-subquery batch maps, hollow template). The
+/// template is the host expression with every scalar subquery BODY
+/// emptied - cloning it per row costs nodes, not whole subquery
+/// ASTs (the splice walk replaces the hollow nodes by pre-order).
+pub type ExprPlan = (
+    usize,
+    alloc::vec::Vec<Option<alloc::rc::Rc<GroupMap>>>,
+    spg_sql::ast::Expr,
+);
 
 #[derive(Debug, Clone)]
 pub struct MemoizeCache {

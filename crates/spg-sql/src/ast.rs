@@ -1684,7 +1684,7 @@ pub enum OnConflictAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SelectStatement {
     /// v4.11: `WITH name AS (SELECT ...) [, ...]` common-table
     /// expressions, materialised once at query start before the
