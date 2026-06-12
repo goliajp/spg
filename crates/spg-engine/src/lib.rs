@@ -11103,7 +11103,7 @@ impl Engine {
         // hot path does zero AST formatting. Building the plan (and
         // its Display-keyed group maps) happens once per expression.
         if let Some(m) = memo.as_deref_mut() {
-            let key = expr as *const Expr as usize;
+            let key = core::ptr::from_ref::<Expr>(expr) as usize;
             let mut subs: Vec<&SelectStatement> = Vec::new();
             collect_scalar_subqueries(expr, &mut subs);
             let plan_ok = match m.expr_plans.get(&key) {
@@ -16531,46 +16531,40 @@ fn enforce_uniqueness_inserts(
         })
     })?;
     let schema = table.schema();
+    // v7.29 (mailrs round-23b) — set-based: ONE O(table) pass folds
+    // existing keys into a hash set, then each batch row is a probe
+    // + insert. The previous shape scanned the WHOLE table per
+    // inserted row (and earlier batch rows per row), which made
+    // bulk import O(n²) — a 104 MB dump extrapolated to ~1 hour
+    // (PG: 2 min). Collation folding (Phase 3.P0-45) and
+    // NULLS [NOT] DISTINCT semantics are unchanged: keys fold via
+    // collated_key_cell before encoding, NULL-bearing keys skip the
+    // set unless nulls_not_distinct.
     for uc in constraints {
-        for (batch_idx, row_values) in rows.iter().enumerate() {
-            // v7.17.0 Phase 3.P0-45 — fold each key cell by its
-            // column's declared Collation before comparing. Phase
-            // 2.5b wired Collation into GROUP BY / ORDER BY / `=`
-            // but the UNIQUE-constraint enforcement still compared
-            // Text byte-wise; a `*_ci` column would let
-            // `('Foo')` and `('FOO')` coexist when MySQL would
-            // reject the second. Owned Values so the fold and
-            // the borrow live in the same scope.
-            let key: Vec<Value> = uc
-                .columns
+        let fold_key = |values: &[Value]| -> Vec<Value> {
+            uc.columns
                 .iter()
-                .map(|&i| collated_key_cell(&row_values[i], i, schema))
-                .collect();
-            let has_null = key.iter().any(|v| matches!(v, Value::Null));
-            // v7.13.0 — `NULLS NOT DISTINCT` (mailrs round-5 G10,
-            // PG 15+): two rows whose constrained columns are all
-            // NULL collide. SQL-standard `NULLS DISTINCT` lets any
-            // NULL skip the check.
-            if has_null && !uc.nulls_not_distinct {
+                .map(|&i| {
+                    let v = values.get(i).cloned().unwrap_or(Value::Null);
+                    collated_key_cell(&v, i, schema)
+                })
+                .collect()
+        };
+        let mut seen: hashbrown::HashSet<String> =
+            hashbrown::HashSet::with_capacity(table.rows().len() + rows.len());
+        for prow in table.rows() {
+            let key = fold_key(&prow.values);
+            if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
                 continue;
             }
-            // Table-side collision: scan existing rows.
-            let collides_in_table = table.rows().iter().any(|prow| {
-                uc.columns.iter().enumerate().all(|(i, &p)| {
-                    prow.values
-                        .get(p)
-                        .is_some_and(|v| collated_key_cell(v, p, schema) == key[i])
-                })
-            });
-            // Batch-side collision: earlier rows in the same INSERT.
-            let collides_in_batch = rows[..batch_idx].iter().any(|earlier| {
-                uc.columns.iter().enumerate().all(|(i, &p)| {
-                    earlier
-                        .get(p)
-                        .is_some_and(|v| collated_key_cell(v, p, schema) == key[i])
-                })
-            });
-            if collides_in_table || collides_in_batch {
+            seen.insert(aggregate::encode_key(&key));
+        }
+        for (batch_idx, row_values) in rows.iter().enumerate() {
+            let key = fold_key(row_values);
+            if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
+                continue;
+            }
+            if !seen.insert(aggregate::encode_key(&key)) {
                 let kind = if uc.is_primary_key {
                     "PRIMARY KEY"
                 } else {
@@ -16729,9 +16723,6 @@ fn enforce_unique_index_inserts(
         };
         let key_positions = unique_key_positions(idx);
         let key_of = |values: &[spg_storage::Value]| -> alloc::vec::Vec<spg_storage::Value> {
-            // v7.17.0 Phase 3.P0-45 — fold per-column collation
-            // before building the comparison key so a `*_ci`
-            // column treats `'Foo'` and `'FOO'` as equal.
             key_positions
                 .iter()
                 .map(|&p| {
@@ -16740,9 +16731,6 @@ fn enforce_unique_index_inserts(
                 })
                 .collect()
         };
-        // Helper: does `values` participate in this index? (predicate
-        // truthy when present.) Wraps `values` into a transient Row
-        // because eval_expr requires &Row.
         let participates = |values: &[spg_storage::Value]| -> Result<bool, EngineError> {
             let Some(expr) = &predicate_expr else {
                 return Ok(true);
@@ -16758,6 +16746,22 @@ fn enforce_unique_index_inserts(
             })?;
             Ok(predicate_truthy(&v))
         };
+        // v7.29 (mailrs round-23b) — set-based: one O(table) pass
+        // (predicate evaluated once per existing row instead of once
+        // per row PAIR), then probe per batch row. The previous
+        // nested scans made bulk import O(n²).
+        let mut seen: hashbrown::HashSet<String> =
+            hashbrown::HashSet::with_capacity(table.rows().len() + rows.len());
+        for prow in table.rows() {
+            if !participates(&prow.values)? {
+                continue;
+            }
+            let key = key_of(&prow.values);
+            if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+                continue;
+            }
+            seen.insert(aggregate::encode_key(&key));
+        }
         for (batch_idx, row_values) in rows.iter().enumerate() {
             if !participates(row_values)? {
                 continue;
@@ -16766,31 +16770,12 @@ fn enforce_unique_index_inserts(
             if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
                 continue;
             }
-            // Committed-table collision.
-            for prow in table.rows() {
-                if !participates(&prow.values)? {
-                    continue;
-                }
-                if key_of(&prow.values) == key {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "UNIQUE INDEX {:?} violation on {table_name:?}: \
-                         row #{batch_idx} duplicates an existing key",
-                        idx.name
-                    )));
-                }
-            }
-            // Within-batch collision: earlier rows in the same INSERT.
-            for earlier in &rows[..batch_idx] {
-                if !participates(earlier)? {
-                    continue;
-                }
-                if key_of(earlier) == key {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "UNIQUE INDEX {:?} violation on {table_name:?}: \
-                         row #{batch_idx} duplicates an earlier row in the same batch",
-                        idx.name
-                    )));
-                }
+            if !seen.insert(aggregate::encode_key(&key)) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} violation on {table_name:?}: \
+                     row #{batch_idx} duplicates an existing key",
+                    idx.name
+                )));
             }
         }
     }
