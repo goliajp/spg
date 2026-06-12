@@ -7869,18 +7869,14 @@ impl Engine {
                     })
             };
             let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
-            let mut agg = aggregate::run(
+            let agg = aggregate::run(
                 stmt,
                 &filtered_refs,
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
             )?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
@@ -8108,18 +8104,14 @@ impl Engine {
                     })
             };
             let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
-            let mut agg = aggregate::run(
+            let agg = aggregate::run(
                 stmt,
                 &filtered_refs,
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
             )?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
@@ -8365,18 +8357,14 @@ impl Engine {
                         },
                     })
             };
-            let mut agg = aggregate::run(
+            let agg = aggregate::run(
                 stmt,
                 &filtered,
                 schema_cols,
                 Some(alias),
                 Some(&agg_correlated),
             )?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            return self.finish_agg_result(agg, stmt, cancel);
         }
 
         let projection = build_projection(&stmt.items, schema_cols, alias)?;
@@ -9624,6 +9612,43 @@ impl Engine {
         }
     }
 
+    /// v7.31 (perf — PG lesson #1): shared aggregate finisher. Apply
+    /// OFFSET/LIMIT first, then evaluate the deferred subquery-bearing
+    /// select items for the surviving rows only — PG's Result-above-
+    /// Limit shape, where SubPlan loops equal the OUTPUT row count
+    /// (50) instead of the group count (24k).
+    fn finish_agg_result(
+        &self,
+        mut agg: aggregate::AggResult,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
+        if !agg.deferred.is_empty() {
+            apply_offset_and_limit(
+                &mut agg.synth_rows,
+                stmt.offset_literal(),
+                stmt.limit_literal(),
+            );
+            let ctx = EvalContext::new(&agg.synth_schema, None);
+            let mut memo = memoize::MemoizeCache::default();
+            for (ri, srow) in agg.synth_rows.iter().enumerate() {
+                cancel.check()?;
+                for (col, expr) in &agg.deferred {
+                    let v =
+                        self.eval_expr_with_correlated(expr, srow, &ctx, cancel, Some(&mut memo))?;
+                    if let Some(cell) = agg.rows[ri].values.get_mut(*col) {
+                        *cell = v;
+                    }
+                }
+            }
+        }
+        Ok(QueryResult::Rows {
+            columns: agg.columns,
+            rows: agg.rows,
+        })
+    }
+
     /// v7.30.3 (mailrs round-26) — bounded execution for the backfill
     /// shape that walked prod into reclaim livelock:
     ///
@@ -9961,13 +9986,8 @@ impl Engine {
                         },
                     })
             };
-            let mut agg =
-                aggregate::run(stmt, &refs, &combined_schema, None, Some(&agg_correlated))?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            let agg = aggregate::run(stmt, &refs, &combined_schema, None, Some(&agg_correlated))?;
+            return self.finish_agg_result(agg, stmt, cancel);
         }
 
         let projection = build_projection(&stmt.items, &combined_schema, "")?;

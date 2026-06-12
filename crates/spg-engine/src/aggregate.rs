@@ -193,6 +193,19 @@ struct AggSpec {
 pub struct AggResult {
     pub columns: Vec<ColumnSchema>,
     pub rows: Vec<Row>,
+    /// v7.31 (perf — PG lesson #1, post-LIMIT subquery projection):
+    /// select-list items whose rewritten expr carries a subquery and
+    /// is referenced by neither ORDER BY nor HAVING. Their output
+    /// cells hold NULL placeholders; the caller truncates to
+    /// LIMIT+OFFSET first and only then evaluates these for the
+    /// surviving rows (PG runs the same shape with SubPlan loops=50
+    /// instead of loops=24000). `(output_col, rewritten_expr)`.
+    pub deferred: Vec<(usize, Expr)>,
+    /// Synthetic group rows aligned 1:1 with `rows`; populated only
+    /// when `deferred` is non-empty.
+    pub synth_rows: Vec<Row>,
+    /// Schema the deferred exprs evaluate against.
+    pub synth_schema: Vec<ColumnSchema>,
 }
 
 /// Execute aggregate logic against an already-WHERE-filtered iterator of
@@ -546,6 +559,34 @@ pub fn run(
             SelectItem::Wildcard => None,
         })
         .collect();
+    // v7.31 (perf — PG lesson #1): subquery-bearing select items
+    // deferred to post-LIMIT, when no sort/filter key can observe
+    // them. ORDER BY rewrites are hoisted here so the safety check
+    // and the sort below share one rewrite pass.
+    let order_rewritten: Vec<Expr> = stmt
+        .order_by
+        .iter()
+        .map(|o| rewrite_expr(&o.expr, &group_exprs, &agg_specs))
+        .collect();
+    let defer_enabled = correlated_eval.is_some()
+        && !stmt.distinct
+        && !having_rewritten
+            .as_ref()
+            .is_some_and(crate::expr_has_subquery)
+        && !order_rewritten.iter().any(crate::expr_has_subquery);
+    let deferred: Vec<(usize, Expr)> = if defer_enabled {
+        items_rewritten
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                r.as_ref()
+                    .filter(|e| crate::expr_has_subquery(e))
+                    .map(|e| (i, e.clone()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut kept_synth: Vec<Row> = Vec::new();
     let mut out_rows: Vec<Row> = Vec::new();
     for srow in synth_rows {
@@ -559,7 +600,12 @@ pub fn run(
             }
         }
         let mut values: Vec<Value> = Vec::with_capacity(columns.len());
-        for rewritten in items_rewritten.iter().flatten() {
+        for (i, rewritten) in items_rewritten.iter().enumerate() {
+            let Some(rewritten) = rewritten else { continue };
+            if deferred.iter().any(|(c, _)| *c == i) {
+                values.push(Value::Null);
+                continue;
+            }
             values.push(match correlated_eval {
                 Some(f) if crate::expr_has_subquery(rewritten) => f(rewritten, &srow, &synth_ctx)?,
                 _ => eval::eval_expr(rewritten, &srow, &synth_ctx)?,
@@ -573,29 +619,29 @@ pub fn run(
     // sort, then drop the keys. Limit is applied by the caller.
     if !stmt.order_by.is_empty() {
         // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
-        // gets its own rewrite + per-key DESC flag.
-        let rewritten: Vec<Expr> = stmt
-            .order_by
-            .iter()
-            .map(|o| rewrite_expr(&o.expr, &group_exprs, &agg_specs))
-            .collect();
+        // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
+        // above as `order_rewritten` — shared with the deferral
+        // safety check.)
         let keys_meta: Vec<(bool, Option<bool>)> = stmt
             .order_by
             .iter()
             .map(|o| (o.desc, o.nulls_first))
             .collect();
-        let mut tagged: Vec<(Vec<Value>, Row)> = kept_synth
+        // The synth row rides through the sort so deferred exprs can
+        // evaluate against the surviving groups after the caller's
+        // LIMIT truncation.
+        let mut tagged: Vec<(Vec<Value>, Row, Row)> = kept_synth
             .into_iter()
             .zip(out_rows)
             .map(|(s, o)| {
-                let mut keys = Vec::with_capacity(rewritten.len());
-                for e in &rewritten {
+                let mut keys = Vec::with_capacity(order_rewritten.len());
+                for e in &order_rewritten {
                     keys.push(match correlated_eval {
                         Some(f) if crate::expr_has_subquery(e) => f(e, &s, &synth_ctx)?,
                         _ => eval::eval_expr(e, &s, &synth_ctx)?,
                     });
                 }
-                Ok::<_, EvalError>((keys, o))
+                Ok::<_, EvalError>((keys, s, o))
             })
             .collect::<Result<_, _>>()?;
         tagged.sort_by(|a, b| {
@@ -609,12 +655,25 @@ pub fn run(
             }
             Ordering::Equal
         });
-        out_rows = tagged.into_iter().map(|(_, o)| o).collect();
+        kept_synth = Vec::with_capacity(tagged.len());
+        out_rows = Vec::with_capacity(tagged.len());
+        for (_, s, o) in tagged {
+            kept_synth.push(s);
+            out_rows.push(o);
+        }
     }
 
+    let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        (kept_synth, synth_schema.clone())
+    };
     Ok(AggResult {
         columns,
         rows: out_rows,
+        deferred,
+        synth_rows: synth_rows_out,
+        synth_schema: synth_schema_out,
     })
 }
 
