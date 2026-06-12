@@ -187,3 +187,48 @@ fn unaddressed_serial_keeps_max_plus_one() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Round-23 collateral (zero-change gate caught it): under
+/// `UNIQUE NULLS NOT DISTINCT`, ON CONFLICT DO NOTHING must treat a
+/// NULL-bearing key as conflictable — mailrs migrate-013 replays
+/// its seed row ('super', NULL) and expects a silent no-op. The
+/// pre-7.29 enforcement missed the table-side duplicate entirely
+/// (silently inserting a second seed row), so this also pins the
+/// count.
+#[test]
+fn on_conflict_do_nothing_respects_nulls_not_distinct() {
+    let mut db = spg_embedded::Database::open_in_memory();
+    db.execute(
+        "CREATE TABLE groups (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, domain TEXT, \
+         UNIQUE NULLS NOT DISTINCT (name, domain))",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        db.execute(
+            "INSERT INTO groups (name, domain) VALUES ('super', NULL) ON CONFLICT DO NOTHING",
+        )
+        .unwrap();
+    }
+    let r = db.execute("SELECT COUNT(*) FROM groups").unwrap();
+    match r {
+        spg_embedded::QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_embedded::Value::BigInt(1));
+        }
+        other => panic!("{other:?}"),
+    }
+    // Default NULLS DISTINCT stays NULL-permissive: two NULL-key
+    // rows coexist and ON CONFLICT never fires for them.
+    db.execute("CREATE TABLE g2 (name TEXT NOT NULL, domain TEXT, UNIQUE (name, domain))")
+        .unwrap();
+    for _ in 0..2 {
+        db.execute("INSERT INTO g2 (name, domain) VALUES ('x', NULL) ON CONFLICT DO NOTHING")
+            .unwrap();
+    }
+    let r = db.execute("SELECT COUNT(*) FROM g2").unwrap();
+    match r {
+        spg_embedded::QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0].values[0], spg_embedded::Value::BigInt(2));
+        }
+        other => panic!("{other:?}"),
+    }
+}

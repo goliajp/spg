@@ -7064,7 +7064,7 @@ impl Engine {
         let mut pending_updates: Vec<(usize, Vec<Value>)> = Vec::new();
         let mut skipped_count = 0usize;
         if let Some(clause) = &stmt.on_conflict {
-            let conflict_cols = resolve_on_conflict_columns(
+            let (conflict_cols, conflict_nnd) = resolve_on_conflict_columns(
                 self.active_catalog(),
                 &stmt.table,
                 clause.target_columns.as_slice(),
@@ -7074,8 +7074,12 @@ impl Engine {
             for values in all_values {
                 let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
                 // SQL spec: NULL in any conflict column means "no
-                // conflict possible" (NULL ≠ NULL for uniqueness).
-                let has_null_key = key_tuple.iter().any(|v| matches!(v, Value::Null));
+                // conflict possible" (NULL ≠ NULL for uniqueness) —
+                // UNLESS the constraint says NULLS NOT DISTINCT
+                // (v7.29; mailrs migrate-013 replays its seed row
+                // ('super', NULL) under exactly that declaration).
+                let has_null_key =
+                    !conflict_nnd && key_tuple.iter().any(|v| matches!(v, Value::Null));
                 let collides_with_table = !has_null_key
                     && on_conflict_keys_exist(
                         self.active_catalog(),
@@ -16375,11 +16379,15 @@ fn pick_pk_index_column(
 /// composite). When the user wrote bare `ON CONFLICT DO …`,
 /// falls back to the table's first unconditional BTree index
 /// (always single-column today).
+/// Returns the conflict-key column positions plus whether the
+/// matched constraint declares NULLS NOT DISTINCT (v7.29 — a NULL
+/// in the key only rules out a conflict under the default
+/// NULLS DISTINCT semantics).
 fn resolve_on_conflict_columns(
     catalog: &Catalog,
     table_name: &str,
     target: &[String],
-) -> Result<Vec<usize>, EngineError> {
+) -> Result<(Vec<usize>, bool), EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
             name: table_name.into(),
@@ -16396,7 +16404,7 @@ fn resolve_on_conflict_columns(
         // column list when one exists; fall back to the leading
         // BTree column for legacy single-column UNIQUE.
         if let Some(uc) = table.schema().uniqueness_constraints.first() {
-            return Ok(uc.columns.clone());
+            return Ok((uc.columns.clone(), uc.nulls_not_distinct));
         }
         let pos = table
             .indices()
@@ -16417,7 +16425,7 @@ fn resolve_on_conflict_columns(
                     "ON CONFLICT without target requires a UNIQUE BTree index on {table_name:?}"
                 ))
             })?;
-        return Ok(alloc::vec![pos]);
+        return Ok((alloc::vec![pos], false));
     }
     let mut out = Vec::with_capacity(target.len());
     for name in target {
@@ -16433,7 +16441,16 @@ fn resolve_on_conflict_columns(
             })?;
         out.push(pos);
     }
-    Ok(out)
+    // An explicit target matching a UNIQUE constraint inherits its
+    // NULLS [NOT] DISTINCT declaration.
+    let mut sorted = out.clone();
+    sorted.sort_unstable();
+    let nnd = table.schema().uniqueness_constraints.iter().any(|uc| {
+        let mut u = uc.columns.clone();
+        u.sort_unstable();
+        u == sorted && uc.nulls_not_distinct
+    });
+    Ok((out, nnd))
 }
 
 /// v7.9.8 — check whether the BTree index on `column_pos` of
