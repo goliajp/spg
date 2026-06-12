@@ -11107,7 +11107,7 @@ impl Engine {
             let mut subs: Vec<&SelectStatement> = Vec::new();
             collect_scalar_subqueries(expr, &mut subs);
             let plan_ok = match m.expr_plans.get(&key) {
-                Some((count, _)) => *count == subs.len(),
+                Some((count, _, _)) => *count == subs.len(),
                 None => false,
             };
             if !plan_ok && !subs.is_empty() {
@@ -11123,17 +11123,22 @@ impl Engine {
                     }
                     plan.push(m.group_maps.get(&repr).cloned().flatten());
                 }
-                m.expr_plans.insert(key, (subs.len(), plan));
+                let mut template = expr.clone();
+                hollow_scalar_subqueries(&mut template);
+                m.expr_plans.insert(key, (subs.len(), plan, template));
             }
-            if let Some((_, plan)) = m.expr_plans.get(&key)
+            if let Some((_, plan, template)) = m.expr_plans.get(&key)
                 && !plan.is_empty()
                 && plan.iter().all(|p| p.is_some())
             {
                 // Fast path: every scalar subquery resolves via its
-                // map; clone once, splice values, eval. Exists/IN
-                // subqueries (if any) still drop to the resolver.
+                // map; clone the HOLLOW template (subquery bodies
+                // emptied at plan time - cloning full subquery ASTs
+                // per row was the dominant malloc load), splice map
+                // values, eval. Exists/IN subqueries (if any) still
+                // drop to the resolver.
                 let plan = plan.clone();
-                let mut e = expr.clone();
+                let mut e = template.clone();
                 let mut idx = 0usize;
                 let ok = splice_planned_subqueries(&mut e, &plan, &mut idx, row, ctx)?;
                 if ok {
@@ -13625,6 +13630,64 @@ fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>
         Expr::ArraySubscript { target, index } => {
             collect_scalar_subqueries(target, out);
             collect_scalar_subqueries(index, out);
+        }
+        _ => {}
+    }
+}
+
+/// v7.29 (3d) — empty every scalar-subquery BODY in a host
+/// expression (node kept so the splice pre-order still matches).
+fn hollow_scalar_subqueries(e: &mut Expr) {
+    match e {
+        Expr::ScalarSubquery(s) => {
+            let hollow = SelectStatement {
+                items: Vec::new(),
+                ..SelectStatement::default()
+            };
+            **s = hollow;
+        }
+        Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            hollow_scalar_subqueries(lhs);
+            hollow_scalar_subqueries(rhs);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            hollow_scalar_subqueries(expr);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            hollow_scalar_subqueries(expr);
+            hollow_scalar_subqueries(pattern);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args.iter_mut() {
+                hollow_scalar_subqueries(a);
+            }
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            hollow_scalar_subqueries(call);
+            for o in order_by.iter_mut() {
+                hollow_scalar_subqueries(&mut o.expr);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                hollow_scalar_subqueries(op);
+            }
+            for (w, t) in branches.iter_mut() {
+                hollow_scalar_subqueries(w);
+                hollow_scalar_subqueries(t);
+            }
+            if let Some(eb) = else_branch {
+                hollow_scalar_subqueries(eb);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            hollow_scalar_subqueries(target);
+            hollow_scalar_subqueries(index);
         }
         _ => {}
     }
