@@ -143,11 +143,18 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check compiled cargo-audit from source on every
+    # run (~190 s of the ~4 min CI wall clock). install-action drops
+    # in the prebuilt binary instead; same advisory DB, same failure
+    # semantics via `cargo audit`'s exit code.
     steps:
       - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2.0.0
+      - name: Install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
 
   deny:
     name: cargo-deny
@@ -184,27 +191,32 @@ jobs:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
       - name: trufflehog scan
-        uses: trufflesecurity/trufflehog@main
+        # Pinned to the latest release tag, not @main — latest *stable*
+        # principle; a moving branch ref is the opposite of stable.
+        uses: trufflesecurity/trufflehog@v3.95.5
         with:
           extra_args: --results=verified,unknown
 
   dropin_acceptance:
-    name: drop-in acceptance (PG dialect + mailrs fixture)
+    name: drop-in acceptance (candidate image)
     runs-on: ubuntu-latest
-    # v7.18 — boots the published SPG image and feeds the
-    # scripts/dropin-acceptance.sh probe (35-case PG dialect panel +
+    # v7.18 — scripts/dropin-acceptance.sh probe (PG dialect panel +
     # mailrs init-schema.sql / pg-extensions.sql as first real
     # customer fixture). Any regression in PG drop-in compatibility
     # — a stock PG schema that worked yesterday but parser-fails
-    # today — flips this gate red.
+    # today — flips this gate red. HARD GATE since v7.29; any case
+    # that flips ✅→❌ is a release blocker. The per-release
+    # reference reports live at scripts/dropin-acceptance-report-v*.md.
     #
-    # v7.30 — HARD GATE. goliakk/spg:7.30.0 passes the full
-    # 42-case panel (40 dialect cases incl. the four round-12
-    # probes + 2 mailrs fixtures); the checked-in
-    # reference is scripts/dropin-acceptance-report-v7.30.0.md.
-    # Any case that flips ✅→❌ between releases is a release
-    # blocker. Bump the --image arg when the next release image
-    # is published.
+    # 2026-06-13 pipeline governance — the panel used to run against
+    # the previously *published* image (`--image goliakk/spg:7.X.Y`,
+    # bumped by hand after each release). That tested a constant: it
+    # could never catch a regression in the commit under test, and
+    # the manual bump drifted (stuck at 7.30.0 while 7.30.2 was
+    # live). Now the job assembles a candidate image from this
+    # checkout's release binaries (Dockerfile.ci) and gates the
+    # actual commit. The published image is still watched by the
+    # nightly sentinel workflow (dropin-published.yml).
     if: |
       github.ref == 'refs/heads/master' ||
       github.ref == 'refs/heads/develop' ||
@@ -212,10 +224,19 @@ jobs:
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
       - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - name: Build candidate binaries
+        run: cargo build --release --locked --bin spg-server --bin spg --bin pg_isready
+      - name: Assemble candidate image
+        run: |
+          mkdir -p target/ci-image
+          cp target/release/spg-server target/release/spg target/release/pg_isready target/ci-image/
+          docker build -f Dockerfile.ci -t spg-candidate:ci target/ci-image
       - name: drop-in acceptance harness
         run: |
           scripts/dropin-acceptance.sh \
-            --image goliakk/spg:7.30.0 \
+            --image spg-candidate:ci \
+            --no-pull \
             --port 25433 \
             --fixture scripts/fixtures/mailrs-pg-extensions.sql \
             --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
