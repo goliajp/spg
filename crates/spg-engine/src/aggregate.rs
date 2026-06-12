@@ -1434,7 +1434,7 @@ fn encode_one(out: &mut String, v: &Value) {
 
 /// v7.30 (perf campaign) - encode from borrowed cells without
 /// materialising an owned Vec<Value> first.
-fn encode_key_refs(vals: &[&Value]) -> String {
+pub(crate) fn encode_key_refs(vals: &[&Value]) -> String {
     let mut out = String::new();
     for v in vals {
         encode_one(&mut out, v);

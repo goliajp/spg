@@ -8544,6 +8544,93 @@ impl Engine {
         Ok((out, cols))
     }
 
+    /// v7.31 (perf campaign) — `materialise_table_ref_filtered` for
+    /// the deferred-join pipeline: same index-seek + linear-filter
+    /// logic, but returns surviving row INDICES into the stored
+    /// table instead of cloned rows. The join working set reads the
+    /// table in place; survivors clone once at output time.
+    fn filter_table_indices(
+        &self,
+        table: &Table,
+        alias: &str,
+        preds: &[&Expr],
+    ) -> Result<Vec<usize>, EngineError> {
+        if preds.is_empty() {
+            return Ok((0..table.rows().len()).collect());
+        }
+        let cols = &table.schema().columns;
+        let mut seeded: Option<Vec<usize>> = None;
+        for p in preds {
+            if let Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::Eq,
+                rhs,
+            } = p
+            {
+                let pair = match (lhs.as_ref(), rhs.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(l)) | (Expr::Literal(l), Expr::Column(c)) => {
+                        Some((c, l))
+                    }
+                    _ => None,
+                };
+                if let Some((c, l)) = pair
+                    && c.qualifier
+                        .as_deref()
+                        .is_none_or(|q| q.eq_ignore_ascii_case(alias))
+                    && let Some(pos) = cols.iter().position(|s| s.name == c.name)
+                    && let Some(idx) = table.index_on(pos)
+                    && let Some(key) = spg_storage::IndexKey::from_value(&eval::literal_to_value(l))
+                {
+                    let mut ids = Vec::new();
+                    let mut all_hot = true;
+                    for loc in idx.lookup_eq(&key) {
+                        match *loc {
+                            spg_storage::RowLocator::Hot(i) => ids.push(i),
+                            spg_storage::RowLocator::Cold { .. } => {
+                                all_hot = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_hot {
+                        seeded = Some(ids);
+                        break;
+                    }
+                }
+            }
+        }
+        let ctx = EvalContext::new(cols, Some(alias));
+        let keep = |row: &Row| -> Result<bool, EngineError> {
+            for p in preds {
+                let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
+                if !matches!(v, Value::Bool(true)) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        let mut out: Vec<usize> = Vec::new();
+        match seeded {
+            Some(ids) => {
+                for i in ids {
+                    if let Some(row) = table.rows().get(i)
+                        && keep(row)?
+                    {
+                        out.push(i);
+                    }
+                }
+            }
+            None => {
+                for (i, row) in table.rows().iter().enumerate() {
+                    if keep(row)? {
+                        out.push(i);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// v7.17.0 Phase 3.P0-43 — materialise a `FROM` with one or more
     /// JOINs into `(combined_schema, filtered_rows)`. The combined
     /// schema uses composite `alias.col` column names so the
@@ -8716,11 +8803,35 @@ impl Engine {
             .as_deref()
             .unwrap_or(from.primary.name.as_str())
             .to_string();
-        let (mut primary_rows, primary_cols) =
-            self.materialise_table_ref_filtered(&from.primary, &primary_preds)?;
-        if let Some(needed) = needed {
-            Self::null_out_unreferenced(&mut primary_rows, &primary_cols, &primary_alias, needed);
-        }
+        // v7.31 (perf campaign) — when the primary is a plain stored
+        // table and there are joins to run, keep it in place: filter
+        // to row indices (same index seek / linear filter) and let
+        // the deferred-join pipeline clone only the surviving,
+        // referenced columns once at output time. Joinless FROMs and
+        // non-table refs take the materialising path.
+        let primary_table: Option<&Table> = if !from.joins.is_empty()
+            && from.primary.unnest_expr.is_none()
+            && from.primary.lateral_subquery.is_none()
+            && from.primary.as_of_segment.is_none()
+        {
+            self.active_catalog().get(&from.primary.name)
+        } else {
+            None
+        };
+        let (primary_rows, primary_cols, primary_indices) = match primary_table {
+            Some(t) => {
+                let idxs = self.filter_table_indices(t, &primary_alias, &primary_preds)?;
+                (Vec::new(), t.schema().columns.clone(), Some(idxs))
+            }
+            None => {
+                let (mut rows, cols) =
+                    self.materialise_table_ref_filtered(&from.primary, &primary_preds)?;
+                if let Some(needed) = needed {
+                    Self::null_out_unreferenced(&mut rows, &cols, &primary_alias, needed);
+                }
+                (rows, cols, None)
+            }
+        };
         // v7.17.0 Phase 3.P0-41 — LATERAL peers can't be
         // pre-materialised because their rows depend on outer
         // columns. For each peer, build either an eager
@@ -8815,19 +8926,87 @@ impl Engine {
         // (mailrs watched RSS climb to 7 GiB of 15 before a manual
         // restart). The ceiling is per join STAGE, not per query.
         const MAX_JOIN_INTERMEDIATE_ROWS: usize = 4_000_000;
-        let mut working: Vec<Row> = primary_rows;
+        if joined.is_empty() {
+            // Joinless FROM: the primary rows ARE the combined rows —
+            // filter and hand them back without any re-clone.
+            let mut filtered: Vec<Row> = Vec::new();
+            let mut memo = memoize::MemoizeCache::default();
+            for row in primary_rows {
+                if let Some(where_expr) = where_ {
+                    let cond = self.eval_expr_with_correlated(
+                        where_expr,
+                        &row,
+                        &ctx,
+                        cancel,
+                        Some(&mut memo),
+                    )?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                filtered.push(row);
+            }
+            return Ok((combined_schema, filtered));
+        }
+        // v7.31 (perf campaign) — deferred join materialisation. The
+        // old pipeline cloned the full combined row at EVERY join
+        // stage (stage k re-clones all columns of stages 0..k), so a
+        // two-join 24k-row query paid the wide-Text clones twice
+        // before aggregation saw a single row. The working set is now
+        // a flat row-index tuple vec (stride = sources joined so far,
+        // usize::MAX = LEFT-join NULL slot). Real rows materialise
+        // exactly once: for a residual-ON / lateral / WHERE evaluation
+        // that needs a Row, and for the survivors returned to the
+        // caller.
+        // Per-source column mask: which columns the statement
+        // references (None = keep all). In-place sources apply it at
+        // materialisation time instead of `null_out_unreferenced`.
+        let keep_mask = |cols: &[ColumnSchema], alias: &str| -> Option<Vec<bool>> {
+            let needed = needed?;
+            let keep: Vec<bool> = cols
+                .iter()
+                .map(|c| needed.contains(&(alias.to_string(), c.name.clone())))
+                .collect();
+            if keep.iter().all(|k| *k) {
+                None
+            } else {
+                Some(keep)
+            }
+        };
+        let mut sources: Vec<JoinSrc<'_>> = Vec::new();
+        let mut masks: Vec<Option<Vec<bool>>> = Vec::new();
+        let mut widths: Vec<usize> = Vec::new();
+        let mut offsets: Vec<usize> = alloc::vec![0];
+        widths.push(primary_cols.len());
+        offsets.push(primary_cols.len());
+        let mut working: Vec<usize> = match primary_indices {
+            Some(idxs) => {
+                let t = primary_table.expect("stored primary");
+                sources.push(JoinSrc::Stored(t.rows()));
+                masks.push(keep_mask(&primary_cols, &primary_alias));
+                idxs
+            }
+            None => {
+                let n = primary_rows.len();
+                sources.push(JoinSrc::Owned(primary_rows));
+                masks.push(None);
+                (0..n).collect()
+            }
+        };
+        let mut stride = 1usize;
         // Track the per-row width consumed by the outer left side so
         // each lateral evaluation sees the correct schema slice.
         let mut consumed_cols = primary_cols.len();
         for peer in &joined {
-            if working.len() > MAX_JOIN_INTERMEDIATE_ROWS {
+            if working.len() / stride > MAX_JOIN_INTERMEDIATE_ROWS {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "join intermediate result exceeds {MAX_JOIN_INTERMEDIATE_ROWS} rows ({} so far) - add join predicates",
-                    working.len()
+                    working.len() / stride
                 )));
             }
             let right_arity = peer.cols.len();
-            let mut next: Vec<Row> = Vec::new();
+            let peer_mask = keep_mask(&peer.cols, &peer.alias);
+            let mut next: Vec<usize> = Vec::new();
             // v7.28 (round-22) — hash equi-join. The old path CLONED
             // the full combined row for EVERY (left, right) pair and
             // then evaluated ON — O(L×R) row materialisations (a
@@ -8877,7 +9056,7 @@ impl Engine {
             if let Some(tname) = &peer.join_table
                 && peer.eager_rows.is_none()
                 && !eq_pairs.is_empty()
-                && working.len() <= INL_MAX_LEFT
+                && working.len() / stride <= INL_MAX_LEFT
                 && let Some(table) = self.active_catalog().get(tname)
                 && let Some(idx) = peer
                     .cols
@@ -8885,27 +9064,29 @@ impl Engine {
                     .position(|c| c.name == peer.cols[eq_pairs[0].1].name)
                     .and_then(|pos| table.index_on(pos))
             {
+                let stored = table.rows();
                 let (lpos0, _) = eq_pairs[0];
-                for left in &working {
+                for tuple in working.chunks(stride) {
                     cancel.check()?;
                     let mut left_matched = false;
-                    let key_v = left.values.get(lpos0).cloned().unwrap_or(Value::Null);
-                    if !matches!(key_v, Value::Null)
-                        && let Some(key) = spg_storage::IndexKey::from_value(&key_v)
+                    if let Some(kv) = tuple_value(&sources, &offsets, tuple, lpos0)
+                        && !matches!(kv, Value::Null)
+                        && let Some(key) = spg_storage::IndexKey::from_value(kv)
                     {
                         for loc in idx.lookup_eq(&key) {
-                            let right = match *loc {
-                                spg_storage::RowLocator::Hot(i) => match table.rows().get(i) {
-                                    Some(r) => r,
-                                    None => continue,
-                                },
+                            let ri = match *loc {
+                                spg_storage::RowLocator::Hot(i) => i,
                                 spg_storage::RowLocator::Cold { .. } => continue,
+                            };
+                            let right = match stored.get(ri) {
+                                Some(r) => r,
+                                None => continue,
                             };
                             // Remaining eq pairs + residual ON check on
                             // the candidate only.
                             let mut ok = true;
                             for (lp, rp) in eq_pairs.iter().skip(1) {
-                                let lv = left.values.get(*lp);
+                                let lv = tuple_value(&sources, &offsets, tuple, *lp);
                                 let rv = right.values.get(*rp);
                                 let eq = match (lv, rv) {
                                     (Some(a), Some(b)) => {
@@ -8923,12 +9104,18 @@ impl Engine {
                             if !ok {
                                 continue;
                             }
-                            let mut combined_vals = left.values.clone();
-                            combined_vals.extend(right.values.iter().cloned());
-                            let combined = Row::new(combined_vals);
                             let keep = if residual.is_empty() {
                                 true
                             } else {
+                                let mut combined_vals = materialise_tuple_vals(
+                                    &sources,
+                                    &widths,
+                                    &masks,
+                                    tuple,
+                                    consumed_cols + right_arity,
+                                );
+                                extend_masked(&mut combined_vals, right, peer_mask.as_deref());
+                                let combined = Row::new(combined_vals);
                                 let mut k = true;
                                 for r in &residual {
                                     let cond = self.eval_expr_with_correlated(
@@ -8942,25 +9129,134 @@ impl Engine {
                                 k
                             };
                             if keep {
-                                next.push(combined);
+                                next.extend_from_slice(tuple);
+                                next.push(ri);
                                 left_matched = true;
                             }
                         }
                     }
                     if !left_matched && matches!(peer.kind, JoinKind::Left) {
-                        let mut combined_vals = left.values.clone();
-                        for _ in 0..right_arity {
-                            combined_vals.push(Value::Null);
-                        }
-                        next.push(Row::new(combined_vals));
+                        next.extend_from_slice(tuple);
+                        next.push(usize::MAX);
                     }
                 }
                 working = next;
+                stride += 1;
+                sources.push(JoinSrc::Stored(stored));
+                masks.push(peer_mask);
                 consumed_cols += right_arity;
+                offsets.push(consumed_cols);
+                widths.push(right_arity);
                 continue;
             }
-            // Deferred peer that didn't take the INL path: materialise
-            // now (no pushed predicate, full table).
+            if !eq_pairs.is_empty() && peer.lateral.is_none() {
+                // Build side: eager rows if the peer was materialised
+                // (pushed predicate / non-table ref), otherwise the
+                // stored table read in place (v7.31 — no full-table
+                // clone + null-out just to hash it).
+                let rights_src: JoinSrc<'_> = match peer.eager_rows.as_deref() {
+                    Some(er) => JoinSrc::Eager(er),
+                    None => match peer
+                        .join_table
+                        .as_deref()
+                        .and_then(|n| self.active_catalog().get(n))
+                    {
+                        Some(t) => JoinSrc::Stored(t.rows()),
+                        None => JoinSrc::Owned(Vec::new()),
+                    },
+                };
+                let n_rights = rights_src.len();
+                // v7.29 - hashbrown over BTreeMap: the ordered map
+                // paid O(log n) string comparisons per insert/probe
+                // (24k-row build sides spent ~100 ms in it).
+                let mut table: hashbrown::HashMap<String, Vec<usize>> =
+                    hashbrown::HashMap::with_capacity(n_rights);
+                let mut keybuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
+                'build: for ri in 0..n_rights {
+                    let Some(right) = rights_src.get(ri) else {
+                        continue;
+                    };
+                    keybuf.clear();
+                    for (_, rpos) in &eq_pairs {
+                        match right.values.get(*rpos) {
+                            Some(v) if !matches!(v, Value::Null) => keybuf.push(v),
+                            _ => continue 'build,
+                        }
+                    }
+                    table
+                        .entry(aggregate::encode_key_refs(&keybuf))
+                        .or_default()
+                        .push(ri);
+                }
+                let mut probebuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
+                for tuple in working.chunks(stride) {
+                    cancel.check()?;
+                    let mut left_matched = false;
+                    probebuf.clear();
+                    let mut left_has_null = false;
+                    for (lpos, _) in &eq_pairs {
+                        match tuple_value(&sources, &offsets, tuple, *lpos) {
+                            Some(v) if !matches!(v, Value::Null) => probebuf.push(v),
+                            _ => {
+                                left_has_null = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !left_has_null
+                        && let Some(cands) = table.get(&aggregate::encode_key_refs(&probebuf))
+                    {
+                        for &ri in cands {
+                            let keep = if residual.is_empty() {
+                                true
+                            } else {
+                                let right = rights_src.get(ri).expect("hash candidate row");
+                                let mut combined_vals = materialise_tuple_vals(
+                                    &sources,
+                                    &widths,
+                                    &masks,
+                                    tuple,
+                                    consumed_cols + right_arity,
+                                );
+                                extend_masked(&mut combined_vals, right, peer_mask.as_deref());
+                                let combined = Row::new(combined_vals);
+                                let mut ok = true;
+                                for r in &residual {
+                                    let cond = self.eval_expr_with_correlated(
+                                        r, &combined, &ctx, cancel, None,
+                                    )?;
+                                    if !matches!(cond, Value::Bool(true)) {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                ok
+                            };
+                            if keep {
+                                next.extend_from_slice(tuple);
+                                next.push(ri);
+                                left_matched = true;
+                            }
+                        }
+                    }
+                    if !left_matched && matches!(peer.kind, JoinKind::Left) {
+                        next.extend_from_slice(tuple);
+                        next.push(usize::MAX);
+                    }
+                }
+                working = next;
+                stride += 1;
+                sources.push(rights_src);
+                masks.push(peer_mask);
+                consumed_cols += right_arity;
+                offsets.push(consumed_cols);
+                widths.push(right_arity);
+                debug_assert!(consumed_cols <= combined_schema.len());
+                continue;
+            }
+            // Fallback: nested loop (lateral peers, non-equi ON).
+            // A deferred plain-table peer materialises here (pruned),
+            // since every (left, right) pair gets evaluated anyway.
             let lazy_rows: Option<Vec<Row>> = if peer.eager_rows.is_none() && peer.lateral.is_none()
             {
                 let tname = peer.join_table.as_deref().unwrap_or("");
@@ -8976,104 +9272,32 @@ impl Engine {
             } else {
                 None
             };
-            let eager_view: Option<&Vec<Row>> = peer.eager_rows.as_ref().or(lazy_rows.as_ref());
-            if !eq_pairs.is_empty() && peer.lateral.is_none() {
-                let rights = eager_view.expect("non-lateral peer eager");
-                // v7.29 - hashbrown over BTreeMap: the ordered map
-                // paid O(log n) string comparisons per insert/probe
-                // (24k-row build sides spent ~100 ms in it).
-                let mut table: hashbrown::HashMap<String, Vec<usize>> =
-                    hashbrown::HashMap::with_capacity(rights.len());
-                let mut keybuf: Vec<Value> = Vec::with_capacity(eq_pairs.len());
-                'build: for (ri, right) in rights.iter().enumerate() {
-                    keybuf.clear();
-                    for (_, rpos) in &eq_pairs {
-                        let v = right.values.get(*rpos).cloned().unwrap_or(Value::Null);
-                        if matches!(v, Value::Null) {
-                            continue 'build;
-                        }
-                        keybuf.push(v);
-                    }
-                    table
-                        .entry(aggregate::encode_key(&keybuf))
-                        .or_default()
-                        .push(ri);
-                }
-                for left in &working {
-                    cancel.check()?;
-                    let mut left_matched = false;
-                    keybuf.clear();
-                    let mut left_has_null = false;
-                    for (lpos, _) in &eq_pairs {
-                        let v = left.values.get(*lpos).cloned().unwrap_or(Value::Null);
-                        if matches!(v, Value::Null) {
-                            left_has_null = true;
-                            break;
-                        }
-                        keybuf.push(v);
-                    }
-                    if !left_has_null
-                        && let Some(cands) = table.get(&aggregate::encode_key(&keybuf))
-                    {
-                        for &ri in cands {
-                            let right = &rights[ri];
-                            let mut combined_vals = left.values.clone();
-                            combined_vals.extend(right.values.iter().cloned());
-                            let combined = Row::new(combined_vals);
-                            let keep = if residual.is_empty() {
-                                true
-                            } else {
-                                let mut ok = true;
-                                for r in &residual {
-                                    let cond = self.eval_expr_with_correlated(
-                                        r, &combined, &ctx, cancel, None,
-                                    )?;
-                                    if !matches!(cond, Value::Bool(true)) {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                                ok
-                            };
-                            if keep {
-                                next.push(combined);
-                                left_matched = true;
-                            }
-                        }
-                    }
-                    if !left_matched && matches!(peer.kind, JoinKind::Left) {
-                        let mut combined_vals = left.values.clone();
-                        for _ in 0..right_arity {
-                            combined_vals.push(Value::Null);
-                        }
-                        next.push(Row::new(combined_vals));
-                    }
-                }
-                working = next;
-                consumed_cols += right_arity;
-                debug_assert!(consumed_cols <= combined_schema.len());
-                continue;
-            }
-            // Fallback: nested loop (lateral peers, non-equi ON).
-            for left in &working {
+            // Lateral results are per-outer-row, so matched right rows
+            // persist in a stage arena the tuples can index.
+            let mut arena: Vec<Row> = Vec::new();
+            let rights_eager: Option<&[Row]> = peer.eager_rows.as_deref().or(lazy_rows.as_deref());
+            for tuple in working.chunks(stride) {
                 cancel.check()?;
                 let mut left_matched = false;
+                let left_vals =
+                    materialise_tuple_vals(&sources, &widths, &masks, tuple, consumed_cols);
                 let per_left_rrows: alloc::borrow::Cow<'_, [Row]> = match peer.lateral {
                     Some(inner) => {
                         // Substitute outer columns and run the inner
                         // SELECT against the current left row's slice
                         // of the combined schema.
                         let outer_schema = &combined_schema[..consumed_cols];
-                        let rows = self.materialise_lateral_for_outer(inner, outer_schema, left)?;
+                        let left_row = Row::new(left_vals.clone());
+                        let rows =
+                            self.materialise_lateral_for_outer(inner, outer_schema, &left_row)?;
                         alloc::borrow::Cow::Owned(rows)
                     }
                     None => {
-                        let r = eager_view.expect("non-lateral peer eager");
-                        alloc::borrow::Cow::Borrowed(r.as_slice())
+                        alloc::borrow::Cow::Borrowed(rights_eager.expect("non-lateral peer eager"))
                     }
                 };
-                for right in per_left_rrows.as_ref() {
-                    let mut combined_vals = left.values.clone();
+                for (ri, right) in per_left_rrows.as_ref().iter().enumerate() {
+                    let mut combined_vals = left_vals.clone();
                     combined_vals.extend(right.values.iter().cloned());
                     let combined = Row::new(combined_vals);
                     let keep = if let Some(on_expr) = peer.on {
@@ -9086,26 +9310,46 @@ impl Engine {
                         true
                     };
                     if keep {
-                        next.push(combined);
+                        next.extend_from_slice(tuple);
+                        if peer.lateral.is_some() {
+                            let mut cv = combined.values;
+                            let rv = cv.split_off(left_vals.len());
+                            arena.push(Row::new(rv));
+                            next.push(arena.len() - 1);
+                        } else {
+                            next.push(ri);
+                        }
                         left_matched = true;
                     }
                 }
                 if !left_matched && matches!(peer.kind, JoinKind::Left) {
-                    let mut combined_vals = left.values.clone();
-                    for _ in 0..right_arity {
-                        combined_vals.push(Value::Null);
-                    }
-                    next.push(Row::new(combined_vals));
+                    next.extend_from_slice(tuple);
+                    next.push(usize::MAX);
                 }
             }
             working = next;
-            if working.len() > MAX_JOIN_INTERMEDIATE_ROWS {
+            stride += 1;
+            if working.len() / stride > MAX_JOIN_INTERMEDIATE_ROWS {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "join intermediate result exceeds {MAX_JOIN_INTERMEDIATE_ROWS} rows ({} so far) - add join predicates",
-                    working.len()
+                    working.len() / stride
                 )));
             }
+            if peer.lateral.is_some() {
+                sources.push(JoinSrc::Owned(arena));
+            } else if let Some(lz) = lazy_rows {
+                sources.push(JoinSrc::Owned(lz));
+            } else {
+                sources.push(JoinSrc::Eager(
+                    peer.eager_rows.as_deref().expect("non-lateral peer eager"),
+                ));
+            }
+            // Fallback sources are pre-pruned (eager / lazy null-out)
+            // or lateral projections; nothing left for a mask to drop.
+            masks.push(None);
             consumed_cols += right_arity;
+            offsets.push(consumed_cols);
+            widths.push(right_arity);
             debug_assert!(consumed_cols <= combined_schema.len());
         }
         let mut filtered: Vec<Row> = Vec::new();
@@ -9115,7 +9359,14 @@ impl Engine {
         // the correlated-aware evaluator (memoized, same as the
         // single-table path).
         let mut memo = memoize::MemoizeCache::default();
-        for row in working {
+        for tuple in working.chunks(stride) {
+            let row = Row::new(materialise_tuple_vals(
+                &sources,
+                &widths,
+                &masks,
+                tuple,
+                consumed_cols,
+            ));
             if let Some(where_expr) = where_ {
                 let cond = self.eval_expr_with_correlated(
                     where_expr,
@@ -13381,6 +13632,104 @@ struct JoinedPeer<'a> {
     /// v7.28 (round-22) — plain-table name for the index-nested-loop
     /// path. None for unnest/lateral.
     join_table: Option<String>,
+}
+
+/// v7.31 (perf campaign) — deferred-join row source: one per join
+/// stage. The working set advances as row-index tuples instead of
+/// cloned combined rows; each tuple slot indexes into one of these.
+enum JoinSrc<'a> {
+    /// Owned by the join: the primary scan, a lazily-materialised
+    /// peer, or the arena of per-outer-row LATERAL results.
+    Owned(Vec<Row>),
+    /// Peer rows materialised up front and still owned by `JoinedPeer`.
+    Eager(&'a [Row]),
+    /// Index-nested-loop peer reading the stored table in place.
+    Stored(&'a spg_storage::persistent::PersistentVec<Row>),
+}
+
+impl JoinSrc<'_> {
+    fn get(&self, i: usize) -> Option<&Row> {
+        match self {
+            Self::Owned(v) => v.get(i),
+            Self::Eager(s) => s.get(i),
+            Self::Stored(p) => p.get(i),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Eager(s) => s.len(),
+            Self::Stored(p) => p.len(),
+        }
+    }
+}
+
+/// Resolve one combined-schema position against a row-index tuple.
+/// `offsets` holds the prefix column offsets of the consumed sources
+/// (`offsets.len() == tuple.len() + 1`). `None` means SQL NULL: a
+/// LEFT-extended slot (`usize::MAX`), or a position past the row's
+/// width.
+fn tuple_value<'s>(
+    sources: &'s [JoinSrc<'_>],
+    offsets: &[usize],
+    tuple: &[usize],
+    pos: usize,
+) -> Option<&'s Value> {
+    let k = offsets.partition_point(|&o| o <= pos).checked_sub(1)?;
+    let ri = *tuple.get(k)?;
+    if ri == usize::MAX {
+        return None;
+    }
+    sources.get(k)?.get(ri)?.values.get(pos - offsets[k])
+}
+
+/// Clone a source row's values into a combined-row buffer. A mask
+/// (per-column "is referenced anywhere in the statement") NULLs the
+/// unreferenced columns instead of cloning them — the in-place
+/// equivalent of `null_out_unreferenced` for sources that were never
+/// pre-cloned.
+fn extend_masked(vals: &mut Vec<Value>, row: &Row, mask: Option<&[bool]>) {
+    match mask {
+        Some(keep) => {
+            for (i, v) in row.values.iter().enumerate() {
+                if keep.get(i).copied().unwrap_or(false) {
+                    vals.push(v.clone());
+                } else {
+                    vals.push(Value::Null);
+                }
+            }
+        }
+        None => vals.extend(row.values.iter().cloned()),
+    }
+}
+
+/// Materialise a row-index tuple into owned values, NULL-padding
+/// LEFT-extended slots to the source's schema width.
+fn materialise_tuple_vals(
+    sources: &[JoinSrc<'_>],
+    widths: &[usize],
+    masks: &[Option<Vec<bool>>],
+    tuple: &[usize],
+    cap: usize,
+) -> Vec<Value> {
+    let mut vals: Vec<Value> = Vec::with_capacity(cap);
+    for (k, &ri) in tuple.iter().enumerate() {
+        let row = if ri == usize::MAX {
+            None
+        } else {
+            sources[k].get(ri)
+        };
+        match row {
+            Some(r) => extend_masked(&mut vals, r, masks[k].as_deref()),
+            None => {
+                for _ in 0..widths[k] {
+                    vals.push(Value::Null);
+                }
+            }
+        }
+    }
+    vals
 }
 
 /// v7.17.0 Phase 3.P0-41 — synthesise a column name for a LATERAL
