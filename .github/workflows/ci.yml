@@ -204,10 +204,10 @@ jobs:
     # — a stock PG schema that worked yesterday but parser-fails
     # today — flips this gate red.
     #
-    # v7.28 — HARD GATE. goliakk/spg:7.28.0 passes the full
+    # v7.29 — HARD GATE. goliakk/spg:7.29.0 passes the full
     # 42-case panel (40 dialect cases incl. the four round-12
     # probes + 2 mailrs fixtures); the checked-in
-    # reference is scripts/dropin-acceptance-report-v7.28.0.md.
+    # reference is scripts/dropin-acceptance-report-v7.29.0.md.
     # Any case that flips ✅→❌ between releases is a release
     # blocker. Bump the --image arg when the next release image
     # is published.
@@ -223,7 +223,7 @@ jobs:
       - name: drop-in acceptance harness
         run: |
           scripts/dropin-acceptance.sh \
-            --image goliakk/spg:7.28.0 \
+            --image goliakk/spg:7.29.0 \
             --port 25433 \
             --fixture scripts/fixtures/mailrs-pg-extensions.sql \
             --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
