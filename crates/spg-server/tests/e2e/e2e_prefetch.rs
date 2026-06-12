@@ -206,7 +206,10 @@ fn sequential_scan_triggers_prefetch() {
     // the last worker may still be counting when /metrics is first
     // scraped. Poll to the expected value instead of asserting a
     // single early sample (v7.22; this was the suite's top flake).
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // v7.29 — 60 s: liveness guard, not a timing assertion. A fully
+    // parallel suite starved the last worker past 15 s once (hits
+    // stuck at 3/4); single-run completes in well under a second.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let hits = loop {
         let body = http_get_body(http_addr, "/metrics");
         let h = metric_value(&body, "spg_cold_prefetch_hits_total")
@@ -216,8 +219,10 @@ fn sequential_scan_triggers_prefetch() {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert_eq!(
-        hits, expected_hits,
-        "prefetch hits {hits} ≠ on-disk segment count {expected_hits}"
-    );
+    if hits != expected_hits {
+        // Forensics for the next occurrence: the full metrics page
+        // says whether the worker died or is merely late.
+        let body = http_get_body(http_addr, "/metrics");
+        panic!("prefetch hits {hits} != on-disk segment count {expected_hits}; /metrics:\n{body}");
+    }
 }
