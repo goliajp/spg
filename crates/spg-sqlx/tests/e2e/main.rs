@@ -9,6 +9,7 @@ mod e2e_vector_tsvector;
 mod fetch;
 mod mailrs_round12;
 mod mailrs_round20;
+mod mailrs_round26;
 mod smoke;
 mod snapshot_routing;
 mod types;

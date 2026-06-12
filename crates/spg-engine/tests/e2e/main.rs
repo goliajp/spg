@@ -199,3 +199,4 @@ mod e2e_view;
 mod e2e_window_in_join;
 mod e2e_window_null_treatment;
 mod e2e_window_with_join;
+mod mailrs_round26;
