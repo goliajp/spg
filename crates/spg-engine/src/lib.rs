@@ -11222,13 +11222,16 @@ impl Engine {
         // its Display-keyed group maps) happens once per expression.
         if let Some(m) = memo.as_deref_mut() {
             let key = core::ptr::from_ref::<Expr>(expr) as usize;
+            // Plan hit: skip the collection walk entirely (it ran
+            // once per group otherwise - 70k walks per inbox query).
+            // The memo is per-query and host expressions outlive it,
+            // so an address that hit once stays valid.
+            let plan_hit = m.expr_plans.contains_key(&key);
             let mut subs: Vec<&SelectStatement> = Vec::new();
-            collect_scalar_subqueries(expr, &mut subs);
-            let plan_ok = match m.expr_plans.get(&key) {
-                Some((count, _, _)) => *count == subs.len(),
-                None => false,
-            };
-            if !plan_ok && !subs.is_empty() {
+            if !plan_hit {
+                collect_scalar_subqueries(expr, &mut subs);
+            }
+            if !plan_hit && !subs.is_empty() {
                 let mut plan: Vec<Option<alloc::rc::Rc<memoize::GroupMap>>> =
                     Vec::with_capacity(subs.len());
                 for sub in &subs {
