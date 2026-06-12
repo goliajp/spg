@@ -2,6 +2,10 @@
 // codegen, so it only compiles in release (the perf_gate
 // convention; budgets in BUDGETS.md).
 #![cfg(not(debug_assertions))]
+// v7.30.3 — the round26_mem gate's peak-tracking #[global_allocator]
+// shim is intrinsically unsafe (GlobalAlloc), same per-target allow
+// as spg-server's alloc_budget.
+#![allow(unsafe_code)]
 // Test-gate allow-list — see crates/spg-crypto/tests/perf_gate.rs.
 #![allow(
     clippy::cast_lossless,
@@ -40,7 +44,42 @@ fn perf_lock() -> MutexGuard<'static, ()> {
     guard
 }
 
+// v7.30.3 (mailrs round-26) — live-bytes + high-water tracking so
+// the memory gate (round26_mem) can assert the bounded join path's
+// peak. Two relaxed atomics per alloc — noise against the 10-1000×
+// headroom of the timing budgets in this binary. The allocator shim
+// is the one legitimate unsafe surface in this target (same pattern
+// as spg-server's alloc_budget module); the file-level allow lives
+// in the header attribute block.
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+struct PeakTracker;
+
+unsafe impl GlobalAlloc for PeakTracker {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static PEAK_TRACKING_ALLOC: PeakTracker = PeakTracker;
+
 mod join_reorder;
 mod plan_cache;
+mod round26_mem;
 mod select_where;
 mod stages_knn;

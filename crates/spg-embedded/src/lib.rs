@@ -207,6 +207,26 @@ fn default_checkpoint_threshold_bytes() -> u64 {
         .unwrap_or(4 * 1024 * 1024)
 }
 
+/// v7.30.3 (mailrs round-26) — per-query byte budget on join/filter
+/// materialisation, default ON at 256 MiB for embed parity with the
+/// server's allocator-level `SPG_MAX_QUERY_BYTES` default. A fat
+/// backfill batch (1000 × full mail bodies) then errors with
+/// `QueryBytesExceeded` instead of walking the host into reclaim
+/// livelock. `SPG_MAX_QUERY_BYTES=0` disables; any other value
+/// overrides. NOT applied to the WAL-replay engine — replay must
+/// never fail on a tuning knob.
+fn engine_with_query_byte_budget(engine: Engine) -> Engine {
+    const DEFAULT_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
+    match std::env::var("SPG_MAX_QUERY_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        Some(0) => engine,
+        Some(n) => engine.with_max_query_bytes(n),
+        None => engine.with_max_query_bytes(DEFAULT_MAX_QUERY_BYTES),
+    }
+}
+
 /// v7.1 — encode one v3 `auto_commit_sql` record. Layout:
 ///
 /// ```text
@@ -1288,7 +1308,7 @@ impl Database {
     #[must_use]
     pub fn open_in_memory() -> Self {
         Self {
-            engine: Engine::new().with_clock(wall_clock_micros),
+            engine: engine_with_query_byte_budget(Engine::new().with_clock(wall_clock_micros)),
             persistence: None,
             commit_lsn: AtomicU64::new(0),
             tx_wal: None,
@@ -1362,9 +1382,9 @@ impl Database {
                     db_path.display()
                 )))
             })?;
-            engine.with_clock(wall_clock_micros)
+            engine_with_query_byte_budget(engine.with_clock(wall_clock_micros))
         } else {
-            Engine::new().with_clock(wall_clock_micros)
+            engine_with_query_byte_budget(Engine::new().with_clock(wall_clock_micros))
         };
         // v7.1.4 — manifest-driven cold-segment reload. The
         // manifest sidecar pairs the catalog snapshot CRC with a

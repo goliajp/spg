@@ -339,6 +339,17 @@ run_case_expect "round19.correlated_scalar_in_group_by" \
 run_case_expect "round20.aggregate_group_composite" \
   "CREATE TABLE r20_m (id BIGSERIAL PRIMARY KEY, t TEXT, d BIGINT, pin BOOLEAN, score REAL); INSERT INTO r20_m (t,d,pin,score) VALUES ('th',100,true,0.5),('th',200,false,0.9); SELECT COUNT(DISTINCT id) || '/' || MAX(d) || '/' || COALESCE(BOOL_OR(pin), false) || '/' || COALESCE(MAX(score), 0.0) FROM r20_m GROUP BY t;" \
   "2/200/true/0.9"
+# round-26: the meili backfill keyset shape (JOIN + ORDER BY id +
+# LIMIT) on the wire path — bounded execution must keep order /
+# cursor / INNER-drop semantics. Seeded with an orphan row (mailbox
+# 9 absent) and a NULL body. Two single-row probes because the
+# harness asserts the LAST output line only.
+run_case_expect "round26.backfill_keyset_offset_skips_orphan" \
+  "CREATE TABLE r26_m (id BIGINT, mailbox_id BIGINT, text_body TEXT); CREATE TABLE r26_mb (id BIGINT, user_address TEXT); INSERT INTO r26_mb VALUES (1,'a@x'),(2,'b@x'); INSERT INTO r26_m VALUES (1,1,'b1'),(2,2,NULL),(3,9,'orphan'),(4,2,'b4'),(5,1,'b5'); SELECT m.id || ':' || mb.user_address FROM r26_m m JOIN r26_mb mb ON m.mailbox_id = mb.id WHERE m.id > 1 ORDER BY m.id ASC LIMIT 1 OFFSET 1;" \
+  "4:b@x"
+run_case_expect "round26.backfill_desc_limit_top_end" \
+  "SELECT m.id || ':' || mb.user_address FROM r26_m m JOIN r26_mb mb ON m.mailbox_id = mb.id ORDER BY m.id DESC LIMIT 1;" \
+  "5:a@x"
 
 # --- Fixture mode — apply each --fixture SQL file as a single chunk ---
 FIXTURE_REPORT=""
