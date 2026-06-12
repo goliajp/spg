@@ -62,6 +62,7 @@ mod e2e_gin_trgm_partial;
 mod e2e_greatest_least;
 mod e2e_group_by_all;
 mod e2e_hnsw_opclass;
+mod e2e_in_list_depth;
 mod e2e_include;
 mod e2e_index_advisor;
 mod e2e_inet_contains;
@@ -91,6 +92,7 @@ mod e2e_materialized_view;
     clippy::uninlined_format_args
 )]
 mod e2e_memoize;
+mod e2e_memory_stats;
 mod e2e_merge;
 mod e2e_mod;
 mod e2e_multi_col_index;
@@ -198,3 +200,4 @@ mod e2e_view;
 mod e2e_window_in_join;
 mod e2e_window_null_treatment;
 mod e2e_window_with_join;
+mod mailrs_round26;

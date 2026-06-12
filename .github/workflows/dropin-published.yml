@@ -1,0 +1,37 @@
+name: dropin-published
+
+# Nightly sentinel: runs the drop-in acceptance panel against the
+# *published* goliakk/spg:latest image. The in-CI dropin_acceptance
+# job gates the candidate source; this one watches what customers
+# actually pull — docker-vs-local divergence has happened before
+# (a binary green locally but broken in the published multi-arch
+# image must be caught here, not by a customer).
+#
+# Separate workflow on purpose: a `schedule:` trigger inside ci.yml
+# would fire every heavy gate nightly for no new commit.
+
+on:
+  schedule:
+    - cron: '17 18 * * *' # daily 18:17 UTC = 03:17 JST
+  workflow_dispatch:
+
+jobs:
+  dropin_published:
+    name: drop-in acceptance (published :latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: drop-in acceptance harness vs published image
+        run: |
+          scripts/dropin-acceptance.sh \
+            --image goliakk/spg:latest \
+            --port 25433 \
+            --fixture scripts/fixtures/mailrs-pg-extensions.sql \
+            --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
+            --report ./dropin-published-report.md
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dropin-published-report
+          path: ./dropin-published-report.md

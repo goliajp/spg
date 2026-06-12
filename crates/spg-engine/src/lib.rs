@@ -99,6 +99,13 @@ pub enum EngineError {
     /// v4.2: a SELECT would have returned more rows than the
     /// configured `max_query_rows` cap. Carries the cap.
     RowLimitExceeded(usize),
+    /// v7.30.3 (mailrs round-26): a SELECT's join/filter
+    /// materialisation would have held more (approximate) heap
+    /// bytes than the configured `max_query_bytes` cap. The row
+    /// cap above counts rows; this counts bytes, because one row
+    /// can be a multi-MB mail body — 1000 fat rows pressure the
+    /// host long before any row ceiling trips. Carries the cap.
+    QueryBytesExceeded(usize),
     /// v4.5: cooperative cancellation — the host (server's
     /// per-query watchdog) set the cancel flag while a long-running
     /// SELECT / UPDATE / DELETE was scanning rows. The partial work
@@ -121,6 +128,12 @@ impl fmt::Display for EngineError {
             }
             Self::RowLimitExceeded(n) => {
                 write!(f, "query exceeded max_query_rows={n}")
+            }
+            Self::QueryBytesExceeded(n) => {
+                write!(
+                    f,
+                    "query materialisation exceeded max_query_bytes={n} (set SPG_MAX_QUERY_BYTES to raise, 0 to disable)"
+                )
             }
             Self::Cancelled => f.write_str("query cancelled (timeout or client request)"),
         }
@@ -636,6 +649,16 @@ pub struct Engine {
     /// is shaped into wire frames so a runaway scan can't blow the
     /// server's heap.
     max_query_rows: Option<usize>,
+    /// v7.30.3 (mailrs round-26) per-query byte cap on join/filter
+    /// materialisation. `None` = unlimited. Approximate net
+    /// accounting (Value heap payloads + per-cell enum overhead)
+    /// charged at every point the join pipeline clones rows;
+    /// crossing the cap raises `EngineError::QueryBytesExceeded`
+    /// instead of pressuring the host into reclaim livelock. The
+    /// host wires this to `SPG_MAX_QUERY_BYTES` (embed defaults it
+    /// ON; the server keeps its allocator-precise budget as the
+    /// outer layer).
+    max_query_bytes: Option<usize>,
     /// v4.1 RBAC user table. Empty means "no RBAC configured yet" —
     /// the server decides what that means at the auth boundary
     /// (open mode vs legacy single-password mode). User CRUD goes
@@ -846,6 +869,7 @@ impl Engine {
             clock: None,
             salt_fn: None,
             max_query_rows: None,
+            max_query_bytes: None,
             users: UserStore::new(),
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
@@ -1034,6 +1058,7 @@ impl Engine {
             clock: None,
             salt_fn: None,
             max_query_rows: None,
+            max_query_bytes: None,
             users: UserStore::new(),
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
@@ -1098,6 +1123,7 @@ impl Engine {
                     clock: None,
                     salt_fn: None,
                     max_query_rows: None,
+                    max_query_bytes: None,
                     users,
                     publications,
                     subscriptions,
@@ -1196,6 +1222,18 @@ impl Engine {
     #[must_use]
     pub const fn with_max_query_rows(mut self, n: usize) -> Self {
         self.max_query_rows = Some(n);
+        self
+    }
+
+    /// Builder: cap the approximate heap bytes a single SELECT's
+    /// join/filter materialisation may hold. Exceeding the cap
+    /// raises `EngineError::QueryBytesExceeded`. Rows are the wrong
+    /// unit when one row carries a multi-MB body (mailrs round-26:
+    /// 1000-row batches of full mail text walked a 15 GiB host into
+    /// reclaim livelock without ever tripping a row ceiling).
+    #[must_use]
+    pub const fn with_max_query_bytes(mut self, n: usize) -> Self {
+        self.max_query_bytes = Some(n);
         self
     }
 
@@ -1714,14 +1752,28 @@ impl Engine {
     /// v4.2: cap result-set size. Applied after the executor
     /// materialises rows but before they leave the engine — wrapping
     /// every Rows-returning exec_* function would scatter the check.
+    ///
+    /// v7.31 (memory campaign, bucket A) — the same choke point now
+    /// also enforces the BYTE budget on the final result set, so
+    /// single-table and aggregate paths (which don't route through
+    /// the join materialiser's incremental accounting) still cannot
+    /// hand the host an unbounded result. Intermediate single-table
+    /// clones are the 7.31.x follow-up (design doc, bucket A).
     fn enforce_row_limit(
         &self,
         result: Result<QueryResult, EngineError>,
     ) -> Result<QueryResult, EngineError> {
-        if let (Ok(QueryResult::Rows { rows, .. }), Some(cap)) = (&result, self.max_query_rows)
-            && rows.len() > cap
-        {
-            return Err(EngineError::RowLimitExceeded(cap));
+        if let Ok(QueryResult::Rows { rows, .. }) = &result {
+            if let Some(cap) = self.max_query_rows
+                && rows.len() > cap
+            {
+                return Err(EngineError::RowLimitExceeded(cap));
+            }
+            if let Some(byte_cap) = self.max_query_bytes
+                && approx_rows_bytes(rows) > byte_cap
+            {
+                return Err(EngineError::QueryBytesExceeded(byte_cap));
+            }
         }
         result
     }
@@ -2332,6 +2384,97 @@ impl Engine {
     /// before any index registered a locator). The walk is
     /// O(tables × indices × keys); cached per call, not across
     /// calls — re-walked on every `SELECT * FROM spg_stat_segment`.
+    /// v7.31 (memory campaign) — walk the committed catalog and
+    /// build the per-bucket memory snapshot. O(rows + index
+    /// entries): operator/monitoring surface, not a query path.
+    pub fn memory_stats(&self) -> MemoryStats {
+        let mut tables: Vec<TableMemoryStats> = Vec::new();
+        let (mut total_enc, mut total_res, mut total_idx) = (0u64, 0u64, 0u64);
+        for tname in self.catalog.table_names() {
+            if is_internal_table_name(&tname) {
+                continue;
+            }
+            let Some(t) = self.catalog.get(&tname) else {
+                continue;
+            };
+            let resident: u64 = t.rows().iter().map(|r| approx_row_bytes(r) as u64).sum();
+            let mut idx_bytes: u64 = 0;
+            for idx in t.indices() {
+                idx_bytes += match &idx.kind {
+                    spg_storage::IndexKind::BTree(map) => {
+                        let mut b: u64 = 0;
+                        for (_, locs) in map.iter() {
+                            b += (core::mem::size_of::<spg_storage::IndexKey>()
+                                + 24
+                                + locs.len() * core::mem::size_of::<spg_storage::RowLocator>())
+                                as u64;
+                        }
+                        b
+                    }
+                    // Parametric estimate: per node, the dense
+                    // layer-0 neighbour list dominates.
+                    spg_storage::IndexKind::Nsw(g) => {
+                        (g.levels.len() * (g.m_max_0 * 8 + 16)) as u64
+                    }
+                    // BRIN is block-range metadata — flat token.
+                    _ => 1024,
+                };
+            }
+            total_enc += t.hot_bytes();
+            total_res += resident;
+            total_idx += idx_bytes;
+            tables.push(TableMemoryStats {
+                name: tname.clone(),
+                hot_rows: t.rows().len() as u64,
+                cold_rows: t.cold_row_count(),
+                hot_encoded_bytes: t.hot_bytes(),
+                approx_resident_bytes: resident,
+                index_count: t.indices().len() as u64,
+                approx_index_bytes: idx_bytes,
+            });
+        }
+        MemoryStats {
+            tables,
+            total_hot_encoded_bytes: total_enc,
+            total_approx_resident_bytes: total_res,
+            total_approx_index_bytes: total_idx,
+            max_query_bytes: self.max_query_bytes,
+        }
+    }
+
+    /// v7.31 — `SELECT * FROM spg_memory_stats`: one row per user
+    /// table (same numbers as `Engine::memory_stats()`), so the
+    /// server path gets the meter through plain SQL.
+    fn exec_spg_memory_stats(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("table_name", DataType::Text, false),
+            ColumnSchema::new("hot_rows", DataType::BigInt, false),
+            ColumnSchema::new("cold_rows", DataType::BigInt, false),
+            ColumnSchema::new("hot_encoded_bytes", DataType::BigInt, false),
+            ColumnSchema::new("approx_resident_bytes", DataType::BigInt, false),
+            ColumnSchema::new("index_count", DataType::BigInt, false),
+            ColumnSchema::new("approx_index_bytes", DataType::BigInt, false),
+        ];
+        #[allow(clippy::cast_possible_wrap)]
+        let rows: Vec<Row> = self
+            .memory_stats()
+            .tables
+            .into_iter()
+            .map(|t| {
+                Row::new(alloc::vec![
+                    Value::Text(t.name),
+                    Value::BigInt(t.hot_rows as i64),
+                    Value::BigInt(t.cold_rows as i64),
+                    Value::BigInt(t.hot_encoded_bytes as i64),
+                    Value::BigInt(t.approx_resident_bytes as i64),
+                    Value::BigInt(t.index_count as i64),
+                    Value::BigInt(t.approx_index_bytes as i64),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
     fn exec_spg_stat_segment(&self) -> QueryResult {
         let columns = alloc::vec![
             ColumnSchema::new("segment_id", DataType::BigInt, false),
@@ -7515,6 +7658,8 @@ impl Engine {
                 // v6.5.0 — observability v2 virtual tables.
                 "spg_stat_replication" => return Ok(self.exec_spg_stat_replication()),
                 "spg_stat_segment" => return Ok(self.exec_spg_stat_segment()),
+                // v7.31 — memory-campaign bucket meters.
+                "spg_memory_stats" => return Ok(self.exec_spg_memory_stats()),
                 "spg_stat_query" => return Ok(self.exec_spg_stat_query()),
                 "spg_stat_activity" => return Ok(self.exec_spg_stat_activity()),
                 "spg_audit_chain" => return Ok(self.exec_spg_audit_chain()),
@@ -8709,6 +8854,7 @@ impl Engine {
         where_: Option<&Expr>,
         cancel: CancelToken<'_>,
         needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
+        budget: &mut ByteBudget,
     ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
         let primary_alias = from
             .primary
@@ -8809,6 +8955,11 @@ impl Engine {
         // the deferred-join pipeline clone only the surviving,
         // referenced columns once at output time. Joinless FROMs and
         // non-table refs take the materialising path.
+        //
+        // v7.30.3 byte-budget interplay: the index path materialises
+        // nothing (row numbers are 8 B each), so the budget charges
+        // land where the clones happen — the materialising fallback
+        // here, eager peers below, and the output assembly.
         let primary_table: Option<&Table> = if !from.joins.is_empty()
             && from.primary.unnest_expr.is_none()
             && from.primary.lateral_subquery.is_none()
@@ -8829,6 +8980,7 @@ impl Engine {
                 if let Some(needed) = needed {
                     Self::null_out_unreferenced(&mut rows, &cols, &primary_alias, needed);
                 }
+                budget.charge(approx_rows_bytes(&rows))?;
                 (rows, cols, None)
             }
         };
@@ -8892,6 +9044,7 @@ impl Engine {
                 if let Some(needed) = needed {
                     Self::null_out_unreferenced(&mut rows, &cols, &a, needed);
                 }
+                budget.charge(approx_rows_bytes(&rows))?;
                 joined.push(JoinedPeer {
                     eager_rows: Some(rows),
                     cols,
@@ -9006,6 +9159,9 @@ impl Engine {
             }
             let right_arity = peer.cols.len();
             let peer_mask = keep_mask(&peer.cols, &peer.alias);
+            // Stage outputs are row-number tuples (8 B per slot) —
+            // the v7.30.3 byte budget has nothing to meter here; it
+            // charges at the real materialisation points instead.
             let mut next: Vec<usize> = Vec::new();
             // v7.28 (round-22) — hash equi-join. The old path CLONED
             // the full combined row for EVERY (left, right) pair and
@@ -9268,6 +9424,7 @@ impl Engine {
                 if let Some(needed) = needed {
                     Self::null_out_unreferenced(&mut rows, &peer.cols, &peer.alias, needed);
                 }
+                budget.charge(approx_rows_bytes(&rows))?;
                 Some(rows)
             } else {
                 None
@@ -9379,6 +9536,12 @@ impl Engine {
                     continue;
                 }
             }
+            // v7.30.3 byte budget — in the deferred-join pipeline the
+            // tuples are 8 B row numbers; THIS is the point where fat
+            // values actually get cloned and retained, so this is
+            // where the meter charges (rows failing WHERE are dropped
+            // immediately and never accumulate).
+            budget.charge(approx_row_bytes(&row))?;
             filtered.push(row);
         }
         Ok((combined_schema, filtered))
@@ -9458,12 +9621,306 @@ impl Engine {
         }
     }
 
+    /// v7.30.3 (mailrs round-26) — bounded execution for the backfill
+    /// shape that walked prod into reclaim livelock:
+    ///
+    ///   SELECT … FROM big b JOIN small s ON b.k = s.k
+    ///   WHERE … ORDER BY … LIMIT n
+    ///
+    /// The general join path materialises the FULL join+filter result
+    /// (≈2× the table's fat columns on a fresh backfill scan) before
+    /// LIMIT truncates to n rows. Here the primary streams row-by-row
+    /// against a hash of the materialised peer, and accepted rows feed
+    /// a keep = LIMIT+OFFSET bounded top-N heap — peak memory scales
+    /// with the answer, not the table. Returns Ok(None) when the shape
+    /// doesn't qualify; the caller falls through to the general path,
+    /// which the byte budget guards.
+    fn try_streamed_inner_join_topn(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        // Shape gate — any bail lands on the general path.
+        let Some(limit) = stmt.limit_literal() else {
+            return Ok(None);
+        };
+        if stmt.offset.is_some() && stmt.offset_literal().is_none() {
+            return Ok(None);
+        }
+        if stmt.distinct
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || aggregate::uses_aggregate(stmt)
+        {
+            return Ok(None);
+        }
+        if from.joins.len() != 1 {
+            return Ok(None);
+        }
+        let j = &from.joins[0];
+        if !matches!(j.kind, JoinKind::Inner) {
+            return Ok(None);
+        }
+        let plain = |t: &TableRef| {
+            t.unnest_expr.is_none() && t.lateral_subquery.is_none() && t.as_of_segment.is_none()
+        };
+        if !plain(&from.primary) || !plain(&j.table) {
+            return Ok(None);
+        }
+        let Some(on_expr) = j.on.as_ref() else {
+            return Ok(None);
+        };
+        // Plain catalog tables only — views / virtual tables keep the
+        // general path's materialise_table_ref fallback.
+        let Some(primary_table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        if self.active_catalog().get(&j.table.name).is_none() {
+            return Ok(None);
+        }
+        let primary_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str())
+            .to_string();
+        let peer_alias = j
+            .table
+            .alias
+            .as_deref()
+            .unwrap_or(j.table.name.as_str())
+            .to_string();
+        let mut needed = alloc::collections::BTreeSet::new();
+        let prunable = collect_qualified_refs(stmt, &mut needed).is_some();
+        // Peer side: materialise + prune exactly like the general
+        // path; the budget still guards a degenerately fat peer.
+        let mut budget = ByteBudget::new(self.max_query_bytes);
+        let (mut peer_rows, peer_cols) = self.materialise_table_ref_filtered(&j.table, &[])?;
+        if prunable {
+            Self::null_out_unreferenced(&mut peer_rows, &peer_cols, &peer_alias, &needed);
+        }
+        budget.charge(approx_rows_bytes(&peer_rows))?;
+        let primary_cols = primary_table.schema().columns.clone();
+        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &primary_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{primary_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for col in &peer_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{peer_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        let ctx = EvalContext::new(&combined_schema, None);
+        // Hash-joinable left = right equality pairs from ON; anything
+        // else stays as a residual conjunct on the candidate row.
+        let left_arity = primary_cols.len();
+        let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut residual: Vec<&Expr> = Vec::new();
+        for sub in reorder::split_and_conjunctions(on_expr) {
+            let mut matched = None;
+            if let Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::Eq,
+                rhs,
+            } = sub
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let left_slice = &combined_schema[..left_arity];
+                if let (Some(l), Some(r)) = (
+                    Self::composite_col_pos(left_slice, a),
+                    Self::peer_col_pos(&peer_alias, &peer_cols, b),
+                ) {
+                    matched = Some((l, r));
+                } else if let (Some(l), Some(r)) = (
+                    Self::composite_col_pos(left_slice, b),
+                    Self::peer_col_pos(&peer_alias, &peer_cols, a),
+                ) {
+                    matched = Some((l, r));
+                }
+            }
+            match matched {
+                Some(pair) => eq_pairs.push(pair),
+                None => residual.push(sub),
+            }
+        }
+        if eq_pairs.is_empty() {
+            return Ok(None); // nested-loop shapes stay on the general path
+        }
+        // Hash the peer on the equality key (NULL keys never match).
+        let mut htable: hashbrown::HashMap<String, Vec<usize>> =
+            hashbrown::HashMap::with_capacity(peer_rows.len());
+        let mut keybuf: Vec<Value> = Vec::with_capacity(eq_pairs.len());
+        'build: for (ri, right) in peer_rows.iter().enumerate() {
+            keybuf.clear();
+            for (_, rpos) in &eq_pairs {
+                let v = right.values.get(*rpos).cloned().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    continue 'build;
+                }
+                keybuf.push(v);
+            }
+            htable
+                .entry(aggregate::encode_key(&keybuf))
+                .or_default()
+                .push(ri);
+        }
+        // Streamed twin of null_out_unreferenced: clone only the
+        // referenced primary columns into each candidate row.
+        let keep_mask: Vec<bool> = primary_cols
+            .iter()
+            .map(|c| !prunable || needed.contains(&(primary_alias.clone(), c.name.clone())))
+            .collect();
+        let keep = (limit as usize).saturating_add(stmt.offset_literal().map_or(0, |o| o as usize));
+        let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+        let mut where_memo = memoize::MemoizeCache::default();
+        let mut heap: alloc::collections::BinaryHeap<TopNEntry> =
+            alloc::collections::BinaryHeap::new();
+        let mut plain_sink: Vec<Row> = Vec::new();
+        let mut seq: u64 = 0;
+        'scan: for left in primary_table.rows().iter() {
+            cancel.check()?;
+            if keep == 0 {
+                break 'scan;
+            }
+            keybuf.clear();
+            let mut left_has_null = false;
+            for (lpos, _) in &eq_pairs {
+                let v = left.values.get(*lpos).cloned().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    left_has_null = true;
+                    break;
+                }
+                keybuf.push(v);
+            }
+            if left_has_null {
+                continue;
+            }
+            let Some(cands) = htable.get(&aggregate::encode_key(&keybuf)) else {
+                continue;
+            };
+            for &ri in cands {
+                let right = &peer_rows[ri];
+                let mut combined_vals: Vec<Value> =
+                    Vec::with_capacity(left_arity + peer_cols.len());
+                for (i, v) in left.values.iter().enumerate() {
+                    combined_vals.push(if keep_mask.get(i).copied().unwrap_or(true) {
+                        v.clone()
+                    } else {
+                        Value::Null
+                    });
+                }
+                combined_vals.extend(right.values.iter().cloned());
+                let combined = Row::new(combined_vals);
+                let mut ok = true;
+                for r in &residual {
+                    let cond = self.eval_expr_with_correlated(r, &combined, &ctx, cancel, None)?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                if let Some(w) = stmt.where_.as_ref() {
+                    let cond = self.eval_expr_with_correlated(
+                        w,
+                        &combined,
+                        &ctx,
+                        cancel,
+                        Some(&mut where_memo),
+                    )?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                if stmt.order_by.is_empty() {
+                    budget.charge(approx_row_bytes(&combined))?;
+                    plain_sink.push(combined);
+                    if plain_sink.len() >= keep {
+                        break 'scan;
+                    }
+                } else {
+                    let raw = build_order_keys(&stmt.order_by, &combined, &ctx)?;
+                    let keys: Vec<f64> = raw
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, k)| {
+                            if descs.get(i).copied().unwrap_or(false) {
+                                -k
+                            } else {
+                                k
+                            }
+                        })
+                        .collect();
+                    let entry = TopNEntry {
+                        keys,
+                        seq,
+                        row: combined,
+                    };
+                    seq += 1;
+                    if heap.len() < keep {
+                        budget.charge(approx_row_bytes(&entry.row))?;
+                        heap.push(entry);
+                    } else if let Some(top) = heap.peek()
+                        && entry < *top
+                    {
+                        if let Some(evicted) = heap.pop() {
+                            budget.release(approx_row_bytes(&evicted.row));
+                        }
+                        budget.charge(approx_row_bytes(&entry.row))?;
+                        heap.push(entry);
+                    }
+                }
+            }
+        }
+        let mut output: Vec<Row> = if stmt.order_by.is_empty() {
+            plain_sink
+        } else {
+            heap.into_sorted_vec().into_iter().map(|e| e.row).collect()
+        };
+        apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
+        let projection = build_projection(&stmt.items, &combined_schema, "")?;
+        let mut proj_memo = memoize::MemoizeCache::default();
+        let mut rows: Vec<Row> = Vec::with_capacity(output.len());
+        for row in &output {
+            let mut values = Vec::with_capacity(projection.len());
+            for p in &projection {
+                values.push(self.eval_expr_with_correlated(
+                    &p.expr,
+                    row,
+                    &ctx,
+                    cancel,
+                    Some(&mut proj_memo),
+                )?);
+            }
+            rows.push(Row::new(values));
+        }
+        let columns: Vec<ColumnSchema> = projection
+            .into_iter()
+            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .collect();
+        Ok(Some(QueryResult::Rows { columns, rows }))
+    }
+
     fn exec_joined_select(
         &self,
         stmt: &SelectStatement,
         from: &FromClause,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.30.3 (mailrs round-26) — the bounded single-join path
+        // first; peak memory scales with LIMIT instead of the table.
+        if let Some(out) = self.try_streamed_inner_join_topn(stmt, from, cancel)? {
+            return Ok(out);
+        }
         // v7.17.0 Phase 3.P0-43 + P0-41 — delegate the join +
         // WHERE materialisation to the shared helper so the LATERAL
         // / UNNEST / regular-catalog paths route through one place.
@@ -9471,6 +9928,7 @@ impl Engine {
         // of Phase 3.P0-41.) Downstream we still handle aggregate /
         // projection / ORDER BY / DISTINCT / LIMIT inline because
         // those depend on the SelectStatement's items list.
+        let mut budget = ByteBudget::new(self.max_query_bytes);
         let (combined_schema, filtered) = {
             let mut needed = alloc::collections::BTreeSet::new();
             let prunable = collect_qualified_refs(stmt, &mut needed).is_some();
@@ -9479,6 +9937,7 @@ impl Engine {
                 stmt.where_.as_ref(),
                 cancel,
                 if prunable { Some(&needed) } else { None },
+                &mut budget,
             )?
         };
         let ctx = EvalContext::new(&combined_schema, None);
@@ -9529,7 +9988,9 @@ impl Engine {
             } else {
                 build_order_keys(&stmt.order_by, row, &ctx)?
             };
-            tagged.push((order_keys, Row::new(values)));
+            let out_row = Row::new(values);
+            budget.charge(approx_row_bytes(&out_row))?;
+            tagged.push((order_keys, out_row));
         }
         if !stmt.order_by.is_empty() {
             let keep = if stmt.distinct {
@@ -9569,6 +10030,156 @@ struct ProjectedItem {
     output_name: String,
     ty: DataType,
     nullable: bool,
+}
+
+/// v7.30.3 (mailrs round-26) — approximate heap bytes held by one
+/// `Value`. Fat payloads (text / json / bytea / vectors / arrays)
+/// dominate; fixed-size variants count 0 here because the per-cell
+/// enum overhead is charged separately in `approx_row_bytes`. An
+/// under-estimate is acceptable — the budget is a host-pressure
+/// guard, not an exact meter.
+fn approx_value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Text(s) | Value::Json(s) => s.len(),
+        Value::Bytes(b) => b.len(),
+        Value::Vector(v) => v.len() * 4,
+        Value::TextArray(a) => a
+            .iter()
+            .map(|o| o.as_ref().map_or(0, String::len) + 8)
+            .sum(),
+        Value::IntArray(a) => a.len() * 8,
+        _ => 0,
+    }
+}
+
+/// Approximate heap bytes held by one materialised `Row`: per-cell
+/// enum slots plus fat payloads.
+fn approx_row_bytes(row: &Row) -> usize {
+    row.values.len() * core::mem::size_of::<Value>()
+        + row.values.iter().map(approx_value_bytes).sum::<usize>()
+}
+
+/// v7.30.3 (mailrs round-26) — per-query byte budget for join/filter
+/// materialisation. Net accounting: stages charge what they clone and
+/// release what they free (`working` is released when the next stage
+/// replaces it), so the meter tracks live bytes, not cumulative
+/// churn. `limit = usize::MAX` when the budget is disabled keeps the
+/// hot path branch-free apart from one saturating add + compare.
+struct ByteBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl ByteBudget {
+    const fn new(limit: Option<usize>) -> Self {
+        Self {
+            limit: match limit {
+                Some(n) => n,
+                None => usize::MAX,
+            },
+            used: 0,
+        }
+    }
+
+    fn charge(&mut self, n: usize) -> Result<(), EngineError> {
+        self.used = self.used.saturating_add(n);
+        if self.used > self.limit {
+            return Err(EngineError::QueryBytesExceeded(self.limit));
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, n: usize) {
+        self.used = self.used.saturating_sub(n);
+    }
+}
+
+/// Sum `approx_row_bytes` over a freshly materialised row set.
+fn approx_rows_bytes(rows: &[Row]) -> usize {
+    rows.iter().map(approx_row_bytes).sum()
+}
+
+/// v7.30.3 (mailrs round-26) — bounded top-N sink entry for the
+/// streamed single-join path. `keys` carry per-key DESC pre-encoded
+/// by negation, so ordering is plain ascending lexicographic (the
+/// negation commutes with `cmp_multi_key`'s per-key reverse,
+/// including the ±INF NULL placements `build_order_keys` emits).
+/// `seq` is production order: ties keep the earliest-produced rows,
+/// matching what the general path's stable in-budget sort yields.
+/// The `BinaryHeap` is a max-heap, so `peek()` is the worst kept row.
+struct TopNEntry {
+    keys: Vec<f64>,
+    seq: u64,
+    row: Row,
+}
+
+impl TopNEntry {
+    fn cmp_keys(a: &[f64], b: &[f64]) -> core::cmp::Ordering {
+        for (ka, kb) in a.iter().zip(b.iter()) {
+            let ord = ka.partial_cmp(kb).unwrap_or(core::cmp::Ordering::Equal);
+            if ord != core::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        core::cmp::Ordering::Equal
+    }
+}
+
+impl PartialEq for TopNEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == core::cmp::Ordering::Equal
+    }
+}
+impl Eq for TopNEntry {}
+impl PartialOrd for TopNEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TopNEntry {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        Self::cmp_keys(&self.keys, &other.keys).then(self.seq.cmp(&other.seq))
+    }
+}
+
+/// v7.31 (memory campaign — ceiling-first / never-die, design v1) —
+/// per-table slice of the engine's resident-memory accounting.
+/// `hot_encoded_bytes` is the storage layer's maintained meter (what
+/// the rows encode to); `approx_resident_bytes` is what they COST in
+/// RAM (per-cell enum slots + heap payloads via `approx_row_bytes`)
+/// — the gap between the two is the representation multiplier the
+/// round-26 report measured at ~11× end-to-end.
+#[derive(Debug, Clone)]
+pub struct TableMemoryStats {
+    pub name: String,
+    pub hot_rows: u64,
+    /// Cached cold-row count (refreshed by ANALYZE — see
+    /// `Table::cold_row_count`'s staleness contract).
+    pub cold_rows: u64,
+    pub hot_encoded_bytes: u64,
+    pub approx_resident_bytes: u64,
+    pub index_count: u64,
+    /// BTree indices are walked entry-by-entry (operator surface,
+    /// not a hot path); NSW graphs and BRIN are parametric
+    /// ESTIMATES until spg-storage carries its own byte meters
+    /// (7.31.x follow-up in the design doc).
+    pub approx_index_bytes: u64,
+}
+
+/// v7.31 — whole-engine memory snapshot: the polling form of the
+/// round-26 ask-4 watermark signal. Hosts compare
+/// `total_approx_resident_bytes` (+ their own WAL/file accounting)
+/// against their deployment ceiling and shed/shrink before the
+/// kernel does it for them.
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    pub tables: Vec<TableMemoryStats>,
+    pub total_hot_encoded_bytes: u64,
+    pub total_approx_resident_bytes: u64,
+    pub total_approx_index_bytes: u64,
+    /// The active per-query materialisation budget (bucket A), so a
+    /// monitoring host sees ceiling and usage through one call.
+    pub max_query_bytes: Option<usize>,
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
@@ -10726,8 +11337,13 @@ impl Engine {
             }
             filtered = owned;
         } else {
-            let (combined_schema, rows) =
-                self.build_joined_filtered_rows(from, stmt.where_.as_ref(), cancel, None)?;
+            let (combined_schema, rows) = self.build_joined_filtered_rows(
+                from,
+                stmt.where_.as_ref(),
+                cancel,
+                None,
+                &mut ByteBudget::new(self.max_query_bytes),
+            )?;
             schema_cols_owned = combined_schema;
             alias_opt = None;
             filtered = rows;
@@ -11414,6 +12030,14 @@ impl Engine {
             | Expr::Literal(_)
             | Expr::Placeholder(_)
             | Expr::Column(_) => {}
+            // v7.30.2 — list elements can carry scalar subqueries
+            // (`x IN (1, (SELECT …))`).
+            Expr::InList { expr, list, .. } => {
+                self.resolve_expr_subqueries(expr, cancel)?;
+                for item in list {
+                    self.resolve_expr_subqueries(item, cancel)?;
+                }
+            }
             // v7.10.10 — recurse children.
             Expr::Array(items) => {
                 for elem in items {
@@ -11463,7 +12087,33 @@ impl Engine {
         cancel: CancelToken<'_>,
         mut memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<Value, EngineError> {
-        if !expr_has_subquery(expr) {
+        // v7.30.2 (mailrs round-25) — the has-subquery walk is
+        // O(tree) and a materialised `IN (…)` list makes the tree
+        // huge; cache the answer per expression address so the
+        // per-row dispatch stops re-walking 24k list elements.
+        let has_subq = if let Some(m) = memo.as_deref_mut() {
+            let key = core::ptr::from_ref::<Expr>(expr) as usize;
+            match m.has_subquery.get(&key) {
+                Some(b) => *b,
+                None => {
+                    let b = expr_has_subquery(expr);
+                    m.has_subquery.insert(key, b);
+                    b
+                }
+            }
+        } else {
+            expr_has_subquery(expr)
+        };
+        if !has_subq {
+            // A large materialised `IN (…)` list inside the WHERE
+            // makes the plain eval O(rows × list); route through the
+            // per-query membership set (built once, keyed by node
+            // address) when one is reachable on the AND spine.
+            if let Some(m) = memo.as_deref_mut()
+                && expr_may_use_in_set(expr)
+            {
+                return eval_with_in_sets(expr, row, ctx, m);
+            }
             return eval::eval_expr(expr, row, ctx).map_err(EngineError::Eval);
         }
         // v7.29 (3c) - per-expression plan: the batch maps for this
@@ -11711,6 +12361,12 @@ impl Engine {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
                 self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
             }
+            Expr::InList { expr, list, .. } => {
+                self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
+                for item in list {
+                    self.resolve_correlated_in_expr(item, row, ctx, cancel, memo.as_deref_mut())?;
+                }
+            }
             Expr::Case {
                 operand,
                 branches,
@@ -11802,36 +12458,21 @@ impl Engine {
                         columns.len()
                     )));
                 }
-                // Build the same OR-Eq chain the parse-time literal-list
-                // path constructs, with each value lifted into a Literal.
-                let mut acc: Option<Expr> = None;
+                // v7.30.2 (mailrs round-25) — flat InList, NOT an OR-Eq
+                // chain: chain depth scaled with the inner result's ROW
+                // COUNT, so one 24k-match search overflowed the worker
+                // stack (recursive eval + recursive Box drop) and
+                // aborted the embedding host process.
+                let mut list: Vec<Expr> = Vec::with_capacity(rows.len());
                 for row in rows {
                     let v = row.values.into_iter().next().unwrap_or(Value::Null);
-                    let lit = value_to_literal_expr(v)?;
-                    let cmp = Expr::Binary {
-                        lhs: expr.clone(),
-                        op: BinOp::Eq,
-                        rhs: Box::new(lit),
-                    };
-                    acc = Some(match acc {
-                        None => cmp,
-                        Some(prev) => Expr::Binary {
-                            lhs: Box::new(prev),
-                            op: BinOp::Or,
-                            rhs: Box::new(cmp),
-                        },
-                    });
+                    list.push(value_to_literal_expr(v)?);
                 }
-                let combined = acc.unwrap_or(Expr::Literal(Literal::Bool(false)));
-                let final_expr = if *negated {
-                    Expr::Unary {
-                        op: UnOp::Not,
-                        expr: Box::new(combined),
-                    }
-                } else {
-                    combined
-                };
-                Ok(Some(final_expr))
+                Ok(Some(Expr::InList {
+                    expr: expr.clone(),
+                    list,
+                    negated: *negated,
+                }))
             }
             _ => Ok(None),
         }
@@ -12099,6 +12740,9 @@ fn expr_refers_to(e: &Expr, target: &str) -> bool {
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
         Expr::Array(items) => items.iter().any(|e| expr_refers_to(e, target)),
+        Expr::InList { expr, list, .. } => {
+            expr_refers_to(expr, target) || list.iter().any(|e| expr_refers_to(e, target))
+        }
         Expr::ArraySubscript { target: t, index } => {
             expr_refers_to(t, target) || expr_refers_to(index, target)
         }
@@ -14101,6 +14745,12 @@ fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>
             collect_scalar_subqueries(target, out);
             collect_scalar_subqueries(index, out);
         }
+        Expr::InList { expr, list, .. } => {
+            collect_scalar_subqueries(expr, out);
+            for item in list {
+                collect_scalar_subqueries(item, out);
+            }
+        }
         _ => {}
     }
 }
@@ -14158,6 +14808,12 @@ fn hollow_scalar_subqueries(e: &mut Expr) {
         Expr::ArraySubscript { target, index } => {
             hollow_scalar_subqueries(target);
             hollow_scalar_subqueries(index);
+        }
+        Expr::InList { expr, list, .. } => {
+            hollow_scalar_subqueries(expr);
+            for item in list.iter_mut() {
+                hollow_scalar_subqueries(item);
+            }
         }
         _ => {}
     }
@@ -14250,7 +14906,137 @@ fn splice_planned_subqueries(
             Ok(splice_planned_subqueries(target, plan, idx, row, ctx)?
                 && splice_planned_subqueries(index, plan, idx, row, ctx)?)
         }
+        Expr::InList { expr, list, .. } => {
+            if !splice_planned_subqueries(expr, plan, idx, row, ctx)? {
+                return Ok(false);
+            }
+            for item in list.iter_mut() {
+                if !splice_planned_subqueries(item, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
         _ => Ok(true),
+    }
+}
+
+/// v7.30.2 (mailrs round-25) — minimum element count before an
+/// all-literal `IN` list gets a per-query membership set. Below
+/// this the linear scan wins on build cost.
+const INLIST_SET_THRESHOLD: usize = 64;
+
+/// Cheap pre-check: is a set-eligible `IN` list reachable on the
+/// AND spine of this expression? Anything else keeps the plain
+/// `eval_expr` path untouched.
+fn expr_may_use_in_set(e: &Expr) -> bool {
+    match e {
+        Expr::InList { list, .. } => list.len() >= INLIST_SET_THRESHOLD,
+        Expr::Binary {
+            lhs,
+            op: BinOp::And,
+            rhs,
+        } => expr_may_use_in_set(lhs) || expr_may_use_in_set(rhs),
+        _ => false,
+    }
+}
+
+/// Analyse an `IN` list for set eligibility: every element a literal,
+/// all of one family (integer or string, NULLs tracked separately).
+fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry> {
+    let mut has_null = false;
+    let mut ints: alloc::collections::BTreeSet<i64> = alloc::collections::BTreeSet::new();
+    let mut texts: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    for item in list {
+        let Expr::Literal(lit) = item else {
+            return None;
+        };
+        match lit {
+            Literal::Null => has_null = true,
+            Literal::Integer(i) => {
+                ints.insert(*i);
+            }
+            Literal::String(s) => {
+                texts.insert(s.clone());
+            }
+            _ => return None,
+        }
+        if !ints.is_empty() && !texts.is_empty() {
+            return None;
+        }
+    }
+    let set = if !ints.is_empty() {
+        memoize::InListSet::Int(ints)
+    } else if !texts.is_empty() {
+        memoize::InListSet::Text(texts)
+    } else {
+        return None;
+    };
+    Some(memoize::InListSetEntry { set, has_null })
+}
+
+/// Subquery-free eval that serves large all-literal `IN` lists from
+/// a per-query membership set (cached in the memo by node address).
+/// Walks only the AND spine; every other node — and every needle
+/// whose runtime family doesn't match the set — falls through to
+/// `eval_expr`, so coercion and error semantics stay identical.
+fn eval_with_in_sets(
+    e: &Expr,
+    row: &Row,
+    ctx: &EvalContext<'_>,
+    m: &mut memoize::MemoizeCache,
+) -> Result<Value, EngineError> {
+    match e {
+        Expr::Binary {
+            lhs,
+            op: BinOp::And,
+            rhs,
+        } => {
+            // Mirror eval_expr: both sides evaluate (no short
+            // circuit), then SQL three-valued AND.
+            let l = eval_with_in_sets(lhs, row, ctx, m)?;
+            let r = eval_with_in_sets(rhs, row, ctx, m)?;
+            eval::and_3vl(l, r).map_err(EngineError::Eval)
+        }
+        Expr::InList {
+            expr: lhs,
+            list,
+            negated,
+        } if list.len() >= INLIST_SET_THRESHOLD => {
+            let key = core::ptr::from_ref::<Expr>(e) as usize;
+            let Some(entry) = m
+                .in_sets
+                .entry(key)
+                .or_insert_with(|| build_in_list_set(list))
+            else {
+                return eval::eval_expr(e, row, ctx).map_err(EngineError::Eval);
+            };
+            let needle = eval::eval_expr(lhs, row, ctx).map_err(EngineError::Eval)?;
+            let contained = match (&needle, &entry.set) {
+                // Non-empty list + NULL needle → NULL (negation of
+                // NULL is still NULL).
+                (Value::Null, _) => return Ok(Value::Null),
+                (Value::SmallInt(n), memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
+                (Value::Int(n), memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
+                (Value::BigInt(n), memoize::InListSet::Int(s)) => s.contains(n),
+                (Value::Text(t), memoize::InListSet::Text(s)) => s.contains(t.as_str()),
+                // Cross-family needle (e.g. Float vs integer list):
+                // keep apply_binary's coercion / error behaviour.
+                _ => return eval::eval_expr(e, row, ctx).map_err(EngineError::Eval),
+            };
+            let inner = if contained {
+                Value::Bool(true)
+            } else if entry.has_null {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+            Ok(match (negated, inner) {
+                (true, Value::Bool(b)) => Value::Bool(!b),
+                (_, v) => v,
+            })
+        }
+        _ => eval::eval_expr(e, row, ctx).map_err(EngineError::Eval),
     }
 }
 
@@ -14397,6 +15183,12 @@ fn substitute_in_expr(e: &mut Expr, row: &Row, ctx: &EvalContext<'_>, outer_alia
             substitute_in_expr(expr, row, ctx, outer_alias);
             substitute_in_expr(array, row, ctx, outer_alias);
         }
+        Expr::InList { expr, list, .. } => {
+            substitute_in_expr(expr, row, ctx, outer_alias);
+            for item in list {
+                substitute_in_expr(item, row, ctx, outer_alias);
+            }
+        }
         Expr::Case {
             operand,
             branches,
@@ -14461,6 +15253,9 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::Array(items) => items.iter().any(expr_has_window),
         Expr::ArraySubscript { target, index } => expr_has_window(target) || expr_has_window(index),
         Expr::AnyAll { expr, array, .. } => expr_has_window(expr) || expr_has_window(array),
+        Expr::InList { expr, list, .. } => {
+            expr_has_window(expr) || list.iter().any(expr_has_window)
+        }
         Expr::Case {
             operand,
             branches,
@@ -15371,6 +16166,9 @@ pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
             expr_has_subquery(target) || expr_has_subquery(index)
         }
         Expr::AnyAll { expr, array, .. } => expr_has_subquery(expr) || expr_has_subquery(array),
+        Expr::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
         Expr::Case {
             operand,
             branches,
@@ -15602,6 +16400,12 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
         Expr::AnyAll { expr, array, .. } => {
             rewrite_column_in_expr(expr, old, new);
             rewrite_column_in_expr(array, old, new);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_column_in_expr(expr, old, new);
+            for item in list {
+                rewrite_column_in_expr(item, old, new);
+            }
         }
         Expr::Case {
             operand,
@@ -15895,6 +16699,12 @@ fn substitute_expr(e: &mut Expr, params: &[Value]) -> Result<(), EngineError> {
         Expr::AnyAll { expr, array, .. } => {
             substitute_expr(expr, params)?;
             substitute_expr(array, params)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            substitute_expr(expr, params)?;
+            for item in list {
+                substitute_expr(item, params)?;
+            }
         }
         Expr::Case {
             operand,
@@ -16257,6 +17067,12 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         Expr::AnyAll { expr, array, .. } => {
             rewrite_expr_clock(expr, now);
             rewrite_expr_clock(array, now);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_expr_clock(expr, now);
+            for item in list {
+                rewrite_expr_clock(item, now);
+            }
         }
         Expr::Case {
             operand,

@@ -1,21 +1,21 @@
 name: CI
 
-# git-flow trigger map. Heavy gates (prod_ready, slo_smoke, perf_gate,
-# release-build) gate by branch via `if:` so feature/bugfix pushes get
-# fast feedback while release/hotfix + integration lines (develop, master)
-# run the full battery. See .claude/git-flow.md for the mapping table.
+# git-flow trigger map — push-only, no PRs. All merges happen locally
+# via `git flow {feature,bugfix,release,hotfix} finish`; what reaches
+# origin is already-merged history. Heavy gates (prod_ready, slo_smoke,
+# perf_gate, release-build) gate by branch via `if:` so feature/bugfix
+# pushes get fast feedback while release/hotfix + integration lines
+# (develop, master) run the full battery. See .claude/git-flow.md for
+# the mapping table.
 on:
   push:
     branches:
       - master
-      - main
       - develop
       - 'release/**'
       - 'hotfix/**'
       - 'feature/**'
       - 'bugfix/**'
-  pull_request:
-    branches: [master, main, develop]
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,7 +26,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install rustfmt
         run: rustup component add rustfmt
       - name: cargo fmt --check
@@ -36,7 +36,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install clippy
         run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
@@ -47,7 +47,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --workspace
         run: cargo build --workspace --locked
@@ -72,18 +72,16 @@ jobs:
     # the gate now actually runs (45 / 45 on master CI as of v7.12.7),
     # so the v7.11.x `continue-on-error` soft-fail is gone.
     #
-    # Skipped on plain feature/bugfix pushes — runs on every PR (so the
-    # gate fires before merge to develop/master) and on any push to
-    # integration / release lines.
+    # Skipped on plain feature/bugfix pushes — runs on any push to
+    # integration / release lines, i.e. right after a git-flow finish
+    # merge lands.
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --release --test prod_ready
         run: cargo test --release -p spg-server --test prod_ready --locked
@@ -95,16 +93,14 @@ jobs:
     # on a normal runner. SLO ceilings are intentionally loose
     # (~2-3× v4.27 baseline) so shared-runner noise doesn't false-alarm.
     #
-    # Same gate policy as prod_ready: PRs + integration/release pushes only.
+    # Same gate policy as prod_ready: integration/release pushes only.
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --release --test slo_smoke
         run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
@@ -125,17 +121,15 @@ jobs:
     # spg-server joined the loop. Fast tier runs here; the
     # `#[ignore]`d full tier is `scripts/gate.sh gates --full`.
     #
-    # Same gate policy as prod_ready / slo_smoke: PRs + integration /
-    # release lines. Skipped on plain feature/bugfix pushes.
+    # Same gate policy as prod_ready / slo_smoke: integration / release
+    # lines. Skipped on plain feature/bugfix pushes.
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --release perf_gate × crates
         run: |
@@ -149,11 +143,18 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check compiled cargo-audit from source on every
+    # run (~190 s of the ~4 min CI wall clock). install-action drops
+    # in the prebuilt binary instead; same advisory DB, same failure
+    # semantics via `cargo audit`'s exit code.
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@v6
+      - name: Install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
 
   deny:
     name: cargo-deny
@@ -161,7 +162,7 @@ jobs:
     # v4.31: license allowlist + duplicate-version check via cargo-deny.
     # Config in deny.toml.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   secret_scan:
@@ -187,50 +188,62 @@ jobs:
     # issuing service (verified) plus genuinely-novel matches
     # the action's analyzers don't recognise (unknown).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
       - name: trufflehog scan
-        uses: trufflesecurity/trufflehog@main
+        # Pinned to the latest release tag, not @main — latest *stable*
+        # principle; a moving branch ref is the opposite of stable.
+        uses: trufflesecurity/trufflehog@v3.95.5
         with:
           extra_args: --results=verified,unknown
 
   dropin_acceptance:
-    name: drop-in acceptance (PG dialect + mailrs fixture)
+    name: drop-in acceptance (candidate image)
     runs-on: ubuntu-latest
-    # v7.18 — boots the published SPG image and feeds the
-    # scripts/dropin-acceptance.sh probe (35-case PG dialect panel +
+    # v7.18 — scripts/dropin-acceptance.sh probe (PG dialect panel +
     # mailrs init-schema.sql / pg-extensions.sql as first real
     # customer fixture). Any regression in PG drop-in compatibility
     # — a stock PG schema that worked yesterday but parser-fails
-    # today — flips this gate red.
+    # today — flips this gate red. HARD GATE since v7.29; any case
+    # that flips ✅→❌ is a release blocker. The per-release
+    # reference reports live at scripts/dropin-acceptance-report-v*.md.
     #
-    # v7.30 — HARD GATE. goliakk/spg:7.30.0 passes the full
-    # 42-case panel (40 dialect cases incl. the four round-12
-    # probes + 2 mailrs fixtures); the checked-in
-    # reference is scripts/dropin-acceptance-report-v7.30.0.md.
-    # Any case that flips ✅→❌ between releases is a release
-    # blocker. Bump the --image arg when the next release image
-    # is published.
+    # 2026-06-13 pipeline governance — the panel used to run against
+    # the previously *published* image (`--image goliakk/spg:7.X.Y`,
+    # bumped by hand after each release). That tested a constant: it
+    # could never catch a regression in the commit under test, and
+    # the manual bump drifted (stuck at 7.30.0 while 7.30.2 was
+    # live). Now the job assembles a candidate image from this
+    # checkout's release binaries (Dockerfile.ci) and gates the
+    # actual commit. The published image is still watched by the
+    # nightly sentinel workflow (dropin-published.yml).
     if: |
-      github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/main' ||
       github.ref == 'refs/heads/develop' ||
       startsWith(github.ref, 'refs/heads/release/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - name: Build candidate binaries
+        run: cargo build --release --locked --bin spg-server --bin spg --bin pg_isready
+      - name: Assemble candidate image
+        run: |
+          mkdir -p target/ci-image
+          cp target/release/spg-server target/release/spg target/release/pg_isready target/ci-image/
+          docker build -f Dockerfile.ci -t spg-candidate:ci target/ci-image
       - name: drop-in acceptance harness
         run: |
           scripts/dropin-acceptance.sh \
-            --image goliakk/spg:7.30.0 \
+            --image spg-candidate:ci \
+            --no-pull \
             --port 25433 \
             --fixture scripts/fixtures/mailrs-pg-extensions.sql \
             --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
             --report ./dropin-acceptance-report.md
       - name: Upload drop-in acceptance report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dropin-acceptance-report
           path: ./dropin-acceptance-report.md
@@ -240,28 +253,22 @@ jobs:
     runs-on: ubuntu-latest
     # Catches optimization-only bugs and confirms the production binary
     # still links cleanly. Runs on anything that will land on master:
-    # master/main push, release/** + hotfix/** push, and PRs targeting
-    # master/main. Skipped on feature/develop to keep their CI quick.
+    # master push, release/** + hotfix/** push. Skipped on
+    # feature/develop to keep their CI quick.
     if: |
-      (github.event_name == 'push' && (
-        github.ref == 'refs/heads/master' ||
-        github.ref == 'refs/heads/main' ||
-        startsWith(github.ref, 'refs/heads/release/') ||
-        startsWith(github.ref, 'refs/heads/hotfix/')
-      )) ||
-      (github.event_name == 'pull_request' && (
-        github.base_ref == 'master' || github.base_ref == 'main'
-      ))
+      github.ref == 'refs/heads/master' ||
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/hotfix/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release -p spg-server
         run: cargo build --release -p spg-server --locked
       - name: Upload spg-server binary
-        # Only upload on master/main pushes — release/hotfix branches
+        # Only upload on master pushes — release/hotfix branches
         # produce the same binary but it's the master tag that we keep.
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
-        uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v7
         with:
           name: spg-server-linux-amd64
           path: target/release/spg-server
