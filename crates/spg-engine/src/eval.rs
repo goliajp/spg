@@ -6491,6 +6491,30 @@ pub(crate) enum Step {
     IsNull {
         negated: bool,
     },
+    /// v7.32 (architecture v2, P1) — `needle [NOT] IN (literals…)`.
+    /// The membership SET is a COMPILE PRODUCT, not a runtime cache:
+    /// it lives in the step, so there is no "forgot to pass the
+    /// memo" failure mode (the round-25 18.7 s accident is now
+    /// unconstructable — see v7.32-executor-architecture-design.md
+    /// invariant I2). The needle is the preceding sub-program; this
+    /// step pops it. `fallback` is the whole InList node, used only
+    /// when the runtime needle family doesn't match the set
+    /// (e.g. Float needle vs Int set) — same escape the interpreter
+    /// takes, evaluated cold.
+    InSet {
+        set: crate::memoize::InListSet,
+        has_null: bool,
+        negated: bool,
+        fallback: Expr,
+    },
+    /// v7.32 (P1) — `text [NOT] [I]LIKE '<literal pattern>'`. The
+    /// pattern (and its lowercased form for ILIKE) is compiled once;
+    /// the step pops the text operand.
+    Like {
+        pattern: alloc::vec::Vec<char>,
+        negated: bool,
+        case_insensitive: bool,
+    },
     /// Fallback: interpret this subtree with eval_expr.
     Subtree(Expr),
 }
@@ -6580,7 +6604,58 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             compile_into(expr, ctx, steps);
             steps.push(Step::IsNull { negated: *negated });
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            // I2: the set is built at compile time. The gate
+            // (`fully_compilable`) guarantees we only reach here
+            // when the list builds a set and the needle compiles —
+            // but keep the Subtree fallback for defence in depth.
+            match crate::build_in_list_set(list) {
+                Some(entry) if fully_compilable(expr) => {
+                    compile_into(expr, ctx, steps);
+                    steps.push(Step::InSet {
+                        set: entry.set,
+                        has_null: entry.has_null,
+                        negated: *negated,
+                        fallback: e.clone(),
+                    });
+                }
+                _ => steps.push(Step::Subtree(e.clone())),
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => match literal_text_pattern(pattern) {
+            Some(pat) if fully_compilable(expr) => {
+                compile_into(expr, ctx, steps);
+                let chars: alloc::vec::Vec<char> = if *case_insensitive {
+                    pat.to_lowercase().chars().collect()
+                } else {
+                    pat.chars().collect()
+                };
+                steps.push(Step::Like {
+                    pattern: chars,
+                    negated: *negated,
+                    case_insensitive: *case_insensitive,
+                });
+            }
+            _ => steps.push(Step::Subtree(e.clone())),
+        },
         other => steps.push(Step::Subtree(other.clone())),
+    }
+}
+
+/// Literal text pattern behind a LIKE/ILIKE, if any.
+fn literal_text_pattern(pattern: &Expr) -> Option<&str> {
+    match pattern {
+        Expr::Literal(Literal::String(s)) => Some(s.as_str()),
+        _ => None,
     }
 }
 
@@ -6595,6 +6670,17 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         Expr::Literal(_) | Expr::Column(_) => true,
         Expr::Binary { lhs, rhs, .. } => fully_compilable(lhs) && fully_compilable(rhs),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => fully_compilable(expr),
+        // I2: an InList is compilable ONLY when it becomes a real
+        // InSet (all-literal list + compilable needle). A
+        // non-set-able InList must keep the whole tree off the
+        // compiled path so it never degrades to a memo-less,
+        // O(list) per-row Subtree (the round-25 18.7 s trap).
+        Expr::InList { expr, list, .. } => {
+            fully_compilable(expr) && crate::build_in_list_set(list).is_some()
+        }
+        Expr::Like { expr, pattern, .. } => {
+            fully_compilable(expr) && literal_text_pattern(pattern).is_some()
+        }
         _ => false,
     }
 }
@@ -6643,6 +6729,75 @@ pub(crate) fn eval_compiled(
                 let v = stack.pop().unwrap_or(Value::Null);
                 let is_null = matches!(v, Value::Null);
                 stack.push(Value::Bool(if *negated { !is_null } else { is_null }));
+            }
+            Step::InSet {
+                set,
+                has_null,
+                negated,
+                fallback,
+            } => {
+                let needle = stack.pop().unwrap_or(Value::Null);
+                let contained = match (&needle, set) {
+                    // Non-empty list + NULL needle → NULL (NOT NULL
+                    // is still NULL) — matches the interpreter and
+                    // eval_with_in_sets.
+                    (Value::Null, _) => {
+                        stack.push(Value::Null);
+                        continue;
+                    }
+                    (Value::SmallInt(n), crate::memoize::InListSet::Int(s)) => {
+                        s.contains(&i64::from(*n))
+                    }
+                    (Value::Int(n), crate::memoize::InListSet::Int(s)) => {
+                        s.contains(&i64::from(*n))
+                    }
+                    (Value::BigInt(n), crate::memoize::InListSet::Int(s)) => s.contains(n),
+                    (Value::Text(t), crate::memoize::InListSet::Text(s)) => s.contains(t.as_str()),
+                    // Cross-family needle: take the interpreter's
+                    // exact coercion / error path on the whole node.
+                    _ => {
+                        stack.push(eval_expr(fallback, row, ctx)?);
+                        continue;
+                    }
+                };
+                let inner = if contained {
+                    Value::Bool(true)
+                } else if *has_null {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                };
+                stack.push(match (negated, inner) {
+                    (true, Value::Bool(b)) => Value::Bool(!b),
+                    (_, v) => v,
+                });
+            }
+            Step::Like {
+                pattern,
+                negated,
+                case_insensitive,
+            } => {
+                let v = stack.pop().unwrap_or(Value::Null);
+                match v {
+                    Value::Null => stack.push(Value::Null),
+                    Value::Text(t) => {
+                        let text: Vec<char> = if *case_insensitive {
+                            t.to_lowercase().chars().collect()
+                        } else {
+                            t.chars().collect()
+                        };
+                        let m = like_match_inner(&text, 0, pattern, 0);
+                        stack.push(Value::Bool(if *negated { !m } else { m }));
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "LIKE requires text operands, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                }
             }
             Step::Subtree(e) => stack.push(eval_expr(e, row, ctx)?),
         }
