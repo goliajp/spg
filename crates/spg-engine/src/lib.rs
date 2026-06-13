@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod copy;
 pub mod describe;
 pub mod eval;
+mod explain;
 mod expr_analysis;
 pub mod fts;
 mod index_access;
@@ -33,6 +34,7 @@ use numeric::{
     numeric_from_float, numeric_from_integer, numeric_rescale, numeric_truncate_to_integer,
     parse_numeric_text,
 };
+use explain::*;
 use expr_analysis::*;
 use index_access::*;
 use system_catalog::*;
@@ -1427,7 +1429,7 @@ impl Engine {
         Ok(reports)
     }
 
-    fn active_catalog(&self) -> &Catalog {
+    pub(crate) fn active_catalog(&self) -> &Catalog {
         match self.current_tx {
             Some(t) => self
                 .tx_catalogs
@@ -11871,312 +11873,6 @@ fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchem
     out
 }
 
-/// v4.26: render a human-readable plan tree for `EXPLAIN <select>`.
-/// Lines are pushed into `out`; `depth` controls indentation. We
-/// describe the rewritten SELECT — what the executor *would* do —
-/// using the engine handle to spot indexed lookups and table shapes.
-#[allow(clippy::too_many_lines, clippy::format_push_string)]
-/// v6.2.4 — Walk every line of the rendered plan tree and append
-/// per-operator stats. Lines that name a known operator get
-/// `(rows=N)` (`actual_rows` of the top-level operator equals the
-/// final result row count; scans report their catalog row count
-/// as the rows-considered metric). Other lines — Filter / Join /
-/// GroupBy / OrderBy etc. — are marked `(—)` so the surface is
-/// complete-by-construction; v6.2.5 fills these in via inline
-/// executor counters.
-/// v6.8.3 — surface "CREATE INDEX …" suggestions for every
-/// `(table, column)` pair the query touches via WHERE / JOIN
-/// that doesn't already have an index on the owning table.
-/// Walks the SELECT's FROM clauses + WHERE expression tree;
-/// returns one line per missing index. Deterministic order:
-/// FROM-clause iteration order, then column-reference walk
-/// order inside each WHERE. Each suggestion is a copy-pastable
-/// DDL string.
-fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -> Vec<String> {
-    use alloc::collections::BTreeSet;
-    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut out: Vec<String> = Vec::new();
-    let cat = engine.active_catalog();
-    // Build a (table, qualifier-or-alias) list from the FROM clause
-    // so unqualified column refs in WHERE resolve to the correct
-    // table.
-    let Some(from) = &stmt.from else {
-        return out;
-    };
-    let mut tables: Vec<String> = Vec::new();
-    tables.push(from.primary.name.clone());
-    for j in &from.joins {
-        tables.push(j.table.name.clone());
-    }
-    // Collect column refs from the WHERE expression. JOIN ON
-    // predicates also feed in.
-    let mut col_refs: Vec<spg_sql::ast::ColumnName> = Vec::new();
-    if let Some(w) = &stmt.where_ {
-        collect_column_refs(w, &mut col_refs);
-    }
-    for j in &from.joins {
-        if let Some(on) = &j.on {
-            collect_column_refs(on, &mut col_refs);
-        }
-    }
-    for cn in &col_refs {
-        // Resolve owner table: explicit qualifier first, else
-        // first table in FROM that has a column of this name.
-        let owner: Option<String> = if let Some(q) = &cn.qualifier {
-            tables.iter().find(|t| t == &q).cloned()
-        } else {
-            tables.iter().find_map(|t| {
-                cat.get(t).and_then(|tbl| {
-                    if tbl.schema().column_position(&cn.name).is_some() {
-                        Some(t.clone())
-                    } else {
-                        None
-                    }
-                })
-            })
-        };
-        let Some(owner) = owner else {
-            continue;
-        };
-        let Some(tbl) = cat.get(&owner) else {
-            continue;
-        };
-        let Some(col_pos) = tbl.schema().column_position(&cn.name) else {
-            continue;
-        };
-        // Skip if any BTree index already covers this column as
-        // its key.
-        let already_indexed = tbl.indices().iter().any(|i| {
-            matches!(i.kind, spg_storage::IndexKind::BTree(_))
-                && i.column_position == col_pos
-                && i.expression.is_none()
-                && i.partial_predicate.is_none()
-        });
-        if already_indexed {
-            continue;
-        }
-        if seen.insert((owner.clone(), cn.name.clone())) {
-            out.push(alloc::format!(
-                "SUGGEST: CREATE INDEX ix_{}_{} ON {} ({})",
-                owner,
-                cn.name,
-                owner,
-                cn.name
-            ));
-        }
-    }
-    out
-}
-
-/// Walks an `Expr` and pushes every `ColumnName` it references.
-/// Order is depth-first, left-to-right.
-fn collect_column_refs(expr: &Expr, out: &mut Vec<spg_sql::ast::ColumnName>) {
-    match expr {
-        Expr::Column(cn) => out.push(cn.clone()),
-        Expr::FunctionCall { args, .. } => {
-            for a in args {
-                collect_column_refs(a, out);
-            }
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            collect_column_refs(lhs, out);
-            collect_column_refs(rhs, out);
-        }
-        Expr::Unary { expr: e, .. } => collect_column_refs(e, out),
-        _ => {}
-    }
-}
-
-fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engine) {
-    let catalog = engine.active_catalog();
-    let cold_ids = catalog.cold_segment_ids_global();
-    let any_cold = !cold_ids.is_empty();
-    let cold_ids_repr = if any_cold {
-        let mut s = alloc::string::String::from("[");
-        for (i, id) in cold_ids.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&alloc::format!("{id}"));
-        }
-        s.push(']');
-        s
-    } else {
-        alloc::string::String::new()
-    };
-    for (idx, line) in lines.iter_mut().enumerate() {
-        let trimmed = line.trim_start();
-        let is_top_level = idx == 0;
-        if is_top_level {
-            line.push_str(&alloc::format!(" (rows={total_rows})"));
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("From: ") {
-            let (name, scan_kind) = match rest.split_once(" [") {
-                Some((n, k)) => (n.trim(), k.trim_end_matches(']')),
-                None => (rest.trim(), ""),
-            };
-            let bare = name.split_whitespace().next().unwrap_or(name);
-            let hot = catalog.get(bare).map(|t| t.rows().len());
-            // v6.2.7 — `cold_segments=[id0,id1,…]` enumerates every
-            // cold-tier segment the scan COULD have walked. v6.2.x
-            // can tighten to per-table by walking the table's
-            // BTree-index cold locators.
-            let annot = match (hot, scan_kind) {
-                (Some(h), "full scan") => {
-                    let mut s = alloc::format!(" (hot_rows={h}");
-                    if any_cold {
-                        s.push_str(&alloc::format!(
-                            ", cold_tier=present, cold_segments={cold_ids_repr}"
-                        ));
-                    }
-                    s.push(')');
-                    s
-                }
-                (Some(h), "index seek") => {
-                    let mut s = alloc::format!(" (hot_rows≤{h}");
-                    if any_cold {
-                        s.push_str(&alloc::format!(
-                            ", cold_tier=present, cold_segments={cold_ids_repr}"
-                        ));
-                    }
-                    s.push(')');
-                    s
-                }
-                _ => " (rows=—)".to_string(),
-            };
-            line.push_str(&annot);
-            continue;
-        }
-        // Filter / GroupBy / Having / OrderBy / Limit / Join etc.
-        line.push_str(" (rows=—)");
-    }
-}
-
-fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &mut Vec<String>) {
-    let pad = "  ".repeat(depth);
-    // 1) Top-level operator label.
-    let top = if !stmt.ctes.is_empty() {
-        if stmt.ctes.iter().any(|c| c.recursive) {
-            "CTEScan (WITH RECURSIVE)"
-        } else {
-            "CTEScan (WITH)"
-        }
-    } else if !stmt.unions.is_empty() {
-        "UnionScan"
-    } else if select_has_window(stmt) {
-        "WindowAgg"
-    } else if aggregate::uses_aggregate(stmt) {
-        "Aggregate"
-    } else if stmt.distinct {
-        "Distinct"
-    } else if stmt.from.is_some() {
-        "TableScan"
-    } else {
-        "Result"
-    };
-    out.push(alloc::format!("{pad}{top}"));
-    let child = "  ".repeat(depth + 1);
-    // 2) CTE bodies.
-    for cte in &stmt.ctes {
-        let head = if cte.recursive {
-            alloc::format!("{child}CTE (recursive): {}", cte.name)
-        } else {
-            alloc::format!("{child}CTE: {}", cte.name)
-        };
-        out.push(head);
-        explain_select(&cte.body, engine, depth + 2, out);
-    }
-    // 3) FROM details — primary table + joins, index hits.
-    if let Some(from) = &stmt.from {
-        let mut tag = alloc::format!("{child}From: {}", from.primary.name);
-        if let Some(alias) = &from.primary.alias {
-            tag.push_str(&alloc::format!(" AS {alias}"));
-        }
-        // Try to detect an index-seek opportunity on WHERE against
-        // the primary table — same heuristic the executor uses.
-        if let Some(w) = &stmt.where_
-            && let Some(table) = engine.active_catalog().get(&from.primary.name)
-        {
-            let alias = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
-            let cols = &table.schema().columns;
-            if try_index_seek(w, cols, engine.active_catalog(), table, alias).is_some() {
-                tag.push_str(" [index seek]");
-            } else {
-                tag.push_str(" [full scan]");
-            }
-        } else {
-            tag.push_str(" [full scan]");
-        }
-        out.push(tag);
-        for j in &from.joins {
-            let kind = match j.kind {
-                spg_sql::ast::JoinKind::Inner => "INNER JOIN",
-                spg_sql::ast::JoinKind::Left => "LEFT JOIN",
-                spg_sql::ast::JoinKind::Cross => "CROSS JOIN",
-            };
-            let mut s = alloc::format!("{child}{kind}: {}", j.table.name);
-            if let Some(alias) = &j.table.alias {
-                s.push_str(&alloc::format!(" AS {alias}"));
-            }
-            if j.on.is_some() {
-                s.push_str(" (ON …)");
-            }
-            out.push(s);
-        }
-    }
-    // 4) WHERE / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET.
-    if let Some(w) = &stmt.where_ {
-        let mut s = alloc::format!("{child}Filter: {w}");
-        if expr_has_subquery(w) {
-            s.push_str(" [subquery]");
-        }
-        out.push(s);
-    }
-    if let Some(gs) = &stmt.group_by {
-        let mut parts = Vec::new();
-        for g in gs {
-            parts.push(alloc::format!("{g}"));
-        }
-        out.push(alloc::format!("{child}GroupBy: {}", parts.join(", ")));
-    }
-    if let Some(h) = &stmt.having {
-        out.push(alloc::format!("{child}Having: {h}"));
-    }
-    for o in &stmt.order_by {
-        let dir = if o.desc { "DESC" } else { "ASC" };
-        out.push(alloc::format!("{child}OrderBy: {} {dir}", o.expr));
-    }
-    if let Some(lim) = stmt.limit {
-        out.push(alloc::format!("{child}Limit: {lim}"));
-    }
-    if let Some(off) = stmt.offset {
-        out.push(alloc::format!("{child}Offset: {off}"));
-    }
-    // 5) Projection — collapse Wildcard or render N items.
-    if stmt
-        .items
-        .iter()
-        .any(|it| matches!(it, SelectItem::Wildcard))
-    {
-        out.push(alloc::format!("{child}Project: *"));
-    } else {
-        out.push(alloc::format!(
-            "{child}Project: {} item(s)",
-            stmt.items.len()
-        ));
-    }
-    // 6) Recurse into UNION peers.
-    for (kind, peer) in &stmt.unions {
-        let label = match kind {
-            UnionKind::All => "UNION ALL",
-            UnionKind::Distinct => "UNION",
-        };
-        out.push(alloc::format!("{child}{label}"));
-        explain_select(peer, engine, depth + 2, out);
-    }
-}
-
 /// v4.23: recognise the engine errors that indicate the inner
 /// SELECT couldn't be evaluated in isolation because it references
 /// an outer column — used by `subquery_replacement` to skip
@@ -13523,7 +13219,7 @@ fn encode_row_key(row: &Row) -> Vec<u8> {
     out
 }
 
-fn select_has_window(stmt: &SelectStatement) -> bool {
+pub(crate) fn select_has_window(stmt: &SelectStatement) -> bool {
     for item in &stmt.items {
         if let SelectItem::Expr { expr, .. } = item
             && expr_has_window(expr)
