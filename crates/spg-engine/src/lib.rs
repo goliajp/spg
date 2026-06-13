@@ -7900,7 +7900,8 @@ impl Engine {
                         },
                     })
             };
-            let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
+            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
+                filtered.iter().map(RowRef::Owned).collect();
             let agg = aggregate::run(
                 stmt,
                 &filtered_refs,
@@ -8135,7 +8136,8 @@ impl Engine {
                         },
                     })
             };
-            let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
+            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
+                filtered.iter().map(RowRef::Owned).collect();
             let agg = aggregate::run(
                 stmt,
                 &filtered_refs,
@@ -8389,9 +8391,11 @@ impl Engine {
                         },
                     })
             };
+            let filtered_rr: alloc::vec::Vec<RowRef<'_>> =
+                filtered.iter().map(|&r| RowRef::Owned(r)).collect();
             let agg = aggregate::run(
                 stmt,
-                &filtered,
+                &filtered_rr,
                 schema_cols,
                 Some(alias),
                 Some(&agg_correlated),
@@ -10062,7 +10066,8 @@ impl Engine {
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
         if aggregate::uses_aggregate(stmt) {
-            let refs: Vec<&Row> = filtered.iter().collect();
+            let refs: alloc::vec::Vec<RowRef<'_>> =
+                filtered.iter().map(RowRef::Owned).collect();
             // v7.29 — a per-query memo so correlated scalar
             // subqueries batch-evaluate once (group map) instead of
             // executing per group.
@@ -14560,6 +14565,65 @@ fn tuple_value<'s>(
         return None;
     }
     sources.get(k)?.get(ri)?.values.get(pos - offsets[k])
+}
+
+/// v7.32 (P4 borrow channel, increment 2) — a row handed to the
+/// aggregate engine. Either a borrowed materialised `Row` (single-table
+/// and legacy paths) or a deferred row-index tuple over join sources
+/// (the join+aggregate path) that resolves cells *by reference* via
+/// `tuple_value`, so the join+aggregate path never materialises a
+/// combined `Row` for the bound-column fast path.
+pub(crate) enum RowRef<'a> {
+    Owned(&'a Row),
+    Tuple {
+        sources: &'a [JoinSrc<'a>],
+        offsets: &'a [usize],
+        tuple: &'a [usize],
+    },
+}
+
+impl RowRef<'_> {
+    /// Borrow the cell at a combined-schema position. The bound-column
+    /// fast path in `aggregate::run` reads cells this way — zero clone.
+    #[inline]
+    fn get(&self, pos: usize) -> Option<&Value> {
+        match self {
+            RowRef::Owned(r) => r.values.get(pos),
+            RowRef::Tuple {
+                sources,
+                offsets,
+                tuple,
+            } => tuple_value(sources, offsets, tuple, pos),
+        }
+    }
+
+    /// Present the row as a `&Row` for the eval path. `Owned` borrows
+    /// directly (zero cost); `Tuple` materialises once into owned values
+    /// — the only allocation, paid solely on the eval (non-bound) path,
+    /// never for the bound fast path. The materialised width is the full
+    /// combined schema (`offsets.last()`); a LEFT-NULL slot or an out-of-
+    /// range position becomes `Value::Null` (same as `tuple_value`).
+    fn as_row(&self) -> Cow<'_, Row> {
+        match self {
+            RowRef::Owned(r) => Cow::Borrowed(r),
+            RowRef::Tuple {
+                sources,
+                offsets,
+                tuple,
+            } => {
+                let width = offsets.last().copied().unwrap_or(0);
+                let mut vals: Vec<Value> = Vec::with_capacity(width);
+                for pos in 0..width {
+                    vals.push(
+                        tuple_value(sources, offsets, tuple, pos)
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+                Cow::Owned(Row::new(vals))
+            }
+        }
+    }
 }
 
 /// Clone a source row's values into a combined-row buffer. A mask

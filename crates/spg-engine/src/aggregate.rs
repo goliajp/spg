@@ -30,6 +30,7 @@ use spg_sql::ast::{Expr, SelectItem, SelectStatement};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
+use crate::RowRef;
 
 /// True if this statement should go through the aggregate path.
 pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
@@ -325,9 +326,9 @@ pub struct AggResult {
 /// surviving subqueries keep erroring loudly.
 pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Result<Value, EvalError>;
 
-pub fn run(
+pub(crate) fn run(
     stmt: &SelectStatement,
-    rows: &[&Row],
+    rows: &[RowRef<'_>],
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
@@ -460,7 +461,7 @@ pub fn run(
             refs.extend(
                 group_pos
                     .iter()
-                    .map(|p| row.values.get(p.unwrap()).unwrap_or(&Value::Null)),
+                    .map(|p| row.get(p.unwrap()).unwrap_or(&Value::Null)),
             );
             encode_key_refs_into(&refs, &mut keybuf_s);
             let idx = match groups.get(keybuf_s.as_str()) {
@@ -481,32 +482,32 @@ pub fn run(
                 // where cond is not TRUE before they reach this
                 // aggregate's accumulator (and before DISTINCT dedup).
                 if let Some(f) = &spec.filter
-                    && !matches!(eval::eval_expr(f, row, &ctx)?, Value::Bool(true))
+                    && !matches!(eval::eval_expr(f, &*row.as_row(), &ctx)?, Value::Bool(true))
                 {
                     continue;
                 }
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], &spec.arg) {
-                    (Some(p), _) => row.values.get(*p).unwrap_or(&Value::Null),
+                    (Some(p), _) => row.get(*p).unwrap_or(&Value::Null),
                     (None, None) => {
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
                     (None, Some(e)) => {
-                        arg_owned = eval::eval_expr(e, row, &ctx)?;
+                        arg_owned = eval::eval_expr(e, &*row.as_row(), &ctx)?;
                         &arg_owned
                     }
                 };
                 let arg2_val = match &spec.arg2 {
                     None => None,
-                    Some(e) => Some(eval::eval_expr(e, row, &ctx)?),
+                    Some(e) => Some(eval::eval_expr(e, &*row.as_row(), &ctx)?),
                 };
                 let order_keys = if spec.order_by.is_empty() {
                     None
                 } else {
                     let mut keys = Vec::with_capacity(spec.order_by.len());
                     for o in &spec.order_by {
-                        keys.push(eval::eval_expr(&o.expr, row, &ctx)?);
+                        keys.push(eval::eval_expr(&o.expr, &*row.as_row(), &ctx)?);
                     }
                     Some(keys)
                 };
@@ -527,6 +528,12 @@ pub fn run(
             }
             continue;
         }
+        // v7.32 (P4 increment 2) — eval (non-bound) path: present the
+        // row as a borrowed Row once (Owned → zero-cost borrow; a join
+        // tuple materialises here exactly once, never on the bound fast
+        // path above), then the original eval loop runs unchanged.
+        let row_materialised = row.as_row();
+        let row: &Row = &row_materialised;
         let group_vals: Vec<Value> = group_exprs
             .iter()
             .map(|g| eval::eval_expr(g, row, &ctx))
@@ -616,7 +623,8 @@ pub fn run(
         // observable. Avoids needing to evaluate group exprs on no row.
         group_exprs.iter().map(|_| DataType::Text).collect()
     } else {
-        let probe = rows[0];
+        let probe_row = rows[0].as_row();
+        let probe: &Row = &probe_row;
         group_exprs
             .iter()
             .map(|g| {
@@ -641,7 +649,7 @@ pub fn run(
     let direct_arg_vals: Vec<Option<Value>> = agg_specs
         .iter()
         .map(|spec| match (&spec.direct_arg, rows.first()) {
-            (Some(e), Some(r)) => eval::eval_expr(e, r, &ctx).map(Some),
+            (Some(e), Some(r)) => eval::eval_expr(e, &*r.as_row(), &ctx).map(Some),
             _ => Ok(None),
         })
         .collect::<Result<_, _>>()?;
