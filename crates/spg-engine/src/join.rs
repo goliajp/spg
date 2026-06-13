@@ -334,150 +334,24 @@ impl Ord for TopNEntry {
     }
 }
 impl Engine {
-    pub(crate) fn build_joined_filtered_rows(
+    /// v7.17.0 Phase 3.P0-41 — build the per-peer descriptor for each
+    /// join stage. A LATERAL peer can't be pre-materialised (its rows
+    /// depend on outer columns), so it gets a sentinel carrying just
+    /// the probed projection schema and the inner SELECT to re-run per
+    /// outer row. A plain table with no pushed predicate is left
+    /// deferred (the index-nested-loop path may avoid cloning it
+    /// entirely). Everything else materialises eagerly to a
+    /// (rows, schema) pair. `peer_preds[i]` are the WHERE conjuncts
+    /// pushed onto peer `i` by `analyze_join_pushdown`.
+    #[allow(clippy::type_complexity)]
+    fn build_join_peers<'a>(
         &self,
-        from: &FromClause,
-        where_: Option<&Expr>,
-        cancel: CancelToken<'_>,
+        from: &'a FromClause,
+        peer_preds: &[Vec<&Expr>],
         needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
         budget: &mut ByteBudget,
-    ) -> Result<DeferredJoin<'_>, EngineError> {
-        let primary_alias = from
-            .primary
-            .alias
-            .as_deref()
-            .unwrap_or(from.primary.name.as_str())
-            .to_string();
-        // v7.28 (round-22) — single-table predicate pushdown. WHERE
-        // conjuncts whose every column is QUALIFIED with one table's
-        // alias filter that table BEFORE the join (with an index
-        // seek when one matches `col = literal`). Only the primary
-        // and INNER peers are eligible — pre-filtering a LEFT peer
-        // would change which rows NULL-extend. Pushed conjuncts stay
-        // in WHERE too (idempotent), so correctness never depends on
-        // the pushdown.
-        let mut primary_preds: Vec<&Expr> = Vec::new();
-        let mut peer_preds: Vec<Vec<&Expr>> = alloc::vec![Vec::new(); from.joins.len()];
-        if let Some(w) = where_ {
-            for sub in reorder::split_and_conjunctions(w) {
-                if expr_has_subquery(sub) || aggregate::contains_aggregate(sub) {
-                    continue;
-                }
-                let mut quals: Vec<&str> = Vec::new();
-                let mut all_qualified = true;
-                collect_column_qualifiers(sub, &mut quals, &mut all_qualified);
-                if !all_qualified || quals.is_empty() {
-                    continue;
-                }
-                let q0 = quals[0];
-                if !quals.iter().all(|q| q.eq_ignore_ascii_case(q0)) {
-                    continue;
-                }
-                if q0.eq_ignore_ascii_case(&primary_alias) {
-                    primary_preds.push(sub);
-                    continue;
-                }
-                for (i, j) in from.joins.iter().enumerate() {
-                    if matches!(j.kind, JoinKind::Inner)
-                        && j.table.lateral_subquery.is_none()
-                        && q0.eq_ignore_ascii_case(
-                            j.table.alias.as_deref().unwrap_or(j.table.name.as_str()),
-                        )
-                    {
-                        peer_preds[i].push(sub);
-                        break;
-                    }
-                }
-            }
-        }
-        // v7.28 (round-22) — table-order swap: when the primary has
-        // no pushed predicate but an INNER peer does, start from the
-        // filtered peer instead. Equi-joins commute; output columns
-        // resolve by composite name, so downstream projection is
-        // order-independent. (A correlated subquery body like
-        // `FROM email_analysis e2 JOIN messages m2 … WHERE
-        // m2.thread_id = '<outer>'` otherwise clones the whole
-        // unfiltered primary once per outer group.)
-        let mut from_owned;
-        let mut from = from;
-        // Safety: swapping reorders which table joins FIRST, so it is
-        // only legal when the FIRST join's ON references no table
-        // beyond {primary, first peer} (a later peer's ON may name
-        // the original primary, which must already be in the
-        // combined row when that peer joins). Restrict to i == 0 AND
-        // an ON whose qualifiers all live in those two tables.
-        if primary_preds.is_empty()
-            && let Some(j0) = from.joins.first()
-            && matches!(j0.kind, JoinKind::Inner)
-            && j0.table.lateral_subquery.is_none()
-            && !peer_preds[0].is_empty()
-        {
-            let peer_alias = j0.table.alias.as_deref().unwrap_or(j0.table.name.as_str());
-            let on_safe = j0.on.as_ref().is_some_and(|on| {
-                let mut quals: Vec<&str> = Vec::new();
-                let mut all_q = true;
-                collect_column_qualifiers(on, &mut quals, &mut all_q);
-                all_q
-                    && quals.iter().all(|q| {
-                        q.eq_ignore_ascii_case(&primary_alias) || q.eq_ignore_ascii_case(peer_alias)
-                    })
-            });
-            if on_safe {
-                from_owned = from.clone();
-                core::mem::swap(&mut from_owned.primary, &mut from_owned.joins[0].table);
-                primary_preds = peer_preds[0].drain(..).collect();
-                from = &from_owned;
-            }
-        }
-        let primary_alias = from
-            .primary
-            .alias
-            .as_deref()
-            .unwrap_or(from.primary.name.as_str())
-            .to_string();
-        // v7.31 (perf campaign) — when the primary is a plain stored
-        // table and there are joins to run, keep it in place: filter
-        // to row indices (same index seek / linear filter) and let
-        // the deferred-join pipeline clone only the surviving,
-        // referenced columns once at output time. Joinless FROMs and
-        // non-table refs take the materialising path.
-        //
-        // v7.30.3 byte-budget interplay: the index path materialises
-        // nothing (row numbers are 8 B each), so the budget charges
-        // land where the clones happen — the materialising fallback
-        // here, eager peers below, and the output assembly.
-        let primary_table: Option<&Table> = if !from.joins.is_empty()
-            && from.primary.unnest_expr.is_none()
-            && from.primary.lateral_subquery.is_none()
-            && from.primary.as_of_segment.is_none()
-        {
-            self.active_catalog().get(&from.primary.name)
-        } else {
-            None
-        };
-        let (primary_rows, primary_cols, primary_indices) = match primary_table {
-            Some(t) => {
-                let idxs = self.filter_table_indices(t, &primary_alias, &primary_preds)?;
-                (Vec::new(), t.schema().columns.clone(), Some(idxs))
-            }
-            None => {
-                let (mut rows, cols) =
-                    self.materialise_table_ref_filtered(&from.primary, &primary_preds)?;
-                if let Some(needed) = needed {
-                    Self::null_out_unreferenced(&mut rows, &cols, &primary_alias, needed);
-                }
-                budget.charge(approx_rows_bytes(&rows))?;
-                (rows, cols, None)
-            }
-        };
-        // v7.17.0 Phase 3.P0-41 — LATERAL peers can't be
-        // pre-materialised because their rows depend on outer
-        // columns. For each peer, build either an eager
-        // (rows, schema) pair or a "lateral" sentinel carrying
-        // just the schema and the inner SELECT to re-run per
-        // outer row.
-        #[allow(clippy::type_complexity)]
-        let mut joined: Vec<JoinedPeer<'_>> = Vec::new();
+    ) -> Result<Vec<JoinedPeer<'a>>, EngineError> {
+        let mut joined: Vec<JoinedPeer<'a>> = Vec::new();
         for j in &from.joins {
             let a = j
                 .table
@@ -542,23 +416,62 @@ impl Engine {
                 });
             }
         }
-        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
-        for col in &primary_cols {
-            combined_schema.push(ColumnSchema::new(
-                alloc::format!("{primary_alias}.{}", col.name),
-                col.ty,
-                col.nullable,
-            ));
-        }
-        for peer in &joined {
-            for col in &peer.cols {
-                combined_schema.push(ColumnSchema::new(
-                    alloc::format!("{}.{}", peer.alias, col.name),
-                    col.ty,
-                    col.nullable,
-                ));
+        Ok(joined)
+    }
+
+    pub(crate) fn build_joined_filtered_rows(
+        &self,
+        from: &FromClause,
+        where_: Option<&Expr>,
+        cancel: CancelToken<'_>,
+        needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
+        budget: &mut ByteBudget,
+    ) -> Result<DeferredJoin<'_>, EngineError> {
+        let (swapped_from, primary_preds, peer_preds) = analyze_join_pushdown(from, where_);
+        let from = swapped_from.as_ref().unwrap_or(from);
+        let primary_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str())
+            .to_string();
+        // v7.31 (perf campaign) — when the primary is a plain stored
+        // table and there are joins to run, keep it in place: filter
+        // to row indices (same index seek / linear filter) and let
+        // the deferred-join pipeline clone only the surviving,
+        // referenced columns once at output time. Joinless FROMs and
+        // non-table refs take the materialising path.
+        //
+        // v7.30.3 byte-budget interplay: the index path materialises
+        // nothing (row numbers are 8 B each), so the budget charges
+        // land where the clones happen — the materialising fallback
+        // here, eager peers below, and the output assembly.
+        let primary_table: Option<&Table> = if !from.joins.is_empty()
+            && from.primary.unnest_expr.is_none()
+            && from.primary.lateral_subquery.is_none()
+            && from.primary.as_of_segment.is_none()
+        {
+            self.active_catalog().get(&from.primary.name)
+        } else {
+            None
+        };
+        let (primary_rows, primary_cols, primary_indices) = match primary_table {
+            Some(t) => {
+                let idxs = self.filter_table_indices(t, &primary_alias, &primary_preds)?;
+                (Vec::new(), t.schema().columns.clone(), Some(idxs))
             }
-        }
+            None => {
+                let (mut rows, cols) =
+                    self.materialise_table_ref_filtered(&from.primary, &primary_preds)?;
+                if let Some(needed) = needed {
+                    Self::null_out_unreferenced(&mut rows, &cols, &primary_alias, needed);
+                }
+                budget.charge(approx_rows_bytes(&rows))?;
+                (rows, cols, None)
+            }
+        };
+        let mut joined = self.build_join_peers(from, &peer_preds, needed, budget)?;
+        let combined_schema = build_combined_schema(&primary_alias, &primary_cols, &joined);
         let ctx = EvalContext::new(&combined_schema, None);
         // v7.28 (round-22) - intermediate-row ceiling: a join whose
         // working set explodes errors instead of eating the host
@@ -1572,4 +1485,130 @@ fn substitute_outer_in_expr(e: &mut Expr, outer_row: &Row, outer_schema: &[Colum
         }
         _ => {}
     }
+}
+
+/// v7.28 (round-22) — single-table predicate pushdown + table-order
+/// swap analysis, run once before the join pipeline. Splits the WHERE
+/// conjuncts into per-table predicate lists (the primary plus one per
+/// INNER peer) so each table can be filtered — with an index seek when
+/// a conjunct is `col = literal` — BEFORE it joins. Pushed conjuncts
+/// stay in WHERE too (idempotent), so correctness never depends on the
+/// pushdown.
+///
+/// When the primary has no pushed predicate but the first INNER peer
+/// does, and the swap is provably safe (equi-joins commute and output
+/// columns resolve by composite name, so downstream projection is
+/// order-independent; restricted to the first join with an ON whose
+/// qualifiers all live in {primary, first peer}), it returns an owned
+/// FromClause with the primary and that peer swapped — the join then
+/// starts from the filtered side instead of cloning the whole
+/// unfiltered primary (e.g. a correlated subquery body like
+/// `FROM email_analysis e2 JOIN messages m2 … WHERE m2.thread_id =
+/// '<outer>'`).
+///
+/// Returns `(swapped_from, primary_preds, peer_preds)`; `swapped_from`
+/// is `Some` only when a swap happened, and the caller rebinds `from`
+/// to it. The returned predicate refs borrow from `where_`.
+fn analyze_join_pushdown<'w>(
+    from: &FromClause,
+    where_: Option<&'w Expr>,
+) -> (Option<FromClause>, Vec<&'w Expr>, Vec<Vec<&'w Expr>>) {
+    let primary_alias = from
+        .primary
+        .alias
+        .as_deref()
+        .unwrap_or(from.primary.name.as_str());
+    let mut primary_preds: Vec<&Expr> = Vec::new();
+    let mut peer_preds: Vec<Vec<&Expr>> = alloc::vec![Vec::new(); from.joins.len()];
+    if let Some(w) = where_ {
+        for sub in reorder::split_and_conjunctions(w) {
+            if expr_has_subquery(sub) || aggregate::contains_aggregate(sub) {
+                continue;
+            }
+            let mut quals: Vec<&str> = Vec::new();
+            let mut all_qualified = true;
+            collect_column_qualifiers(sub, &mut quals, &mut all_qualified);
+            if !all_qualified || quals.is_empty() {
+                continue;
+            }
+            let q0 = quals[0];
+            if !quals.iter().all(|q| q.eq_ignore_ascii_case(q0)) {
+                continue;
+            }
+            if q0.eq_ignore_ascii_case(primary_alias) {
+                primary_preds.push(sub);
+                continue;
+            }
+            for (i, j) in from.joins.iter().enumerate() {
+                if matches!(j.kind, JoinKind::Inner)
+                    && j.table.lateral_subquery.is_none()
+                    && q0.eq_ignore_ascii_case(
+                        j.table.alias.as_deref().unwrap_or(j.table.name.as_str()),
+                    )
+                {
+                    peer_preds[i].push(sub);
+                    break;
+                }
+            }
+        }
+    }
+    // Safety: swapping reorders which table joins FIRST, so it is only
+    // legal when the FIRST join's ON references no table beyond
+    // {primary, first peer} (a later peer's ON may name the original
+    // primary, which must already be in the combined row when that peer
+    // joins). Restrict to i == 0 AND an ON whose qualifiers all live in
+    // those two tables.
+    if primary_preds.is_empty()
+        && let Some(j0) = from.joins.first()
+        && matches!(j0.kind, JoinKind::Inner)
+        && j0.table.lateral_subquery.is_none()
+        && !peer_preds[0].is_empty()
+    {
+        let peer_alias = j0.table.alias.as_deref().unwrap_or(j0.table.name.as_str());
+        let on_safe = j0.on.as_ref().is_some_and(|on| {
+            let mut quals: Vec<&str> = Vec::new();
+            let mut all_q = true;
+            collect_column_qualifiers(on, &mut quals, &mut all_q);
+            all_q
+                && quals.iter().all(|q| {
+                    q.eq_ignore_ascii_case(primary_alias) || q.eq_ignore_ascii_case(peer_alias)
+                })
+        });
+        if on_safe {
+            let mut from_owned = from.clone();
+            core::mem::swap(&mut from_owned.primary, &mut from_owned.joins[0].table);
+            let primary_preds = peer_preds[0].drain(..).collect();
+            return (Some(from_owned), primary_preds, peer_preds);
+        }
+    }
+    (None, primary_preds, peer_preds)
+}
+
+/// Build the combined output schema for a join: every primary column
+/// then every peer column, each qualified `<alias>.<col>` so the
+/// deferred-join cell lookups and downstream projection resolve by
+/// composite name.
+fn build_combined_schema(
+    primary_alias: &str,
+    primary_cols: &[ColumnSchema],
+    joined: &[JoinedPeer<'_>],
+) -> Vec<ColumnSchema> {
+    let mut combined_schema: Vec<ColumnSchema> = Vec::new();
+    for col in primary_cols {
+        combined_schema.push(ColumnSchema::new(
+            alloc::format!("{primary_alias}.{}", col.name),
+            col.ty,
+            col.nullable,
+        ));
+    }
+    for peer in joined {
+        for col in &peer.cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{}.{}", peer.alias, col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+    }
+    combined_schema
 }
