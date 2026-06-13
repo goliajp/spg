@@ -281,6 +281,21 @@ fn stddev_is_sqrt_of_variance() {
     }
 }
 
+/// The `ALL` quantifier (the dual of `DISTINCT`, and the default) must
+/// parse — ORMs emit `COUNT(ALL x)` / `SUM(ALL x)`.
+#[test]
+fn all_quantifier_parses() {
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE t (x INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(2),(3)").unwrap();
+    let r = rows_of(&mut db, "SELECT COUNT(ALL x), SUM(ALL x) FROM t");
+    assert_eq!(r[0][0], Value::BigInt(4)); // ALL keeps duplicates
+    assert_eq!(r[0][1], Value::BigInt(8)); // 1+2+2+3
+    // DISTINCT still dedupes.
+    let r = rows_of(&mut db, "SELECT COUNT(DISTINCT x) FROM t");
+    assert_eq!(r[0][0], Value::BigInt(3));
+}
+
 /// Bitwise aggregates over integer columns.
 #[test]
 fn bitwise_aggregates() {
@@ -294,6 +309,53 @@ fn bitwise_aggregates() {
     assert_eq!(r[0][0], Value::BigInt(0));
     assert_eq!(r[0][1], Value::BigInt(30));
     assert_eq!(r[0][2], Value::BigInt(20));
+}
+
+/// Two-argument regression family `f(Y, X)`, verified on a perfect
+/// line y = 2x + 1.
+#[test]
+fn regression_aggregates() {
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE p (x INT, y INT)").unwrap();
+    db.execute("INSERT INTO p VALUES (1,3),(2,5),(3,7),(4,9)").unwrap();
+    let r = rows_of(
+        &mut db,
+        "SELECT regr_slope(y,x), regr_intercept(y,x), corr(y,x), regr_r2(y,x), \
+                regr_count(y,x), regr_avgx(y,x), regr_avgy(y,x), \
+                covar_pop(y,x), covar_samp(y,x) FROM p",
+    );
+    assert_eq!(r[0][0], Value::Float(2.0)); // slope
+    assert_eq!(r[0][1], Value::Float(1.0)); // intercept
+    assert_eq!(r[0][2], Value::Float(1.0)); // corr (perfect)
+    assert_eq!(r[0][3], Value::Float(1.0)); // r2
+    assert_eq!(r[0][4], Value::BigInt(4)); // count
+    assert_eq!(r[0][5], Value::Float(2.5)); // avgx
+    assert_eq!(r[0][6], Value::Float(6.0)); // avgy
+    assert_eq!(r[0][7], Value::Float(2.5)); // covar_pop
+    match r[0][8] {
+        Value::Float(v) => assert!((v - 10.0 / 3.0).abs() < 1e-9), // covar_samp
+        ref other => panic!("expected float, got {other:?}"),
+    }
+    // Only pairs where BOTH are non-NULL count.
+    db.execute("INSERT INTO p VALUES (5, NULL), (NULL, 11)").unwrap();
+    let r = rows_of(&mut db, "SELECT regr_count(y, x) FROM p");
+    assert_eq!(r[0][0], Value::BigInt(4)); // the two NULL-bearing rows excluded
+}
+
+/// JSON aggregates: array (json_agg/jsonb_agg) and object
+/// (json_object_agg). Empty set → SQL NULL.
+#[test]
+fn json_aggregates() {
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE p (x INT, y INT)").unwrap();
+    db.execute("INSERT INTO p VALUES (1,3),(2,5),(3,7)").unwrap();
+    let r = rows_of(&mut db, "SELECT json_agg(x) FROM p");
+    assert_eq!(r[0][0], Value::Json("[1, 2, 3]".into()));
+    let r = rows_of(&mut db, "SELECT json_object_agg(x, y) FROM p");
+    assert_eq!(r[0][0], Value::Json("{\"1\": 3, \"2\": 5, \"3\": 7}".into()));
+    // empty → NULL (PG)
+    let r = rows_of(&mut db, "SELECT json_agg(x) FROM p WHERE x > 99");
+    assert_eq!(r[0][0], Value::Null);
 }
 
 /// The whole new family composes with FILTER (the decoration applies
