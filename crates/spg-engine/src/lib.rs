@@ -15013,7 +15013,7 @@ fn expr_may_use_in_set(e: &Expr) -> bool {
 
 /// Analyse an `IN` list for set eligibility: every element a literal,
 /// all of one family (integer or string, NULLs tracked separately).
-fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry> {
+pub(crate) fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry> {
     let mut has_null = false;
     let mut ints: alloc::collections::BTreeSet<i64> = alloc::collections::BTreeSet::new();
     let mut texts: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();

@@ -21,6 +21,7 @@ mod e2e_cold_rows_per_table;
 mod e2e_collate;
 mod e2e_collate_order_group;
 mod e2e_compaction;
+mod e2e_compiled_expr;
 mod e2e_concat;
 mod e2e_concat_ws;
 mod e2e_create_extension;
