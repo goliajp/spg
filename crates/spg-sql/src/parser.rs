@@ -8606,6 +8606,77 @@ impl Parser {
         Ok(Some(Box::new(cond)))
     }
 
+    /// v7.32 (round-29) — `WITHIN GROUP ( ORDER BY <sort_spec> )` tail
+    /// for ordered-set aggregates. `WITHIN` is unreserved (arrives as an
+    /// `Ident`); `GROUP` and `ORDER`/`BY` are keywords. Returns the sort
+    /// keys, or an empty vec when no `WITHIN GROUP` follows.
+    fn parse_within_group_clause(&mut self) -> Result<Vec<OrderBy>, ParseError> {
+        let (Token::Ident(s) | Token::QuotedIdent(s)) = self.peek() else {
+            return Ok(Vec::new());
+        };
+        if !s.eq_ignore_ascii_case("within") {
+            return Ok(Vec::new());
+        }
+        self.advance(); // WITHIN
+        if !matches!(self.peek(), Token::Group) {
+            return Err(self.err(format!(
+                "expected GROUP after WITHIN, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // GROUP
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "expected '(' after WITHIN GROUP, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // (
+        if !matches!(self.peek(), Token::Order) {
+            return Err(self.err(format!(
+                "expected ORDER BY inside WITHIN GROUP (...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // ORDER
+        if !matches!(self.peek(), Token::By) {
+            return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
+        }
+        self.advance(); // BY
+        let mut keys: Vec<OrderBy> = Vec::new();
+        loop {
+            let expr = self.parse_expr(0)?;
+            let desc = if matches!(self.peek(), Token::Desc) {
+                self.advance();
+                true
+            } else if matches!(self.peek(), Token::Asc) {
+                self.advance();
+                false
+            } else {
+                false
+            };
+            let nulls_first = self.parse_optional_nulls_placement()?;
+            keys.push(OrderBy {
+                expr,
+                desc,
+                nulls_first,
+            });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' to close WITHIN GROUP (ORDER BY ...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // )
+        Ok(keys)
+    }
+
     /// No frame clause is supported.
     #[allow(clippy::type_complexity)] // (partitions, ordered-keys-with-desc) is the natural shape
     fn parse_over_clause(
@@ -8937,6 +9008,25 @@ impl Parser {
                 }
             }
             self.advance(); // consume ')'
+            // v7.32 (round-29) — ordered-set aggregate tail
+            // `name(direct_args) WITHIN GROUP (ORDER BY …)`
+            // (percentile_cont / percentile_disc / mode). The sort spec
+            // lands in the same `order_by` slot a decorated aggregate
+            // uses; the executor dispatches on the function name. WITHIN
+            // GROUP and an intra-argument ORDER BY are mutually
+            // exclusive (PG rejects both).
+            let within_group_order = self.parse_within_group_clause()?;
+            if !within_group_order.is_empty() && !agg_order_by.is_empty() {
+                return Err(self.err(
+                    "an aggregate may not carry both an in-argument ORDER BY and WITHIN GROUP"
+                        .into(),
+                ));
+            }
+            let agg_order_by = if within_group_order.is_empty() {
+                agg_order_by
+            } else {
+                within_group_order
+            };
             // v7.32 (round-29) — `name(args) FILTER (WHERE …)`.
             let filter = self.parse_filter_clause()?;
             // v4.12: window-function tail — `name(args) OVER (...)`.
