@@ -6449,7 +6449,9 @@ pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_st
     // resolve_column): match a single composite ending in
     // ".<name>".
     let ends_with_dot_name = |s: &str| {
-        s.len() >= c.name.len() + 1
+        // usize: `len > name.len()` ≡ `len >= name.len() + 1`
+        // (rust 1.96 clippy::int_plus_one sweep).
+        s.len() > c.name.len()
             && s.ends_with(c.name.as_str())
             && s.as_bytes()[s.len() - c.name.len() - 1] == b'.'
     };
