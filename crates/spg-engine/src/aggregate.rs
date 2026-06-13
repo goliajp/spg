@@ -185,6 +185,11 @@ struct AggSpec {
     /// other aggregates are order-insensitive and ignore it (PG
     /// accepts the syntax everywhere too).
     order_by: Vec<spg_sql::ast::OrderBy>,
+    /// v7.32 (round-29) — `FILTER (WHERE cond)`: a per-row predicate
+    /// evaluated against the source row before accumulation. A row
+    /// whose `cond` is not TRUE (false or NULL) is excluded from this
+    /// aggregate only. `None` for the unfiltered form.
+    filter: Option<Expr>,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -337,6 +342,14 @@ pub fn run(
             };
             let entry = &mut order[idx];
             for (i, spec) in agg_specs.iter().enumerate() {
+                // v7.32 (round-29) — FILTER (WHERE cond): exclude rows
+                // where cond is not TRUE before they reach this
+                // aggregate's accumulator (and before DISTINCT dedup).
+                if let Some(f) = &spec.filter
+                    && !matches!(eval::eval_expr(f, row, &ctx)?, Value::Bool(true))
+                {
+                    continue;
+                }
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], &spec.arg) {
                     (Some(p), _) => row.values.get(*p).unwrap_or(&Value::Null),
@@ -411,6 +424,13 @@ pub fn run(
         };
         let entry = &mut order[idx];
         for (i, spec) in agg_specs.iter().enumerate() {
+            // v7.32 (round-29) — FILTER (WHERE cond): exclude rows where
+            // cond is not TRUE before accumulation (and before DISTINCT).
+            if let Some(f) = &spec.filter
+                && !matches!(eval::eval_expr(f, row, &ctx)?, Value::Bool(true))
+            {
+                continue;
+            }
             let arg_val = match &spec.arg {
                 None => Value::Bool(true), // count_star: sentinel non-null
                 Some(e) => eval::eval_expr(e, row, &ctx)?,
@@ -788,6 +808,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             call,
             order_by,
             distinct,
+            filter,
         } => {
             if let Expr::FunctionCall { name, args } = call.as_ref() {
                 let lower = name.to_ascii_lowercase();
@@ -807,6 +828,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         },
                         distinct: *distinct,
                         order_by: order_by.clone(),
+                        filter: filter.as_deref().cloned(),
                     };
                     if !out.iter().any(|s| {
                         s.name == spec.name
@@ -814,6 +836,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                             && s.arg2 == spec.arg2
                             && s.distinct == spec.distinct
                             && s.order_by == spec.order_by
+                            && s.filter == spec.filter
                     }) {
                         out.push(spec);
                     }
@@ -855,6 +878,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     arg2: arg2.clone(),
                     distinct: false,
                     order_by: Vec::new(),
+                    filter: None,
                 };
                 if !out.iter().any(|s| {
                     s.name == spec.name
@@ -862,6 +886,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         && s.arg2 == spec.arg2
                         && !s.distinct
                         && s.order_by == spec.order_by
+                        && s.filter.is_none()
                 }) {
                     out.push(spec);
                 }
@@ -1228,6 +1253,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         call,
         order_by,
         distinct,
+        filter,
     } = e
         && let Expr::FunctionCall { name, args } = call.as_ref()
     {
@@ -1240,12 +1266,14 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             } else {
                 None
             };
+            let filter_owned = filter.as_deref().cloned();
             for (i, spec) in aggs.iter().enumerate() {
                 if spec.name == canonical
                     && spec.arg == arg
                     && spec.arg2 == arg2
                     && spec.distinct == *distinct
                     && spec.order_by == *order_by
+                    && spec.filter == filter_owned
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
                         qualifier: None,
@@ -1309,6 +1337,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             call,
             order_by,
             distinct,
+            filter,
         } => Expr::AggregateOrdered {
             call: Box::new(rewrite_expr(call, group_exprs, aggs)),
             distinct: *distinct,
@@ -1320,6 +1349,9 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                     nulls_first: o.nulls_first,
                 })
                 .collect(),
+            // The filter is evaluated against SOURCE rows during
+            // accumulation, never against synth rows — keep it as-is.
+            filter: filter.clone(),
         },
         Expr::Binary { lhs, op, rhs } => Expr::Binary {
             lhs: Box::new(rewrite_expr(lhs, group_exprs, aggs)),

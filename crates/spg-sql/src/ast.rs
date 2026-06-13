@@ -1950,6 +1950,15 @@ pub enum Expr {
         /// `string_agg(DISTINCT s, ',')`. The wrapper carries every
         /// aggregate modifier so plain FunctionCall stays untouched.
         distinct: bool,
+        /// v7.32 (mailrs round-29) — `agg(args) FILTER (WHERE cond)`.
+        /// Only the rows where `cond` is true contribute to this
+        /// aggregate (SQL:2003 T612 / PG 9.4). Carried as a first-class
+        /// modifier — NOT desugared to `agg(CASE WHEN cond THEN arg
+        /// END)`, which is faithful for NULL-ignoring aggregates but
+        /// WRONG for `array_agg` (it would collect a NULL per excluded
+        /// row). The executor instead skips excluded rows before
+        /// accumulation, which is correct for every aggregate.
+        filter: Option<Box<Expr>>,
     },
     /// SQL `LIKE` predicate. `pattern` evaluates to text at runtime;
     /// wildcards are `%` (any run) and `_` (one char), backslash escapes
@@ -3909,9 +3918,11 @@ impl fmt::Display for Expr {
                 call,
                 order_by,
                 distinct,
+                filter,
             } => {
-                // Render as `name([DISTINCT ]args [ORDER BY …])` —
-                // peel the inner call's parens to splice modifiers.
+                // Render as `name([DISTINCT ]args [ORDER BY …])
+                // [FILTER (WHERE …)]` — peel the inner call's parens to
+                // splice modifiers.
                 let inner = alloc::format!("{call}");
                 let body = inner.strip_suffix(')').unwrap_or(&inner);
                 let (head, args_part) = body.split_once('(').unwrap_or((body, ""));
@@ -3920,25 +3931,28 @@ impl fmt::Display for Expr {
                     f.write_str("DISTINCT ")?;
                 }
                 write!(f, "{args_part}")?;
-                if order_by.is_empty() {
-                    return f.write_str(")");
+                if !order_by.is_empty() {
+                    f.write_str(" ORDER BY ")?;
+                    for (i, o) in order_by.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{}", o.expr)?;
+                        if o.desc {
+                            f.write_str(" DESC")?;
+                        }
+                        match o.nulls_first {
+                            Some(true) => f.write_str(" NULLS FIRST")?,
+                            Some(false) => f.write_str(" NULLS LAST")?,
+                            None => {}
+                        }
+                    }
                 }
-                f.write_str(" ORDER BY ")?;
-                for (i, o) in order_by.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{}", o.expr)?;
-                    if o.desc {
-                        f.write_str(" DESC")?;
-                    }
-                    match o.nulls_first {
-                        Some(true) => f.write_str(" NULLS FIRST")?,
-                        Some(false) => f.write_str(" NULLS LAST")?,
-                        None => {}
-                    }
+                f.write_str(")")?;
+                if let Some(cond) = filter {
+                    write!(f, " FILTER (WHERE {cond})")?;
                 }
-                f.write_str(")")
+                Ok(())
             }
             Self::IsNull { expr, negated } => {
                 if *negated {
