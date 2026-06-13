@@ -587,10 +587,34 @@ pub fn run(
     } else {
         Vec::new()
     };
+    // v7.32 (architecture v2, P2) — compile the per-group synth-row
+    // expressions ONCE. The projection / HAVING here run per GROUP
+    // (24k for the inbox shape) × per item; the rewritten exprs are
+    // mostly `Column(__agg_N)` / `Column(__grp_K)` against the synth
+    // schema — flat step programs, no tree walk per group.
+    let having_compiled = having_rewritten
+        .as_ref()
+        .filter(|h| eval::fully_compilable(h))
+        .map(|h| eval::compile_expr(h, &synth_ctx));
+    let items_compiled: Vec<Option<eval::CompiledExpr>> = items_rewritten
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.as_ref()
+                .filter(|e| !deferred.iter().any(|(c, _)| *c == i) && eval::fully_compilable(e))
+                .map(|e| eval::compile_expr(e, &synth_ctx))
+        })
+        .collect();
     let mut kept_synth: Vec<Row> = Vec::new();
     let mut out_rows: Vec<Row> = Vec::new();
+    let mut stack: Vec<Value> = Vec::new();
     for srow in synth_rows {
-        if let Some(h) = &having_rewritten {
+        if let Some(hc) = &having_compiled {
+            let cond = eval::eval_compiled(hc, &srow, &synth_ctx, &mut stack)?;
+            if !matches!(cond, Value::Bool(true)) {
+                continue;
+            }
+        } else if let Some(h) = &having_rewritten {
             let cond = match correlated_eval {
                 Some(f) if crate::expr_has_subquery(h) => f(h, &srow, &synth_ctx)?,
                 _ => eval::eval_expr(h, &srow, &synth_ctx)?,
@@ -606,9 +630,15 @@ pub fn run(
                 values.push(Value::Null);
                 continue;
             }
-            values.push(match correlated_eval {
-                Some(f) if crate::expr_has_subquery(rewritten) => f(rewritten, &srow, &synth_ctx)?,
-                _ => eval::eval_expr(rewritten, &srow, &synth_ctx)?,
+            values.push(if let Some(cc) = &items_compiled[i] {
+                eval::eval_compiled(cc, &srow, &synth_ctx, &mut stack)?
+            } else {
+                match correlated_eval {
+                    Some(f) if crate::expr_has_subquery(rewritten) => {
+                        f(rewritten, &srow, &synth_ctx)?
+                    }
+                    _ => eval::eval_expr(rewritten, &srow, &synth_ctx)?,
+                }
             });
         }
         kept_synth.push(srow);
@@ -627,23 +657,35 @@ pub fn run(
             .iter()
             .map(|o| (o.desc, o.nulls_first))
             .collect();
+        // P2: compile order-by keys once (per-group sort keys are
+        // the same `__agg_N` / `__grp_K` shape as the projection).
+        let order_compiled: Vec<Option<eval::CompiledExpr>> = order_rewritten
+            .iter()
+            .map(|e| {
+                Some(e)
+                    .filter(|e| eval::fully_compilable(e))
+                    .map(|e| eval::compile_expr(e, &synth_ctx))
+            })
+            .collect();
         // The synth row rides through the sort so deferred exprs can
         // evaluate against the surviving groups after the caller's
         // LIMIT truncation.
-        let mut tagged: Vec<(Vec<Value>, Row, Row)> = kept_synth
-            .into_iter()
-            .zip(out_rows)
-            .map(|(s, o)| {
-                let mut keys = Vec::with_capacity(order_rewritten.len());
-                for e in &order_rewritten {
-                    keys.push(match correlated_eval {
+        let mut keystack: Vec<Value> = Vec::new();
+        let mut tagged: Vec<(Vec<Value>, Row, Row)> = Vec::with_capacity(kept_synth.len());
+        for (s, o) in kept_synth.into_iter().zip(out_rows) {
+            let mut keys = Vec::with_capacity(order_rewritten.len());
+            for (e, oc) in order_rewritten.iter().zip(&order_compiled) {
+                keys.push(if let Some(oc) = oc {
+                    eval::eval_compiled(oc, &s, &synth_ctx, &mut keystack)?
+                } else {
+                    match correlated_eval {
                         Some(f) if crate::expr_has_subquery(e) => f(e, &s, &synth_ctx)?,
                         _ => eval::eval_expr(e, &s, &synth_ctx)?,
-                    });
-                }
-                Ok::<_, EvalError>((keys, s, o))
-            })
-            .collect::<Result<_, _>>()?;
+                    }
+                });
+            }
+            tagged.push((keys, s, o));
+        }
         tagged.sort_by(|a, b| {
             use core::cmp::Ordering;
             for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
