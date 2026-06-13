@@ -12507,6 +12507,13 @@ impl Engine {
     ) -> Result<Option<Expr>, EngineError> {
         match e {
             Expr::ScalarSubquery(inner) => {
+                // v7.32 (R30) — a correlated subquery is resolved by
+                // the per-row / post-LIMIT correlated path; executing
+                // it here only to catch the correlation error first
+                // materialises (and discards) its whole inner FROM.
+                if select_is_correlated(inner) {
+                    return Ok(None);
+                }
                 let mut s = (**inner).clone();
                 // Recurse into the inner SELECT first so nested
                 // subqueries materialise bottom-up.
@@ -12534,6 +12541,9 @@ impl Engine {
                 Ok(Some(value_to_literal_expr(value)?))
             }
             Expr::Exists { subquery, negated } => {
+                if select_is_correlated(subquery) {
+                    return Ok(None);
+                }
                 let mut s = (**subquery).clone();
                 self.resolve_select_subqueries(&mut s, cancel)?;
                 let r = match self.exec_bare_select_cancel(&s, cancel) {
@@ -12553,6 +12563,9 @@ impl Engine {
                 subquery,
                 negated,
             } => {
+                if select_is_correlated(subquery) {
+                    return Ok(None);
+                }
                 let mut s = (**subquery).clone();
                 self.resolve_select_subqueries(&mut s, cancel)?;
                 let r = match self.exec_bare_select_cancel(&s, cancel) {
@@ -14369,6 +14382,114 @@ fn is_correlation_error(e: &EngineError) -> bool {
     )
 }
 
+/// v7.32 (R30 memory) — cheap static correlation pre-check.
+///
+/// `subquery_replacement` distinguishes a correlated subquery from an
+/// uncorrelated one by *optimistically executing* it and catching the
+/// resulting `ColumnNotFound` / `UnknownQualifier`. For a join-bodied
+/// correlated subquery that catch fires only AFTER the inner FROM is
+/// materialised — and the deferred-join pipeline clones the whole
+/// driving table to do it (the inbox `… JOIN messages m2 …` body
+/// clones 960k × 10 KB ≈ 10 GB at prod scale, once per outer query,
+/// purely to be thrown away). A correlated subquery is always handled
+/// downstream by the per-row / post-LIMIT correlated path, so spotting
+/// it up front lets us skip the wasted materialisation entirely.
+///
+/// Sound for the `true` answer: returns true only when a qualified
+/// column at the statement's own level names a qualifier that is not
+/// one of its own FROM aliases — exactly the reference the inner exec
+/// would fail to resolve. Everything it can't reason about cleanly
+/// (lateral / derived FROM entries) returns false and falls through to
+/// the existing execute-and-catch path, so behaviour is unchanged.
+fn select_is_correlated(s: &SelectStatement) -> bool {
+    use spg_sql::ast::SelectItem;
+    let Some(from) = &s.from else {
+        // No FROM: correlated iff some projected column is qualified
+        // (a qualifier with nothing to bind to is necessarily outer).
+        let mut qualified = false;
+        for item in &s.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                visit_expr_columns_and_subqueries(
+                    expr,
+                    &mut |c| {
+                        if c.qualifier.is_some() {
+                            qualified = true;
+                        }
+                    },
+                    &mut |_| {},
+                );
+            }
+        }
+        return qualified;
+    };
+    // Lateral / derived FROM entries put scope resolution beyond this
+    // cheap check — defer to execute-and-catch.
+    if from.primary.lateral_subquery.is_some() {
+        return false;
+    }
+    let mut inner: Vec<&str> = Vec::new();
+    if let Some(a) = &from.primary.alias {
+        inner.push(a.as_str());
+    }
+    if !from.primary.name.is_empty() {
+        inner.push(from.primary.name.as_str());
+    }
+    for j in &from.joins {
+        if j.table.lateral_subquery.is_some() {
+            return false;
+        }
+        if let Some(a) = &j.table.alias {
+            inner.push(a.as_str());
+        }
+        if !j.table.name.is_empty() {
+            inner.push(j.table.name.as_str());
+        }
+    }
+    // Gather every expression position that evaluates in this
+    // statement's own scope (NOT inside nested subquery bodies — the
+    // visitor reports those via the subquery callback, which we drop).
+    let mut exprs: Vec<&Expr> = Vec::new();
+    for item in &s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            exprs.push(expr);
+        }
+    }
+    if let Some(w) = &s.where_ {
+        exprs.push(w);
+    }
+    for j in &from.joins {
+        if let Some(on) = &j.on {
+            exprs.push(on);
+        }
+    }
+    if let Some(gs) = &s.group_by {
+        for g in gs {
+            exprs.push(g);
+        }
+    }
+    if let Some(h) = &s.having {
+        exprs.push(h);
+    }
+    for o in &s.order_by {
+        exprs.push(&o.expr);
+    }
+    let mut correlated = false;
+    for e in exprs {
+        visit_expr_columns_and_subqueries(
+            e,
+            &mut |c| {
+                if let Some(q) = &c.qualifier
+                    && !inner.iter().any(|a| a.eq_ignore_ascii_case(q))
+                {
+                    correlated = true;
+                }
+            },
+            &mut |_| {},
+        );
+    }
+    correlated
+}
+
 /// v4.23: walk every Expr in `stmt` and replace each Column ref
 /// that targets the outer scope (qualifier matches the outer
 /// table alias) with a Literal carrying the outer row's value.
@@ -14766,26 +14887,70 @@ impl Engine {
         batch.items = items;
         // v7.32 (architecture v2 P3) — keyed index-probe. When the
         // caller hands a restriction set (the ≤LIMIT surviving outer
-        // rows of a post-LIMIT deferred subquery) AND the inner is a
-        // single indexed table, evaluate only the surviving correlation
-        // keys via per-key index seek instead of scanning the whole
-        // inner relation. This is PG's SubPlan with an index scan:
-        // 50 seeks of ~µs each vs a 24k-row all-keys batch (~16 ms).
-        // The grouping below is shared — keyed result ≡ full-batch
-        // result for the covered keys, so semantics are identical.
-        // Joins / un-indexed columns return None here and the caller
-        // falls back to the lazy all-keys batch (no regression).
+        // rows of a post-LIMIT deferred subquery) AND the correlation
+        // column is backed by an index, evaluate only the surviving
+        // correlation keys via per-key index seek instead of scanning
+        // the whole inner relation. This is PG's SubPlan with an index
+        // scan: 50 seeks of ~µs each vs a 24k-row all-keys batch
+        // (~16 ms). The grouping below is shared — keyed result ≡
+        // full-batch result for the covered keys, so semantics are
+        // identical.
+        //
+        // The inner relation may itself be a join. The correlation
+        // column names the *driving* table; PG, MySQL and MariaDB all
+        // plan a correlated join subquery the same way — seek the
+        // correlation index, then index-nested-loop to the joined
+        // table. We promote that table to drive `batch` (an all-INNER
+        // chain only) so the per-key `inner_col = <lit>` predicate
+        // becomes a primary index seek and the existing INL path joins
+        // the rest. A correlation column without a usable index, or a
+        // join the promotion can't safely reorder, returns None and
+        // the caller falls back to the lazy all-keys batch (no
+        // regression).
         let keyed: Option<(&[Row], &EvalContext<'_>)> = restrict.and_then(|(rows, rctx)| {
-            if !from.joins.is_empty() {
-                return None;
-            }
-            let table = self.active_catalog().get(&from.primary.name)?;
+            // Resolve the table that owns the correlation column.
+            let driver_name: &str = if from.joins.is_empty() {
+                from.primary.name.as_str()
+            } else {
+                let q = inner_col.qualifier.as_deref()?;
+                let primary_alias = from
+                    .primary
+                    .alias
+                    .as_deref()
+                    .unwrap_or(from.primary.name.as_str());
+                if primary_alias.eq_ignore_ascii_case(q) {
+                    from.primary.name.as_str()
+                } else {
+                    from.joins
+                        .iter()
+                        .find(|j| {
+                            j.table
+                                .alias
+                                .as_deref()
+                                .unwrap_or(j.table.name.as_str())
+                                .eq_ignore_ascii_case(q)
+                        })
+                        .map(|j| j.table.name.as_str())?
+                }
+            };
+            let table = self.active_catalog().get(driver_name)?;
             let pos = table
                 .schema()
                 .columns
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(&inner_col.name))?;
             table.index_on(pos)?;
+            // For a join inner, drive the seek from the correlation
+            // table so `inner_col = <lit>` lands as a primary index
+            // seek (else the source-order primary scans the full
+            // relation and the join hash-builds the whole peer — the
+            // 12 GB all-keys hog R30 hit at prod scale).
+            if !from.joins.is_empty() {
+                let driver_alias = inner_col.qualifier.as_deref()?;
+                if !reorder::drive_from(&mut batch, driver_alias) {
+                    return None;
+                }
+            }
             Some((rows, rctx))
         });
         let rows = if let Some((restrict_rows, rctx)) = keyed {
