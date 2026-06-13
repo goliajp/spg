@@ -135,6 +135,9 @@ pub fn is_aggregate_name(name: &str) -> bool {
             // v7.32 (round-29) — ordered-set aggregates (used with
             // `WITHIN GROUP (ORDER BY …)`).
             | "percentile_cont" | "percentile_disc" | "mode"
+            // v7.32 (round-29) — hypothetical-set aggregates (also
+            // `WITHIN GROUP`): the rank the direct args WOULD have.
+            | "rank" | "dense_rank" | "percent_rank" | "cume_dist"
             // v7.32 (round-29) — two-argument regression family.
             | "covar_pop" | "covar_samp" | "corr"
             | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_slope"
@@ -182,6 +185,23 @@ pub fn is_ordered_set_name(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "percentile_cont" | "percentile_disc" | "mode"
     )
+}
+
+/// v7.32 (round-29) — hypothetical-set aggregates: `rank(args) WITHIN
+/// GROUP (ORDER BY …)` and friends compute the rank the hypothetical
+/// row would have. Like ordered-set, the value stream comes from the
+/// sort spec and the in-parens args are direct (the hypothetical row).
+pub fn is_hypothetical_set_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "rank" | "dense_rank" | "percent_rank" | "cume_dist"
+    )
+}
+
+/// v7.32 (round-29) — every aggregate that takes its value stream from
+/// a `WITHIN GROUP (ORDER BY …)` clause (ordered-set + hypothetical-set).
+pub fn is_within_group_name(name: &str) -> bool {
+    is_ordered_set_name(name) || is_hypothetical_set_name(name)
 }
 
 /// Per-aggregate running state.
@@ -332,21 +352,36 @@ pub fn run(
     // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
-    // v7.32 (round-29) — ordered-set aggregates require WITHIN GROUP
-    // (PG raises a hard error otherwise rather than silently degrading).
+    // v7.32 (round-29) — WITHIN GROUP aggregates require the clause (PG
+    // raises a hard error otherwise rather than silently degrading), and
+    // SPG supports the single-sort-key form only.
     for spec in &agg_specs {
-        if is_ordered_set_name(&spec.name) {
+        if is_within_group_name(&spec.name) {
             if spec.order_by.is_empty() {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "{}() is an ordered-set aggregate and requires WITHIN GROUP (ORDER BY …)",
+                        "{}() requires WITHIN GROUP (ORDER BY …)",
                         spec.name
                     ),
                 });
             }
+            // mode() is the only WITHIN GROUP aggregate with no direct
+            // argument; the rest carry one (percentile fraction /
+            // hypothetical value).
             if spec.name != "mode" && spec.direct_arg.is_none() {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("{}() requires a single fraction argument", spec.name),
+                    detail: format!("{}() requires a direct argument", spec.name),
+                });
+            }
+            // Multi-key WITHIN GROUP (multiple sort keys / hypothetical
+            // args) is not supported yet — error loudly instead of
+            // silently using only the first key.
+            if spec.order_by.len() > 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{}() with multiple WITHIN GROUP sort keys is not supported yet",
+                        spec.name
+                    ),
                 });
             }
         }
@@ -646,8 +681,13 @@ pub fn run(
                 };
             // Ordered-set aggregates compute from the sorted items + the
             // direct fraction; everything else uses the running state.
-            let v = if is_ordered_set_name(&agg_specs[i].name) {
-                finalize_ordered_set(&agg_specs[i].name, st_final, direct_arg_vals[i].as_ref())
+            let v = if is_within_group_name(&agg_specs[i].name) {
+                finalize_ordered_set(
+                    &agg_specs[i].name,
+                    st_final,
+                    direct_arg_vals[i].as_ref(),
+                    agg_specs[i].order_by.first(),
+                )
             } else {
                 finalize(&agg_specs[i].name, st_final)
             };
@@ -949,7 +989,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     // WITHIN GROUP (ORDER BY x)`) take the value to
                     // aggregate from the sort spec and the in-parens
                     // arg as the direct (fraction) argument.
-                    let ordered_set = is_ordered_set_name(&canonical);
+                    let ordered_set = is_within_group_name(&canonical);
                     let (arg, direct_arg) = if ordered_set {
                         (order_by.first().map(|o| o.expr.clone()), args.first().cloned())
                     } else {
@@ -1276,10 +1316,11 @@ fn update_state(
                 (Some(acc), _) => acc ^ n, // bit_xor
             });
         }
-        // v7.32 (round-29) — ordered-set aggregates collect the
-        // WITHIN GROUP value (NULLs ignored, per PG) into `items`,
-        // sorted at finalize by the parallel `item_keys`.
-        "percentile_cont" | "percentile_disc" | "mode" => {
+        // v7.32 (round-29) — WITHIN GROUP aggregates (ordered-set +
+        // hypothetical-set) collect the sort value (NULLs ignored, per
+        // PG) into `items`, sorted at finalize by the parallel
+        // `item_keys`.
+        n if is_within_group_name(n) => {
             if is_null {
                 return Ok(());
             }
@@ -1551,18 +1592,66 @@ fn agg_value_to_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// v7.32 (round-29) — finalize an ordered-set aggregate. `st.items` is
-/// already sorted by the `WITHIN GROUP (ORDER BY …)` spec. `fraction`
-/// is the evaluated direct argument for `percentile_*` (ignored by
-/// `mode`).
+/// v7.32 (round-29) — finalize a WITHIN GROUP aggregate. `st.items` is
+/// already sorted by the `WITHIN GROUP (ORDER BY …)` spec. `direct` is
+/// the evaluated direct argument: the fraction for `percentile_*`, the
+/// hypothetical value for the hypothetical-set family (`rank` etc.),
+/// and unused by `mode`. `order` is the (single) sort key, needed by
+/// the hypothetical-set family to compare in the sort direction.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn finalize_ordered_set(name: &str, st: &AggState, fraction: Option<&Value>) -> Value {
+fn finalize_ordered_set(
+    name: &str,
+    st: &AggState,
+    direct: Option<&Value>,
+    order: Option<&spg_sql::ast::OrderBy>,
+) -> Value {
+    let fraction = direct;
     let items = &st.items;
     if items.is_empty() {
-        return Value::Null;
+        // A hypothetical row ranks first over an empty group; the
+        // distribution functions are 0 / divide-by-(n+1).
+        return match name {
+            "rank" | "dense_rank" => Value::BigInt(1),
+            "percent_rank" => Value::Float(0.0),
+            "cume_dist" => Value::Float(1.0),
+            _ => Value::Null,
+        };
     }
     let n = items.len();
     match name {
+        // v7.32 (round-29) — hypothetical-set: the rank the direct value
+        // would have if inserted into the group, in the sort direction.
+        "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
+            let Some(h) = fraction else { return Value::Null };
+            let (desc, nulls_first) = order.map_or((false, None), |o| (o.desc, o.nulls_first));
+            let mut before = 0usize; // sort strictly before h
+            let mut before_or_eq = 0usize; // sort before-or-peer with h
+            let mut distinct_before = 0usize;
+            let mut last_before: Option<&Value> = None;
+            for it in items {
+                match crate::order_by_value_cmp(desc, nulls_first, it, h) {
+                    core::cmp::Ordering::Less => {
+                        before += 1;
+                        before_or_eq += 1;
+                        if last_before.is_none_or(|p| value_cmp(p, it) != core::cmp::Ordering::Equal)
+                        {
+                            distinct_before += 1;
+                            last_before = Some(it);
+                        }
+                    }
+                    core::cmp::Ordering::Equal => before_or_eq += 1,
+                    core::cmp::Ordering::Greater => {}
+                }
+            }
+            let nn = n as f64;
+            match name {
+                "rank" => Value::BigInt((before + 1) as i64),
+                "dense_rank" => Value::BigInt((distinct_before + 1) as i64),
+                "percent_rank" => Value::Float(before as f64 / nn),
+                "cume_dist" => Value::Float((before_or_eq as f64 + 1.0) / (nn + 1.0)),
+                _ => unreachable!(),
+            }
+        }
         // Most frequent value; equal values are adjacent in the sorted
         // run, and a frequency tie resolves to the earliest run (the
         // smallest value under an ascending sort), matching PG.
@@ -1647,9 +1736,13 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         | "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx"
         | "regr_avgy" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_sxx"
         | "regr_syy" | "regr_sxy" => DataType::Float,
-        // v7.32 (round-29) — bitwise aggregates and regr_count return
-        // an integer.
-        "bit_and" | "bit_or" | "bit_xor" | "regr_count" => DataType::BigInt,
+        // v7.32 (round-29) — bitwise aggregates, regr_count, and the
+        // integer hypothetical-set ranks return an integer.
+        "bit_and" | "bit_or" | "bit_xor" | "regr_count" | "rank" | "dense_rank" => {
+            DataType::BigInt
+        }
+        // v7.32 (round-29) — hypothetical-set distribution functions.
+        "percent_rank" | "cume_dist" => DataType::Float,
         // v7.32 (round-29) — JSON aggregates return JSON.
         "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg" => DataType::Json,
         // min/max, percentile_disc, mode, and anything pass-through:
@@ -1691,7 +1784,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             let canonical: &str = if lower == "every" { "bool_and" } else { &lower };
             // Mirror collect_aggregates: ordered-set aggregates take the
             // value from the sort spec and the in-parens arg as direct.
-            let (arg, direct_arg) = if is_ordered_set_name(canonical) {
+            let (arg, direct_arg) = if is_within_group_name(canonical) {
                 (order_by.first().map(|o| o.expr.clone()), args.first().cloned())
             } else {
                 (args.first().cloned(), None)

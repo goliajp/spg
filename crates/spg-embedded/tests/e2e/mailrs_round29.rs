@@ -311,6 +311,43 @@ fn bitwise_aggregates() {
     assert_eq!(r[0][2], Value::BigInt(20));
 }
 
+/// Hypothetical-set aggregates: the rank the direct value would have if
+/// inserted into the group. Values verified against PostgreSQL 18 on
+/// {1,3,5,5,8} with the hypothetical 5.
+#[test]
+fn hypothetical_set_aggregates() {
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE t (x INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(3),(5),(5),(8)").unwrap();
+    let r = rows_of(
+        &mut db,
+        "SELECT rank(5) WITHIN GROUP (ORDER BY x), \
+                dense_rank(5) WITHIN GROUP (ORDER BY x), \
+                percent_rank(5) WITHIN GROUP (ORDER BY x), \
+                cume_dist(5) WITHIN GROUP (ORDER BY x) FROM t",
+    );
+    assert_eq!(r[0][0], Value::BigInt(3)); // rank
+    assert_eq!(r[0][1], Value::BigInt(3)); // dense_rank
+    assert_eq!(r[0][2], Value::Float(0.4)); // percent_rank = (3-1)/5
+    match r[0][3] {
+        Value::Float(v) => assert!((v - 5.0 / 6.0).abs() < 1e-9), // cume_dist
+        ref other => panic!("expected float, got {other:?}"),
+    }
+    // DESC flips which side is "before": rank(5) desc = 2.
+    let r = rows_of(
+        &mut db,
+        "SELECT rank(5) WITHIN GROUP (ORDER BY x DESC) FROM t",
+    );
+    assert_eq!(r[0][0], Value::BigInt(2));
+    // Below / above the whole group.
+    let r = rows_of(
+        &mut db,
+        "SELECT rank(0) WITHIN GROUP (ORDER BY x), rank(9) WITHIN GROUP (ORDER BY x) FROM t",
+    );
+    assert_eq!(r[0][0], Value::BigInt(1));
+    assert_eq!(r[0][1], Value::BigInt(6));
+}
+
 /// Two-argument regression family `f(Y, X)`, verified on a perfect
 /// line y = 2x + 1.
 #[test]
