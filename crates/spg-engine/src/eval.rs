@@ -15,6 +15,7 @@
 //! v0.4 deliberately does *not* implement: function calls, string
 //! concatenation, IS NULL / IS NOT NULL, BETWEEN, IN, etc. Those come later.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -168,6 +169,36 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
             apply_unary(*op, v)
         }
         Expr::Binary { lhs, op, rhs } => {
+            // v7.32 (P4 borrow channel) — comparison fast path. A pure
+            // comparison op only reads its operands and returns Bool,
+            // and for non-NUMERIC / non-INTERVAL / non-CI-collation
+            // operands `apply_binary` IS just the NULL-3VL check plus
+            // the ref-based `compare` (NUMERIC routes through fixed-
+            // point `apply_binary_numeric`; INTERVAL through
+            // `apply_binary_interval`; CI columns fold). So read the
+            // operands borrowed — a column cell is no longer cloned
+            // just to compare it (`WHERE thread_id != ''` alone cloned
+            // one Text cell per scanned row). Anything that needs the
+            // owned path falls through unchanged.
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+            ) {
+                let lc = eval_expr_cow(lhs, row, ctx)?;
+                let rc = eval_expr_cow(rhs, row, ctx)?;
+                let owned_path = is_owned_compare_value(lc.as_ref())
+                    || is_owned_compare_value(rc.as_ref())
+                    || compare_is_case_insensitive(lhs, rhs, ctx);
+                if !owned_path {
+                    if lc.as_ref().is_null() || rc.as_ref().is_null() {
+                        return Ok(Value::Null);
+                    }
+                    return compare(*op, lc.as_ref(), rc.as_ref());
+                }
+                let (l, r) =
+                    collation_fold_for_compare(*op, lhs, rhs, lc.into_owned(), rc.into_owned(), ctx);
+                return apply_binary(*op, l, r);
+            }
             let l = eval_expr(lhs, row, ctx)?;
             let r = eval_expr(rhs, row, ctx)?;
             // v7.17.0 Phase 2.5 — collation-aware text comparison.
@@ -6839,6 +6870,52 @@ fn collation_fold_for_compare(
     (fold(l), fold(r))
 }
 
+/// v7.32 (P4 borrow channel) — borrowed-or-owned evaluation. A bare
+/// column read borrows its cell (no clone); literals and computed
+/// sub-expressions stay owned. Used by the comparison fast path in
+/// `eval_expr` so a predicate like `col != ''` reads the cell by
+/// reference instead of cloning it per scanned row. Semantically
+/// identical to `eval_expr` — a borrowed cell compares equal to its
+/// clone — and the fallback to owned `resolve_column` preserves the
+/// detailed not-found / unknown-qualifier errors.
+fn eval_expr_cow<'r>(
+    expr: &Expr,
+    row: &'r Row,
+    ctx: &EvalContext<'_>,
+) -> Result<Cow<'r, Value>, EvalError> {
+    match expr {
+        Expr::Column(c) => match resolve_column_borrowed(c, row, ctx)? {
+            Some(v) => Ok(Cow::Borrowed(v)),
+            None => resolve_column(c, row, ctx).map(Cow::Owned),
+        },
+        _ => eval_expr(expr, row, ctx).map(Cow::Owned),
+    }
+}
+
+/// v7.32 (P4 borrow channel) — operands whose comparison `apply_binary`
+/// does NOT route through the plain ref-based `compare`: NUMERIC goes
+/// through fixed-point `apply_binary_numeric` and INTERVAL through
+/// `apply_binary_interval`. The borrowed comparison fast path falls
+/// back to the owned path for these so their semantics are untouched.
+#[inline]
+fn is_owned_compare_value(v: &Value) -> bool {
+    matches!(v, Value::Numeric { .. } | Value::Interval { .. })
+}
+
+/// v7.32 (P4 borrow channel) — does a comparison need case-insensitive
+/// folding? Mirrors the trigger in `collation_fold_for_compare`; when
+/// true the fast path defers to the owned path so the fold still runs.
+#[inline]
+fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>) -> bool {
+    matches!(
+        column_collation(lhs, ctx),
+        Some(spg_storage::Collation::CaseInsensitive)
+    ) || matches!(
+        column_collation(rhs, ctx),
+        Some(spg_storage::Collation::CaseInsensitive)
+    )
+}
+
 /// v7.29 - borrow a column cell without cloning (the prefix fast
 /// path for LEFT). Mirrors resolve_column's lookup; returns Ok(None)
 /// when the reference can't be attributed (caller falls back to the
@@ -8032,6 +8109,77 @@ mod tests {
 
     fn ctx<'a>(cols: &'a [ColumnSchema], alias: Option<&'a str>) -> EvalContext<'a> {
         EvalContext::new(cols, alias)
+    }
+
+    /// v7.32 (P4 borrow channel) differential: the borrowed comparison
+    /// fast path in `eval_expr`'s Binary arm must be byte-for-byte the
+    /// pre-P4 owned path (`apply_binary` on cloned operands) across a
+    /// cross-type value matrix and every comparison operator — covering
+    /// the fast-path types (Text/Int/Float/Date/Timestamp/Bool/Null) and
+    /// the owned-fallback types (Numeric/Interval).
+    #[test]
+    fn borrowed_compare_equals_owned_apply_binary() {
+        let vals = vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::SmallInt(3),
+            Value::Int(3),
+            Value::Int(-1),
+            Value::BigInt(3),
+            Value::BigInt(100),
+            Value::Float(3.0),
+            Value::Float(2.5),
+            Value::Text(String::new()),
+            Value::Text("a".into()),
+            Value::Text("b".into()),
+            Value::Date(10),
+            Value::Timestamp(1000),
+            Value::Numeric { scaled: 30, scale: 1 },
+            Value::Interval { months: 0, micros: 5 },
+        ];
+        let ops = [
+            BinOp::Eq,
+            BinOp::NotEq,
+            BinOp::Lt,
+            BinOp::LtEq,
+            BinOp::Gt,
+            BinOp::GtEq,
+        ];
+        let cs = vec![col("x", DataType::Int), col("y", DataType::Int)];
+        let c = ctx(&cs, None);
+        let lhs = Expr::Column(ColumnName {
+            qualifier: None,
+            name: "x".into(),
+        });
+        let rhs = Expr::Column(ColumnName {
+            qualifier: None,
+            name: "y".into(),
+        });
+        for l in &vals {
+            for r in &vals {
+                let row = Row::new(vec![l.clone(), r.clone()]);
+                for op in ops {
+                    let got = eval_expr(
+                        &Expr::Binary {
+                            lhs: Box::new(lhs.clone()),
+                            op,
+                            rhs: Box::new(rhs.clone()),
+                        },
+                        &row,
+                        &c,
+                    );
+                    // Pre-P4 reference: owned operands through apply_binary
+                    // (collation fold is a no-op for non-CI columns).
+                    let want = apply_binary(op, l.clone(), r.clone());
+                    assert_eq!(
+                        format!("{got:?}"),
+                        format!("{want:?}"),
+                        "op={op:?} l={l:?} r={r:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn lit(n: i64) -> Expr {
