@@ -8393,13 +8393,28 @@ impl Engine {
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
         // v6.2.6 — Memoize per-row WHERE eval shares one cache.
         let mut memo = memoize::MemoizeCache::new();
+        // v7.32 (perf knife D) — subquery-free WHERE compiles once;
+        // the row loop then runs a flat step program instead of a
+        // tree interpretation per row.
+        let compiled_where: Option<eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| eval::fully_compilable(w))
+            .map(|w| eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value> = Vec::new();
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row, loop_idx: usize| -> Result<(), EngineError> {
             if loop_idx.is_multiple_of(256) {
                 cancel.check()?;
             }
-            if let Some(where_expr) = &stmt.where_ {
+            if let Some(cw) = &compiled_where {
+                let cond = eval::eval_compiled(cw, row, &ctx, &mut eval_stack)
+                    .map_err(EngineError::Eval)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    return Ok(());
+                }
+            } else if let Some(where_expr) = &stmt.where_ {
                 let cond =
                     self.eval_expr_with_correlated(where_expr, row, &ctx, cancel, Some(&mut memo))?;
                 if !matches!(cond, Value::Bool(true)) {
@@ -9518,6 +9533,13 @@ impl Engine {
         // the correlated-aware evaluator (memoized, same as the
         // single-table path).
         let mut memo = memoize::MemoizeCache::default();
+        // v7.32 (perf knife D) — compiled WHERE on the joined output
+        // loop too (subquery-bearing filters keep the correlated
+        // interpreter).
+        let compiled_where: Option<eval::CompiledExpr> = where_
+            .filter(|w| eval::fully_compilable(w))
+            .map(|w| eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value> = Vec::new();
         for tuple in working.chunks(stride) {
             let row = Row::new(materialise_tuple_vals(
                 &sources,
@@ -9526,7 +9548,13 @@ impl Engine {
                 tuple,
                 consumed_cols,
             ));
-            if let Some(where_expr) = where_ {
+            if let Some(cw) = &compiled_where {
+                let cond = eval::eval_compiled(cw, &row, &ctx, &mut eval_stack)
+                    .map_err(EngineError::Eval)?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
+                }
+            } else if let Some(where_expr) = where_ {
                 let cond = self.eval_expr_with_correlated(
                     where_expr,
                     &row,
