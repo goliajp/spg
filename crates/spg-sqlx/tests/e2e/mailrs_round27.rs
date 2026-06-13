@@ -66,3 +66,34 @@ async fn returning_plain_columns_stay_typed() {
             .unwrap();
     assert_eq!((id, name.as_str()), (1, "INBOX"));
 }
+
+// mailrs round-28 — correlated scalar subquery in UPDATE SET on the
+// prepared (sqlx inline) path. The engine fix lives in the shared
+// exec_update_cancel; this pins the embed consumer's actual path.
+#[tokio::test]
+async fn round28_correlated_subquery_in_update_set() {
+    let pool = SpgPool::connect_in_memory().await.expect("in-memory spg");
+    for ddl in [
+        "CREATE TABLE mb (id BIGINT PRIMARY KEY, uidnext INT)",
+        "CREATE TABLE msg (mailbox_id BIGINT, uid INT)",
+        "INSERT INTO mb VALUES (1, 5), (2, 5)",
+        "INSERT INTO msg VALUES (1, 10), (1, 12), (2, 99), (2, 7)",
+    ] {
+        sqlx::query(ddl).execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "UPDATE mb SET uidnext = (SELECT MAX(m.uid) FROM msg m WHERE m.mailbox_id = mb.id)",
+    )
+    .execute(&pool)
+    .await
+    .expect("correlated UPDATE SET over prepared path");
+    let (u1,): (i32,) = sqlx::query_as("SELECT uidnext FROM mb WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (u2,): (i32,) = sqlx::query_as("SELECT uidnext FROM mb WHERE id = 2")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((u1, u2), (12, 99));
+}
