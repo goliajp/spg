@@ -135,7 +135,42 @@ pub fn is_aggregate_name(name: &str) -> bool {
             // v7.32 (round-29) — ordered-set aggregates (used with
             // `WITHIN GROUP (ORDER BY …)`).
             | "percentile_cont" | "percentile_disc" | "mode"
+            // v7.32 (round-29) — two-argument regression family.
+            | "covar_pop" | "covar_samp" | "corr"
+            | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_slope"
+            | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
+            // v7.32 (round-29) — JSON aggregates.
+            | "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
     )
+}
+
+/// v7.32 (round-29) — two-argument regression aggregates `f(Y, X)`.
+fn is_regression_name(name: &str) -> bool {
+    matches!(
+        name,
+        "covar_pop"
+            | "covar_samp"
+            | "corr"
+            | "regr_count"
+            | "regr_avgx"
+            | "regr_avgy"
+            | "regr_slope"
+            | "regr_intercept"
+            | "regr_r2"
+            | "regr_sxx"
+            | "regr_syy"
+            | "regr_sxy"
+    )
+}
+
+/// v7.32 (round-29) — aggregates that consume a second positional
+/// argument: `string_agg(v, sep)`, the regression family `f(Y, X)`, and
+/// `json_object_agg(key, value)`.
+fn agg_uses_second_arg(name: &str) -> bool {
+    name == "string_agg"
+        || name == "json_object_agg"
+        || name == "jsonb_object_agg"
+        || is_regression_name(name)
 }
 
 /// v7.32 (round-29) — ordered-set aggregates: the value to aggregate
@@ -188,6 +223,19 @@ struct AggState {
     /// v7.32 (round-29) — running accumulator for bit_and / bit_or /
     /// bit_xor. `None` until the first non-NULL input → SQL NULL.
     bit_acc: Option<i64>,
+    /// v7.32 (round-29) — two-argument regression family
+    /// (`covar_*` / `corr` / `regr_*`), PG arg order `f(Y, X)`. Only
+    /// rows where BOTH inputs are non-NULL contribute (`count` is the
+    /// paired n, independent of the single-arg `sum_*`).
+    reg_n: i64,
+    reg_sx: f64,
+    reg_sy: f64,
+    reg_sxx: f64,
+    reg_syy: f64,
+    reg_sxy: f64,
+    /// v7.32 (round-29) — second value stream for `json_object_agg`
+    /// (`items` holds the keys, `aux_items` the values).
+    aux_items: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -830,11 +878,18 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 // collect_aggregates / rewrite_expr.
                 | "bool_and" | "bool_or" | "every"
                 // v7.32 (round-29) — statistical + bitwise aggregates
-                // are single-argument.
+                // + single-arg JSON aggregate.
                 | "stddev" | "stddev_samp" | "stddev_pop"
                 | "variance" | "var_samp" | "var_pop"
-                | "bit_and" | "bit_or" | "bit_xor" => Some(1),
-                "string_agg" => Some(2),
+                | "bit_and" | "bit_or" | "bit_xor"
+                | "json_agg" | "jsonb_agg" => Some(1),
+                // v7.32 (round-29) — two-argument aggregates: string_agg,
+                // the regression family f(Y, X), and json_object_agg.
+                "string_agg"
+                | "covar_pop" | "covar_samp" | "corr"
+                | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_slope"
+                | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
+                | "json_object_agg" | "jsonb_object_agg" => Some(2),
                 _ => None,
             };
             if let Some(want) = expected
@@ -901,9 +956,9 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         (args.first().cloned(), None)
                     };
                     let spec = AggSpec {
-                        name: canonical,
+                        name: canonical.clone(),
                         arg,
-                        arg2: if name.eq_ignore_ascii_case("string_agg") {
+                        arg2: if agg_uses_second_arg(&canonical) {
                             args.get(1).cloned()
                         } else {
                             None
@@ -941,9 +996,9 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     args.first().cloned()
                 };
                 // v7.17.0 — second positional arg for
-                // `string_agg(value, separator)`. Everything else
-                // ignores it.
-                let arg2 = if lower == "string_agg" {
+                // `string_agg(value, separator)`; v7.32 — also the
+                // regression family `f(Y, X)` and `json_object_agg`.
+                let arg2 = if agg_uses_second_arg(&lower) {
                     args.get(1).cloned()
                 } else {
                     None
@@ -1234,6 +1289,37 @@ fn update_state(
             }
             st.count += 1;
         }
+        // v7.32 (round-29) — regression family f(Y, X). Only rows with
+        // BOTH inputs non-NULL contribute (PG semantics). `v` is Y,
+        // `arg2` is X.
+        n if is_regression_name(n) => {
+            let (Some(y), Some(x)) = (agg_value_to_f64(v), arg2.and_then(agg_value_to_f64)) else {
+                return Ok(()); // NULL (or non-numeric) in either input
+            };
+            st.reg_n += 1;
+            st.reg_sx += x;
+            st.reg_sy += y;
+            st.reg_sxx += x * x;
+            st.reg_syy += y * y;
+            st.reg_sxy += x * y;
+        }
+        // v7.32 (round-29) — json_agg / jsonb_agg collect every input
+        // (NULL becomes JSON null, per PG) in row order.
+        "json_agg" | "jsonb_agg" => {
+            st.items.push(v.clone());
+            st.count += 1;
+        }
+        // v7.32 (round-29) — json_object_agg(key, value): keys in
+        // `items`, values in `aux_items`. A NULL key is skipped (PG
+        // raises; we drop it rather than abort the whole query).
+        "json_object_agg" | "jsonb_object_agg" => {
+            if is_null {
+                return Ok(());
+            }
+            st.items.push(v.clone());
+            st.aux_items.push(arg2.cloned().unwrap_or(Value::Null));
+            st.count += 1;
+        }
         _ => unreachable!("non-aggregate {name} in update_state"),
     }
     Ok(())
@@ -1364,6 +1450,90 @@ fn finalize(name: &str, st: &AggState) -> Value {
         // v7.32 (round-29) — bitwise aggregates: None (empty / all-NULL)
         // → SQL NULL.
         "bit_and" | "bit_or" | "bit_xor" => st.bit_acc.map_or(Value::Null, Value::BigInt),
+        // v7.32 (round-29) — regression family. `regr_count` is the
+        // paired n; everything else is NULL over an empty set. Terms
+        // are the mean-centred sums of squares / cross-products.
+        "regr_count" => Value::BigInt(st.reg_n),
+        "covar_pop" | "covar_samp" | "corr" | "regr_avgx" | "regr_avgy" | "regr_slope"
+        | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy" => {
+            let n = st.reg_n;
+            if n == 0 {
+                return Value::Null;
+            }
+            let nf = n as f64;
+            let sxx = st.reg_sxx - st.reg_sx * st.reg_sx / nf;
+            let syy = st.reg_syy - st.reg_sy * st.reg_sy / nf;
+            let sxy = st.reg_sxy - st.reg_sx * st.reg_sy / nf;
+            let avgx = st.reg_sx / nf;
+            let avgy = st.reg_sy / nf;
+            let out = match name {
+                "regr_avgx" => Some(avgx),
+                "regr_avgy" => Some(avgy),
+                "regr_sxx" => Some(sxx),
+                "regr_syy" => Some(syy),
+                "regr_sxy" => Some(sxy),
+                "covar_pop" => Some(sxy / nf),
+                "covar_samp" => (n >= 2).then(|| sxy / (nf - 1.0)),
+                "regr_slope" => (sxx != 0.0).then(|| sxy / sxx),
+                "regr_intercept" => (sxx != 0.0).then(|| avgy - (sxy / sxx) * avgx),
+                "corr" => {
+                    let d = sxx * syy;
+                    (d > 0.0).then(|| sxy / crate::eval::f64_sqrt(d))
+                }
+                // PG: NULL when sxx==0; 1 when syy==0 (and sxx>0).
+                "regr_r2" => {
+                    if sxx == 0.0 {
+                        None
+                    } else if syy == 0.0 {
+                        Some(1.0)
+                    } else {
+                        Some((sxy * sxy) / (sxx * syy))
+                    }
+                }
+                _ => None,
+            };
+            out.map_or(Value::Null, Value::Float)
+        }
+        // v7.32 (round-29) — json_agg / jsonb_agg: a JSON array of every
+        // collected element in row order; empty set → SQL NULL.
+        "json_agg" | "jsonb_agg" => {
+            if st.items.is_empty() {
+                return Value::Null;
+            }
+            let mut out = String::from("[");
+            for (i, item) in st.items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&crate::json::value_to_json_text(item));
+            }
+            out.push(']');
+            Value::Json(out)
+        }
+        // v7.32 (round-29) — json_object_agg: a JSON object built from
+        // the parallel key (`items`) / value (`aux_items`) streams.
+        "json_object_agg" | "jsonb_object_agg" => {
+            if st.items.is_empty() {
+                return Value::Null;
+            }
+            let mut out = String::from("{");
+            for (i, key) in st.items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                // Object keys are always JSON strings (PG coerces).
+                let key_text = match key {
+                    Value::Text(s) | Value::Json(s) => s.clone(),
+                    other => crate::json::value_to_json_text(other),
+                };
+                out.push_str(&crate::json::value_to_json_text(&Value::Text(key_text)));
+                out.push_str(": ");
+                let val = st.aux_items.get(i).unwrap_or(&Value::Null);
+                out.push_str(&crate::json::value_to_json_text(val));
+            }
+            out.push('}');
+            Value::Json(out)
+        }
         // Ordered-set aggregates are finalized in `run` (they need the
         // sorted items + the direct fraction argument), never here.
         _ => unreachable!(),
@@ -1471,11 +1641,17 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // — empty / all-NULL group → NULL).
         "bool_and" | "bool_or" => DataType::Bool,
         // v7.32 (round-29) — variance / stddev are floating point;
-        // percentile_cont interpolates to float.
+        // percentile_cont interpolates to float; the regression family
+        // (except regr_count) is floating point.
         "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop"
-        | "percentile_cont" => DataType::Float,
-        // v7.32 (round-29) — bitwise aggregates return an integer.
-        "bit_and" | "bit_or" | "bit_xor" => DataType::BigInt,
+        | "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx"
+        | "regr_avgy" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_sxx"
+        | "regr_syy" | "regr_sxy" => DataType::Float,
+        // v7.32 (round-29) — bitwise aggregates and regr_count return
+        // an integer.
+        "bit_and" | "bit_or" | "bit_xor" | "regr_count" => DataType::BigInt,
+        // v7.32 (round-29) — JSON aggregates return JSON.
+        "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg" => DataType::Json,
         // min/max, percentile_disc, mode, and anything pass-through:
         // the argument's shape (for ordered-set aggs `spec.arg` is the
         // WITHIN GROUP value expression).
@@ -1520,11 +1696,11 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             } else {
                 (args.first().cloned(), None)
             };
-            let arg2 = if lower == "string_agg" {
+            let arg2 = if agg_uses_second_arg(canonical) {
                 args.get(1).cloned()
-            } else {
+                } else {
                 None
-            };
+                };
             let filter_owned = filter.as_deref().cloned();
             for (i, spec) in aggs.iter().enumerate() {
                 if spec.name == canonical
@@ -1553,8 +1729,9 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                 args.first().cloned()
             };
             // v7.17.0 — match the spec we registered for
-            // string_agg(value, separator) on the full pair.
-            let arg2 = if lower == "string_agg" {
+            // string_agg(value, separator) on the full pair; v7.32 also
+            // the regression family and json_object_agg.
+            let arg2 = if agg_uses_second_arg(&lower) {
                 args.get(1).cloned()
             } else {
                 None

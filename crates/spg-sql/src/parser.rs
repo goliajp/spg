@@ -8921,9 +8921,14 @@ impl Parser {
             let mut args = Vec::new();
             let mut agg_order_by: Vec<OrderBy> = Vec::new();
             // v7.25 (round-17) — `COUNT(DISTINCT x)` and friends.
+            // v7.32 (round-29) — accept the dual `ALL` quantifier too
+            // (the default; ORMs emit `COUNT(ALL x)` / `SUM(ALL x)`).
             let agg_distinct = if matches!(self.peek(), Token::Distinct) {
                 self.advance();
                 true
+            } else if matches!(self.peek(), Token::All) {
+                self.advance();
+                false
             } else {
                 false
             };
