@@ -198,7 +198,11 @@ pub(crate) fn visit_expr_columns_and_subqueries<'a>(
 /// v7.28 (round-22) — collect every Column qualifier in an expr;
 /// `all_qualified` flips false on any bare column (those can't be
 /// attributed to one table safely, so the pushdown skips them).
-pub(crate) fn collect_column_qualifiers<'e>(e: &'e Expr, out: &mut Vec<&'e str>, all_qualified: &mut bool) {
+pub(crate) fn collect_column_qualifiers<'e>(
+    e: &'e Expr,
+    out: &mut Vec<&'e str>,
+    all_qualified: &mut bool,
+) {
     if let Expr::Column(c) = e {
         match &c.qualifier {
             Some(q) => out.push(q.as_str()),

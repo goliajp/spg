@@ -11,12 +11,12 @@ use alloc::vec::Vec;
 use spg_sql::ast::{ColumnTypeName, Expr, Literal, UnOp, VecEncoding as SqlVecEncoding};
 use spg_storage::{ColumnSchema, DataType, StorageError, Value, VecEncoding};
 
+use crate::EngineError;
 use crate::eval::{self, EvalContext, EvalError};
 use crate::numeric::{
     numeric_from_float, numeric_from_integer, numeric_rescale, numeric_truncate_to_integer,
     parse_numeric_text,
 };
-use crate::EngineError;
 
 /// v7.10.4 — decode a BYTEA literal. Accepts:
 ///   * `\xDEADBEEF` (case-insensitive hex; whitespace stripped)
@@ -502,7 +502,9 @@ pub(crate) fn parse_bigint_2d_literal(s: &str) -> Result<Vec<Vec<Option<i64>>>, 
         .collect()
 }
 
-pub(crate) fn parse_text_2d_literal(s: &str) -> Result<Vec<Vec<Option<alloc::string::String>>>, &'static str> {
+pub(crate) fn parse_text_2d_literal(
+    s: &str,
+) -> Result<Vec<Vec<Option<alloc::string::String>>>, &'static str> {
     let raw = split_2d_literal(s)?;
     Ok(raw
         .into_iter()
@@ -564,7 +566,9 @@ pub(crate) fn format_bigint_2d_text(rows: &[Vec<Option<i64>>]) -> alloc::string:
     out
 }
 
-pub(crate) fn format_text_2d_text(rows: &[Vec<Option<alloc::string::String>>]) -> alloc::string::String {
+pub(crate) fn format_text_2d_text(
+    rows: &[Vec<Option<alloc::string::String>>],
+) -> alloc::string::String {
     let mut out = alloc::string::String::from("{");
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {

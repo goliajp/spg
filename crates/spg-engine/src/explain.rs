@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use spg_sql::ast::{Expr, SelectItem, SelectStatement, UnionKind};
 
 use crate::index_access::try_index_seek;
-use crate::{aggregate, expr_has_subquery, select_has_window, Engine};
+use crate::{Engine, aggregate, expr_has_subquery, select_has_window};
 
 /// Walks the SELECT's FROM clauses + WHERE expression tree;
 /// returns one line per missing index. Deterministic order:
@@ -188,7 +188,12 @@ pub(crate) fn annotate_explain_lines(lines: &mut [String], total_rows: usize, en
 /// describe the rewritten SELECT — what the executor *would* do —
 /// using the engine handle to spot indexed lookups and table shapes.
 #[allow(clippy::too_many_lines, clippy::format_push_string)]
-pub(crate) fn explain_select(stmt: &SelectStatement, engine: &Engine, depth: usize, out: &mut Vec<String>) {
+pub(crate) fn explain_select(
+    stmt: &SelectStatement,
+    engine: &Engine,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
     let pad = "  ".repeat(depth);
     // 1) Top-level operator label.
     let top = if !stmt.ctes.is_empty() {

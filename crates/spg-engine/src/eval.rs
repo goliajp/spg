@@ -195,8 +195,14 @@ pub fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext<'_>) -> Result<Value,
                     }
                     return compare(*op, lc.as_ref(), rc.as_ref());
                 }
-                let (l, r) =
-                    collation_fold_for_compare(*op, lhs, rhs, lc.into_owned(), rc.into_owned(), ctx);
+                let (l, r) = collation_fold_for_compare(
+                    *op,
+                    lhs,
+                    rhs,
+                    lc.into_owned(),
+                    rc.into_owned(),
+                    ctx,
+                );
                 return apply_binary(*op, l, r);
             }
             let l = eval_expr(lhs, row, ctx)?;
@@ -8152,8 +8158,14 @@ mod tests {
             Value::Text("b".into()),
             Value::Date(10),
             Value::Timestamp(1000),
-            Value::Numeric { scaled: 30, scale: 1 },
-            Value::Interval { months: 0, micros: 5 },
+            Value::Numeric {
+                scaled: 30,
+                scale: 1,
+            },
+            Value::Interval {
+                months: 0,
+                micros: 5,
+            },
         ];
         let ops = [
             BinOp::Eq,

@@ -15,10 +15,8 @@ use spg_storage::{Row, Value};
 
 fn setup() -> Engine {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE messages (id INT PRIMARY KEY, thread_id TEXT, internal_date BIGINT)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE messages (id INT PRIMARY KEY, thread_id TEXT, internal_date BIGINT)")
+        .unwrap();
     e.execute("CREATE TABLE email_analysis (message_id INT PRIMARY KEY, category TEXT)")
         .unwrap();
     e.execute("CREATE INDEX idx_thread ON messages(thread_id)")
@@ -77,8 +75,16 @@ fn correlated_join_subquery_latest_analysed_category() {
         panic!("expected rows");
     };
     assert_eq!(rows.len(), 3);
-    assert_eq!(cat_of(&rows, "th-0"), "b", "latest analysed in thread 0 is msg 3");
-    assert_eq!(cat_of(&rows, "th-1"), "c", "only msg 8 analysed in thread 1");
+    assert_eq!(
+        cat_of(&rows, "th-0"),
+        "b",
+        "latest analysed in thread 0 is msg 3"
+    );
+    assert_eq!(
+        cat_of(&rows, "th-1"),
+        "c",
+        "only msg 8 analysed in thread 1"
+    );
     assert_eq!(cat_of(&rows, "th-2"), "none", "thread 2 has no analysis");
 }
 

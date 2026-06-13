@@ -362,10 +362,7 @@ pub(crate) fn run(
         if is_within_group_name(&spec.name) {
             if spec.order_by.is_empty() {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "{}() requires WITHIN GROUP (ORDER BY …)",
-                        spec.name
-                    ),
+                    detail: format!("{}() requires WITHIN GROUP (ORDER BY …)", spec.name),
                 });
             }
             // mode() is the only WITHIN GROUP aggregate with no direct
@@ -1001,7 +998,10 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     // arg as the direct (fraction) argument.
                     let ordered_set = is_within_group_name(&canonical);
                     let (arg, direct_arg) = if ordered_set {
-                        (order_by.first().map(|o| o.expr.clone()), args.first().cloned())
+                        (
+                            order_by.first().map(|o| o.expr.clone()),
+                            args.first().cloned(),
+                        )
                     } else {
                         (args.first().cloned(), None)
                     };
@@ -1608,7 +1608,11 @@ fn agg_value_to_f64(v: &Value) -> Option<f64> {
 /// hypothetical value for the hypothetical-set family (`rank` etc.),
 /// and unused by `mode`. `order` is the (single) sort key, needed by
 /// the hypothetical-set family to compare in the sort direction.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn finalize_ordered_set(
     name: &str,
     st: &AggState,
@@ -1632,7 +1636,9 @@ fn finalize_ordered_set(
         // v7.32 (round-29) — hypothetical-set: the rank the direct value
         // would have if inserted into the group, in the sort direction.
         "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
-            let Some(h) = fraction else { return Value::Null };
+            let Some(h) = fraction else {
+                return Value::Null;
+            };
             let (desc, nulls_first) = order.map_or((false, None), |o| (o.desc, o.nulls_first));
             let mut before = 0usize; // sort strictly before h
             let mut before_or_eq = 0usize; // sort before-or-peer with h
@@ -1643,7 +1649,8 @@ fn finalize_ordered_set(
                     core::cmp::Ordering::Less => {
                         before += 1;
                         before_or_eq += 1;
-                        if last_before.is_none_or(|p| value_cmp(p, it) != core::cmp::Ordering::Equal)
+                        if last_before
+                            .is_none_or(|p| value_cmp(p, it) != core::cmp::Ordering::Equal)
                         {
                             distinct_before += 1;
                             last_before = Some(it);
@@ -1684,7 +1691,10 @@ fn finalize_ordered_set(
         }
         // The first value whose cumulative fraction reaches `f`.
         "percentile_disc" => {
-            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0).clamp(0.0, 1.0);
+            let f = fraction
+                .and_then(agg_value_to_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
             let idx = if f <= 0.0 {
                 0
             } else {
@@ -1696,8 +1706,15 @@ fn finalize_ordered_set(
         }
         // Linear interpolation between the two bracketing values.
         "percentile_cont" => {
-            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0).clamp(0.0, 1.0);
-            let Some(nums) = items.iter().map(agg_value_to_f64).collect::<Option<Vec<f64>>>() else {
+            let f = fraction
+                .and_then(agg_value_to_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let Some(nums) = items
+                .iter()
+                .map(agg_value_to_f64)
+                .collect::<Option<Vec<f64>>>()
+            else {
                 return Value::Null; // non-numeric ordered set
             };
             if n == 1 {
@@ -1743,14 +1760,13 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // percentile_cont interpolates to float; the regression family
         // (except regr_count) is floating point.
         "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop"
-        | "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx"
-        | "regr_avgy" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_sxx"
-        | "regr_syy" | "regr_sxy" => DataType::Float,
+        | "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx" | "regr_avgy"
+        | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy" => {
+            DataType::Float
+        }
         // v7.32 (round-29) — bitwise aggregates, regr_count, and the
         // integer hypothetical-set ranks return an integer.
-        "bit_and" | "bit_or" | "bit_xor" | "regr_count" | "rank" | "dense_rank" => {
-            DataType::BigInt
-        }
+        "bit_and" | "bit_or" | "bit_xor" | "regr_count" | "rank" | "dense_rank" => DataType::BigInt,
         // v7.32 (round-29) — hypothetical-set distribution functions.
         "percent_rank" | "cume_dist" => DataType::Float,
         // v7.32 (round-29) — JSON aggregates return JSON.
@@ -1795,15 +1811,18 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             // Mirror collect_aggregates: ordered-set aggregates take the
             // value from the sort spec and the in-parens arg as direct.
             let (arg, direct_arg) = if is_within_group_name(canonical) {
-                (order_by.first().map(|o| o.expr.clone()), args.first().cloned())
+                (
+                    order_by.first().map(|o| o.expr.clone()),
+                    args.first().cloned(),
+                )
             } else {
                 (args.first().cloned(), None)
             };
             let arg2 = if agg_uses_second_arg(canonical) {
                 args.get(1).cloned()
-                } else {
+            } else {
                 None
-                };
+            };
             let filter_owned = filter.as_deref().cloned();
             for (i, spec) in aggs.iter().enumerate() {
                 if spec.name == canonical
