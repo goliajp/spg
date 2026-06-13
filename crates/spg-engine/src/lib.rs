@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod aggregate;
+mod bytebudget;
 mod conversions;
 pub mod copy;
 mod ddl;
@@ -37,6 +38,7 @@ pub mod users;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 
+use bytebudget::*;
 use conversions::*;
 pub use conversions::{
     format_bigint_2d_text_pub, format_hstore_text, format_int_2d_text_pub, format_range_text,
@@ -4039,73 +4041,6 @@ struct ProjectedItem {
     output_name: String,
     ty: DataType,
     nullable: bool,
-}
-
-/// v7.30.3 (mailrs round-26) — approximate heap bytes held by one
-/// `Value`. Fat payloads (text / json / bytea / vectors / arrays)
-/// dominate; fixed-size variants count 0 here because the per-cell
-/// enum overhead is charged separately in `approx_row_bytes`. An
-/// under-estimate is acceptable — the budget is a host-pressure
-/// guard, not an exact meter.
-pub(crate) fn approx_value_bytes(v: &Value) -> usize {
-    match v {
-        Value::Text(s) | Value::Json(s) => s.len(),
-        Value::Bytes(b) => b.len(),
-        Value::Vector(v) => v.len() * 4,
-        Value::TextArray(a) => a
-            .iter()
-            .map(|o| o.as_ref().map_or(0, String::len) + 8)
-            .sum(),
-        Value::IntArray(a) => a.len() * 8,
-        _ => 0,
-    }
-}
-
-/// Approximate heap bytes held by one materialised `Row`: per-cell
-/// enum slots plus fat payloads.
-fn approx_row_bytes(row: &Row) -> usize {
-    row.values.len() * core::mem::size_of::<Value>()
-        + row.values.iter().map(approx_value_bytes).sum::<usize>()
-}
-
-/// v7.30.3 (mailrs round-26) — per-query byte budget for join/filter
-/// materialisation. Net accounting: stages charge what they clone and
-/// release what they free (`working` is released when the next stage
-/// replaces it), so the meter tracks live bytes, not cumulative
-/// churn. `limit = usize::MAX` when the budget is disabled keeps the
-/// hot path branch-free apart from one saturating add + compare.
-struct ByteBudget {
-    limit: usize,
-    used: usize,
-}
-
-impl ByteBudget {
-    const fn new(limit: Option<usize>) -> Self {
-        Self {
-            limit: match limit {
-                Some(n) => n,
-                None => usize::MAX,
-            },
-            used: 0,
-        }
-    }
-
-    fn charge(&mut self, n: usize) -> Result<(), EngineError> {
-        self.used = self.used.saturating_add(n);
-        if self.used > self.limit {
-            return Err(EngineError::QueryBytesExceeded(self.limit));
-        }
-        Ok(())
-    }
-
-    fn release(&mut self, n: usize) {
-        self.used = self.used.saturating_sub(n);
-    }
-}
-
-/// Sum `approx_row_bytes` over a freshly materialised row set.
-fn approx_rows_bytes(rows: &[Row]) -> usize {
-    rows.iter().map(approx_row_bytes).sum()
 }
 
 /// v7.31 (memory campaign — ceiling-first / never-die, design v1) —
