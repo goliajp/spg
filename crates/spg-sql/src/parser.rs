@@ -8569,6 +8569,43 @@ impl Parser {
         NullTreatment::Respect
     }
 
+    /// v7.32 (mailrs round-29) — `agg(args) FILTER (WHERE cond)`.
+    /// `FILTER` is an unreserved keyword, so it arrives as an `Ident`
+    /// (same shape as the `OVER` tail). Consumes the whole clause and
+    /// returns the predicate; returns `None` when no `FILTER` follows.
+    fn parse_filter_clause(&mut self) -> Result<Option<Box<Expr>>, ParseError> {
+        let (Token::Ident(s) | Token::QuotedIdent(s)) = self.peek() else {
+            return Ok(None);
+        };
+        if !s.eq_ignore_ascii_case("filter") {
+            return Ok(None);
+        }
+        self.advance(); // FILTER
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "expected '(' after FILTER, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // (
+        if !matches!(self.peek(), Token::Where) {
+            return Err(self.err(format!(
+                "expected WHERE inside FILTER (...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // WHERE
+        let cond = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' to close FILTER (WHERE ...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // )
+        Ok(Some(Box::new(cond)))
+    }
+
     /// No frame clause is supported.
     #[allow(clippy::type_complexity)] // (partitions, ordered-keys-with-desc) is the natural shape
     fn parse_over_clause(
@@ -8770,11 +8807,18 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                // v7.32 (round-29) — `COUNT(*) FILTER (WHERE …)`.
+                let filter = self.parse_filter_clause()?;
                 // v4.12: COUNT(*) OVER (...) — same window tail.
                 let null_treatment = self.parse_null_treatment_modifier();
                 if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                     && s.eq_ignore_ascii_case("over")
                 {
+                    if filter.is_some() {
+                        return Err(self.err(
+                            "FILTER on window functions is not supported yet".into(),
+                        ));
+                    }
                     self.advance();
                     let (partition_by, order_by, frame) = self.parse_over_clause()?;
                     return Ok(Expr::WindowFunction {
@@ -8784,6 +8828,17 @@ impl Parser {
                         order_by,
                         frame,
                         null_treatment,
+                    });
+                }
+                if let Some(filter) = filter {
+                    return Ok(Expr::AggregateOrdered {
+                        call: Box::new(Expr::FunctionCall {
+                            name: "count_star".into(),
+                            args: Vec::new(),
+                        }),
+                        order_by: Vec::new(),
+                        distinct: false,
+                        filter: Some(filter),
                     });
                 }
                 return Ok(Expr::FunctionCall {
@@ -8882,6 +8937,8 @@ impl Parser {
                 }
             }
             self.advance(); // consume ')'
+            // v7.32 (round-29) — `name(args) FILTER (WHERE …)`.
+            let filter = self.parse_filter_clause()?;
             // v4.12: window-function tail — `name(args) OVER (...)`.
             // Promotes the just-parsed FunctionCall into a
             // WindowFunction node carrying partition + order.
@@ -8892,6 +8949,11 @@ impl Parser {
             if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                 && s.eq_ignore_ascii_case("over")
             {
+                if filter.is_some() {
+                    return Err(self.err(
+                        "FILTER on window functions is not supported yet".into(),
+                    ));
+                }
                 self.advance();
                 let (partition_by, order_by, frame) = self.parse_over_clause()?;
                 return Ok(Expr::WindowFunction {
@@ -8903,11 +8965,12 @@ impl Parser {
                     null_treatment,
                 });
             }
-            if !agg_order_by.is_empty() || agg_distinct {
+            if !agg_order_by.is_empty() || agg_distinct || filter.is_some() {
                 return Ok(Expr::AggregateOrdered {
                     call: Box::new(Expr::FunctionCall { name: first, args }),
                     order_by: agg_order_by,
                     distinct: agg_distinct,
+                    filter,
                 });
             }
             return Ok(Expr::FunctionCall { name: first, args });
