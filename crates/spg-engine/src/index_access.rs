@@ -11,8 +11,7 @@ use spg_sql::ast::{BinOp, Expr, Literal, SelectStatement};
 use spg_storage::{Catalog, ColumnSchema, IndexKey, Row, Table, Value};
 
 use crate::eval::{self, EvalContext};
-use crate::{apply_offset_and_limit, build_projection, EngineError, QueryResult};
-
+use crate::{EngineError, QueryResult, apply_offset_and_limit, build_projection};
 
 /// Try to plan a WHERE clause as an equality lookup against an existing
 /// index. Returns the candidate row indices on success; `None` means the
