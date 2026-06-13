@@ -7565,7 +7565,7 @@ impl Engine {
         &self,
         items: &[SelectItem],
         schema_cols: &[ColumnSchema],
-        _alias: &str,
+        table_alias: &str,
     ) -> Vec<ColumnSchema> {
         let mut out = Vec::new();
         for item in items {
@@ -7587,9 +7587,20 @@ impl Engine {
                         continue;
                     }
                     let name = alias.clone().unwrap_or_else(|| "?column?".to_string());
-                    // Default to Text; the caller's row values
-                    // carry the actual type. v6.10.2 scope.
-                    out.push(ColumnSchema::new(name, DataType::Text, true));
+                    // v7.30.4 (mailrs round-27, P0) — type the
+                    // expression with the same inference the SELECT
+                    // list uses (INT−INT=INT, BIGINT+INT=BIGINT…).
+                    // The old Text default broke every typed decode
+                    // of `RETURNING uidnext - 1 AS uid`: four days
+                    // of inbound mail indexed nowhere. Inference
+                    // failure keeps the old Text fallback rather
+                    // than inventing new error paths here.
+                    let (ty, nullable) =
+                        build_projection(core::slice::from_ref(item), schema_cols, table_alias)
+                            .ok()
+                            .and_then(|p| p.into_iter().next())
+                            .map_or((DataType::Text, true), |p| (p.ty, p.nullable));
+                    out.push(ColumnSchema::new(name, ty, nullable));
                 }
             }
         }

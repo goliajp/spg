@@ -10,6 +10,7 @@ mod fetch;
 mod mailrs_round12;
 mod mailrs_round20;
 mod mailrs_round26;
+mod mailrs_round27;
 mod smoke;
 mod snapshot_routing;
 mod types;

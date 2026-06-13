@@ -191,3 +191,37 @@ async fn on_conflict_composite_target_do_update() {
     let p: String = row.try_get("payload").unwrap();
     assert_eq!(p, "v2");
 }
+
+#[tokio::test]
+#[ignore]
+async fn round27_returning_arithmetic_types_as_int_not_text() {
+    // mailrs round-27 (P0): `RETURNING uidnext - 1 AS uid` was
+    // wire-typed TEXT; the typed i32 decode rejected every delivery
+    // index write. Server-path twin of
+    // crates/spg-sqlx/tests/e2e/mailrs_round27.rs.
+    let pool = pool().await;
+    sqlx::query("DROP TABLE IF EXISTS r27_mb")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE r27_mb (id BIGSERIAL PRIMARY KEY, name TEXT, \
+         uidnext INTEGER NOT NULL DEFAULT 1, hm BIGINT NOT NULL DEFAULT 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO r27_mb (name) VALUES ('INBOX')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (id, uid, new_modseq): (i64, i32, i64) = sqlx::query_as(
+        "UPDATE r27_mb SET uidnext = uidnext + 1, hm = hm + 1 WHERE name = $1 \
+         RETURNING id, uidnext - 1 AS uid, hm AS new_modseq",
+    )
+    .bind("INBOX")
+    .fetch_one(&pool)
+    .await
+    .expect("typed decode of arithmetic RETURNING over pgwire");
+    assert_eq!((id, uid, new_modseq), (1, 1, 1));
+}
