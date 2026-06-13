@@ -9691,15 +9691,37 @@ impl Engine {
                 stmt.limit_literal(),
             );
             let ctx = EvalContext::new(&agg.synth_schema, None);
-            // Memoized path on purpose. Bypassing the batch (memo
-            // None) was measured at 715 ms — 12.8 ms PER direct eval:
-            // the join-shaped inner subquery takes no index seek
-            // (seeded lookups demand all-hot locators, and the e2
-            // JOIN m2 inner shape re-runs the full join pipeline per
-            // row). One all-keys batch ≈ 15 ms total stays the best
-            // available until inner subplans can index-probe like
-            // PG's SubPlan (knife: keyed single-probe execution).
             let mut memo = memoize::MemoizeCache::default();
+            // v7.32 (architecture v2 P3) — keyed index-probe seeding.
+            // Deferred subqueries are referenced only by surviving
+            // select-list rows (≤ LIMIT), so their correlation keys are
+            // exactly the ≤LIMIT group keys in `synth_rows`. Pre-build
+            // each batchable subquery's group map over just those keys
+            // via per-key index seek; the per-row splice loop below then
+            // reuses the seeded map. A join-shaped or un-indexed inner
+            // falls through to the all-keys batch inside the call (built
+            // eagerly here instead of lazily on row 0 — same cost), so
+            // it still pays the full scan, never the 715 ms per-row
+            // direct eval; its index-nested-loop probe is the next
+            // knife. Genuinely non-batchable shapes return None and are
+            // left unseeded for the loop's per-row resolver, as before.
+            for (_, expr) in &agg.deferred {
+                let mut subs: Vec<&SelectStatement> = Vec::new();
+                collect_scalar_subqueries(expr, &mut subs);
+                for sub in subs {
+                    let repr = alloc::format!("{sub}");
+                    if memo.group_maps.contains_key(&repr) {
+                        continue;
+                    }
+                    if let Some(gm) = self.try_batch_correlated_scalar(
+                        sub,
+                        Some((&agg.synth_rows, &ctx)),
+                        cancel,
+                    )? {
+                        memo.group_maps.insert(repr, Some(alloc::rc::Rc::new(gm)));
+                    }
+                }
+            }
             for (ri, srow) in agg.synth_rows.iter().enumerate() {
                 cancel.check()?;
                 for (col, expr) in &agg.deferred {
@@ -12230,7 +12252,7 @@ impl Engine {
                     let repr = alloc::format!("{sub}");
                     if !m.group_maps.contains_key(&repr) {
                         let built = self
-                            .try_batch_correlated_scalar(sub, cancel)?
+                            .try_batch_correlated_scalar(sub, None, cancel)?
                             .map(alloc::rc::Rc::new);
                         m.group_maps.insert(repr.clone(), built);
                     }
@@ -12302,7 +12324,7 @@ impl Engine {
                         .is_some_and(|m| m.group_maps.contains_key(&repr));
                     if !entry_known {
                         let built = self
-                            .try_batch_correlated_scalar(inner, cancel)?
+                            .try_batch_correlated_scalar(inner, None, cancel)?
                             .map(alloc::rc::Rc::new);
                         if let Some(m) = memo.as_deref_mut() {
                             m.group_maps.insert(repr.clone(), built);
@@ -14594,6 +14616,7 @@ impl Engine {
     fn try_batch_correlated_scalar(
         &self,
         inner: &SelectStatement,
+        restrict: Option<(&[Row], &EvalContext<'_>)>,
         cancel: CancelToken<'_>,
     ) -> Result<Option<memoize::GroupMap>, EngineError> {
         use spg_sql::ast::{BinOp, SelectItem as SI};
@@ -14727,7 +14750,7 @@ impl Engine {
                 rhs: alloc::boxed::Box::new(b),
             });
         let mut items: Vec<SI> = alloc::vec![SI::Expr {
-            expr: Expr::Column(inner_col),
+            expr: Expr::Column(inner_col.clone()),
             alias: None,
         }];
         if let Some(o) = order {
@@ -14741,9 +14764,69 @@ impl Engine {
             alias: None,
         });
         batch.items = items;
-        let r = self.exec_select_cancel(&batch, cancel)?;
-        let QueryResult::Rows { rows, .. } = r else {
-            return Ok(None);
+        // v7.32 (architecture v2 P3) — keyed index-probe. When the
+        // caller hands a restriction set (the ≤LIMIT surviving outer
+        // rows of a post-LIMIT deferred subquery) AND the inner is a
+        // single indexed table, evaluate only the surviving correlation
+        // keys via per-key index seek instead of scanning the whole
+        // inner relation. This is PG's SubPlan with an index scan:
+        // 50 seeks of ~µs each vs a 24k-row all-keys batch (~16 ms).
+        // The grouping below is shared — keyed result ≡ full-batch
+        // result for the covered keys, so semantics are identical.
+        // Joins / un-indexed columns return None here and the caller
+        // falls back to the lazy all-keys batch (no regression).
+        let keyed: Option<(&[Row], &EvalContext<'_>)> = restrict.and_then(|(rows, rctx)| {
+            if !from.joins.is_empty() {
+                return None;
+            }
+            let table = self.active_catalog().get(&from.primary.name)?;
+            let pos = table
+                .schema()
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&inner_col.name))?;
+            table.index_on(pos)?;
+            Some((rows, rctx))
+        });
+        let rows = if let Some((restrict_rows, rctx)) = keyed {
+            let mut seen: alloc::collections::BTreeSet<String> =
+                alloc::collections::BTreeSet::new();
+            let mut all_rows: Vec<Row> = Vec::new();
+            for srow in restrict_rows {
+                cancel.check()?;
+                let kv = eval::eval_expr(&Expr::Column(outer_col.clone()), srow, rctx)
+                    .map_err(EngineError::Eval)?;
+                if matches!(kv, Value::Null) {
+                    continue;
+                }
+                if !seen.insert(aggregate::encode_key(core::slice::from_ref(&kv))) {
+                    continue;
+                }
+                let key_eq = Expr::Binary {
+                    lhs: alloc::boxed::Box::new(Expr::Column(inner_col.clone())),
+                    op: BinOp::Eq,
+                    rhs: alloc::boxed::Box::new(value_to_literal_expr(kv)?),
+                };
+                let mut probe = batch.clone();
+                probe.where_ = Some(match probe.where_.take() {
+                    Some(w) => Expr::Binary {
+                        lhs: alloc::boxed::Box::new(w),
+                        op: BinOp::And,
+                        rhs: alloc::boxed::Box::new(key_eq),
+                    },
+                    None => key_eq,
+                });
+                if let QueryResult::Rows { rows, .. } = self.exec_select_cancel(&probe, cancel)? {
+                    all_rows.extend(rows);
+                }
+            }
+            all_rows
+        } else {
+            let r = self.exec_select_cancel(&batch, cancel)?;
+            let QueryResult::Rows { rows, .. } = r else {
+                return Ok(None);
+            };
+            rows
         };
         let has_order = order.is_some();
         let (desc, nf) = order
