@@ -1,21 +1,24 @@
-//! DDL execution for tables and indexes — CREATE / DROP / ALTER
-//! TABLE, CREATE / DROP / ALTER INDEX. Lifted out of `lib.rs`
-//! (v7.32 engine modularisation). These `impl Engine` methods are
-//! dispatched from `Engine::execute` (hence pub(crate)) and drive
-//! the catalog / storage schema mutations.
+//! DDL execution — every CREATE / DROP / ALTER for schema objects:
+//! tables and indexes, plus users, functions, triggers, sequences,
+//! views, types, domains, schemas, and materialized views. Lifted out
+//! of `lib.rs` (v7.32 engine modularisation). These `impl Engine`
+//! methods are dispatched from `Engine::execute` (hence pub(crate)) and
+//! drive the catalog / storage schema mutations.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use spg_sql::ast::{
-    CreateIndexStatement, CreateTableStatement, IndexMethod, VecEncoding as SqlVecEncoding,
+    CreateIndexStatement, CreateTableStatement, CreateUserStatement, IndexMethod, Statement,
+    VecEncoding as SqlVecEncoding,
 };
 use spg_storage::{StorageError, TableSchema, Value, VecEncoding};
 
 use crate::{
-    Engine, EngineError, QueryResult, check_existing_unique_violation, coerce_value,
-    column_def_to_schema, column_type_to_data_type, enforce_fk_inserts, eval,
-    resolve_column_default_free, resolve_foreign_key, rewrite_column_in_source,
+    CancelToken, Engine, EngineError, QueryResult, check_existing_unique_violation, coerce_value,
+    column_def_to_schema, column_type_to_data_type, enforce_fk_inserts, eval, infer_column_types,
+    render_function_args, resolve_column_default_free, resolve_foreign_key,
+    rewrite_column_in_source, users,
 };
 
 impl Engine {
@@ -1360,6 +1363,759 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
+        })
+    }
+}
+
+impl Engine {
+    pub(crate) fn exec_create_user(
+        &mut self,
+        s: &CreateUserStatement,
+    ) -> Result<QueryResult, EngineError> {
+        if self.in_transaction() {
+            return Err(EngineError::Unsupported(
+                "CREATE USER is not allowed inside a transaction".into(),
+            ));
+        }
+        let role = users::Role::parse(&s.role).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("invalid role: {:?}", s.role))
+        })?;
+        // Prefer the host-injected RNG. Falls back to a deterministic
+        // salt derived from the username only when no RNG is wired —
+        // acceptable for tests; the server always installs one.
+        let salt = self.salt_fn.map_or_else(
+            || {
+                let mut s_bytes = [0u8; 16];
+                let digest = spg_crypto::hash(s.name.as_bytes());
+                s_bytes.copy_from_slice(&digest[..16]);
+                s_bytes
+            },
+            |f| f(),
+        );
+        self.users
+            .create(&s.name, &s.password, role, salt)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE USER: {e}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    pub(crate) fn exec_drop_user(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        if self.in_transaction() {
+            return Err(EngineError::Unsupported(
+                "DROP USER is not allowed inside a transaction".into(),
+            ));
+        }
+        self.users
+            .drop(name)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("DROP USER: {e}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    /// v7.12.4 — `CREATE [OR REPLACE] FUNCTION`. Stores the
+    /// function metadata in the catalog. PL/pgSQL bodies are
+    /// already parsed by the SQL parser; we re-canonicalise the
+    /// body to source text for storage (the executor re-parses
+    /// it at trigger fire time — see the trigger fire path).
+    pub(crate) fn exec_create_function(
+        &mut self,
+        s: spg_sql::ast::CreateFunctionStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let args_repr = render_function_args(&s.args);
+        let returns = match &s.returns {
+            spg_sql::ast::FunctionReturn::Trigger => alloc::string::String::from("TRIGGER"),
+            spg_sql::ast::FunctionReturn::Void => alloc::string::String::from("VOID"),
+            spg_sql::ast::FunctionReturn::Type(t) => alloc::format!("{t}"),
+            spg_sql::ast::FunctionReturn::Other(s) => s.clone(),
+        };
+        let body_text = match &s.body {
+            spg_sql::ast::FunctionBody::PlPgSql(b) => alloc::format!("{b}"),
+            spg_sql::ast::FunctionBody::Raw(s) => s.clone(),
+        };
+        let def = spg_storage::FunctionDef {
+            name: s.name.clone(),
+            args_repr,
+            returns,
+            language: s.language.clone(),
+            body: body_text,
+        };
+        self.active_catalog_mut()
+            .create_function(def, s.or_replace)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
+    /// v7.12.4 — `CREATE [OR REPLACE] TRIGGER`. The referenced
+    /// function must already exist in the catalog (forward
+    /// references defer to a later release). Persists the
+    /// trigger metadata for the row-write hooks below to consult.
+    pub(crate) fn exec_create_trigger(
+        &mut self,
+        s: spg_sql::ast::CreateTriggerStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let timing = match s.timing {
+            spg_sql::ast::TriggerTiming::Before => "BEFORE",
+            spg_sql::ast::TriggerTiming::After => "AFTER",
+            spg_sql::ast::TriggerTiming::InsteadOf => "INSTEAD OF",
+        };
+        let events: Vec<alloc::string::String> = s
+            .events
+            .iter()
+            .map(|e| match e {
+                spg_sql::ast::TriggerEvent::Insert => alloc::string::String::from("INSERT"),
+                spg_sql::ast::TriggerEvent::Update => alloc::string::String::from("UPDATE"),
+                spg_sql::ast::TriggerEvent::Delete => alloc::string::String::from("DELETE"),
+                spg_sql::ast::TriggerEvent::Truncate => alloc::string::String::from("TRUNCATE"),
+            })
+            .collect();
+        let for_each = match s.for_each {
+            spg_sql::ast::TriggerForEach::Row => "ROW",
+            spg_sql::ast::TriggerForEach::Statement => "STATEMENT",
+        };
+        let def = spg_storage::TriggerDef {
+            name: s.name.clone(),
+            table: s.table.clone(),
+            timing: alloc::string::String::from(timing),
+            events,
+            for_each: alloc::string::String::from(for_each),
+            function: s.function.clone(),
+            update_columns: s.update_columns.clone(),
+            // v7.16.1 — every trigger is born enabled. Toggled
+            // by ALTER TABLE … { ENABLE | DISABLE } TRIGGER.
+            enabled: true,
+        };
+        self.active_catalog_mut()
+            .create_trigger(def, s.or_replace)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
+    pub(crate) fn exec_drop_trigger(
+        &mut self,
+        name: &str,
+        table: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let removed = self.active_catalog_mut().drop_trigger(name, table);
+        if !removed && !if_exists {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("trigger {name:?} on {table:?} does not exist"),
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    pub(crate) fn exec_drop_function(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let removed = self.active_catalog_mut().drop_function(name);
+        if !removed && !if_exists {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("function {name:?} does not exist"),
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    /// v7.17.0 — `CREATE SEQUENCE` engine path. Resolves
+    /// `min_value` / `max_value` / `start` against PG defaults
+    /// when omitted, then installs the SequenceDef in the catalog.
+    pub(crate) fn exec_create_sequence(
+        &mut self,
+        s: spg_sql::ast::CreateSequenceStatement,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::{SeqBound, SequenceDataType as AstDt};
+        use spg_storage::{SequenceDataType, SequenceDef};
+        let dt = match s.data_type {
+            None => SequenceDataType::BigInt,
+            Some(AstDt::SmallInt) => SequenceDataType::SmallInt,
+            Some(AstDt::Int) => SequenceDataType::Int,
+            Some(AstDt::BigInt) => SequenceDataType::BigInt,
+        };
+        let increment = s.options.increment.unwrap_or(1);
+        if increment == 0 {
+            return Err(EngineError::Unsupported(
+                "INCREMENT must not be zero".into(),
+            ));
+        }
+        let (def_min, def_max) = dt.default_bounds(increment > 0);
+        let min_value = match s.options.min_value {
+            None | Some(SeqBound::NoBound) => def_min,
+            Some(SeqBound::Value(n)) => n,
+        };
+        let max_value = match s.options.max_value {
+            None | Some(SeqBound::NoBound) => def_max,
+            Some(SeqBound::Value(n)) => n,
+        };
+        if min_value > max_value {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "MINVALUE ({min_value}) must be <= MAXVALUE ({max_value})"
+            )));
+        }
+        let start = s
+            .options
+            .start
+            .unwrap_or(if increment > 0 { min_value } else { max_value });
+        if start < min_value || start > max_value {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "START WITH ({start}) is outside MINVALUE..MAXVALUE ({min_value}..{max_value})"
+            )));
+        }
+        let cache = s.options.cache.unwrap_or(1);
+        if cache < 1 {
+            return Err(EngineError::Unsupported("CACHE must be >= 1".into()));
+        }
+        let cycle = s.options.cycle.unwrap_or(false);
+        let owned_by = match s.options.owned_by {
+            None | Some(spg_sql::ast::SequenceOwnedBy::None) => None,
+            Some(spg_sql::ast::SequenceOwnedBy::Column { table, column }) => Some((table, column)),
+        };
+        let def = SequenceDef {
+            name: s.name.clone(),
+            data_type: dt,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cache,
+            cycle,
+            owned_by,
+            last_value: start,
+            is_called: false,
+        };
+        self.active_catalog_mut()
+            .create_sequence(def, s.if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 — `ALTER SEQUENCE` engine path. Re-uses the catalog
+    /// `alter_sequence` merge helper.
+    pub(crate) fn exec_alter_sequence(
+        &mut self,
+        s: spg_sql::ast::AlterSequenceStatement,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::SeqBound;
+        // v7.29 (round-23a) - implicit serial sequences materialise
+        // on first address, ALTER SEQUENCE included.
+        self.ensure_implicit_sequence(&s.name);
+        let cat = self.active_catalog_mut();
+        if !cat.sequences().contains_key(&s.name) {
+            if s.if_exists {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("sequence {:?} does not exist", s.name),
+            )));
+        }
+        let min_value = match s.options.min_value {
+            None => None,
+            Some(SeqBound::NoBound) => None, // NO MINVALUE → keep current
+            Some(SeqBound::Value(n)) => Some(n),
+        };
+        let max_value = match s.options.max_value {
+            None => None,
+            Some(SeqBound::NoBound) => None,
+            Some(SeqBound::Value(n)) => Some(n),
+        };
+        let owned_by = s.options.owned_by.map(|ob| match ob {
+            spg_sql::ast::SequenceOwnedBy::None => None,
+            spg_sql::ast::SequenceOwnedBy::Column { table, column } => Some((table, column)),
+        });
+        cat.alter_sequence(
+            &s.name,
+            s.options.increment,
+            min_value,
+            max_value,
+            s.options.start,
+            s.options.restart,
+            s.options.cache,
+            s.options.cycle,
+            owned_by,
+        )
+        .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.2 — `CREATE VIEW` engine path. Stores the
+    /// Display-rendered body verbatim in the catalog; SELECT-from-
+    /// view at exec time re-parses + prepends as a synthetic CTE.
+    pub(crate) fn exec_create_view(
+        &mut self,
+        s: spg_sql::ast::CreateViewStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Render the SELECT body to canonical form so the catalog
+        // round-trips a deterministic source (no whitespace /
+        // comment surprises in the on-disk snapshot).
+        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body));
+        let def = spg_storage::ViewDef {
+            name: s.name.clone(),
+            columns: s.columns,
+            body: body_repr,
+        };
+        self.active_catalog_mut()
+            .create_view(def, s.or_replace, s.if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.4 — `CREATE TYPE name AS ENUM (…)` engine
+    /// path. Registers the enum in the catalog with order-
+    /// preserving labels. PG semantics: CREATE TYPE errors if the
+    /// name is taken (no IF NOT EXISTS).
+    pub(crate) fn exec_create_type(
+        &mut self,
+        s: spg_sql::ast::CreateTypeStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Name-collision check against tables / sequences / views /
+        // materialized views.
+        let cat = self.active_catalog();
+        if cat.get(&s.name).is_some() {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing table", s.name),
+            )));
+        }
+        if cat.sequences().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing sequence", s.name),
+            )));
+        }
+        if cat.views().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("type {:?} would shadow an existing view", s.name),
+            )));
+        }
+        let def = match s.kind {
+            spg_sql::ast::TypeKind::Enum { labels } => {
+                if labels.is_empty() {
+                    return Err(EngineError::Unsupported(
+                        "CREATE TYPE … AS ENUM requires at least one label".into(),
+                    ));
+                }
+                // Reject duplicate labels per PG.
+                for i in 0..labels.len() {
+                    for j in (i + 1)..labels.len() {
+                        if labels[i] == labels[j] {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "CREATE TYPE {:?}: duplicate ENUM label {:?}",
+                                s.name,
+                                labels[i]
+                            )));
+                        }
+                    }
+                }
+                spg_storage::EnumDef {
+                    name: s.name.clone(),
+                    labels,
+                }
+            }
+        };
+        self.active_catalog_mut()
+            .create_enum_type(def)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.5 — `CREATE DOMAIN name AS base [DEFAULT
+    /// expr] [NOT NULL] [CHECK (expr)]*` engine path. Stores the
+    /// base type + Display-rendered CHECK / DEFAULT sources so
+    /// INSERT/UPDATE on bound columns can re-eval the checks.
+    pub(crate) fn exec_create_domain(
+        &mut self,
+        s: spg_sql::ast::CreateDomainStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let cat = self.active_catalog();
+        if cat.domain_types().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("domain {:?} already exists", s.name),
+            )));
+        }
+        if cat.get(&s.name).is_some()
+            || cat.sequences().contains_key(&s.name)
+            || cat.views().contains_key(&s.name)
+            || cat.enum_types().contains_key(&s.name)
+        {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("domain {:?} would shadow an existing object", s.name),
+            )));
+        }
+        let base_type = column_type_to_data_type(s.base_type);
+        let default = s.default.as_ref().map(|e| alloc::format!("{e}"));
+        let checks = s
+            .checks
+            .iter()
+            .map(|e| alloc::format!("{e}"))
+            .collect::<Vec<_>>();
+        let def = spg_storage::DomainDef {
+            name: s.name.clone(),
+            base_type,
+            nullable: !s.not_null,
+            default,
+            checks,
+        };
+        self.active_catalog_mut()
+            .create_domain_type(def)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.5 — `DROP DOMAIN [IF EXISTS] names`.
+    pub(crate) fn exec_drop_domain(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_domain_type(name);
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("domain {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.6 — `CREATE SCHEMA [IF NOT EXISTS] name`.
+    /// Registers the schema in the catalog. Schema-qualified
+    /// table references continue to strip the prefix at lookup
+    /// time (prefix routing, not isolation — see project-next-
+    /// docket for the v7.18+ real-isolation tracking).
+    pub(crate) fn exec_create_schema(
+        &mut self,
+        name: String,
+        if_not_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        self.active_catalog_mut()
+            .create_schema(name, if_not_exists)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.6 — `DROP SCHEMA [IF EXISTS] names`.
+    /// Built-in schemas always reject the drop with a clear
+    /// error.
+    pub(crate) fn exec_drop_schema(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self
+                .active_catalog_mut()
+                .drop_schema(name)
+                .map_err(EngineError::Storage)?;
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("schema {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.4 — `DROP TYPE [IF EXISTS] names`. Only
+    /// ENUM types are catalogued today; other types silently
+    /// no-op even outside IF EXISTS to mirror the prior
+    /// "everything's text" lax stance.
+    pub(crate) fn exec_drop_type(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_enum_type(name);
+            if was_present {
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("type {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW` engine path.
+    /// Materialises the body at CREATE time (unless WITH NO DATA),
+    /// stores the result as a regular `Table`, and registers the
+    /// body source in the catalog so REFRESH can re-run it.
+    pub(crate) fn exec_create_materialized_view(
+        &mut self,
+        s: spg_sql::ast::CreateMaterializedViewStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // Name-collision check (table / view / sequence / mat-view).
+        let cat = self.active_catalog();
+        if cat.materialized_views().contains_key(&s.name) || cat.get(&s.name).is_some() {
+            if s.if_not_exists {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("materialized view {:?} already exists", s.name),
+            )));
+        }
+        if cat.views().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} would shadow an existing view",
+                    s.name
+                ),
+            )));
+        }
+        if cat.sequences().contains_key(&s.name) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!(
+                    "materialized view {:?} would shadow an existing sequence",
+                    s.name
+                ),
+            )));
+        }
+        // Render the body to canonical form for the registry.
+        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body.clone()));
+        // Execute the body to learn the columns. With WITH DATA we
+        // also materialise the rows; with WITH NO DATA we only need
+        // the schema, so re-use a LIMIT 0 wrap to keep the column
+        // inference path uniform without paying for the rows.
+        let result = self.exec_select_cancel(&s.body, CancelToken::none())?;
+        let (mut cols, rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CREATE MATERIALIZED VIEW body did not return rows: {other:?}"
+                )));
+            }
+        };
+        // Apply the column-rename list per PG semantics.
+        if !s.columns.is_empty() {
+            if s.columns.len() != cols.len() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "CREATE MATERIALIZED VIEW {:?}: column list has {} names but body returns {}",
+                    s.name,
+                    s.columns.len(),
+                    cols.len()
+                )));
+            }
+            for (c, name) in cols.iter_mut().zip(s.columns.iter()) {
+                c.name.clone_from(name);
+            }
+        }
+        // Promote any synthetic-Text projections to their actual
+        // observed types so the backing table accepts the rows.
+        cols = infer_column_types(&cols, &rows);
+        let schema = spg_storage::TableSchema::new(s.name.clone(), cols);
+        let cat = self.active_catalog_mut();
+        cat.create_table(schema).map_err(EngineError::Storage)?;
+        if s.with_data {
+            let table = cat
+                .get_mut(&s.name)
+                .expect("just-created materialized-view backing table must exist");
+            for row in rows {
+                table.insert(row).map_err(EngineError::Storage)?;
+            }
+        }
+        cat.register_materialized_view(s.name.clone(), body_repr);
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `REFRESH MATERIALIZED VIEW name [WITH
+    /// [NO] DATA]`. Looks up the source, re-runs it, replaces the
+    /// backing table's rows.
+    pub(crate) fn exec_refresh_materialized_view(
+        &mut self,
+        name: &str,
+        with_data: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let source = self
+            .active_catalog()
+            .materialized_views()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "materialized view {name:?} does not exist"
+                )))
+            })?;
+        // Wipe the existing rows first (PG truncates the matview
+        // and rebuilds; we approximate with an empty INSERT loop).
+        {
+            let cat = self.active_catalog_mut();
+            let table = cat.get_mut(name).ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "materialized view {name:?} backing table missing"
+                )))
+            })?;
+            table.truncate();
+        }
+        if !with_data {
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: !self.in_transaction(),
+            });
+        }
+        let parsed = spg_sql::parser::parse_statement(&source).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body re-parse failed: {e}"
+            ))
+        })?;
+        let Statement::Select(body) = parsed else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body is not a SELECT (catalog corruption)"
+            )));
+        };
+        let rows = match self.exec_select_cancel(&body, CancelToken::none())? {
+            QueryResult::Rows { rows, .. } => rows,
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "REFRESH MATERIALIZED VIEW {name:?} body did not return rows: {other:?}"
+                )));
+            }
+        };
+        let cat = self.active_catalog_mut();
+        let table = cat.get_mut(name).expect("backing table verified above");
+        let affected = rows.len();
+        for row in rows {
+            table.insert(row).map_err(EngineError::Storage)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.3 — `DROP MATERIALIZED VIEW [IF EXISTS]
+    /// names`. Drops the backing table + unregisters the source.
+    pub(crate) fn exec_drop_materialized_view(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self
+                .active_catalog_mut()
+                .drop_materialized_view_source(name);
+            if was_present {
+                // Drop the backing table too.
+                self.active_catalog_mut().drop_table(name);
+                removed += 1;
+            } else if !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("materialized view {name:?} does not exist"),
+                )));
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 Phase 1.2 — `DROP VIEW [IF EXISTS] name [, name…]`.
+    pub(crate) fn exec_drop_view(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_view(name);
+            if !was_present && !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("view {name:?} does not exist"),
+                )));
+            }
+            if was_present {
+                removed += 1;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
+        })
+    }
+
+    /// v7.17.0 — `DROP SEQUENCE [IF EXISTS] name [, name…]`.
+    pub(crate) fn exec_drop_sequence(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let mut removed = 0usize;
+        for name in names {
+            let was_present = self.active_catalog_mut().drop_sequence(name);
+            if !was_present && !if_exists {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("sequence {name:?} does not exist"),
+                )));
+            }
+            if was_present {
+                removed += 1;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: removed,
+            modified_catalog: removed > 0 && !self.in_transaction(),
         })
     }
 }
