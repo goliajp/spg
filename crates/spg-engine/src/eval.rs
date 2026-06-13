@@ -6731,11 +6731,28 @@ pub(crate) fn eval_compiled(
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value>,
 ) -> Result<Value, EvalError> {
+    eval_compiled_ref(c, &crate::RowRef::Owned(row), ctx, stack)
+}
+
+/// v7.32 (P4 borrow channel, increment 2) — the RowRef-borrowing form of
+/// `eval_compiled`. `Step::Column` borrows its cell straight from the
+/// RowRef (a join tuple resolves it via `tuple_value`, never
+/// materialising a combined Row); only the rare Subtree / InSet
+/// cross-family fallback materialises the row once. Bit-for-bit
+/// equivalent to the Owned path — `eval_compiled` above is now a thin
+/// `RowRef::Owned` wrapper, so there is a single interpreter (invariant
+/// I3); a differential test pins the equivalence.
+pub(crate) fn eval_compiled_ref(
+    c: &CompiledExpr,
+    row: &crate::RowRef<'_>,
+    ctx: &EvalContext<'_>,
+    stack: &mut Vec<Value>,
+) -> Result<Value, EvalError> {
     stack.clear();
     for step in &c.steps {
         match step {
             Step::Column(pos) => {
-                stack.push(row.values.get(*pos).cloned().unwrap_or(Value::Null));
+                stack.push(row.get(*pos).cloned().unwrap_or(Value::Null));
             }
             Step::Lit(v) => stack.push(v.clone()),
             Step::Binary(op) => {
@@ -6787,7 +6804,7 @@ pub(crate) fn eval_compiled(
                     // Cross-family needle: take the interpreter's
                     // exact coercion / error path on the whole node.
                     _ => {
-                        stack.push(eval_expr(fallback, row, ctx)?);
+                        stack.push(eval_expr(fallback, &*row.as_row(), ctx)?);
                         continue;
                     }
                 };
@@ -6830,7 +6847,7 @@ pub(crate) fn eval_compiled(
                     }
                 }
             }
-            Step::Subtree(e) => stack.push(eval_expr(e, row, ctx)?),
+            Step::Subtree(e) => stack.push(eval_expr(e, &*row.as_row(), ctx)?),
         }
     }
     Ok(stack.pop().unwrap_or(Value::Null))

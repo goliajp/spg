@@ -8894,7 +8894,7 @@ impl Engine {
         cancel: CancelToken<'_>,
         needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
         budget: &mut ByteBudget,
-    ) -> Result<(Vec<ColumnSchema>, Vec<Row>), EngineError> {
+    ) -> Result<DeferredJoin<'_>, EngineError> {
         let primary_alias = from
             .primary
             .alias
@@ -9138,7 +9138,20 @@ impl Engine {
                 }
                 filtered.push(row);
             }
-            return Ok((combined_schema, filtered));
+            // v7.32 (P4 increment 2) — joinless: the survivors ARE the
+            // primary rows; wrap them as one Owned source with identity
+            // tuples so the deferred output type stays uniform.
+            let width = combined_schema.len();
+            let n = filtered.len();
+            return Ok(DeferredJoin {
+                sources: alloc::vec![JoinSrc::Owned(filtered)],
+                offsets: alloc::vec![0, width],
+                widths: alloc::vec![width],
+                masks: alloc::vec![None],
+                survivors: (0..n).collect(),
+                stride: 1,
+                combined_schema,
+            });
         }
         // v7.31 (perf campaign) — deferred join materialisation. The
         // old pipeline cloned the full combined row at EVERY join
@@ -9189,7 +9202,7 @@ impl Engine {
         // Track the per-row width consumed by the outer left side so
         // each lateral evaluation sees the correct schema slice.
         let mut consumed_cols = primary_cols.len();
-        for peer in &joined {
+        for peer in &mut joined {
             if working.len() / stride > MAX_JOIN_INTERMEDIATE_ROWS {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "join intermediate result exceeds {MAX_JOIN_INTERMEDIATE_ROWS} rows ({} so far) - add join predicates",
@@ -9349,8 +9362,12 @@ impl Engine {
                 // (pushed predicate / non-table ref), otherwise the
                 // stored table read in place (v7.31 — no full-table
                 // clone + null-out just to hash it).
-                let rights_src: JoinSrc<'_> = match peer.eager_rows.as_deref() {
-                    Some(er) => JoinSrc::Eager(er),
+                // v7.32 (P4 increment 2) — move the eager build side
+                // into an Owned source instead of borrowing `joined`,
+                // so the deferred output can outlive this loop. Probe
+                // and hash-build read the stack-local `rights_src`.
+                let rights_src: JoinSrc<'_> = match peer.eager_rows.take() {
+                    Some(rows) => JoinSrc::Owned(rows),
                     None => match peer
                         .join_table
                         .as_deref()
@@ -9539,8 +9556,11 @@ impl Engine {
             } else if let Some(lz) = lazy_rows {
                 sources.push(JoinSrc::Owned(lz));
             } else {
-                sources.push(JoinSrc::Eager(
-                    peer.eager_rows.as_deref().expect("non-lateral peer eager"),
+                // v7.32 (P4 increment 2) — move (not borrow) the eager
+                // peer rows; `rights_eager` above has finished its
+                // nested-loop borrow by here.
+                sources.push(JoinSrc::Owned(
+                    peer.eager_rows.take().expect("non-lateral peer eager"),
                 ));
             }
             // Fallback sources are pre-pruned (eager / lazy null-out)
@@ -9551,7 +9571,6 @@ impl Engine {
             widths.push(right_arity);
             debug_assert!(consumed_cols <= combined_schema.len());
         }
-        let mut filtered: Vec<Row> = Vec::new();
         // v7.24 (round-16 B) — the joined WHERE filter ran the plain
         // row evaluator, so a correlated EXISTS/IN/scalar subquery
         // under a JOIN hit "subquery reached row eval". Route through
@@ -9565,41 +9584,61 @@ impl Engine {
             .filter(|w| eval::fully_compilable(w))
             .map(|w| eval::compile_expr(w, &ctx));
         let mut eval_stack: Vec<Value> = Vec::new();
+        // v7.32 (P4 borrow channel, increment 2) — WHERE filters the
+        // row-index tuples WITHOUT materialising a combined Row. The
+        // compiled path reads cells by reference through `RowRef::Tuple`
+        // (eval_compiled_ref); only a correlated WHERE (subqueries)
+        // materialises, once, per surviving probe. Survivors are kept as
+        // their tuples — the aggregate path borrows them; projection /
+        // window callers call `materialise()`.
+        let mut survivors: Vec<usize> = Vec::new();
         for tuple in working.chunks(stride) {
-            let row = Row::new(materialise_tuple_vals(
-                &sources,
-                &widths,
-                &masks,
+            let rr = RowRef::Tuple {
+                sources: &sources,
+                offsets: &offsets,
                 tuple,
-                consumed_cols,
-            ));
-            if let Some(cw) = &compiled_where {
-                let cond = eval::eval_compiled(cw, &row, &ctx, &mut eval_stack)
-                    .map_err(EngineError::Eval)?;
-                if !matches!(cond, Value::Bool(true)) {
-                    continue;
-                }
+            };
+            let pass = if let Some(cw) = &compiled_where {
+                matches!(
+                    eval::eval_compiled_ref(cw, &rr, &ctx, &mut eval_stack)
+                        .map_err(EngineError::Eval)?,
+                    Value::Bool(true)
+                )
             } else if let Some(where_expr) = where_ {
-                let cond = self.eval_expr_with_correlated(
-                    where_expr,
-                    &row,
-                    &ctx,
-                    cancel,
-                    Some(&mut memo),
-                )?;
-                if !matches!(cond, Value::Bool(true)) {
-                    continue;
-                }
+                let row = rr.as_row();
+                matches!(
+                    self.eval_expr_with_correlated(
+                        where_expr,
+                        &row,
+                        &ctx,
+                        cancel,
+                        Some(&mut memo),
+                    )?,
+                    Value::Bool(true)
+                )
+            } else {
+                true
+            };
+            if !pass {
+                continue;
             }
-            // v7.30.3 byte budget — in the deferred-join pipeline the
-            // tuples are 8 B row numbers; THIS is the point where fat
-            // values actually get cloned and retained, so this is
-            // where the meter charges (rows failing WHERE are dropped
-            // immediately and never accumulate).
-            budget.charge(approx_row_bytes(&row))?;
-            filtered.push(row);
+            // v7.30.3 byte budget — survivors hold 8 B row numbers, but
+            // the live data they reference is what the meter must track;
+            // `approx_tuple_bytes` sums it by reference (no clone),
+            // mirroring the bytes the old `approx_row_bytes(materialised)`
+            // charged. Rows failing WHERE never accumulate.
+            budget.charge(approx_tuple_bytes(&sources, &offsets, &masks, tuple))?;
+            survivors.extend_from_slice(tuple);
         }
-        Ok((combined_schema, filtered))
+        Ok(DeferredJoin {
+            sources,
+            offsets,
+            widths,
+            masks,
+            survivors,
+            stride,
+            combined_schema,
+        })
     }
 
     /// v7.17.0 Phase 3.P0-41 — probe a LATERAL subquery's projection
@@ -10051,7 +10090,7 @@ impl Engine {
         // projection / ORDER BY / DISTINCT / LIMIT inline because
         // those depend on the SelectStatement's items list.
         let mut budget = ByteBudget::new(self.max_query_bytes);
-        let (combined_schema, filtered) = {
+        let deferred = {
             let mut needed = alloc::collections::BTreeSet::new();
             let prunable = collect_qualified_refs(stmt, &mut needed).is_some();
             self.build_joined_filtered_rows(
@@ -10062,12 +10101,18 @@ impl Engine {
                 &mut budget,
             )?
         };
-        let ctx = EvalContext::new(&combined_schema, None);
+        let combined_schema = &deferred.combined_schema;
+        let ctx = EvalContext::new(combined_schema, None);
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
         if aggregate::uses_aggregate(stmt) {
-            let refs: alloc::vec::Vec<RowRef<'_>> =
-                filtered.iter().map(RowRef::Owned).collect();
+            // v7.32 (P4 borrow channel, increment 2) — borrow each
+            // surviving join tuple as a RowRef::Tuple; the aggregate
+            // engine reads source cells by reference (bound fast path =
+            // zero clone) instead of consuming materialised combined
+            // Rows. This is where the +211k materialise_tuple_vals
+            // clones disappear for the join+aggregate shape.
+            let refs = deferred.row_refs();
             // v7.29 — a per-query memo so correlated scalar
             // subqueries batch-evaluate once (group map) instead of
             // executing per group.
@@ -10081,11 +10126,15 @@ impl Engine {
                         },
                     })
             };
-            let agg = aggregate::run(stmt, &refs, &combined_schema, None, Some(&agg_correlated))?;
+            let agg = aggregate::run(stmt, &refs, combined_schema, None, Some(&agg_correlated))?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
 
-        let projection = build_projection(&stmt.items, &combined_schema, "")?;
+        let projection = build_projection(&stmt.items, combined_schema, "")?;
+        // v7.32 (P4 increment 2) — projection / ORDER / DISTINCT / LIMIT
+        // need owned Rows; materialise the survivors here (byte-identical
+        // to the pre-deferral output).
+        let filtered = deferred.materialise();
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
         let mut proj_memo = memoize::MemoizeCache::default();
         for row in &filtered {
@@ -11455,16 +11504,18 @@ impl Engine {
             }
             filtered = owned;
         } else {
-            let (combined_schema, rows) = self.build_joined_filtered_rows(
+            let deferred = self.build_joined_filtered_rows(
                 from,
                 stmt.where_.as_ref(),
                 cancel,
                 None,
                 &mut ByteBudget::new(self.max_query_bytes),
             )?;
-            schema_cols_owned = combined_schema;
+            // Window path needs owned Rows; materialise the survivors
+            // before moving out the schema.
+            filtered = deferred.materialise();
+            schema_cols_owned = deferred.combined_schema;
             alias_opt = None;
-            filtered = rows;
         }
         let schema_cols = &schema_cols_owned;
         let ctx = self.ev_ctx(schema_cols, alias_opt);
@@ -14672,6 +14723,103 @@ fn materialise_tuple_vals(
         }
     }
     vals
+}
+
+/// v7.32 (P4 borrow channel, increment 2) — the deferred output of
+/// `build_joined_filtered_rows`: WHERE-surviving rows held as row-index
+/// tuples over the join sources, NOT materialised into combined Rows.
+/// The aggregate path borrows each survivor as a `RowRef::Tuple` (the
+/// bound fast path reads source cells by reference — zero clone); the
+/// projection / window paths call `materialise()` for an owned
+/// `Vec<Row>` identical to the pre-increment-2 output.
+struct DeferredJoin<'a> {
+    sources: Vec<JoinSrc<'a>>,
+    offsets: Vec<usize>,
+    widths: Vec<usize>,
+    masks: Vec<Option<Vec<bool>>>,
+    /// Flat row-index tuples — one stride-long group per surviving row.
+    survivors: Vec<usize>,
+    stride: usize,
+    combined_schema: Vec<ColumnSchema>,
+}
+
+impl DeferredJoin<'_> {
+    fn len(&self) -> usize {
+        if self.stride == 0 {
+            0
+        } else {
+            self.survivors.len() / self.stride
+        }
+    }
+
+    /// Borrow each surviving tuple as a `RowRef::Tuple` for the
+    /// aggregate engine — no combined Row is materialised.
+    fn row_refs(&self) -> Vec<RowRef<'_>> {
+        if self.stride == 0 {
+            return Vec::new();
+        }
+        self.survivors
+            .chunks(self.stride)
+            .map(|tuple| RowRef::Tuple {
+                sources: &self.sources,
+                offsets: &self.offsets,
+                tuple,
+            })
+            .collect()
+    }
+
+    /// Materialise the survivors into owned combined Rows (projection /
+    /// window paths). Byte-identical to the pre-deferral output.
+    fn materialise(&self) -> Vec<Row> {
+        if self.stride == 0 {
+            return Vec::new();
+        }
+        let cap = self.offsets.last().copied().unwrap_or(0);
+        self.survivors
+            .chunks(self.stride)
+            .map(|tuple| {
+                Row::new(materialise_tuple_vals(
+                    &self.sources,
+                    &self.widths,
+                    &self.masks,
+                    tuple,
+                    cap,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// v7.32 (P4 borrow channel, increment 2) — byte estimate of a
+/// row-index tuple WITHOUT materialising it: walk each referenced source
+/// cell by reference and sum, applying the same per-column mask
+/// `materialise_tuple_vals` would (unreferenced columns count as NULL).
+/// Mirrors `approx_row_bytes(materialised)` so the v7.30.3 byte budget
+/// meters identical live bytes on the deferred path.
+fn approx_tuple_bytes(
+    sources: &[JoinSrc<'_>],
+    offsets: &[usize],
+    masks: &[Option<Vec<bool>>],
+    tuple: &[usize],
+) -> usize {
+    let width = offsets.last().copied().unwrap_or(0);
+    let mut bytes = width * core::mem::size_of::<Value>();
+    for (k, &ri) in tuple.iter().enumerate() {
+        if ri == usize::MAX {
+            continue;
+        }
+        let Some(row) = sources.get(k).and_then(|s| s.get(ri)) else {
+            continue;
+        };
+        let mask = masks.get(k).and_then(|m| m.as_deref());
+        for (i, v) in row.values.iter().enumerate() {
+            let kept = mask.map_or(true, |m| m.get(i).copied().unwrap_or(false));
+            if kept {
+                bytes += approx_value_bytes(v);
+            }
+        }
+    }
+    bytes
 }
 
 /// v7.17.0 Phase 3.P0-41 — synthesise a column name for a LATERAL
