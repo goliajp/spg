@@ -250,18 +250,20 @@ pub fn run(
     validate_agg_arities(stmt, &agg_specs)?;
 
     // Map group key (vec of values, encoded as canonical string) -> group state.
-    // Order of insertion is preserved via a parallel Vec of keys.
-    // v7.29 - hash map (output order rides key_order, not map order).
-    let mut groups: hashbrown::HashMap<String, (Vec<Value>, Vec<AggState>)> =
-        hashbrown::HashMap::new();
-    let mut key_order: Vec<String> = Vec::new();
+    // v7.32 (architecture v2, P2b) — insertion-ordered group state in
+    // a Vec; the hash map only maps key → index. Removes the parallel
+    // `key_order: Vec<String>` (a second per-group key clone) and the
+    // per-group re-probe `groups[k]` at finalize (24k hash lookups for
+    // the inbox shape). The map owns its key once on vacant insert.
+    let mut order: Vec<(Vec<Value>, Vec<AggState>)> = Vec::new();
+    let mut groups: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
     // When there are no GROUP BY exprs *and* there is at least one aggregate,
     // every row collapses into a single anonymous group keyed by "".
     if rows.is_empty() && group_exprs.is_empty() {
         // Single empty-aggregate group: count=0, sum=0, max=NULL, etc.
+        // No rows follow, so the map is never probed — seed `order` only.
         let init: Vec<AggState> = (0..agg_specs.len()).map(|_| AggState::default()).collect();
-        groups.insert(String::new(), (Vec::new(), init));
-        key_order.push(String::new());
+        order.push((Vec::new(), init));
     }
 
     // v7.30 (perf campaign) - hoist the per-row work that doesn't
@@ -321,16 +323,19 @@ pub fn run(
                     .map(|p| row.values.get(p.unwrap()).unwrap_or(&Value::Null)),
             );
             encode_key_refs_into(&refs, &mut keybuf_s);
-            let entry = match groups.entry_ref(keybuf_s.as_str()) {
-                hashbrown::hash_map::EntryRef::Occupied(o) => o.into_mut(),
-                hashbrown::hash_map::EntryRef::Vacant(v) => {
-                    key_order.push(keybuf_s.clone());
+            let idx = match groups.get(keybuf_s.as_str()) {
+                Some(&i) => i,
+                None => {
+                    let i = order.len();
                     let init: Vec<AggState> =
                         (0..agg_specs.len()).map(|_| AggState::default()).collect();
                     let owned: Vec<Value> = refs.iter().map(|v| (*v).clone()).collect();
-                    v.insert((owned, init))
+                    order.push((owned, init));
+                    groups.insert(keybuf_s.clone(), i);
+                    i
                 }
             };
+            let entry = &mut order[idx];
             for (i, spec) in agg_specs.iter().enumerate() {
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], &spec.arg) {
@@ -392,16 +397,19 @@ pub fn run(
             }
             encode_key(&key_vals)
         };
-        // entry_ref: no per-row key clone on the (dominant) hit path.
-        let entry = match groups.entry_ref(key.as_str()) {
-            hashbrown::hash_map::EntryRef::Occupied(o) => o.into_mut(),
-            hashbrown::hash_map::EntryRef::Vacant(v) => {
-                key_order.push(key.clone());
+        // Probe by index; the map owns the key once on vacant insert.
+        let idx = match groups.get(key.as_str()) {
+            Some(&i) => i,
+            None => {
+                let i = order.len();
                 let init: Vec<AggState> =
                     (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                v.insert((group_vals.clone(), init))
+                order.push((group_vals.clone(), init));
+                groups.insert(key, i);
+                i
             }
         };
+        let entry = &mut order[idx];
         for (i, spec) in agg_specs.iter().enumerate() {
             let arg_val = match &spec.arg {
                 None => Value::Bool(true), // count_star: sentinel non-null
@@ -473,10 +481,9 @@ pub fn run(
         synth_schema.push(ColumnSchema::new(format!("__agg_{i}"), *ty, true));
     }
 
-    // Materialise synthetic rows.
+    // Materialise synthetic rows (insertion order = `order`).
     let mut synth_rows: Vec<Row> = Vec::new();
-    for k in &key_order {
-        let (gvals, states) = &groups[k];
+    for (gvals, states) in &order {
         let mut values: Vec<Value> = Vec::with_capacity(synth_schema.len());
         values.extend(gvals.iter().cloned());
         for (i, st) in states.iter().enumerate() {
