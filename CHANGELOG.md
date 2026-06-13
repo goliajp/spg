@@ -8,6 +8,13 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.31.1] — 2026-06-13 (HOTFIX — rust 1.96 clippy sweep; supersedes the unpublished 7.31.0)
+
+One-line `clippy::int_plus_one` sweep (new stable lint landed
+between the local gate and CI). 7.31.0 was tagged but its CI went
+red before any crates.io / docker publish — 7.31.1 is the shipped
+artifact for the 7.31 line.
+
 ## [7.31.0] — 2026-06-13
 
 Rolling release carrying four lines of work: the round-27 P0 fix,
