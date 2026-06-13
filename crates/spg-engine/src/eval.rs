@@ -4984,7 +4984,7 @@ pub fn cast_value(v: Value, target: CastTarget) -> Result<Value, EvalError> {
         // mailrs D-pre #3 reverse-acceptance gap.
         CastTarget::Bytea => match v {
             Value::Bytes(b) => Ok(Value::Bytes(b)),
-            Value::Text(s) => match crate::decode_bytea_literal(&s) {
+            Value::Text(s) => match crate::conversions::decode_bytea_literal(&s) {
                 Ok(b) => Ok(Value::Bytes(b)),
                 Err(msg) => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("invalid input syntax for type bytea: {msg}"),
@@ -5339,13 +5339,13 @@ fn value_to_text(v: &Value) -> String {
         // v7.17.0 Phase 3.P0-38 — Range canonical form. Routes
         // through the engine's format_range_text to share the
         // single renderer with pgwire / sqllogictest.
-        Value::Range { .. } => crate::format_range_text(v),
+        Value::Range { .. } => crate::conversions::format_range_text(v),
         // v7.17.0 Phase 3.P0-39 — Hstore canonical PG text form.
-        Value::Hstore(pairs) => crate::format_hstore_text(pairs),
+        Value::Hstore(pairs) => crate::conversions::format_hstore_text(pairs),
         // v7.17.0 Phase 3.P0-40 — 2D array canonical PG text form.
-        Value::IntArray2D(rows) => crate::format_int_2d_text_pub(rows),
-        Value::BigIntArray2D(rows) => crate::format_bigint_2d_text_pub(rows),
-        Value::TextArray2D(rows) => crate::format_text_2d_text_pub(rows),
+        Value::IntArray2D(rows) => crate::conversions::format_int_2d_text_pub(rows),
+        Value::BigIntArray2D(rows) => crate::conversions::format_bigint_2d_text_pub(rows),
+        Value::TextArray2D(rows) => crate::conversions::format_text_2d_text_pub(rows),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }
