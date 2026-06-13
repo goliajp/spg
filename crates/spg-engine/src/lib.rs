@@ -4326,14 +4326,18 @@ impl Engine {
         // we hold the catalog mutably so ON UPDATE runtime
         // overrides see the engine wall clock.
         let clock_for_on_update = self.clock;
-        let table = self
-            .active_catalog_mut()
-            .get_mut(&stmt.table)
-            .ok_or_else(|| {
-                EngineError::Storage(StorageError::TableNotFound {
-                    name: stmt.table.clone(),
-                })
-            })?;
+        // v7.31 (mailrs round-28) — the candidate-gathering phase
+        // below is READ-ONLY (it builds `planned`; the mutation
+        // happens after `let _ = table`). Borrow the catalog
+        // SHARED here so a correlated scalar subquery in SET / WHERE
+        // can re-enter the engine read path (`eval_expr_with_correlated`
+        // also takes `&self`) with the target row as its outer
+        // context. The apply phase re-acquires `active_catalog_mut()`.
+        let table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: stmt.table.clone(),
+            })
+        })?;
         let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
         // Resolve each SET target to a column position once, validate
         // up front so a typo'd column doesn't leave a partial mutation
@@ -4400,14 +4404,31 @@ impl Engine {
                 continue;
             };
             if let Some(w) = &stmt.where_ {
-                let cond = eval::eval_expr(w, row, &ctx)?;
+                // v7.31 (round-28) — correlated subqueries in the
+                // UPDATE WHERE bind to the candidate row, like the
+                // SELECT path; plain predicates keep the cheap
+                // interpreter.
+                let cond = if expr_has_subquery(w) {
+                    self.eval_expr_with_correlated(w, row, &ctx, cancel, None)?
+                } else {
+                    eval::eval_expr(w, row, &ctx)?
+                };
                 if !matches!(cond, Value::Bool(true)) {
                     continue;
                 }
             }
             let mut new_vals = row.values.clone();
             for (pos, expr) in &targets {
-                let v = eval::eval_expr(expr, row, &ctx)?;
+                // v7.31 (round-28) — correlated scalar subquery in
+                // SET (`SET c = (SELECT … WHERE x = target.col)`)
+                // binds the target row as its outer context. The
+                // non-correlated case was materialised up front by
+                // resolve_expr_subqueries at the UPDATE entry.
+                let v = if expr_has_subquery(expr) {
+                    self.eval_expr_with_correlated(expr, row, &ctx, cancel, None)?
+                } else {
+                    eval::eval_expr(expr, row, &ctx)?
+                };
                 let coerced = coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
                 check_unsigned_range(&coerced, &schema_cols[*pos], *pos)?;
                 new_vals[*pos] = coerced;
