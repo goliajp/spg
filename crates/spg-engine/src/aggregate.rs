@@ -126,6 +126,26 @@ pub fn is_aggregate_name(name: &str) -> bool {
             | "bool_and"
             | "bool_or"
             | "every"
+            // v7.32 (round-29) — statistical aggregates (every BI /
+            // dashboard emits these in rollups).
+            | "stddev" | "stddev_samp" | "stddev_pop"
+            | "variance" | "var_samp" | "var_pop"
+            // v7.32 (round-29) — bitwise aggregates.
+            | "bit_and" | "bit_or" | "bit_xor"
+            // v7.32 (round-29) — ordered-set aggregates (used with
+            // `WITHIN GROUP (ORDER BY …)`).
+            | "percentile_cont" | "percentile_disc" | "mode"
+    )
+}
+
+/// v7.32 (round-29) — ordered-set aggregates: the value to aggregate
+/// comes from the `WITHIN GROUP (ORDER BY …)` sort spec, and any
+/// in-parens arguments are *direct* arguments (the percentile fraction).
+/// `mode()` takes no direct argument.
+pub fn is_ordered_set_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "percentile_cont" | "percentile_disc" | "mode"
     )
 }
 
@@ -162,6 +182,12 @@ struct AggState {
     /// bool_or / every. `None` until the first non-NULL input;
     /// at finalize None → SQL NULL.
     bool_acc: Option<bool>,
+    /// v7.32 (round-29) — sum of squares for the variance / stddev
+    /// family (`sum_float` carries the running sum; `count` the n).
+    sum_sq: f64,
+    /// v7.32 (round-29) — running accumulator for bit_and / bit_or /
+    /// bit_xor. `None` until the first non-NULL input → SQL NULL.
+    bit_acc: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +216,11 @@ struct AggSpec {
     /// whose `cond` is not TRUE (false or NULL) is excluded from this
     /// aggregate only. `None` for the unfiltered form.
     filter: Option<Expr>,
+    /// v7.32 (round-29) — ordered-set aggregates only: the *direct*
+    /// argument (the percentile fraction for `percentile_cont/disc`).
+    /// PG requires it constant, so it is evaluated once. `None` for
+    /// `mode()` and for every non-ordered-set aggregate.
+    direct_arg: Option<Expr>,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -253,6 +284,25 @@ pub fn run(
     // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
+    // v7.32 (round-29) — ordered-set aggregates require WITHIN GROUP
+    // (PG raises a hard error otherwise rather than silently degrading).
+    for spec in &agg_specs {
+        if is_ordered_set_name(&spec.name) {
+            if spec.order_by.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{}() is an ordered-set aggregate and requires WITHIN GROUP (ORDER BY …)",
+                        spec.name
+                    ),
+                });
+            }
+            if spec.name != "mode" && spec.direct_arg.is_none() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{}() requires a single fraction argument", spec.name),
+                });
+            }
+        }
+    }
 
     // Map group key (vec of values, encoded as canonical string) -> group state.
     // v7.32 (architecture v2, P2b) — insertion-ordered group state in
@@ -501,6 +551,16 @@ pub fn run(
         synth_schema.push(ColumnSchema::new(format!("__agg_{i}"), *ty, true));
     }
 
+    // v7.32 (round-29) — ordered-set direct arguments (the percentile
+    // fraction) are constant per PG, so evaluate each once up front.
+    let direct_arg_vals: Vec<Option<Value>> = agg_specs
+        .iter()
+        .map(|spec| match (&spec.direct_arg, rows.first()) {
+            (Some(e), Some(r)) => eval::eval_expr(e, r, &ctx).map(Some),
+            _ => Ok(None),
+        })
+        .collect::<Result<_, _>>()?;
+
     // Materialise synthetic rows (insertion order = `order`).
     let mut synth_rows: Vec<Row> = Vec::new();
     for (gvals, states) in &order {
@@ -536,7 +596,14 @@ pub fn run(
                 } else {
                     st
                 };
-            values.push(finalize(&agg_specs[i].name, st_final));
+            // Ordered-set aggregates compute from the sorted items + the
+            // direct fraction; everything else uses the running state.
+            let v = if is_ordered_set_name(&agg_specs[i].name) {
+                finalize_ordered_set(&agg_specs[i].name, st_final, direct_arg_vals[i].as_ref())
+            } else {
+                finalize(&agg_specs[i].name, st_final)
+            };
+            values.push(v);
         }
         synth_rows.push(Row::new(values));
     }
@@ -761,7 +828,12 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 // v7.17.0 — boolean aggregates also take exactly
                 // one arg. `every` is an alias normalised inside
                 // collect_aggregates / rewrite_expr.
-                | "bool_and" | "bool_or" | "every" => Some(1),
+                | "bool_and" | "bool_or" | "every"
+                // v7.32 (round-29) — statistical + bitwise aggregates
+                // are single-argument.
+                | "stddev" | "stddev_samp" | "stddev_pop"
+                | "variance" | "var_samp" | "var_pop"
+                | "bit_and" | "bit_or" | "bit_xor" => Some(1),
                 "string_agg" => Some(2),
                 _ => None,
             };
@@ -818,9 +890,19 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     } else {
                         lower
                     };
+                    // Ordered-set aggregates (`percentile_cont(f)
+                    // WITHIN GROUP (ORDER BY x)`) take the value to
+                    // aggregate from the sort spec and the in-parens
+                    // arg as the direct (fraction) argument.
+                    let ordered_set = is_ordered_set_name(&canonical);
+                    let (arg, direct_arg) = if ordered_set {
+                        (order_by.first().map(|o| o.expr.clone()), args.first().cloned())
+                    } else {
+                        (args.first().cloned(), None)
+                    };
                     let spec = AggSpec {
                         name: canonical,
-                        arg: args.first().cloned(),
+                        arg,
                         arg2: if name.eq_ignore_ascii_case("string_agg") {
                             args.get(1).cloned()
                         } else {
@@ -829,6 +911,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         distinct: *distinct,
                         order_by: order_by.clone(),
                         filter: filter.as_deref().cloned(),
+                        direct_arg,
                     };
                     if !out.iter().any(|s| {
                         s.name == spec.name
@@ -837,6 +920,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                             && s.distinct == spec.distinct
                             && s.order_by == spec.order_by
                             && s.filter == spec.filter
+                            && s.direct_arg == spec.direct_arg
                     }) {
                         out.push(spec);
                     }
@@ -879,6 +963,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     distinct: false,
                     order_by: Vec::new(),
                     filter: None,
+                    direct_arg: None,
                 };
                 if !out.iter().any(|s| {
                     s.name == spec.name
@@ -1092,6 +1177,63 @@ fn update_state(
             };
             st.bool_acc = Some(st.bool_acc.map_or(b, |acc| acc || b));
         }
+        // v7.32 (round-29) — variance / stddev family. Accumulate the
+        // running sum (sum_float) and sum of squares (sum_sq) over the
+        // non-NULL numeric inputs; finalize divides by n or n-1.
+        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+            if is_null {
+                return Ok(());
+            }
+            let x = match v {
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                Value::Float(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("{name} needs numeric, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            st.count += 1;
+            st.sum_float += x;
+            st.sum_sq += x * x;
+        }
+        // v7.32 (round-29) — bitwise aggregates over integer inputs.
+        "bit_and" | "bit_or" | "bit_xor" => {
+            if is_null {
+                return Ok(());
+            }
+            let n = match v {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("{name} needs integer, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            st.bit_acc = Some(match (st.bit_acc, name) {
+                (None, _) => n,
+                (Some(acc), "bit_and") => acc & n,
+                (Some(acc), "bit_or") => acc | n,
+                (Some(acc), _) => acc ^ n, // bit_xor
+            });
+        }
+        // v7.32 (round-29) — ordered-set aggregates collect the
+        // WITHIN GROUP value (NULLs ignored, per PG) into `items`,
+        // sorted at finalize by the parallel `item_keys`.
+        "percentile_cont" | "percentile_disc" | "mode" => {
+            if is_null {
+                return Ok(());
+            }
+            st.items.push(v.clone());
+            if let Some(k) = order_keys {
+                st.item_keys.push(k);
+            }
+            st.count += 1;
+        }
         _ => unreachable!("non-aggregate {name} in update_state"),
     }
     Ok(())
@@ -1195,6 +1337,109 @@ fn finalize(name: &str, st: &AggState) -> Value {
         // means `None` is exactly "empty group or all-NULL", which
         // PG surfaces as SQL NULL.
         "bool_and" | "bool_or" => st.bool_acc.map_or(Value::Null, Value::Bool),
+        // v7.32 (round-29) — variance / stddev. PG: `variance` ==
+        // `var_samp`, `stddev` == `stddev_samp`. samp needs n >= 2
+        // (n < 2 → NULL); pop needs n >= 1 (n == 1 → 0).
+        "variance" | "var_samp" | "var_pop" | "stddev" | "stddev_samp" | "stddev_pop" => {
+            let n = st.count;
+            if n == 0 {
+                return Value::Null;
+            }
+            let nf = n as f64;
+            // Sum of squared deviations from the mean.
+            let ss = st.sum_sq - (st.sum_float * st.sum_float) / nf;
+            let pop = name.ends_with("_pop");
+            let denom = if pop { nf } else { nf - 1.0 };
+            if denom <= 0.0 {
+                // var_samp / stddev (samp) with n == 1 → NULL.
+                return Value::Null;
+            }
+            let var = (ss / denom).max(0.0); // clamp fp noise below 0
+            if name.starts_with("stddev") {
+                Value::Float(crate::eval::f64_sqrt(var))
+            } else {
+                Value::Float(var)
+            }
+        }
+        // v7.32 (round-29) — bitwise aggregates: None (empty / all-NULL)
+        // → SQL NULL.
+        "bit_and" | "bit_or" | "bit_xor" => st.bit_acc.map_or(Value::Null, Value::BigInt),
+        // Ordered-set aggregates are finalized in `run` (they need the
+        // sorted items + the direct fraction argument), never here.
+        _ => unreachable!(),
+    }
+}
+
+/// v7.32 (round-29) — numeric coercion for the percentile interpolation.
+fn agg_value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(f64::from(*n)),
+        Value::SmallInt(n) => Some(f64::from(*n)),
+        Value::BigInt(n) => Some(*n as f64),
+        Value::Float(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// v7.32 (round-29) — finalize an ordered-set aggregate. `st.items` is
+/// already sorted by the `WITHIN GROUP (ORDER BY …)` spec. `fraction`
+/// is the evaluated direct argument for `percentile_*` (ignored by
+/// `mode`).
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn finalize_ordered_set(name: &str, st: &AggState, fraction: Option<&Value>) -> Value {
+    let items = &st.items;
+    if items.is_empty() {
+        return Value::Null;
+    }
+    let n = items.len();
+    match name {
+        // Most frequent value; equal values are adjacent in the sorted
+        // run, and a frequency tie resolves to the earliest run (the
+        // smallest value under an ascending sort), matching PG.
+        "mode" => {
+            let (mut best_i, mut best_cnt) = (0usize, 1usize);
+            let (mut run_i, mut run_cnt) = (0usize, 1usize);
+            for i in 1..n {
+                if value_cmp(&items[i], &items[run_i]) == core::cmp::Ordering::Equal {
+                    run_cnt += 1;
+                } else {
+                    run_i = i;
+                    run_cnt = 1;
+                }
+                if run_cnt > best_cnt {
+                    best_cnt = run_cnt;
+                    best_i = run_i;
+                }
+            }
+            items[best_i].clone()
+        }
+        // The first value whose cumulative fraction reaches `f`.
+        "percentile_disc" => {
+            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0).clamp(0.0, 1.0);
+            let idx = if f <= 0.0 {
+                0
+            } else {
+                (crate::eval::f64_ceil(f * n as f64) as usize)
+                    .saturating_sub(1)
+                    .min(n - 1)
+            };
+            items[idx].clone()
+        }
+        // Linear interpolation between the two bracketing values.
+        "percentile_cont" => {
+            let f = fraction.and_then(agg_value_to_f64).unwrap_or(0.0).clamp(0.0, 1.0);
+            let Some(nums) = items.iter().map(agg_value_to_f64).collect::<Option<Vec<f64>>>() else {
+                return Value::Null; // non-numeric ordered set
+            };
+            if n == 1 {
+                return Value::Float(nums[0]);
+            }
+            let rank = f * (n as f64 - 1.0);
+            let lo = crate::eval::f64_floor(rank) as usize;
+            let hi = crate::eval::f64_ceil(rank) as usize;
+            let frac = rank - lo as f64;
+            Value::Float(nums[lo] + (nums[hi] - nums[lo]) * frac)
+        }
         _ => unreachable!(),
     }
 }
@@ -1225,7 +1470,15 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // v7.17.0 — boolean aggregates always return BOOL (nullable
         // — empty / all-NULL group → NULL).
         "bool_and" | "bool_or" => DataType::Bool,
-        // min/max and anything pass-through: the argument's shape.
+        // v7.32 (round-29) — variance / stddev are floating point;
+        // percentile_cont interpolates to float.
+        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop"
+        | "percentile_cont" => DataType::Float,
+        // v7.32 (round-29) — bitwise aggregates return an integer.
+        "bit_and" | "bit_or" | "bit_xor" => DataType::BigInt,
+        // min/max, percentile_disc, mode, and anything pass-through:
+        // the argument's shape (for ordered-set aggs `spec.arg` is the
+        // WITHIN GROUP value expression).
         _ => arg_ty.unwrap_or(DataType::Text),
     }
 }
@@ -1260,7 +1513,13 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         let lower = name.to_ascii_lowercase();
         if is_aggregate_name(&lower) {
             let canonical: &str = if lower == "every" { "bool_and" } else { &lower };
-            let arg = args.first().cloned();
+            // Mirror collect_aggregates: ordered-set aggregates take the
+            // value from the sort spec and the in-parens arg as direct.
+            let (arg, direct_arg) = if is_ordered_set_name(canonical) {
+                (order_by.first().map(|o| o.expr.clone()), args.first().cloned())
+            } else {
+                (args.first().cloned(), None)
+            };
             let arg2 = if lower == "string_agg" {
                 args.get(1).cloned()
             } else {
@@ -1274,6 +1533,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                     && spec.distinct == *distinct
                     && spec.order_by == *order_by
                     && spec.filter == filter_owned
+                    && spec.direct_arg == direct_arg
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
                         qualifier: None,

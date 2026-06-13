@@ -3920,19 +3920,7 @@ impl fmt::Display for Expr {
                 distinct,
                 filter,
             } => {
-                // Render as `name([DISTINCT ]args [ORDER BY …])
-                // [FILTER (WHERE …)]` — peel the inner call's parens to
-                // splice modifiers.
-                let inner = alloc::format!("{call}");
-                let body = inner.strip_suffix(')').unwrap_or(&inner);
-                let (head, args_part) = body.split_once('(').unwrap_or((body, ""));
-                write!(f, "{head}(")?;
-                if *distinct {
-                    f.write_str("DISTINCT ")?;
-                }
-                write!(f, "{args_part}")?;
-                if !order_by.is_empty() {
-                    f.write_str(" ORDER BY ")?;
+                let fmt_order_by = |f: &mut fmt::Formatter<'_>| -> fmt::Result {
                     for (i, o) in order_by.iter().enumerate() {
                         if i > 0 {
                             f.write_str(", ")?;
@@ -3947,8 +3935,41 @@ impl fmt::Display for Expr {
                             None => {}
                         }
                     }
+                    Ok(())
+                };
+                // Ordered-set aggregates (`percentile_cont(f) WITHIN
+                // GROUP (ORDER BY x)`) render the in-parens args as the
+                // direct argument and the sort spec under WITHIN GROUP —
+                // not as an in-argument ORDER BY.
+                let ordered_set = matches!(
+                    call.as_ref(),
+                    Expr::FunctionCall { name, .. }
+                        if matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "percentile_cont" | "percentile_disc" | "mode"
+                        )
+                );
+                if ordered_set {
+                    write!(f, "{call} WITHIN GROUP (ORDER BY ")?;
+                    fmt_order_by(f)?;
+                    f.write_str(")")?;
+                } else {
+                    // `name([DISTINCT ]args [ORDER BY …])` — peel the
+                    // inner call's parens to splice modifiers.
+                    let inner = alloc::format!("{call}");
+                    let body = inner.strip_suffix(')').unwrap_or(&inner);
+                    let (head, args_part) = body.split_once('(').unwrap_or((body, ""));
+                    write!(f, "{head}(")?;
+                    if *distinct {
+                        f.write_str("DISTINCT ")?;
+                    }
+                    write!(f, "{args_part}")?;
+                    if !order_by.is_empty() {
+                        f.write_str(" ORDER BY ")?;
+                        fmt_order_by(f)?;
+                    }
+                    f.write_str(")")?;
                 }
-                f.write_str(")")?;
                 if let Some(cond) = filter {
                     write!(f, " FILTER (WHERE {cond})")?;
                 }

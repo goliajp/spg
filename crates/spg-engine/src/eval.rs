@@ -3938,7 +3938,7 @@ pub fn gen_random_uuid_bytes() -> [u8; 16] {
 /// (Babylonian). Gives EXACT results for perfect squares
 /// because the iteration converges to bit-exact precision in
 /// floating-point. x must be non-negative (caller's contract).
-fn f64_sqrt(x: f64) -> f64 {
+pub(crate) fn f64_sqrt(x: f64) -> f64 {
     if x == 0.0 || x.is_nan() {
         return x;
     }
@@ -4068,7 +4068,7 @@ fn f64_round_half_away(x: f64) -> f64 {
 /// `f64_floor` but rounds toward +infinity for fractional
 /// values. Negative fractions round toward zero
 /// (ceil(-1.5) → -1, NOT -2).
-fn f64_ceil(x: f64) -> f64 {
+pub(crate) fn f64_ceil(x: f64) -> f64 {
     if x.is_nan() || x.is_infinite() {
         return x;
     }
@@ -4090,7 +4090,7 @@ fn f64_ceil(x: f64) -> f64 {
 ///   * Values outside i64 range are already integer-precision.
 ///   * Negative non-integers floor toward -infinity (the
 ///     critical PG-canonical semantic).
-fn f64_floor(x: f64) -> f64 {
+pub(crate) fn f64_floor(x: f64) -> f64 {
     if x.is_nan() || x.is_infinite() {
         return x;
     }

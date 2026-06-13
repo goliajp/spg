@@ -172,3 +172,142 @@ fn filter_round_trips_through_display() {
     assert_eq!(first[0][1], Value::BigInt(1)); // t1: one flags=1 row
     assert_eq!(first[1][1], Value::BigInt(1)); // t2: one flags=1 row
 }
+
+// ---------------------------------------------------------------------
+// round-29 swept the whole aggregate-completeness class, not just the
+// reported FILTER point: the rest of the standard aggregate-call grammar
+// (WITHIN GROUP ordered-set aggregates) and the common analytics
+// function inventory (statistical + bitwise) an ORM/BI tool emits.
+// ---------------------------------------------------------------------
+
+fn seed_nums(db: &mut Database) {
+    db.execute("CREATE TABLE t (g TEXT, x INT)").unwrap();
+    // a = {1,2,3,4}; b = {10,10,20}
+    db.execute("INSERT INTO t VALUES ('a',1),('a',2),('a',3),('a',4),('b',10),('b',10),('b',20)")
+        .unwrap();
+}
+
+/// `percentile_cont(f) WITHIN GROUP (ORDER BY x)` — interpolated.
+#[test]
+fn percentile_cont_within_group() {
+    let mut db = Database::open_in_memory();
+    seed_nums(&mut db);
+    let r = rows_of(
+        &mut db,
+        "SELECT g, percentile_cont(0.5) WITHIN GROUP (ORDER BY x) \
+         FROM t GROUP BY g ORDER BY g",
+    );
+    assert_eq!(r[0][1], Value::Float(2.5)); // median of 1,2,3,4
+    assert_eq!(r[1][1], Value::Float(10.0)); // median of 10,10,20
+    // whole-table quartile: sorted 1,2,3,4,10,10,20 ; rank 0.25*6=1.5 → 2.5
+    let r = rows_of(
+        &mut db,
+        "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY x) FROM t",
+    );
+    assert_eq!(r[0][0], Value::Float(2.5));
+}
+
+/// `percentile_disc(f)` picks an actual member; `mode()` the most
+/// frequent (ties → smallest).
+#[test]
+fn percentile_disc_and_mode_within_group() {
+    let mut db = Database::open_in_memory();
+    seed_nums(&mut db);
+    let r = rows_of(
+        &mut db,
+        "SELECT g, percentile_disc(0.5) WITHIN GROUP (ORDER BY x), \
+                mode() WITHIN GROUP (ORDER BY x) \
+         FROM t GROUP BY g ORDER BY g",
+    );
+    // disc median: a→2, b→10 ; mode: a→1 (all unique, smallest), b→10
+    assert_eq!(r[0][1], Value::Int(2));
+    assert_eq!(r[0][2], Value::Int(1));
+    assert_eq!(r[1][1], Value::Int(10));
+    assert_eq!(r[1][2], Value::Int(10));
+}
+
+/// Ordered-set aggregate without WITHIN GROUP is a hard error (PG
+/// parity), not a panic or a wrong number.
+#[test]
+fn ordered_set_requires_within_group() {
+    let mut db = Database::open_in_memory();
+    seed_nums(&mut db);
+    let err = db
+        .execute("SELECT percentile_cont(0.5) FROM t")
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("WITHIN GROUP"),
+        "expected a WITHIN GROUP requirement error, got {err:?}"
+    );
+}
+
+/// Statistical aggregates: PG semantics — `variance`==`var_samp`,
+/// `stddev`==`stddev_samp`; samp over n=1 → NULL, pop over n=1 → 0.
+#[test]
+fn statistical_aggregates() {
+    let mut db = Database::open_in_memory();
+    seed_nums(&mut db);
+    let r = rows_of(
+        &mut db,
+        "SELECT g, var_pop(x), var_samp(x), variance(x) \
+         FROM t GROUP BY g ORDER BY g",
+    );
+    // a = {1,2,3,4}: var_pop = 1.25, var_samp = variance = 5/3.
+    assert_eq!(r[0][1], Value::Float(1.25));
+    assert_eq!(r[0][2], r[0][3]); // variance is var_samp
+    match r[0][2] {
+        Value::Float(v) => assert!((v - 5.0 / 3.0).abs() < 1e-9),
+        ref other => panic!("expected float, got {other:?}"),
+    }
+    // single-row group: var_samp/stddev → NULL, var_pop → 0.
+    db.execute("CREATE TABLE one (x INT)").unwrap();
+    db.execute("INSERT INTO one VALUES (7)").unwrap();
+    let r = rows_of(&mut db, "SELECT var_pop(x), var_samp(x), stddev_samp(x) FROM one");
+    assert_eq!(r[0][0], Value::Float(0.0));
+    assert_eq!(r[0][1], Value::Null);
+    assert_eq!(r[0][2], Value::Null);
+}
+
+/// `stddev_pop` is the square root of `var_pop`.
+#[test]
+fn stddev_is_sqrt_of_variance() {
+    let mut db = Database::open_in_memory();
+    seed_nums(&mut db);
+    let r = rows_of(&mut db, "SELECT stddev_pop(x) FROM t WHERE g = 'a'");
+    match r[0][0] {
+        // sqrt(1.25) = 1.1180339887…
+        Value::Float(v) => assert!((v - 1.118_033_988_749_895).abs() < 1e-9),
+        ref other => panic!("expected float, got {other:?}"),
+    }
+}
+
+/// Bitwise aggregates over integer columns.
+#[test]
+fn bitwise_aggregates() {
+    let mut db = Database::open_in_memory();
+    seed_nums(&mut db);
+    // b = {10, 10, 20}: AND=0, OR=30, XOR=20.
+    let r = rows_of(
+        &mut db,
+        "SELECT bit_and(x), bit_or(x), bit_xor(x) FROM t WHERE g = 'b'",
+    );
+    assert_eq!(r[0][0], Value::BigInt(0));
+    assert_eq!(r[0][1], Value::BigInt(30));
+    assert_eq!(r[0][2], Value::BigInt(20));
+}
+
+/// The whole new family composes with FILTER (the decoration applies
+/// before the ordered-set / statistical accumulation).
+#[test]
+fn new_aggregates_compose_with_filter() {
+    let mut db = Database::open_in_memory();
+    seed_nums(&mut db);
+    // median of a's values > 1 → {2,3,4} → 3.0. Standard clause order is
+    // WITHIN GROUP then FILTER.
+    let r = rows_of(
+        &mut db,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FILTER (WHERE x > 1) \
+         FROM t WHERE g = 'a'",
+    );
+    assert_eq!(r[0][0], Value::Float(3.0));
+}
