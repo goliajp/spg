@@ -6731,7 +6731,7 @@ pub(crate) fn eval_compiled(
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value>,
 ) -> Result<Value, EvalError> {
-    eval_compiled_ref(c, &crate::RowRef::Owned(row), ctx, stack)
+    eval_compiled_ref(c, &crate::join::RowRef::Owned(row), ctx, stack)
 }
 
 /// v7.32 (P4 borrow channel, increment 2) — the RowRef-borrowing form of
@@ -6744,7 +6744,7 @@ pub(crate) fn eval_compiled(
 /// I3); a differential test pins the equivalence.
 pub(crate) fn eval_compiled_ref(
     c: &CompiledExpr,
-    row: &crate::RowRef<'_>,
+    row: &crate::join::RowRef<'_>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value>,
 ) -> Result<Value, EvalError> {

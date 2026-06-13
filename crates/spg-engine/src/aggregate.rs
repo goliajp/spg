@@ -30,7 +30,7 @@ use spg_sql::ast::{Expr, SelectItem, SelectStatement};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
-use crate::RowRef;
+use crate::join::RowRef;
 
 /// True if this statement should go through the aggregate path.
 pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
