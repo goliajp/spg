@@ -8,6 +8,36 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased] — mailrs round-27: RETURNING expression typing (P0 fix, ships with 7.31.0)
+
+`RETURNING uidnext - 1 AS uid` (and any expression or cast in a
+RETURNING list) was wire-typed TEXT; typed decodes rejected it, and
+mailrs's delivery indexing silently lost four days of inbound mail
+(recoverable — maildir intact). Present since v6.10.2, not a
+regression: derive_output_columns typed bare columns from the schema
+and defaulted everything else to Text.
+
+### Fixed
+
+- **RETURNING expression/cast columns now type by the same inference
+  as the SELECT list** (INT−INT=INT, BIGINT+INT=BIGINT,
+  `::bigint` casts, COALESCE, …): derive_output_columns routes
+  non-bare items through build_projection and keeps the Text
+  fallback only when inference itself declines. Naming behaviour
+  (alias / bare / "?column?") unchanged. The AS OF SEGMENT
+  projection shares the fix.
+- Coverage per the acceptance-shape rules: verbatim mailrs
+  index_message statement, typed decode, embed prepared
+  (spg-sqlx ×3) + a server-path pgwire twin (see Known issues).
+
+### Known issues
+
+- The sqlx↔local-spg-server pgwire smoke suite (xtests/sqlx-pgwire,
+  all of it — not the new test) aborts with a client-side stack
+  overflow during the exchange; psql-based wire harnesses pass.
+  sqlx speaks the extended protocol — filed alongside backlog P0 #0
+  (server extended-protocol WAL gap) for investigation.
+
 ## [7.30.3] — 2026-06-13 (HOTFIX — mailrs round-26: bounded join memory, P1 incident)
 
 First prod boot on 7.30.2 (mailrs v1.7.153) froze a 15 GiB no-swap
