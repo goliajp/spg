@@ -181,10 +181,13 @@ fn agg_uses_second_arg(name: &str) -> bool {
 /// in-parens arguments are *direct* arguments (the percentile fraction).
 /// `mode()` takes no direct argument.
 pub fn is_ordered_set_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "percentile_cont" | "percentile_disc" | "mode"
-    )
+    // v7.32 — `eq_ignore_ascii_case` instead of `to_ascii_lowercase()`:
+    // these classifiers run in the aggregate row/group loop, where the
+    // old per-call `String` allocation showed up as ~16% of the inbox's
+    // aggregate path in a sampled profile (the names are constant).
+    ["percentile_cont", "percentile_disc", "mode"]
+        .iter()
+        .any(|k| name.eq_ignore_ascii_case(k))
 }
 
 /// v7.32 (round-29) — hypothetical-set aggregates: `rank(args) WITHIN
@@ -192,10 +195,9 @@ pub fn is_ordered_set_name(name: &str) -> bool {
 /// row would have. Like ordered-set, the value stream comes from the
 /// sort spec and the in-parens args are direct (the hypothetical row).
 pub fn is_hypothetical_set_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "rank" | "dense_rank" | "percent_rank" | "cume_dist"
-    )
+    ["rank", "dense_rank", "percent_rank", "cume_dist"]
+        .iter()
+        .any(|k| name.eq_ignore_ascii_case(k))
 }
 
 /// v7.32 (round-29) — every aggregate that takes its value stream from
