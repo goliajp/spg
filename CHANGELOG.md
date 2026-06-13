@@ -8,7 +8,37 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased] — mailrs round-27: RETURNING expression typing (P0 fix, ships with 7.31.0)
+## [7.31.0] — 2026-06-13
+
+Rolling release carrying four lines of work: the round-27 P0 fix,
+the memory campaign's first instruments (round-26 asks 1 + 4), the
+perf campaign's first four knives (inbox 95.9 → 72.6 ms on the
+24k-row prod-shaped benchmark; PG-18 trace-driven), and the pipeline
+governance batch (push-only CI with a candidate-build drop-in gate,
+latest-stable actions, release.sh publish train, nightly published-
+image sentinel).
+
+### Added
+
+- **`Engine::memory_stats()` / `Database::memory_stats()` /
+  `SELECT * FROM spg_memory_stats`** — per-table hot/cold rows,
+  encoded vs approx-resident bytes, index estimates, and the active
+  query byte budget. The polling form of the round-26 watermark ask.
+- **Byte budget at the result choke point** — single-table and
+  aggregate SELECTs now respect `max_query_bytes` (join paths
+  already did since 7.30.3).
+
+### Fixed (mailrs round-27, P0)
+
+### Performance
+
+- Post-LIMIT evaluation of subquery select items (PG's
+  Result-above-Limit shape): SubPlan work drops from group count to
+  output count.
+- Zero-allocation column_collation lookup; scratch-buffer key
+  encoding on group/DISTINCT/join paths.
+- (7.30.x line, first minor release carrying it) deferred-join
+  tuple pipeline + bounded top-N.
 
 `RETURNING uidnext - 1 AS uid` (and any expression or cast in a
 RETURNING list) was wire-typed TEXT; typed decodes rejected it, and
