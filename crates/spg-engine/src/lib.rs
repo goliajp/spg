@@ -7880,18 +7880,14 @@ impl Engine {
                     })
             };
             let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
-            let mut agg = aggregate::run(
+            let agg = aggregate::run(
                 stmt,
                 &filtered_refs,
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
             )?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
@@ -8119,18 +8115,14 @@ impl Engine {
                     })
             };
             let filtered_refs: alloc::vec::Vec<&Row> = filtered.iter().collect();
-            let mut agg = aggregate::run(
+            let agg = aggregate::run(
                 stmt,
                 &filtered_refs,
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
             )?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
@@ -8376,18 +8368,14 @@ impl Engine {
                         },
                     })
             };
-            let mut agg = aggregate::run(
+            let agg = aggregate::run(
                 stmt,
                 &filtered,
                 schema_cols,
                 Some(alias),
                 Some(&agg_correlated),
             )?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            return self.finish_agg_result(agg, stmt, cancel);
         }
 
         let projection = build_projection(&stmt.items, schema_cols, alias)?;
@@ -9339,6 +9327,10 @@ impl Engine {
                 let mut table: hashbrown::HashMap<String, Vec<usize>> =
                     hashbrown::HashMap::with_capacity(n_rights);
                 let mut keybuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
+                // v7.31 (perf 3e) — scratch key buffer: build inserts
+                // allocate only on vacant, probes never allocate (the
+                // old code built a fresh String for all 24k probes).
+                let mut keystr = String::new();
                 'build: for ri in 0..n_rights {
                     let Some(right) = rights_src.get(ri) else {
                         continue;
@@ -9350,10 +9342,8 @@ impl Engine {
                             _ => continue 'build,
                         }
                     }
-                    table
-                        .entry(aggregate::encode_key_refs(&keybuf))
-                        .or_default()
-                        .push(ri);
+                    aggregate::encode_key_refs_into(&keybuf, &mut keystr);
+                    table.entry_ref(keystr.as_str()).or_default().push(ri);
                 }
                 let mut probebuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
                 for tuple in working.chunks(stride) {
@@ -9370,9 +9360,10 @@ impl Engine {
                             }
                         }
                     }
-                    if !left_has_null
-                        && let Some(cands) = table.get(&aggregate::encode_key_refs(&probebuf))
-                    {
+                    if !left_has_null {
+                        aggregate::encode_key_refs_into(&probebuf, &mut keystr);
+                    }
+                    if !left_has_null && let Some(cands) = table.get(keystr.as_str()) {
                         for &ri in cands {
                             let keep = if residual.is_empty() {
                                 true
@@ -9630,6 +9621,51 @@ impl Engine {
                 "LATERAL subquery must be a SELECT (cannot be a write statement)".into(),
             )),
         }
+    }
+
+    /// v7.31 (perf — PG lesson #1): shared aggregate finisher. Apply
+    /// OFFSET/LIMIT first, then evaluate the deferred subquery-bearing
+    /// select items for the surviving rows only — PG's Result-above-
+    /// Limit shape, where SubPlan loops equal the OUTPUT row count
+    /// (50) instead of the group count (24k).
+    fn finish_agg_result(
+        &self,
+        mut agg: aggregate::AggResult,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
+        if !agg.deferred.is_empty() {
+            apply_offset_and_limit(
+                &mut agg.synth_rows,
+                stmt.offset_literal(),
+                stmt.limit_literal(),
+            );
+            let ctx = EvalContext::new(&agg.synth_schema, None);
+            // Memoized path on purpose. Bypassing the batch (memo
+            // None) was measured at 715 ms — 12.8 ms PER direct eval:
+            // the join-shaped inner subquery takes no index seek
+            // (seeded lookups demand all-hot locators, and the e2
+            // JOIN m2 inner shape re-runs the full join pipeline per
+            // row). One all-keys batch ≈ 15 ms total stays the best
+            // available until inner subplans can index-probe like
+            // PG's SubPlan (knife: keyed single-probe execution).
+            let mut memo = memoize::MemoizeCache::default();
+            for (ri, srow) in agg.synth_rows.iter().enumerate() {
+                cancel.check()?;
+                for (col, expr) in &agg.deferred {
+                    let v =
+                        self.eval_expr_with_correlated(expr, srow, &ctx, cancel, Some(&mut memo))?;
+                    if let Some(cell) = agg.rows[ri].values.get_mut(*col) {
+                        *cell = v;
+                    }
+                }
+            }
+        }
+        Ok(QueryResult::Rows {
+            columns: agg.columns,
+            rows: agg.rows,
+        })
     }
 
     /// v7.30.3 (mailrs round-26) — bounded execution for the backfill
@@ -9969,13 +10005,8 @@ impl Engine {
                         },
                     })
             };
-            let mut agg =
-                aggregate::run(stmt, &refs, &combined_schema, None, Some(&agg_correlated))?;
-            apply_offset_and_limit(&mut agg.rows, stmt.offset_literal(), stmt.limit_literal());
-            return Ok(QueryResult::Rows {
-                columns: agg.columns,
-                rows: agg.rows,
-            });
+            let agg = aggregate::run(stmt, &refs, &combined_schema, None, Some(&agg_correlated))?;
+            return self.finish_agg_result(agg, stmt, cancel);
         }
 
         let projection = build_projection(&stmt.items, &combined_schema, "")?;

@@ -6424,11 +6424,23 @@ pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_st
     let Expr::Column(c) = e else {
         return None;
     };
-    if let Some(q) = &c.qualifier {
-        let composite = alloc::format!("{q}.{name}", name = c.name);
-        if let Some(s) = ctx.columns.iter().find(|s| s.name == composite) {
-            return Some(s.collation);
-        }
+    // v7.31 (perf 3e) — zero-allocation segment matching (the
+    // composite_eq pattern). This runs once per comparison eval —
+    // 24k × per-row format! calls showed up as an allocator line
+    // item in the inbox profile for a value that never changes
+    // across rows.
+    let matches_composite = |s: &str| {
+        c.qualifier.as_deref().is_some_and(|q| {
+            s.len() == q.len() + 1 + c.name.len()
+                && s.as_bytes()[q.len()] == b'.'
+                && s.starts_with(q)
+                && s.ends_with(c.name.as_str())
+        })
+    };
+    if c.qualifier.is_some()
+        && let Some(s) = ctx.columns.iter().find(|s| matches_composite(&s.name))
+    {
+        return Some(s.collation);
     }
     if let Some(s) = ctx.columns.iter().find(|s| s.name == c.name) {
         return Some(s.collation);
@@ -6436,8 +6448,12 @@ pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_st
     // Bare-name fallback for joined schemas (same shape as
     // resolve_column): match a single composite ending in
     // ".<name>".
-    let suffix = alloc::format!(".{name}", name = c.name);
-    let mut matches = ctx.columns.iter().filter(|s| s.name.ends_with(&suffix));
+    let ends_with_dot_name = |s: &str| {
+        s.len() >= c.name.len() + 1
+            && s.ends_with(c.name.as_str())
+            && s.as_bytes()[s.len() - c.name.len() - 1] == b'.'
+    };
+    let mut matches = ctx.columns.iter().filter(|s| ends_with_dot_name(&s.name));
     let first = matches.next();
     let extra = matches.next();
     match (first, extra) {
