@@ -436,11 +436,12 @@ fn row_1_8_storage_crc32_present_and_chaos_tested() {
         engine_src.contains("ENVELOPE_VERSION_V2") && engine_src.contains("spg_crypto::crc32"),
         "engine envelope must carry a v2 CRC32 trailer"
     );
-    let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
-        .expect("main.rs");
+    // server file split moved the WAL codec out of main.rs into wal.rs.
+    let wal_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/wal.rs"))
+        .expect("wal.rs");
     assert!(
-        main_src.contains("WAL_V2_SENTINEL") && main_src.contains("encode_wal_record"),
-        "main.rs must encode v2 WAL records with CRC32"
+        wal_src.contains("WAL_V2_SENTINEL") && wal_src.contains("encode_wal_record"),
+        "wal.rs must encode v2 WAL records with CRC32"
     );
     let backup_src =
         std::fs::read_to_string(workspace_root().join("crates/spg-server/src/backup.rs"))
@@ -564,15 +565,18 @@ fn row_1_11_in_memory_consistency_covered_by_e2e() {
         main_src.contains("SPG_DISABLE_WAL_PREFLIGHT"),
         "main.rs must declare the SPG_DISABLE_WAL_PREFLIGHT knob"
     );
+    // server file split moved the WAL codec + commit queue into wal.rs.
+    let wal_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/wal.rs"))
+        .expect("wal.rs");
     assert!(
-        main_src.contains("WAL_V3_TYPE_AUTO_COMMIT_SQL")
-            && main_src.contains("encode_wal_v3_record"),
-        "main.rs must use the v4.41 single-record v3 framing for the implicit auto-commit \
+        wal_src.contains("WAL_V3_TYPE_AUTO_COMMIT_SQL")
+            && wal_src.contains("encode_wal_v3_record"),
+        "wal.rs must use the v4.41 single-record v3 framing for the implicit auto-commit \
          (WAL_V3_TYPE_AUTO_COMMIT_SQL + encode_wal_v3_record)"
     );
     assert!(
-        main_src.contains("append_wal_v3_group"),
-        "main.rs must batch the v3 auto-commit fsync via append_wal_v3_group (v4.42 group commit)"
+        wal_src.contains("append_wal_v3_group"),
+        "wal.rs must batch the v3 auto-commit fsync via append_wal_v3_group (v4.42 group commit)"
     );
     assert!(
         main_src.contains("run_leader_commit_round"),
@@ -662,9 +666,12 @@ fn row_5_7_disk_watermark_covered_by_e2e() {
         main_src.contains("SPG_WAL_MIN_FREE_BYTES"),
         "main.rs must declare the SPG_WAL_MIN_FREE_BYTES env var"
     );
+    // server file split moved wal_volume_free_bytes (the statvfs probe) to wal.rs.
+    let wal_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/wal.rs"))
+        .expect("wal.rs");
     assert!(
-        main_src.contains("libc::statvfs"),
-        "main.rs must call statvfs for the WAL volume"
+        wal_src.contains("libc::statvfs"),
+        "wal.rs must call statvfs for the WAL volume"
     );
 }
 
@@ -1050,26 +1057,29 @@ fn row_1_12_async_commit_durability_window_covered_by_e2e() {
     // Code surface — env knob, lock-free fsync clone, v3 marker tag.
     let main_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/main.rs"))
         .expect("main.rs");
+    // server file split moved the WAL codec + commit queue + replay into wal.rs.
+    let wal_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/wal.rs"))
+        .expect("wal.rs");
     assert!(
-        main_src.contains("fn synchronous_commit_disabled"),
-        "main.rs must define synchronous_commit_disabled() OnceLock parser"
+        wal_src.contains("fn synchronous_commit_disabled"),
+        "wal.rs must define synchronous_commit_disabled() OnceLock parser"
     );
     assert!(
-        main_src.contains("WAL_V3_TYPE_DURABILITY_CHECKPOINT"),
-        "main.rs must register the v3 0x02 durability_checkpoint kind tag"
+        wal_src.contains("WAL_V3_TYPE_DURABILITY_CHECKPOINT"),
+        "wal.rs must register the v3 0x02 durability_checkpoint kind tag"
     );
     assert!(
-        main_src.contains("fn encode_durability_marker")
-            && main_src.contains("fn append_durability_marker"),
-        "main.rs must expose encode_durability_marker + append_durability_marker"
+        wal_src.contains("fn encode_durability_marker")
+            && wal_src.contains("fn append_durability_marker"),
+        "wal.rs must expose encode_durability_marker + append_durability_marker"
     );
     assert!(
         main_src.contains("wal_sync_clone"),
         "main.rs must hold a try_clone'd WAL handle for lock-free fsync (v5.4.4)"
     );
     assert!(
-        main_src.contains("fn dispatch_v3_record"),
-        "main.rs replay path must dispatch v3 records via dispatch_v3_record (marker = no-op)"
+        wal_src.contains("fn dispatch_v3_record"),
+        "wal.rs replay path must dispatch v3 records via dispatch_v3_record (marker = no-op)"
     );
 
     // Flusher module ships the env knob + spawn + run loop.
