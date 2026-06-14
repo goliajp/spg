@@ -25,11 +25,16 @@ use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 mod encoding;
 mod inet;
+mod math;
 mod regexp;
 mod textsearch;
 
 use encoding::{decode_text, encode_text};
 use inet::{inet_host, inet_masklen, inet_network, inet_op_bool_result};
+pub(crate) use math::{f64_ceil, f64_floor, f64_sqrt};
+use math::{
+    f64_exp, f64_ln, f64_powi, f64_round_half_away, f64_trunc, prng_next_f64, prng_next_u64,
+};
 use regexp::{regexp_matches, regexp_replace, regexp_split_to_array};
 pub use textsearch::{
     decode_tsquery_external, decode_tsvector_external, format_tsquery, format_tsvector,
@@ -2646,58 +2651,6 @@ fn values_equal_for_nullif(a: &Value, b: &Value) -> bool {
     false
 }
 
-/// no_std-compatible `trunc(x)` for f64 — truncate toward zero.
-/// `as i64 as f64` already truncates toward zero for the in-range
-/// case; the |x| > 2^53 branch returns x verbatim because the f64
-/// is already integer-precision.
-fn f64_trunc(x: f64) -> f64 {
-    if x.is_nan() || x.is_infinite() {
-        return x;
-    }
-    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
-        return x;
-    }
-    (x as i64) as f64
-}
-
-/// xorshift64* PRNG state — process-static seed advanced on
-/// every `random()` call. Not cryptographically secure; use
-/// `gen_random_uuid` / future crypto-RNG functions when
-/// security matters.
-static PRNG_STATE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
-
-/// Advance the PRNG and return the raw next 64-bit state.
-/// Shared between `random()` and `gen_random_uuid()`. The CAS
-/// loop guarantees concurrent callers each see a distinct value
-/// — important for `gen_random_uuid` collision freedom under
-/// concurrent INSERTs.
-fn prng_next_u64() -> u64 {
-    use core::sync::atomic::Ordering;
-    let mut x = PRNG_STATE.load(Ordering::Relaxed);
-    loop {
-        if x == 0 {
-            x = 0x2545_F491_4F6C_DD1D;
-        }
-        let mut next = x;
-        next ^= next << 13;
-        next ^= next >> 7;
-        next ^= next << 17;
-        match PRNG_STATE.compare_exchange_weak(x, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return next,
-            Err(seen) => x = seen,
-        }
-    }
-}
-
-/// Advance the PRNG and return a uniform double in [0, 1).
-fn prng_next_f64() -> f64 {
-    // 53 bits of randomness mapped to [0, 1).
-    let mantissa = prng_next_u64() >> 11;
-    let denom = (1u64 << 53) as f64;
-    mantissa as f64 / denom
-}
-
 /// v7.17.0 — generate a RFC 4122 v4 (random) UUID. Layout: 16
 /// random bytes with the version nibble (high nibble of byte 6)
 /// pinned to `0100` (= 4) and the variant top bits (high two bits
@@ -2715,179 +2668,6 @@ pub fn gen_random_uuid_bytes() -> [u8; 16] {
     // Variant 1 (RFC 4122): top two bits of byte 8 must be 10.
     out[8] = (out[8] & 0x3f) | 0x80;
     out
-}
-
-/// no_std `f64::sqrt(x)` — square root via Newton's method
-/// (Babylonian). Gives EXACT results for perfect squares
-/// because the iteration converges to bit-exact precision in
-/// floating-point. x must be non-negative (caller's contract).
-pub(crate) fn f64_sqrt(x: f64) -> f64 {
-    if x == 0.0 || x.is_nan() {
-        return x;
-    }
-    if x.is_infinite() {
-        return x;
-    }
-    // Initial guess via bit manipulation of the exponent: divide
-    // the exponent by 2. Avoids needing a logarithm for the
-    // seed and converges in ~5 iterations.
-    let bits = x.to_bits();
-    let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
-    let new_exp = (exp / 2) + 1023;
-    let mut guess = f64::from_bits(((new_exp as u64) & 0x7ff) << 52);
-    // 5 Newton iterations are MORE than enough for f64 precision.
-    for _ in 0..8 {
-        guess = 0.5 * (guess + x / guess);
-    }
-    guess
-}
-
-/// no_std `f64::exp(x)` — e^x via range-reduction + Taylor
-/// series. Adequate for power(), exp(), and pseudo-random-ish
-/// scales the engine uses; ~1e-12 relative error in the
-/// common range.
-fn f64_exp(x: f64) -> f64 {
-    if x.is_nan() {
-        return x;
-    }
-    if x > 709.0 {
-        return f64::INFINITY;
-    }
-    if x < -745.0 {
-        return 0.0;
-    }
-    // exp(x) = 2^k * exp(r) where r = x - k*ln(2), |r| <= ln(2)/2.
-    const LN2: f64 = 0.6931471805599453;
-    let k = f64_round_half_away(x / LN2) as i32;
-    let r = x - (k as f64) * LN2;
-    // Taylor series for exp(r): sum r^n / n!  (rapid for |r|<0.35)
-    let mut term = 1.0;
-    let mut sum = 1.0;
-    for n in 1..=20 {
-        term *= r / (n as f64);
-        sum += term;
-        if term.abs() < 1e-18 {
-            break;
-        }
-    }
-    // Multiply by 2^k.
-    f64_powi(2.0, k) * sum
-}
-
-/// no_std `f64::ln(x)` — natural log via range-reduction +
-/// atanh series. x must be positive (caller's contract).
-fn f64_ln(x: f64) -> f64 {
-    if x <= 0.0 {
-        return f64::NAN;
-    }
-    if x == 1.0 {
-        return 0.0;
-    }
-    // x = 2^k * m where m in [0.5, 1.0). Then ln(x) = k*ln(2) + ln(m).
-    const LN2: f64 = 0.6931471805599453;
-    let mut k = 0i32;
-    let mut m = x;
-    while m >= 2.0 {
-        m *= 0.5;
-        k += 1;
-    }
-    while m < 1.0 {
-        m *= 2.0;
-        k -= 1;
-    }
-    // Now m in [1.0, 2.0). Use atanh series via u = (m-1)/(m+1).
-    // ln(m) = 2*(u + u^3/3 + u^5/5 + ...). Converges fast.
-    let u = (m - 1.0) / (m + 1.0);
-    let u2 = u * u;
-    let mut term = u;
-    let mut sum = u;
-    for k_iter in 1..50 {
-        term *= u2;
-        let denom = (2 * k_iter + 1) as f64;
-        sum += term / denom;
-        if (term / denom).abs() < 1e-18 {
-            break;
-        }
-    }
-    2.0 * sum + (k as f64) * LN2
-}
-
-/// no_std `f64::powi` substitute — integer exponent for f64
-/// base. Uses repeated multiplication; correct for the small
-/// exponents the rounding / cast code uses (scale up to ±38).
-fn f64_powi(base: f64, exp: i32) -> f64 {
-    if exp == 0 {
-        return 1.0;
-    }
-    let mut result = 1.0;
-    let mut b = if exp > 0 { base } else { 1.0 / base };
-    let mut e = exp.unsigned_abs();
-    while e > 0 {
-        if e & 1 == 1 {
-            result *= b;
-        }
-        e >>= 1;
-        if e > 0 {
-            b *= b;
-        }
-    }
-    result
-}
-
-/// no_std-compatible `round(x)` for f64 with half-away-from-zero
-/// rule (PG NUMERIC semantic — NOT banker's rounding).
-fn f64_round_half_away(x: f64) -> f64 {
-    if x.is_nan() || x.is_infinite() {
-        return x;
-    }
-    if x >= 0.0 {
-        f64_floor(x + 0.5)
-    } else {
-        f64_ceil(x - 0.5)
-    }
-}
-
-/// no_std-compatible `ceil(x)` for f64. Same shape as
-/// `f64_floor` but rounds toward +infinity for fractional
-/// values. Negative fractions round toward zero
-/// (ceil(-1.5) → -1, NOT -2).
-pub(crate) fn f64_ceil(x: f64) -> f64 {
-    if x.is_nan() || x.is_infinite() {
-        return x;
-    }
-    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
-        return x;
-    }
-    let trunc = (x as i64) as f64;
-    if x > 0.0 && x != trunc {
-        trunc + 1.0
-    } else {
-        trunc
-    }
-}
-
-/// no_std-compatible `floor(x)` for f64. SPG's engine is
-/// `#![no_std]` and can't call `f64::floor` directly (libm).
-/// This handles the floor semantic manually:
-///   * NaN / Inf passthrough.
-///   * Values outside i64 range are already integer-precision.
-///   * Negative non-integers floor toward -infinity (the
-///     critical PG-canonical semantic).
-pub(crate) fn f64_floor(x: f64) -> f64 {
-    if x.is_nan() || x.is_infinite() {
-        return x;
-    }
-    // f64 representation: any value with |x| > 2^53 is integer
-    // precision (mantissa is 52 bits), so floor is identity.
-    if x >= 9_007_199_254_740_992.0 || x <= -9_007_199_254_740_992.0 {
-        return x;
-    }
-    let trunc = (x as i64) as f64;
-    if x < 0.0 && x != trunc {
-        trunc - 1.0
-    } else {
-        trunc
-    }
 }
 
 /// PG `lpad` / `rpad` shared implementation. Length is the
