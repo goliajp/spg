@@ -1163,6 +1163,7 @@ impl Engine {
     /// the post-parse row set: drop or reroute conflicting rows, queue
     /// updates for the existing rows they collide with, and return the
     /// rows that survive to be inserted plus those queued updates.
+    #[allow(clippy::type_complexity)]
     fn resolve_insert_on_conflict(
         &self,
         table_name: &str,
@@ -1400,8 +1401,8 @@ fn parse_insert_rows(
                     raw = Value::BigInt(next);
                 }
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
-                enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
-                let coerced = canonicalize_set_value(&set_variant_lookup, i, &col.name, coerced)?;
+                enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
+                let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 check_unsigned_range(&coerced, col, i)?;
                 out.push(coerced);
             }
@@ -1428,8 +1429,8 @@ fn parse_insert_rows(
                     raw = Value::BigInt(next);
                 }
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
-                enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
-                let coerced = canonicalize_set_value(&set_variant_lookup, i, &col.name, coerced)?;
+                enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
+                let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 check_unsigned_range(&coerced, col, i)?;
                 out.push(coerced);
             }
@@ -1445,7 +1446,7 @@ fn parse_insert_rows(
 /// and emit deferred embedded SQL), then apply the queued ON CONFLICT
 /// DO UPDATE rewrites. Returns the RETURNING projection rows, the
 /// deferred trigger statements, and the affected-row count.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn insert_parsed_rows(
     table: &mut spg_storage::Table,
     all_values: Vec<Vec<Value>>,
@@ -1478,7 +1479,7 @@ fn insert_parsed_rows(
                 Some(row.clone()),
                 None,
                 table_name,
-                &column_meta,
+                column_meta,
                 &[],
                 trigger_session_cfg,
                 false,
@@ -1507,7 +1508,7 @@ fn insert_parsed_rows(
                 Some(inserted.clone()),
                 None,
                 table_name,
-                &column_meta,
+                column_meta,
                 &[],
                 trigger_session_cfg,
                 true,

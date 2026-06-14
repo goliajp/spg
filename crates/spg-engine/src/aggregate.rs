@@ -476,7 +476,7 @@ fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
 /// (1) Stream the WHERE-filtered rows, group by the GROUP BY value
 /// tuple, and update per-group aggregate state. Returns the groups in
 /// insertion order. See `run` for the bind-once fast path rationale.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
 fn accumulate_groups(
     rows: &[RowRef<'_>],
     group_exprs: &[Expr],
@@ -606,7 +606,7 @@ fn accumulate_groups(
                 // where cond is not TRUE before they reach this
                 // aggregate's accumulator (and before DISTINCT dedup).
                 if let Some(f) = &spec.filter
-                    && !matches!(eval_arg(f, &*row.as_row(), &ctx)?, Value::Bool(true))
+                    && !matches!(eval_arg(f, &row.as_row(), &ctx)?, Value::Bool(true))
                 {
                     continue;
                 }
@@ -618,20 +618,20 @@ fn accumulate_groups(
                         &arg_owned
                     }
                     (None, Some(e)) => {
-                        arg_owned = eval_arg(e, &*row.as_row(), &ctx)?;
+                        arg_owned = eval_arg(e, &row.as_row(), &ctx)?;
                         &arg_owned
                     }
                 };
                 let arg2_val = match &spec.arg2 {
                     None => None,
-                    Some(e) => Some(eval_arg(e, &*row.as_row(), &ctx)?),
+                    Some(e) => Some(eval_arg(e, &row.as_row(), &ctx)?),
                 };
                 let order_keys = if spec.order_by.is_empty() {
                     None
                 } else {
                     let mut keys = Vec::with_capacity(spec.order_by.len());
                     for o in &spec.order_by {
-                        keys.push(eval_arg(&o.expr, &*row.as_row(), &ctx)?);
+                        keys.push(eval_arg(&o.expr, &row.as_row(), &ctx)?);
                     }
                     Some(keys)
                 };
@@ -800,7 +800,7 @@ fn finalize_synth_rows(
     let direct_arg_vals: Vec<Option<Value>> = agg_specs
         .iter()
         .map(|spec| match (&spec.direct_arg, rows.first()) {
-            (Some(e), Some(r)) => eval::eval_expr(e, &*r.as_row(), &ctx).map(Some),
+            (Some(e), Some(r)) => eval::eval_expr(e, &r.as_row(), &ctx).map(Some),
             _ => Ok(None),
         })
         .collect::<Result<_, _>>()?;
@@ -884,11 +884,11 @@ fn project_groups(
                 detail: "SELECT * with aggregates is not supported".into(),
             }),
             SelectItem::Expr { expr, alias } => {
-                let rewritten = rewrite_expr(expr, &group_exprs, &agg_specs);
+                let rewritten = rewrite_expr(expr, group_exprs, agg_specs);
                 let name = alias.clone().unwrap_or_else(|| expr.to_string());
                 Ok(ColumnSchema::new(
                     name,
-                    agg_or_group_type(&rewritten, &synth_schema),
+                    agg_or_group_type(&rewritten, synth_schema),
                     true,
                 ))
             }

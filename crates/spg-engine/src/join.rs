@@ -735,6 +735,7 @@ impl Engine {
     /// subquery body otherwise clones the full table once per outer
     /// group). Returns `Ok(false)` when the shape doesn't qualify, so the
     /// caller falls through to the hash / nested-loop strategy.
+    #[allow(clippy::too_many_arguments)]
     fn join_stage_inl<'a, 'p>(
         &'a self,
         pipe: &mut JoinPipeline<'a>,
@@ -855,6 +856,7 @@ impl Engine {
     /// Build a hash on the (smaller) right side over the `eq_pairs` keys,
     /// probe per left tuple, and materialise only matching pairs for the
     /// `residual` ON conjuncts. NULL keys never match (SQL equality).
+    #[allow(clippy::too_many_arguments)]
     fn join_stage_hash<'a, 'p>(
         &'a self,
         pipe: &mut JoinPipeline<'a>,
@@ -974,6 +976,7 @@ impl Engine {
     /// Nested-loop join stage — the fallback for LATERAL peers and
     /// non-equi ON. A deferred plain-table peer materialises here
     /// (pruned), since every (left, right) pair gets evaluated anyway.
+    #[allow(clippy::too_many_arguments)]
     fn join_stage_nested<'a, 'p>(
         &'a self,
         pipe: &mut JoinPipeline<'a>,
