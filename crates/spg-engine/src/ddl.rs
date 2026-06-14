@@ -48,597 +48,654 @@ impl Engine {
         table_name_outer: &str,
         target: spg_sql::ast::AlterTableTarget,
     ) -> Result<(), EngineError> {
-        // Inner helper retains the s.name closure shape; alias to `s`
-        // for minimal diff against the v7.13.0 body.
-        struct S<'a> {
-            name: &'a str,
-        }
-        let s = S {
-            name: table_name_outer,
-        };
+        use spg_sql::ast::AlterTableTarget as T;
+        let tbl = table_name_outer;
         match target {
-            spg_sql::ast::AlterTableTarget::SetHotTierBytes(n) => {
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                table.schema_mut().hot_tier_bytes = Some(n);
+            T::SetHotTierBytes(n) => self.alter_set_hot_tier_bytes(tbl, n),
+            T::AddForeignKey(fk) => self.alter_add_foreign_key(tbl, fk),
+            T::DropForeignKey { name, if_exists } => {
+                self.alter_drop_foreign_key(tbl, name, if_exists)
             }
-            spg_sql::ast::AlterTableTarget::AddForeignKey(fk) => {
-                // v7.6.8 — resolve FK against the live catalog first
-                // (validates parent table, columns, indices). Then
-                // verify every existing row in the child table
-                // satisfies the new constraint. Then install it.
-                let cols_snapshot = self
-                    .active_catalog()
-                    .get(s.name)
-                    .ok_or_else(|| {
-                        EngineError::Storage(StorageError::TableNotFound {
-                            name: s.name.into(),
-                        })
-                    })?
-                    .schema()
-                    .columns
-                    .clone();
-                let storage_fk =
-                    resolve_foreign_key(s.name, &cols_snapshot, fk, self.active_catalog())?;
-                // Verify existing rows. Treat them as a virtual
-                // INSERT batch — reusing the v7.6.2 enforce helper.
-                let existing_rows: Vec<Vec<Value>> = self
-                    .active_catalog()
-                    .get(s.name)
-                    .expect("checked above")
-                    .rows()
-                    .iter()
-                    .map(|r| r.values.clone())
-                    .collect();
-                enforce_fk_inserts(
-                    self.active_catalog(),
-                    s.name,
-                    core::slice::from_ref(&storage_fk),
-                    &existing_rows,
-                )?;
-                // Reject duplicate constraint name.
-                let table = self
-                    .active_catalog_mut()
-                    .get_mut(s.name)
-                    .expect("checked above");
-                if let Some(name) = &storage_fk.name
-                    && table
-                        .schema()
-                        .foreign_keys
-                        .iter()
-                        .any(|f| f.name.as_ref() == Some(name))
-                {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "ALTER TABLE ADD CONSTRAINT: a constraint named {name:?} already exists"
-                    )));
-                }
-                table.schema_mut().foreign_keys.push(storage_fk);
-            }
-            spg_sql::ast::AlterTableTarget::DropForeignKey { name, if_exists } => {
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                let fks = &mut table.schema_mut().foreign_keys;
-                let before = fks.len();
-                fks.retain(|f| f.name.as_ref() != Some(&name));
-                if fks.len() == before && !if_exists {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "ALTER TABLE DROP CONSTRAINT: no FK named {name:?} on {:?}",
-                        s.name
-                    )));
-                }
-                // v7.13.2 mailrs round-6 S7: IF EXISTS silences the miss.
-            }
-            spg_sql::ast::AlterTableTarget::AddColumn {
+            T::AddColumn {
                 column,
                 if_not_exists,
-            } => {
-                // v7.13.0 — mailrs round-5 G1. Append-only column add
-                // with back-fill of the DEFAULT (or NULL) into every
-                // existing row. Column positions don't shift, so we
-                // skip index rebuild.
-                let clock = self.clock;
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                if table
-                    .schema()
-                    .columns
-                    .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(&column.name))
-                {
-                    if if_not_exists {
-                        return Ok(());
-                    }
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "ALTER TABLE ADD COLUMN: column {:?} already exists on {:?}",
-                        column.name,
-                        s.name
-                    )));
-                }
-                let col_name = column.name.clone();
-                let nullable = column.nullable;
-                let has_default = column.default.is_some() || column.auto_increment;
-                let col_schema = column_def_to_schema(column)?;
-                let row_count = table.row_count();
-                // Compute the back-fill value. Literal / runtime DEFAULT
-                // funnels through the same resolver that INSERT uses
-                // (v7.9.21 `resolve_column_default_free`). NULL when
-                // the column is nullable and has no DEFAULT. NOT NULL
-                // without DEFAULT errors when the table has existing
-                // rows — same as PG.
-                let fill_value: Value = if has_default || col_schema.runtime_default.is_some() {
-                    resolve_column_default_free(&col_schema, clock)?
-                } else if nullable || row_count == 0 {
-                    Value::Null
-                } else {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "ALTER TABLE ADD COLUMN {col_name:?}: NOT NULL column requires DEFAULT \
-                         when the table has existing rows"
-                    )));
-                };
-                table.add_column(col_schema, fill_value);
-            }
-            spg_sql::ast::AlterTableTarget::AlterColumnType {
+            } => self.alter_add_column(tbl, column, if_not_exists),
+            T::AlterColumnType {
                 column,
                 new_type,
                 using,
-            } => {
-                // v7.13.0 — mailrs round-5 G8. Re-evaluate each
-                // row's column value (either through the USING
-                // expression if supplied, or as a direct CAST of
-                // the existing value) and re-coerce to the new
-                // type. Indices on the column get rebuilt.
-                let new_data_type = column_type_to_data_type(new_type);
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                let col_pos = table
-                    .schema()
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&column))
-                    .ok_or_else(|| {
-                        EngineError::Unsupported(alloc::format!(
-                            "ALTER COLUMN TYPE: column {column:?} not found on {:?}",
-                            s.name
-                        ))
-                    })?;
-                let schema_cols = table.schema().columns.clone();
-                let ctx = eval::EvalContext::new(&schema_cols, None);
-                let mut new_values: alloc::vec::Vec<Value> =
-                    alloc::vec::Vec::with_capacity(table.row_count());
-                for row in table.rows().iter() {
-                    let raw = match &using {
-                        Some(expr) => eval::eval_expr(expr, row, &ctx).map_err(|e| {
-                            EngineError::Unsupported(alloc::format!(
-                                "ALTER COLUMN TYPE: USING expression failed: {e:?}"
-                            ))
-                        })?,
-                        None => row.values.get(col_pos).cloned().unwrap_or(Value::Null),
-                    };
-                    let coerced = coerce_value(raw, new_data_type, &column, col_pos)?;
-                    new_values.push(coerced);
-                }
-                table.schema_mut().columns[col_pos].ty = new_data_type;
-                for (i, v) in new_values.into_iter().enumerate() {
-                    let mut row_values = table
-                        .rows()
-                        .get(i)
-                        .expect("bounds-checked above")
-                        .values
-                        .clone();
-                    row_values[col_pos] = v;
-                    table.update_row(i, row_values)?;
-                }
-            }
-            spg_sql::ast::AlterTableTarget::AddTableConstraint(tc) => {
-                // v7.14.0 — pg_dump emits PKs as a separate
-                // ALTER TABLE ADD CONSTRAINT post-CREATE-TABLE.
-                // For PRIMARY KEY / UNIQUE, install a UC entry
-                // and the implicit BTree index on the leading
-                // column. CHECK: append predicate to schema.
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                let is_pk = matches!(tc, spg_sql::ast::TableConstraint::PrimaryKey { .. });
-                // v7.22 (mailrs round-13 gap 6) — carry the parsed
-                // NULLS NOT DISTINCT flag through the ALTER path;
-                // it was hardcoded false here while the CREATE
-                // TABLE path honoured it since v7.13.
-                let nnd = matches!(
-                    tc,
-                    spg_sql::ast::TableConstraint::Unique {
-                        nulls_not_distinct: true,
-                        ..
-                    }
-                );
-                match tc {
-                    spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
-                    | spg_sql::ast::TableConstraint::Unique { columns, .. } => {
-                        let positions: Vec<usize> = columns
-                            .iter()
-                            .map(|c| {
-                                table
-                                    .schema()
-                                    .columns
-                                    .iter()
-                                    .position(|sc| sc.name.eq_ignore_ascii_case(c))
-                                    .ok_or_else(|| {
-                                        EngineError::Unsupported(alloc::format!(
-                                            "ALTER TABLE ADD CONSTRAINT: column {c:?} not found on {:?}",
-                                            s.name
-                                        ))
-                                    })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        // Skip if an equivalent UC is already there
-                        // (idempotent — pg_dump's PK + a prior inline
-                        // PK shouldn't double-install).
-                        let already = table
-                            .schema()
-                            .uniqueness_constraints
-                            .iter()
-                            .any(|u| u.columns == positions);
-                        if !already {
-                            table.schema_mut().uniqueness_constraints.push(
-                                spg_storage::UniquenessConstraint {
-                                    is_primary_key: is_pk,
-                                    columns: positions.clone(),
-                                    nulls_not_distinct: nnd,
-                                },
-                            );
-                            // PK implies NOT NULL on referenced cols.
-                            if is_pk {
-                                for p in &positions {
-                                    if let Some(c) = table.schema_mut().columns.get_mut(*p) {
-                                        c.nullable = false;
-                                    }
-                                }
-                            }
-                            // Add a BTree index on the leading
-                            // column for INSERT-side enforcement.
-                            let leading = &columns[0];
-                            let already_idx = table.indices().iter().any(|idx| {
-                                matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                                    && table.schema().columns[idx.column_position].name == *leading
-                            });
-                            if !already_idx {
-                                let suffix = if is_pk { "pkey" } else { "key" };
-                                let idx_name = alloc::format!("{}_{leading}_{suffix}", s.name);
-                                let _ = table.add_index(idx_name, leading);
-                            }
-                        }
-                    }
-                    spg_sql::ast::TableConstraint::Check { expr, .. } => {
-                        table.schema_mut().checks.push(alloc::format!("{expr}"));
-                    }
-                    spg_sql::ast::TableConstraint::Index { name, columns } => {
-                        // v7.15.0 — ALTER TABLE ADD KEY (cols).
-                        // mysqldump occasionally emits this
-                        // post-CREATE-TABLE shape; build a BTree
-                        // on the leading column using the
-                        // user-supplied or synthesised name.
-                        let leading = &columns[0];
-                        let already_idx = table.indices().iter().any(|idx| {
-                            matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                                && table.schema().columns[idx.column_position].name == *leading
-                        });
-                        if !already_idx {
-                            let idx_name = name
-                                .clone()
-                                .unwrap_or_else(|| alloc::format!("{}_{leading}_idx", s.name));
-                            let _ = table.add_index(idx_name, leading);
-                        }
-                    }
-                    spg_sql::ast::TableConstraint::FulltextIndex { name, columns } => {
-                        // v7.17.0 Phase 2.2 — ALTER TABLE ADD
-                        // FULLTEXT KEY (cols). Builds one
-                        // fulltext-GIN per named column so MATCH
-                        // AGAINST gets a real inverted index.
-                        // Multi-column declarations expand to
-                        // per-column GINs (the leading column
-                        // drives MATCH AGAINST planning).
-                        for (k, col) in columns.iter().enumerate() {
-                            let already_idx = table.indices().iter().any(|idx| {
-                                matches!(idx.kind, spg_storage::IndexKind::GinFulltext(_))
-                                    && table.schema().columns[idx.column_position].name == *col
-                            });
-                            if already_idx {
-                                continue;
-                            }
-                            let idx_name = match (&name, columns.len(), k) {
-                                (Some(n), 1, _) => n.clone(),
-                                (Some(n), _, k) => alloc::format!("{n}_{k}"),
-                                (None, _, _) => {
-                                    alloc::format!("{}_{col}_ftidx", s.name)
-                                }
-                            };
-                            let _ = table.add_gin_fulltext_index(idx_name, col);
-                        }
-                    }
-                }
-            }
-            spg_sql::ast::AlterTableTarget::DropColumn {
+            } => self.alter_column_type(tbl, column, new_type, using),
+            T::AddTableConstraint(tc) => self.alter_add_table_constraint(tbl, tc),
+            T::DropColumn {
                 column,
                 if_exists,
                 cascade,
-            } => {
-                // v7.13.3 — mailrs round-7 S8. Remove the column +
-                // every row's value at that position; drop any index
-                // on the column. RESTRICT (default) rejects when an
-                // FK on this table or partial-index predicate
-                // references the column; CASCADE removes those
-                // dependents first.
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                let col_pos = match table
-                    .schema()
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&column))
-                {
-                    Some(p) => p,
-                    None => {
-                        if if_exists {
-                            return Ok(());
-                        }
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "ALTER TABLE DROP COLUMN: column {column:?} not found on {:?}",
-                            s.name
-                        )));
-                    }
-                };
-                // Dependent check: FKs whose local columns include
-                // col_pos. CASCADE drops them; otherwise reject.
-                let dependent_fks: Vec<usize> = table
-                    .schema()
-                    .foreign_keys
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, fk)| {
-                        if fk.local_columns.contains(&col_pos) {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !dependent_fks.is_empty() && !cascade {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "ALTER TABLE DROP COLUMN {column:?}: column has FK dependents; \
-                         use DROP COLUMN ... CASCADE to remove them"
-                    )));
-                }
-                // CASCADE the FK removals first.
-                if cascade {
-                    // Drop in reverse so indices stay valid.
-                    let mut sorted = dependent_fks.clone();
-                    sorted.sort();
-                    sorted.reverse();
-                    let fks = &mut table.schema_mut().foreign_keys;
-                    for i in sorted {
-                        fks.remove(i);
-                    }
-                }
-                // Drop the column. New helper on Table does the
-                // row + schema + index shift atomically.
-                table.drop_column(col_pos);
+            } => self.alter_drop_column(tbl, column, if_exists, cascade),
+            T::SetTriggerEnabled { which, enabled } => {
+                self.alter_set_trigger_enabled(tbl, which, enabled)
             }
-            spg_sql::ast::AlterTableTarget::SetTriggerEnabled { which, enabled } => {
-                // v7.16.1 — mailrs round-9 A.2.b. pg_dump
-                // --disable-triggers wraps each table's data
-                // block with `ALTER TABLE … DISABLE TRIGGER ALL`
-                // / `… ENABLE TRIGGER ALL`. Toggle the enabled
-                // flag on every matching trigger so the row-
-                // write paths skip them; the catalog snapshot
-                // persists the new state across restarts.
-                let table_name = s.name.to_string();
-                let trigs = self.active_catalog_mut().triggers_mut();
-                let mut touched = false;
-                for t in trigs.iter_mut() {
-                    if !t.table.eq_ignore_ascii_case(&table_name) {
-                        continue;
-                    }
-                    match &which {
-                        spg_sql::ast::TriggerSelector::All => {
-                            t.enabled = enabled;
-                            touched = true;
-                        }
-                        spg_sql::ast::TriggerSelector::Named(name) => {
-                            if t.name.eq_ignore_ascii_case(name) {
-                                t.enabled = enabled;
-                                touched = true;
+            T::SetColumnAutoIncrement { column, seq_name } => {
+                self.alter_set_column_auto_increment(tbl, column, seq_name)
+            }
+            T::RenameTable { new } => self.alter_rename_table(tbl, new),
+            T::RenameColumn { old, new } => self.alter_rename_column(tbl, old, new),
+        }
+    }
+
+    fn alter_set_hot_tier_bytes(&mut self, tbl: &str, n: u64) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        table.schema_mut().hot_tier_bytes = Some(n);
+        Ok(())
+    }
+
+    fn alter_add_foreign_key(
+        &mut self,
+        tbl: &str,
+        fk: spg_sql::ast::ForeignKeyConstraint,
+    ) -> Result<(), EngineError> {
+        // v7.6.8 — resolve FK against the live catalog first
+        // (validates parent table, columns, indices). Then
+        // verify every existing row in the child table
+        // satisfies the new constraint. Then install it.
+        let cols_snapshot = self
+            .active_catalog()
+            .get(tbl)
+            .ok_or_else(|| EngineError::Storage(StorageError::TableNotFound { name: tbl.into() }))?
+            .schema()
+            .columns
+            .clone();
+        let storage_fk = resolve_foreign_key(tbl, &cols_snapshot, fk, self.active_catalog())?;
+        // Verify existing rows. Treat them as a virtual
+        // INSERT batch — reusing the v7.6.2 enforce helper.
+        let existing_rows: Vec<Vec<Value>> = self
+            .active_catalog()
+            .get(tbl)
+            .expect("checked above")
+            .rows()
+            .iter()
+            .map(|r| r.values.clone())
+            .collect();
+        enforce_fk_inserts(
+            self.active_catalog(),
+            tbl,
+            core::slice::from_ref(&storage_fk),
+            &existing_rows,
+        )?;
+        // Reject duplicate constraint name.
+        let table = self
+            .active_catalog_mut()
+            .get_mut(tbl)
+            .expect("checked above");
+        if let Some(name) = &storage_fk.name
+            && table
+                .schema()
+                .foreign_keys
+                .iter()
+                .any(|f| f.name.as_ref() == Some(name))
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER TABLE ADD CONSTRAINT: a constraint named {name:?} already exists"
+            )));
+        }
+        table.schema_mut().foreign_keys.push(storage_fk);
+        Ok(())
+    }
+
+    fn alter_drop_foreign_key(
+        &mut self,
+        tbl: &str,
+        name: String,
+        if_exists: bool,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let fks = &mut table.schema_mut().foreign_keys;
+        let before = fks.len();
+        fks.retain(|f| f.name.as_ref() != Some(&name));
+        if fks.len() == before && !if_exists {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER TABLE DROP CONSTRAINT: no FK named {name:?} on {:?}",
+                tbl
+            )));
+        }
+        // v7.13.2 mailrs round-6 S7: IF EXISTS silences the miss.
+        Ok(())
+    }
+
+    fn alter_add_column(
+        &mut self,
+        tbl: &str,
+        column: ColumnDef,
+        if_not_exists: bool,
+    ) -> Result<(), EngineError> {
+        // v7.13.0 — mailrs round-5 G1. Append-only column add
+        // with back-fill of the DEFAULT (or NULL) into every
+        // existing row. Column positions don't shift, so we
+        // skip index rebuild.
+        let clock = self.clock;
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        if table
+            .schema()
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+        {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER TABLE ADD COLUMN: column {:?} already exists on {:?}",
+                column.name,
+                tbl
+            )));
+        }
+        let col_name = column.name.clone();
+        let nullable = column.nullable;
+        let has_default = column.default.is_some() || column.auto_increment;
+        let col_schema = column_def_to_schema(column)?;
+        let row_count = table.row_count();
+        // Compute the back-fill value. Literal / runtime DEFAULT
+        // funnels through the same resolver that INSERT uses
+        // (v7.9.21 `resolve_column_default_free`). NULL when
+        // the column is nullable and has no DEFAULT. NOT NULL
+        // without DEFAULT errors when the table has existing
+        // rows — same as PG.
+        let fill_value: Value = if has_default || col_schema.runtime_default.is_some() {
+            resolve_column_default_free(&col_schema, clock)?
+        } else if nullable || row_count == 0 {
+            Value::Null
+        } else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER TABLE ADD COLUMN {col_name:?}: NOT NULL column requires DEFAULT \
+                         when the table has existing rows"
+            )));
+        };
+        table.add_column(col_schema, fill_value);
+        Ok(())
+    }
+
+    fn alter_column_type(
+        &mut self,
+        tbl: &str,
+        column: String,
+        new_type: spg_sql::ast::ColumnTypeName,
+        using: Option<Expr>,
+    ) -> Result<(), EngineError> {
+        // v7.13.0 — mailrs round-5 G8. Re-evaluate each
+        // row's column value (either through the USING
+        // expression if supplied, or as a direct CAST of
+        // the existing value) and re-coerce to the new
+        // type. Indices on the column get rebuilt.
+        let new_data_type = column_type_to_data_type(new_type);
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let col_pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN TYPE: column {column:?} not found on {:?}",
+                    tbl
+                ))
+            })?;
+        let schema_cols = table.schema().columns.clone();
+        let ctx = eval::EvalContext::new(&schema_cols, None);
+        let mut new_values: alloc::vec::Vec<Value> =
+            alloc::vec::Vec::with_capacity(table.row_count());
+        for row in table.rows().iter() {
+            let raw = match &using {
+                Some(expr) => eval::eval_expr(expr, row, &ctx).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "ALTER COLUMN TYPE: USING expression failed: {e:?}"
+                    ))
+                })?,
+                None => row.values.get(col_pos).cloned().unwrap_or(Value::Null),
+            };
+            let coerced = coerce_value(raw, new_data_type, &column, col_pos)?;
+            new_values.push(coerced);
+        }
+        table.schema_mut().columns[col_pos].ty = new_data_type;
+        for (i, v) in new_values.into_iter().enumerate() {
+            let mut row_values = table
+                .rows()
+                .get(i)
+                .expect("bounds-checked above")
+                .values
+                .clone();
+            row_values[col_pos] = v;
+            table.update_row(i, row_values)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn alter_add_table_constraint(
+        &mut self,
+        tbl: &str,
+        tc: spg_sql::ast::TableConstraint,
+    ) -> Result<(), EngineError> {
+        // v7.14.0 — pg_dump emits PKs as a separate
+        // ALTER TABLE ADD CONSTRAINT post-CREATE-TABLE.
+        // For PRIMARY KEY / UNIQUE, install a UC entry
+        // and the implicit BTree index on the leading
+        // column. CHECK: append predicate to schema.
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let is_pk = matches!(tc, spg_sql::ast::TableConstraint::PrimaryKey { .. });
+        // v7.22 (mailrs round-13 gap 6) — carry the parsed
+        // NULLS NOT DISTINCT flag through the ALTER path;
+        // it was hardcoded false here while the CREATE
+        // TABLE path honoured it since v7.13.
+        let nnd = matches!(
+            tc,
+            spg_sql::ast::TableConstraint::Unique {
+                nulls_not_distinct: true,
+                ..
+            }
+        );
+        match tc {
+            spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
+            | spg_sql::ast::TableConstraint::Unique { columns, .. } => {
+                let positions: Vec<usize> = columns
+                    .iter()
+                    .map(|c| {
+                        table
+                            .schema()
+                            .columns
+                            .iter()
+                            .position(|sc| sc.name.eq_ignore_ascii_case(c))
+                            .ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "ALTER TABLE ADD CONSTRAINT: column {c:?} not found on {:?}",
+                                    tbl
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Skip if an equivalent UC is already there
+                // (idempotent — pg_dump's PK + a prior inline
+                // PK shouldn't double-install).
+                let already = table
+                    .schema()
+                    .uniqueness_constraints
+                    .iter()
+                    .any(|u| u.columns == positions);
+                if !already {
+                    table.schema_mut().uniqueness_constraints.push(
+                        spg_storage::UniquenessConstraint {
+                            is_primary_key: is_pk,
+                            columns: positions.clone(),
+                            nulls_not_distinct: nnd,
+                        },
+                    );
+                    // PK implies NOT NULL on referenced cols.
+                    if is_pk {
+                        for p in &positions {
+                            if let Some(c) = table.schema_mut().columns.get_mut(*p) {
+                                c.nullable = false;
                             }
                         }
                     }
-                }
-                // PG semantics: `ALL` on a table with no
-                // triggers is a no-op (no error). A `Named`
-                // form pointing at a non-existent trigger
-                // raises in PG; v7.16.1 also raises so we
-                // don't silently lose state.
-                if !touched {
-                    if let spg_sql::ast::TriggerSelector::Named(name) = &which {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "ALTER TABLE {table_name:?} {} TRIGGER {name:?}: no such trigger on table",
-                            if enabled { "ENABLE" } else { "DISABLE" },
-                        )));
+                    // Add a BTree index on the leading
+                    // column for INSERT-side enforcement.
+                    let leading = &columns[0];
+                    let already_idx = table.indices().iter().any(|idx| {
+                        matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                            && table.schema().columns[idx.column_position].name == *leading
+                    });
+                    if !already_idx {
+                        let suffix = if is_pk { "pkey" } else { "key" };
+                        let idx_name = alloc::format!("{}_{leading}_{suffix}", tbl);
+                        let _ = table.add_index(idx_name, leading);
                     }
                 }
             }
-            spg_sql::ast::AlterTableTarget::SetColumnAutoIncrement { column, seq_name } => {
-                // pg_dump's identity form names an IMPLICIT sequence
-                // (`… AS IDENTITY ( SEQUENCE NAME s … )`) that never
-                // gets its own CREATE SEQUENCE statement, while the
-                // data section still calls `setval(s, …)`. Make the
-                // sequence exist (idempotent) so those calls land.
-                if let Some(seq) = seq_name {
-                    let _ = self.exec_create_sequence(spg_sql::ast::CreateSequenceStatement {
-                        name: seq,
-                        if_not_exists: true,
-                        temporary: false,
-                        data_type: None,
-                        options: spg_sql::ast::SequenceOptions::default(),
-                    })?;
-                }
-                // v7.22 (round-13 T2) — pg_dump's serial/identity
-                // spellings (`SET DEFAULT nextval(…)` / `ADD
-                // GENERATED … AS IDENTITY`) lower here: flip the
-                // column's auto-increment flag so post-import
-                // INSERTs without an explicit value keep numbering
-                // (max+1 semantics; the dump's setval() calls are
-                // no-ops by construction).
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                let pos = table
-                    .schema()
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&column))
-                    .ok_or_else(|| {
-                        EngineError::Unsupported(alloc::format!(
-                            "ALTER COLUMN {column:?}: no such column on {:?}",
-                            s.name
-                        ))
-                    })?;
-                let col = &table.schema().columns[pos];
-                if !matches!(
-                    col.ty,
-                    spg_storage::DataType::SmallInt
-                        | spg_storage::DataType::Int
-                        | spg_storage::DataType::BigInt
-                ) {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "auto-increment applies to integer columns only ({column:?} is {:?})",
-                        col.ty
-                    )));
-                }
-                table.schema_mut().columns[pos].auto_increment = true;
+            spg_sql::ast::TableConstraint::Check { expr, .. } => {
+                table.schema_mut().checks.push(alloc::format!("{expr}"));
             }
-            spg_sql::ast::AlterTableTarget::RenameTable { new } => {
-                // v7.16.2 — table-level rename (mailrs round-10
-                // A.5 — used by migrate-042's `ALTER TABLE
-                // contacts RENAME TO email_contacts`). Storage
-                // helper updates the schema + by_name index +
-                // dangling FK / trigger references in one
-                // atomic step.
-                let old = s.name.to_string();
-                self.active_catalog_mut()
-                    .rename_table(&old, &new)
-                    .map_err(EngineError::Storage)?;
+            spg_sql::ast::TableConstraint::Index { name, columns } => {
+                // v7.15.0 — ALTER TABLE ADD KEY (cols).
+                // mysqldump occasionally emits this
+                // post-CREATE-TABLE shape; build a BTree
+                // on the leading column using the
+                // user-supplied or synthesised name.
+                let leading = &columns[0];
+                let already_idx = table.indices().iter().any(|idx| {
+                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                        && table.schema().columns[idx.column_position].name == *leading
+                });
+                if !already_idx {
+                    let idx_name = name
+                        .clone()
+                        .unwrap_or_else(|| alloc::format!("{}_{leading}_idx", tbl));
+                    let _ = table.add_index(idx_name, leading);
+                }
             }
-            spg_sql::ast::AlterTableTarget::RenameColumn { old, new } => {
-                // v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO
-                // new`. Rename the column in the schema; rewrite
-                // every stored source string on this table that
-                // references it as a (potentially-qualified)
-                // column identifier: CHECK predicates, partial-
-                // index predicates, runtime DEFAULT expressions.
-                // Then walk catalog triggers on this table and
-                // patch any `UPDATE OF` column list. Function and
-                // trigger bodies are NOT auto-rewritten — that
-                // surface is dynamic SQL territory; users update
-                // those separately (matches PG plpgsql behavior:
-                // a column rename invalidates name-referencing
-                // plpgsql at call time, not rename time).
-                let table = self.active_catalog_mut().get_mut(s.name).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: s.name.into(),
-                    })
-                })?;
-                let col_pos = table
-                    .schema()
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&old))
-                    .ok_or_else(|| {
-                        EngineError::Unsupported(alloc::format!(
-                            "ALTER TABLE RENAME COLUMN: column {old:?} not found on {:?}",
-                            s.name
-                        ))
-                    })?;
-                // Reject same-name (case-insensitive) collision.
-                if table
-                    .schema()
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .any(|(i, c)| i != col_pos && c.name.eq_ignore_ascii_case(&new))
-                {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "ALTER TABLE RENAME COLUMN: column {new:?} already exists on {:?}",
-                        s.name
-                    )));
-                }
-                // Schema rename first — even idempotent same-name
-                // rename (`ALTER TABLE t RENAME a TO a`) needs to
-                // be a no-op, not an error.
-                if old.eq_ignore_ascii_case(&new) {
-                    return Ok(());
-                }
-                table.rename_column(col_pos, &new);
-                // Rewrite per-column runtime_default sources on
-                // every column of this table — a DEFAULT expression
-                // on column X may reference column Y by name (rare,
-                // but legal in PG when the value is supplied via a
-                // function that takes the row).
-                let n_cols = table.schema().columns.len();
-                for i in 0..n_cols {
-                    let rt = table.schema().columns[i].runtime_default.clone();
-                    if let Some(src) = rt {
-                        let rewritten = rewrite_column_in_source(&src, &old, &new)?;
-                        table.schema_mut().columns[i].runtime_default = Some(rewritten);
-                    }
-                }
-                // Rewrite table-level CHECK predicates.
-                let checks = table.schema().checks.clone();
-                let mut new_checks = Vec::with_capacity(checks.len());
-                for chk in checks {
-                    new_checks.push(rewrite_column_in_source(&chk, &old, &new)?);
-                }
-                table.schema_mut().checks = new_checks;
-                // Rewrite per-index partial_predicate sources.
-                let n_idx = table.indices().len();
-                for i in 0..n_idx {
-                    let pred = table.indices()[i].partial_predicate.clone();
-                    if let Some(src) = pred {
-                        let rewritten = rewrite_column_in_source(&src, &old, &new)?;
-                        // SAFETY: indices_mut would be cleanest, but
-                        // partial_predicate is the only mutable field
-                        // here; reach in via the public mut accessor.
-                        table.set_partial_predicate(i, Some(rewritten));
-                    }
-                }
-                // Walk catalog triggers; patch `update_columns` on
-                // triggers attached to this table.
-                let table_name = s.name.to_string();
-                for trig in self.active_catalog_mut().triggers_mut() {
-                    if !trig.table.eq_ignore_ascii_case(&table_name) {
+            spg_sql::ast::TableConstraint::FulltextIndex { name, columns } => {
+                // v7.17.0 Phase 2.2 — ALTER TABLE ADD
+                // FULLTEXT KEY (cols). Builds one
+                // fulltext-GIN per named column so MATCH
+                // AGAINST gets a real inverted index.
+                // Multi-column declarations expand to
+                // per-column GINs (the leading column
+                // drives MATCH AGAINST planning).
+                for (k, col) in columns.iter().enumerate() {
+                    let already_idx = table.indices().iter().any(|idx| {
+                        matches!(idx.kind, spg_storage::IndexKind::GinFulltext(_))
+                            && table.schema().columns[idx.column_position].name == *col
+                    });
+                    if already_idx {
                         continue;
                     }
-                    for c in &mut trig.update_columns {
-                        if c.eq_ignore_ascii_case(&old) {
-                            *c = new.clone();
+                    let idx_name = match (&name, columns.len(), k) {
+                        (Some(n), 1, _) => n.clone(),
+                        (Some(n), _, k) => alloc::format!("{n}_{k}"),
+                        (None, _, _) => {
+                            alloc::format!("{}_{col}_ftidx", tbl)
                         }
+                    };
+                    let _ = table.add_gin_fulltext_index(idx_name, col);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn alter_drop_column(
+        &mut self,
+        tbl: &str,
+        column: String,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<(), EngineError> {
+        // v7.13.3 — mailrs round-7 S8. Remove the column +
+        // every row's value at that position; drop any index
+        // on the column. RESTRICT (default) rejects when an
+        // FK on this table or partial-index predicate
+        // references the column; CASCADE removes those
+        // dependents first.
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let col_pos = match table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+        {
+            Some(p) => p,
+            None => {
+                if if_exists {
+                    return Ok(());
+                }
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "ALTER TABLE DROP COLUMN: column {column:?} not found on {:?}",
+                    tbl
+                )));
+            }
+        };
+        // Dependent check: FKs whose local columns include
+        // col_pos. CASCADE drops them; otherwise reject.
+        let dependent_fks: Vec<usize> = table
+            .schema()
+            .foreign_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(i, fk)| {
+                if fk.local_columns.contains(&col_pos) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !dependent_fks.is_empty() && !cascade {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER TABLE DROP COLUMN {column:?}: column has FK dependents; \
+                         use DROP COLUMN ... CASCADE to remove them"
+            )));
+        }
+        // CASCADE the FK removals first.
+        if cascade {
+            // Drop in reverse so indices stay valid.
+            let mut sorted = dependent_fks.clone();
+            sorted.sort();
+            sorted.reverse();
+            let fks = &mut table.schema_mut().foreign_keys;
+            for i in sorted {
+                fks.remove(i);
+            }
+        }
+        // Drop the column. New helper on Table does the
+        // row + schema + index shift atomically.
+        table.drop_column(col_pos);
+        Ok(())
+    }
+
+    fn alter_set_trigger_enabled(
+        &mut self,
+        tbl: &str,
+        which: spg_sql::ast::TriggerSelector,
+        enabled: bool,
+    ) -> Result<(), EngineError> {
+        // v7.16.1 — mailrs round-9 A.2.b. pg_dump
+        // --disable-triggers wraps each table's data
+        // block with `ALTER TABLE … DISABLE TRIGGER ALL`
+        // / `… ENABLE TRIGGER ALL`. Toggle the enabled
+        // flag on every matching trigger so the row-
+        // write paths skip them; the catalog snapshot
+        // persists the new state across restarts.
+        let table_name = tbl.to_string();
+        let trigs = self.active_catalog_mut().triggers_mut();
+        let mut touched = false;
+        for t in trigs.iter_mut() {
+            if !t.table.eq_ignore_ascii_case(&table_name) {
+                continue;
+            }
+            match &which {
+                spg_sql::ast::TriggerSelector::All => {
+                    t.enabled = enabled;
+                    touched = true;
+                }
+                spg_sql::ast::TriggerSelector::Named(name) => {
+                    if t.name.eq_ignore_ascii_case(name) {
+                        t.enabled = enabled;
+                        touched = true;
                     }
+                }
+            }
+        }
+        // PG semantics: `ALL` on a table with no
+        // triggers is a no-op (no error). A `Named`
+        // form pointing at a non-existent trigger
+        // raises in PG; v7.16.1 also raises so we
+        // don't silently lose state.
+        if !touched {
+            if let spg_sql::ast::TriggerSelector::Named(name) = &which {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "ALTER TABLE {table_name:?} {} TRIGGER {name:?}: no such trigger on table",
+                    if enabled { "ENABLE" } else { "DISABLE" },
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn alter_set_column_auto_increment(
+        &mut self,
+        tbl: &str,
+        column: String,
+        seq_name: Option<String>,
+    ) -> Result<(), EngineError> {
+        // pg_dump's identity form names an IMPLICIT sequence
+        // (`… AS IDENTITY ( SEQUENCE NAME s … )`) that never
+        // gets its own CREATE SEQUENCE statement, while the
+        // data section still calls `setval(s, …)`. Make the
+        // sequence exist (idempotent) so those calls land.
+        if let Some(seq) = seq_name {
+            let _ = self.exec_create_sequence(spg_sql::ast::CreateSequenceStatement {
+                name: seq,
+                if_not_exists: true,
+                temporary: false,
+                data_type: None,
+                options: spg_sql::ast::SequenceOptions::default(),
+            })?;
+        }
+        // v7.22 (round-13 T2) — pg_dump's serial/identity
+        // spellings (`SET DEFAULT nextval(…)` / `ADD
+        // GENERATED … AS IDENTITY`) lower here: flip the
+        // column's auto-increment flag so post-import
+        // INSERTs without an explicit value keep numbering
+        // (max+1 semantics; the dump's setval() calls are
+        // no-ops by construction).
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&column))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER COLUMN {column:?}: no such column on {:?}",
+                    tbl
+                ))
+            })?;
+        let col = &table.schema().columns[pos];
+        if !matches!(
+            col.ty,
+            spg_storage::DataType::SmallInt
+                | spg_storage::DataType::Int
+                | spg_storage::DataType::BigInt
+        ) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "auto-increment applies to integer columns only ({column:?} is {:?})",
+                col.ty
+            )));
+        }
+        table.schema_mut().columns[pos].auto_increment = true;
+        Ok(())
+    }
+
+    fn alter_rename_table(&mut self, tbl: &str, new: String) -> Result<(), EngineError> {
+        // v7.16.2 — table-level rename (mailrs round-10
+        // A.5 — used by migrate-042's `ALTER TABLE
+        // contacts RENAME TO email_contacts`). Storage
+        // helper updates the schema + by_name index +
+        // dangling FK / trigger references in one
+        // atomic step.
+        let old = tbl.to_string();
+        self.active_catalog_mut()
+            .rename_table(&old, &new)
+            .map_err(EngineError::Storage)?;
+        Ok(())
+    }
+
+    fn alter_rename_column(
+        &mut self,
+        tbl: &str,
+        old: String,
+        new: String,
+    ) -> Result<(), EngineError> {
+        // v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO
+        // new`. Rename the column in the schema; rewrite
+        // every stored source string on this table that
+        // references it as a (potentially-qualified)
+        // column identifier: CHECK predicates, partial-
+        // index predicates, runtime DEFAULT expressions.
+        // Then walk catalog triggers on this table and
+        // patch any `UPDATE OF` column list. Function and
+        // trigger bodies are NOT auto-rewritten — that
+        // surface is dynamic SQL territory; users update
+        // those separately (matches PG plpgsql behavior:
+        // a column rename invalidates name-referencing
+        // plpgsql at call time, not rename time).
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let col_pos = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&old))
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "ALTER TABLE RENAME COLUMN: column {old:?} not found on {:?}",
+                    tbl
+                ))
+            })?;
+        // Reject same-name (case-insensitive) collision.
+        if table
+            .schema()
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != col_pos && c.name.eq_ignore_ascii_case(&new))
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER TABLE RENAME COLUMN: column {new:?} already exists on {:?}",
+                tbl
+            )));
+        }
+        // Schema rename first — even idempotent same-name
+        // rename (`ALTER TABLE t RENAME a TO a`) needs to
+        // be a no-op, not an error.
+        if old.eq_ignore_ascii_case(&new) {
+            return Ok(());
+        }
+        table.rename_column(col_pos, &new);
+        // Rewrite per-column runtime_default sources on
+        // every column of this table — a DEFAULT expression
+        // on column X may reference column Y by name (rare,
+        // but legal in PG when the value is supplied via a
+        // function that takes the row).
+        let n_cols = table.schema().columns.len();
+        for i in 0..n_cols {
+            let rt = table.schema().columns[i].runtime_default.clone();
+            if let Some(src) = rt {
+                let rewritten = rewrite_column_in_source(&src, &old, &new)?;
+                table.schema_mut().columns[i].runtime_default = Some(rewritten);
+            }
+        }
+        // Rewrite table-level CHECK predicates.
+        let checks = table.schema().checks.clone();
+        let mut new_checks = Vec::with_capacity(checks.len());
+        for chk in checks {
+            new_checks.push(rewrite_column_in_source(&chk, &old, &new)?);
+        }
+        table.schema_mut().checks = new_checks;
+        // Rewrite per-index partial_predicate sources.
+        let n_idx = table.indices().len();
+        for i in 0..n_idx {
+            let pred = table.indices()[i].partial_predicate.clone();
+            if let Some(src) = pred {
+                let rewritten = rewrite_column_in_source(&src, &old, &new)?;
+                // SAFETY: indices_mut would be cleanest, but
+                // partial_predicate is the only mutable field
+                // here; reach in via the public mut accessor.
+                table.set_partial_predicate(i, Some(rewritten));
+            }
+        }
+        // Walk catalog triggers; patch `update_columns` on
+        // triggers attached to this table.
+        let table_name = tbl.to_string();
+        for trig in self.active_catalog_mut().triggers_mut() {
+            if !trig.table.eq_ignore_ascii_case(&table_name) {
+                continue;
+            }
+            for c in &mut trig.update_columns {
+                if c.eq_ignore_ascii_case(&old) {
+                    *c = new.clone();
                 }
             }
         }
