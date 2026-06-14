@@ -12,6 +12,9 @@ use spg_storage::{ColumnSchema, DataType, Row, StorageError, Value};
 use crate::{Engine, EngineError, QueryResult, render_data_type};
 
 impl Engine {
+    /// `SHOW TABLES` — one row per table in the active catalog.
+    /// Column name is `name` so result-set consumers can downstream
+    /// `SELECT name FROM ...` style logic if needed.
     pub(crate) fn exec_show_tables(&self) -> QueryResult {
         let columns = alloc::vec![ColumnSchema::new("name", DataType::Text, false)];
         let rows: Vec<Row> = self
