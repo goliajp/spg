@@ -9,16 +9,15 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use spg_sql::ast::{
-    CreateIndexStatement, CreateTableStatement, CreateUserStatement, IndexMethod, Statement,
-    VecEncoding as SqlVecEncoding,
+    ColumnDef, CreateIndexStatement, CreateTableStatement, CreateUserStatement, Expr, IndexMethod,
+    Statement, VecEncoding as SqlVecEncoding,
 };
-use spg_storage::{StorageError, TableSchema, Value, VecEncoding};
+use spg_storage::{ColumnSchema, DataType, StorageError, TableSchema, Value, VecEncoding};
 
 use crate::{
-    CancelToken, Engine, EngineError, QueryResult, check_existing_unique_violation, coerce_value,
-    column_def_to_schema, column_type_to_data_type, enforce_fk_inserts, eval, infer_column_types,
-    render_function_args, resolve_column_default_free, resolve_foreign_key,
-    rewrite_column_in_source, users,
+    CancelToken, ClockFn, Engine, EngineError, QueryResult, check_existing_unique_violation,
+    coerce_value, column_type_to_data_type, enforce_fk_inserts, eval, infer_column_types,
+    literal_expr_to_value, resolve_foreign_key, rewrite_column_in_source, users,
 };
 
 impl Engine {
@@ -2118,4 +2117,269 @@ impl Engine {
             modified_catalog: removed > 0 && !self.in_transaction(),
         })
     }
+}
+
+// ---- column-definition / DEFAULT / SET / enum helpers (lib.rs split 11) ----
+
+/// v7.9.21 — resolve a column's DEFAULT for INSERT-time
+/// default-fill. Free fn (rather than `&self`) so callers
+/// with an active `&mut Table` borrow can still use it.
+/// Literal defaults take the cached path (`col.default`);
+/// runtime defaults hit `clock_fn` at each call. mailrs G4.
+pub(crate) fn resolve_column_default_free(
+    col: &ColumnSchema,
+    clock_fn: Option<ClockFn>,
+) -> Result<Value, EngineError> {
+    if let Some(rt) = &col.runtime_default {
+        return eval_runtime_default_free(rt, col.ty, clock_fn);
+    }
+    Ok(col.default.clone().unwrap_or(Value::Null))
+}
+
+pub(crate) fn eval_runtime_default_free(
+    rt: &str,
+    ty: DataType,
+    clock_fn: Option<ClockFn>,
+) -> Result<Value, EngineError> {
+    let s = rt.trim().to_ascii_lowercase();
+    // v7.17.0 Phase 2.1 — also strip `(N)` precision suffix
+    // so MySQL `CURRENT_TIMESTAMP(6)` resolves the same as
+    // bare `CURRENT_TIMESTAMP`. SPG stores TIMESTAMP at fixed
+    // microsecond resolution; the precision modifier is
+    // parser-only.
+    let with_no_parens = s.trim_end_matches("()");
+    let canonical: &str = if let Some(open_idx) = with_no_parens.find('(') {
+        if with_no_parens.ends_with(')') {
+            &with_no_parens[..open_idx]
+        } else {
+            with_no_parens
+        }
+    } else {
+        with_no_parens
+    };
+    let now_us = match clock_fn {
+        Some(f) => f(),
+        None => 0,
+    };
+    let v = match canonical {
+        "now" | "current_timestamp" | "localtimestamp" => Value::Timestamp(now_us),
+        "current_date" => Value::Date((now_us / 86_400_000_000) as i32),
+        "current_time" | "localtime" => Value::Timestamp(now_us),
+        // v7.17.0 — UUID generators in DEFAULT clauses. Required
+        // for the canonical Django / Rails / Hibernate `id UUID
+        // PRIMARY KEY DEFAULT gen_random_uuid()` pattern. Each
+        // INSERT evaluates the function fresh; the per-row UUID
+        // is the storage value, not a cached literal.
+        "gen_random_uuid" | "uuid_generate_v4" => Value::Uuid(eval::gen_random_uuid_bytes()),
+        other => {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "runtime DEFAULT expression {other:?} not supported \
+                 (v7.17.0 whitelist: now() / current_timestamp / \
+                 current_date / current_time / localtimestamp / \
+                 localtime / gen_random_uuid() / \
+                 uuid_generate_v4())"
+            )));
+        }
+    };
+    coerce_value(v, ty, "DEFAULT", 0)
+}
+
+/// v7.9.21 — true when a DEFAULT expression needs INSERT-time
+/// evaluation rather than being cacheable as a literal Value.
+/// FunctionCall is the immediate case (`now()`,
+/// `current_timestamp`). Literal expressions and simple sign-
+/// flipped numerics still take the static-cache path.
+fn is_runtime_default_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { .. } => true,
+        Expr::Unary { expr, .. } => is_runtime_default_expr(expr),
+        _ => false,
+    }
+}
+
+/// v7.17.0 Phase 1.4 — INSERT/UPDATE-time enum label check. When
+/// `col_idx` has a registered label list, the cell value must be
+/// NULL or one of the labels (case-sensitive per PG).
+/// v7.17.0 Phase 3.P0-37 — validate + canonicalise a MySQL inline
+/// SET cell. For non-SET columns this is a no-op pass-through.
+///
+/// Semantics:
+///   * NULL preserved.
+///   * Empty string → `''` (zero flags).
+///   * Otherwise split on ',', trim each token, validate every
+///     token against the column's variant list (error on miss),
+///     de-dup, then re-emit in DEFINITION order joined by ','.
+pub(crate) fn canonicalize_set_value(
+    lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    col_idx: usize,
+    col_name: &str,
+    value: Value,
+) -> Result<Value, EngineError> {
+    let Some(variants) = lookup.get(&col_idx) else {
+        return Ok(value);
+    };
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Text(s) => {
+            if s.is_empty() {
+                return Ok(Value::Text(alloc::string::String::new()));
+            }
+            // Collect a presence-set of variant indices to keep
+            // definition order + handle de-dup in one pass.
+            let mut present = alloc::vec![false; variants.len()];
+            for raw in s.split(',') {
+                let tok = raw.trim();
+                if tok.is_empty() {
+                    continue;
+                }
+                let idx = variants.iter().position(|v| v == tok).ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "column {col_name:?}: invalid SET token {tok:?}; \
+                         allowed: {variants:?}"
+                    ))
+                })?;
+                present[idx] = true;
+            }
+            // Re-emit in definition order.
+            let mut out = alloc::string::String::new();
+            let mut first = true;
+            for (i, keep) in present.iter().enumerate() {
+                if !keep {
+                    continue;
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&variants[i]);
+            }
+            Ok(Value::Text(out))
+        }
+        other => Err(EngineError::Unsupported(alloc::format!(
+            "column {col_name:?}: SET-typed column expects TEXT, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+pub(crate) fn enforce_enum_label(
+    lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    col_idx: usize,
+    col_name: &str,
+    value: &Value,
+) -> Result<(), EngineError> {
+    if let Some(labels) = lookup.get(&col_idx) {
+        match value {
+            Value::Null => Ok(()),
+            Value::Text(s) => {
+                if labels.iter().any(|l| l == s) {
+                    Ok(())
+                } else {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "column {col_name:?}: invalid enum label {s:?}; allowed: {labels:?}"
+                    )))
+                }
+            }
+            other => Err(EngineError::Unsupported(alloc::format!(
+                "column {col_name:?}: enum-typed column expects TEXT, got {:?}",
+                other.data_type()
+            ))),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
+    let ty = column_type_to_data_type(c.ty);
+    let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
+    // user_type_ref is the raw ident the parser couldn't resolve
+    // to a built-in; classification into enum vs domain happens
+    // at exec_create_table where we have catalog access. We
+    // park it temporarily as user_enum_type and the engine
+    // promotes domain bindings to user_domain_type before the
+    // table is stored.
+    if let Some(name) = c.user_type_ref {
+        schema.user_enum_type = Some(name);
+    }
+    // v7.17.0 Phase 2.1 — render the ON UPDATE expression to
+    // canonical text (the engine re-parses at UPDATE time).
+    if let Some(expr) = c.on_update_runtime {
+        schema.on_update_runtime = Some(alloc::format!("{expr}"));
+    }
+    // v7.17.0 Phase 2.5 — bridge the AST `Collation` enum to the
+    // storage one. Same variants, different crates (spg-storage
+    // owns no dep on spg-sql).
+    schema.collation = match c.collation {
+        spg_sql::ast::Collation::Binary => spg_storage::Collation::Binary,
+        spg_sql::ast::Collation::CaseInsensitive => spg_storage::Collation::CaseInsensitive,
+    };
+    // v7.17.0 Phase 4.4 — MySQL `UNSIGNED` flag propagates to
+    // storage so engine INSERT / UPDATE can range-check.
+    schema.is_unsigned = c.is_unsigned;
+    // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant list.
+    // INSERT validation lives in coerce_value (Text → Text path
+    // with the column's variant list as the accept-set).
+    schema.inline_enum_variants = c.inline_enum_variants;
+    // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant list.
+    // INSERT canonicalisation (de-dup + sort by definition order)
+    // lives in the exec_insert path next to the ENUM check.
+    schema.inline_set_variants = c.inline_set_variants;
+    if let Some(default_expr) = c.default {
+        // v7.9.21 — distinguish literal defaults (evaluated once
+        // at CREATE TABLE) from expression defaults (deferred to
+        // INSERT). Function calls (`now()`, `current_timestamp`
+        // — see v7.9.20 keyword promotion) take the runtime path.
+        // Literals continue to cache. mailrs G4.
+        if is_runtime_default_expr(&default_expr) {
+            let display = alloc::format!("{default_expr}");
+            schema = schema.with_runtime_default(display);
+        } else {
+            let raw = literal_expr_to_value(default_expr)?;
+            let coerced = coerce_value(raw, ty, &c.name, 0)?;
+            schema = schema.with_default(coerced);
+        }
+    }
+    if c.auto_increment {
+        // AUTO_INCREMENT only makes sense on integer-shaped columns.
+        if !matches!(ty, DataType::SmallInt | DataType::Int | DataType::BigInt) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "AUTO_INCREMENT requires an integer column type, got {ty:?}"
+            )));
+        }
+        schema = schema.with_auto_increment();
+    }
+    Ok(schema)
+}
+
+/// v7.12.4 — render a function arg list into the
+/// canonical form the storage layer caches as
+/// [`spg_storage::FunctionDef::args_repr`]. The catalogue uses
+/// this string for both display + as a coarse signature key
+/// for the (deferred) overload resolution v7.12.5+ adds.
+fn render_function_args(args: &[spg_sql::ast::FunctionArg]) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::from("(");
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        match a.mode {
+            spg_sql::ast::FunctionArgMode::In => {}
+            spg_sql::ast::FunctionArgMode::Out => out.push_str("OUT "),
+            spg_sql::ast::FunctionArgMode::InOut => out.push_str("INOUT "),
+        }
+        if let Some(n) = &a.name {
+            out.push_str(n);
+            out.push(' ');
+        }
+        match &a.ty {
+            spg_sql::ast::FunctionArgType::Typed(t) => {
+                let _ = write!(out, "{t}");
+            }
+            spg_sql::ast::FunctionArgType::Raw(s) => out.push_str(s),
+        }
+    }
+    out.push(')');
+    out
 }
