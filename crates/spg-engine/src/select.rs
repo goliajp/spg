@@ -1641,10 +1641,10 @@ impl Engine {
             .into_iter()
             .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
             .collect();
-        return Ok(QueryResult::Rows {
+        Ok(QueryResult::Rows {
             columns,
             rows: alloc::vec![Row::new(values)],
-        });
+        })
     }
 
     /// Single-table aggregate path: filter the (optionally index-seeked)
@@ -1722,7 +1722,7 @@ impl Engine {
             Some(alias),
             Some(&agg_correlated),
         )?;
-        return self.finish_agg_result(agg, stmt, cancel);
+        self.finish_agg_result(agg, stmt, cancel)
     }
 
     /// Single-table scan + projection path: WHERE filter (compiled when

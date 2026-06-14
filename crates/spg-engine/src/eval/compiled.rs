@@ -318,7 +318,7 @@ pub(crate) fn eval_compiled_ref(
                     // Cross-family needle: take the interpreter's
                     // exact coercion / error path on the whole node.
                     _ => {
-                        stack.push(eval_expr(fallback, &*row.as_row(), ctx)?);
+                        stack.push(eval_expr(fallback, &row.as_row(), ctx)?);
                         continue;
                     }
                 };
@@ -361,7 +361,7 @@ pub(crate) fn eval_compiled_ref(
                     }
                 }
             }
-            Step::Subtree(e) => stack.push(eval_expr(e, &*row.as_row(), ctx)?),
+            Step::Subtree(e) => stack.push(eval_expr(e, &row.as_row(), ctx)?),
         }
     }
     Ok(stack.pop().unwrap_or(Value::Null))
