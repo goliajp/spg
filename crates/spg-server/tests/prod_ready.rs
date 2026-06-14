@@ -569,8 +569,7 @@ fn row_1_11_in_memory_consistency_covered_by_e2e() {
     let wal_src = std::fs::read_to_string(workspace_root().join("crates/spg-server/src/wal.rs"))
         .expect("wal.rs");
     assert!(
-        wal_src.contains("WAL_V3_TYPE_AUTO_COMMIT_SQL")
-            && wal_src.contains("encode_wal_v3_record"),
+        wal_src.contains("WAL_V3_TYPE_AUTO_COMMIT_SQL") && wal_src.contains("encode_wal_v3_record"),
         "wal.rs must use the v4.41 single-record v3 framing for the implicit auto-commit \
          (WAL_V3_TYPE_AUTO_COMMIT_SQL + encode_wal_v3_record)"
     );
