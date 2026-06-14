@@ -59,8 +59,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use spg_sql::ast::{
-    BinOp, ColumnDef, ColumnName, CreatePublicationStatement, CreateSubscriptionStatement, Expr,
-    FrameBound, FrameKind, Literal, OrderBy, SelectItem, SelectStatement, Statement, WindowFrame,
+    BinOp, ColumnDef, ColumnName, Expr, FrameBound, FrameKind, Literal, OrderBy, SelectItem,
+    SelectStatement, Statement, WindowFrame,
 };
 // v7.16.0 — re-export the parsed-statement AST so downstream
 // crates (spg-embedded → spg-sqlx) don't need a direct dep on
@@ -2142,109 +2142,6 @@ impl Engine {
             }
         };
         self.enforce_row_limit(result)
-    }
-
-    /// v6.1.2 — `CREATE PUBLICATION` runtime path. Duplicate names
-    /// surface as `EngineError::Unsupported` so the existing PG-wire
-    /// error mapping stays uniform; the message carries the name so
-    /// operators can grep replication-log noise. Inside-transaction
-    /// invocation is rejected (matches `CREATE USER` / `DROP USER`
-    /// stance) — replication-catalog mutation is a connection-level
-    /// administrative op, not a transactional one.
-    fn exec_create_publication(
-        &mut self,
-        s: CreatePublicationStatement,
-    ) -> Result<QueryResult, EngineError> {
-        // v6.1.4 — the v6.1.2 "no DDL inside a transaction" guard
-        // was over-cautious: it also blocked the auto-commit wrap
-        // path (which begins an internal TX around every WAL-
-        // logged statement). PG itself allows CREATE PUBLICATION
-        // inside a transaction (it rolls back with the TX).
-        self.publications
-            .create(s.name, s.scope)
-            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE PUBLICATION: {e:?}")))?;
-        Ok(QueryResult::CommandOk {
-            affected: 1,
-            modified_catalog: true,
-        })
-    }
-
-    /// v6.1.2 — `DROP PUBLICATION` runtime path. PG-compatible silent
-    /// no-op when the publication doesn't exist (returns `affected=0`
-    /// in that case so the wire-level command tag distinguishes
-    /// "dropped" from "no-op", though both succeed).
-    fn exec_drop_publication(&mut self, name: &str) -> Result<QueryResult, EngineError> {
-        let removed = self.publications.drop(name);
-        Ok(QueryResult::CommandOk {
-            affected: usize::from(removed),
-            modified_catalog: removed,
-        })
-    }
-
-    /// v6.1.2 — read access to the publication catalog. Used by
-    /// the v6.1.5 publisher-side WAL filter, by `SHOW PUBLICATIONS`
-    /// (v6.1.3+), and by e2e tests that need to assert state without
-    /// going through the wire.
-    pub const fn publications(&self) -> &publications::Publications {
-        &self.publications
-    }
-
-    /// v6.1.4 — `CREATE SUBSCRIPTION` runtime path. Defaults
-    /// `enabled = true` and `last_received_pos = 0` for a freshly-
-    /// created subscription. The actual worker thread is spawned
-    /// by spg-server once the engine returns success.
-    fn exec_create_subscription(
-        &mut self,
-        s: CreateSubscriptionStatement,
-    ) -> Result<QueryResult, EngineError> {
-        // See exec_create_publication — the in_transaction gate
-        // was over-cautious; the auto-commit wrap path holds an
-        // internal TX that this check was incorrectly blocking.
-        let sub = subscriptions::Subscription {
-            conn_str: s.conn_str,
-            publications: s.publications,
-            enabled: true,
-            last_received_pos: 0,
-        };
-        self.subscriptions
-            .create(s.name, sub)
-            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE SUBSCRIPTION: {e:?}")))?;
-        Ok(QueryResult::CommandOk {
-            affected: 1,
-            modified_catalog: true,
-        })
-    }
-
-    /// v6.1.4 — `DROP SUBSCRIPTION`. Silent no-op when the name
-    /// doesn't exist (PG-compatible). The associated worker is
-    /// torn down by spg-server when it observes the catalog
-    /// change at the next snapshot or via the engine's
-    /// subscriptions accessor (the worker polls the catalog on
-    /// reconnect; v6.1.5's filter-side will tighten this to an
-    /// explicit signal).
-    fn exec_drop_subscription(&mut self, name: &str) -> Result<QueryResult, EngineError> {
-        let removed = self.subscriptions.drop(name);
-        Ok(QueryResult::CommandOk {
-            affected: usize::from(removed),
-            modified_catalog: removed,
-        })
-    }
-
-    /// v6.1.4 — read access to the subscription catalog. Used by
-    /// the subscription worker (read its own row to find its
-    /// publications + last applied position), by SHOW SUBSCRIPTIONS,
-    /// and by e2e tests asserting state directly.
-    pub const fn subscriptions(&self) -> &subscriptions::Subscriptions {
-        &self.subscriptions
-    }
-
-    /// v6.1.4 — write access to `last_received_pos`. Worker
-    /// calls this after each apply batch (under the engine's
-    /// write-lock). Returns `false` when the subscription was
-    /// dropped between when the worker received the record and
-    /// when this call landed.
-    pub fn subscription_advance(&mut self, name: &str, pos: u64) -> bool {
-        self.subscriptions.update_last_received_pos(name, pos)
     }
 
     /// v7.12.1 — record a `SET <name> = <value>` parameter. Names
