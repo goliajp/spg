@@ -24,9 +24,9 @@ use alloc::vec::Vec;
 
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
-use crate::{Engine, QueryResult};
+use crate::{Engine, EngineError, QueryResult};
 
-use spg_sql::ast::PublicationScope;
+use spg_sql::ast::{CreatePublicationStatement, PublicationScope};
 
 /// On-disk scope tag — v6.1.2 only writes/reads `0` (AllTables).
 /// `1` and `2` are reserved for v6.1.3 (`ForTables` /
@@ -269,6 +269,51 @@ impl Engine {
             })
             .collect();
         QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.1.2 — `CREATE PUBLICATION` runtime path. Duplicate names
+    /// surface as `EngineError::Unsupported` so the existing PG-wire
+    /// error mapping stays uniform; the message carries the name so
+    /// operators can grep replication-log noise. Inside-transaction
+    /// invocation is rejected (matches `CREATE USER` / `DROP USER`
+    /// stance) — replication-catalog mutation is a connection-level
+    /// administrative op, not a transactional one.
+    pub(crate) fn exec_create_publication(
+        &mut self,
+        s: CreatePublicationStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // v6.1.4 — the v6.1.2 "no DDL inside a transaction" guard
+        // was over-cautious: it also blocked the auto-commit wrap
+        // path (which begins an internal TX around every WAL-
+        // logged statement). PG itself allows CREATE PUBLICATION
+        // inside a transaction (it rolls back with the TX).
+        self.publications
+            .create(s.name, s.scope)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE PUBLICATION: {e:?}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    /// v6.1.2 — `DROP PUBLICATION` runtime path. PG-compatible silent
+    /// no-op when the publication doesn't exist (returns `affected=0`
+    /// in that case so the wire-level command tag distinguishes
+    /// "dropped" from "no-op", though both succeed).
+    pub(crate) fn exec_drop_publication(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        let removed = self.publications.drop(name);
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    /// v6.1.2 — read access to the publication catalog. Used by
+    /// the v6.1.5 publisher-side WAL filter, by `SHOW PUBLICATIONS`
+    /// (v6.1.3+), and by e2e tests that need to assert state without
+    /// going through the wire.
+    pub const fn publications(&self) -> &Publications {
+        &self.publications
     }
 }
 
