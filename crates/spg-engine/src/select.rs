@@ -8,7 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use spg_sql::ast::{
-    ColumnName, Expr, FromClause, SelectItem, SelectStatement, TableRef, UnionKind,
+    ColumnName, Expr, FromClause, SelectItem, SelectStatement, Statement, TableRef, UnionKind,
 };
 use spg_storage::{
     Catalog, ColumnSchema, DataType, Row, StorageError, TableSchema, Value, VecEncoding,
@@ -17,6 +17,7 @@ use spg_storage::{
 use crate::describe;
 use crate::eval::{EvalContext, EvalError};
 use crate::join::RowRef;
+use crate::system_catalog::collect_view_refs;
 use crate::{
     ByteBudget, CancelToken, Engine, EngineError, QueryResult, aggregate, apply_offset_and_limit,
     apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys, collect_meta_view_names,
@@ -2594,5 +2595,62 @@ fn array_value_to_elements(v: &Value) -> Result<Vec<Value>, EngineError> {
                 other.data_type()
             ),
         })),
+    }
+}
+
+impl Engine {
+    /// v7.17.0 Phase 1.2 — find every catalog VIEW referenced in
+    /// the SELECT's FROM / JOIN graph, re-parse each view's body
+    /// source, and prepend it as a synthetic CTE on the
+    /// returned SelectStatement. Returns `None` when no view
+    /// references are found (caller proceeds with the original
+    /// statement); returns `Some(rewritten)` otherwise (caller
+    /// re-runs exec_select_cancel on the rewritten form so the
+    /// regular CTE materialiser handles it).
+    fn expand_views_in_select(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<SelectStatement>, EngineError> {
+        let cat = self.active_catalog();
+        let mut referenced: Vec<String> = Vec::new();
+        if let Some(from) = &stmt.from {
+            collect_view_refs(&from.primary, cat, &mut referenced);
+            for j in &from.joins {
+                collect_view_refs(&j.table, cat, &mut referenced);
+            }
+        }
+        // Don't expand a view name that's already shadowed by a
+        // CTE on the same SELECT — the CTE wins per PG.
+        referenced.retain(|n| !stmt.ctes.iter().any(|c| c.name == *n));
+        if referenced.is_empty() {
+            return Ok(None);
+        }
+        let mut new_ctes: Vec<spg_sql::ast::Cte> = Vec::with_capacity(referenced.len());
+        for name in &referenced {
+            let view = cat.views().get(name).ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                    "view {name:?} disappeared mid-expansion"
+                )))
+            })?;
+            let parsed = spg_sql::parser::parse_statement(&view.body).map_err(|e| {
+                EngineError::Unsupported(alloc::format!("view {name:?} body re-parse failed: {e}"))
+            })?;
+            let Statement::Select(body) = parsed else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "view {name:?} body is not a SELECT (catalog corruption)"
+                )));
+            };
+            new_ctes.push(spg_sql::ast::Cte {
+                name: name.clone(),
+                body,
+                recursive: false,
+                column_overrides: view.columns.clone(),
+            });
+        }
+        let mut out = stmt.clone();
+        // Prepend so view CTEs are visible to caller-supplied CTEs.
+        new_ctes.extend(out.ctes);
+        out.ctes = new_ctes;
+        Ok(Some(out))
     }
 }
