@@ -326,6 +326,18 @@ pub struct AggResult {
 /// surviving subqueries keep erroring loudly.
 pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Result<Value, EvalError>;
 
+/// Output of the per-group projection stage (`project_groups`): the
+/// output schema, the projected rows, the synth rows kept alongside
+/// them for post-LIMIT deferred evaluation, the deferred subquery
+/// items, and the rewritten ORDER BY exprs (shared with the sort).
+struct Projection {
+    columns: Vec<ColumnSchema>,
+    out_rows: Vec<Row>,
+    kept_synth: Vec<Row>,
+    deferred: Vec<(usize, Expr)>,
+    order_rewritten: Vec<Expr>,
+}
+
 pub(crate) fn run(
     stmt: &SelectStatement,
     rows: &[RowRef<'_>],
@@ -333,7 +345,6 @@ pub(crate) fn run(
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
 ) -> Result<AggResult, EvalError> {
-    let ctx = EvalContext::new(schema_cols, table_alias);
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
 
     // Collect aggregate sub-expressions across items + order_by.
@@ -355,10 +366,83 @@ pub(crate) fn run(
     // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
+    validate_within_group(&agg_specs)?;
+
+    // (1) Stream the WHERE-filtered rows into insertion-ordered group state.
+    let order = accumulate_groups(
+        rows,
+        &group_exprs,
+        &agg_specs,
+        schema_cols,
+        table_alias,
+        correlated_eval,
+    )?;
+
+    // (2) Build the synthetic per-group schema and finalise each group's row.
+    let synth_schema =
+        build_synth_schema(rows, &group_exprs, &agg_specs, schema_cols, table_alias)?;
+    let synth_rows = finalize_synth_rows(
+        &order,
+        &agg_specs,
+        &synth_schema,
+        rows,
+        schema_cols,
+        table_alias,
+    )?;
+
+    // (3) Rewrite the user's expressions, filter groups by HAVING and project.
+    let Projection {
+        columns,
+        mut out_rows,
+        mut kept_synth,
+        deferred,
+        order_rewritten,
+    } = project_groups(
+        synth_rows,
+        stmt,
+        &group_exprs,
+        &agg_specs,
+        &synth_schema,
+        correlated_eval,
+    )?;
+
+    // (4) ORDER BY on the aggregated output (the caller applies LIMIT).
+    if !stmt.order_by.is_empty() {
+        let (sorted_synth, sorted_out) = sort_synth_by_order_by(
+            &synth_schema,
+            &stmt.order_by,
+            &order_rewritten,
+            kept_synth,
+            out_rows,
+            correlated_eval,
+        )?;
+        kept_synth = sorted_synth;
+        out_rows = sorted_out;
+    }
+
+    let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        (kept_synth, synth_schema.clone())
+    };
+    Ok(AggResult {
+        columns,
+        rows: out_rows,
+        deferred,
+        synth_rows: synth_rows_out,
+        synth_schema: synth_schema_out,
+    })
+}
+
+/// v7.32 (round-29) — validate the structural requirements of WITHIN
+/// GROUP (ordered-set / hypothetical-set) aggregates up front, so a
+/// malformed call surfaces as a SQL error rather than a silently
+/// degenerate aggregate.
+fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
     // v7.32 (round-29) — WITHIN GROUP aggregates require the clause (PG
     // raises a hard error otherwise rather than silently degrading), and
     // SPG supports the single-sort-key form only.
-    for spec in &agg_specs {
+    for spec in agg_specs {
         if is_within_group_name(&spec.name) {
             if spec.order_by.is_empty() {
                 return Err(EvalError::TypeMismatch {
@@ -386,7 +470,22 @@ pub(crate) fn run(
             }
         }
     }
+    Ok(())
+}
 
+/// (1) Stream the WHERE-filtered rows, group by the GROUP BY value
+/// tuple, and update per-group aggregate state. Returns the groups in
+/// insertion order. See `run` for the bind-once fast path rationale.
+#[allow(clippy::too_many_lines)]
+fn accumulate_groups(
+    rows: &[RowRef<'_>],
+    group_exprs: &[Expr],
+    agg_specs: &[AggSpec],
+    schema_cols: &[ColumnSchema],
+    table_alias: Option<&str>,
+    correlated_eval: Option<CorrelatedEval<'_>>,
+) -> Result<Vec<(Vec<Value>, Vec<AggState>)>, EvalError> {
+    let ctx = EvalContext::new(schema_cols, table_alias);
     // Map group key (vec of values, encoded as canonical string) -> group state.
     // v7.32 (architecture v2, P2b) — insertion-ordered group state in
     // a Vec; the hash map only maps key → index. Removes the parallel
@@ -641,7 +740,20 @@ pub(crate) fn run(
             )?;
         }
     }
+    Ok(order)
+}
 
+/// (2a) Build the synthetic per-group schema: `__grp_0..K` then
+/// `__agg_0..N`. Group types are probed from the first row; aggregate
+/// types from each spec.
+fn build_synth_schema(
+    rows: &[RowRef<'_>],
+    group_exprs: &[Expr],
+    agg_specs: &[AggSpec],
+    schema_cols: &[ColumnSchema],
+    table_alias: Option<&str>,
+) -> Result<Vec<ColumnSchema>, EvalError> {
+    let ctx = EvalContext::new(schema_cols, table_alias);
     // Build synthetic schema: __grp_0..K then __agg_0..N.
     let group_types: Vec<DataType> = if rows.is_empty() {
         // Use Text as a safe stand-in — empty result means schema isn't
@@ -668,7 +780,21 @@ pub(crate) fn run(
     for (i, ty) in agg_types.iter().enumerate() {
         synth_schema.push(ColumnSchema::new(format!("__agg_{i}"), *ty, true));
     }
+    Ok(synth_schema)
+}
 
+/// (2b) Materialise one synthetic row per group (insertion order):
+/// apply each aggregate's internal ORDER BY, then finalise the running
+/// state into the group + aggregate cells.
+fn finalize_synth_rows(
+    order: &[(Vec<Value>, Vec<AggState>)],
+    agg_specs: &[AggSpec],
+    synth_schema: &[ColumnSchema],
+    rows: &[RowRef<'_>],
+    schema_cols: &[ColumnSchema],
+    table_alias: Option<&str>,
+) -> Result<Vec<Row>, EvalError> {
+    let ctx = EvalContext::new(schema_cols, table_alias);
     // v7.32 (round-29) — ordered-set direct arguments (the percentile
     // fraction) are constant per PG, so evaluate each once up front.
     let direct_arg_vals: Vec<Option<Value>> = agg_specs
@@ -681,7 +807,7 @@ pub(crate) fn run(
 
     // Materialise synthetic rows (insertion order = `order`).
     let mut synth_rows: Vec<Row> = Vec::new();
-    for (gvals, states) in &order {
+    for (gvals, states) in order {
         let mut values: Vec<Value> = Vec::with_capacity(synth_schema.len());
         values.extend(gvals.iter().cloned());
         for (i, st) in states.iter().enumerate() {
@@ -730,7 +856,22 @@ pub(crate) fn run(
         }
         synth_rows.push(Row::new(values));
     }
+    Ok(synth_rows)
+}
 
+/// (3) Rewrite the user's SELECT items + HAVING to reference the
+/// synthetic columns, filter groups by HAVING, and project each
+/// surviving group into an output row. The synth rows ride alongside
+/// (`kept_synth`) so post-LIMIT deferred subqueries can evaluate later.
+#[allow(clippy::too_many_lines)]
+fn project_groups(
+    synth_rows: Vec<Row>,
+    stmt: &SelectStatement,
+    group_exprs: &[Expr],
+    agg_specs: &[AggSpec],
+    synth_schema: &[ColumnSchema],
+    correlated_eval: Option<CorrelatedEval<'_>>,
+) -> Result<Projection, EvalError> {
     // Rewrite the user's SELECT items + ORDER BY to reference synthetic
     // columns. After rewriting, every remaining `Expr::Column` must
     // resolve against the synthetic schema (i.e. must have been a GROUP
@@ -758,11 +899,11 @@ pub(crate) fn run(
     // we keep the projected row — same semantics as PG: HAVING runs
     // against the aggregated row (so `HAVING count(*) > 1` works) and
     // sees only group-by'd columns plus aggregate values.
-    let synth_ctx = EvalContext::new(&synth_schema, None);
+    let synth_ctx = EvalContext::new(synth_schema, None);
     let having_rewritten = stmt
         .having
         .as_ref()
-        .map(|h| rewrite_expr(h, &group_exprs, &agg_specs));
+        .map(|h| rewrite_expr(h, group_exprs, agg_specs));
     // v7.30 (phase 3e-1) - rewrite SELECT items ONCE. This ran per
     // GROUP (23.5k x 9 items of AST cloning = ~48% of the inbox
     // query in sampled stacks); the rewrite is group-independent.
@@ -772,7 +913,7 @@ pub(crate) fn run(
         .items
         .iter()
         .map(|item| match item {
-            SelectItem::Expr { expr, .. } => Some(rewrite_expr(expr, &group_exprs, &agg_specs)),
+            SelectItem::Expr { expr, .. } => Some(rewrite_expr(expr, group_exprs, agg_specs)),
             SelectItem::Wildcard => None,
         })
         .collect();
@@ -783,7 +924,7 @@ pub(crate) fn run(
     let order_rewritten: Vec<Expr> = stmt
         .order_by
         .iter()
-        .map(|o| rewrite_expr(&o.expr, &group_exprs, &agg_specs))
+        .map(|o| rewrite_expr(&o.expr, group_exprs, agg_specs))
         .collect();
     let defer_enabled = correlated_eval.is_some()
         && !stmt.distinct
@@ -861,79 +1002,80 @@ pub(crate) fn run(
         kept_synth.push(srow);
         out_rows.push(Row::new(values));
     }
-
-    // ORDER BY: evaluate the rewritten order_by against each synth row,
-    // sort, then drop the keys. Limit is applied by the caller.
-    if !stmt.order_by.is_empty() {
-        // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
-        // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
-        // above as `order_rewritten` — shared with the deferral
-        // safety check.)
-        let keys_meta: Vec<(bool, Option<bool>)> = stmt
-            .order_by
-            .iter()
-            .map(|o| (o.desc, o.nulls_first))
-            .collect();
-        // P2: compile order-by keys once (per-group sort keys are
-        // the same `__agg_N` / `__grp_K` shape as the projection).
-        let order_compiled: Vec<Option<eval::CompiledExpr>> = order_rewritten
-            .iter()
-            .map(|e| {
-                Some(e)
-                    .filter(|e| eval::fully_compilable(e))
-                    .map(|e| eval::compile_expr(e, &synth_ctx))
-            })
-            .collect();
-        // The synth row rides through the sort so deferred exprs can
-        // evaluate against the surviving groups after the caller's
-        // LIMIT truncation.
-        let mut keystack: Vec<Value> = Vec::new();
-        let mut tagged: Vec<(Vec<Value>, Row, Row)> = Vec::with_capacity(kept_synth.len());
-        for (s, o) in kept_synth.into_iter().zip(out_rows) {
-            let mut keys = Vec::with_capacity(order_rewritten.len());
-            for (e, oc) in order_rewritten.iter().zip(&order_compiled) {
-                keys.push(if let Some(oc) = oc {
-                    eval::eval_compiled(oc, &s, &synth_ctx, &mut keystack)?
-                } else {
-                    match correlated_eval {
-                        Some(f) if crate::expr_has_subquery(e) => f(e, &s, &synth_ctx)?,
-                        _ => eval::eval_expr(e, &s, &synth_ctx)?,
-                    }
-                });
-            }
-            tagged.push((keys, s, o));
-        }
-        tagged.sort_by(|a, b| {
-            use core::cmp::Ordering;
-            for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
-                let (desc, nf) = keys_meta[i];
-                let cmp = crate::order_by_value_cmp(desc, nf, ka, kb);
-                if cmp != Ordering::Equal {
-                    return cmp;
-                }
-            }
-            Ordering::Equal
-        });
-        kept_synth = Vec::with_capacity(tagged.len());
-        out_rows = Vec::with_capacity(tagged.len());
-        for (_, s, o) in tagged {
-            kept_synth.push(s);
-            out_rows.push(o);
-        }
-    }
-
-    let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        (kept_synth, synth_schema.clone())
-    };
-    Ok(AggResult {
+    Ok(Projection {
         columns,
-        rows: out_rows,
+        out_rows,
+        kept_synth,
         deferred,
-        synth_rows: synth_rows_out,
-        synth_schema: synth_schema_out,
+        order_rewritten,
     })
+}
+
+/// (4) Sort the projected output by the rewritten ORDER BY keys. The
+/// synth rows ride through the sort so deferred subqueries evaluate
+/// against the surviving groups after the caller's LIMIT truncation.
+fn sort_synth_by_order_by(
+    synth_schema: &[ColumnSchema],
+    order_by: &[spg_sql::ast::OrderBy],
+    order_rewritten: &[Expr],
+    mut kept_synth: Vec<Row>,
+    mut out_rows: Vec<Row>,
+    correlated_eval: Option<CorrelatedEval<'_>>,
+) -> Result<(Vec<Row>, Vec<Row>), EvalError> {
+    let synth_ctx = EvalContext::new(synth_schema, None);
+    // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
+    // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
+    // above as `order_rewritten` — shared with the deferral
+    // safety check.)
+    let keys_meta: Vec<(bool, Option<bool>)> =
+        order_by.iter().map(|o| (o.desc, o.nulls_first)).collect();
+    // P2: compile order-by keys once (per-group sort keys are
+    // the same `__agg_N` / `__grp_K` shape as the projection).
+    let order_compiled: Vec<Option<eval::CompiledExpr>> = order_rewritten
+        .iter()
+        .map(|e| {
+            Some(e)
+                .filter(|e| eval::fully_compilable(e))
+                .map(|e| eval::compile_expr(e, &synth_ctx))
+        })
+        .collect();
+    // The synth row rides through the sort so deferred exprs can
+    // evaluate against the surviving groups after the caller's
+    // LIMIT truncation.
+    let mut keystack: Vec<Value> = Vec::new();
+    let mut tagged: Vec<(Vec<Value>, Row, Row)> = Vec::with_capacity(kept_synth.len());
+    for (s, o) in kept_synth.into_iter().zip(out_rows) {
+        let mut keys = Vec::with_capacity(order_rewritten.len());
+        for (e, oc) in order_rewritten.iter().zip(&order_compiled) {
+            keys.push(if let Some(oc) = oc {
+                eval::eval_compiled(oc, &s, &synth_ctx, &mut keystack)?
+            } else {
+                match correlated_eval {
+                    Some(f) if crate::expr_has_subquery(e) => f(e, &s, &synth_ctx)?,
+                    _ => eval::eval_expr(e, &s, &synth_ctx)?,
+                }
+            });
+        }
+        tagged.push((keys, s, o));
+    }
+    tagged.sort_by(|a, b| {
+        use core::cmp::Ordering;
+        for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
+            let (desc, nf) = keys_meta[i];
+            let cmp = crate::order_by_value_cmp(desc, nf, ka, kb);
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
+        }
+        Ordering::Equal
+    });
+    kept_synth = Vec::with_capacity(tagged.len());
+    out_rows = Vec::with_capacity(tagged.len());
+    for (_, s, o) in tagged {
+        kept_synth.push(s);
+        out_rows.push(o);
+    }
+    Ok((kept_synth, out_rows))
 }
 
 /// v7.17.0 — walk the statement again to validate the positional
