@@ -1175,13 +1175,41 @@ impl Engine {
             .filter(|c| c.is_primary_key)
             .map(|c| c.name.clone())
             .collect();
+        let schema = self.build_create_table_schema(
+            &table_name,
+            stmt.columns,
+            &stmt.table_constraints,
+            stmt.foreign_keys,
+            &inline_pk_columns,
+        )?;
+        self.active_catalog_mut().create_table(schema)?;
+        self.install_implicit_indexes(&table_name, &inline_pk_columns, &stmt.table_constraints)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// Build the `TableSchema` for a CREATE TABLE: column schemas with
+    /// ENUM / DOMAIN bindings resolved, table-level + inline PRIMARY KEY
+    /// NOT NULL marking, FK resolution (deferring to `pending_foreign_keys`
+    /// when checks are off and the parent is absent), and uniqueness /
+    /// CHECK constraint translation.
+    #[allow(clippy::too_many_lines)]
+    fn build_create_table_schema(
+        &mut self,
+        table_name: &str,
+        columns: Vec<ColumnDef>,
+        table_constraints: &[spg_sql::ast::TableConstraint],
+        foreign_keys: Vec<spg_sql::ast::ForeignKeyConstraint>,
+        inline_pk_columns: &[String],
+    ) -> Result<TableSchema, EngineError> {
         // v7.9.19 — table-level constraints: PRIMARY KEY (a, b, ...)
         // and UNIQUE (a, b, ...). Each builds a BTree index on the
         // leading column (the existing single-column storage tier)
         // and registers a UniquenessConstraint on the schema for
         // INSERT-time enforcement of the full tuple. mailrs G1/G6.
-        let cols = stmt
-            .columns
+        let cols = columns
             .into_iter()
             .map(column_def_to_schema)
             .collect::<Result<Vec<_>, _>>()?;
@@ -1217,7 +1245,7 @@ impl Engine {
                 name
             )));
         }
-        for tc in &stmt.table_constraints {
+        for tc in table_constraints {
             if let spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } = tc {
                 for col_name in columns {
                     if let Some(col) = cols.iter_mut().find(|c| c.name == *col_name) {
@@ -1233,37 +1261,37 @@ impl Engine {
         // table == this table) resolve against the column list we
         // just built — they don't need the catalog yet.
         let mut fks: Vec<spg_storage::ForeignKeyConstraint> =
-            Vec::with_capacity(stmt.foreign_keys.len());
-        for fk in stmt.foreign_keys {
+            Vec::with_capacity(foreign_keys.len());
+        for fk in foreign_keys {
             // v7.14.0 — when SET FOREIGN_KEY_CHECKS=0 is in effect
             // (mysqldump preamble + bulk imports), defer FK
             // resolution if the parent table isn't in the catalog
             // yet. The FK is queued and resolved when checks flip
             // back on. Self-references stay in-band (the parent is
             // the same as the child we're building).
-            let needs_parent = !fk.parent_table.eq_ignore_ascii_case(&table_name);
+            let needs_parent = !fk.parent_table.eq_ignore_ascii_case(table_name);
             if !self.foreign_key_checks
                 && needs_parent
                 && self.active_catalog().get(&fk.parent_table).is_none()
             {
-                self.pending_foreign_keys.push((table_name.clone(), fk));
+                self.pending_foreign_keys.push((table_name.to_string(), fk));
                 continue;
             }
             fks.push(resolve_foreign_key(
-                &table_name,
+                table_name,
                 &cols,
                 fk,
                 self.active_catalog(),
             )?);
         }
-        let mut schema = TableSchema::new(table_name.clone(), cols);
+        let mut schema = TableSchema::new(table_name.to_string(), cols);
         schema.foreign_keys = fks;
         // v7.9.19 — translate AST table_constraints to storage
         // UniquenessConstraints (column name → position) so the
         // INSERT enforcement helper sees positions directly.
         let mut uc_storage: Vec<spg_storage::UniquenessConstraint> = Vec::new();
         let mut check_exprs: Vec<String> = Vec::new();
-        for tc in &stmt.table_constraints {
+        for tc in table_constraints {
             let (is_pk, names, nnd) = match tc {
                 spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
                     (true, columns.clone(), false)
@@ -1317,7 +1345,7 @@ impl Engine {
         // form gets, unless one already covers the column set.
         if !inline_pk_columns.is_empty() {
             let mut positions = Vec::with_capacity(inline_pk_columns.len());
-            for n in &inline_pk_columns {
+            for n in inline_pk_columns {
                 if let Some(pos) = schema.columns.iter().position(|c| c.name == *n) {
                     positions.push(pos);
                 }
@@ -1335,13 +1363,24 @@ impl Engine {
         }
         schema.uniqueness_constraints = uc_storage.clone();
         schema.checks = check_exprs;
-        self.active_catalog_mut().create_table(schema)?;
+        Ok(schema)
+    }
+
+    /// Install the implicit BTree / fulltext-GIN indexes a freshly-created
+    /// table needs: one per inline PRIMARY KEY column, plus one per
+    /// table-level PRIMARY KEY / UNIQUE / KEY / FULLTEXT constraint.
+    fn install_implicit_indexes(
+        &mut self,
+        table_name: &str,
+        inline_pk_columns: &[String],
+        table_constraints: &[spg_sql::ast::TableConstraint],
+    ) -> Result<(), EngineError> {
         // v7.9.13 — implicit BTree per inline PK column +
         // v7.9.19 — implicit BTree on the leading column of every
         // table-level PRIMARY KEY / UNIQUE constraint.
         let table = self
             .active_catalog_mut()
-            .get_mut(&table_name)
+            .get_mut(table_name)
             .expect("just created");
         for (i, col_name) in inline_pk_columns.iter().enumerate() {
             let idx_name = if inline_pk_columns.len() == 1 {
@@ -1353,7 +1392,7 @@ impl Engine {
                 return Err(EngineError::Storage(e));
             }
         }
-        for (i, tc) in stmt.table_constraints.iter().enumerate() {
+        for (i, tc) in table_constraints.iter().enumerate() {
             // v7.17.0 Phase 2.2 — FULLTEXT KEY lands a real
             // tsvector-GIN per declared column instead of the
             // BTree the PK / UQ / KEY paths build. Branch early
@@ -1416,10 +1455,7 @@ impl Engine {
                 return Err(EngineError::Storage(e));
             }
         }
-        Ok(QueryResult::CommandOk {
-            affected: 0,
-            modified_catalog: !self.in_transaction(),
-        })
+        Ok(())
     }
 }
 
