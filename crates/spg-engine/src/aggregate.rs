@@ -449,6 +449,34 @@ pub(crate) fn run(
     let mut keybuf_s = String::new();
     let mut dkeybuf = String::new();
     let mut refs: Vec<&Value> = Vec::with_capacity(group_pos.len());
+    // v7.32 (round-31) — an aggregate's argument / FILTER / second arg /
+    // ORDER key may itself be a *correlated* subquery, e.g.
+    // `MAX((SELECT i.v FROM inner i WHERE i.fk = o.id))`. A non-correlated
+    // subquery is pre-resolved to a literal before this loop, but a
+    // correlated one survives as a subquery node and must be evaluated per
+    // outer row through the correlated evaluator — the same hook the
+    // select-list / HAVING / ORDER finalisers already use below. Plain
+    // `eval_expr` would hit "subquery reached row eval".
+    //
+    // The `any_agg_subquery` gate is computed once here so the common case
+    // (no subquery anywhere in the aggregate args — including every hot
+    // scan/group aggregate) short-circuits before the per-row
+    // `expr_has_subquery` walk: `eval_arg` is then exactly `eval_expr`.
+    let any_agg_subquery = correlated_eval.is_some()
+        && agg_specs.iter().any(|s| {
+            s.filter
+                .as_ref()
+                .is_some_and(|e| crate::expr_has_subquery(e))
+                || s.arg.as_ref().is_some_and(|e| crate::expr_has_subquery(e))
+                || s.arg2.as_ref().is_some_and(|e| crate::expr_has_subquery(e))
+                || s.order_by.iter().any(|o| crate::expr_has_subquery(&o.expr))
+        });
+    let eval_arg = |e: &Expr, r: &Row, c: &EvalContext<'_>| -> Result<Value, EvalError> {
+        match correlated_eval {
+            Some(f) if any_agg_subquery && crate::expr_has_subquery(e) => f(e, r, c),
+            _ => eval::eval_expr(e, r, c),
+        }
+    };
     for row in rows {
         // Fast key: bound positions + no ci folding -> encode
         // straight from borrowed cells; group_vals materialise
@@ -479,7 +507,7 @@ pub(crate) fn run(
                 // where cond is not TRUE before they reach this
                 // aggregate's accumulator (and before DISTINCT dedup).
                 if let Some(f) = &spec.filter
-                    && !matches!(eval::eval_expr(f, &*row.as_row(), &ctx)?, Value::Bool(true))
+                    && !matches!(eval_arg(f, &*row.as_row(), &ctx)?, Value::Bool(true))
                 {
                     continue;
                 }
@@ -491,20 +519,20 @@ pub(crate) fn run(
                         &arg_owned
                     }
                     (None, Some(e)) => {
-                        arg_owned = eval::eval_expr(e, &*row.as_row(), &ctx)?;
+                        arg_owned = eval_arg(e, &*row.as_row(), &ctx)?;
                         &arg_owned
                     }
                 };
                 let arg2_val = match &spec.arg2 {
                     None => None,
-                    Some(e) => Some(eval::eval_expr(e, &*row.as_row(), &ctx)?),
+                    Some(e) => Some(eval_arg(e, &*row.as_row(), &ctx)?),
                 };
                 let order_keys = if spec.order_by.is_empty() {
                     None
                 } else {
                     let mut keys = Vec::with_capacity(spec.order_by.len());
                     for o in &spec.order_by {
-                        keys.push(eval::eval_expr(&o.expr, &*row.as_row(), &ctx)?);
+                        keys.push(eval_arg(&o.expr, &*row.as_row(), &ctx)?);
                     }
                     Some(keys)
                 };
@@ -566,13 +594,13 @@ pub(crate) fn run(
             // v7.32 (round-29) — FILTER (WHERE cond): exclude rows where
             // cond is not TRUE before accumulation (and before DISTINCT).
             if let Some(f) = &spec.filter
-                && !matches!(eval::eval_expr(f, row, &ctx)?, Value::Bool(true))
+                && !matches!(eval_arg(f, row, &ctx)?, Value::Bool(true))
             {
                 continue;
             }
             let arg_val = match &spec.arg {
                 None => Value::Bool(true), // count_star: sentinel non-null
-                Some(e) => eval::eval_expr(e, row, &ctx)?,
+                Some(e) => eval_arg(e, row, &ctx)?,
             };
             // v7.17.0 — `string_agg(value, separator)` evaluates the
             // separator per row but PG treats it as constant; we
@@ -581,7 +609,7 @@ pub(crate) fn run(
             // even though SPG (like PG) only uses the most recent.
             let arg2_val = match &spec.arg2 {
                 None => None,
-                Some(e) => Some(eval::eval_expr(e, row, &ctx)?),
+                Some(e) => Some(eval_arg(e, row, &ctx)?),
             };
             // v7.24 (round-16 A) — aggregate-internal ORDER BY:
             // evaluate the key tuple against the source row.
@@ -590,7 +618,7 @@ pub(crate) fn run(
             } else {
                 let mut keys = Vec::with_capacity(spec.order_by.len());
                 for o in &spec.order_by {
-                    keys.push(eval::eval_expr(&o.expr, row, &ctx)?);
+                    keys.push(eval_arg(&o.expr, row, &ctx)?);
                 }
                 Some(keys)
             };
