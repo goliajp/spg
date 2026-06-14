@@ -22,6 +22,18 @@ use crate::{
     value_to_literal_expr_permissive,
 };
 
+/// Pre-borrow snapshots gathered by `prepare_insert_snapshots` for the
+/// INSERT row loop, taken before the mutable catalog borrow opens.
+struct InsertSnapshots {
+    clock: Option<crate::ClockFn>,
+    before_insert_triggers: Vec<spg_storage::FunctionDef>,
+    after_insert_triggers: Vec<spg_storage::FunctionDef>,
+    trigger_session_cfg: Option<String>,
+    enum_label_lookup: alloc::collections::BTreeMap<usize, Vec<String>>,
+    set_variant_lookup: alloc::collections::BTreeMap<usize, Vec<String>>,
+    seq_floors: alloc::collections::BTreeMap<usize, i64>,
+}
+
 impl Engine {
     /// v4.4 `UPDATE <table> SET col = expr [, ...] [WHERE cond]`.
     /// Filter pass uses the same WHERE eval as `exec_select`. Per
@@ -860,6 +872,108 @@ impl Engine {
         })
     }
 
+    /// Snapshot the per-INSERT catalog state the row loop depends on,
+    /// taken while the catalog is still immutably borrowable (before the
+    /// `get_mut` window): the clock fn, BEFORE/AFTER row triggers + their
+    /// session config, the column ENUM / SET variant lookups, and the
+    /// AUTO_INCREMENT sequence floors.
+    fn prepare_insert_snapshots(&self, table_name: &str) -> Result<InsertSnapshots, EngineError> {
+        // v7.9.21 — snapshot the clock fn pointer before the mut
+        // borrow on the catalog opens; runtime DEFAULT eval needs
+        // it inside the row hot loop.
+        let clock = self.clock;
+        // v7.12.4 — snapshot row-level triggers + their referenced
+        // functions before the mut borrow on the catalog opens.
+        // Cloned out so the row hot loop can fire them without
+        // re-borrowing the catalog (which would conflict with
+        // table.insert's mutable borrow).
+        let before_insert_triggers = self.snapshot_row_triggers(table_name, "INSERT", "BEFORE");
+        let after_insert_triggers = self.snapshot_row_triggers(table_name, "INSERT", "AFTER");
+        let trigger_session_cfg: Option<alloc::string::String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
+        // v7.17.0 Phase 1.4 — snapshot the enum label lookup BEFORE
+        // opening the mutable borrow on the table below. We need
+        // catalog-level read access (enum_types lives at the
+        // catalog level, not the table) and the upcoming mutable
+        // borrow shadows it.
+        let pre_borrow_column_meta: Vec<ColumnSchema> = {
+            let preview_table = self.active_catalog().get(table_name).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: String::from(table_name),
+                })
+            })?;
+            preview_table.schema().columns.clone()
+        };
+        let enum_label_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
+            pre_borrow_column_meta
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| {
+                    // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
+                    // variant lists take priority over the PG
+                    // catalog enum_types lookup (they're
+                    // column-local and authoritative when set).
+                    if let Some(inline) = &col.inline_enum_variants {
+                        return Some((i, inline.clone()));
+                    }
+                    col.user_enum_type.as_ref().and_then(|ename| {
+                        self.active_catalog()
+                            .enum_types()
+                            .get(ename)
+                            .map(|e| (i, e.labels.clone()))
+                    })
+                })
+                .collect();
+        // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant lists.
+        // Distinct from enum_label_lookup: SET validates that
+        // every comma-separated token is in the variant list, and
+        // canonicalises the cell to definition-order de-duped text.
+        let set_variant_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
+            pre_borrow_column_meta
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| col.inline_set_variants.as_ref().map(|vs| (i, vs.clone())))
+                .collect();
+        // v7.29 (round-23a) - when the column's implicit sequence
+        // exists (born on first nextval/setval address), a setval
+        // above the table MAX moves the next auto-assigned id:
+        // assign from max(table_max + 1, last_value + 1). Tables
+        // whose sequence was never addressed keep the bare max+1
+        // path (identical pre-7.29 behaviour, no lookup cost
+        // beyond one map probe per auto column per statement).
+        let mut seq_floors: alloc::collections::BTreeMap<usize, i64> =
+            alloc::collections::BTreeMap::new();
+        for (i, col) in pre_borrow_column_meta.iter().enumerate() {
+            if col.auto_increment
+                && let Some(sd) = self.active_catalog().sequences().get(&alloc::format!(
+                    "{}_{}_seq",
+                    table_name,
+                    col.name
+                ))
+            {
+                // is_called=false (fresh RESTART / setval(_, false))
+                // means the NEXT value is last_value itself.
+                let floor = if sd.is_called {
+                    sd.last_value + 1
+                } else {
+                    sd.last_value
+                };
+                seq_floors.insert(i, floor);
+            }
+        }
+        Ok(InsertSnapshots {
+            clock,
+            before_insert_triggers,
+            after_insert_triggers,
+            trigger_session_cfg,
+            enum_label_lookup,
+            set_variant_lookup,
+            seq_floors,
+        })
+    }
+
     pub(crate) fn exec_insert(
         &mut self,
         mut stmt: InsertStatement,
@@ -908,91 +1022,18 @@ impl Engine {
             };
             return self.exec_insert(recurse);
         }
-        // v7.9.21 — snapshot the clock fn pointer before the mut
-        // borrow on the catalog opens; runtime DEFAULT eval needs
-        // it inside the row hot loop.
-        let clock = self.clock;
-        // v7.12.4 — snapshot row-level triggers + their referenced
-        // functions before the mut borrow on the catalog opens.
-        // Cloned out so the row hot loop can fire them without
-        // re-borrowing the catalog (which would conflict with
-        // table.insert's mutable borrow).
-        let before_insert_triggers = self.snapshot_row_triggers(&stmt.table, "INSERT", "BEFORE");
-        let after_insert_triggers = self.snapshot_row_triggers(&stmt.table, "INSERT", "AFTER");
-        let trigger_session_cfg: Option<alloc::string::String> = self
-            .session_params
-            .get("default_text_search_config")
-            .cloned();
-        // v7.17.0 Phase 1.4 — snapshot the enum label lookup BEFORE
-        // opening the mutable borrow on the table below. We need
-        // catalog-level read access (enum_types lives at the
-        // catalog level, not the table) and the upcoming mutable
-        // borrow shadows it.
-        let pre_borrow_column_meta: Vec<ColumnSchema> = {
-            let preview_table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
-                EngineError::Storage(StorageError::TableNotFound {
-                    name: stmt.table.clone(),
-                })
-            })?;
-            preview_table.schema().columns.clone()
-        };
-        let enum_label_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
-            pre_borrow_column_meta
-                .iter()
-                .enumerate()
-                .filter_map(|(i, col)| {
-                    // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM
-                    // variant lists take priority over the PG
-                    // catalog enum_types lookup (they're
-                    // column-local and authoritative when set).
-                    if let Some(inline) = &col.inline_enum_variants {
-                        return Some((i, inline.clone()));
-                    }
-                    col.user_enum_type.as_ref().and_then(|ename| {
-                        self.active_catalog()
-                            .enum_types()
-                            .get(ename)
-                            .map(|e| (i, e.labels.clone()))
-                    })
-                })
-                .collect();
-        // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant lists.
-        // Distinct from enum_label_lookup: SET validates that
-        // every comma-separated token is in the variant list, and
-        // canonicalises the cell to definition-order de-duped text.
-        let set_variant_lookup: alloc::collections::BTreeMap<usize, Vec<String>> =
-            pre_borrow_column_meta
-                .iter()
-                .enumerate()
-                .filter_map(|(i, col)| col.inline_set_variants.as_ref().map(|vs| (i, vs.clone())))
-                .collect();
-        // v7.29 (round-23a) - when the column's implicit sequence
-        // exists (born on first nextval/setval address), a setval
-        // above the table MAX moves the next auto-assigned id:
-        // assign from max(table_max + 1, last_value + 1). Tables
-        // whose sequence was never addressed keep the bare max+1
-        // path (identical pre-7.29 behaviour, no lookup cost
-        // beyond one map probe per auto column per statement).
-        let mut seq_floors: alloc::collections::BTreeMap<usize, i64> =
-            alloc::collections::BTreeMap::new();
-        for (i, col) in pre_borrow_column_meta.iter().enumerate() {
-            if col.auto_increment
-                && let Some(sd) = self.active_catalog().sequences().get(&alloc::format!(
-                    "{}_{}_seq",
-                    stmt.table,
-                    col.name
-                ))
-            {
-                // is_called=false (fresh RESTART / setval(_, false))
-                // means the NEXT value is last_value itself.
-                let floor = if sd.is_called {
-                    sd.last_value + 1
-                } else {
-                    sd.last_value
-                };
-                seq_floors.insert(i, floor);
-            }
-        }
+        // Snapshot everything the row loop needs from the catalog
+        // before the mutable borrow below shadows it (clock, triggers,
+        // enum/set variant lookups, sequence floors).
+        let InsertSnapshots {
+            clock,
+            before_insert_triggers,
+            after_insert_triggers,
+            trigger_session_cfg,
+            enum_label_lookup,
+            set_variant_lookup,
+            seq_floors,
+        } = self.prepare_insert_snapshots(&stmt.table)?;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1008,46 +1049,7 @@ impl Engine {
         // reading schema fields.
         let column_meta: Vec<ColumnSchema> = table.schema().columns.clone();
         let schema_cols_len = column_meta.len();
-        // Build a permutation `tuple_pos[c] = Some(j)` meaning schema
-        // column `c` is filled from the `j`-th tuple slot; `None` means
-        // "fill with NULL". Validated once and reused for every row.
-        let tuple_pos: Option<Vec<Option<usize>>> = match &stmt.columns {
-            None => None, // 1-1 mapping, fast path
-            Some(cols) => {
-                let mut map = alloc::vec![None; schema_cols_len];
-                for (j, name) in cols.iter().enumerate() {
-                    let idx = column_meta
-                        .iter()
-                        .position(|c| c.name == *name)
-                        .ok_or_else(|| {
-                            EngineError::Eval(EvalError::ColumnNotFound { name: name.clone() })
-                        })?;
-                    if map[idx].is_some() {
-                        return Err(EngineError::Storage(StorageError::ArityMismatch {
-                            expected: schema_cols_len,
-                            actual: cols.len(),
-                        }));
-                    }
-                    map[idx] = Some(j);
-                }
-                // Omitted columns must either be nullable, carry a
-                // DEFAULT, or be AUTO_INCREMENT. Catch NOT NULL
-                // omissions up front so the WAL stays clean.
-                for (i, col) in column_meta.iter().enumerate() {
-                    if map[i].is_none()
-                        && !col.nullable
-                        && col.default.is_none()
-                        && col.runtime_default.is_none()
-                        && !col.auto_increment
-                    {
-                        return Err(EngineError::Storage(StorageError::NullInNotNull {
-                            column: col.name.clone(),
-                        }));
-                    }
-                }
-                Some(map)
-            }
-        };
+        let tuple_pos = build_tuple_pos(&stmt.columns, &column_meta)?;
         let expected_tuple_len = stmt.columns.as_ref().map_or(schema_cols_len, Vec::len);
         // v7.6.2 — snapshot this table's FK list before the
         // mutable-borrow window so we can run parent lookups
@@ -1055,97 +1057,19 @@ impl Engine {
         // the no-FK fast path; clone cost is O(fks * arity) which
         // is < 100 ns for typical schemas.
         let fks = table.schema().foreign_keys.clone();
-        let mut affected = 0usize;
         // Stage 1 — parse + AUTO_INC + coerce all rows under the
-        // single mutable borrow.
-        let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(stmt.rows.len());
-        // v7.24 (round-16 collateral) — statement-scoped serial
-        // cursors. next_auto_value() is a max+1 scan over COMMITTED
-        // rows; multi-row `INSERT … VALUES (…),(…)` computed it per
-        // tuple BEFORE any insertion, so every row drew the SAME id
-        // (then sailed through, compounding with the inline-PK
-        // enforcement gap). First use per column seeds from the
-        // table; subsequent rows increment.
-        let mut auto_cursors: alloc::collections::BTreeMap<usize, i64> =
-            alloc::collections::BTreeMap::new();
-        for tuple in stmt.rows {
-            if tuple.len() != expected_tuple_len {
-                return Err(EngineError::Storage(StorageError::ArityMismatch {
-                    expected: expected_tuple_len,
-                    actual: tuple.len(),
-                }));
-            }
-            // Fast path: no column-list permutation → tuple slot j
-            // maps to schema column j. We can zip schema with tuple
-            // and skip the `raw_tuple` staging allocation entirely.
-            let values: Vec<Value> = if let Some(map) = &tuple_pos {
-                // Permuted path: still need raw_tuple to index by `map[i]`.
-                let raw_tuple: Vec<Value> = tuple
-                    .into_iter()
-                    .map(literal_expr_to_value)
-                    .collect::<Result<_, _>>()?;
-                let mut out = Vec::with_capacity(schema_cols_len);
-                for (i, col) in column_meta.iter().enumerate() {
-                    let mut raw = match map[i] {
-                        Some(j) => raw_tuple[j].clone(),
-                        None => resolve_column_default_free(col, clock)?,
-                    };
-                    if col.auto_increment && raw.is_null() {
-                        let next = match auto_cursors.get(&i) {
-                            Some(n) => *n,
-                            None => {
-                                let base = table.next_auto_value(i).ok_or_else(|| {
-                                    EngineError::Unsupported(alloc::format!(
-                                        "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                        col.name
-                                    ))
-                                })?;
-                                base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
-                            }
-                        };
-                        auto_cursors.insert(i, next + 1);
-                        raw = Value::BigInt(next);
-                    }
-                    let coerced = coerce_value(raw, col.ty, &col.name, i)?;
-                    enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
-                    let coerced =
-                        canonicalize_set_value(&set_variant_lookup, i, &col.name, coerced)?;
-                    check_unsigned_range(&coerced, col, i)?;
-                    out.push(coerced);
-                }
-                out
-            } else {
-                // 1-1 mapping fast path: single Vec alloc, no raw_tuple.
-                let mut out = Vec::with_capacity(schema_cols_len);
-                for (i, (col, expr)) in column_meta.iter().zip(tuple).enumerate() {
-                    let mut raw = literal_expr_to_value(expr)?;
-                    if col.auto_increment && raw.is_null() {
-                        let next = match auto_cursors.get(&i) {
-                            Some(n) => *n,
-                            None => {
-                                let base = table.next_auto_value(i).ok_or_else(|| {
-                                    EngineError::Unsupported(alloc::format!(
-                                        "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                        col.name
-                                    ))
-                                })?;
-                                base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
-                            }
-                        };
-                        auto_cursors.insert(i, next + 1);
-                        raw = Value::BigInt(next);
-                    }
-                    let coerced = coerce_value(raw, col.ty, &col.name, i)?;
-                    enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
-                    let coerced =
-                        canonicalize_set_value(&set_variant_lookup, i, &col.name, coerced)?;
-                    check_unsigned_range(&coerced, col, i)?;
-                    out.push(coerced);
-                }
-                out
-            };
-            all_values.push(values);
-        }
+        // (immutable) table borrow.
+        let mut all_values = parse_insert_rows(
+            table,
+            stmt.rows,
+            &column_meta,
+            &tuple_pos,
+            expected_tuple_len,
+            clock,
+            &seq_floors,
+            &enum_label_lookup,
+            &set_variant_lookup,
+        )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
         // `table` here since stage 1 was the last use. The
@@ -1170,86 +1094,15 @@ impl Engine {
         //   - `DO UPDATE SET …` ALSO filters, but for each
         //     conflicting row it queues an UPDATE on the existing
         //     row using the incoming row's values as `EXCLUDED.*`.
-        let mut pending_updates: Vec<(usize, Vec<Value>)> = Vec::new();
-        let mut skipped_count = 0usize;
-        if let Some(clause) = &stmt.on_conflict {
-            let (conflict_cols, conflict_nnd) = resolve_on_conflict_columns(
-                self.active_catalog(),
-                &stmt.table,
-                clause.target_columns.as_slice(),
-            )?;
-            let mut kept: Vec<Vec<Value>> = Vec::with_capacity(all_values.len());
-            let mut seen_keys: Vec<Vec<Value>> = Vec::new();
-            for values in all_values {
-                let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
-                // SQL spec: NULL in any conflict column means "no
-                // conflict possible" (NULL ≠ NULL for uniqueness) —
-                // UNLESS the constraint says NULLS NOT DISTINCT
-                // (v7.29; mailrs migrate-013 replays its seed row
-                // ('super', NULL) under exactly that declaration).
-                let has_null_key =
-                    !conflict_nnd && key_tuple.iter().any(|v| matches!(v, Value::Null));
-                let collides_with_table = !has_null_key
-                    && on_conflict_keys_exist(
-                        self.active_catalog(),
-                        &stmt.table,
-                        &conflict_cols,
-                        &key_tuple,
-                    );
-                let key_tuple_owned: Vec<Value> = key_tuple.iter().map(|v| (*v).clone()).collect();
-                let collides_with_batch =
-                    !has_null_key && seen_keys.iter().any(|k| k == &key_tuple_owned);
-                let collides = collides_with_table || collides_with_batch;
-                match (&clause.action, collides) {
-                    (_, false) => {
-                        seen_keys.push(key_tuple_owned);
-                        kept.push(values);
-                    }
-                    (spg_sql::ast::OnConflictAction::Nothing, true) => {
-                        skipped_count += 1;
-                    }
-                    (
-                        spg_sql::ast::OnConflictAction::Update {
-                            assignments,
-                            where_,
-                        },
-                        true,
-                    ) => {
-                        if !collides_with_table {
-                            skipped_count += 1;
-                            continue;
-                        }
-                        let target_pos = lookup_row_position_by_keys(
-                            self.active_catalog(),
-                            &stmt.table,
-                            &conflict_cols,
-                            &key_tuple,
-                        )
-                        .ok_or_else(|| {
-                            EngineError::Unsupported(
-                                "ON CONFLICT DO UPDATE: conflict detected but row \
-                                 position could not be resolved (cold-tier row?)"
-                                    .into(),
-                            )
-                        })?;
-                        let updated = apply_on_conflict_assignments(
-                            self.active_catalog(),
-                            &stmt.table,
-                            target_pos,
-                            &values,
-                            assignments,
-                            where_.as_ref(),
-                        )?;
-                        if let Some(new_row) = updated {
-                            pending_updates.push((target_pos, new_row));
-                        } else {
-                            skipped_count += 1;
-                        }
-                    }
-                }
+        let (pending_updates, skipped_count) = match &stmt.on_conflict {
+            Some(clause) => {
+                let (kept, pending, skipped) =
+                    self.resolve_insert_on_conflict(&stmt.table, clause, all_values)?;
+                all_values = kept;
+                (pending, skipped)
             }
-            all_values = kept;
-        }
+            None => (Vec::new(), 0usize),
+        };
         // v7.9.19 — composite UNIQUE / PRIMARY KEY enforcement.
         // v7.9.29 — CREATE UNIQUE INDEX [WHERE pred] enforcement.
         // Both run on the post-ON-CONFLICT row set: conflicting rows
@@ -1257,7 +1110,6 @@ impl Engine {
         // reroute), so what remains must be genuinely unique.
         enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
         enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
-        // Stage 3 — insert all rows under a fresh mutable borrow.
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1266,74 +1118,19 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
-        // v7.9.4 — keep RETURNING projection rows separate per
-        // INSERT and per UPDATE branch so DO UPDATE pushes the new
-        // post-update state, not the incoming-only values.
-        let mut returning_rows: Vec<Vec<Value>> = Vec::new();
-        // v7.12.7 — collect embedded SQL emitted by any trigger
-        // fire across the row loop; engine drains the queue after
-        // the table mut borrow drops.
-        let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
-        'rowloop: for values in all_values {
-            let mut row = Row::new(values);
-            // v7.12.4 — BEFORE INSERT row-level triggers. Each
-            // trigger may rewrite NEW cells (e.g. populate
-            // `search_vector := to_tsvector(...)`) and may return
-            // NULL to skip the row entirely.
-            for fd in &before_insert_triggers {
-                let (outcome, deferred) = triggers::fire_row_trigger(
-                    fd,
-                    Some(row.clone()),
-                    None,
-                    &stmt.table,
-                    &column_meta,
-                    &[],
-                    trigger_session_cfg.as_deref(),
-                    false,
-                )
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
-                deferred_embedded.extend(deferred);
-                match outcome {
-                    triggers::TriggerOutcome::Row(r) => row = r,
-                    triggers::TriggerOutcome::Skip => continue 'rowloop,
-                }
-            }
-            if stmt.returning.is_some() {
-                returning_rows.push(row.values.clone());
-            }
-            // v7.12.4 — clone for the AFTER trigger view; insert
-            // moves the row into the table.
-            let inserted = row.clone();
-            table.insert(row)?;
-            affected += 1;
-            // v7.12.4 — AFTER INSERT row-level triggers fire post-
-            // write. Return value is ignored (PG semantics); we
-            // surface any error from the body up to the caller.
-            for fd in &after_insert_triggers {
-                let (_outcome, deferred) = triggers::fire_row_trigger(
-                    fd,
-                    Some(inserted.clone()),
-                    None,
-                    &stmt.table,
-                    &column_meta,
-                    &[],
-                    trigger_session_cfg.as_deref(),
-                    true,
-                )
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
-                deferred_embedded.extend(deferred);
-            }
-        }
-        // v7.9.9 — apply ON CONFLICT DO UPDATE rewrites collected
-        // in the conflict-resolution pass. update_row handles
-        // index maintenance + body re-encoding.
-        for (pos, new_row) in pending_updates {
-            if stmt.returning.is_some() {
-                returning_rows.push(new_row.clone());
-            }
-            table.update_row(pos, new_row)?;
-            affected += 1;
-        }
+        // Stage 3 — insert the surviving rows + fire row triggers under
+        // a fresh mutable borrow, then apply queued ON CONFLICT updates.
+        let (returning_rows, deferred_embedded, affected) = insert_parsed_rows(
+            table,
+            all_values,
+            pending_updates,
+            &before_insert_triggers,
+            &after_insert_triggers,
+            &column_meta,
+            &stmt.table,
+            trigger_session_cfg.as_deref(),
+            stmt.returning.is_some(),
+        )?;
         let _ = skipped_count;
         // v7.12.7 — drop the table mut borrow and drain any
         // trigger-emitted embedded SQL queued during this INSERT.
@@ -1360,6 +1157,95 @@ impl Engine {
             affected,
             modified_catalog: !self.in_transaction(),
         })
+    }
+
+    /// (ON CONFLICT) Resolve a `DO NOTHING` / `DO UPDATE` clause against
+    /// the post-parse row set: drop or reroute conflicting rows, queue
+    /// updates for the existing rows they collide with, and return the
+    /// rows that survive to be inserted plus those queued updates.
+    fn resolve_insert_on_conflict(
+        &self,
+        table_name: &str,
+        clause: &spg_sql::ast::OnConflictClause,
+        all_values: Vec<Vec<Value>>,
+    ) -> Result<(Vec<Vec<Value>>, Vec<(usize, Vec<Value>)>, usize), EngineError> {
+        let mut pending_updates: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut skipped_count = 0usize;
+        let (conflict_cols, conflict_nnd) = resolve_on_conflict_columns(
+            self.active_catalog(),
+            table_name,
+            clause.target_columns.as_slice(),
+        )?;
+        let mut kept: Vec<Vec<Value>> = Vec::with_capacity(all_values.len());
+        let mut seen_keys: Vec<Vec<Value>> = Vec::new();
+        for values in all_values {
+            let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
+            // SQL spec: NULL in any conflict column means "no
+            // conflict possible" (NULL ≠ NULL for uniqueness) —
+            // UNLESS the constraint says NULLS NOT DISTINCT
+            // (v7.29; mailrs migrate-013 replays its seed row
+            // ('super', NULL) under exactly that declaration).
+            let has_null_key = !conflict_nnd && key_tuple.iter().any(|v| matches!(v, Value::Null));
+            let collides_with_table = !has_null_key
+                && on_conflict_keys_exist(
+                    self.active_catalog(),
+                    table_name,
+                    &conflict_cols,
+                    &key_tuple,
+                );
+            let key_tuple_owned: Vec<Value> = key_tuple.iter().map(|v| (*v).clone()).collect();
+            let collides_with_batch =
+                !has_null_key && seen_keys.iter().any(|k| k == &key_tuple_owned);
+            let collides = collides_with_table || collides_with_batch;
+            match (&clause.action, collides) {
+                (_, false) => {
+                    seen_keys.push(key_tuple_owned);
+                    kept.push(values);
+                }
+                (spg_sql::ast::OnConflictAction::Nothing, true) => {
+                    skipped_count += 1;
+                }
+                (
+                    spg_sql::ast::OnConflictAction::Update {
+                        assignments,
+                        where_,
+                    },
+                    true,
+                ) => {
+                    if !collides_with_table {
+                        skipped_count += 1;
+                        continue;
+                    }
+                    let target_pos = lookup_row_position_by_keys(
+                        self.active_catalog(),
+                        table_name,
+                        &conflict_cols,
+                        &key_tuple,
+                    )
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(
+                            "ON CONFLICT DO UPDATE: conflict detected but row \
+                                 position could not be resolved (cold-tier row?)"
+                                .into(),
+                        )
+                    })?;
+                    let updated = apply_on_conflict_assignments(
+                        self.active_catalog(),
+                        table_name,
+                        target_pos,
+                        &values,
+                        assignments,
+                        where_.as_ref(),
+                    )?;
+                    if let Some(new_row) = updated {
+                        pending_updates.push((target_pos, new_row));
+                    } else {
+                        skipped_count += 1;
+                    }
+                }
+            }
+        }
+        Ok((kept, pending_updates, skipped_count))
     }
 }
 
@@ -1394,4 +1280,251 @@ impl Engine {
             rows: out_rows,
         })
     }
+}
+
+/// Build the INSERT column permutation `tuple_pos[c] = Some(j)` (schema
+/// column `c` is filled from the `j`-th tuple slot; `None` = fill with
+/// NULL / DEFAULT). `None` overall means the 1-1 fast path. Validates
+/// the column list once for reuse across every row.
+fn build_tuple_pos(
+    columns: &Option<Vec<String>>,
+    column_meta: &[ColumnSchema],
+) -> Result<Option<Vec<Option<usize>>>, EngineError> {
+    let schema_cols_len = column_meta.len();
+    // Build a permutation `tuple_pos[c] = Some(j)` meaning schema
+    // column `c` is filled from the `j`-th tuple slot; `None` means
+    // "fill with NULL". Validated once and reused for every row.
+    let tuple_pos: Option<Vec<Option<usize>>> = match columns {
+        None => None, // 1-1 mapping, fast path
+        Some(cols) => {
+            let mut map = alloc::vec![None; schema_cols_len];
+            for (j, name) in cols.iter().enumerate() {
+                let idx = column_meta
+                    .iter()
+                    .position(|c| c.name == *name)
+                    .ok_or_else(|| {
+                        EngineError::Eval(EvalError::ColumnNotFound { name: name.clone() })
+                    })?;
+                if map[idx].is_some() {
+                    return Err(EngineError::Storage(StorageError::ArityMismatch {
+                        expected: schema_cols_len,
+                        actual: cols.len(),
+                    }));
+                }
+                map[idx] = Some(j);
+            }
+            // Omitted columns must either be nullable, carry a
+            // DEFAULT, or be AUTO_INCREMENT. Catch NOT NULL
+            // omissions up front so the WAL stays clean.
+            for (i, col) in column_meta.iter().enumerate() {
+                if map[i].is_none()
+                    && !col.nullable
+                    && col.default.is_none()
+                    && col.runtime_default.is_none()
+                    && !col.auto_increment
+                {
+                    return Err(EngineError::Storage(StorageError::NullInNotNull {
+                        column: col.name.clone(),
+                    }));
+                }
+            }
+            Some(map)
+        }
+    };
+    Ok(tuple_pos)
+}
+
+/// Stage 1 — parse every INSERT tuple into a coerced row of `Value`s:
+/// apply the column permutation, mint AUTO_INCREMENT ids (statement-
+/// scoped cursors), run DEFAULT / ENUM / SET / unsigned-range checks.
+/// Reads the table immutably (`next_auto_value`); no row is written yet.
+#[allow(clippy::too_many_arguments)]
+fn parse_insert_rows(
+    table: &spg_storage::Table,
+    rows: Vec<Vec<Expr>>,
+    column_meta: &[ColumnSchema],
+    tuple_pos: &Option<Vec<Option<usize>>>,
+    expected_tuple_len: usize,
+    clock: Option<crate::ClockFn>,
+    seq_floors: &alloc::collections::BTreeMap<usize, i64>,
+    enum_label_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+    set_variant_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
+) -> Result<Vec<Vec<Value>>, EngineError> {
+    let schema_cols_len = column_meta.len();
+    let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    // v7.24 (round-16 collateral) — statement-scoped serial
+    // cursors. next_auto_value() is a max+1 scan over COMMITTED
+    // rows; multi-row `INSERT … VALUES (…),(…)` computed it per
+    // tuple BEFORE any insertion, so every row drew the SAME id
+    // (then sailed through, compounding with the inline-PK
+    // enforcement gap). First use per column seeds from the
+    // table; subsequent rows increment.
+    let mut auto_cursors: alloc::collections::BTreeMap<usize, i64> =
+        alloc::collections::BTreeMap::new();
+    for tuple in rows {
+        if tuple.len() != expected_tuple_len {
+            return Err(EngineError::Storage(StorageError::ArityMismatch {
+                expected: expected_tuple_len,
+                actual: tuple.len(),
+            }));
+        }
+        // Fast path: no column-list permutation → tuple slot j
+        // maps to schema column j. We can zip schema with tuple
+        // and skip the `raw_tuple` staging allocation entirely.
+        let values: Vec<Value> = if let Some(map) = &tuple_pos {
+            // Permuted path: still need raw_tuple to index by `map[i]`.
+            let raw_tuple: Vec<Value> = tuple
+                .into_iter()
+                .map(literal_expr_to_value)
+                .collect::<Result<_, _>>()?;
+            let mut out = Vec::with_capacity(schema_cols_len);
+            for (i, col) in column_meta.iter().enumerate() {
+                let mut raw = match map[i] {
+                    Some(j) => raw_tuple[j].clone(),
+                    None => resolve_column_default_free(col, clock)?,
+                };
+                if col.auto_increment && raw.is_null() {
+                    let next = match auto_cursors.get(&i) {
+                        Some(n) => *n,
+                        None => {
+                            let base = table.next_auto_value(i).ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                    col.name
+                                ))
+                            })?;
+                            base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
+                        }
+                    };
+                    auto_cursors.insert(i, next + 1);
+                    raw = Value::BigInt(next);
+                }
+                let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                let coerced = canonicalize_set_value(&set_variant_lookup, i, &col.name, coerced)?;
+                check_unsigned_range(&coerced, col, i)?;
+                out.push(coerced);
+            }
+            out
+        } else {
+            // 1-1 mapping fast path: single Vec alloc, no raw_tuple.
+            let mut out = Vec::with_capacity(schema_cols_len);
+            for (i, (col, expr)) in column_meta.iter().zip(tuple).enumerate() {
+                let mut raw = literal_expr_to_value(expr)?;
+                if col.auto_increment && raw.is_null() {
+                    let next = match auto_cursors.get(&i) {
+                        Some(n) => *n,
+                        None => {
+                            let base = table.next_auto_value(i).ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+                                    col.name
+                                ))
+                            })?;
+                            base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
+                        }
+                    };
+                    auto_cursors.insert(i, next + 1);
+                    raw = Value::BigInt(next);
+                }
+                let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                enforce_enum_label(&enum_label_lookup, i, &col.name, &coerced)?;
+                let coerced = canonicalize_set_value(&set_variant_lookup, i, &col.name, coerced)?;
+                check_unsigned_range(&coerced, col, i)?;
+                out.push(coerced);
+            }
+            out
+        };
+        all_values.push(values);
+    }
+    Ok(all_values)
+}
+
+/// Stage 3 — insert the surviving rows under a mutable table borrow,
+/// firing BEFORE / AFTER row triggers (which may rewrite or skip a row
+/// and emit deferred embedded SQL), then apply the queued ON CONFLICT
+/// DO UPDATE rewrites. Returns the RETURNING projection rows, the
+/// deferred trigger statements, and the affected-row count.
+#[allow(clippy::too_many_arguments)]
+fn insert_parsed_rows(
+    table: &mut spg_storage::Table,
+    all_values: Vec<Vec<Value>>,
+    pending_updates: Vec<(usize, Vec<Value>)>,
+    before_insert_triggers: &[spg_storage::FunctionDef],
+    after_insert_triggers: &[spg_storage::FunctionDef],
+    column_meta: &[ColumnSchema],
+    table_name: &str,
+    trigger_session_cfg: Option<&str>,
+    returning_enabled: bool,
+) -> Result<(Vec<Vec<Value>>, Vec<triggers::DeferredEmbeddedStmt>, usize), EngineError> {
+    let mut affected = 0usize;
+    // v7.9.4 — keep RETURNING projection rows separate per
+    // INSERT and per UPDATE branch so DO UPDATE pushes the new
+    // post-update state, not the incoming-only values.
+    let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+    // v7.12.7 — collect embedded SQL emitted by any trigger
+    // fire across the row loop; engine drains the queue after
+    // the table mut borrow drops.
+    let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+    'rowloop: for values in all_values {
+        let mut row = Row::new(values);
+        // v7.12.4 — BEFORE INSERT row-level triggers. Each
+        // trigger may rewrite NEW cells (e.g. populate
+        // `search_vector := to_tsvector(...)`) and may return
+        // NULL to skip the row entirely.
+        for fd in before_insert_triggers {
+            let (outcome, deferred) = triggers::fire_row_trigger(
+                fd,
+                Some(row.clone()),
+                None,
+                table_name,
+                &column_meta,
+                &[],
+                trigger_session_cfg,
+                false,
+            )
+            .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            deferred_embedded.extend(deferred);
+            match outcome {
+                triggers::TriggerOutcome::Row(r) => row = r,
+                triggers::TriggerOutcome::Skip => continue 'rowloop,
+            }
+        }
+        if returning_enabled {
+            returning_rows.push(row.values.clone());
+        }
+        // v7.12.4 — clone for the AFTER trigger view; insert
+        // moves the row into the table.
+        let inserted = row.clone();
+        table.insert(row)?;
+        affected += 1;
+        // v7.12.4 — AFTER INSERT row-level triggers fire post-
+        // write. Return value is ignored (PG semantics); we
+        // surface any error from the body up to the caller.
+        for fd in after_insert_triggers {
+            let (_outcome, deferred) = triggers::fire_row_trigger(
+                fd,
+                Some(inserted.clone()),
+                None,
+                table_name,
+                &column_meta,
+                &[],
+                trigger_session_cfg,
+                true,
+            )
+            .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            deferred_embedded.extend(deferred);
+        }
+    }
+    // v7.9.9 — apply ON CONFLICT DO UPDATE rewrites collected
+    // in the conflict-resolution pass. update_row handles
+    // index maintenance + body re-encoding.
+    for (pos, new_row) in pending_updates {
+        if returning_enabled {
+            returning_rows.push(new_row.clone());
+        }
+        table.update_row(pos, new_row)?;
+        affected += 1;
+    }
+    Ok((returning_rows, deferred_embedded, affected))
 }
