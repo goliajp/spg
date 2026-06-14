@@ -75,7 +75,7 @@ start_server() {
             -p "$PORT:5432" "goliakk/spg:$VERSION" >/dev/null
     fi
     for i in $(seq 1 30); do
-        if docker run --rm postgres:15 pg_isready \
+        if docker run --rm postgres:18 pg_isready \
                 -h host.docker.internal -p "$PORT" -U u -d app \
                 >/dev/null 2>&1; then
             return 0
@@ -102,14 +102,14 @@ run_fixture() {
 
     local schema_out
     schema_out=$(docker run --rm -v "$schema:/x.sql:ro" \
-        postgres:15 psql "$URL" -X -q -f /x.sql 2>&1 || true)
+        postgres:18 psql "$URL" -X -q -f /x.sql 2>&1 || true)
     local schema_err
     schema_err=$(echo "$schema_out" | grep -cE '^psql:.*ERROR:' 2>/dev/null)
     [[ -z "$schema_err" ]] && schema_err=0
 
     local data_out
     data_out=$(docker run --rm -v "$data:/x.sql:ro" \
-        postgres:15 psql "$URL" -X -q -f /x.sql 2>&1 || true)
+        postgres:18 psql "$URL" -X -q -f /x.sql 2>&1 || true)
     local data_err
     data_err=$(echo "$data_out" | grep -cE '^psql:.*ERROR:' 2>/dev/null)
     [[ -z "$data_err" ]] && data_err=0
@@ -121,7 +121,7 @@ run_fixture() {
         while read -r table want; do
             [[ -z "$table" ]] && continue
             local got
-            got=$(docker run --rm postgres:15 psql "$URL" -X -t -A \
+            got=$(docker run --rm postgres:18 psql "$URL" -X -t -A \
                 -c "SELECT count(*) FROM $table" 2>/dev/null \
                 | tr -d '[:space:]' || echo "?")
             if [[ "$got" != "$want" ]]; then

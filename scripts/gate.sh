@@ -10,7 +10,7 @@
 #   gates  release-mode budget gates: perf_gate × crates +
 #          prod_ready + slo_smoke
 #   biz    customer-facing harnesses: sqllogictest + dump-compat +
-#          data-compat (needs Docker — psql runs from the postgres:15 image)
+#          data-compat (needs Docker — psql runs from the postgres:18 image)
 #   all    everything above, in that order
 #
 # Tiers: the default run is the fast tier. `--full` adds
