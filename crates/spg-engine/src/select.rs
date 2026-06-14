@@ -1537,22 +1537,7 @@ impl Engine {
         // `SELECT '7'::INT`. Column references will surface as
         // ColumnNotFound on eval since the schema is empty.
         let Some(from) = &stmt.from else {
-            let empty_schema: Vec<ColumnSchema> = Vec::new();
-            let ctx = self.ev_ctx(&empty_schema, None);
-            let projection = build_projection(&stmt.items, &empty_schema, "")?;
-            let dummy_row = Row::new(Vec::new());
-            let mut values = Vec::with_capacity(projection.len());
-            for p in &projection {
-                values.push(eval::eval_expr(&p.expr, &dummy_row, &ctx)?);
-            }
-            let columns: Vec<ColumnSchema> = projection
-                .into_iter()
-                .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
-                .collect();
-            return Ok(QueryResult::Rows {
-                columns,
-                rows: alloc::vec![Row::new(values)],
-            });
+            return self.exec_constant_select(stmt);
         };
         // Multi-table FROM (one or more joined peers) goes through the
         // nested-loop join executor. Single-table FROM stays on the
@@ -1629,71 +1614,130 @@ impl Engine {
         // Aggregate path: filter rows first, then hand off to the
         // aggregate executor which does its own projection + ORDER BY.
         if aggregate::uses_aggregate(stmt) {
-            let mut filtered: Vec<&Row> = Vec::new();
-            // v6.2.6 — Memoize: per-query LRU cache for correlated
-            // scalar subqueries. Fresh per row-loop entry so each
-            // SELECT execution gets an isolated cache.
-            let mut memo = memoize::MemoizeCache::new();
-            if let Some(rows) = &indexed_rows {
-                for cow in rows {
-                    let row = cow.as_ref();
-                    if let Some(where_expr) = &stmt.where_ {
-                        let cond = self.eval_expr_with_correlated(
-                            where_expr,
-                            row,
-                            &ctx,
-                            cancel,
-                            Some(&mut memo),
-                        )?;
-                        if !matches!(cond, Value::Bool(true)) {
-                            continue;
-                        }
-                    }
-                    filtered.push(row);
-                }
-            } else {
-                for i in 0..table.row_count() {
-                    let row = &table.rows()[i];
-                    if let Some(where_expr) = &stmt.where_ {
-                        let cond = self.eval_expr_with_correlated(
-                            where_expr,
-                            row,
-                            &ctx,
-                            cancel,
-                            Some(&mut memo),
-                        )?;
-                        if !matches!(cond, Value::Bool(true)) {
-                            continue;
-                        }
-                    }
-                    filtered.push(row);
-                }
-            }
-            // v7.29 — a per-query memo so correlated scalar
-            // subqueries batch-evaluate once (group map) instead of
-            // executing per group.
-            let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
-            let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
-                self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
-                    .map_err(|err| match err {
-                        EngineError::Eval(ev) => ev,
-                        other => eval::EvalError::TypeMismatch {
-                            detail: alloc::format!("{other}"),
-                        },
-                    })
-            };
-            let filtered_rr: alloc::vec::Vec<RowRef<'_>> =
-                filtered.iter().map(|&r| RowRef::Owned(r)).collect();
-            let agg = aggregate::run(
+            return self.run_single_table_aggregate(
                 stmt,
-                &filtered_rr,
+                table,
                 schema_cols,
-                Some(alias),
-                Some(&agg_correlated),
-            )?;
-            return self.finish_agg_result(agg, stmt, cancel);
+                alias,
+                indexed_rows,
+                cancel,
+            );
         }
+        self.run_single_table_scan(stmt, table, schema_cols, alias, indexed_rows, cancel)
+    }
 
+    /// Constant `SELECT` with no FROM: evaluate each projection item
+    /// once against an empty dummy row (`SELECT 1`, `SELECT '7'::INT`).
+    fn exec_constant_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
+        let empty_schema: Vec<ColumnSchema> = Vec::new();
+        let ctx = self.ev_ctx(&empty_schema, None);
+        let projection = build_projection(&stmt.items, &empty_schema, "")?;
+        let dummy_row = Row::new(Vec::new());
+        let mut values = Vec::with_capacity(projection.len());
+        for p in &projection {
+            values.push(eval::eval_expr(&p.expr, &dummy_row, &ctx)?);
+        }
+        let columns: Vec<ColumnSchema> = projection
+            .into_iter()
+            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .collect();
+        return Ok(QueryResult::Rows {
+            columns,
+            rows: alloc::vec![Row::new(values)],
+        });
+    }
+
+    /// Single-table aggregate path: filter the (optionally index-seeked)
+    /// rows, then hand off to the aggregate executor which does its own
+    /// projection + ORDER BY before `finish_agg_result` applies LIMIT.
+    fn run_single_table_aggregate<'a>(
+        &self,
+        stmt: &SelectStatement,
+        table: &'a spg_storage::Table,
+        schema_cols: &'a [ColumnSchema],
+        alias: &str,
+        indexed_rows: Option<Vec<Cow<'a, Row>>>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let ctx = self.ev_ctx(schema_cols, Some(alias));
+        let mut filtered: Vec<&Row> = Vec::new();
+        // v6.2.6 — Memoize: per-query LRU cache for correlated
+        // scalar subqueries. Fresh per row-loop entry so each
+        // SELECT execution gets an isolated cache.
+        let mut memo = memoize::MemoizeCache::new();
+        if let Some(rows) = &indexed_rows {
+            for cow in rows {
+                let row = cow.as_ref();
+                if let Some(where_expr) = &stmt.where_ {
+                    let cond = self.eval_expr_with_correlated(
+                        where_expr,
+                        row,
+                        &ctx,
+                        cancel,
+                        Some(&mut memo),
+                    )?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                filtered.push(row);
+            }
+        } else {
+            for i in 0..table.row_count() {
+                let row = &table.rows()[i];
+                if let Some(where_expr) = &stmt.where_ {
+                    let cond = self.eval_expr_with_correlated(
+                        where_expr,
+                        row,
+                        &ctx,
+                        cancel,
+                        Some(&mut memo),
+                    )?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                filtered.push(row);
+            }
+        }
+        // v7.29 — a per-query memo so correlated scalar
+        // subqueries batch-evaluate once (group map) instead of
+        // executing per group.
+        let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
+        let agg_correlated = |e: &Expr, r: &Row, c: &EvalContext<'_>| {
+            self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
+                .map_err(|err| match err {
+                    EngineError::Eval(ev) => ev,
+                    other => eval::EvalError::TypeMismatch {
+                        detail: alloc::format!("{other}"),
+                    },
+                })
+        };
+        let filtered_rr: alloc::vec::Vec<RowRef<'_>> =
+            filtered.iter().map(|&r| RowRef::Owned(r)).collect();
+        let agg = aggregate::run(
+            stmt,
+            &filtered_rr,
+            schema_cols,
+            Some(alias),
+            Some(&agg_correlated),
+        )?;
+        return self.finish_agg_result(agg, stmt, cancel);
+    }
+
+    /// Single-table scan + projection path: WHERE filter (compiled when
+    /// subquery-free), ORDER BY keying, SRF expansion / projection, then
+    /// sort + WITH TIES / DISTINCT / OFFSET-LIMIT.
+    fn run_single_table_scan<'a>(
+        &self,
+        stmt: &SelectStatement,
+        table: &'a spg_storage::Table,
+        schema_cols: &'a [ColumnSchema],
+        alias: &str,
+        indexed_rows: Option<Vec<Cow<'a, Row>>>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let ctx = self.ev_ctx(schema_cols, Some(alias));
         let projection = build_projection(&stmt.items, schema_cols, alias)?;
         // v7.19 P5 — single-table SELECT path for SRF
         // `SELECT unnest(arr) FROM t` shape. Detect a top-level
