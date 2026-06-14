@@ -18,6 +18,10 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use spg_storage::{ColumnSchema, DataType, Row, Value};
+
+use crate::{Engine, QueryResult};
+
 const SALT_LEN: usize = 16;
 const HASH_LEN: usize = 32;
 /// v7.17.0 Phase 3.P0-71 — length of SHA1(SHA1(password)) stored
@@ -644,6 +648,27 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         return Err(UserDeserializeError::Truncated);
     }
     Ok(store)
+}
+
+impl Engine {
+    /// v4.1 `SHOW USERS` — `(name, role)` per row, ordered by name.
+    pub(crate) fn exec_show_users(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("role", DataType::Text, false),
+        ];
+        let rows: Vec<Row> = self
+            .users
+            .iter()
+            .map(|(name, rec)| {
+                Row::new(alloc::vec![
+                    Value::Text(name.to_string()),
+                    Value::Text(rec.role.as_str().to_string()),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
 }
 
 #[cfg(test)]

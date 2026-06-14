@@ -31,6 +31,10 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use spg_storage::{ColumnSchema, DataType, Row, Value};
+
+use crate::{Engine, QueryResult};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
     pub conn_str: String,
@@ -261,6 +265,37 @@ fn read_long_str(buf: &[u8], p: &mut usize) -> Result<String, SubscriptionError>
     core::str::from_utf8(slice)
         .map(ToString::to_string)
         .map_err(|e| SubscriptionError::Corrupt(alloc::format!("non-UTF-8 conn_str: {e}")))
+}
+
+impl Engine {
+    /// v6.1.4 — `SHOW SUBSCRIPTIONS` row materialisation. Returns
+    /// `(name, conn_str, publications, enabled, last_received_pos)`
+    /// ordered by subscription name. The `publications` column is
+    /// the comma-joined list ("p1, p2") for ergonomic SHOW output;
+    /// callers wanting structured access read `Engine::subscriptions`.
+    pub(crate) fn exec_show_subscriptions(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("conn_str", DataType::Text, false),
+            ColumnSchema::new("publications", DataType::Text, false),
+            ColumnSchema::new("enabled", DataType::Bool, false),
+            ColumnSchema::new("last_received_pos", DataType::BigInt, false),
+        ];
+        let rows: Vec<Row> = self
+            .subscriptions
+            .iter()
+            .map(|(name, sub)| {
+                Row::new(alloc::vec![
+                    Value::Text(name.clone()),
+                    Value::Text(sub.conn_str.clone()),
+                    Value::Text(sub.publications.join(", ")),
+                    Value::Bool(sub.enabled),
+                    Value::BigInt(i64::try_from(sub.last_received_pos).unwrap_or(i64::MAX)),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
 }
 
 #[cfg(test)]
