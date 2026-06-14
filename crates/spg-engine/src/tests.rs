@@ -8,8 +8,8 @@ use super::*;
 use alloc::string::ToString;
 use alloc::vec;
 
-use spg_sql::ast::{BinOp, Expr};
-use spg_storage::{DataType, VecEncoding};
+use spg_sql::ast::{BinOp, Expr, Statement};
+use spg_storage::{DataType, Value, VecEncoding};
 
 fn unwrap_command_ok(r: &QueryResult) -> usize {
     match r {
