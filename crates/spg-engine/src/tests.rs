@@ -9,7 +9,7 @@ use alloc::string::ToString;
 use alloc::vec;
 
 use spg_sql::ast::{BinOp, Expr};
-use spg_storage::VecEncoding;
+use spg_storage::{DataType, VecEncoding};
 
 fn unwrap_command_ok(r: &QueryResult) -> usize {
     match r {

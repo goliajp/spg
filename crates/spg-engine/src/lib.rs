@@ -69,6 +69,7 @@ pub(crate) use orderby::{
     resolve_order_by_position, sort_by_keys, sort_values_for_histogram, value_cmp, value_to_f64,
 };
 pub(crate) use select::{build_projection, infer_column_types, value_to_order_key};
+pub(crate) use show::render_create_table;
 pub(crate) use subquery::{
     build_in_list_set, collect_scalar_subqueries, expr_has_subquery, expr_tree_has_subquery,
 };
@@ -88,7 +89,7 @@ use spg_sql::ast::Statement;
 // spg-sql for the prepare/bind handle.
 pub use spg_sql::ast::Statement as ParsedStatement;
 use spg_sql::parser::{self, ParseError};
-use spg_storage::{Catalog, ColumnSchema, DataType, Row, StorageError, Value};
+use spg_storage::{Catalog, ColumnSchema, Row, StorageError, Value};
 
 use crate::eval::{EvalContext, EvalError};
 
@@ -791,73 +792,6 @@ const MAX_TRIGGER_RECURSION: u32 = 16;
 /// with `(sql, elapsed_us)` once per successful execute that crosses
 /// the threshold.
 pub type SlowQueryLogger = fn(&str, u64);
-
-/// v6.5.4 — synthesise a `CREATE TABLE` statement from catalog
-/// state. Round-trips through `Engine::execute` to recreate the
-/// same schema (sans data + indexes — indexes are emitted as a
-/// separate `CREATE INDEX` chain in `spg_database_ddl`).
-fn render_create_table(name: &str, columns: &[ColumnSchema]) -> String {
-    let mut out = alloc::format!("CREATE TABLE {name} (");
-    for (i, col) in columns.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&col.name);
-        out.push(' ');
-        out.push_str(&render_data_type(col.ty));
-        if !col.nullable {
-            out.push_str(" NOT NULL");
-        }
-        if col.auto_increment {
-            out.push_str(" AUTO_INCREMENT");
-        }
-    }
-    out.push(')');
-    out
-}
-
-fn render_data_type(ty: DataType) -> String {
-    match ty {
-        DataType::SmallInt => "SMALLINT".into(),
-        DataType::Int => "INT".into(),
-        DataType::BigInt => "BIGINT".into(),
-        DataType::Float => "FLOAT".into(),
-        DataType::Text => "TEXT".into(),
-        DataType::Varchar(n) => alloc::format!("VARCHAR({n})"),
-        DataType::Char(n) => alloc::format!("CHAR({n})"),
-        DataType::Bool => "BOOL".into(),
-        DataType::Vector { dim, encoding } => match encoding {
-            spg_storage::VecEncoding::F32 => alloc::format!("VECTOR({dim})"),
-            spg_storage::VecEncoding::Sq8 => alloc::format!("VECTOR({dim}) USING SQ8"),
-            spg_storage::VecEncoding::F16 => alloc::format!("VECTOR({dim}) USING HALF"),
-        },
-        DataType::Numeric { precision, scale } => {
-            alloc::format!("NUMERIC({precision},{scale})")
-        }
-        DataType::Date => "DATE".into(),
-        DataType::Timestamp => "TIMESTAMP".into(),
-        DataType::Interval => "INTERVAL".into(),
-        DataType::Json => "JSON".into(),
-        DataType::Jsonb => "JSONB".into(),
-        DataType::Timestamptz => "TIMESTAMPTZ".into(),
-        DataType::Bytes => "BYTEA".into(),
-        DataType::TextArray => "TEXT[]".into(),
-        DataType::IntArray => "INT[]".into(),
-        DataType::BigIntArray => "BIGINT[]".into(),
-        DataType::TsVector => "TSVECTOR".into(),
-        DataType::TsQuery => "TSQUERY".into(),
-        DataType::Uuid => "UUID".into(),
-        DataType::Time => "TIME".into(),
-        DataType::Year => "YEAR".into(),
-        DataType::TimeTz => "TIMETZ".into(),
-        DataType::Money => "MONEY".into(),
-        DataType::Range(k) => k.keyword().into(),
-        DataType::Hstore => "HSTORE".into(),
-        DataType::IntArray2D => "INT[][]".into(),
-        DataType::BigIntArray2D => "BIGINT[][]".into(),
-        DataType::TextArray2D => "TEXT[][]".into(),
-    }
-}
 
 /// v6.5.2 — one row of `spg_stat_activity`. Engine-public so
 /// spg-server can construct rows without re-exporting internal
