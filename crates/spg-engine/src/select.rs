@@ -7,28 +7,30 @@ use alloc::borrow::Cow;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use spg_sql::ast::{Expr, FromClause, SelectItem, SelectStatement, TableRef, UnionKind};
-use spg_storage::{Catalog, ColumnSchema, DataType, Row, StorageError, TableSchema, Value};
+use spg_sql::ast::{
+    ColumnName, Expr, FromClause, SelectItem, SelectStatement, TableRef, UnionKind,
+};
+use spg_storage::{
+    Catalog, ColumnSchema, DataType, Row, StorageError, TableSchema, Value, VecEncoding,
+};
 
-use crate::eval::EvalContext;
+use crate::describe;
+use crate::eval::{EvalContext, EvalError};
 use crate::join::RowRef;
 use crate::{
     ByteBudget, CancelToken, Engine, EngineError, QueryResult, aggregate, apply_offset_and_limit,
-    apply_offset_and_limit_tagged, approx_row_bytes, array_value_to_elements, build_order_keys,
-    build_projection, check_with_ties_requires_order_by, collect_meta_view_names,
+    apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys, collect_meta_view_names,
     collect_qualified_refs, collect_scalar_subqueries, collect_window_nodes,
-    compute_window_partition, dedup_rows, encode_row_key, eval, expr_tree_has_subquery,
-    generate_series_integers, generate_series_timestamps, infer_column_types, is_top_level_unnest,
-    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp, order_key_cmp,
-    partial_sort_tagged, partition_key_cmp, rewrite_window_to_columns, select_has_window,
-    select_references_meta_view, select_refers_to, sort_by_keys, synth_info_key_column_usage,
+    compute_window_partition, eval, expr_tree_has_subquery, materialise_in_order,
+    materialise_meta_view, memoize, order_by_value_cmp, order_key_cmp, partial_sort_tagged,
+    partition_key_cmp, rewrite_window_to_columns, select_has_window, select_references_meta_view,
+    select_refers_to, sort_by_keys, synth_info_key_column_usage,
     synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
     synth_information_schema_columns, synth_information_schema_tables, synth_mysql_db,
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
     synth_pg_roles, synth_pg_settings, synth_pg_trigger, synth_pg_type, synth_pg_views,
-    top_level_unnest_arg, try_gin_seek, try_index_seek, try_nsw_knn, try_trgm_seek,
-    value_is_integer, value_to_i64, value_to_order_key,
+    try_gin_seek, try_index_seek, try_nsw_knn, try_trgm_seek, value_is_integer, value_to_i64,
 };
 
 impl Engine {
@@ -2116,5 +2118,481 @@ impl Engine {
     ) -> Result<Value, EngineError> {
         let cancel = CancelToken::none();
         self.eval_expr_with_correlated(expr, row, ctx, cancel, None)
+    }
+}
+
+// ---- SELECT result / projection / generate-series / SRF helpers (lib.rs split 12) ----
+
+/// One row-producing projection: an expression to evaluate, the resulting
+/// column's user-visible name, its inferred type, and nullability.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectedItem {
+    pub(crate) expr: Expr,
+    pub(crate) output_name: String,
+    pub(crate) ty: DataType,
+    pub(crate) nullable: bool,
+}
+
+/// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
+/// structural (`Vec<Value>` ⇒ pairwise `Value` equality), which gives SQL
+/// `NULL = NULL → TRUE` and `NaN = NaN → FALSE`. The first agrees with
+/// the spec's "two NULLs are not distinct"; the second is a tolerated
+/// quirk for v1 (no NaN literals are reachable from the SQL surface).
+fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
+    let mut out: Vec<Row> = Vec::with_capacity(rows.len());
+    for r in rows {
+        if !out.iter().any(|seen| seen == &r) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// Coerce a `Value` to an `f64` sort key for ORDER BY. Numbers map directly;
+/// NULL sorts last (treated as `+∞`); booleans are 0.0 / 1.0; text uses lex
+/// order via the byte values; vectors are not sortable.
+pub(crate) fn value_to_order_key(v: &Value) -> Result<f64, EngineError> {
+    match v {
+        Value::Null => Ok(f64::INFINITY),
+        Value::SmallInt(n) => Ok(f64::from(*n)),
+        Value::Int(n) => Ok(f64::from(*n)),
+        Value::Date(d) => Ok(f64::from(*d)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Timestamp(t) => Ok(*t as f64),
+        // v7.17.0 Phase 3.P0-32 — PG TIME ordered by underlying
+        // i64 microseconds (matches wall-clock ordering).
+        #[allow(clippy::cast_precision_loss)]
+        Value::Time(us) => Ok(*us as f64),
+        // v7.17.0 Phase 3.P0-33 — MySQL YEAR ordered by underlying
+        // u16 (matches calendar ordering; zero-year sentinel
+        // sorts before 1901).
+        Value::Year(y) => Ok(f64::from(*y)),
+        // v7.17.0 Phase 3.P0-34 — PG TIMETZ ordered by the
+        // UTC-equivalent microseconds (local wall - offset). Two
+        // values for the same physical instant in different zones
+        // sort equal — matches PG TIMETZ index behaviour.
+        #[allow(clippy::cast_precision_loss)]
+        Value::TimeTz { us, offset_secs } => Ok((us - i64::from(*offset_secs) * 1_000_000) as f64),
+        // v7.17.0 Phase 3.P0-35 — PG MONEY ordered by i64 cents.
+        #[allow(clippy::cast_precision_loss)]
+        Value::Money(c) => Ok(*c as f64),
+        // v7.17.0 Phase 3.P0-38 — range ordering is not supported
+        // in v7.17.0 (needs lex-then-inclusivity tiebreak).
+        Value::Range { .. } => Err(EngineError::Unsupported(
+            "ORDER BY of a range value is not supported in v7.17.0".into(),
+        )),
+        // v7.17.0 Phase 3.P0-39 — hstore is not orderable.
+        Value::Hstore(_) => Err(EngineError::Unsupported(
+            "ORDER BY of a hstore value is not supported".into(),
+        )),
+        // v7.17.0 Phase 3.P0-40 — 2D arrays not orderable.
+        Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => Err(
+            EngineError::Unsupported("ORDER BY of a 2D array is not supported in v7.17.0".into()),
+        ),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Numeric { scaled, scale } => {
+            // Scaled integer / 10^scale, computed via f64 for sort
+            // ordering only. Precision losses here only matter for
+            // ORDER BY tie-breaks well past 15 significant digits.
+            // `f64::powi` lives in std; we hand-roll the loop so the
+            // no_std engine crate doesn't need it.
+            let mut divisor = 1.0_f64;
+            for _ in 0..*scale {
+                divisor *= 10.0;
+            }
+            Ok((*scaled as f64) / divisor)
+        }
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(n) => Ok(*n as f64),
+        Value::Float(x) => Ok(*x),
+        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        Value::Text(s) => {
+            // Lex order by codepoints — good enough for ORDER BY name.
+            // Map first 8 bytes packed into u64 as a coarse key; ties fall to
+            // partial_cmp Equal. v1.x can swap in a real string comparator.
+            let mut key: u64 = 0;
+            for &b in s.as_bytes().iter().take(8) {
+                key = (key << 8) | u64::from(b);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            Ok(key as f64)
+        }
+        Value::Vector(_) | Value::Sq8Vector(_) | Value::HalfVector(_) => {
+            Err(EngineError::Unsupported(
+                "ORDER BY of a raw vector column is not meaningful — use `<->`".into(),
+            ))
+        }
+        Value::Interval { .. } => Err(EngineError::Unsupported(
+            "ORDER BY of an INTERVAL is not supported in v2.11 \
+             (months vs micros has no single canonical ordering)"
+                .into(),
+        )),
+        Value::Json(_) => Err(EngineError::Unsupported(
+            "ORDER BY of a JSON value is not supported — cast the document to text first".into(),
+        )),
+        // v7.5.0 — Value is #[non_exhaustive]; future variants need
+        // an explicit ORDER BY mapping. Surface as Unsupported until
+        // engine support is added.
+        _ => Err(EngineError::Unsupported(
+            "ORDER BY of this value type is not supported".into(),
+        )),
+    }
+}
+
+/// Find the schema entry that a SELECT-list `Expr::Column` refers to.
+/// Mirrors `resolve_column` in `eval.rs`, but returns a proper
+/// `EngineError` so the projection-build path keeps `UnknownQualifier`
+/// vs `ColumnNotFound` distinct.
+pub(crate) fn resolve_projection_column<'a>(
+    c: &ColumnName,
+    schema_cols: &'a [ColumnSchema],
+    table_alias: &str,
+) -> Result<&'a ColumnSchema, EngineError> {
+    if let Some(q) = &c.qualifier {
+        let composite = alloc::format!("{q}.{name}", name = c.name);
+        if let Some(s) = schema_cols.iter().find(|s| s.name == composite) {
+            return Ok(s);
+        }
+        // Single-table case: the qualifier may equal the active alias —
+        // then look for the bare column name.
+        if q == table_alias
+            && let Some(s) = schema_cols.iter().find(|s| s.name == c.name)
+        {
+            return Ok(s);
+        }
+        // For multi-table schemas the qualifier is unknown only if no
+        // column bears the "<q>." prefix. For single-table, the alias
+        // mismatch alone is enough.
+        let prefix = alloc::format!("{q}.");
+        let qualifier_known =
+            q == table_alias || schema_cols.iter().any(|s| s.name.starts_with(&prefix));
+        if !qualifier_known {
+            return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                qualifier: q.clone(),
+            }));
+        }
+        return Err(EngineError::Eval(EvalError::ColumnNotFound {
+            name: c.name.clone(),
+        }));
+    }
+    if let Some(s) = schema_cols.iter().find(|s| s.name == c.name) {
+        return Ok(s);
+    }
+    let suffix = alloc::format!(".{name}", name = c.name);
+    let mut matches = schema_cols.iter().filter(|s| s.name.ends_with(&suffix));
+    let first = matches.next();
+    let extra = matches.next();
+    match (first, extra) {
+        (Some(s), None) => Ok(s),
+        (Some(_), Some(_)) => Err(EngineError::Eval(EvalError::TypeMismatch {
+            detail: alloc::format!("ambiguous column reference: {}", c.name),
+        })),
+        _ => Err(EngineError::Eval(EvalError::ColumnNotFound {
+            name: c.name.clone(),
+        })),
+    }
+}
+
+pub(crate) fn build_projection(
+    items: &[SelectItem],
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Result<Vec<ProjectedItem>, EngineError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard => {
+                for col in schema_cols {
+                    out.push(ProjectedItem {
+                        expr: Expr::Column(ColumnName {
+                            qualifier: None,
+                            name: col.name.clone(),
+                        }),
+                        output_name: col.name.clone(),
+                        ty: col.ty,
+                        nullable: col.nullable,
+                    });
+                }
+            }
+            SelectItem::Expr { expr, alias } => {
+                // Plain column ref keeps full schema info (real type +
+                // nullability). For compound expressions try the
+                // describe-side function-return-type table first
+                // (e.g. `SELECT now()` → Timestamptz, `SELECT
+                // concat(…)` → Text). Falls back to nullable Text
+                // for shapes the describe path can't resolve.
+                if let Expr::Column(c) = expr {
+                    let sch = resolve_projection_column(c, schema_cols, table_alias)?;
+                    let output_name = alias.clone().unwrap_or_else(|| c.name.clone());
+                    out.push(ProjectedItem {
+                        expr: expr.clone(),
+                        output_name,
+                        ty: sch.ty,
+                        nullable: sch.nullable,
+                    });
+                } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
+                    let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
+                    out.push(ProjectedItem {
+                        expr: expr.clone(),
+                        output_name,
+                        ty: shape.ty,
+                        nullable: shape.nullable,
+                    });
+                } else {
+                    let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
+                    out.push(ProjectedItem {
+                        expr: expr.clone(),
+                        output_name,
+                        ty: DataType::Text,
+                        nullable: true,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ---- v4.12 window-function helpers ----
+// The (partition-key, order-key, original-index) tuple shape used
+// across these helpers is intrinsic to the planner. Factoring it
+// into a typedef adds indirection without making the code clearer,
+// so several lints are allowed inline on the affected functions
+// rather than module-wide.
+
+/// v4.22: pick more specific column types from observed rows when
+/// the projection builder defaulted to Text (the v1.x behavior for
+/// non-column expressions). Lets `WITH t(n) AS (SELECT 1 ...)`
+/// land an Int column in the CTE storage table rather than failing
+/// the insert with "expected TEXT, got INT".
+pub(crate) fn infer_column_types(columns: &[ColumnSchema], rows: &[Row]) -> Vec<ColumnSchema> {
+    let mut out = columns.to_vec();
+    for (col_idx, col) in out.iter_mut().enumerate() {
+        if col.ty != DataType::Text {
+            continue;
+        }
+        let mut inferred: Option<DataType> = None;
+        let mut all_null = true;
+        for row in rows {
+            let Some(v) = row.values.get(col_idx) else {
+                continue;
+            };
+            let ty = match v {
+                Value::Null => continue,
+                Value::SmallInt(_) => DataType::SmallInt,
+                Value::Int(_) => DataType::Int,
+                Value::BigInt(_) => DataType::BigInt,
+                Value::Float(_) => DataType::Float,
+                Value::Bool(_) => DataType::Bool,
+                Value::Vector(_) => DataType::Vector {
+                    dim: 0,
+                    encoding: VecEncoding::F32,
+                },
+                _ => DataType::Text,
+            };
+            all_null = false;
+            inferred = Some(match inferred {
+                None => ty,
+                Some(prev) if prev == ty => prev,
+                Some(_) => DataType::Text,
+            });
+        }
+        if let Some(t) = inferred {
+            col.ty = t;
+            col.nullable = true;
+        } else if all_null {
+            col.nullable = true;
+        }
+    }
+    out
+}
+
+/// v4.22: encode a Row to a comparable byte key for UNION-DISTINCT
+/// dedup inside the recursive iteration. Crude but deterministic
+/// — Debug prints embed type discriminants so NULL ≠ "" ≠ 0.
+fn encode_row_key(row: &Row) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in &row.values {
+        let s = alloc::format!("{v:?}|");
+        out.extend_from_slice(s.as_bytes());
+    }
+    out
+}
+
+/// v7.17.0 Phase 3.10 — integer-mode generate_series materialiser.
+/// Step direction follows the sign: positive step iterates upward
+/// (stops when current > stop); negative iterates downward; zero
+/// errors. Caller-facing row stream is `BigInt`-typed so a single
+/// projection schema covers SmallInt / Int / BigInt callers.
+fn generate_series_integers(
+    start: i64,
+    stop: i64,
+    step: i64,
+    cancel: &CancelToken<'_>,
+) -> Result<alloc::vec::Vec<Row>, EngineError> {
+    if step == 0 {
+        return Err(EngineError::Unsupported(
+            "generate_series(): step argument cannot be zero".into(),
+        ));
+    }
+    let mut out = alloc::vec::Vec::new();
+    let mut cur = start;
+    // Hard cap to keep a runaway call from eating all memory. PG
+    // has no such cap but does honour query timeout; SPG's cancel
+    // token will fire too — this is a defense-in-depth backstop.
+    const MAX_ROWS: usize = 10_000_000;
+    loop {
+        cancel.check()?;
+        if step > 0 && cur > stop {
+            break;
+        }
+        if step < 0 && cur < stop {
+            break;
+        }
+        out.push(Row::new(alloc::vec![Value::BigInt(cur)]));
+        if out.len() > MAX_ROWS {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "generate_series(): exceeded {MAX_ROWS} rows; \
+                 narrow start/stop or use a larger step"
+            )));
+        }
+        cur = match cur.checked_add(step) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+    Ok(out)
+}
+
+/// v7.17.0 Phase 3.10 — timestamp-mode generate_series. step is a
+/// `Value::Interval { months, micros }` per the caller's guard;
+/// each iteration adds the interval via `apply_binary_interval`
+/// so month-shifting handles short-month rollover (PG semantics).
+fn generate_series_timestamps(
+    start: i64,
+    stop: i64,
+    step: Value,
+    cancel: &CancelToken<'_>,
+) -> Result<alloc::vec::Vec<Row>, EngineError> {
+    let (months, micros) = match &step {
+        Value::Interval { months, micros } => (*months, *micros),
+        _ => unreachable!("caller guards step.is_interval"),
+    };
+    if months == 0 && micros == 0 {
+        return Err(EngineError::Unsupported(
+            "generate_series(): INTERVAL step cannot be zero".into(),
+        ));
+    }
+    let ascending = months > 0 || micros > 0;
+    let mut out = alloc::vec::Vec::new();
+    let mut cur = Value::Timestamp(start);
+    const MAX_ROWS: usize = 10_000_000;
+    loop {
+        cancel.check()?;
+        let cur_t = match cur {
+            Value::Timestamp(t) => t,
+            _ => unreachable!("loop invariant: cur is Timestamp"),
+        };
+        if ascending && cur_t > stop {
+            break;
+        }
+        if !ascending && cur_t < stop {
+            break;
+        }
+        out.push(Row::new(alloc::vec![Value::Timestamp(cur_t)]));
+        if out.len() > MAX_ROWS {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "generate_series(): exceeded {MAX_ROWS} rows; \
+                 narrow start/stop or use a larger step"
+            )));
+        }
+        let next = eval::apply_binary_interval(
+            spg_sql::ast::BinOp::Add,
+            &cur,
+            &Value::Interval { months, micros },
+        )
+        .map_err(EngineError::Eval)?;
+        cur = match next {
+            Some(v) => v,
+            None => break,
+        };
+    }
+    Ok(out)
+}
+
+/// v7.17.0 Phase 3.P0-49 — PG-canonical: `FETCH FIRST <n> ROWS
+/// WITH TIES` requires an `ORDER BY`. Without one, there's no
+/// way to identify "ties" deterministically, so PG errors at
+/// plan time. SPG mirrors that surface so the same DDL / app
+/// behaviour holds on cutover.
+fn check_with_ties_requires_order_by(stmt: &SelectStatement) -> Result<(), EngineError> {
+    if stmt.limit_with_ties && stmt.order_by.is_empty() {
+        return Err(EngineError::Unsupported(alloc::string::String::from(
+            "FETCH FIRST … ROWS WITH TIES requires an ORDER BY clause",
+        )));
+    }
+    Ok(())
+}
+
+/// v7.19 P5 — true iff `expr` is `unnest(arg)` at the top level
+/// (case-insensitive). Used by `exec_select_cancel`'s
+/// projection loop to detect Set-Returning-Function rows that
+/// need per-row expansion. Only the top-level call counts —
+/// `coalesce(unnest(arr), 'x')` is NOT a SRF row from the
+/// projection's perspective; it would surface as an "unknown
+/// function" mismatch downstream, which is what we want
+/// (multi-SRF / nested SRF is documented carve-out for v7.19).
+fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
+    match expr {
+        spg_sql::ast::Expr::FunctionCall { name, args } => {
+            name.eq_ignore_ascii_case("unnest") && args.len() == 1
+        }
+        _ => false,
+    }
+}
+
+/// v7.19 P5 — extract the array argument out of a top-level
+/// `unnest(arg)` call. `None` if `expr` isn't a `unnest` call
+/// of arity 1 (mirrors `is_top_level_unnest`).
+fn top_level_unnest_arg(expr: &spg_sql::ast::Expr) -> Option<&spg_sql::ast::Expr> {
+    match expr {
+        spg_sql::ast::Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("unnest") && args.len() == 1 =>
+        {
+            Some(&args[0])
+        }
+        _ => None,
+    }
+}
+
+/// v7.19 P5 — turn an array-typed `Value` into the element list
+/// `unnest()` projection emits. NULL → empty list (PG: `unnest(NULL)
+/// = (no rows)`). Non-array values fall through to a type-mismatch
+/// error.
+fn array_value_to_elements(v: &Value) -> Result<Vec<Value>, EngineError> {
+    match v {
+        Value::Null => Ok(Vec::new()),
+        Value::TextArray(items) => Ok(items
+            .iter()
+            .map(|opt| {
+                opt.as_ref()
+                    .map(|s| Value::Text(s.clone()))
+                    .unwrap_or(Value::Null)
+            })
+            .collect()),
+        Value::IntArray(items) => Ok(items
+            .iter()
+            .map(|opt| opt.map(Value::Int).unwrap_or(Value::Null))
+            .collect()),
+        Value::BigIntArray(items) => Ok(items
+            .iter()
+            .map(|opt| opt.map(Value::BigInt).unwrap_or(Value::Null))
+            .collect()),
+        other => Err(EngineError::Eval(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "unnest() expects an array argument, got {:?}",
+                other.data_type()
+            ),
+        })),
     }
 }
