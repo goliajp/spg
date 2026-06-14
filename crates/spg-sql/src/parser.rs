@@ -8582,10 +8582,7 @@ impl Parser {
         }
         self.advance(); // FILTER
         if !matches!(self.peek(), Token::LParen) {
-            return Err(self.err(format!(
-                "expected '(' after FILTER, got {:?}",
-                self.peek()
-            )));
+            return Err(self.err(format!("expected '(' after FILTER, got {:?}", self.peek())));
         }
         self.advance(); // (
         if !matches!(self.peek(), Token::Where) {
@@ -8886,9 +8883,9 @@ impl Parser {
                     && s.eq_ignore_ascii_case("over")
                 {
                     if filter.is_some() {
-                        return Err(self.err(
-                            "FILTER on window functions is not supported yet".into(),
-                        ));
+                        return Err(
+                            self.err("FILTER on window functions is not supported yet".into())
+                        );
                     }
                     self.advance();
                     let (partition_by, order_by, frame) = self.parse_over_clause()?;
@@ -9045,9 +9042,7 @@ impl Parser {
                 && s.eq_ignore_ascii_case("over")
             {
                 if filter.is_some() {
-                    return Err(self.err(
-                        "FILTER on window functions is not supported yet".into(),
-                    ));
+                    return Err(self.err("FILTER on window functions is not supported yet".into()));
                 }
                 self.advance();
                 let (partition_by, order_by, frame) = self.parse_over_clause()?;

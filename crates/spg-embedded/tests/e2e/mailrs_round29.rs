@@ -262,7 +262,10 @@ fn statistical_aggregates() {
     // single-row group: var_samp/stddev → NULL, var_pop → 0.
     db.execute("CREATE TABLE one (x INT)").unwrap();
     db.execute("INSERT INTO one VALUES (7)").unwrap();
-    let r = rows_of(&mut db, "SELECT var_pop(x), var_samp(x), stddev_samp(x) FROM one");
+    let r = rows_of(
+        &mut db,
+        "SELECT var_pop(x), var_samp(x), stddev_samp(x) FROM one",
+    );
     assert_eq!(r[0][0], Value::Float(0.0));
     assert_eq!(r[0][1], Value::Null);
     assert_eq!(r[0][2], Value::Null);
@@ -318,7 +321,8 @@ fn bitwise_aggregates() {
 fn hypothetical_set_aggregates() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE t (x INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(3),(5),(5),(8)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(3),(5),(5),(8)")
+        .unwrap();
     let r = rows_of(
         &mut db,
         "SELECT rank(5) WITHIN GROUP (ORDER BY x), \
@@ -354,7 +358,8 @@ fn hypothetical_set_aggregates() {
 fn regression_aggregates() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE p (x INT, y INT)").unwrap();
-    db.execute("INSERT INTO p VALUES (1,3),(2,5),(3,7),(4,9)").unwrap();
+    db.execute("INSERT INTO p VALUES (1,3),(2,5),(3,7),(4,9)")
+        .unwrap();
     let r = rows_of(
         &mut db,
         "SELECT regr_slope(y,x), regr_intercept(y,x), corr(y,x), regr_r2(y,x), \
@@ -374,7 +379,8 @@ fn regression_aggregates() {
         ref other => panic!("expected float, got {other:?}"),
     }
     // Only pairs where BOTH are non-NULL count.
-    db.execute("INSERT INTO p VALUES (5, NULL), (NULL, 11)").unwrap();
+    db.execute("INSERT INTO p VALUES (5, NULL), (NULL, 11)")
+        .unwrap();
     let r = rows_of(&mut db, "SELECT regr_count(y, x) FROM p");
     assert_eq!(r[0][0], Value::BigInt(4)); // the two NULL-bearing rows excluded
 }
@@ -385,11 +391,15 @@ fn regression_aggregates() {
 fn json_aggregates() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE p (x INT, y INT)").unwrap();
-    db.execute("INSERT INTO p VALUES (1,3),(2,5),(3,7)").unwrap();
+    db.execute("INSERT INTO p VALUES (1,3),(2,5),(3,7)")
+        .unwrap();
     let r = rows_of(&mut db, "SELECT json_agg(x) FROM p");
     assert_eq!(r[0][0], Value::Json("[1, 2, 3]".into()));
     let r = rows_of(&mut db, "SELECT json_object_agg(x, y) FROM p");
-    assert_eq!(r[0][0], Value::Json("{\"1\": 3, \"2\": 5, \"3\": 7}".into()));
+    assert_eq!(
+        r[0][0],
+        Value::Json("{\"1\": 3, \"2\": 5, \"3\": 7}".into())
+    );
     // empty → NULL (PG)
     let r = rows_of(&mut db, "SELECT json_agg(x) FROM p WHERE x > 99");
     assert_eq!(r[0][0], Value::Null);

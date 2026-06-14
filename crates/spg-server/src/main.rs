@@ -62,8 +62,8 @@ use spg_audit::AuditLog;
 use spg_engine::{Engine, EngineError, QueryResult, Role};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 use spg_wire::{
-    Frame, FrameError, Op, build_error_response, build_stats_response,
-    decode, parse_auth, parse_auth_user, parse_query,
+    Frame, FrameError, Op, build_error_response, build_stats_response, decode, parse_auth,
+    parse_auth_user, parse_query,
 };
 
 pub(crate) use commands::*;
