@@ -5,9 +5,11 @@
 //! per-topic split.
 
 use super::*;
+use alloc::string::ToString;
 use alloc::vec;
 
-use spg_sql::ast::BinOp;
+use spg_sql::ast::{BinOp, Expr};
+use spg_storage::VecEncoding;
 
 fn unwrap_command_ok(r: &QueryResult) -> usize {
     match r {
