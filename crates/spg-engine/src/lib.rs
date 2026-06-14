@@ -2298,35 +2298,6 @@ impl Engine {
         self.subscriptions.update_last_received_pos(name, pos)
     }
 
-    /// v6.1.4 — `SHOW SUBSCRIPTIONS` row materialisation. Returns
-    /// `(name, conn_str, publications, enabled, last_received_pos)`
-    /// ordered by subscription name. The `publications` column is
-    /// the comma-joined list ("p1, p2") for ergonomic SHOW output;
-    /// callers wanting structured access read `Engine::subscriptions`.
-    fn exec_show_subscriptions(&self) -> QueryResult {
-        let columns = alloc::vec![
-            ColumnSchema::new("name", DataType::Text, false),
-            ColumnSchema::new("conn_str", DataType::Text, false),
-            ColumnSchema::new("publications", DataType::Text, false),
-            ColumnSchema::new("enabled", DataType::Bool, false),
-            ColumnSchema::new("last_received_pos", DataType::BigInt, false),
-        ];
-        let rows: Vec<Row> = self
-            .subscriptions
-            .iter()
-            .map(|(name, sub)| {
-                Row::new(alloc::vec![
-                    Value::Text(name.clone()),
-                    Value::Text(sub.conn_str.clone()),
-                    Value::Text(sub.publications.join(", ")),
-                    Value::Bool(sub.enabled),
-                    Value::BigInt(i64::try_from(sub.last_received_pos).unwrap_or(i64::MAX)),
-                ])
-            })
-            .collect();
-        QueryResult::Rows { columns, rows }
-    }
-
     /// v6.2.0 — `ANALYZE [<table>]` runtime. Bare `ANALYZE` walks
     /// every user table; `ANALYZE <name>` re-stats one. For each
     /// target table, single-pass scan + per-column histogram +
@@ -2615,70 +2586,6 @@ impl Engine {
         table_mut.set_cold_row_count(cold_count);
         Ok(())
     }
-
-    /// v6.1.3 — `SHOW PUBLICATIONS` row materialisation. Returns
-    /// `(name, scope, table_count)` ordered by publication name.
-    ///   - `scope` is the human-readable string:
-    ///       `"FOR ALL TABLES"` /
-    ///       `"FOR TABLE t1, t2"` /
-    ///       `"FOR ALL TABLES EXCEPT t1, t2"`.
-    ///   - `table_count` is NULL for `AllTables`, the list length
-    ///     otherwise. NULLability lets clients distinguish "publish
-    ///     everything" from "publish exactly 0 tables" (the v6.1.3
-    ///     parser forbids the empty list, but the column shape is
-    ///     ready for the v6.1.5 publisher-side semantics).
-    fn exec_show_publications(&self) -> QueryResult {
-        let columns = alloc::vec![
-            ColumnSchema::new("name", DataType::Text, false),
-            ColumnSchema::new("scope", DataType::Text, false),
-            ColumnSchema::new("table_count", DataType::Int, true),
-        ];
-        let rows: Vec<Row> = self
-            .publications
-            .iter()
-            .map(|(name, scope)| {
-                let (scope_str, count_val) = match scope {
-                    spg_sql::ast::PublicationScope::AllTables => {
-                        ("FOR ALL TABLES".to_string(), Value::Null)
-                    }
-                    spg_sql::ast::PublicationScope::ForTables(ts) => (
-                        alloc::format!("FOR TABLE {}", ts.join(", ")),
-                        Value::Int(i32::try_from(ts.len()).unwrap_or(i32::MAX)),
-                    ),
-                    spg_sql::ast::PublicationScope::AllTablesExcept(ts) => (
-                        alloc::format!("FOR ALL TABLES EXCEPT {}", ts.join(", ")),
-                        Value::Int(i32::try_from(ts.len()).unwrap_or(i32::MAX)),
-                    ),
-                };
-                Row::new(alloc::vec![
-                    Value::Text(name.clone()),
-                    Value::Text(scope_str),
-                    count_val,
-                ])
-            })
-            .collect();
-        QueryResult::Rows { columns, rows }
-    }
-
-    /// v4.1 `SHOW USERS` — `(name, role)` per row, ordered by name.
-    fn exec_show_users(&self) -> QueryResult {
-        let columns = alloc::vec![
-            ColumnSchema::new("name", DataType::Text, false),
-            ColumnSchema::new("role", DataType::Text, false),
-        ];
-        let rows: Vec<Row> = self
-            .users
-            .iter()
-            .map(|(name, rec)| {
-                Row::new(alloc::vec![
-                    Value::Text(name.to_string()),
-                    Value::Text(rec.role.as_str().to_string()),
-                ])
-            })
-            .collect();
-        QueryResult::Rows { columns, rows }
-    }
-
     /// v7.17.0 Phase 1.1 — walk a Statement tree and pre-resolve
     /// any sequence FunctionCall nodes inside its Expr slots.
     /// Delegates per-statement-kind: SELECT projection +
