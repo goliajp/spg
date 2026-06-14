@@ -19,7 +19,7 @@ use spg_storage::{Catalog, ColumnSchema, Row, StorageError, Value};
 
 use crate::aggregate;
 use crate::eval::{self, EvalError};
-use crate::{EngineError, check_unsigned_range, coerce_value, value_to_literal_expr};
+use crate::{Engine, EngineError, check_unsigned_range, coerce_value, value_to_literal_expr};
 
 /// v7.6.1 — resolve a parser-level `ForeignKeyConstraint` (column
 /// names + parent table name) into the storage-layer shape (column
@@ -1435,5 +1435,34 @@ fn fk_action_sql_to_storage(a: spg_sql::ast::FkAction) -> spg_storage::FkAction 
         spg_sql::ast::FkAction::SetNull => spg_storage::FkAction::SetNull,
         spg_sql::ast::FkAction::SetDefault => spg_storage::FkAction::SetDefault,
         spg_sql::ast::FkAction::NoAction => spg_storage::FkAction::NoAction,
+    }
+}
+
+impl Engine {
+    /// v7.14.0 — resolve every queued FK whose installation was
+    /// deferred (`SET FOREIGN_KEY_CHECKS=0` window). Called by
+    /// `set_session_param` when checks flip back on and by the
+    /// drop-import release gate. Each FK is resolved against the
+    /// current catalog; remaining missing-parent errors propagate
+    /// up so the caller knows the import was incomplete.
+    pub(crate) fn drain_pending_foreign_keys(&mut self) -> Result<(), EngineError> {
+        let pending = core::mem::take(&mut self.pending_foreign_keys);
+        for (child, fk) in pending {
+            // Resolve against the current catalog. Skip silently
+            // when the child table itself was dropped between
+            // queue + drain.
+            let cols_snapshot = match self.active_catalog().get(&child) {
+                Some(t) => t.schema().columns.clone(),
+                None => continue,
+            };
+            let storage_fk =
+                resolve_foreign_key(&child, &cols_snapshot, fk, self.active_catalog())?;
+            let table = self
+                .active_catalog_mut()
+                .get_mut(&child)
+                .expect("checked above");
+            table.schema_mut().foreign_keys.push(storage_fk);
+        }
+        Ok(())
     }
 }
