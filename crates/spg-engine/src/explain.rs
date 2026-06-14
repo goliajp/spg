@@ -9,7 +9,11 @@ use alloc::vec::Vec;
 use spg_sql::ast::{Expr, SelectItem, SelectStatement, UnionKind};
 
 use crate::index_access::try_index_seek;
-use crate::{Engine, aggregate, expr_has_subquery, select_has_window};
+use spg_storage::{ColumnSchema, DataType, Row, Value};
+
+use crate::{
+    CancelToken, Engine, EngineError, QueryResult, aggregate, expr_has_subquery, select_has_window,
+};
 
 /// Walks the SELECT's FROM clauses + WHERE expression tree;
 /// returns one line per missing index. Deterministic order:
@@ -314,5 +318,77 @@ pub(crate) fn explain_select(
         };
         out.push(alloc::format!("{child}{label}"));
         explain_select(peer, engine, depth + 2, out);
+    }
+}
+
+impl Engine {
+    /// v4.26: `EXPLAIN [ANALYZE] <select>`. Returns a single-column
+    /// `QUERY PLAN` text table — first line names the top operator
+    /// (Scan / Aggregate / Window / etc.), indented children list
+    /// FROM joins, WHERE filters, ORDER BY / LIMIT, projection
+    /// shape, and any active index hits. `ANALYZE` execs the inner
+    /// SELECT and appends actual-row + elapsed-micros annotations.
+    #[allow(clippy::format_push_string)]
+    pub(crate) fn exec_explain(
+        &self,
+        e: &spg_sql::ast::ExplainStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let mut lines = Vec::<String>::new();
+        explain_select(&e.inner, self, 0, &mut lines);
+        if e.suggest {
+            // v6.8.3 — index advisor. Walks the SELECT's FROM
+            // tables + WHERE column refs; for each (table, column)
+            // pair that lacks an index, append a SUGGEST line with
+            // a copy-pastable `CREATE INDEX` statement. This is a
+            // pure-syntax heuristic — no cardinality estimation —
+            // matching the v6.8.3 design intent of "tell the
+            // operator where indexes are missing", not "give the
+            // mathematically optimal index set".
+            let suggestions = build_index_suggestions(&e.inner, self);
+            for s in suggestions {
+                lines.push(s);
+            }
+        } else if e.analyze {
+            // v6.2.4 — EXPLAIN ANALYZE annotates each operator line
+            // with `(rows=N)` where the row count is computable
+            // without re-executing the full query:
+            //   - Top-level operator (first non-indented line):
+            //     rows = final result.len()
+            //   - "From: <table> [full scan]" lines: rows =
+            //     table.rows().len() (catalog read; no execution)
+            //   - "From: <table> [index seek]": indeterminate —
+            //     the index step would need re-execution; v6.2.5
+            //     adds per-operator wall-clock + hot/cold rows
+            //     instrumentation that makes this concrete.
+            //   - Everything else: marked `(—)` so the surface
+            //     stays well-defined without silently dropping
+            //     stats. v6.2.5 fills in via inline executor
+            //     instrumentation.
+            // Total elapsed lands on a trailing `Total: …` line.
+            let started = self.clock.map(|f| f());
+            let exec = self.exec_select_cancel(&e.inner, cancel)?;
+            let elapsed_micros = match (self.clock, started) {
+                (Some(f), Some(s)) => Some(f().saturating_sub(s)),
+                _ => None,
+            };
+            let row_count = if let QueryResult::Rows { rows, .. } = &exec {
+                rows.len()
+            } else {
+                0
+            };
+            annotate_explain_lines(&mut lines, row_count, self);
+            let mut total = alloc::format!("Total: rows={row_count}");
+            if let Some(us) = elapsed_micros {
+                total.push_str(&alloc::format!(" elapsed={us}us"));
+            }
+            lines.push(total);
+        }
+        let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
+        let rows: Vec<Row> = lines
+            .into_iter()
+            .map(|l| Row::new(alloc::vec![Value::Text(l)]))
+            .collect();
+        Ok(QueryResult::Rows { columns, rows })
     }
 }
