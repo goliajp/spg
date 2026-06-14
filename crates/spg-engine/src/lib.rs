@@ -82,7 +82,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use spg_sql::ast::{SelectItem, SelectStatement, Statement};
+use spg_sql::ast::Statement;
 // v7.16.0 — re-export the parsed-statement AST so downstream
 // crates (spg-embedded → spg-sqlx) don't need a direct dep on
 // spg-sql for the prepare/bind handle.
@@ -2002,92 +2002,6 @@ impl Engine {
     ) -> EvalContext<'a> {
         EvalContext::new(columns, alias)
             .with_default_text_search_config(self.session_param("default_text_search_config"))
-    }
-
-    /// v7.17.0 Phase 1.2 — find every catalog VIEW referenced in
-    /// the SELECT's FROM / JOIN graph, re-parse each view's body
-    /// source, and prepend it as a synthetic CTE on the
-    /// returned SelectStatement. Returns `None` when no view
-    /// references are found (caller proceeds with the original
-    /// statement); returns `Some(rewritten)` otherwise (caller
-    /// re-runs exec_select_cancel on the rewritten form so the
-    /// regular CTE materialiser handles it).
-    fn expand_views_in_select(
-        &self,
-        stmt: &SelectStatement,
-    ) -> Result<Option<SelectStatement>, EngineError> {
-        let cat = self.active_catalog();
-        let mut referenced: Vec<String> = Vec::new();
-        if let Some(from) = &stmt.from {
-            collect_view_refs(&from.primary, cat, &mut referenced);
-            for j in &from.joins {
-                collect_view_refs(&j.table, cat, &mut referenced);
-            }
-        }
-        // Don't expand a view name that's already shadowed by a
-        // CTE on the same SELECT — the CTE wins per PG.
-        referenced.retain(|n| !stmt.ctes.iter().any(|c| c.name == *n));
-        if referenced.is_empty() {
-            return Ok(None);
-        }
-        let mut new_ctes: Vec<spg_sql::ast::Cte> = Vec::with_capacity(referenced.len());
-        for name in &referenced {
-            let view = cat.views().get(name).ok_or_else(|| {
-                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
-                    "view {name:?} disappeared mid-expansion"
-                )))
-            })?;
-            let parsed = spg_sql::parser::parse_statement(&view.body).map_err(|e| {
-                EngineError::Unsupported(alloc::format!("view {name:?} body re-parse failed: {e}"))
-            })?;
-            let Statement::Select(body) = parsed else {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "view {name:?} body is not a SELECT (catalog corruption)"
-                )));
-            };
-            new_ctes.push(spg_sql::ast::Cte {
-                name: name.clone(),
-                body,
-                recursive: false,
-                column_overrides: view.columns.clone(),
-            });
-        }
-        let mut out = stmt.clone();
-        // Prepend so view CTEs are visible to caller-supplied CTEs.
-        new_ctes.extend(out.ctes);
-        out.ctes = new_ctes;
-        Ok(Some(out))
-    }
-
-    /// v7.9.4 — INSERT / UPDATE / DELETE RETURNING projector.
-    /// Given the table name, the user-supplied projection items,
-    /// and the mutated rows (post-insert / post-update values, or
-    /// pre-delete snapshot), build a `QueryResult::Rows` whose
-    /// schema describes the projected columns. Mailrs migration
-    /// blocker #1.
-    fn build_returning_rows(
-        &self,
-        table_name: &str,
-        items: &[SelectItem],
-        mutated_rows: Vec<Vec<Value>>,
-    ) -> Result<QueryResult, EngineError> {
-        let table = self.active_catalog().get(table_name).ok_or_else(|| {
-            EngineError::Storage(StorageError::TableNotFound {
-                name: table_name.into(),
-            })
-        })?;
-        let schema_cols = table.schema().columns.clone();
-        let columns = self.derive_output_columns(items, &schema_cols, table_name);
-        let mut out_rows: Vec<Row> = Vec::with_capacity(mutated_rows.len());
-        for values in mutated_rows {
-            let row = Row::new(values);
-            let projected = self.project_row_simple(&row, items, &schema_cols, table_name)?;
-            out_rows.push(projected);
-        }
-        Ok(QueryResult::Rows {
-            columns,
-            rows: out_rows,
-        })
     }
 }
 

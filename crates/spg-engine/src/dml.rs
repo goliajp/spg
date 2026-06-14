@@ -7,7 +7,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use spg_sql::ast::{Expr, InsertStatement};
+use spg_sql::ast::{Expr, InsertStatement, SelectItem};
 use spg_storage::{ColumnSchema, Row, StorageError, Value};
 
 use crate::eval::{EvalContext, EvalError};
@@ -1359,6 +1359,39 @@ impl Engine {
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: !self.in_transaction(),
+        })
+    }
+}
+
+impl Engine {
+    /// v7.9.4 — INSERT / UPDATE / DELETE RETURNING projector.
+    /// Given the table name, the user-supplied projection items,
+    /// and the mutated rows (post-insert / post-update values, or
+    /// pre-delete snapshot), build a `QueryResult::Rows` whose
+    /// schema describes the projected columns. Mailrs migration
+    /// blocker #1.
+    fn build_returning_rows(
+        &self,
+        table_name: &str,
+        items: &[SelectItem],
+        mutated_rows: Vec<Vec<Value>>,
+    ) -> Result<QueryResult, EngineError> {
+        let table = self.active_catalog().get(table_name).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: table_name.into(),
+            })
+        })?;
+        let schema_cols = table.schema().columns.clone();
+        let columns = self.derive_output_columns(items, &schema_cols, table_name);
+        let mut out_rows: Vec<Row> = Vec::with_capacity(mutated_rows.len());
+        for values in mutated_rows {
+            let row = Row::new(values);
+            let projected = self.project_row_simple(&row, items, &schema_cols, table_name)?;
+            out_rows.push(projected);
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: out_rows,
         })
     }
 }
