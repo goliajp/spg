@@ -34,9 +34,10 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use spg_sql::ast::{AssignTarget, Expr, PlPgSqlDeclare, PlPgSqlStmt, RaiseLevel, ReturnTarget};
-use spg_storage::{ColumnSchema, FunctionDef, Row, TriggerDef, Value};
+use spg_storage::{ColumnSchema, FunctionDef, Row, StorageError, TriggerDef, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
+use crate::{CancelToken, Engine, EngineError, MAX_TRIGGER_RECURSION};
 
 /// v7.12.7 — embedded SQL statement collected during a trigger
 /// fire, queued for execution after the firing DML completes.
@@ -1029,4 +1030,95 @@ pub fn matching_trigger_names<'a>(
                 && t.events.iter().any(|e| e.eq_ignore_ascii_case(event))
         })
         .collect()
+}
+
+impl Engine {
+    /// v7.12.4 — snapshot every row-level trigger on `table` that
+    /// fires for `event` (`"INSERT"` / `"UPDATE"` / `"DELETE"`) at
+    /// the given `timing` (`"BEFORE"` / `"AFTER"`), and clone its
+    /// referenced function definition. Returned as a vec of owned
+    /// `FunctionDef` so the row-write loop can fire them without
+    /// holding a borrow on the catalog (which would conflict with
+    /// the table.insert / update_row / delete mutable borrows).
+    pub(crate) fn snapshot_row_triggers(
+        &self,
+        table: &str,
+        event: &str,
+        timing: &str,
+    ) -> Vec<spg_storage::FunctionDef> {
+        let cat = self.active_catalog();
+        cat.triggers()
+            .iter()
+            .filter(|t| {
+                // v7.16.1 — skip disabled triggers (mailrs
+                // round-9 A.2.b — pg_dump --disable-triggers).
+                t.enabled
+                    && t.table == table
+                    && t.timing.eq_ignore_ascii_case(timing)
+                    && t.for_each.eq_ignore_ascii_case("row")
+                    && t.events.iter().any(|e| e.eq_ignore_ascii_case(event))
+            })
+            .filter_map(|t| cat.functions().get(&t.function).cloned())
+            .collect()
+    }
+
+    /// v7.13.0 — UPDATE-side snapshot that pairs each trigger's
+    /// function with its `UPDATE OF cols` filter (mailrs round-5
+    /// G7). Empty filter Vec means "fire unconditionally", matching
+    /// the v7.12 behaviour.
+    pub(crate) fn snapshot_update_row_triggers(
+        &self,
+        table: &str,
+        timing: &str,
+    ) -> Vec<(spg_storage::FunctionDef, Vec<String>)> {
+        let cat = self.active_catalog();
+        cat.triggers()
+            .iter()
+            .filter(|t| {
+                // v7.16.1 — skip disabled triggers.
+                t.enabled
+                    && t.table == table
+                    && t.timing.eq_ignore_ascii_case(timing)
+                    && t.for_each.eq_ignore_ascii_case("row")
+                    && t.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
+            })
+            .filter_map(|t| {
+                cat.functions()
+                    .get(&t.function)
+                    .cloned()
+                    .map(|fd| (fd, t.update_columns.clone()))
+            })
+            .collect()
+    }
+
+    /// v7.12.7 — drain the trigger-emitted embedded SQL queue.
+    /// Called by the INSERT / UPDATE / DELETE executors after
+    /// their main row-write loop returns. Each statement runs
+    /// inside the same cancel scope as the firing DML and bumps
+    /// the recursion counter; nested embedded SQL beyond
+    /// [`MAX_TRIGGER_RECURSION`] errors with a clear message so
+    /// a trigger-graph cycle surfaces as a query failure instead
+    /// of stack-blowing the engine.
+    pub(crate) fn execute_deferred_trigger_stmts(
+        &mut self,
+        deferred: Vec<DeferredEmbeddedStmt>,
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        for d in deferred {
+            if self.trigger_recursion_depth >= MAX_TRIGGER_RECURSION {
+                return Err(EngineError::Storage(StorageError::Corrupt(alloc::format!(
+                    "trigger embedded SQL recursion depth {} exceeded (trigger function \
+                     {:?} would push past the {} cap — check for trigger cycles)",
+                    self.trigger_recursion_depth,
+                    d.function,
+                    MAX_TRIGGER_RECURSION,
+                ))));
+            }
+            self.trigger_recursion_depth += 1;
+            let res = self.execute_stmt_with_cancel(d.stmt, cancel);
+            self.trigger_recursion_depth -= 1;
+            res?;
+        }
+        Ok(())
+    }
 }
