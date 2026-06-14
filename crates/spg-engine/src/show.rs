@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use spg_storage::{ColumnSchema, DataType, Row, StorageError, Value};
 
-use crate::{Engine, EngineError, QueryResult, render_data_type};
+use crate::{Engine, EngineError, QueryResult};
 
 impl Engine {
     /// `SHOW TABLES` — one row per table in the active catalog.
@@ -308,5 +308,74 @@ impl Engine {
             })
             .collect();
         Ok(QueryResult::Rows { columns, rows })
+    }
+}
+
+// ---- CREATE TABLE / data-type DDL rendering (lib.rs split 14) ----
+
+/// v6.5.4 — synthesise a `CREATE TABLE` statement from catalog
+/// state. Round-trips through `Engine::execute` to recreate the
+/// same schema (sans data + indexes — indexes are emitted as a
+/// separate `CREATE INDEX` chain in `spg_database_ddl`).
+pub(crate) fn render_create_table(name: &str, columns: &[ColumnSchema]) -> String {
+    let mut out = alloc::format!("CREATE TABLE {name} (");
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&col.name);
+        out.push(' ');
+        out.push_str(&render_data_type(col.ty));
+        if !col.nullable {
+            out.push_str(" NOT NULL");
+        }
+        if col.auto_increment {
+            out.push_str(" AUTO_INCREMENT");
+        }
+    }
+    out.push(')');
+    out
+}
+
+fn render_data_type(ty: DataType) -> String {
+    match ty {
+        DataType::SmallInt => "SMALLINT".into(),
+        DataType::Int => "INT".into(),
+        DataType::BigInt => "BIGINT".into(),
+        DataType::Float => "FLOAT".into(),
+        DataType::Text => "TEXT".into(),
+        DataType::Varchar(n) => alloc::format!("VARCHAR({n})"),
+        DataType::Char(n) => alloc::format!("CHAR({n})"),
+        DataType::Bool => "BOOL".into(),
+        DataType::Vector { dim, encoding } => match encoding {
+            spg_storage::VecEncoding::F32 => alloc::format!("VECTOR({dim})"),
+            spg_storage::VecEncoding::Sq8 => alloc::format!("VECTOR({dim}) USING SQ8"),
+            spg_storage::VecEncoding::F16 => alloc::format!("VECTOR({dim}) USING HALF"),
+        },
+        DataType::Numeric { precision, scale } => {
+            alloc::format!("NUMERIC({precision},{scale})")
+        }
+        DataType::Date => "DATE".into(),
+        DataType::Timestamp => "TIMESTAMP".into(),
+        DataType::Interval => "INTERVAL".into(),
+        DataType::Json => "JSON".into(),
+        DataType::Jsonb => "JSONB".into(),
+        DataType::Timestamptz => "TIMESTAMPTZ".into(),
+        DataType::Bytes => "BYTEA".into(),
+        DataType::TextArray => "TEXT[]".into(),
+        DataType::IntArray => "INT[]".into(),
+        DataType::BigIntArray => "BIGINT[]".into(),
+        DataType::TsVector => "TSVECTOR".into(),
+        DataType::TsQuery => "TSQUERY".into(),
+        DataType::Uuid => "UUID".into(),
+        DataType::Time => "TIME".into(),
+        DataType::Year => "YEAR".into(),
+        DataType::TimeTz => "TIMETZ".into(),
+        DataType::Money => "MONEY".into(),
+        DataType::Range(k) => k.keyword().into(),
+        DataType::Hstore => "HSTORE".into(),
+        DataType::IntArray2D => "INT[][]".into(),
+        DataType::BigIntArray2D => "BIGINT[][]".into(),
+        DataType::TextArray2D => "TEXT[][]".into(),
     }
 }
