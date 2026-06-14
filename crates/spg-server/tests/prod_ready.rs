@@ -427,8 +427,11 @@ fn row_1_8_storage_crc32_present_and_chaos_tested() {
         chaos_src.contains("fn chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay"),
         "e2e_chaos.rs must contain the v4.37 bit-flip CRC32 test"
     );
-    let engine_src = std::fs::read_to_string(workspace_root().join("crates/spg-engine/src/lib.rs"))
-        .expect("spg-engine lib.rs");
+    // v7.32 engine modularisation moved the snapshot-envelope codec out
+    // of lib.rs into envelope.rs; the v2 CRC32 invariant lives there now.
+    let engine_src =
+        std::fs::read_to_string(workspace_root().join("crates/spg-engine/src/envelope.rs"))
+            .expect("spg-engine envelope.rs");
     assert!(
         engine_src.contains("ENVELOPE_VERSION_V2") && engine_src.contains("spg_crypto::crc32"),
         "engine envelope must carry a v2 CRC32 trailer"
