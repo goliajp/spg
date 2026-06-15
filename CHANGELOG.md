@@ -8,6 +8,38 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.32.0] — 2026-06-15
+
+Executor architecture v2 + the perf campaign's structural knives,
+shipped together with two production bug fixes.
+
+- **Bug fixes (production):**
+  - round-31 — correlated subqueries inside aggregate arguments
+    (`MAX((SELECT … WHERE i.fk = o.id))`) now route through the
+    correlated evaluator instead of erroring `subquery reached row
+    eval`; golia.ai 7.30.3 hit the same path.
+  - round-30 — the optimistic correlated-materialise that cloned a
+    whole 10 GB drive table before a keyed join is gone; static
+    `select_is_correlated` pre-check defers it and the join keys
+    (PG/MySQL/MariaDB standard plan). The 12.68 GiB prod livelock is
+    closed; 10 GB inbox churn 12.16 → 0.49 GB.
+- **Perf (executor architecture v2, P1+P2):** compiled flat-step
+  expressions for WHERE/projection/aggregate-args (InSet/Like
+  compile-time sets, no per-row tree walk), post-LIMIT evaluation of
+  subquery select items. The 24k-row prod-shape inbox query runs in
+  ~29 ms embedded — faster than PG 18 (~34 ms) on the same machine.
+- **Memory (ceiling-first):** `Engine::memory_stats()` /
+  `Database::memory_stats()` / `SELECT * FROM spg_memory_stats`
+  bucket meters, plus a byte budget enforced at the result choke
+  point so any single-table / aggregate SELECT is bounded.
+- **Internal — executor modularisation (no behaviour change):**
+  `spg-engine/lib.rs` 22.8k → 0.9k lines and `eval.rs` 8.5k → 1.2k
+  lines split into focused domain modules; the five largest engine
+  methods (`aggregate::run`, `exec_insert`,
+  `exec_alter_table_subaction`, `exec_bare_select_cancel`,
+  `exec_create_table`) decomposed into named helpers; `spg-server`
+  `main.rs` 4.5k → 2.8k lines (wire / WAL / commands modules).
+
 ## [7.31.1] — 2026-06-13 (HOTFIX — rust 1.96 clippy sweep; supersedes the unpublished 7.31.0)
 
 One-line `clippy::int_plus_one` sweep (new stable lint landed

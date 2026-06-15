@@ -13,8 +13,8 @@ name = "sqllogictest"
 path = "src/main.rs"
 
 [dependencies]
-spg-engine  = { path = "../../crates/spg-engine",  version = "7.11" }
-spg-storage = { path = "../../crates/spg-storage", version = "7.11" }
+spg-engine  = { path = "../../crates/spg-engine", version = "7.32" }
+spg-storage = { path = "../../crates/spg-storage", version = "7.32" }
 
 [lints]
 workspace = true

@@ -15,10 +15,10 @@ publish      = false
 # out unsafe_code for spg-crypto; this crate inherits the default deny.
 
 [dependencies]
-spg-engine         = { path = "../../crates/spg-engine",  version = "7.11" }
-spg-storage        = { path = "../../crates/spg-storage", version = "7.11" }
-spg-wire           = { path = "../../crates/spg-wire",    version = "7.11" }
-spg-sql            = { path = "../../crates/spg-sql",     version = "7.11" }
+spg-engine         = { path = "../../crates/spg-engine", version = "7.32" }
+spg-storage        = { path = "../../crates/spg-storage", version = "7.32" }
+spg-wire           = { path = "../../crates/spg-wire", version = "7.32" }
+spg-sql            = { path = "../../crates/spg-sql", version = "7.32" }
 # v7.18 — sqlx Pool concurrent-reads bench needs the sqlx adapter
 # + embed wrappers so the harness can stand up SpgPool and an
 # AsyncDatabase side-by-side with the wire-protocol PgPool.
