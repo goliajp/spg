@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "7.31.1"
+version      = "7.32.0"
 edition      = "2024"
 rust-version = "1.95"
 authors      = ["GOLIA K.K. <lihao@golia.jp>"]
@@ -37,22 +37,22 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # `version = "X.Y"` alongside the `path = …`. crates.io strips paths
 # and uses the version; `path` keeps local development from going via
 # the registry. All ten crates share the workspace version.
-spg-wire     = { path = "crates/spg-wire",     version = "7.9" }
-spg-crypto   = { path = "crates/spg-crypto",   version = "7.9" }
-spg-sql      = { path = "crates/spg-sql",      version = "7.9" }
-spg-storage  = { path = "crates/spg-storage",  version = "7.9" }
-spg-audit    = { path = "crates/spg-audit",    version = "7.9" }
-spg-manifest = { path = "crates/spg-manifest", version = "7.9" }
-spg-engine   = { path = "crates/spg-engine",   version = "7.9" }
-spg-embedded = { path = "crates/spg-embedded", version = "7.9" }
+spg-wire     = { path = "crates/spg-wire", version = "7.32" }
+spg-crypto   = { path = "crates/spg-crypto", version = "7.32" }
+spg-sql      = { path = "crates/spg-sql", version = "7.32" }
+spg-storage  = { path = "crates/spg-storage", version = "7.32" }
+spg-audit    = { path = "crates/spg-audit", version = "7.32" }
+spg-manifest = { path = "crates/spg-manifest", version = "7.32" }
+spg-engine   = { path = "crates/spg-engine", version = "7.32" }
+spg-embedded = { path = "crates/spg-embedded", version = "7.32" }
 # v7.10.0 — tokio adapter for spg-embedded. Bumps the published
 # version to 7.10 right at introduction; spg-embedded stays 0-deps
 # and this is the *only* crate that pulls tokio.
-spg-embedded-tokio = { path = "crates/spg-embedded-tokio", version = "7.10" }
+spg-embedded-tokio = { path = "crates/spg-embedded-tokio", version = "7.32" }
 # v7.16.0 — sqlx 0.8 adapter for spg-embedded. Lets mailrs-shape
 # in-process callers use sqlx::query / query_as / pool.begin against
 # an in-process SPG (no TCP listener).
-spg-sqlx = { path = "crates/spg-sqlx", version = "7.17" }
+spg-sqlx = { path = "crates/spg-sqlx", version = "7.32" }
 
 [workspace.lints.rust]
 # v3.0.4: relaxed from `forbid` to `deny` so spg-crypto can drop into
