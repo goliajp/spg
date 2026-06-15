@@ -668,6 +668,23 @@ impl Engine {
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(&inner_col.name))?;
             table.index_on(pos)?;
+            // v7.33 (mailrs 7.32.1) — cost guard. The keyed path runs one
+            // index seek (a full `exec_select_cancel` round trip) per
+            // surviving correlation key. That wins when few keys survive
+            // (a tight outer LIMIT leaves a handful), but a *correlated
+            // select-list subquery with no outer LIMIT* leaves every group
+            // alive — `restrict` is then all ~N groups, and N seeks dwarf
+            // a single grouped all-keys scan of the same driver. Reproduced
+            // on the conversation aggregation (`get_conversations_by_thread_ids`,
+            // no LIMIT): 24k per-key seeks took 78–155 ms vs ~one scan.
+            // Fall through to the all-keys batch (`keyed = None` → the
+            // `else` arm below) when the survivor set is large relative to
+            // the driver; the batch's group map ⊇ the keyed map for every
+            // covered key, so the result is identical. Crossover ~rows/4
+            // (measured per-seek exec overhead vs per-row scan cost).
+            if rows.len().saturating_mul(4) >= table.row_count() {
+                return None;
+            }
             // For a join inner, drive the seek from the correlation
             // table so `inner_col = <lit>` lands as a primary index
             // seek (else the source-order primary scans the full
