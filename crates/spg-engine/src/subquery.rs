@@ -13,7 +13,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use spg_sql::ast::{BinOp, Expr, Literal, SelectItem, SelectStatement};
+use spg_sql::ast::{
+    BinOp, ColumnName, Expr, FromJoin, JoinKind, Literal, SelectItem, SelectStatement, TableRef,
+};
 use spg_storage::{Row, Value};
 
 use crate::eval::{self, EvalContext};
@@ -780,7 +782,390 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// v7.33 (mailrs 7.32.1) — sublink pull-up for aggregate-wrapped
+    /// correlated scalar subqueries. Rewrite
+    ///   AGG( (SELECT j_col FROM t j WHERE j.key = outer.col [AND inner preds]) )
+    /// into a LEFT JOIN plus a plain column reference:
+    ///   AGG(j.j_col) … LEFT JOIN t AS j ON j.key = outer.col [AND inner preds]
+    /// when `t.key` carries a single-column UNIQUE / PRIMARY KEY constraint.
+    /// That constraint guarantees the join matches AT MOST ONE inner row
+    /// per outer row, which is exactly the scalar subquery's at-most-one
+    /// contract (NULL on no match), so the aggregate folds an identical
+    /// per-row value stream — only now the executor streams one join
+    /// instead of splicing a per-row subplan (the R31 path cloned a hollow
+    /// template per outer row: ~24k clones for the mailrs conversation
+    /// aggregation).
+    ///
+    /// Scoped tightly for safety: the subquery must sit inside an aggregate
+    /// argument (so the joined column is always folded, never a bare
+    /// select-list column a GROUP BY would reject); the inner must be a
+    /// single plain-table scan projecting one inner column with exactly one
+    /// `inner.key = outer.col` correlation (both qualified) plus optional
+    /// all-inner predicates; and the select list must have no bare wildcard
+    /// (a join would widen `*`). Anything else is left for the existing
+    /// per-row / batch resolver. Returns true when it rewrote at least one.
+    pub(crate) fn pull_up_unique_correlated_agg_subqueries(
+        &self,
+        stmt: &mut SelectStatement,
+    ) -> bool {
+        if stmt.from.is_none() || stmt.items.iter().any(|i| matches!(i, SelectItem::Wildcard)) {
+            return false;
+        }
+        // Aliases an outer-correlation column may qualify to.
+        let outer_aliases: alloc::collections::BTreeSet<String> = {
+            let from = stmt.from.as_ref().expect("from present");
+            let mut s = alloc::collections::BTreeSet::new();
+            let push = |s: &mut alloc::collections::BTreeSet<String>, t: &TableRef| {
+                s.insert(
+                    t.alias
+                        .clone()
+                        .unwrap_or_else(|| t.name.clone())
+                        .to_ascii_lowercase(),
+                );
+            };
+            push(&mut s, &from.primary);
+            for j in &from.joins {
+                push(&mut s, &j.table);
+            }
+            s
+        };
+        let mut new_joins: Vec<FromJoin> = Vec::new();
+        for item in &mut stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.pull_up_walk(expr, false, &outer_aliases, &mut new_joins);
+            }
+        }
+        if new_joins.is_empty() {
+            return false;
+        }
+        stmt.from
+            .as_mut()
+            .expect("from present")
+            .joins
+            .extend(new_joins);
+        true
+    }
+
+    /// Recursive mutable walk over an expression tracking whether we are
+    /// inside an aggregate argument. A correlated scalar subquery found in
+    /// aggregate context that `try_pull_up_join` accepts is replaced in
+    /// place by the joined column; the join is queued in `joins_out`.
+    fn pull_up_walk(
+        &self,
+        e: &mut Expr,
+        in_agg: bool,
+        outer_aliases: &alloc::collections::BTreeSet<String>,
+        joins_out: &mut Vec<FromJoin>,
+    ) {
+        match e {
+            Expr::ScalarSubquery(inner) => {
+                if in_agg
+                    && let Some((join, col)) =
+                        self.try_pull_up_join(inner, outer_aliases, joins_out.len())
+                {
+                    joins_out.push(join);
+                    *e = Expr::Column(col);
+                }
+                // Otherwise leave for the existing resolver; the subquery
+                // body is a separate scope, so don't descend into it.
+            }
+            Expr::FunctionCall { name, args } => {
+                let child = in_agg || aggregate::is_aggregate_name(name);
+                for a in args.iter_mut() {
+                    self.pull_up_walk(a, child, outer_aliases, joins_out);
+                }
+            }
+            Expr::AggregateOrdered {
+                call,
+                order_by,
+                filter,
+                ..
+            } => {
+                self.pull_up_walk(call, true, outer_aliases, joins_out);
+                for o in order_by.iter_mut() {
+                    self.pull_up_walk(&mut o.expr, true, outer_aliases, joins_out);
+                }
+                if let Some(f) = filter {
+                    self.pull_up_walk(f, true, outer_aliases, joins_out);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.pull_up_walk(lhs, in_agg, outer_aliases, joins_out);
+                self.pull_up_walk(rhs, in_agg, outer_aliases, joins_out);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                self.pull_up_walk(expr, in_agg, outer_aliases, joins_out);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.pull_up_walk(expr, in_agg, outer_aliases, joins_out);
+                self.pull_up_walk(pattern, in_agg, outer_aliases, joins_out);
+            }
+            Expr::InList { expr, list, .. } => {
+                self.pull_up_walk(expr, in_agg, outer_aliases, joins_out);
+                for it in list.iter_mut() {
+                    self.pull_up_walk(it, in_agg, outer_aliases, joins_out);
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    self.pull_up_walk(o, in_agg, outer_aliases, joins_out);
+                }
+                for (w, t) in branches.iter_mut() {
+                    self.pull_up_walk(w, in_agg, outer_aliases, joins_out);
+                    self.pull_up_walk(t, in_agg, outer_aliases, joins_out);
+                }
+                if let Some(eb) = else_branch {
+                    self.pull_up_walk(eb, in_agg, outer_aliases, joins_out);
+                }
+            }
+            // Window functions, EXISTS / IN subqueries, and other variants
+            // are intentionally not descended for this rewrite — the
+            // common aggregate-arg shapes above cover the reported load and
+            // anything missed simply keeps its existing evaluation.
+            _ => {}
+        }
+    }
+
+    /// Decide whether a correlated scalar subquery qualifies for the
+    /// unique-key LEFT JOIN pull-up. Returns the join to append and the
+    /// column that replaces the subquery node, or None to leave it alone.
+    fn try_pull_up_join(
+        &self,
+        inner: &SelectStatement,
+        outer_aliases: &alloc::collections::BTreeSet<String>,
+        alias_n: usize,
+    ) -> Option<(FromJoin, ColumnName)> {
+        // Inner must be a single plain-table scan with one projected
+        // column and none of the shape-breaking clauses.
+        if !inner.ctes.is_empty()
+            || !inner.unions.is_empty()
+            || inner.group_by.is_some()
+            || inner.having.is_some()
+            || inner.distinct
+            || !inner.order_by.is_empty()
+            || inner.limit.is_some()
+            || inner.offset.is_some()
+            || inner.items.len() != 1
+        {
+            return None;
+        }
+        let from = inner.from.as_ref()?;
+        if !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.as_of_segment.is_some()
+        {
+            return None;
+        }
+        let inner_table = from.primary.name.clone();
+        let inner_alias = from
+            .primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| inner_table.clone());
+        let is_inner = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(&inner_alias))
+        };
+        let is_outer = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| outer_aliases.contains(&q.to_ascii_lowercase()))
+        };
+        // Projected column: a single inner-qualified column.
+        let SelectItem::Expr { expr: out_expr, .. } = &inner.items[0] else {
+            return None;
+        };
+        let Expr::Column(out_col) = out_expr else {
+            return None;
+        };
+        if !is_inner(out_col) {
+            return None;
+        }
+        // WHERE: exactly one `inner.key = outer.col`, rest all-inner.
+        let w = inner.where_.as_ref()?;
+        let mut corr: Option<(String, ColumnName)> = None;
+        let mut rest: Vec<Expr> = Vec::new();
+        for c in reorder::split_and_conjunctions(w) {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::Eq,
+                rhs,
+            } = c
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let pair = if is_inner(a) && is_outer(b) {
+                    Some((a.name.clone(), b.clone()))
+                } else if is_inner(b) && is_outer(a) {
+                    Some((b.name.clone(), a.clone()))
+                } else {
+                    None
+                };
+                if let Some(p) = pair {
+                    if corr.is_some() {
+                        return None; // more than one correlation
+                    }
+                    corr = Some(p);
+                    continue;
+                }
+            }
+            if !expr_is_all_inner(c, &inner_alias) {
+                return None;
+            }
+            rest.push(c.clone());
+        }
+        let (inner_key, outer_col) = corr?;
+        // Safety gate: the correlation key must be UNIQUE / PRIMARY KEY on
+        // the inner table so the join can't multiply outer rows.
+        if !self.column_is_single_unique(&inner_table, &inner_key) {
+            return None;
+        }
+        // Build the LEFT JOIN against a fresh alias.
+        let fresh = alloc::format!("__plj_{alias_n}");
+        let key_eq = Expr::Binary {
+            lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
+                qualifier: Some(fresh.clone()),
+                name: inner_key,
+            })),
+            op: BinOp::Eq,
+            rhs: alloc::boxed::Box::new(Expr::Column(outer_col)),
+        };
+        let on = rest
+            .into_iter()
+            .map(|mut e| {
+                rename_qualifier(&mut e, &inner_alias, &fresh);
+                e
+            })
+            .fold(key_eq, |acc, pred| Expr::Binary {
+                lhs: alloc::boxed::Box::new(acc),
+                op: BinOp::And,
+                rhs: alloc::boxed::Box::new(pred),
+            });
+        let join = FromJoin {
+            kind: JoinKind::Left,
+            table: TableRef {
+                name: inner_table,
+                alias: Some(fresh.clone()),
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: None,
+            },
+            on: Some(on),
+        };
+        let repl = ColumnName {
+            qualifier: Some(fresh),
+            name: out_col.name.clone(),
+        };
+        Some((join, repl))
+    }
+
+    /// True when `col` on `table` is covered by a single-column UNIQUE or
+    /// PRIMARY KEY constraint (declared and engine-enforced), or a unique
+    /// index — i.e. an equality on it matches at most one row.
+    fn column_is_single_unique(&self, table: &str, col: &str) -> bool {
+        let Some(t) = self.active_catalog().get(table) else {
+            return false;
+        };
+        let sch = t.schema();
+        let Some(pos) = sch
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col))
+        else {
+            return false;
+        };
+        if sch
+            .uniqueness_constraints
+            .iter()
+            .any(|u| u.columns.as_slice() == [pos])
+        {
+            return true;
+        }
+        t.index_on(pos).is_some_and(|idx| idx.is_unique)
+    }
+}
+
 // ---- subquery free-fn helpers (lib.rs split 6) ----
+
+/// v7.33 — true when every column in `e` is qualified to `inner_alias`
+/// and `e` contains no nested subquery. Used by the sublink pull-up to
+/// confirm a non-correlation conjunct is purely inner (safe to carry into
+/// the join ON after a qualifier rename).
+fn expr_is_all_inner(e: &Expr, inner_alias: &str) -> bool {
+    let mut cols: Vec<ColumnName> = Vec::new();
+    let mut subs: Vec<&SelectStatement> = Vec::new();
+    visit_expr_columns_and_subqueries(e, &mut |c| cols.push(c.clone()), &mut |s| subs.push(s));
+    subs.is_empty()
+        && cols.iter().all(|c| {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(inner_alias))
+        })
+}
+
+/// v7.33 — rename every column qualifier equal to `from` into `to` in
+/// place. Used to retarget an inner subquery's predicates from its
+/// original table alias onto the fresh LEFT JOIN alias.
+fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
+    match e {
+        Expr::Column(c) => {
+            if c.qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(from))
+            {
+                c.qualifier = Some(to.into());
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            rename_qualifier(lhs, from, to);
+            rename_qualifier(rhs, from, to);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rename_qualifier(expr, from, to);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args.iter_mut() {
+                rename_qualifier(a, from, to);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            rename_qualifier(expr, from, to);
+            rename_qualifier(pattern, from, to);
+        }
+        Expr::InList { expr, list, .. } => {
+            rename_qualifier(expr, from, to);
+            for it in list.iter_mut() {
+                rename_qualifier(it, from, to);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                rename_qualifier(o, from, to);
+            }
+            for (w, t) in branches.iter_mut() {
+                rename_qualifier(w, from, to);
+                rename_qualifier(t, from, to);
+            }
+            if let Some(eb) = else_branch {
+                rename_qualifier(eb, from, to);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// v4.23: recognise the engine errors that indicate the inner
 /// SELECT couldn't be evaluated in isolation because it references
