@@ -1034,41 +1034,11 @@ fn run(
     // populate it before ServerState is built. After `run` finishes
     // setup it gets moved into `ServerState::cold_segment_paths`.
     let mut cold_segment_paths: BTreeMap<u32, PathBuf> = BTreeMap::new();
-    let mut manifest_wal_baseline: u64 = 0;
-    let mut engine = match &db_path {
-        Some(p) if p.exists() => {
-            let bytes = fs::read(p)?;
-            let path_str = p.display();
-            // v4.1: snapshot may be either a v4.1 envelope (catalog +
-            // users) or the bare v3.x catalog blob. `restore_envelope`
-            // handles both transparently — v3.x files keep loading.
-            let mut engine = Engine::restore_envelope(&bytes)
-                .map_err(|e| std::io::Error::other(format!("restore from {path_str}: {e}")))?;
-            eprintln!(
-                "spg-server: restored {} table(s), {} user(s) from {path_str}",
-                engine.catalog().table_count(),
-                engine.users().len()
-            );
-            // v5.3.1: load the sidecar manifest, if any. Verifies the
-            // snapshot CRC matches what we just read, then auto-
-            // preloads every recorded cold-tier segment. Returns 0
-            // (= legacy "replay from start") when no usable manifest
-            // exists, so old deployments boot identical to v5.2.
-            manifest_wal_baseline =
-                load_manifest_and_preload_cold(&mut engine, p, &bytes, &mut cold_segment_paths);
-            engine
-        }
-        Some(p) => {
-            eprintln!(
-                "spg-server: db file {} does not exist yet — starting fresh",
-                p.display()
-            );
-            Engine::new()
-        }
-        None => Engine::new(),
-    }
-    .with_clock(wall_clock_micros)
-    .with_salt_fn(urandom_salt_or_panic);
+    let (base_engine, manifest_wal_baseline) =
+        restore_engine(db_path.as_deref(), &mut cold_segment_paths)?;
+    let mut engine = base_engine
+        .with_clock(wall_clock_micros)
+        .with_salt_fn(urandom_salt_or_panic);
 
     if let Some(n) = limits.max_query_rows {
         engine = engine.with_max_query_rows(n);
@@ -1111,93 +1081,11 @@ fn run(
         None => AuditLog::new(),
     };
 
-    // Replay WAL onto the loaded snapshot. Truncated entries (server crash
-    // mid-fsync) abort the loop with a warning rather than fatal — the
-    // already-applied prefix wins, the trailing partial entry is dropped.
-    // An open TX at end-of-WAL is auto-rolled-back.
-    if let Some(p) = &wal_path
-        && p.exists()
-    {
-        let mut bytes = fs::read(p)?;
-        // v4.25 PITR: SPG_REPLAY_UPTO caps replay at a specific
-        // byte offset of the WAL. Anything past that offset is
-        // ignored on this boot — operator's restore mechanism.
-        // 0 is a meaningful value (= "snapshot only, skip all WAL"),
-        // so this parser doesn't reuse parse_env_u64's `n > 0` filter.
-        if let Ok(s) = env::var("SPG_REPLAY_UPTO")
-            && let Ok(upto) = s.trim().parse::<u64>()
-        {
-            let upto_usize = usize::try_from(upto).unwrap_or(usize::MAX);
-            if bytes.len() > upto_usize {
-                eprintln!(
-                    "spg-server: PITR — truncating WAL replay at offset {upto} \
-                     (of {} total bytes)",
-                    bytes.len()
-                );
-                bytes.truncate(upto_usize);
-            }
-        }
-        // v5.3.1: skip WAL bytes before the manifest's recorded
-        // baseline. Those bytes have already been incorporated into
-        // the snapshot we just restored — replaying them would
-        // double-insert. v5.3.2 physically truncates the WAL file
-        // up to the same offset for disk reclaim; v5.3.1 only
-        // optimises replay time.
-        let baseline_usize = usize::try_from(manifest_wal_baseline).unwrap_or(usize::MAX);
-        if baseline_usize > 0 && baseline_usize <= bytes.len() {
-            eprintln!(
-                "spg-server: manifest skip — WAL replay starts at offset {manifest_wal_baseline} \
-                 (of {} total bytes)",
-                bytes.len()
-            );
-            bytes.drain(..baseline_usize);
-        } else if baseline_usize > bytes.len() {
-            // Manifest baseline is past EOF — the WAL file shrank
-            // between checkpoint write and this boot. Defensive
-            // fallback: replay the whole file. Data isn't lost,
-            // just re-applied (and the auto-rollback at end-of-WAL
-            // handles any mid-TX leftover).
-            eprintln!(
-                "spg-server: manifest WAL baseline {manifest_wal_baseline} exceeds file size {}; \
-                 replaying from start as a safety net",
-                bytes.len()
-            );
-        }
-        let applied = replay_wal_bytes(&bytes, &mut engine)?;
-        eprintln!(
-            "spg-server: replayed {} WAL entries from {}",
-            applied,
-            p.display()
-        );
-        if engine.in_transaction() {
-            eprintln!("spg-server: WAL ended mid-transaction — auto-rollback");
-            engine
-                .execute("ROLLBACK")
-                .map_err(|e| std::io::Error::other(format!("post-replay rollback: {e}")))?;
-        }
-    } else if let Some(p) = &wal_path {
-        // Create empty WAL file ahead of time so OpenOptions::append below
-        // doesn't need a `create(true)` branch.
-        fs::write(p, b"")?;
-        eprintln!("spg-server: started fresh WAL at {}", p.display());
-    }
+    replay_wal_into_engine(&mut engine, wal_path.as_deref(), manifest_wal_baseline)?;
 
     bootstrap_admin_from_env(&mut engine, db_path.as_deref())?;
 
-    let (wal, wal_sync_clone) = match &wal_path {
-        Some(p) => {
-            let file = OpenOptions::new().append(true).open(p).map_err(|e| {
-                std::io::Error::other(format!("open WAL {} for append: {e}", p.display()))
-            })?;
-            // v5.4.4 — clone the handle for lock-free fsync from the
-            // async-commit flusher. `try_clone` failure (extremely
-            // rare; would mean fd exhaustion at startup) degrades
-            // gracefully: the flusher falls back to taking the mutex.
-            let sync_clone = file.try_clone().ok().map(Arc::new);
-            (Some(Mutex::new(file)), sync_clone)
-        }
-        None => (None, None),
-    };
+    let (wal, wal_sync_clone) = open_wal_for_append(wal_path.as_deref())?;
 
     let auth_msg = if password.is_some() {
         " (AUTH required)"
@@ -1300,88 +1188,7 @@ fn run(
     let local = listener.local_addr()?;
     eprintln!("spg-server: listening on {local}{auth_msg}");
 
-    // v4.3: optional PG-wire compatibility listener. Opt-in via env
-    // so a deployment that doesn't need psql / Metabase / DBeaver
-    // doesn't pay the extra port + thread.
-    // v7.13.0 (C1, mailrs round-5): the Dockerfile sets
-    // `SPG_PG_ADDR=0.0.0.0:5432` so the official image is a
-    // drop-in PG listener. Local / cargo-test runs keep the
-    // pre-v7.13 opt-in behaviour (no listener unless the env var
-    // is explicitly set).
-    if let Ok(pg_addr) = env::var("SPG_PG_ADDR")
-        && !pg_addr.is_empty()
-    {
-        match pgwire::spawn_listener(&pg_addr, Arc::clone(&state)) {
-            Ok(pg_local) => eprintln!("spg-server: pg-wire listening on {pg_local}"),
-            Err(e) => eprintln!("spg-server: pg-wire failed to start on {pg_addr}: {e}"),
-        }
-    }
-
-    // v7.17.0 Phase 3.P0-70 — optional MySQL-wire compatibility
-    // listener. Opt-in via env so existing deployments don't
-    // suddenly grow a third bound port. Plumbed through Segment
-    // G as auth (P0-71/P0-72), commands (P0-73..P0-75), binary
-    // result rows (P0-76), and SSL upgrade (P0-77) land.
-    if let Ok(my_addr) = env::var("SPG_MYSQLWIRE_ADDR")
-        && !my_addr.is_empty()
-    {
-        match mysqlwire::spawn_listener(&my_addr, Arc::clone(&state)) {
-            Ok(my_local) => eprintln!("spg-server: mysql-wire listening on {my_local}"),
-            Err(e) => eprintln!("spg-server: mysql-wire failed to start on {my_addr}: {e}"),
-        }
-    }
-
-    // v4.13: optional observability HTTP endpoint. /healthz for
-    // k8s liveness, /metrics for Prometheus scraping. The
-    // listener reads live counters out of state directly via
-    // an Arc<ServerState>.
-    if let Ok(http_addr) = env::var("SPG_HTTP_ADDR")
-        && !http_addr.is_empty()
-    {
-        match observability::spawn_http(&http_addr, Arc::clone(&state)) {
-            Ok(http_local) => eprintln!("spg-server: http listening on {http_local}"),
-            Err(e) => eprintln!("spg-server: http failed to start on {http_addr}: {e}"),
-        }
-    }
-
-    // v4.24: optional master-side replication listener. When set,
-    // followers can connect and stream the WAL.
-    if let Ok(repl_addr) = env::var("SPG_REPL_ADDR")
-        && !repl_addr.is_empty()
-    {
-        match replication::spawn_master_listener(&repl_addr, Arc::clone(&state)) {
-            Ok(repl_local) => {
-                eprintln!("spg-server: replication listening on {repl_local}");
-            }
-            Err(e) => {
-                eprintln!("spg-server: replication failed to start on {repl_addr}: {e}");
-            }
-        }
-    }
-
-    // v4.24: optional follower mode. When set, the server tails
-    // the master's WAL and applies it locally. Requires a db_path
-    // and wal_path so the snapshot + WAL stream can be persisted
-    // (and survive restart).
-    if let Ok(master_addr) = env::var("SPG_FOLLOW_OF")
-        && !master_addr.is_empty()
-    {
-        if let (Some(db), Some(wal)) = (state.db_path.clone(), state.wal_path.clone()) {
-            let state_for_follower = Arc::clone(&state);
-            thread::Builder::new()
-                .name("spg-follower".into())
-                .spawn(move || {
-                    replication::run_follower(master_addr, db, wal, state_for_follower);
-                })
-                .ok();
-            eprintln!("spg-server: started as follower");
-        } else {
-            eprintln!(
-                "spg-server: SPG_FOLLOW_OF set but db_path or wal_path missing — \
-                 follower mode requires both"
-            );
-        }
-    }
+    spawn_optional_listeners(&state);
 
     // v5.2.2: background freezer. Polls every tick; if hot-tier byte
     // sum exceeds `SPG_HOT_TIER_BYTES` (default 4 GiB), demotes a
@@ -1450,6 +1257,252 @@ fn run(
     }
     drain_connections(&state);
     Ok(())
+}
+
+/// v7.33 (D) — spawn the env-gated auxiliary listeners / workers split
+/// out of `run`: the PG-wire and MySQL-wire compatibility listeners, the
+/// observability HTTP endpoint, the master-side replication listener, and
+/// follower mode. Each is opt-in via its own env var (except the
+/// Dockerfile's default `SPG_PG_ADDR`); absent var = no port, no thread.
+/// Pure extraction — behaviour is identical to the inline block.
+/// v7.33 (D) — restore the engine from the snapshot file (or start
+/// fresh), split out of `run`. On an existing db file: restore the v4
+/// envelope (or bare v3 catalog), then load the sidecar manifest and
+/// auto-preload its cold-tier segments into `cold_segment_paths`,
+/// returning the manifest's WAL baseline (0 = replay from start, the
+/// legacy default). The clock / salt / query-limit builders are applied
+/// by the caller. Pure extraction.
+fn restore_engine(
+    db_path: Option<&Path>,
+    cold_segment_paths: &mut BTreeMap<u32, PathBuf>,
+) -> std::io::Result<(Engine, u64)> {
+    let mut manifest_wal_baseline: u64 = 0;
+    let engine = match db_path {
+        Some(p) if p.exists() => {
+            let bytes = fs::read(p)?;
+            let path_str = p.display();
+            // v4.1: snapshot may be either a v4.1 envelope (catalog +
+            // users) or the bare v3.x catalog blob. `restore_envelope`
+            // handles both transparently — v3.x files keep loading.
+            let mut engine = Engine::restore_envelope(&bytes)
+                .map_err(|e| std::io::Error::other(format!("restore from {path_str}: {e}")))?;
+            eprintln!(
+                "spg-server: restored {} table(s), {} user(s) from {path_str}",
+                engine.catalog().table_count(),
+                engine.users().len()
+            );
+            // v5.3.1: load the sidecar manifest, if any. Verifies the
+            // snapshot CRC matches what we just read, then auto-
+            // preloads every recorded cold-tier segment. Returns 0
+            // (= legacy "replay from start") when no usable manifest
+            // exists, so old deployments boot identical to v5.2.
+            manifest_wal_baseline =
+                load_manifest_and_preload_cold(&mut engine, p, &bytes, cold_segment_paths);
+            engine
+        }
+        Some(p) => {
+            eprintln!(
+                "spg-server: db file {} does not exist yet — starting fresh",
+                p.display()
+            );
+            Engine::new()
+        }
+        None => Engine::new(),
+    };
+    Ok((engine, manifest_wal_baseline))
+}
+
+/// v7.33 (D) — replay the WAL onto the loaded snapshot, split out of
+/// `run`. Honours PITR `SPG_REPLAY_UPTO` (byte-offset cap) and the
+/// manifest baseline (skip bytes already folded into the snapshot), and
+/// auto-rolls-back an open TX at end-of-WAL. Truncated trailing entries
+/// (crash mid-fsync) drop with a warning, not a fatal. When the WAL file
+/// is absent it is created empty so the later append open needs no
+/// `create` branch. Pure extraction.
+fn replay_wal_into_engine(
+    engine: &mut Engine,
+    wal_path: Option<&Path>,
+    manifest_wal_baseline: u64,
+) -> std::io::Result<()> {
+    // Truncated entries (server crash mid-fsync) abort the loop with a
+    // warning rather than fatal — the already-applied prefix wins, the
+    // trailing partial entry is dropped. An open TX at end-of-WAL is
+    // auto-rolled-back.
+    if let Some(p) = wal_path
+        && p.exists()
+    {
+        let mut bytes = fs::read(p)?;
+        // v4.25 PITR: SPG_REPLAY_UPTO caps replay at a specific
+        // byte offset of the WAL. Anything past that offset is
+        // ignored on this boot — operator's restore mechanism.
+        // 0 is a meaningful value (= "snapshot only, skip all WAL"),
+        // so this parser doesn't reuse parse_env_u64's `n > 0` filter.
+        if let Ok(s) = env::var("SPG_REPLAY_UPTO")
+            && let Ok(upto) = s.trim().parse::<u64>()
+        {
+            let upto_usize = usize::try_from(upto).unwrap_or(usize::MAX);
+            if bytes.len() > upto_usize {
+                eprintln!(
+                    "spg-server: PITR — truncating WAL replay at offset {upto} \
+                     (of {} total bytes)",
+                    bytes.len()
+                );
+                bytes.truncate(upto_usize);
+            }
+        }
+        // v5.3.1: skip WAL bytes before the manifest's recorded
+        // baseline. Those bytes have already been incorporated into
+        // the snapshot we just restored — replaying them would
+        // double-insert. v5.3.2 physically truncates the WAL file
+        // up to the same offset for disk reclaim; v5.3.1 only
+        // optimises replay time.
+        let baseline_usize = usize::try_from(manifest_wal_baseline).unwrap_or(usize::MAX);
+        if baseline_usize > 0 && baseline_usize <= bytes.len() {
+            eprintln!(
+                "spg-server: manifest skip — WAL replay starts at offset {manifest_wal_baseline} \
+                 (of {} total bytes)",
+                bytes.len()
+            );
+            bytes.drain(..baseline_usize);
+        } else if baseline_usize > bytes.len() {
+            // Manifest baseline is past EOF — the WAL file shrank
+            // between checkpoint write and this boot. Defensive
+            // fallback: replay the whole file. Data isn't lost,
+            // just re-applied (and the auto-rollback at end-of-WAL
+            // handles any mid-TX leftover).
+            eprintln!(
+                "spg-server: manifest WAL baseline {manifest_wal_baseline} exceeds file size {}; \
+                 replaying from start as a safety net",
+                bytes.len()
+            );
+        }
+        let applied = replay_wal_bytes(&bytes, engine)?;
+        eprintln!(
+            "spg-server: replayed {} WAL entries from {}",
+            applied,
+            p.display()
+        );
+        if engine.in_transaction() {
+            eprintln!("spg-server: WAL ended mid-transaction — auto-rollback");
+            engine
+                .execute("ROLLBACK")
+                .map_err(|e| std::io::Error::other(format!("post-replay rollback: {e}")))?;
+        }
+    } else if let Some(p) = wal_path {
+        // Create empty WAL file ahead of time so OpenOptions::append
+        // (open_wal_for_append) doesn't need a `create(true)` branch.
+        fs::write(p, b"")?;
+        eprintln!("spg-server: started fresh WAL at {}", p.display());
+    }
+    Ok(())
+}
+
+/// v7.33 (D) — open the WAL file for append + clone its handle for the
+/// async-commit flusher's lock-free fsync, split out of `run`. `None`
+/// path = WAL disabled. Pure extraction.
+#[allow(clippy::type_complexity)]
+fn open_wal_for_append(
+    wal_path: Option<&Path>,
+) -> std::io::Result<(Option<Mutex<File>>, Option<Arc<File>>)> {
+    match wal_path {
+        Some(p) => {
+            let file = OpenOptions::new().append(true).open(p).map_err(|e| {
+                std::io::Error::other(format!("open WAL {} for append: {e}", p.display()))
+            })?;
+            // v5.4.4 — clone the handle for lock-free fsync from the
+            // async-commit flusher. `try_clone` failure (extremely
+            // rare; would mean fd exhaustion at startup) degrades
+            // gracefully: the flusher falls back to taking the mutex.
+            let sync_clone = file.try_clone().ok().map(Arc::new);
+            Ok((Some(Mutex::new(file)), sync_clone))
+        }
+        None => Ok((None, None)),
+    }
+}
+
+fn spawn_optional_listeners(state: &Arc<ServerState>) {
+    // v4.3: optional PG-wire compatibility listener. Opt-in via env
+    // so a deployment that doesn't need psql / Metabase / DBeaver
+    // doesn't pay the extra port + thread.
+    // v7.13.0 (C1, mailrs round-5): the Dockerfile sets
+    // `SPG_PG_ADDR=0.0.0.0:5432` so the official image is a
+    // drop-in PG listener. Local / cargo-test runs keep the
+    // pre-v7.13 opt-in behaviour (no listener unless the env var
+    // is explicitly set).
+    if let Ok(pg_addr) = env::var("SPG_PG_ADDR")
+        && !pg_addr.is_empty()
+    {
+        match pgwire::spawn_listener(&pg_addr, Arc::clone(state)) {
+            Ok(pg_local) => eprintln!("spg-server: pg-wire listening on {pg_local}"),
+            Err(e) => eprintln!("spg-server: pg-wire failed to start on {pg_addr}: {e}"),
+        }
+    }
+
+    // v7.17.0 Phase 3.P0-70 — optional MySQL-wire compatibility
+    // listener. Opt-in via env so existing deployments don't
+    // suddenly grow a third bound port. Plumbed through Segment
+    // G as auth (P0-71/P0-72), commands (P0-73..P0-75), binary
+    // result rows (P0-76), and SSL upgrade (P0-77) land.
+    if let Ok(my_addr) = env::var("SPG_MYSQLWIRE_ADDR")
+        && !my_addr.is_empty()
+    {
+        match mysqlwire::spawn_listener(&my_addr, Arc::clone(state)) {
+            Ok(my_local) => eprintln!("spg-server: mysql-wire listening on {my_local}"),
+            Err(e) => eprintln!("spg-server: mysql-wire failed to start on {my_addr}: {e}"),
+        }
+    }
+
+    // v4.13: optional observability HTTP endpoint. /healthz for
+    // k8s liveness, /metrics for Prometheus scraping. The
+    // listener reads live counters out of state directly via
+    // an Arc<ServerState>.
+    if let Ok(http_addr) = env::var("SPG_HTTP_ADDR")
+        && !http_addr.is_empty()
+    {
+        match observability::spawn_http(&http_addr, Arc::clone(state)) {
+            Ok(http_local) => eprintln!("spg-server: http listening on {http_local}"),
+            Err(e) => eprintln!("spg-server: http failed to start on {http_addr}: {e}"),
+        }
+    }
+
+    // v4.24: optional master-side replication listener. When set,
+    // followers can connect and stream the WAL.
+    if let Ok(repl_addr) = env::var("SPG_REPL_ADDR")
+        && !repl_addr.is_empty()
+    {
+        match replication::spawn_master_listener(&repl_addr, Arc::clone(state)) {
+            Ok(repl_local) => {
+                eprintln!("spg-server: replication listening on {repl_local}");
+            }
+            Err(e) => {
+                eprintln!("spg-server: replication failed to start on {repl_addr}: {e}");
+            }
+        }
+    }
+
+    // v4.24: optional follower mode. When set, the server tails
+    // the master's WAL and applies it locally. Requires a db_path
+    // and wal_path so the snapshot + WAL stream can be persisted
+    // (and survive restart).
+    if let Ok(master_addr) = env::var("SPG_FOLLOW_OF")
+        && !master_addr.is_empty()
+    {
+        if let (Some(db), Some(wal)) = (state.db_path.clone(), state.wal_path.clone()) {
+            let state_for_follower = Arc::clone(state);
+            thread::Builder::new()
+                .name("spg-follower".into())
+                .spawn(move || {
+                    replication::run_follower(master_addr, db, wal, state_for_follower);
+                })
+                .ok();
+            eprintln!("spg-server: started as follower");
+        } else {
+            eprintln!(
+                "spg-server: SPG_FOLLOW_OF set but db_path or wal_path missing — \
+                 follower mode requires both"
+            );
+        }
+    }
 }
 
 /// v4.33: thread that watches `SHUTDOWN_FLAG` and, when it flips,
@@ -1969,345 +2022,7 @@ fn dispatch(
             let body = render_stats(state)?;
             write_frame(stream, &build_stats_response(&body))
         }
-        Op::Query => {
-            state.metrics.queries_total.fetch_add(1, Ordering::Relaxed);
-            // v5.1: cold-tier preload — checks each pending spec for
-            // (table, index) existence and loads on the first hit.
-            // No-op once every spec has loaded (Relaxed bool).
-            try_lazy_preload_cold(state);
-            let sql = match parse_query(frame) {
-                Ok(s) => s.to_string(),
-                Err(e) => {
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                    return write_frame(stream, &build_error_response(&e.to_string()));
-                }
-            };
-            // v4.33 slow-query log: scoped guard times the entire
-            // dispatch (read-path, write-path, every error branch) and
-            // emits one JSON line on stderr if elapsed exceeds
-            // `SPG_SLOW_QUERY_LOG_MS`. Drop runs on every return below.
-            let _slow_log = SlowLogGuard::new(state, &sql, *role);
-            // v6.1.7 — server-layer intercept for WAIT FOR WAL POSITION.
-            // The engine refuses this statement; we read `lag_state`
-            // (which the engine has no access to) and poll until the
-            // target is reached or the optional timeout fires.
-            if sql_looks_like_wait_for(&sql)
-                && let Ok(stmt) = spg_sql::parser::parse_statement(&sql)
-                && let spg_sql::ast::Statement::WaitForWalPosition { pos, timeout_ms } = stmt
-            {
-                return handle_wait_for_wal_position(stream, state, pos, timeout_ms);
-            }
-            // v6.1.8 — server-layer intercept for
-            //   SET   effective_wal_level = 'logical' | 'replica'
-            //   SHOW  effective_wal_level
-            // wal_level is global server state, not a session var,
-            // so the engine's pgwire-style session-settings map
-            // isn't the right home for it.
-            if sql_looks_like_show_wal_level(&sql) {
-                return handle_show_wal_level(stream, state);
-            }
-            if sql_looks_like_set_wal_level(&sql) {
-                return handle_set_wal_level(stream, state, &sql);
-            }
-            // v4.0 fast path: SELECT / SHOW outside an active TX take
-            // the engine *read* lock and run in parallel with other
-            // readers. WriteRequired drop-through is rare (only if
-            // `sql_is_read_only` peek mis-classifies — over-broad
-            // matches like a column named "select" don't happen in
-            // practice).
-            if !*in_tx && sql_is_read_only(&sql) {
-                // v4.5: per-query cancellation token. Watchdog
-                // thread (if SPG_QUERY_TIMEOUT_MS set) trips the
-                // flag after the budget; the engine's row loops
-                // poll it at checkpoints and bail.
-                let cancel_flag = Arc::new(AtomicBool::new(false));
-                let watchdog = spawn_query_watchdog(state, &cancel_flag);
-                let engine = state
-                    .engine
-                    .read()
-                    .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-                let budget = usize::try_from(
-                    state
-                        .limits
-                        .max_query_bytes
-                        .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
-                )
-                .unwrap_or(usize::MAX);
-                alloc_budget::reset_query_budget(budget, &cancel_flag);
-                let result = engine.execute_readonly_with_cancel(
-                    &sql,
-                    spg_engine::CancelToken::from_flag(&cancel_flag),
-                );
-                alloc_budget::clear_query_budget();
-                drop(engine);
-                watchdog.cancel();
-                if !matches!(&result, Err(EngineError::WriteRequired)) {
-                    return emit_result(stream, result);
-                }
-            }
-            // v4.1: anything that falls through to the write path
-            // requires a role with write privileges. ReadOnly users
-            // hit this gate; admin / readwrite proceed. CREATE USER
-            // / DROP USER need the stricter Admin role.
-            let acting = current_role(*role);
-            if sql_is_user_mgmt(&sql) {
-                if !acting.can_manage_users() {
-                    return write_frame(
-                        stream,
-                        &build_error_response(
-                            "permission denied: user management requires admin role",
-                        ),
-                    );
-                }
-            } else if !acting.can_write() {
-                return write_frame(
-                    stream,
-                    &build_error_response(
-                        "permission denied: write requires admin or readwrite role",
-                    ),
-                );
-            }
-            // v4.25: intercept BACKUP TO '<path>' [INCREMENTAL SINCE <n>]
-            // before passing to the engine. Admin-only — backup writes
-            // arbitrary file paths so it lives behind the same gate as
-            // user management.
-            if let Some(backup_intent) = parse_backup_intent(&sql) {
-                if !acting.can_manage_users() {
-                    return write_frame(
-                        stream,
-                        &build_error_response("permission denied: BACKUP requires admin role"),
-                    );
-                }
-                return run_backup_command(stream, state, &backup_intent);
-            }
-            // v5.3.2: intercept CHECKPOINT. Admin-only because it
-            // writes the snapshot + manifest + truncates the WAL —
-            // same surface as BACKUP / user management.
-            if parse_checkpoint_intent(&sql) {
-                if !acting.can_manage_users() {
-                    return write_frame(
-                        stream,
-                        &build_error_response("permission denied: CHECKPOINT requires admin role"),
-                    );
-                }
-                return run_checkpoint_command(stream, state);
-            }
-            // v6.7.3: intercept COMPACT COLD SEGMENTS. Engine-level
-            // execution would only mutate the catalog in memory;
-            // server-side persists each merged segment to
-            // `<db>.spg/segments/seg_<merged_id>.spg` + updates
-            // `cold_segment_paths` so the next CHECKPOINT writes a
-            // manifest that no longer lists the retired sources.
-            // Admin-only — same operator-surface as CHECKPOINT.
-            if parse_compact_cold_segments_intent(&sql) {
-                if !acting.can_manage_users() {
-                    return write_frame(
-                        stream,
-                        &build_error_response(
-                            "permission denied: COMPACT COLD SEGMENTS requires admin role",
-                        ),
-                    );
-                }
-                return run_compact_cold_segments_command(stream, state);
-            }
-            // v4.34: when WAL is on and this is an auto-commit write
-            // (no client-driven TX in flight, not a TX-control verb),
-            // wrap the engine mutation in an implicit BEGIN..COMMIT.
-            // v4.41 replaces the original three-v2-record block with
-            // a single v3 `auto_commit_sql` record — same atomicity
-            // (one write_all + one fsync), 35→9 header bytes per
-            // write. If the WAL append fails, we ROLLBACK the
-            // implicit TX — the live in-memory state never sees the
-            // half-applied write. Closes the real ENOSPC mid-
-            // `write_all` window that v4.30's preflight chaos path
-            // couldn't fix on its own (PROD_READY 1.11).
-            let needs_wrap = !*in_tx && state.wal.is_some() && !sql_is_tx_control(&sql);
-            // v4.30 preflight (chaos path): if SPG_FAIL_WAL_QUOTA_BYTES
-            // is set and the block won't fit, reject before any engine
-            // mutation so even without the wrap, the in-memory state
-            // stays in sync. Skipped when the test deliberately turns
-            // it off via SPG_DISABLE_WAL_PREFLIGHT — that path forces
-            // the v4.34 rollback to be exercised end-to-end.
-            if let Some(quota) = state.chaos.wal_quota_bytes
-                && let Some(wal_path) = &state.wal_path
-                && !state.chaos.disable_wal_preflight
-            {
-                let cur = fs::metadata(wal_path).map_or(0, |m| m.len());
-                let needed = if needs_wrap {
-                    wal_v3_auto_commit_size(&sql)
-                } else {
-                    4 + sql.len() as u64
-                };
-                if cur.saturating_add(needed) > quota {
-                    return write_frame(
-                        stream,
-                        &build_error_response(&format!(
-                            "wal quota exceeded: cur={cur} + {needed} > quota={quota} (SPG_FAIL_WAL_QUOTA_BYTES)"
-                        )),
-                    );
-                }
-            }
-            let cancel_flag = Arc::new(AtomicBool::new(false));
-            let watchdog = spawn_query_watchdog(state, &cancel_flag);
-            // v4.42 — split the wrap path from the non-wrap path.
-            //
-            // **Wrap path** (auto-commit write, WAL on): push the
-            // SQL onto the commit-barrier queue and wait on the
-            // task's `ack` channel. The first arriving task flips
-            // `leader_active` and drives `run_leader_commit_round`
-            // (drain → batched fsync → install/rollback), then
-            // acks every task in the group. Group of 1 = the
-            // pusher is itself the leader and proceeds without
-            // any condvar wait — same latency shape as v4.41.1.
-            //
-            // **Non-wrap path** (TX-control verbs or writes
-            // inside an explicit client TX): keep the v4.41.1
-            // synchronous flow. These don't fan out, so the
-            // commit barrier would only add coordination cost.
-            // The legacy v2 WAL framing is the right format here
-            // (auto-commit framing assumes there's no client TX
-            // in flight, which this branch contradicts).
-            let (result, wal_result, snapshot) = if needs_wrap {
-                let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
-                let task = CommitTask {
-                    sql: sql.clone(),
-                    cancel_flag: Arc::clone(&cancel_flag),
-                    ack: ack_tx,
-                };
-                let became_leader = enqueue_commit_task(state, task);
-                if became_leader {
-                    run_leader_commit_round(state);
-                }
-                let CommitResult {
-                    result,
-                    wal_outcome,
-                } = ack_rx.recv().map_err(|_| {
-                    std::io::Error::other(
-                        "commit barrier: ack channel closed before result arrived",
-                    )
-                })?;
-                // Wrap path always has WAL on (see `needs_wrap`
-                // gate above), so the wal-off snapshot branch is
-                // unreachable here. Auto-commit wraps never leave
-                // a TX open, so `*in_tx` would already be false —
-                // sync it explicitly anyway against the engine
-                // state so a hypothetical engine-internal
-                // mismatch can't drift.
-                *in_tx = state.engine.read().is_ok_and(|e| e.in_transaction());
-                (result, wal_outcome, None)
-            } else {
-                let mut engine = state
-                    .engine
-                    .write()
-                    .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-                let budget = usize::try_from(
-                    state
-                        .limits
-                        .max_query_bytes
-                        .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
-                )
-                .unwrap_or(usize::MAX);
-                alloc_budget::reset_query_budget(budget, &cancel_flag);
-                let result = engine
-                    .execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
-                alloc_budget::clear_query_budget();
-                let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
-                let wal_result = if was_command_ok && state.wal.is_some() {
-                    append_wal(state, &sql)
-                } else {
-                    Ok(())
-                };
-                *in_tx = engine.in_transaction();
-                let snapshot = if state.db_path.is_some() && state.wal.is_none() {
-                    match &result {
-                        Ok(QueryResult::CommandOk {
-                            modified_catalog: true,
-                            ..
-                        }) => Some(engine.snapshot()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                drop(engine);
-                (result, wal_result, snapshot)
-            };
-            watchdog.cancel();
-            // Snapshot the catalog first; an audit entry that survives a
-            // partial flush would be inconsistent.
-            if let (Some(bytes), Some(path)) = (snapshot.as_ref(), state.db_path.as_deref())
-                && let Err(e) = write_atomic(path, bytes)
-            {
-                let _ = write_frame(
-                    stream,
-                    &build_error_response(&format!("snapshot write failed: {e}")),
-                );
-                return Err(e);
-            }
-            // v5.3.1 — sidecar manifest write. Best-effort: a
-            // manifest failure here doesn't kill the snapshot (the
-            // WAL is still the durability surface; legacy SPG_PRELOAD
-            // _COLD_SEGMENT keeps working when the manifest is
-            // missing). Only fires when a snapshot was actually
-            // written (no-WAL mode `modified_catalog: true`).
-            if let (Some(bytes), Some(path)) = (snapshot.as_ref(), state.db_path.as_deref()) {
-                let paths_snapshot = state
-                    .cold_segment_paths
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
-                let wal_len = state
-                    .wal_path
-                    .as_deref()
-                    .and_then(|p| fs::metadata(p).ok())
-                    .map_or(0, |m| m.len());
-                write_manifest_alongside(path, bytes, &paths_snapshot, wal_len);
-            }
-            if let Err(e) = wal_result {
-                let _ = write_frame(
-                    stream,
-                    &build_error_response(&format!("WAL append failed: {e}")),
-                );
-                return Err(e);
-            }
-            // Audit-log only when the committed state actually changed AND
-            // an audit path is configured. v3.4.0 fix: previously the
-            // in-memory AuditLog grew every write even without an audit
-            // file (the SQL text was cloned into the log forever), so a
-            // long-running server with no audit configured still leaked
-            // a few MB per 10K writes.
-            if state.audit_path.is_some()
-                && matches!(
-                    result,
-                    Ok(QueryResult::CommandOk {
-                        modified_catalog: true,
-                        ..
-                    })
-                )
-                && let Err(e) = append_audit(state, &sql)
-            {
-                let _ = write_frame(
-                    stream,
-                    &build_error_response(&format!("audit append failed: {e}")),
-                );
-                return Err(e);
-            }
-            // v6.1.4 — CREATE / DROP SUBSCRIPTION flips
-            // `modified_catalog: true`. Reconcile picks up the
-            // change and spawns / tears down the corresponding
-            // worker thread. Idempotent + cheap when the catalog
-            // change wasn't subscription-related.
-            if matches!(
-                result,
-                Ok(QueryResult::CommandOk {
-                    modified_catalog: true,
-                    ..
-                })
-            ) {
-                reconcile_subscriptions(state);
-            }
-            emit_result(stream, result)
-        }
+        Op::Query => handle_query_op(stream, frame, state, *role, in_tx),
         Op::Pong
         | Op::RowDescription
         | Op::DataRow
@@ -2323,6 +2038,349 @@ fn dispatch(
             &Frame::error("clients should not send Error frames"),
         ),
     }
+}
+
+/// v7.33 (D) — the native-wire `Op::Query` handler, split out of
+/// `dispatch` (it was ~330 of its ~430 lines). Parses the SQL, runs
+/// the read fast path / write commit-barrier path, and applies WAL +
+/// snapshot + manifest + audit + subscription reconcile. Pure
+/// extraction; `dispatch` now just authenticates + routes opcodes.
+fn handle_query_op(
+    stream: &mut TcpStream,
+    frame: &Frame,
+    state: &Arc<ServerState>,
+    role: Option<Role>,
+    in_tx: &mut bool,
+) -> std::io::Result<()> {
+    state.metrics.queries_total.fetch_add(1, Ordering::Relaxed);
+    // v5.1: cold-tier preload — checks each pending spec for
+    // (table, index) existence and loads on the first hit.
+    // No-op once every spec has loaded (Relaxed bool).
+    try_lazy_preload_cold(state);
+    let sql = match parse_query(frame) {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return write_frame(stream, &build_error_response(&e.to_string()));
+        }
+    };
+    // v4.33 slow-query log: scoped guard times the entire
+    // dispatch (read-path, write-path, every error branch) and
+    // emits one JSON line on stderr if elapsed exceeds
+    // `SPG_SLOW_QUERY_LOG_MS`. Drop runs on every return below.
+    let _slow_log = SlowLogGuard::new(state, &sql, role);
+    // v6.1.7 — server-layer intercept for WAIT FOR WAL POSITION.
+    // The engine refuses this statement; we read `lag_state`
+    // (which the engine has no access to) and poll until the
+    // target is reached or the optional timeout fires.
+    if sql_looks_like_wait_for(&sql)
+        && let Ok(stmt) = spg_sql::parser::parse_statement(&sql)
+        && let spg_sql::ast::Statement::WaitForWalPosition { pos, timeout_ms } = stmt
+    {
+        return handle_wait_for_wal_position(stream, state, pos, timeout_ms);
+    }
+    // v6.1.8 — server-layer intercept for
+    //   SET   effective_wal_level = 'logical' | 'replica'
+    //   SHOW  effective_wal_level
+    // wal_level is global server state, not a session var,
+    // so the engine's pgwire-style session-settings map
+    // isn't the right home for it.
+    if sql_looks_like_show_wal_level(&sql) {
+        return handle_show_wal_level(stream, state);
+    }
+    if sql_looks_like_set_wal_level(&sql) {
+        return handle_set_wal_level(stream, state, &sql);
+    }
+    // v4.0 fast path: SELECT / SHOW outside an active TX take
+    // the engine *read* lock and run in parallel with other
+    // readers. WriteRequired drop-through is rare (only if
+    // `sql_is_read_only` peek mis-classifies — over-broad
+    // matches like a column named "select" don't happen in
+    // practice).
+    if !*in_tx && sql_is_read_only(&sql) {
+        // v4.5: per-query cancellation token. Watchdog
+        // thread (if SPG_QUERY_TIMEOUT_MS set) trips the
+        // flag after the budget; the engine's row loops
+        // poll it at checkpoints and bail.
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let watchdog = spawn_query_watchdog(state, &cancel_flag);
+        let engine = state
+            .engine
+            .read()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        let budget = usize::try_from(
+            state
+                .limits
+                .max_query_bytes
+                .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
+        )
+        .unwrap_or(usize::MAX);
+        alloc_budget::reset_query_budget(budget, &cancel_flag);
+        let result = engine
+            .execute_readonly_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
+        alloc_budget::clear_query_budget();
+        drop(engine);
+        watchdog.cancel();
+        if !matches!(&result, Err(EngineError::WriteRequired)) {
+            return emit_result(stream, result);
+        }
+    }
+    // v4.1: anything that falls through to the write path
+    // requires a role with write privileges. ReadOnly users
+    // hit this gate; admin / readwrite proceed. CREATE USER
+    // / DROP USER need the stricter Admin role.
+    let acting = current_role(role);
+    if sql_is_user_mgmt(&sql) {
+        if !acting.can_manage_users() {
+            return write_frame(
+                stream,
+                &build_error_response("permission denied: user management requires admin role"),
+            );
+        }
+    } else if !acting.can_write() {
+        return write_frame(
+            stream,
+            &build_error_response("permission denied: write requires admin or readwrite role"),
+        );
+    }
+    // v4.25: intercept BACKUP TO '<path>' [INCREMENTAL SINCE <n>]
+    // before passing to the engine. Admin-only — backup writes
+    // arbitrary file paths so it lives behind the same gate as
+    // user management.
+    if let Some(backup_intent) = parse_backup_intent(&sql) {
+        if !acting.can_manage_users() {
+            return write_frame(
+                stream,
+                &build_error_response("permission denied: BACKUP requires admin role"),
+            );
+        }
+        return run_backup_command(stream, state, &backup_intent);
+    }
+    // v5.3.2: intercept CHECKPOINT. Admin-only because it
+    // writes the snapshot + manifest + truncates the WAL —
+    // same surface as BACKUP / user management.
+    if parse_checkpoint_intent(&sql) {
+        if !acting.can_manage_users() {
+            return write_frame(
+                stream,
+                &build_error_response("permission denied: CHECKPOINT requires admin role"),
+            );
+        }
+        return run_checkpoint_command(stream, state);
+    }
+    // v6.7.3: intercept COMPACT COLD SEGMENTS. Engine-level
+    // execution would only mutate the catalog in memory;
+    // server-side persists each merged segment to
+    // `<db>.spg/segments/seg_<merged_id>.spg` + updates
+    // `cold_segment_paths` so the next CHECKPOINT writes a
+    // manifest that no longer lists the retired sources.
+    // Admin-only — same operator-surface as CHECKPOINT.
+    if parse_compact_cold_segments_intent(&sql) {
+        if !acting.can_manage_users() {
+            return write_frame(
+                stream,
+                &build_error_response(
+                    "permission denied: COMPACT COLD SEGMENTS requires admin role",
+                ),
+            );
+        }
+        return run_compact_cold_segments_command(stream, state);
+    }
+    // v4.34: when WAL is on and this is an auto-commit write
+    // (no client-driven TX in flight, not a TX-control verb),
+    // wrap the engine mutation in an implicit BEGIN..COMMIT.
+    // v4.41 replaces the original three-v2-record block with
+    // a single v3 `auto_commit_sql` record — same atomicity
+    // (one write_all + one fsync), 35→9 header bytes per
+    // write. If the WAL append fails, we ROLLBACK the
+    // implicit TX — the live in-memory state never sees the
+    // half-applied write. Closes the real ENOSPC mid-
+    // `write_all` window that v4.30's preflight chaos path
+    // couldn't fix on its own (PROD_READY 1.11).
+    let needs_wrap = !*in_tx && state.wal.is_some() && !sql_is_tx_control(&sql);
+    // v4.30 preflight (chaos path): if SPG_FAIL_WAL_QUOTA_BYTES
+    // is set and the block won't fit, reject before any engine
+    // mutation so even without the wrap, the in-memory state
+    // stays in sync. Skipped when the test deliberately turns
+    // it off via SPG_DISABLE_WAL_PREFLIGHT — that path forces
+    // the v4.34 rollback to be exercised end-to-end.
+    if let Some(quota) = state.chaos.wal_quota_bytes
+        && let Some(wal_path) = &state.wal_path
+        && !state.chaos.disable_wal_preflight
+    {
+        let cur = fs::metadata(wal_path).map_or(0, |m| m.len());
+        let needed = if needs_wrap {
+            wal_v3_auto_commit_size(&sql)
+        } else {
+            4 + sql.len() as u64
+        };
+        if cur.saturating_add(needed) > quota {
+            return write_frame(
+                stream,
+                &build_error_response(&format!(
+                    "wal quota exceeded: cur={cur} + {needed} > quota={quota} (SPG_FAIL_WAL_QUOTA_BYTES)"
+                )),
+            );
+        }
+    }
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let watchdog = spawn_query_watchdog(state, &cancel_flag);
+    // v4.42 — split the wrap path from the non-wrap path.
+    //
+    // **Wrap path** (auto-commit write, WAL on): push the
+    // SQL onto the commit-barrier queue and wait on the
+    // task's `ack` channel. The first arriving task flips
+    // `leader_active` and drives `run_leader_commit_round`
+    // (drain → batched fsync → install/rollback), then
+    // acks every task in the group. Group of 1 = the
+    // pusher is itself the leader and proceeds without
+    // any condvar wait — same latency shape as v4.41.1.
+    //
+    // **Non-wrap path** (TX-control verbs or writes
+    // inside an explicit client TX): keep the v4.41.1
+    // synchronous flow. These don't fan out, so the
+    // commit barrier would only add coordination cost.
+    // The legacy v2 WAL framing is the right format here
+    // (auto-commit framing assumes there's no client TX
+    // in flight, which this branch contradicts).
+    let (result, wal_result, snapshot) = if needs_wrap {
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
+        let task = CommitTask {
+            sql: sql.clone(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            ack: ack_tx,
+        };
+        let became_leader = enqueue_commit_task(state, task);
+        if became_leader {
+            run_leader_commit_round(state);
+        }
+        let CommitResult {
+            result,
+            wal_outcome,
+        } = ack_rx.recv().map_err(|_| {
+            std::io::Error::other("commit barrier: ack channel closed before result arrived")
+        })?;
+        // Wrap path always has WAL on (see `needs_wrap`
+        // gate above), so the wal-off snapshot branch is
+        // unreachable here. Auto-commit wraps never leave
+        // a TX open, so `*in_tx` would already be false —
+        // sync it explicitly anyway against the engine
+        // state so a hypothetical engine-internal
+        // mismatch can't drift.
+        *in_tx = state.engine.read().is_ok_and(|e| e.in_transaction());
+        (result, wal_outcome, None)
+    } else {
+        let mut engine = state
+            .engine
+            .write()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+        let budget = usize::try_from(
+            state
+                .limits
+                .max_query_bytes
+                .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
+        )
+        .unwrap_or(usize::MAX);
+        alloc_budget::reset_query_budget(budget, &cancel_flag);
+        let result =
+            engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
+        alloc_budget::clear_query_budget();
+        let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
+        let wal_result = if was_command_ok && state.wal.is_some() {
+            append_wal(state, &sql)
+        } else {
+            Ok(())
+        };
+        *in_tx = engine.in_transaction();
+        let snapshot = if state.db_path.is_some() && state.wal.is_none() {
+            match &result {
+                Ok(QueryResult::CommandOk {
+                    modified_catalog: true,
+                    ..
+                }) => Some(engine.snapshot()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        drop(engine);
+        (result, wal_result, snapshot)
+    };
+    watchdog.cancel();
+    // Snapshot the catalog first; an audit entry that survives a
+    // partial flush would be inconsistent.
+    if let (Some(bytes), Some(path)) = (snapshot.as_ref(), state.db_path.as_deref())
+        && let Err(e) = write_atomic(path, bytes)
+    {
+        let _ = write_frame(
+            stream,
+            &build_error_response(&format!("snapshot write failed: {e}")),
+        );
+        return Err(e);
+    }
+    // v5.3.1 — sidecar manifest write. Best-effort: a
+    // manifest failure here doesn't kill the snapshot (the
+    // WAL is still the durability surface; legacy SPG_PRELOAD
+    // _COLD_SEGMENT keeps working when the manifest is
+    // missing). Only fires when a snapshot was actually
+    // written (no-WAL mode `modified_catalog: true`).
+    if let (Some(bytes), Some(path)) = (snapshot.as_ref(), state.db_path.as_deref()) {
+        let paths_snapshot = state
+            .cold_segment_paths
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let wal_len = state
+            .wal_path
+            .as_deref()
+            .and_then(|p| fs::metadata(p).ok())
+            .map_or(0, |m| m.len());
+        write_manifest_alongside(path, bytes, &paths_snapshot, wal_len);
+    }
+    if let Err(e) = wal_result {
+        let _ = write_frame(
+            stream,
+            &build_error_response(&format!("WAL append failed: {e}")),
+        );
+        return Err(e);
+    }
+    // Audit-log only when the committed state actually changed AND
+    // an audit path is configured. v3.4.0 fix: previously the
+    // in-memory AuditLog grew every write even without an audit
+    // file (the SQL text was cloned into the log forever), so a
+    // long-running server with no audit configured still leaked
+    // a few MB per 10K writes.
+    if state.audit_path.is_some()
+        && matches!(
+            result,
+            Ok(QueryResult::CommandOk {
+                modified_catalog: true,
+                ..
+            })
+        )
+        && let Err(e) = append_audit(state, &sql)
+    {
+        let _ = write_frame(
+            stream,
+            &build_error_response(&format!("audit append failed: {e}")),
+        );
+        return Err(e);
+    }
+    // v6.1.4 — CREATE / DROP SUBSCRIPTION flips
+    // `modified_catalog: true`. Reconcile picks up the
+    // change and spawns / tears down the corresponding
+    // worker thread. Idempotent + cheap when the catalog
+    // change wasn't subscription-related.
+    if matches!(
+        result,
+        Ok(QueryResult::CommandOk {
+            modified_catalog: true,
+            ..
+        })
+    ) {
+        reconcile_subscriptions(state);
+    }
+    emit_result(stream, result)
 }
 
 /// v6.5.3 — public alias so the pgwire crate can append audit
