@@ -297,6 +297,14 @@ pub fn substitute_placeholders(stmt: &mut Statement, params: &[Value]) -> Result
                     substitute_expr(w, params)?;
                 }
             }
+            // v7.33 (A1) — `INSERT INTO t SELECT … WHERE x = $1`: the
+            // inner SELECT carries placeholders too. Without this a
+            // prepared INSERT…SELECT hit the inner SELECT with an
+            // unbound `$N` (reachable now the server WALs prepared
+            // writes — bind-final render walks the same statement).
+            if let Some(sel) = &mut ins.select_source {
+                substitute_select(sel, params)?;
+            }
         }
         Statement::Update(u) => {
             for (_, e) in &mut u.assignments {

@@ -510,6 +510,16 @@ fn handle_com_query(
         };
         engine.execute(sql)
     };
+    // v7.33 (A1) — persist the write (WAL/snapshot + audit) before
+    // acking. The mysql-wire path was non-durable like pgwire pre-7.33:
+    // a COM_QUERY write was lost on crash. A durability failure turns
+    // the write into an error, never a silent OK.
+    let outcome = match crate::pgwire::persist_wire_write(state, sql, &outcome) {
+        Ok(()) => outcome,
+        Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
+            "durability append failed: {e}"
+        ))),
+    };
     match outcome {
         Err(e) => {
             // Map engine errors to MySQL errno 1064 (parse / unsupported)
@@ -683,7 +693,7 @@ fn handle_com_stmt_execute(
     };
 
     // Bind + execute via engine.
-    let outcome = {
+    let (outcome, render) = {
         let Ok(mut engine) = state.engine.write() else {
             return write_packet(
                 stream,
@@ -698,7 +708,29 @@ fn handle_com_stmt_execute(
                 return write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg));
             }
         };
-        engine.execute_prepared(stmt, &params)
+        // v7.33 (A1) — render the bind-final SQL for the WAL before
+        // execute_prepared consumes the statement (writes only; a
+        // substitute failure leaves render None and execute reports it).
+        let render = if matches!(&stmt, spg_sql::ast::Statement::Select(_)) {
+            None
+        } else {
+            let mut bind = stmt.clone();
+            spg_engine::substitute_placeholders(&mut bind, &params)
+                .ok()
+                .map(|()| bind.to_string())
+        };
+        (engine.execute_prepared(stmt, &params), render)
+    };
+    // v7.33 (A1) — persist the prepared write before acking (was
+    // non-durable pre-7.33, lost on crash).
+    let outcome = match render {
+        Some(render) => match crate::pgwire::persist_wire_write(state, &render, &outcome) {
+            Ok(()) => outcome,
+            Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
+                "durability append failed: {e}"
+            ))),
+        },
+        None => outcome,
     };
     match outcome {
         Err(e) => {
