@@ -40,7 +40,7 @@ done
 # dependency-before-dependent publishes.
 CRATES=(
     spg-wire spg-crypto spg-sql spg-storage spg-audit spg-manifest
-    spg-engine spg-embedded spg-embedded-tokio spg-server spgctl
+    spg-engine spg-embedded spg-embedded-tokio spg-sqlx spg-server spgctl
 )
 
 banner() { printf '\n══ release.sh %s ══\n' "$*"; }
