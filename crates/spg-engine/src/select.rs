@@ -2008,29 +2008,63 @@ impl Engine {
         }
 
         let projection = build_projection(&stmt.items, combined_schema, "")?;
-        // v7.32 (P4 increment 2) — projection / ORDER / DISTINCT / LIMIT
-        // need owned Rows; materialise the survivors here (byte-identical
-        // to the pre-deferral output).
-        let filtered = deferred.materialise();
+        // v7.33 (P4 borrow channel, increment 3) — project directly off
+        // the deferred row-index tuples instead of materialising an
+        // intermediate combined Row per survivor. A bound qualified
+        // column is read by reference (`RowRef::get` → `tuple_value`) and
+        // cloned ONCE into the output row; the old `materialise()` (a full
+        // combined Row plus a source→intermediate clone per referenced
+        // cell, for every survivor) is gone. A row materialises on demand
+        // only when a projection or ORDER BY expression needs the eval
+        // path (subquery / function / arithmetic / unqualified column).
+        // Same bind-once classification the aggregate input fast path uses
+        // (`accumulate_groups`), reading the same `tuple_value` mapping the
+        // differential gate already covers.
+        let refs = deferred.row_refs();
+        let bound_pos = |e: &Expr| -> Option<usize> {
+            match e {
+                Expr::Column(c) if c.qualifier.is_some() => eval::find_column_pos(c, &ctx),
+                _ => None,
+            }
+        };
+        let proj_pos: Vec<Option<usize>> = projection.iter().map(|p| bound_pos(&p.expr)).collect();
+        let all_proj_bound = proj_pos.iter().all(Option::is_some);
+        // ORDER BY (when present) still evaluates against a materialised
+        // Row — keep the order-key encoder correct rather than fork it.
+        let need_eval_row = !all_proj_bound || !stmt.order_by.is_empty();
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
         let mut proj_memo = memoize::MemoizeCache::default();
-        for row in &filtered {
+        for row in &refs {
+            let materialised: Option<Cow<'_, Row>> = if need_eval_row {
+                Some(row.as_row())
+            } else {
+                None
+            };
             let mut values = Vec::with_capacity(projection.len());
-            for p in &projection {
-                // v7.24 (round-16 B) — select-list subqueries under a
-                // JOIN go through the correlated-aware evaluator too.
-                values.push(self.eval_expr_with_correlated(
-                    &p.expr,
-                    row,
-                    &ctx,
-                    cancel,
-                    Some(&mut proj_memo),
-                )?);
+            for (i, p) in projection.iter().enumerate() {
+                if let Some(pos) = proj_pos[i] {
+                    // Bound qualified column — borrow the source cell.
+                    values.push(row.get(pos).cloned().unwrap_or(Value::Null));
+                } else {
+                    // Eval path — `materialised` is Some whenever any
+                    // projection item is non-bound (need_eval_row true).
+                    // v7.24 (round-16 B) — select-list subqueries under a
+                    // JOIN go through the correlated-aware evaluator too.
+                    let mrow = materialised.as_deref().expect("materialised for eval");
+                    values.push(self.eval_expr_with_correlated(
+                        &p.expr,
+                        mrow,
+                        &ctx,
+                        cancel,
+                        Some(&mut proj_memo),
+                    )?);
+                }
             }
             let order_keys = if stmt.order_by.is_empty() {
                 Vec::new()
             } else {
-                build_order_keys(&stmt.order_by, row, &ctx)?
+                let mrow = materialised.as_deref().expect("materialised for order by");
+                build_order_keys(&stmt.order_by, mrow, &ctx)?
             };
             let out_row = Row::new(values);
             budget.charge(approx_row_bytes(&out_row))?;
