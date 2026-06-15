@@ -68,7 +68,7 @@ start_server() {
     fi
     # Wait for ready
     for i in $(seq 1 30); do
-        if docker run --rm postgres:15 pg_isready \
+        if docker run --rm postgres:18 pg_isready \
                 -h host.docker.internal -p "$PORT" -U u -d app \
                 >/dev/null 2>&1; then
             return 0
@@ -98,7 +98,7 @@ run_one() {
     local out
     out=$(docker run --rm \
             -v "$file:/schema.sql:ro" \
-            postgres:15 psql "$URL" -X -q -f /schema.sql 2>&1 || true)
+            postgres:18 psql "$URL" -X -q -f /schema.sql 2>&1 || true)
     local total=$(grep -cE '^(SET|CREATE|ALTER|COMMENT|DROP|INSERT|DO|REVOKE|GRANT|SELECT|BEGIN|COMMIT|/\*)' "$file" 2>/dev/null)
     [[ -z "$total" ]] && total=0
     local errors=$(echo "$out" | grep -cE '^psql:.*ERROR:' 2>/dev/null)

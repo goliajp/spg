@@ -30,6 +30,7 @@ use spg_sql::ast::{Expr, SelectItem, SelectStatement};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
+use crate::join::RowRef;
 
 /// True if this statement should go through the aggregate path.
 pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
@@ -126,7 +127,84 @@ pub fn is_aggregate_name(name: &str) -> bool {
             | "bool_and"
             | "bool_or"
             | "every"
+            // v7.32 (round-29) — statistical aggregates (every BI /
+            // dashboard emits these in rollups).
+            | "stddev" | "stddev_samp" | "stddev_pop"
+            | "variance" | "var_samp" | "var_pop"
+            // v7.32 (round-29) — bitwise aggregates.
+            | "bit_and" | "bit_or" | "bit_xor"
+            // v7.32 (round-29) — ordered-set aggregates (used with
+            // `WITHIN GROUP (ORDER BY …)`).
+            | "percentile_cont" | "percentile_disc" | "mode"
+            // v7.32 (round-29) — hypothetical-set aggregates (also
+            // `WITHIN GROUP`): the rank the direct args WOULD have.
+            | "rank" | "dense_rank" | "percent_rank" | "cume_dist"
+            // v7.32 (round-29) — two-argument regression family.
+            | "covar_pop" | "covar_samp" | "corr"
+            | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_slope"
+            | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
+            // v7.32 (round-29) — JSON aggregates.
+            | "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
     )
+}
+
+/// v7.32 (round-29) — two-argument regression aggregates `f(Y, X)`.
+fn is_regression_name(name: &str) -> bool {
+    matches!(
+        name,
+        "covar_pop"
+            | "covar_samp"
+            | "corr"
+            | "regr_count"
+            | "regr_avgx"
+            | "regr_avgy"
+            | "regr_slope"
+            | "regr_intercept"
+            | "regr_r2"
+            | "regr_sxx"
+            | "regr_syy"
+            | "regr_sxy"
+    )
+}
+
+/// v7.32 (round-29) — aggregates that consume a second positional
+/// argument: `string_agg(v, sep)`, the regression family `f(Y, X)`, and
+/// `json_object_agg(key, value)`.
+fn agg_uses_second_arg(name: &str) -> bool {
+    name == "string_agg"
+        || name == "json_object_agg"
+        || name == "jsonb_object_agg"
+        || is_regression_name(name)
+}
+
+/// v7.32 (round-29) — ordered-set aggregates: the value to aggregate
+/// comes from the `WITHIN GROUP (ORDER BY …)` sort spec, and any
+/// in-parens arguments are *direct* arguments (the percentile fraction).
+/// `mode()` takes no direct argument.
+pub fn is_ordered_set_name(name: &str) -> bool {
+    // v7.32 — `eq_ignore_ascii_case` instead of `to_ascii_lowercase()`:
+    // these classifiers run in the aggregate row/group loop, where the
+    // old per-call `String` allocation showed up as ~16% of the inbox's
+    // aggregate path in a sampled profile (the names are constant).
+    ["percentile_cont", "percentile_disc", "mode"]
+        .iter()
+        .any(|k| name.eq_ignore_ascii_case(k))
+}
+
+/// v7.32 (round-29) — hypothetical-set aggregates: `rank(args) WITHIN
+/// GROUP (ORDER BY …)` and friends compute the rank the hypothetical
+/// row would have. Like ordered-set, the value stream comes from the
+/// sort spec and the in-parens args are direct (the hypothetical row).
+pub fn is_hypothetical_set_name(name: &str) -> bool {
+    ["rank", "dense_rank", "percent_rank", "cume_dist"]
+        .iter()
+        .any(|k| name.eq_ignore_ascii_case(k))
+}
+
+/// v7.32 (round-29) — every aggregate that takes its value stream from
+/// a `WITHIN GROUP (ORDER BY …)` clause (ordered-set + hypothetical-set).
+pub fn is_within_group_name(name: &str) -> bool {
+    is_ordered_set_name(name) || is_hypothetical_set_name(name)
 }
 
 /// Per-aggregate running state.
@@ -162,6 +240,25 @@ struct AggState {
     /// bool_or / every. `None` until the first non-NULL input;
     /// at finalize None → SQL NULL.
     bool_acc: Option<bool>,
+    /// v7.32 (round-29) — sum of squares for the variance / stddev
+    /// family (`sum_float` carries the running sum; `count` the n).
+    sum_sq: f64,
+    /// v7.32 (round-29) — running accumulator for bit_and / bit_or /
+    /// bit_xor. `None` until the first non-NULL input → SQL NULL.
+    bit_acc: Option<i64>,
+    /// v7.32 (round-29) — two-argument regression family
+    /// (`covar_*` / `corr` / `regr_*`), PG arg order `f(Y, X)`. Only
+    /// rows where BOTH inputs are non-NULL contribute (`count` is the
+    /// paired n, independent of the single-arg `sum_*`).
+    reg_n: i64,
+    reg_sx: f64,
+    reg_sy: f64,
+    reg_sxx: f64,
+    reg_syy: f64,
+    reg_sxy: f64,
+    /// v7.32 (round-29) — second value stream for `json_object_agg`
+    /// (`items` holds the keys, `aux_items` the values).
+    aux_items: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +282,16 @@ struct AggSpec {
     /// other aggregates are order-insensitive and ignore it (PG
     /// accepts the syntax everywhere too).
     order_by: Vec<spg_sql::ast::OrderBy>,
+    /// v7.32 (round-29) — `FILTER (WHERE cond)`: a per-row predicate
+    /// evaluated against the source row before accumulation. A row
+    /// whose `cond` is not TRUE (false or NULL) is excluded from this
+    /// aggregate only. `None` for the unfiltered form.
+    filter: Option<Expr>,
+    /// v7.32 (round-29) — ordered-set aggregates only: the *direct*
+    /// argument (the percentile fraction for `percentile_cont/disc`).
+    /// PG requires it constant, so it is evaluated once. `None` for
+    /// `mode()` and for every non-ordered-set aggregate.
+    direct_arg: Option<Expr>,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -219,14 +326,25 @@ pub struct AggResult {
 /// surviving subqueries keep erroring loudly.
 pub type CorrelatedEval<'a> = &'a dyn Fn(&Expr, &Row, &EvalContext<'_>) -> Result<Value, EvalError>;
 
-pub fn run(
+/// Output of the per-group projection stage (`project_groups`): the
+/// output schema, the projected rows, the synth rows kept alongside
+/// them for post-LIMIT deferred evaluation, the deferred subquery
+/// items, and the rewritten ORDER BY exprs (shared with the sort).
+struct Projection {
+    columns: Vec<ColumnSchema>,
+    out_rows: Vec<Row>,
+    kept_synth: Vec<Row>,
+    deferred: Vec<(usize, Expr)>,
+    order_rewritten: Vec<Expr>,
+}
+
+pub(crate) fn run(
     stmt: &SelectStatement,
-    rows: &[&Row],
+    rows: &[RowRef<'_>],
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
 ) -> Result<AggResult, EvalError> {
-    let ctx = EvalContext::new(schema_cols, table_alias);
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
 
     // Collect aggregate sub-expressions across items + order_by.
@@ -248,20 +366,141 @@ pub fn run(
     // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
+    validate_within_group(&agg_specs)?;
 
+    // (1) Stream the WHERE-filtered rows into insertion-ordered group state.
+    let order = accumulate_groups(
+        rows,
+        &group_exprs,
+        &agg_specs,
+        schema_cols,
+        table_alias,
+        correlated_eval,
+    )?;
+
+    // (2) Build the synthetic per-group schema and finalise each group's row.
+    let synth_schema =
+        build_synth_schema(rows, &group_exprs, &agg_specs, schema_cols, table_alias)?;
+    let synth_rows = finalize_synth_rows(
+        &order,
+        &agg_specs,
+        &synth_schema,
+        rows,
+        schema_cols,
+        table_alias,
+    )?;
+
+    // (3) Rewrite the user's expressions, filter groups by HAVING and project.
+    let Projection {
+        columns,
+        mut out_rows,
+        mut kept_synth,
+        deferred,
+        order_rewritten,
+    } = project_groups(
+        synth_rows,
+        stmt,
+        &group_exprs,
+        &agg_specs,
+        &synth_schema,
+        correlated_eval,
+    )?;
+
+    // (4) ORDER BY on the aggregated output (the caller applies LIMIT).
+    if !stmt.order_by.is_empty() {
+        let (sorted_synth, sorted_out) = sort_synth_by_order_by(
+            &synth_schema,
+            &stmt.order_by,
+            &order_rewritten,
+            kept_synth,
+            out_rows,
+            correlated_eval,
+        )?;
+        kept_synth = sorted_synth;
+        out_rows = sorted_out;
+    }
+
+    let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        (kept_synth, synth_schema.clone())
+    };
+    Ok(AggResult {
+        columns,
+        rows: out_rows,
+        deferred,
+        synth_rows: synth_rows_out,
+        synth_schema: synth_schema_out,
+    })
+}
+
+/// v7.32 (round-29) — validate the structural requirements of WITHIN
+/// GROUP (ordered-set / hypothetical-set) aggregates up front, so a
+/// malformed call surfaces as a SQL error rather than a silently
+/// degenerate aggregate.
+fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
+    // v7.32 (round-29) — WITHIN GROUP aggregates require the clause (PG
+    // raises a hard error otherwise rather than silently degrading), and
+    // SPG supports the single-sort-key form only.
+    for spec in agg_specs {
+        if is_within_group_name(&spec.name) {
+            if spec.order_by.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{}() requires WITHIN GROUP (ORDER BY …)", spec.name),
+                });
+            }
+            // mode() is the only WITHIN GROUP aggregate with no direct
+            // argument; the rest carry one (percentile fraction /
+            // hypothetical value).
+            if spec.name != "mode" && spec.direct_arg.is_none() {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{}() requires a direct argument", spec.name),
+                });
+            }
+            // Multi-key WITHIN GROUP (multiple sort keys / hypothetical
+            // args) is not supported yet — error loudly instead of
+            // silently using only the first key.
+            if spec.order_by.len() > 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "{}() with multiple WITHIN GROUP sort keys is not supported yet",
+                        spec.name
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// (1) Stream the WHERE-filtered rows, group by the GROUP BY value
+/// tuple, and update per-group aggregate state. Returns the groups in
+/// insertion order. See `run` for the bind-once fast path rationale.
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+fn accumulate_groups(
+    rows: &[RowRef<'_>],
+    group_exprs: &[Expr],
+    agg_specs: &[AggSpec],
+    schema_cols: &[ColumnSchema],
+    table_alias: Option<&str>,
+    correlated_eval: Option<CorrelatedEval<'_>>,
+) -> Result<Vec<(Vec<Value>, Vec<AggState>)>, EvalError> {
+    let ctx = EvalContext::new(schema_cols, table_alias);
     // Map group key (vec of values, encoded as canonical string) -> group state.
-    // Order of insertion is preserved via a parallel Vec of keys.
-    // v7.29 - hash map (output order rides key_order, not map order).
-    let mut groups: hashbrown::HashMap<String, (Vec<Value>, Vec<AggState>)> =
-        hashbrown::HashMap::new();
-    let mut key_order: Vec<String> = Vec::new();
+    // v7.32 (architecture v2, P2b) — insertion-ordered group state in
+    // a Vec; the hash map only maps key → index. Removes the parallel
+    // `key_order: Vec<String>` (a second per-group key clone) and the
+    // per-group re-probe `groups[k]` at finalize (24k hash lookups for
+    // the inbox shape). The map owns its key once on vacant insert.
+    let mut order: Vec<(Vec<Value>, Vec<AggState>)> = Vec::new();
+    let mut groups: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
     // When there are no GROUP BY exprs *and* there is at least one aggregate,
     // every row collapses into a single anonymous group keyed by "".
     if rows.is_empty() && group_exprs.is_empty() {
         // Single empty-aggregate group: count=0, sum=0, max=NULL, etc.
+        // No rows follow, so the map is never probed — seed `order` only.
         let init: Vec<AggState> = (0..agg_specs.len()).map(|_| AggState::default()).collect();
-        groups.insert(String::new(), (Vec::new(), init));
-        key_order.push(String::new());
+        order.push((Vec::new(), init));
     }
 
     // v7.30 (perf campaign) - hoist the per-row work that doesn't
@@ -309,6 +548,34 @@ pub fn run(
     let mut keybuf_s = String::new();
     let mut dkeybuf = String::new();
     let mut refs: Vec<&Value> = Vec::with_capacity(group_pos.len());
+    // v7.32 (round-31) — an aggregate's argument / FILTER / second arg /
+    // ORDER key may itself be a *correlated* subquery, e.g.
+    // `MAX((SELECT i.v FROM inner i WHERE i.fk = o.id))`. A non-correlated
+    // subquery is pre-resolved to a literal before this loop, but a
+    // correlated one survives as a subquery node and must be evaluated per
+    // outer row through the correlated evaluator — the same hook the
+    // select-list / HAVING / ORDER finalisers already use below. Plain
+    // `eval_expr` would hit "subquery reached row eval".
+    //
+    // The `any_agg_subquery` gate is computed once here so the common case
+    // (no subquery anywhere in the aggregate args — including every hot
+    // scan/group aggregate) short-circuits before the per-row
+    // `expr_has_subquery` walk: `eval_arg` is then exactly `eval_expr`.
+    let any_agg_subquery = correlated_eval.is_some()
+        && agg_specs.iter().any(|s| {
+            s.filter
+                .as_ref()
+                .is_some_and(|e| crate::expr_has_subquery(e))
+                || s.arg.as_ref().is_some_and(|e| crate::expr_has_subquery(e))
+                || s.arg2.as_ref().is_some_and(|e| crate::expr_has_subquery(e))
+                || s.order_by.iter().any(|o| crate::expr_has_subquery(&o.expr))
+        });
+    let eval_arg = |e: &Expr, r: &Row, c: &EvalContext<'_>| -> Result<Value, EvalError> {
+        match correlated_eval {
+            Some(f) if any_agg_subquery && crate::expr_has_subquery(e) => f(e, r, c),
+            _ => eval::eval_expr(e, r, c),
+        }
+    };
     for row in rows {
         // Fast key: bound positions + no ci folding -> encode
         // straight from borrowed cells; group_vals materialise
@@ -318,42 +585,53 @@ pub fn run(
             refs.extend(
                 group_pos
                     .iter()
-                    .map(|p| row.values.get(p.unwrap()).unwrap_or(&Value::Null)),
+                    .map(|p| row.get(p.unwrap()).unwrap_or(&Value::Null)),
             );
             encode_key_refs_into(&refs, &mut keybuf_s);
-            let entry = match groups.entry_ref(keybuf_s.as_str()) {
-                hashbrown::hash_map::EntryRef::Occupied(o) => o.into_mut(),
-                hashbrown::hash_map::EntryRef::Vacant(v) => {
-                    key_order.push(keybuf_s.clone());
+            let idx = match groups.get(keybuf_s.as_str()) {
+                Some(&i) => i,
+                None => {
+                    let i = order.len();
                     let init: Vec<AggState> =
                         (0..agg_specs.len()).map(|_| AggState::default()).collect();
                     let owned: Vec<Value> = refs.iter().map(|v| (*v).clone()).collect();
-                    v.insert((owned, init))
+                    order.push((owned, init));
+                    groups.insert(keybuf_s.clone(), i);
+                    i
                 }
             };
+            let entry = &mut order[idx];
             for (i, spec) in agg_specs.iter().enumerate() {
+                // v7.32 (round-29) — FILTER (WHERE cond): exclude rows
+                // where cond is not TRUE before they reach this
+                // aggregate's accumulator (and before DISTINCT dedup).
+                if let Some(f) = &spec.filter
+                    && !matches!(eval_arg(f, &row.as_row(), &ctx)?, Value::Bool(true))
+                {
+                    continue;
+                }
                 let arg_owned: Value;
                 let arg_ref: &Value = match (&arg_pos[i], &spec.arg) {
-                    (Some(p), _) => row.values.get(*p).unwrap_or(&Value::Null),
+                    (Some(p), _) => row.get(*p).unwrap_or(&Value::Null),
                     (None, None) => {
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
                     (None, Some(e)) => {
-                        arg_owned = eval::eval_expr(e, row, &ctx)?;
+                        arg_owned = eval_arg(e, &row.as_row(), &ctx)?;
                         &arg_owned
                     }
                 };
                 let arg2_val = match &spec.arg2 {
                     None => None,
-                    Some(e) => Some(eval::eval_expr(e, row, &ctx)?),
+                    Some(e) => Some(eval_arg(e, &row.as_row(), &ctx)?),
                 };
                 let order_keys = if spec.order_by.is_empty() {
                     None
                 } else {
                     let mut keys = Vec::with_capacity(spec.order_by.len());
                     for o in &spec.order_by {
-                        keys.push(eval::eval_expr(&o.expr, row, &ctx)?);
+                        keys.push(eval_arg(&o.expr, &row.as_row(), &ctx)?);
                     }
                     Some(keys)
                 };
@@ -374,6 +652,12 @@ pub fn run(
             }
             continue;
         }
+        // v7.32 (P4 increment 2) — eval (non-bound) path: present the
+        // row as a borrowed Row once (Owned → zero-cost borrow; a join
+        // tuple materialises here exactly once, never on the bound fast
+        // path above), then the original eval loop runs unchanged.
+        let row_materialised = row.as_row();
+        let row: &Row = &row_materialised;
         let group_vals: Vec<Value> = group_exprs
             .iter()
             .map(|g| eval::eval_expr(g, row, &ctx))
@@ -392,20 +676,30 @@ pub fn run(
             }
             encode_key(&key_vals)
         };
-        // entry_ref: no per-row key clone on the (dominant) hit path.
-        let entry = match groups.entry_ref(key.as_str()) {
-            hashbrown::hash_map::EntryRef::Occupied(o) => o.into_mut(),
-            hashbrown::hash_map::EntryRef::Vacant(v) => {
-                key_order.push(key.clone());
+        // Probe by index; the map owns the key once on vacant insert.
+        let idx = match groups.get(key.as_str()) {
+            Some(&i) => i,
+            None => {
+                let i = order.len();
                 let init: Vec<AggState> =
                     (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                v.insert((group_vals.clone(), init))
+                order.push((group_vals.clone(), init));
+                groups.insert(key, i);
+                i
             }
         };
+        let entry = &mut order[idx];
         for (i, spec) in agg_specs.iter().enumerate() {
+            // v7.32 (round-29) — FILTER (WHERE cond): exclude rows where
+            // cond is not TRUE before accumulation (and before DISTINCT).
+            if let Some(f) = &spec.filter
+                && !matches!(eval_arg(f, row, &ctx)?, Value::Bool(true))
+            {
+                continue;
+            }
             let arg_val = match &spec.arg {
                 None => Value::Bool(true), // count_star: sentinel non-null
-                Some(e) => eval::eval_expr(e, row, &ctx)?,
+                Some(e) => eval_arg(e, row, &ctx)?,
             };
             // v7.17.0 — `string_agg(value, separator)` evaluates the
             // separator per row but PG treats it as constant; we
@@ -414,7 +708,7 @@ pub fn run(
             // even though SPG (like PG) only uses the most recent.
             let arg2_val = match &spec.arg2 {
                 None => None,
-                Some(e) => Some(eval::eval_expr(e, row, &ctx)?),
+                Some(e) => Some(eval_arg(e, row, &ctx)?),
             };
             // v7.24 (round-16 A) — aggregate-internal ORDER BY:
             // evaluate the key tuple against the source row.
@@ -423,7 +717,7 @@ pub fn run(
             } else {
                 let mut keys = Vec::with_capacity(spec.order_by.len());
                 for o in &spec.order_by {
-                    keys.push(eval::eval_expr(&o.expr, row, &ctx)?);
+                    keys.push(eval_arg(&o.expr, row, &ctx)?);
                 }
                 Some(keys)
             };
@@ -446,14 +740,28 @@ pub fn run(
             )?;
         }
     }
+    Ok(order)
+}
 
+/// (2a) Build the synthetic per-group schema: `__grp_0..K` then
+/// `__agg_0..N`. Group types are probed from the first row; aggregate
+/// types from each spec.
+fn build_synth_schema(
+    rows: &[RowRef<'_>],
+    group_exprs: &[Expr],
+    agg_specs: &[AggSpec],
+    schema_cols: &[ColumnSchema],
+    table_alias: Option<&str>,
+) -> Result<Vec<ColumnSchema>, EvalError> {
+    let ctx = EvalContext::new(schema_cols, table_alias);
     // Build synthetic schema: __grp_0..K then __agg_0..N.
     let group_types: Vec<DataType> = if rows.is_empty() {
         // Use Text as a safe stand-in — empty result means schema isn't
         // observable. Avoids needing to evaluate group exprs on no row.
         group_exprs.iter().map(|_| DataType::Text).collect()
     } else {
-        let probe = rows[0];
+        let probe_row = rows[0].as_row();
+        let probe: &Row = &probe_row;
         group_exprs
             .iter()
             .map(|g| {
@@ -472,11 +780,34 @@ pub fn run(
     for (i, ty) in agg_types.iter().enumerate() {
         synth_schema.push(ColumnSchema::new(format!("__agg_{i}"), *ty, true));
     }
+    Ok(synth_schema)
+}
 
-    // Materialise synthetic rows.
+/// (2b) Materialise one synthetic row per group (insertion order):
+/// apply each aggregate's internal ORDER BY, then finalise the running
+/// state into the group + aggregate cells.
+fn finalize_synth_rows(
+    order: &[(Vec<Value>, Vec<AggState>)],
+    agg_specs: &[AggSpec],
+    synth_schema: &[ColumnSchema],
+    rows: &[RowRef<'_>],
+    schema_cols: &[ColumnSchema],
+    table_alias: Option<&str>,
+) -> Result<Vec<Row>, EvalError> {
+    let ctx = EvalContext::new(schema_cols, table_alias);
+    // v7.32 (round-29) — ordered-set direct arguments (the percentile
+    // fraction) are constant per PG, so evaluate each once up front.
+    let direct_arg_vals: Vec<Option<Value>> = agg_specs
+        .iter()
+        .map(|spec| match (&spec.direct_arg, rows.first()) {
+            (Some(e), Some(r)) => eval::eval_expr(e, &r.as_row(), &ctx).map(Some),
+            _ => Ok(None),
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Materialise synthetic rows (insertion order = `order`).
     let mut synth_rows: Vec<Row> = Vec::new();
-    for k in &key_order {
-        let (gvals, states) = &groups[k];
+    for (gvals, states) in order {
         let mut values: Vec<Value> = Vec::with_capacity(synth_schema.len());
         values.extend(gvals.iter().cloned());
         for (i, st) in states.iter().enumerate() {
@@ -509,11 +840,38 @@ pub fn run(
                 } else {
                     st
                 };
-            values.push(finalize(&agg_specs[i].name, st_final));
+            // Ordered-set aggregates compute from the sorted items + the
+            // direct fraction; everything else uses the running state.
+            let v = if is_within_group_name(&agg_specs[i].name) {
+                finalize_ordered_set(
+                    &agg_specs[i].name,
+                    st_final,
+                    direct_arg_vals[i].as_ref(),
+                    agg_specs[i].order_by.first(),
+                )
+            } else {
+                finalize(&agg_specs[i].name, st_final)
+            };
+            values.push(v);
         }
         synth_rows.push(Row::new(values));
     }
+    Ok(synth_rows)
+}
 
+/// (3) Rewrite the user's SELECT items + HAVING to reference the
+/// synthetic columns, filter groups by HAVING, and project each
+/// surviving group into an output row. The synth rows ride alongside
+/// (`kept_synth`) so post-LIMIT deferred subqueries can evaluate later.
+#[allow(clippy::too_many_lines)]
+fn project_groups(
+    synth_rows: Vec<Row>,
+    stmt: &SelectStatement,
+    group_exprs: &[Expr],
+    agg_specs: &[AggSpec],
+    synth_schema: &[ColumnSchema],
+    correlated_eval: Option<CorrelatedEval<'_>>,
+) -> Result<Projection, EvalError> {
     // Rewrite the user's SELECT items + ORDER BY to reference synthetic
     // columns. After rewriting, every remaining `Expr::Column` must
     // resolve against the synthetic schema (i.e. must have been a GROUP
@@ -526,11 +884,11 @@ pub fn run(
                 detail: "SELECT * with aggregates is not supported".into(),
             }),
             SelectItem::Expr { expr, alias } => {
-                let rewritten = rewrite_expr(expr, &group_exprs, &agg_specs);
+                let rewritten = rewrite_expr(expr, group_exprs, agg_specs);
                 let name = alias.clone().unwrap_or_else(|| expr.to_string());
                 Ok(ColumnSchema::new(
                     name,
-                    agg_or_group_type(&rewritten, &synth_schema),
+                    agg_or_group_type(&rewritten, synth_schema),
                     true,
                 ))
             }
@@ -541,11 +899,11 @@ pub fn run(
     // we keep the projected row — same semantics as PG: HAVING runs
     // against the aggregated row (so `HAVING count(*) > 1` works) and
     // sees only group-by'd columns plus aggregate values.
-    let synth_ctx = EvalContext::new(&synth_schema, None);
+    let synth_ctx = EvalContext::new(synth_schema, None);
     let having_rewritten = stmt
         .having
         .as_ref()
-        .map(|h| rewrite_expr(h, &group_exprs, &agg_specs));
+        .map(|h| rewrite_expr(h, group_exprs, agg_specs));
     // v7.30 (phase 3e-1) - rewrite SELECT items ONCE. This ran per
     // GROUP (23.5k x 9 items of AST cloning = ~48% of the inbox
     // query in sampled stacks); the rewrite is group-independent.
@@ -555,7 +913,7 @@ pub fn run(
         .items
         .iter()
         .map(|item| match item {
-            SelectItem::Expr { expr, .. } => Some(rewrite_expr(expr, &group_exprs, &agg_specs)),
+            SelectItem::Expr { expr, .. } => Some(rewrite_expr(expr, group_exprs, agg_specs)),
             SelectItem::Wildcard => None,
         })
         .collect();
@@ -566,7 +924,7 @@ pub fn run(
     let order_rewritten: Vec<Expr> = stmt
         .order_by
         .iter()
-        .map(|o| rewrite_expr(&o.expr, &group_exprs, &agg_specs))
+        .map(|o| rewrite_expr(&o.expr, group_exprs, agg_specs))
         .collect();
     let defer_enabled = correlated_eval.is_some()
         && !stmt.distinct
@@ -587,10 +945,34 @@ pub fn run(
     } else {
         Vec::new()
     };
+    // v7.32 (architecture v2, P2) — compile the per-group synth-row
+    // expressions ONCE. The projection / HAVING here run per GROUP
+    // (24k for the inbox shape) × per item; the rewritten exprs are
+    // mostly `Column(__agg_N)` / `Column(__grp_K)` against the synth
+    // schema — flat step programs, no tree walk per group.
+    let having_compiled = having_rewritten
+        .as_ref()
+        .filter(|h| eval::fully_compilable(h))
+        .map(|h| eval::compile_expr(h, &synth_ctx));
+    let items_compiled: Vec<Option<eval::CompiledExpr>> = items_rewritten
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.as_ref()
+                .filter(|e| !deferred.iter().any(|(c, _)| *c == i) && eval::fully_compilable(e))
+                .map(|e| eval::compile_expr(e, &synth_ctx))
+        })
+        .collect();
     let mut kept_synth: Vec<Row> = Vec::new();
     let mut out_rows: Vec<Row> = Vec::new();
+    let mut stack: Vec<Value> = Vec::new();
     for srow in synth_rows {
-        if let Some(h) = &having_rewritten {
+        if let Some(hc) = &having_compiled {
+            let cond = eval::eval_compiled(hc, &srow, &synth_ctx, &mut stack)?;
+            if !matches!(cond, Value::Bool(true)) {
+                continue;
+            }
+        } else if let Some(h) = &having_rewritten {
             let cond = match correlated_eval {
                 Some(f) if crate::expr_has_subquery(h) => f(h, &srow, &synth_ctx)?,
                 _ => eval::eval_expr(h, &srow, &synth_ctx)?,
@@ -606,75 +988,94 @@ pub fn run(
                 values.push(Value::Null);
                 continue;
             }
-            values.push(match correlated_eval {
-                Some(f) if crate::expr_has_subquery(rewritten) => f(rewritten, &srow, &synth_ctx)?,
-                _ => eval::eval_expr(rewritten, &srow, &synth_ctx)?,
+            values.push(if let Some(cc) = &items_compiled[i] {
+                eval::eval_compiled(cc, &srow, &synth_ctx, &mut stack)?
+            } else {
+                match correlated_eval {
+                    Some(f) if crate::expr_has_subquery(rewritten) => {
+                        f(rewritten, &srow, &synth_ctx)?
+                    }
+                    _ => eval::eval_expr(rewritten, &srow, &synth_ctx)?,
+                }
             });
         }
         kept_synth.push(srow);
         out_rows.push(Row::new(values));
     }
-
-    // ORDER BY: evaluate the rewritten order_by against each synth row,
-    // sort, then drop the keys. Limit is applied by the caller.
-    if !stmt.order_by.is_empty() {
-        // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
-        // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
-        // above as `order_rewritten` — shared with the deferral
-        // safety check.)
-        let keys_meta: Vec<(bool, Option<bool>)> = stmt
-            .order_by
-            .iter()
-            .map(|o| (o.desc, o.nulls_first))
-            .collect();
-        // The synth row rides through the sort so deferred exprs can
-        // evaluate against the surviving groups after the caller's
-        // LIMIT truncation.
-        let mut tagged: Vec<(Vec<Value>, Row, Row)> = kept_synth
-            .into_iter()
-            .zip(out_rows)
-            .map(|(s, o)| {
-                let mut keys = Vec::with_capacity(order_rewritten.len());
-                for e in &order_rewritten {
-                    keys.push(match correlated_eval {
-                        Some(f) if crate::expr_has_subquery(e) => f(e, &s, &synth_ctx)?,
-                        _ => eval::eval_expr(e, &s, &synth_ctx)?,
-                    });
-                }
-                Ok::<_, EvalError>((keys, s, o))
-            })
-            .collect::<Result<_, _>>()?;
-        tagged.sort_by(|a, b| {
-            use core::cmp::Ordering;
-            for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
-                let (desc, nf) = keys_meta[i];
-                let cmp = crate::order_by_value_cmp(desc, nf, ka, kb);
-                if cmp != Ordering::Equal {
-                    return cmp;
-                }
-            }
-            Ordering::Equal
-        });
-        kept_synth = Vec::with_capacity(tagged.len());
-        out_rows = Vec::with_capacity(tagged.len());
-        for (_, s, o) in tagged {
-            kept_synth.push(s);
-            out_rows.push(o);
-        }
-    }
-
-    let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        (kept_synth, synth_schema.clone())
-    };
-    Ok(AggResult {
+    Ok(Projection {
         columns,
-        rows: out_rows,
+        out_rows,
+        kept_synth,
         deferred,
-        synth_rows: synth_rows_out,
-        synth_schema: synth_schema_out,
+        order_rewritten,
     })
+}
+
+/// (4) Sort the projected output by the rewritten ORDER BY keys. The
+/// synth rows ride through the sort so deferred subqueries evaluate
+/// against the surviving groups after the caller's LIMIT truncation.
+fn sort_synth_by_order_by(
+    synth_schema: &[ColumnSchema],
+    order_by: &[spg_sql::ast::OrderBy],
+    order_rewritten: &[Expr],
+    mut kept_synth: Vec<Row>,
+    mut out_rows: Vec<Row>,
+    correlated_eval: Option<CorrelatedEval<'_>>,
+) -> Result<(Vec<Row>, Vec<Row>), EvalError> {
+    let synth_ctx = EvalContext::new(synth_schema, None);
+    // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
+    // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
+    // above as `order_rewritten` — shared with the deferral
+    // safety check.)
+    let keys_meta: Vec<(bool, Option<bool>)> =
+        order_by.iter().map(|o| (o.desc, o.nulls_first)).collect();
+    // P2: compile order-by keys once (per-group sort keys are
+    // the same `__agg_N` / `__grp_K` shape as the projection).
+    let order_compiled: Vec<Option<eval::CompiledExpr>> = order_rewritten
+        .iter()
+        .map(|e| {
+            Some(e)
+                .filter(|e| eval::fully_compilable(e))
+                .map(|e| eval::compile_expr(e, &synth_ctx))
+        })
+        .collect();
+    // The synth row rides through the sort so deferred exprs can
+    // evaluate against the surviving groups after the caller's
+    // LIMIT truncation.
+    let mut keystack: Vec<Value> = Vec::new();
+    let mut tagged: Vec<(Vec<Value>, Row, Row)> = Vec::with_capacity(kept_synth.len());
+    for (s, o) in kept_synth.into_iter().zip(out_rows) {
+        let mut keys = Vec::with_capacity(order_rewritten.len());
+        for (e, oc) in order_rewritten.iter().zip(&order_compiled) {
+            keys.push(if let Some(oc) = oc {
+                eval::eval_compiled(oc, &s, &synth_ctx, &mut keystack)?
+            } else {
+                match correlated_eval {
+                    Some(f) if crate::expr_has_subquery(e) => f(e, &s, &synth_ctx)?,
+                    _ => eval::eval_expr(e, &s, &synth_ctx)?,
+                }
+            });
+        }
+        tagged.push((keys, s, o));
+    }
+    tagged.sort_by(|a, b| {
+        use core::cmp::Ordering;
+        for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
+            let (desc, nf) = keys_meta[i];
+            let cmp = crate::order_by_value_cmp(desc, nf, ka, kb);
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
+        }
+        Ordering::Equal
+    });
+    kept_synth = Vec::with_capacity(tagged.len());
+    out_rows = Vec::with_capacity(tagged.len());
+    for (_, s, o) in tagged {
+        kept_synth.push(s);
+        out_rows.push(o);
+    }
+    Ok((kept_synth, out_rows))
 }
 
 /// v7.17.0 — walk the statement again to validate the positional
@@ -692,8 +1093,20 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 // v7.17.0 — boolean aggregates also take exactly
                 // one arg. `every` is an alias normalised inside
                 // collect_aggregates / rewrite_expr.
-                | "bool_and" | "bool_or" | "every" => Some(1),
-                "string_agg" => Some(2),
+                | "bool_and" | "bool_or" | "every"
+                // v7.32 (round-29) — statistical + bitwise aggregates
+                // + single-arg JSON aggregate.
+                | "stddev" | "stddev_samp" | "stddev_pop"
+                | "variance" | "var_samp" | "var_pop"
+                | "bit_and" | "bit_or" | "bit_xor"
+                | "json_agg" | "jsonb_agg" => Some(1),
+                // v7.32 (round-29) — two-argument aggregates: string_agg,
+                // the regression family f(Y, X), and json_object_agg.
+                "string_agg"
+                | "covar_pop" | "covar_samp" | "corr"
+                | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_slope"
+                | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy"
+                | "json_object_agg" | "jsonb_object_agg" => Some(2),
                 _ => None,
             };
             if let Some(want) = expected
@@ -739,6 +1152,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             call,
             order_by,
             distinct,
+            filter,
         } => {
             if let Expr::FunctionCall { name, args } = call.as_ref() {
                 let lower = name.to_ascii_lowercase();
@@ -748,16 +1162,31 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     } else {
                         lower
                     };
+                    // Ordered-set aggregates (`percentile_cont(f)
+                    // WITHIN GROUP (ORDER BY x)`) take the value to
+                    // aggregate from the sort spec and the in-parens
+                    // arg as the direct (fraction) argument.
+                    let ordered_set = is_within_group_name(&canonical);
+                    let (arg, direct_arg) = if ordered_set {
+                        (
+                            order_by.first().map(|o| o.expr.clone()),
+                            args.first().cloned(),
+                        )
+                    } else {
+                        (args.first().cloned(), None)
+                    };
                     let spec = AggSpec {
-                        name: canonical,
-                        arg: args.first().cloned(),
-                        arg2: if name.eq_ignore_ascii_case("string_agg") {
+                        name: canonical.clone(),
+                        arg,
+                        arg2: if agg_uses_second_arg(&canonical) {
                             args.get(1).cloned()
                         } else {
                             None
                         },
                         distinct: *distinct,
                         order_by: order_by.clone(),
+                        filter: filter.as_deref().cloned(),
+                        direct_arg,
                     };
                     if !out.iter().any(|s| {
                         s.name == spec.name
@@ -765,6 +1194,8 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                             && s.arg2 == spec.arg2
                             && s.distinct == spec.distinct
                             && s.order_by == spec.order_by
+                            && s.filter == spec.filter
+                            && s.direct_arg == spec.direct_arg
                     }) {
                         out.push(spec);
                     }
@@ -785,9 +1216,9 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     args.first().cloned()
                 };
                 // v7.17.0 — second positional arg for
-                // `string_agg(value, separator)`. Everything else
-                // ignores it.
-                let arg2 = if lower == "string_agg" {
+                // `string_agg(value, separator)`; v7.32 — also the
+                // regression family `f(Y, X)` and `json_object_agg`.
+                let arg2 = if agg_uses_second_arg(&lower) {
                     args.get(1).cloned()
                 } else {
                     None
@@ -806,6 +1237,8 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     arg2: arg2.clone(),
                     distinct: false,
                     order_by: Vec::new(),
+                    filter: None,
+                    direct_arg: None,
                 };
                 if !out.iter().any(|s| {
                     s.name == spec.name
@@ -813,6 +1246,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         && s.arg2 == spec.arg2
                         && !s.distinct
                         && s.order_by == spec.order_by
+                        && s.filter.is_none()
                 }) {
                     out.push(spec);
                 }
@@ -1018,6 +1452,95 @@ fn update_state(
             };
             st.bool_acc = Some(st.bool_acc.map_or(b, |acc| acc || b));
         }
+        // v7.32 (round-29) — variance / stddev family. Accumulate the
+        // running sum (sum_float) and sum of squares (sum_sq) over the
+        // non-NULL numeric inputs; finalize divides by n or n-1.
+        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+            if is_null {
+                return Ok(());
+            }
+            let x = match v {
+                Value::Int(n) => f64::from(*n),
+                Value::SmallInt(n) => f64::from(*n),
+                Value::BigInt(n) => *n as f64,
+                Value::Float(x) => *x,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("{name} needs numeric, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            st.count += 1;
+            st.sum_float += x;
+            st.sum_sq += x * x;
+        }
+        // v7.32 (round-29) — bitwise aggregates over integer inputs.
+        "bit_and" | "bit_or" | "bit_xor" => {
+            if is_null {
+                return Ok(());
+            }
+            let n = match v {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("{name} needs integer, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            st.bit_acc = Some(match (st.bit_acc, name) {
+                (None, _) => n,
+                (Some(acc), "bit_and") => acc & n,
+                (Some(acc), "bit_or") => acc | n,
+                (Some(acc), _) => acc ^ n, // bit_xor
+            });
+        }
+        // v7.32 (round-29) — WITHIN GROUP aggregates (ordered-set +
+        // hypothetical-set) collect the sort value (NULLs ignored, per
+        // PG) into `items`, sorted at finalize by the parallel
+        // `item_keys`.
+        n if is_within_group_name(n) => {
+            if is_null {
+                return Ok(());
+            }
+            st.items.push(v.clone());
+            if let Some(k) = order_keys {
+                st.item_keys.push(k);
+            }
+            st.count += 1;
+        }
+        // v7.32 (round-29) — regression family f(Y, X). Only rows with
+        // BOTH inputs non-NULL contribute (PG semantics). `v` is Y,
+        // `arg2` is X.
+        n if is_regression_name(n) => {
+            let (Some(y), Some(x)) = (agg_value_to_f64(v), arg2.and_then(agg_value_to_f64)) else {
+                return Ok(()); // NULL (or non-numeric) in either input
+            };
+            st.reg_n += 1;
+            st.reg_sx += x;
+            st.reg_sy += y;
+            st.reg_sxx += x * x;
+            st.reg_syy += y * y;
+            st.reg_sxy += x * y;
+        }
+        // v7.32 (round-29) — json_agg / jsonb_agg collect every input
+        // (NULL becomes JSON null, per PG) in row order.
+        "json_agg" | "jsonb_agg" => {
+            st.items.push(v.clone());
+            st.count += 1;
+        }
+        // v7.32 (round-29) — json_object_agg(key, value): keys in
+        // `items`, values in `aux_items`. A NULL key is skipped (PG
+        // raises; we drop it rather than abort the whole query).
+        "json_object_agg" | "jsonb_object_agg" => {
+            if is_null {
+                return Ok(());
+            }
+            st.items.push(v.clone());
+            st.aux_items.push(arg2.cloned().unwrap_or(Value::Null));
+            st.count += 1;
+        }
         _ => unreachable!("non-aggregate {name} in update_state"),
     }
     Ok(())
@@ -1121,6 +1644,258 @@ fn finalize(name: &str, st: &AggState) -> Value {
         // means `None` is exactly "empty group or all-NULL", which
         // PG surfaces as SQL NULL.
         "bool_and" | "bool_or" => st.bool_acc.map_or(Value::Null, Value::Bool),
+        // v7.32 (round-29) — variance / stddev. PG: `variance` ==
+        // `var_samp`, `stddev` == `stddev_samp`. samp needs n >= 2
+        // (n < 2 → NULL); pop needs n >= 1 (n == 1 → 0).
+        "variance" | "var_samp" | "var_pop" | "stddev" | "stddev_samp" | "stddev_pop" => {
+            let n = st.count;
+            if n == 0 {
+                return Value::Null;
+            }
+            let nf = n as f64;
+            // Sum of squared deviations from the mean.
+            let ss = st.sum_sq - (st.sum_float * st.sum_float) / nf;
+            let pop = name.ends_with("_pop");
+            let denom = if pop { nf } else { nf - 1.0 };
+            if denom <= 0.0 {
+                // var_samp / stddev (samp) with n == 1 → NULL.
+                return Value::Null;
+            }
+            let var = (ss / denom).max(0.0); // clamp fp noise below 0
+            if name.starts_with("stddev") {
+                Value::Float(crate::eval::f64_sqrt(var))
+            } else {
+                Value::Float(var)
+            }
+        }
+        // v7.32 (round-29) — bitwise aggregates: None (empty / all-NULL)
+        // → SQL NULL.
+        "bit_and" | "bit_or" | "bit_xor" => st.bit_acc.map_or(Value::Null, Value::BigInt),
+        // v7.32 (round-29) — regression family. `regr_count` is the
+        // paired n; everything else is NULL over an empty set. Terms
+        // are the mean-centred sums of squares / cross-products.
+        "regr_count" => Value::BigInt(st.reg_n),
+        "covar_pop" | "covar_samp" | "corr" | "regr_avgx" | "regr_avgy" | "regr_slope"
+        | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy" => {
+            let n = st.reg_n;
+            if n == 0 {
+                return Value::Null;
+            }
+            let nf = n as f64;
+            let sxx = st.reg_sxx - st.reg_sx * st.reg_sx / nf;
+            let syy = st.reg_syy - st.reg_sy * st.reg_sy / nf;
+            let sxy = st.reg_sxy - st.reg_sx * st.reg_sy / nf;
+            let avgx = st.reg_sx / nf;
+            let avgy = st.reg_sy / nf;
+            let out = match name {
+                "regr_avgx" => Some(avgx),
+                "regr_avgy" => Some(avgy),
+                "regr_sxx" => Some(sxx),
+                "regr_syy" => Some(syy),
+                "regr_sxy" => Some(sxy),
+                "covar_pop" => Some(sxy / nf),
+                "covar_samp" => (n >= 2).then(|| sxy / (nf - 1.0)),
+                "regr_slope" => (sxx != 0.0).then(|| sxy / sxx),
+                "regr_intercept" => (sxx != 0.0).then(|| avgy - (sxy / sxx) * avgx),
+                "corr" => {
+                    let d = sxx * syy;
+                    (d > 0.0).then(|| sxy / crate::eval::f64_sqrt(d))
+                }
+                // PG: NULL when sxx==0; 1 when syy==0 (and sxx>0).
+                "regr_r2" => {
+                    if sxx == 0.0 {
+                        None
+                    } else if syy == 0.0 {
+                        Some(1.0)
+                    } else {
+                        Some((sxy * sxy) / (sxx * syy))
+                    }
+                }
+                _ => None,
+            };
+            out.map_or(Value::Null, Value::Float)
+        }
+        // v7.32 (round-29) — json_agg / jsonb_agg: a JSON array of every
+        // collected element in row order; empty set → SQL NULL.
+        "json_agg" | "jsonb_agg" => {
+            if st.items.is_empty() {
+                return Value::Null;
+            }
+            let mut out = String::from("[");
+            for (i, item) in st.items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&crate::json::value_to_json_text(item));
+            }
+            out.push(']');
+            Value::Json(out)
+        }
+        // v7.32 (round-29) — json_object_agg: a JSON object built from
+        // the parallel key (`items`) / value (`aux_items`) streams.
+        "json_object_agg" | "jsonb_object_agg" => {
+            if st.items.is_empty() {
+                return Value::Null;
+            }
+            let mut out = String::from("{");
+            for (i, key) in st.items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                // Object keys are always JSON strings (PG coerces).
+                let key_text = match key {
+                    Value::Text(s) | Value::Json(s) => s.clone(),
+                    other => crate::json::value_to_json_text(other),
+                };
+                out.push_str(&crate::json::value_to_json_text(&Value::Text(key_text)));
+                out.push_str(": ");
+                let val = st.aux_items.get(i).unwrap_or(&Value::Null);
+                out.push_str(&crate::json::value_to_json_text(val));
+            }
+            out.push('}');
+            Value::Json(out)
+        }
+        // Ordered-set aggregates are finalized in `run` (they need the
+        // sorted items + the direct fraction argument), never here.
+        _ => unreachable!(),
+    }
+}
+
+/// v7.32 (round-29) — numeric coercion for the percentile interpolation.
+fn agg_value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(f64::from(*n)),
+        Value::SmallInt(n) => Some(f64::from(*n)),
+        Value::BigInt(n) => Some(*n as f64),
+        Value::Float(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// v7.32 (round-29) — finalize a WITHIN GROUP aggregate. `st.items` is
+/// already sorted by the `WITHIN GROUP (ORDER BY …)` spec. `direct` is
+/// the evaluated direct argument: the fraction for `percentile_*`, the
+/// hypothetical value for the hypothetical-set family (`rank` etc.),
+/// and unused by `mode`. `order` is the (single) sort key, needed by
+/// the hypothetical-set family to compare in the sort direction.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn finalize_ordered_set(
+    name: &str,
+    st: &AggState,
+    direct: Option<&Value>,
+    order: Option<&spg_sql::ast::OrderBy>,
+) -> Value {
+    let fraction = direct;
+    let items = &st.items;
+    if items.is_empty() {
+        // A hypothetical row ranks first over an empty group; the
+        // distribution functions are 0 / divide-by-(n+1).
+        return match name {
+            "rank" | "dense_rank" => Value::BigInt(1),
+            "percent_rank" => Value::Float(0.0),
+            "cume_dist" => Value::Float(1.0),
+            _ => Value::Null,
+        };
+    }
+    let n = items.len();
+    match name {
+        // v7.32 (round-29) — hypothetical-set: the rank the direct value
+        // would have if inserted into the group, in the sort direction.
+        "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
+            let Some(h) = fraction else {
+                return Value::Null;
+            };
+            let (desc, nulls_first) = order.map_or((false, None), |o| (o.desc, o.nulls_first));
+            let mut before = 0usize; // sort strictly before h
+            let mut before_or_eq = 0usize; // sort before-or-peer with h
+            let mut distinct_before = 0usize;
+            let mut last_before: Option<&Value> = None;
+            for it in items {
+                match crate::order_by_value_cmp(desc, nulls_first, it, h) {
+                    core::cmp::Ordering::Less => {
+                        before += 1;
+                        before_or_eq += 1;
+                        if last_before
+                            .is_none_or(|p| value_cmp(p, it) != core::cmp::Ordering::Equal)
+                        {
+                            distinct_before += 1;
+                            last_before = Some(it);
+                        }
+                    }
+                    core::cmp::Ordering::Equal => before_or_eq += 1,
+                    core::cmp::Ordering::Greater => {}
+                }
+            }
+            let nn = n as f64;
+            match name {
+                "rank" => Value::BigInt((before + 1) as i64),
+                "dense_rank" => Value::BigInt((distinct_before + 1) as i64),
+                "percent_rank" => Value::Float(before as f64 / nn),
+                "cume_dist" => Value::Float((before_or_eq as f64 + 1.0) / (nn + 1.0)),
+                _ => unreachable!(),
+            }
+        }
+        // Most frequent value; equal values are adjacent in the sorted
+        // run, and a frequency tie resolves to the earliest run (the
+        // smallest value under an ascending sort), matching PG.
+        "mode" => {
+            let (mut best_i, mut best_cnt) = (0usize, 1usize);
+            let (mut run_i, mut run_cnt) = (0usize, 1usize);
+            for i in 1..n {
+                if value_cmp(&items[i], &items[run_i]) == core::cmp::Ordering::Equal {
+                    run_cnt += 1;
+                } else {
+                    run_i = i;
+                    run_cnt = 1;
+                }
+                if run_cnt > best_cnt {
+                    best_cnt = run_cnt;
+                    best_i = run_i;
+                }
+            }
+            items[best_i].clone()
+        }
+        // The first value whose cumulative fraction reaches `f`.
+        "percentile_disc" => {
+            let f = fraction
+                .and_then(agg_value_to_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let idx = if f <= 0.0 {
+                0
+            } else {
+                (crate::eval::f64_ceil(f * n as f64) as usize)
+                    .saturating_sub(1)
+                    .min(n - 1)
+            };
+            items[idx].clone()
+        }
+        // Linear interpolation between the two bracketing values.
+        "percentile_cont" => {
+            let f = fraction
+                .and_then(agg_value_to_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let Some(nums) = items
+                .iter()
+                .map(agg_value_to_f64)
+                .collect::<Option<Vec<f64>>>()
+            else {
+                return Value::Null; // non-numeric ordered set
+            };
+            if n == 1 {
+                return Value::Float(nums[0]);
+            }
+            let rank = f * (n as f64 - 1.0);
+            let lo = crate::eval::f64_floor(rank) as usize;
+            let hi = crate::eval::f64_ceil(rank) as usize;
+            let frac = rank - lo as f64;
+            Value::Float(nums[lo] + (nums[hi] - nums[lo]) * frac)
+        }
         _ => unreachable!(),
     }
 }
@@ -1151,7 +1926,24 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // v7.17.0 — boolean aggregates always return BOOL (nullable
         // — empty / all-NULL group → NULL).
         "bool_and" | "bool_or" => DataType::Bool,
-        // min/max and anything pass-through: the argument's shape.
+        // v7.32 (round-29) — variance / stddev are floating point;
+        // percentile_cont interpolates to float; the regression family
+        // (except regr_count) is floating point.
+        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop"
+        | "percentile_cont" | "covar_pop" | "covar_samp" | "corr" | "regr_avgx" | "regr_avgy"
+        | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_sxx" | "regr_syy" | "regr_sxy" => {
+            DataType::Float
+        }
+        // v7.32 (round-29) — bitwise aggregates, regr_count, and the
+        // integer hypothetical-set ranks return an integer.
+        "bit_and" | "bit_or" | "bit_xor" | "regr_count" | "rank" | "dense_rank" => DataType::BigInt,
+        // v7.32 (round-29) — hypothetical-set distribution functions.
+        "percent_rank" | "cume_dist" => DataType::Float,
+        // v7.32 (round-29) — JSON aggregates return JSON.
+        "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg" => DataType::Json,
+        // min/max, percentile_disc, mode, and anything pass-through:
+        // the argument's shape (for ordered-set aggs `spec.arg` is the
+        // WITHIN GROUP value expression).
         _ => arg_ty.unwrap_or(DataType::Text),
     }
 }
@@ -1179,24 +1971,37 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         call,
         order_by,
         distinct,
+        filter,
     } = e
         && let Expr::FunctionCall { name, args } = call.as_ref()
     {
         let lower = name.to_ascii_lowercase();
         if is_aggregate_name(&lower) {
             let canonical: &str = if lower == "every" { "bool_and" } else { &lower };
-            let arg = args.first().cloned();
-            let arg2 = if lower == "string_agg" {
+            // Mirror collect_aggregates: ordered-set aggregates take the
+            // value from the sort spec and the in-parens arg as direct.
+            let (arg, direct_arg) = if is_within_group_name(canonical) {
+                (
+                    order_by.first().map(|o| o.expr.clone()),
+                    args.first().cloned(),
+                )
+            } else {
+                (args.first().cloned(), None)
+            };
+            let arg2 = if agg_uses_second_arg(canonical) {
                 args.get(1).cloned()
             } else {
                 None
             };
+            let filter_owned = filter.as_deref().cloned();
             for (i, spec) in aggs.iter().enumerate() {
                 if spec.name == canonical
                     && spec.arg == arg
                     && spec.arg2 == arg2
                     && spec.distinct == *distinct
                     && spec.order_by == *order_by
+                    && spec.filter == filter_owned
+                    && spec.direct_arg == direct_arg
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
                         qualifier: None,
@@ -1216,8 +2021,9 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                 args.first().cloned()
             };
             // v7.17.0 — match the spec we registered for
-            // string_agg(value, separator) on the full pair.
-            let arg2 = if lower == "string_agg" {
+            // string_agg(value, separator) on the full pair; v7.32 also
+            // the regression family and json_object_agg.
+            let arg2 = if agg_uses_second_arg(&lower) {
                 args.get(1).cloned()
             } else {
                 None
@@ -1260,6 +2066,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             call,
             order_by,
             distinct,
+            filter,
         } => Expr::AggregateOrdered {
             call: Box::new(rewrite_expr(call, group_exprs, aggs)),
             distinct: *distinct,
@@ -1271,6 +2078,9 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                     nulls_first: o.nulls_first,
                 })
                 .collect(),
+            // The filter is evaluated against SOURCE rows during
+            // accumulation, never against synth rows — keep it as-is.
+            filter: filter.clone(),
         },
         Expr::Binary { lhs, op, rhs } => Expr::Binary {
             lhs: Box::new(rewrite_expr(lhs, group_exprs, aggs)),
