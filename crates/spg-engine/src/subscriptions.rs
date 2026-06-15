@@ -31,6 +31,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use spg_sql::ast::CreateSubscriptionStatement;
+use spg_storage::{ColumnSchema, DataType, Row, Value};
+
+use crate::{Engine, EngineError, QueryResult};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
     pub conn_str: String,
@@ -261,6 +266,98 @@ fn read_long_str(buf: &[u8], p: &mut usize) -> Result<String, SubscriptionError>
     core::str::from_utf8(slice)
         .map(ToString::to_string)
         .map_err(|e| SubscriptionError::Corrupt(alloc::format!("non-UTF-8 conn_str: {e}")))
+}
+
+impl Engine {
+    /// v6.1.4 — `SHOW SUBSCRIPTIONS` row materialisation. Returns
+    /// `(name, conn_str, publications, enabled, last_received_pos)`
+    /// ordered by subscription name. The `publications` column is
+    /// the comma-joined list ("p1, p2") for ergonomic SHOW output;
+    /// callers wanting structured access read `Engine::subscriptions`.
+    pub(crate) fn exec_show_subscriptions(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("conn_str", DataType::Text, false),
+            ColumnSchema::new("publications", DataType::Text, false),
+            ColumnSchema::new("enabled", DataType::Bool, false),
+            ColumnSchema::new("last_received_pos", DataType::BigInt, false),
+        ];
+        let rows: Vec<Row> = self
+            .subscriptions
+            .iter()
+            .map(|(name, sub)| {
+                Row::new(alloc::vec![
+                    Value::Text(name.clone()),
+                    Value::Text(sub.conn_str.clone()),
+                    Value::Text(sub.publications.join(", ")),
+                    Value::Bool(sub.enabled),
+                    Value::BigInt(i64::try_from(sub.last_received_pos).unwrap_or(i64::MAX)),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.1.4 — `CREATE SUBSCRIPTION` runtime path. Defaults
+    /// `enabled = true` and `last_received_pos = 0` for a freshly-
+    /// created subscription. The actual worker thread is spawned
+    /// by spg-server once the engine returns success.
+    pub(crate) fn exec_create_subscription(
+        &mut self,
+        s: CreateSubscriptionStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // See exec_create_publication — the in_transaction gate
+        // was over-cautious; the auto-commit wrap path holds an
+        // internal TX that this check was incorrectly blocking.
+        let sub = Subscription {
+            conn_str: s.conn_str,
+            publications: s.publications,
+            enabled: true,
+            last_received_pos: 0,
+        };
+        self.subscriptions
+            .create(s.name, sub)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE SUBSCRIPTION: {e:?}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    /// v6.1.4 — `DROP SUBSCRIPTION`. Silent no-op when the name
+    /// doesn't exist (PG-compatible). The associated worker is
+    /// torn down by spg-server when it observes the catalog
+    /// change at the next snapshot or via the engine's
+    /// subscriptions accessor (the worker polls the catalog on
+    /// reconnect; v6.1.5's filter-side will tighten this to an
+    /// explicit signal).
+    pub(crate) fn exec_drop_subscription(
+        &mut self,
+        name: &str,
+    ) -> Result<QueryResult, EngineError> {
+        let removed = self.subscriptions.drop(name);
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    /// v6.1.4 — read access to the subscription catalog. Used by
+    /// the subscription worker (read its own row to find its
+    /// publications + last applied position), by SHOW SUBSCRIPTIONS,
+    /// and by e2e tests asserting state directly.
+    pub const fn subscriptions(&self) -> &Subscriptions {
+        &self.subscriptions
+    }
+
+    /// v6.1.4 — write access to `last_received_pos`. Worker
+    /// calls this after each apply batch (under the engine's
+    /// write-lock). Returns `false` when the subscription was
+    /// dropped between when the worker received the record and
+    /// when this call landed.
+    pub fn subscription_advance(&mut self, name: &str, pos: u64) -> bool {
+        self.subscriptions.update_last_received_pos(name, pos)
+    }
 }
 
 #[cfg(test)]

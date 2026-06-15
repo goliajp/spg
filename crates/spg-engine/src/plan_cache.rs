@@ -251,10 +251,21 @@ fn collect_table_ref(t: &TableRef, out: &mut Vec<String>) {
 
 fn collect_expr(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr::AggregateOrdered { call, order_by, .. } => {
+        Expr::AggregateOrdered {
+            call,
+            order_by,
+            filter,
+            ..
+        } => {
             collect_expr(call, out);
             for o in order_by {
                 collect_expr(&o.expr, out);
+            }
+            // A `FILTER (WHERE …)` predicate can carry a subquery that
+            // names a table; track it so writes to that table still
+            // invalidate this cached plan.
+            if let Some(f) = filter {
+                collect_expr(f, out);
             }
         }
         Expr::ScalarSubquery(inner) => collect_from_select(inner, out),

@@ -18,6 +18,10 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use spg_storage::{ColumnSchema, DataType, Row, Value};
+
+use crate::{Engine, QueryResult};
+
 const SALT_LEN: usize = 16;
 const HASH_LEN: usize = 32;
 /// v7.17.0 Phase 3.P0-71 — length of SHA1(SHA1(password)) stored
@@ -644,6 +648,66 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         return Err(UserDeserializeError::Truncated);
     }
     Ok(store)
+}
+
+impl Engine {
+    /// v4.1 `SHOW USERS` — `(name, role)` per row, ordered by name.
+    pub(crate) fn exec_show_users(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("role", DataType::Text, false),
+        ];
+        let rows: Vec<Row> = self
+            .users
+            .iter()
+            .map(|(name, rec)| {
+                Row::new(alloc::vec![
+                    Value::Text(name.to_string()),
+                    Value::Text(rec.role.as_str().to_string()),
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+    /// `salt` is supplied by the caller (the host has a random
+    /// source; the engine is `no_std`). Caller should pass a fresh
+    /// 16-byte random value per user.
+    pub fn create_user(
+        &mut self,
+        name: &str,
+        password: &str,
+        role: Role,
+        salt: [u8; 16],
+    ) -> Result<(), UserError> {
+        self.users.create(name, password, role, salt)?;
+        // v4.8: also derive SCRAM-SHA-256 secrets so PG-wire SASL
+        // auth can verify without re-running PBKDF2 per attempt.
+        // Uses a fresh salt from the host RNG (falls back to a
+        // deterministic per-username salt when no RNG is wired, same
+        // as the legacy hash path).
+        let scram_salt = self.salt_fn.map_or_else(
+            || {
+                let mut s = [0u8; SCRAM_SALT_LEN];
+                let digest = spg_crypto::hash(name.as_bytes());
+                // Use bytes 16..32 of BLAKE3 so we don't reuse the
+                // exact same fallback salt as the BLAKE3 hash path.
+                s.copy_from_slice(&digest[16..32]);
+                s
+            },
+            |f| f(),
+        );
+        self.users
+            .enable_scram(name, password, scram_salt, SCRAM_DEFAULT_ITERS)?;
+        Ok(())
+    }
+
+    pub fn drop_user(&mut self, name: &str) -> Result<(), UserError> {
+        self.users.drop(name)
+    }
+
+    pub fn verify_user(&self, name: &str, password: &str) -> Option<Role> {
+        self.users.verify(name, password)
+    }
 }
 
 #[cfg(test)]
