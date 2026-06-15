@@ -22,7 +22,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use spg_sql::ast::PublicationScope;
+use spg_storage::{ColumnSchema, DataType, Row, Value};
+
+use crate::{Engine, EngineError, QueryResult};
+
+use spg_sql::ast::{CreatePublicationStatement, PublicationScope};
 
 /// On-disk scope tag — v6.1.2 only writes/reads `0` (AllTables).
 /// `1` and `2` are reserved for v6.1.3 (`ForTables` /
@@ -220,6 +224,97 @@ fn read_table_list(buf: &[u8], p: &mut usize) -> Result<Vec<String>, Publication
         out.push(read_str(buf, p)?);
     }
     Ok(out)
+}
+
+impl Engine {
+    /// v6.1.3 — `SHOW PUBLICATIONS` row materialisation. Returns
+    /// `(name, scope, table_count)` ordered by publication name.
+    ///   - `scope` is the human-readable string:
+    ///       `"FOR ALL TABLES"` /
+    ///       `"FOR TABLE t1, t2"` /
+    ///       `"FOR ALL TABLES EXCEPT t1, t2"`.
+    ///   - `table_count` is NULL for `AllTables`, the list length
+    ///     otherwise. NULLability lets clients distinguish "publish
+    ///     everything" from "publish exactly 0 tables" (the v6.1.3
+    ///     parser forbids the empty list, but the column shape is
+    ///     ready for the v6.1.5 publisher-side semantics).
+    pub(crate) fn exec_show_publications(&self) -> QueryResult {
+        let columns = alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("scope", DataType::Text, false),
+            ColumnSchema::new("table_count", DataType::Int, true),
+        ];
+        let rows: Vec<Row> = self
+            .publications
+            .iter()
+            .map(|(name, scope)| {
+                let (scope_str, count_val) = match scope {
+                    spg_sql::ast::PublicationScope::AllTables => {
+                        ("FOR ALL TABLES".to_string(), Value::Null)
+                    }
+                    spg_sql::ast::PublicationScope::ForTables(ts) => (
+                        alloc::format!("FOR TABLE {}", ts.join(", ")),
+                        Value::Int(i32::try_from(ts.len()).unwrap_or(i32::MAX)),
+                    ),
+                    spg_sql::ast::PublicationScope::AllTablesExcept(ts) => (
+                        alloc::format!("FOR ALL TABLES EXCEPT {}", ts.join(", ")),
+                        Value::Int(i32::try_from(ts.len()).unwrap_or(i32::MAX)),
+                    ),
+                };
+                Row::new(alloc::vec![
+                    Value::Text(name.clone()),
+                    Value::Text(scope_str),
+                    count_val,
+                ])
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
+    /// v6.1.2 — `CREATE PUBLICATION` runtime path. Duplicate names
+    /// surface as `EngineError::Unsupported` so the existing PG-wire
+    /// error mapping stays uniform; the message carries the name so
+    /// operators can grep replication-log noise. Inside-transaction
+    /// invocation is rejected (matches `CREATE USER` / `DROP USER`
+    /// stance) — replication-catalog mutation is a connection-level
+    /// administrative op, not a transactional one.
+    pub(crate) fn exec_create_publication(
+        &mut self,
+        s: CreatePublicationStatement,
+    ) -> Result<QueryResult, EngineError> {
+        // v6.1.4 — the v6.1.2 "no DDL inside a transaction" guard
+        // was over-cautious: it also blocked the auto-commit wrap
+        // path (which begins an internal TX around every WAL-
+        // logged statement). PG itself allows CREATE PUBLICATION
+        // inside a transaction (it rolls back with the TX).
+        self.publications
+            .create(s.name, s.scope)
+            .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE PUBLICATION: {e:?}")))?;
+        Ok(QueryResult::CommandOk {
+            affected: 1,
+            modified_catalog: true,
+        })
+    }
+
+    /// v6.1.2 — `DROP PUBLICATION` runtime path. PG-compatible silent
+    /// no-op when the publication doesn't exist (returns `affected=0`
+    /// in that case so the wire-level command tag distinguishes
+    /// "dropped" from "no-op", though both succeed).
+    pub(crate) fn exec_drop_publication(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+        let removed = self.publications.drop(name);
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
+    /// v6.1.2 — read access to the publication catalog. Used by
+    /// the v6.1.5 publisher-side WAL filter, by `SHOW PUBLICATIONS`
+    /// (v6.1.3+), and by e2e tests that need to assert state without
+    /// going through the wire.
+    pub const fn publications(&self) -> &Publications {
+        &self.publications
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,294 @@
+//! SELECT/expression structural analysis — does a query refer to a name,
+//! collect qualified column references, walk columns and subqueries. Split
+//! out of `lib.rs` (v7.32 engine modularisation). Pure AST walks over
+//! `spg_sql::ast`, no Engine state.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use spg_sql::ast::{Expr, FromClause, SelectItem, SelectStatement};
+
+/// v4.22: cheap structural scan for `FROM <name>` (qualified or
+/// not) inside a SELECT — used to verify the anchor of a WITH
+/// RECURSIVE CTE doesn't recurse into itself. Conservative: walks
+/// FROM joins, subqueries, and unions.
+pub(crate) fn select_refers_to(stmt: &SelectStatement, target: &str) -> bool {
+    if let Some(from) = &stmt.from
+        && from_refers_to(from, target)
+    {
+        return true;
+    }
+    for (_, peer) in &stmt.unions {
+        if select_refers_to(peer, target) {
+            return true;
+        }
+    }
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item
+            && expr_refers_to(expr, target)
+        {
+            return true;
+        }
+    }
+    if let Some(w) = &stmt.where_
+        && expr_refers_to(w, target)
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn from_refers_to(from: &FromClause, target: &str) -> bool {
+    if from.primary.name.eq_ignore_ascii_case(target) {
+        return true;
+    }
+    from.joins
+        .iter()
+        .any(|j| j.table.name.eq_ignore_ascii_case(target))
+}
+
+/// v7.28 (round-22) — collect every QUALIFIED column referenced
+/// anywhere in a SELECT (subquery bodies included). Returns None
+/// when a wildcard or a bare column name makes static attribution
+/// unsafe — callers then keep every column.
+pub(crate) fn collect_qualified_refs(
+    stmt: &SelectStatement,
+    out: &mut alloc::collections::BTreeSet<(String, String)>,
+) -> Option<()> {
+    for item in &stmt.items {
+        match item {
+            SelectItem::Wildcard => return None,
+            SelectItem::Expr { expr, .. } => collect_qualified_refs_expr(expr, out)?,
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        collect_qualified_refs_expr(w, out)?;
+    }
+    if let Some(from) = &stmt.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                collect_qualified_refs_expr(on, out)?;
+            }
+            if j.table.lateral_subquery.is_some() {
+                return None;
+            }
+        }
+    }
+    if let Some(gs) = &stmt.group_by {
+        for g in gs {
+            collect_qualified_refs_expr(g, out)?;
+        }
+    }
+    if let Some(h) = &stmt.having {
+        collect_qualified_refs_expr(h, out)?;
+    }
+    for o in &stmt.order_by {
+        collect_qualified_refs_expr(&o.expr, out)?;
+    }
+    for (_, peer) in &stmt.unions {
+        collect_qualified_refs(peer, out)?;
+    }
+    for cte in &stmt.ctes {
+        collect_qualified_refs(&cte.body, out)?;
+    }
+    Some(())
+}
+
+pub(crate) fn collect_qualified_refs_expr(
+    e: &Expr,
+    out: &mut alloc::collections::BTreeSet<(String, String)>,
+) -> Option<()> {
+    // Two passes so the column and subquery visitors don't both
+    // capture `out` mutably.
+    let mut cols: Vec<spg_sql::ast::ColumnName> = Vec::new();
+    let mut subs: Vec<&SelectStatement> = Vec::new();
+    visit_expr_columns_and_subqueries(
+        e,
+        &mut |c: &spg_sql::ast::ColumnName| cols.push(c.clone()),
+        &mut |sub| subs.push(sub),
+    );
+    for c in cols {
+        match c.qualifier {
+            Some(q) => {
+                out.insert((q, c.name));
+            }
+            None => return None,
+        }
+    }
+    for sub in subs {
+        collect_qualified_refs(sub, out)?;
+    }
+    Some(())
+}
+
+/// Immutable walk over an Expr visiting every Column and every
+/// nested SelectStatement (v7.28).
+pub(crate) fn visit_expr_columns_and_subqueries<'a>(
+    e: &'a Expr,
+    on_col: &mut impl FnMut(&'a spg_sql::ast::ColumnName),
+    on_sub: &mut impl FnMut(&'a SelectStatement),
+) {
+    match e {
+        Expr::Column(c) => on_col(c),
+        Expr::ScalarSubquery(s) => on_sub(s),
+        Expr::Exists { subquery, .. } => on_sub(subquery),
+        Expr::InSubquery { expr, subquery, .. } => {
+            visit_expr_columns_and_subqueries(expr, on_col, on_sub);
+            on_sub(subquery);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            visit_expr_columns_and_subqueries(lhs, on_col, on_sub);
+            visit_expr_columns_and_subqueries(rhs, on_col, on_sub);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            visit_expr_columns_and_subqueries(expr, on_col, on_sub);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            visit_expr_columns_and_subqueries(expr, on_col, on_sub);
+            visit_expr_columns_and_subqueries(pattern, on_col, on_sub);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                visit_expr_columns_and_subqueries(a, on_col, on_sub);
+            }
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            visit_expr_columns_and_subqueries(call, on_col, on_sub);
+            for o in order_by {
+                visit_expr_columns_and_subqueries(&o.expr, on_col, on_sub);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                visit_expr_columns_and_subqueries(op, on_col, on_sub);
+            }
+            for (w, t) in branches {
+                visit_expr_columns_and_subqueries(w, on_col, on_sub);
+                visit_expr_columns_and_subqueries(t, on_col, on_sub);
+            }
+            if let Some(eb) = else_branch {
+                visit_expr_columns_and_subqueries(eb, on_col, on_sub);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            visit_expr_columns_and_subqueries(target, on_col, on_sub);
+            visit_expr_columns_and_subqueries(index, on_col, on_sub);
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) => {}
+        // Exotic nodes (window etc.) — visit nothing extra; their
+        // columns are caught when the caller bails on bare names
+        // elsewhere, and window queries skip pruning entirely at
+        // the call sites.
+        _ => {
+            // Exotic node (window function etc.): report an
+            // unattributable marker so callers disable pruning.
+            static BAIL: spg_sql::ast::ColumnName = spg_sql::ast::ColumnName {
+                qualifier: None,
+                name: String::new(),
+            };
+            on_col(&BAIL);
+        }
+    }
+}
+
+/// v7.28 (round-22) — collect every Column qualifier in an expr;
+/// `all_qualified` flips false on any bare column (those can't be
+/// attributed to one table safely, so the pushdown skips them).
+pub(crate) fn collect_column_qualifiers<'e>(
+    e: &'e Expr,
+    out: &mut Vec<&'e str>,
+    all_qualified: &mut bool,
+) {
+    if let Expr::Column(c) = e {
+        match &c.qualifier {
+            Some(q) => out.push(q.as_str()),
+            None => *all_qualified = false,
+        }
+        return;
+    }
+    // Reuse the canonical immutable walk via describe's walker shape:
+    // recurse the common containers.
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_column_qualifiers(lhs, out, all_qualified);
+            collect_column_qualifiers(rhs, out, all_qualified);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_column_qualifiers(expr, out, all_qualified);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_column_qualifiers(expr, out, all_qualified);
+            collect_column_qualifiers(pattern, out, all_qualified);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_column_qualifiers(a, out, all_qualified);
+            }
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) => {}
+        // Anything exotic (CASE, subquery, window, arrays…):
+        // conservatively mark unattributable.
+        _ => *all_qualified = false,
+    }
+}
+
+pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
+    match e {
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            expr_refers_to(call, target) || order_by.iter().any(|o| expr_refers_to(&o.expr, target))
+        }
+        Expr::ScalarSubquery(s) => select_refers_to(s, target),
+        Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
+            select_refers_to(subquery, target)
+        }
+        Expr::Binary { lhs, rhs, .. } => expr_refers_to(lhs, target) || expr_refers_to(rhs, target),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_refers_to(expr, target)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_refers_to(expr, target) || expr_refers_to(pattern, target)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(|a| expr_refers_to(a, target)),
+        Expr::Extract { source, .. } => expr_refers_to(source, target),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(|a| expr_refers_to(a, target))
+                || partition_by.iter().any(|p| expr_refers_to(p, target))
+                || order_by.iter().any(|(o, _, _)| expr_refers_to(o, target))
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => false,
+        Expr::Array(items) => items.iter().any(|e| expr_refers_to(e, target)),
+        Expr::InList { expr, list, .. } => {
+            expr_refers_to(expr, target) || list.iter().any(|e| expr_refers_to(e, target))
+        }
+        Expr::ArraySubscript { target: t, index } => {
+            expr_refers_to(t, target) || expr_refers_to(index, target)
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_refers_to(expr, target) || expr_refers_to(array, target)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_refers_to(o, target))
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_refers_to(w, target) || expr_refers_to(t, target))
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|e| expr_refers_to(e, target))
+        }
+    }
+}

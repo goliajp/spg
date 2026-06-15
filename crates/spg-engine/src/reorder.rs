@@ -495,6 +495,120 @@ fn rewrite_from(from: &mut FromClause, tables: &[TableRef], edges: &[Edge], orde
     }
 }
 
+/// v7.32 (architecture v2 P3) — force a specific table to drive an
+/// all-INNER join chain, ignoring cost.
+///
+/// `reorder_joins` is cost-based: it weighs table sizes and ON-edge
+/// selectivity but is blind to single-table WHERE restrictions. The
+/// keyed correlated-subquery probe ([`crate::Engine::try_batch_correlated_scalar`])
+/// needs the opposite: the correlated column is a *known* seek key
+/// (an equality against a literal pushed in per surviving group), so
+/// the table owning it must be the driving table — exactly how PG,
+/// MySQL and MariaDB all plan a correlated join subquery (an index
+/// scan on the correlation column, then an index-nested-loop to the
+/// joined table). The driver is a certainty here, not an estimate,
+/// so we skip the cost model entirely.
+///
+/// Returns `true` if `driver_alias` now drives `stmt.from` (already
+/// primary counts as success). Returns `false` without mutating when
+/// the chain isn't all-INNER, the alias can't be found, or an ON
+/// predicate can't be resolved to its endpoint tables.
+pub(crate) fn drive_from(stmt: &mut SelectStatement, driver_alias: &str) -> bool {
+    let Some(from) = stmt.from.as_mut() else {
+        return false;
+    };
+    // Build the table list (primary first) + alias index, mirroring
+    // `choose_order_inner`. Joinless FROMs only succeed when the lone
+    // table already is the driver.
+    let mut tables: Vec<TableRef> = Vec::with_capacity(1 + from.joins.len());
+    tables.push(from.primary.clone());
+    for j in &from.joins {
+        tables.push(j.table.clone());
+    }
+    let mut alias_to_idx: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, t) in tables.iter().enumerate() {
+        let key = t.alias.clone().unwrap_or_else(|| t.name.clone());
+        alias_to_idx.insert(key, i);
+        if t.alias.is_some() {
+            alias_to_idx.entry(t.name.clone()).or_insert(i);
+        }
+    }
+    let Some(&driver_idx) = alias_to_idx.get(driver_alias) else {
+        return false;
+    };
+    if from.joins.is_empty() {
+        // Nothing to swap: the single table either is or isn't the
+        // driver.
+        return driver_idx == 0;
+    }
+    if driver_idx == 0 {
+        return true; // already driving
+    }
+    if from
+        .joins
+        .iter()
+        .any(|j| !matches!(j.kind, JoinKind::Inner))
+    {
+        return false; // LEFT/CROSS: promotion would change semantics
+    }
+    // Extract ON edges. Selectivity is irrelevant for a forced order
+    // (`rewrite_from` never reads it), so charge 0.0 and skip the
+    // catalog/stats round-trip.
+    let mut edges: Vec<Edge> = Vec::new();
+    for j in &from.joins {
+        let Some(on) = j.on.as_ref() else {
+            return false;
+        };
+        for sub in split_and_conjunctions(on) {
+            let mut endpoint_set: Vec<usize> = Vec::new();
+            if !collect_referenced_tables(sub, &alias_to_idx, &mut endpoint_set) {
+                return false;
+            }
+            endpoint_set.sort_unstable();
+            endpoint_set.dedup();
+            edges.push(Edge {
+                endpoints: endpoint_set,
+                predicate: sub.clone(),
+                selectivity: 0.0,
+            });
+        }
+    }
+    // Order = driver first, then a connectivity-preserving sweep so
+    // each appended table shares an edge with the prefix (keeps
+    // `rewrite_from`'s ON re-attachment exact). Disconnected leftovers
+    // fall back to source order.
+    let n = tables.len();
+    let mut order: Vec<usize> = alloc::vec![driver_idx];
+    let mut included: Vec<bool> = alloc::vec![false; n];
+    included[driver_idx] = true;
+    loop {
+        let mut progressed = false;
+        for ti in 0..n {
+            if included[ti] {
+                continue;
+            }
+            let connects = edges.iter().any(|e| {
+                e.endpoints.contains(&ti) && e.endpoints.iter().all(|&x| x == ti || included[x])
+            });
+            if connects {
+                order.push(ti);
+                included[ti] = true;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    for ti in 0..n {
+        if !included[ti] {
+            order.push(ti);
+        }
+    }
+    rewrite_from(from, &tables, &edges, &order);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +686,60 @@ mod tests {
         let snap = stmt.clone();
         reorder_joins(&mut stmt, &cat, &stats);
         assert_eq!(stmt, snap);
+    }
+
+    fn parse_select(sql: &str) -> SelectStatement {
+        match parser::parse_statement(sql).unwrap() {
+            spg_sql::ast::Statement::Select(s) => s,
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn drive_from_promotes_named_table_to_primary() {
+        // The keyed correlated-subquery probe shape: the correlation
+        // table (m2) must drive even though it is written second.
+        let mut s = parse_select(
+            "SELECT e2.category FROM email_analysis e2 \
+             INNER JOIN messages m2 ON e2.message_id = m2.id \
+             WHERE m2.thread_id = 'th-5'",
+        );
+        assert!(drive_from(&mut s, "m2"));
+        let from = s.from.as_ref().unwrap();
+        assert_eq!(from.primary.alias.as_deref(), Some("m2"));
+        assert_eq!(from.primary.name, "messages");
+        assert_eq!(from.joins.len(), 1);
+        assert_eq!(from.joins[0].table.alias.as_deref(), Some("e2"));
+        // The ON edge travelled with the join and is intact.
+        assert!(from.joins[0].on.is_some());
+    }
+
+    #[test]
+    fn drive_from_noop_when_already_primary() {
+        let mut s = parse_select(
+            "SELECT m2.id FROM messages m2 INNER JOIN email_analysis e2 ON e2.message_id = m2.id",
+        );
+        let snap = s.clone();
+        assert!(drive_from(&mut s, "m2"));
+        assert_eq!(s, snap, "already-driving promotion must not mutate");
+    }
+
+    #[test]
+    fn drive_from_refuses_left_join() {
+        // Promoting across a LEFT join would change semantics.
+        let mut s = parse_select(
+            "SELECT e2.id FROM email_analysis e2 LEFT JOIN messages m2 ON e2.message_id = m2.id",
+        );
+        let snap = s.clone();
+        assert!(!drive_from(&mut s, "m2"));
+        assert_eq!(s, snap, "refused promotion must not mutate");
+    }
+
+    #[test]
+    fn drive_from_unknown_alias_is_false() {
+        let mut s = parse_select(
+            "SELECT e2.id FROM email_analysis e2 INNER JOIN messages m2 ON e2.message_id = m2.id",
+        );
+        assert!(!drive_from(&mut s, "nope"));
     }
 }
