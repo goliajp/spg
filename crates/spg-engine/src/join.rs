@@ -35,6 +35,15 @@ pub(crate) struct JoinedPeer<'a> {
     /// v7.28 (round-22) — plain-table name for the index-nested-loop
     /// path. None for unnest/lateral.
     pub(crate) join_table: Option<String>,
+    /// v7.33 (mailrs 7.33.0) — WHERE conjuncts pushed onto this (INNER)
+    /// peer that were NOT applied by eager materialisation. A deferred
+    /// plain peer carries them here so the join stages apply them as a
+    /// residual filter on matched (left,right) pairs — keeping the
+    /// index-nested-loop path (seek driver + look up only matched peer
+    /// rows) instead of eagerly scanning the whole peer table to filter
+    /// it. Empty for eager peers (already filtered) and LEFT peers
+    /// (analyze_join_pushdown only pushes onto INNER peers).
+    pub(crate) where_preds: Vec<Expr>,
 }
 
 /// v7.31 (perf campaign) — deferred-join row source: one per join
@@ -505,6 +514,7 @@ impl Engine {
                     on: j.on.as_ref(),
                     lateral: Some(inner_box.as_ref()),
                     join_table: None,
+                    where_preds: Vec::new(),
                 });
             } else {
                 let pidx = from
@@ -512,14 +522,19 @@ impl Engine {
                     .iter()
                     .position(|jj| core::ptr::eq(jj, j))
                     .unwrap_or(0);
-                // v7.28 - defer materialisation for plain tables with
-                // no pushed predicate: the index-nested-loop path may
-                // avoid cloning the table entirely.
+                // v7.28 - defer materialisation for plain tables so the
+                // index-nested-loop path can seek the driver and look up
+                // only matched peer rows instead of cloning the whole
+                // table. v7.33 — defer EVEN WITH a pushed WHERE predicate:
+                // carry the predicate as `where_preds` for the stages to
+                // apply as a residual on matched pairs (the eager path
+                // here scanned + filtered the entire peer table, which on
+                // mailrs's snippet subquery cost a full email_analysis scan
+                // per seeked thread — 60× per IN-list group). Correctness
+                // is backstopped by filter_join_survivors re-applying the
+                // full WHERE to survivors.
                 let plain = j.table.unnest_expr.is_none() && j.table.as_of_segment.is_none();
-                if plain
-                    && peer_preds[pidx].is_empty()
-                    && let Some(t) = self.active_catalog().get(&j.table.name)
-                {
+                if plain && let Some(t) = self.active_catalog().get(&j.table.name) {
                     joined.push(JoinedPeer {
                         eager_rows: None,
                         cols: t.schema().columns.clone(),
@@ -528,9 +543,12 @@ impl Engine {
                         on: j.on.as_ref(),
                         lateral: None,
                         join_table: Some(j.table.name.clone()),
+                        where_preds: peer_preds[pidx].iter().map(|e| (*e).clone()).collect(),
                     });
                     continue;
                 }
+                // Non-table peer (UNNEST / AS OF SEGMENT) — materialise
+                // eagerly with its predicate filter applied up front.
                 let (mut rows, cols) =
                     self.materialise_table_ref_filtered(&j.table, &peer_preds[pidx])?;
                 if let Some(needed) = needed {
@@ -545,6 +563,7 @@ impl Engine {
                     on: j.on.as_ref(),
                     lateral: None,
                     join_table: Some(j.table.name.clone()),
+                    where_preds: Vec::new(),
                 });
             }
         }
@@ -680,6 +699,13 @@ impl Engine {
             let peer_mask = keep_mask(needed, &peer.cols, &peer.alias);
             let (eq_pairs, residual) =
                 extract_join_keys(peer, &combined_schema, pipe.consumed_cols);
+            // v7.33 — a deferred peer's pushed WHERE conjuncts ride as extra
+            // residual so the INL / hash stages drop non-matching (left,
+            // right) pairs in place (the eager path used to pre-filter the
+            // whole peer). Taken out of `peer` so the &mut hash call below
+            // doesn't alias the residual borrow.
+            let extra_preds = core::mem::take(&mut peer.where_preds);
+            let residual: Vec<&Expr> = residual.into_iter().chain(extra_preds.iter()).collect();
             if self.join_stage_inl(
                 &mut pipe,
                 peer,
