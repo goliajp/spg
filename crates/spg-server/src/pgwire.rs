@@ -376,6 +376,15 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 conn_state
                     .wait_event
                     .store(0, std::sync::atomic::Ordering::Relaxed);
+                // v7.33 (A1) — persist the write (WAL/snapshot + audit)
+                // before acking it; a durability failure surfaces as a
+                // query error, never a false CommandComplete.
+                let result = match persist_pgwire_write(state, &sql, &result) {
+                    Ok(()) => result,
+                    Err(e) => Err(EngineError::Unsupported(format!(
+                        "durability append failed: {e}"
+                    ))),
+                };
                 match result {
                     Ok(QueryResult::Rows { columns, rows }) => {
                         send_row_description(&mut wbuf, &columns)?;
@@ -385,21 +394,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                         }
                         send_command_complete(&mut wbuf, &format!("SELECT {n}"))?;
                     }
-                    Ok(QueryResult::CommandOk {
-                        affected,
-                        modified_catalog,
-                    }) => {
+                    Ok(QueryResult::CommandOk { affected, .. }) => {
                         let tag = command_tag(&sql, affected);
                         send_command_complete(&mut wbuf, &tag)?;
-                        // v6.5.3 — audit-log every catalog-mutating
-                        // statement from the pgwire path (matches the
-                        // native-wire path's audit hook). Silent on
-                        // mutex poisoning / write error to keep the
-                        // hot path simple; broken audit chains surface
-                        // via spg_audit_verify.
-                        if modified_catalog && state.audit_path.is_some() {
-                            let _ = crate::append_audit_pub(state, &sql);
-                        }
                         // Sync tx state from engine after writes.
                         tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
                             b'T'
@@ -670,6 +667,46 @@ fn execute_with_role(
             .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
         engine.execute_with_cancel(sql, cancel)
     }
+}
+
+/// v7.33 (A1) — persist a successful pgwire write to the durability
+/// surface (WAL, else the no-WAL snapshot) and audit, BEFORE the client
+/// is told the command completed. Both pgwire entry points — the
+/// simple-query path (`execute_with_role`) and the extended-query path
+/// (`execute_prepared`) — route every write through here so one path
+/// can't silently skip durability. Pre-7.33 NEITHER persisted: server-
+/// mode pgwire writes (psql, sqlx, every prepared driver) were lost on
+/// crash. `sql` is the statement text to replay — bind-final (params
+/// substituted to literals) on the extended path so replay reproduces
+/// the effect.
+fn persist_pgwire_write(
+    state: &Arc<ServerState>,
+    sql: &str,
+    result: &Result<QueryResult, EngineError>,
+) -> std::io::Result<()> {
+    let Ok(QueryResult::CommandOk {
+        modified_catalog, ..
+    }) = result
+    else {
+        return Ok(()); // SELECT / error — nothing to persist
+    };
+    if state.wal.is_some() {
+        crate::append_wal(state, sql)?;
+    } else if *modified_catalog && state.db_path.is_some() {
+        // No-WAL mode: capture the current committed state.
+        let bytes = state
+            .engine
+            .read()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?
+            .snapshot();
+        if let Some(path) = state.db_path.as_deref() {
+            crate::write_atomic(path, &bytes)?;
+        }
+    }
+    if *modified_catalog && state.audit_path.is_some() {
+        crate::append_audit_pub(state, sql)?;
+    }
+    Ok(())
 }
 
 fn command_tag(sql: &str, affected: usize) -> String {
@@ -1533,36 +1570,32 @@ fn handle_execute(
     // because the engine itself will satisfy it).
     let needs_write = !matches!(&stmt.ast, spg_sql::ast::Statement::Select(_));
     let result = {
-        let mut eng = if needs_write {
-            // Same lock-tier shape as `execute_with_role`'s
-            // write path. We hold `engine.write()` for the
-            // duration of execute_prepared so transactional
-            // state (in_transaction, savepoints) stays
-            // single-writer.
-            state
-                .engine
-                .write()
-                .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?
-        } else {
-            // SELECT-only path could take a read lock today —
-            // but execute_prepared takes &mut self for symmetry
-            // with the simple-query path. Leave the write lock
-            // for the v6.1.1 commit; v6.2 can introduce a
-            // dedicated read-only execute_prepared_readonly()
-            // and avoid the upgrade. Hot kNN reads still benefit
-            // from the parse caching, which is the load-bearing
-            // win.
-            state
-                .engine
-                .write()
-                .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?
-        };
+        // execute_prepared takes &mut self for symmetry with the
+        // simple-query path, so both read and write hold the write
+        // lock for the duration (single-writer transactional state).
+        let mut eng = state
+            .engine
+            .write()
+            .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
         // Role gate — same shape as `execute_with_role`.
         if needs_write && matches!(role, Role::ReadOnly) {
             return Err(proto("permission denied: readonly role".to_string()));
         }
         eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel)
     };
+    // v7.33 (A1) — persist the write to the WAL (or the no-WAL snapshot)
+    // BEFORE acking it. Pre-7.33 `handle_execute` persisted nothing, so
+    // server-mode prepared writes were lost on crash. Render the
+    // bind-final SQL (placeholders substituted to literals — the same
+    // walk execute_prepared just ran, so replay reproduces the effect)
+    // and route it through the shared persister both pgwire paths use.
+    if needs_write && matches!(&result, Ok(QueryResult::CommandOk { .. })) {
+        let mut bind_ast = stmt.ast.clone();
+        spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
+            .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
+        persist_pgwire_write(state, &bind_ast.to_string(), &result)
+            .map_err(|e| proto(format!("Execute: durability append failed: {e}")))?;
+    }
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
             send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
