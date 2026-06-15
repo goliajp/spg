@@ -8569,6 +8569,111 @@ impl Parser {
         NullTreatment::Respect
     }
 
+    /// v7.32 (mailrs round-29) — `agg(args) FILTER (WHERE cond)`.
+    /// `FILTER` is an unreserved keyword, so it arrives as an `Ident`
+    /// (same shape as the `OVER` tail). Consumes the whole clause and
+    /// returns the predicate; returns `None` when no `FILTER` follows.
+    fn parse_filter_clause(&mut self) -> Result<Option<Box<Expr>>, ParseError> {
+        let (Token::Ident(s) | Token::QuotedIdent(s)) = self.peek() else {
+            return Ok(None);
+        };
+        if !s.eq_ignore_ascii_case("filter") {
+            return Ok(None);
+        }
+        self.advance(); // FILTER
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!("expected '(' after FILTER, got {:?}", self.peek())));
+        }
+        self.advance(); // (
+        if !matches!(self.peek(), Token::Where) {
+            return Err(self.err(format!(
+                "expected WHERE inside FILTER (...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // WHERE
+        let cond = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' to close FILTER (WHERE ...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // )
+        Ok(Some(Box::new(cond)))
+    }
+
+    /// v7.32 (round-29) — `WITHIN GROUP ( ORDER BY <sort_spec> )` tail
+    /// for ordered-set aggregates. `WITHIN` is unreserved (arrives as an
+    /// `Ident`); `GROUP` and `ORDER`/`BY` are keywords. Returns the sort
+    /// keys, or an empty vec when no `WITHIN GROUP` follows.
+    fn parse_within_group_clause(&mut self) -> Result<Vec<OrderBy>, ParseError> {
+        let (Token::Ident(s) | Token::QuotedIdent(s)) = self.peek() else {
+            return Ok(Vec::new());
+        };
+        if !s.eq_ignore_ascii_case("within") {
+            return Ok(Vec::new());
+        }
+        self.advance(); // WITHIN
+        if !matches!(self.peek(), Token::Group) {
+            return Err(self.err(format!(
+                "expected GROUP after WITHIN, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // GROUP
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "expected '(' after WITHIN GROUP, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // (
+        if !matches!(self.peek(), Token::Order) {
+            return Err(self.err(format!(
+                "expected ORDER BY inside WITHIN GROUP (...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // ORDER
+        if !matches!(self.peek(), Token::By) {
+            return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
+        }
+        self.advance(); // BY
+        let mut keys: Vec<OrderBy> = Vec::new();
+        loop {
+            let expr = self.parse_expr(0)?;
+            let desc = if matches!(self.peek(), Token::Desc) {
+                self.advance();
+                true
+            } else if matches!(self.peek(), Token::Asc) {
+                self.advance();
+                false
+            } else {
+                false
+            };
+            let nulls_first = self.parse_optional_nulls_placement()?;
+            keys.push(OrderBy {
+                expr,
+                desc,
+                nulls_first,
+            });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "expected ')' to close WITHIN GROUP (ORDER BY ...), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // )
+        Ok(keys)
+    }
+
     /// No frame clause is supported.
     #[allow(clippy::type_complexity)] // (partitions, ordered-keys-with-desc) is the natural shape
     fn parse_over_clause(
@@ -8770,11 +8875,18 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                // v7.32 (round-29) — `COUNT(*) FILTER (WHERE …)`.
+                let filter = self.parse_filter_clause()?;
                 // v4.12: COUNT(*) OVER (...) — same window tail.
                 let null_treatment = self.parse_null_treatment_modifier();
                 if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                     && s.eq_ignore_ascii_case("over")
                 {
+                    if filter.is_some() {
+                        return Err(
+                            self.err("FILTER on window functions is not supported yet".into())
+                        );
+                    }
                     self.advance();
                     let (partition_by, order_by, frame) = self.parse_over_clause()?;
                     return Ok(Expr::WindowFunction {
@@ -8786,6 +8898,17 @@ impl Parser {
                         null_treatment,
                     });
                 }
+                if let Some(filter) = filter {
+                    return Ok(Expr::AggregateOrdered {
+                        call: Box::new(Expr::FunctionCall {
+                            name: "count_star".into(),
+                            args: Vec::new(),
+                        }),
+                        order_by: Vec::new(),
+                        distinct: false,
+                        filter: Some(filter),
+                    });
+                }
                 return Ok(Expr::FunctionCall {
                     name: "count_star".into(),
                     args: Vec::new(),
@@ -8795,9 +8918,14 @@ impl Parser {
             let mut args = Vec::new();
             let mut agg_order_by: Vec<OrderBy> = Vec::new();
             // v7.25 (round-17) — `COUNT(DISTINCT x)` and friends.
+            // v7.32 (round-29) — accept the dual `ALL` quantifier too
+            // (the default; ORMs emit `COUNT(ALL x)` / `SUM(ALL x)`).
             let agg_distinct = if matches!(self.peek(), Token::Distinct) {
                 self.advance();
                 true
+            } else if matches!(self.peek(), Token::All) {
+                self.advance();
+                false
             } else {
                 false
             };
@@ -8882,6 +9010,27 @@ impl Parser {
                 }
             }
             self.advance(); // consume ')'
+            // v7.32 (round-29) — ordered-set aggregate tail
+            // `name(direct_args) WITHIN GROUP (ORDER BY …)`
+            // (percentile_cont / percentile_disc / mode). The sort spec
+            // lands in the same `order_by` slot a decorated aggregate
+            // uses; the executor dispatches on the function name. WITHIN
+            // GROUP and an intra-argument ORDER BY are mutually
+            // exclusive (PG rejects both).
+            let within_group_order = self.parse_within_group_clause()?;
+            if !within_group_order.is_empty() && !agg_order_by.is_empty() {
+                return Err(self.err(
+                    "an aggregate may not carry both an in-argument ORDER BY and WITHIN GROUP"
+                        .into(),
+                ));
+            }
+            let agg_order_by = if within_group_order.is_empty() {
+                agg_order_by
+            } else {
+                within_group_order
+            };
+            // v7.32 (round-29) — `name(args) FILTER (WHERE …)`.
+            let filter = self.parse_filter_clause()?;
             // v4.12: window-function tail — `name(args) OVER (...)`.
             // Promotes the just-parsed FunctionCall into a
             // WindowFunction node carrying partition + order.
@@ -8892,6 +9041,9 @@ impl Parser {
             if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
                 && s.eq_ignore_ascii_case("over")
             {
+                if filter.is_some() {
+                    return Err(self.err("FILTER on window functions is not supported yet".into()));
+                }
                 self.advance();
                 let (partition_by, order_by, frame) = self.parse_over_clause()?;
                 return Ok(Expr::WindowFunction {
@@ -8903,11 +9055,12 @@ impl Parser {
                     null_treatment,
                 });
             }
-            if !agg_order_by.is_empty() || agg_distinct {
+            if !agg_order_by.is_empty() || agg_distinct || filter.is_some() {
                 return Ok(Expr::AggregateOrdered {
                     call: Box::new(Expr::FunctionCall { name: first, args }),
                     order_by: agg_order_by,
                     distinct: agg_distinct,
+                    filter,
                 });
             }
             return Ok(Expr::FunctionCall { name: first, args });

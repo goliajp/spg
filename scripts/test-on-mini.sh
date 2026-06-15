@@ -14,7 +14,7 @@
 #   scripts/test-on-mini.sh gates --full
 #
 # Caveat: the biz category needs Docker (its harnesses run psql from
-# the postgres:15 image) and a .git dir for rev-parse — neither exists
+# the postgres:18 image) and a .git dir for rev-parse — neither exists
 # on the testbed mirror, so run biz locally.
 set -euo pipefail
 cd "$(dirname "$0")/.."
