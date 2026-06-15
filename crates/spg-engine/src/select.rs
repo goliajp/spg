@@ -1012,6 +1012,13 @@ impl Engine {
         let mut stmt_owned;
         let stmt_ref: &SelectStatement = if expr_tree_has_subquery(stmt) {
             stmt_owned = stmt.clone();
+            // v7.33 (mailrs 7.32.1) — sublink pull-up first: an
+            // aggregate-wrapped correlated scalar subquery whose
+            // correlation key is UNIQUE/PK becomes a LEFT JOIN, so the
+            // executor streams one join instead of splicing a per-row
+            // subplan. Runs before the per-row/batch resolver, which then
+            // only sees the subqueries the pull-up left behind.
+            self.pull_up_unique_correlated_agg_subqueries(&mut stmt_owned);
             self.resolve_select_subqueries(&mut stmt_owned, cancel)?;
             &stmt_owned
         } else {
