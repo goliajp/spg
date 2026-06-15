@@ -74,6 +74,212 @@ pub fn spawn_listener(
     Ok(local)
 }
 
+/// v7.33 (D, autorun) — the PG-wire simple-query ('Q') handler, split
+/// out of `handle_conn` (~195 of its ~528 lines). SET / SHOW / COPY
+/// intercepts, the canned-probe answers, then execute + WAL/snapshot
+/// persist + result emit. Touches only the simple-query connection
+/// state (tx_state, settings) — never the extended-protocol prepared/
+/// portal maps. Each former `continue` is a normal `Ok(())` return;
+/// the caller loops to the next message. Pure extraction.
+#[allow(clippy::too_many_arguments)]
+fn handle_pg_simple_query(
+    stream: &mut TcpStream,
+    body: &[u8],
+    state: &Arc<ServerState>,
+    conn_state: &Arc<crate::ConnState>,
+    role: Role,
+    tx_state: &mut u8,
+    settings: &mut std::collections::HashMap<String, String>,
+    wbuf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    // Null-terminated SQL string (typically — psql appends \0).
+    let sql_bytes = body.strip_suffix(b"\0").unwrap_or(body);
+    // v6.5.2 — update activity registry.
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    conn_state
+        .last_query_start_us
+        .store(now_us, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut s) = conn_state.current_sql.write() {
+        *s = String::from_utf8_lossy(sql_bytes).to_string();
+    }
+    let Ok(sql_str) = std::str::from_utf8(sql_bytes) else {
+        send_error(wbuf, "22021", "invalid UTF-8 in query")?;
+        send_ready_for_query(wbuf, *tx_state)?;
+        stream.write_all(wbuf)?;
+        wbuf.clear();
+        return Ok(());
+    };
+    let sql = sql_str.trim_end_matches(';').trim().to_string();
+    // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
+    // multi-frame protocol; intercept before the regular
+    // execute path tries to parse them.
+    // v4.19: SET name=value / SET name TO value /
+    // SET SESSION name=value / SET LOCAL name=value.
+    // We store the assignment and return CC "SET";
+    // SPG doesn't act on the value (most are
+    // client-side hints), but `SHOW name` later
+    // returns what was stored.
+    // v7.14.0 — SET dispatch is two-tiered:
+    //   1. Engine-affecting (FOREIGN_KEY_CHECKS,
+    //      session_replication_role, default_text_search_config)
+    //      and multi-assignment SET (mysqldump preamble
+    //      `SET @OLD_FK_CHECKS=@@FK_CHECKS, FK_CHECKS=0`)
+    //      fall through to the engine so the flag
+    //      flips.
+    //   2. All other SETs (search_path / client_encoding /
+    //      timezone / …) stay intercepted to keep the
+    //      engine RWLock contention low.
+    if let Some((name, value)) = parse_set_statement(&sql) {
+        let name_lc = name.to_ascii_lowercase();
+        settings.insert(name_lc.clone(), value.clone());
+        // v7.17 Phase 2.4 — `application_name` is a
+        // session GUC; mirror it onto ConnState so
+        // `spg_stat_activity.application_name` reflects
+        // the live value. PG's own `application_name`
+        // is session-scoped — `SET LOCAL` does NOT scope
+        // it to a tx (its GUC context is U / S, not L),
+        // so we don't special-case SET LOCAL here either.
+        if name_lc == "application_name" {
+            if let Ok(mut g) = conn_state.application_name.write() {
+                *g = value.clone();
+            }
+        }
+        let engine_affecting = matches!(
+            name_lc.as_str(),
+            "foreign_key_checks" | "session_replication_role" | "default_text_search_config"
+        );
+        // Detect multi-assignment from the LHS shape
+        // (contains '@' anywhere) or comma in the value
+        // portion (more than one assignment).
+        let is_multi = name_lc.contains('@')
+            || value.contains(',')
+            || sql.to_ascii_lowercase().contains("foreign_key_checks=0")
+            || sql.to_ascii_lowercase().contains("foreign_key_checks =")
+            || sql.to_ascii_lowercase().contains("foreign_key_checks  ");
+        if !engine_affecting && !is_multi {
+            send_command_complete(wbuf, "SET")?;
+            send_ready_for_query(wbuf, *tx_state)?;
+            stream.write_all(wbuf)?;
+            wbuf.clear();
+            return Ok(());
+        }
+        // engine-affecting or multi-assignment:
+        // fall through to dispatch so the engine sees it.
+    }
+    // v4.19: SHOW name / SHOW ALL.
+    if let Some(name) = parse_show_statement(&sql) {
+        let resp = render_show(&name, settings);
+        send_canned(wbuf, &resp)?;
+        send_ready_for_query(wbuf, *tx_state)?;
+        stream.write_all(wbuf)?;
+        wbuf.clear();
+        return Ok(());
+    }
+    if let Some(copy) = parse_copy_intent(&sql) {
+        // COPY mode handles its own protocol roundtrips —
+        // flush any pending output so the COPY handler
+        // starts from a clean wire state.
+        if !wbuf.is_empty() {
+            stream.write_all(wbuf)?;
+            wbuf.clear();
+        }
+        match copy {
+            CopyIntent::From(table, opts) => {
+                handle_copy_from_stdin(stream, state, role, &table, &opts, tx_state)?;
+            }
+            CopyIntent::To(table) => {
+                handle_copy_to_stdout(stream, state, role, &table, tx_state)?;
+            }
+        }
+        send_ready_for_query(wbuf, *tx_state)?;
+        stream.write_all(wbuf)?;
+        wbuf.clear();
+        return Ok(());
+    }
+    // psql sends startup probes like "SELECT version()" /
+    // "SHOW search_path". Stub the common ones with sane
+    // canned answers so the client doesn't error out.
+    if let Some(canned) = canned_response(&sql, state) {
+        send_canned(wbuf, &canned)?;
+        send_ready_for_query(wbuf, *tx_state)?;
+        stream.write_all(wbuf)?;
+        wbuf.clear();
+        return Ok(());
+    }
+    // v6.5.5 — wait_event = write_lock around the
+    // engine lock acquisition. Cleared in all paths
+    // below (success, error, panic via guard would be
+    // overkill — execute_with_role returns Result).
+    conn_state
+        .wait_event
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    // v7.17.0 Phase 2.3 — resolve per-statement deadline
+    // from the session `statement_timeout` GUC (default
+    // `0` → `CancelToken::none()`, hot path unchanged).
+    let cancel = statement_cancel(settings);
+    let result = execute_with_role(state, &sql, role, cancel);
+    conn_state
+        .wait_event
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    // v7.33 (A1) — persist the write (WAL/snapshot + audit)
+    // before acking it; a durability failure surfaces as a
+    // query error, never a false CommandComplete.
+    let result = match persist_wire_write(state, &sql, &result) {
+        Ok(()) => result,
+        Err(e) => Err(EngineError::Unsupported(format!(
+            "durability append failed: {e}"
+        ))),
+    };
+    match result {
+        Ok(QueryResult::Rows { columns, rows }) => {
+            send_row_description(wbuf, &columns)?;
+            let n = rows.len();
+            for row in &rows {
+                send_data_row(wbuf, &columns, row)?;
+            }
+            send_command_complete(wbuf, &format!("SELECT {n}"))?;
+        }
+        Ok(QueryResult::CommandOk { affected, .. }) => {
+            let tag = command_tag(&sql, affected);
+            send_command_complete(wbuf, &tag)?;
+            // Sync tx state from engine after writes.
+            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+                b'T'
+            } else {
+                b'I'
+            };
+        }
+        Err(e) => {
+            // v7.17.0 Phase 2.3 — map `Cancelled` to
+            // SQLSTATE `57014` so PG client libraries
+            // surface it as a statement-timeout, not a
+            // generic `42000` syntax / access error.
+            let (sqlstate, msg) = engine_error_to_wire(&e);
+            send_error(wbuf, sqlstate, &msg)?;
+            // After an error inside a TX, PG goes to 'E'
+            // and stays there until ROLLBACK. We track
+            // best-effort: if engine still in TX, mark
+            // 'E'; otherwise 'I'.
+            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+                b'E'
+            } else {
+                b'I'
+            };
+        }
+        // v7.5.0 — QueryResult is #[non_exhaustive].
+        Ok(_) => {
+            send_error(wbuf, "XX000", "unexpected QueryResult variant")?;
+        }
+    }
+    send_ready_for_query(wbuf, *tx_state)?;
+    stream.write_all(wbuf)?;
+    wbuf.clear();
+    Ok(())
+}
+
 fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
 
@@ -234,202 +440,16 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
         }
 
         match msg_type {
-            b'Q' => {
-                // Null-terminated SQL string (typically — psql appends \0).
-                let sql_bytes = body.strip_suffix(b"\0").unwrap_or(&body);
-                // v6.5.2 — update activity registry.
-                let now_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as i64)
-                    .unwrap_or(0);
-                conn_state
-                    .last_query_start_us
-                    .store(now_us, std::sync::atomic::Ordering::Relaxed);
-                if let Ok(mut s) = conn_state.current_sql.write() {
-                    *s = String::from_utf8_lossy(sql_bytes).to_string();
-                }
-                let Ok(sql_str) = std::str::from_utf8(sql_bytes) else {
-                    send_error(&mut wbuf, "22021", "invalid UTF-8 in query")?;
-                    send_ready_for_query(&mut wbuf, tx_state)?;
-                    stream.write_all(&wbuf)?;
-                    wbuf.clear();
-                    continue;
-                };
-                let sql = sql_str.trim_end_matches(';').trim().to_string();
-                // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
-                // multi-frame protocol; intercept before the regular
-                // execute path tries to parse them.
-                // v4.19: SET name=value / SET name TO value /
-                // SET SESSION name=value / SET LOCAL name=value.
-                // We store the assignment and return CC "SET";
-                // SPG doesn't act on the value (most are
-                // client-side hints), but `SHOW name` later
-                // returns what was stored.
-                // v7.14.0 — SET dispatch is two-tiered:
-                //   1. Engine-affecting (FOREIGN_KEY_CHECKS,
-                //      session_replication_role, default_text_search_config)
-                //      and multi-assignment SET (mysqldump preamble
-                //      `SET @OLD_FK_CHECKS=@@FK_CHECKS, FK_CHECKS=0`)
-                //      fall through to the engine so the flag
-                //      flips.
-                //   2. All other SETs (search_path / client_encoding /
-                //      timezone / …) stay intercepted to keep the
-                //      engine RWLock contention low.
-                if let Some((name, value)) = parse_set_statement(&sql) {
-                    let name_lc = name.to_ascii_lowercase();
-                    settings.insert(name_lc.clone(), value.clone());
-                    // v7.17 Phase 2.4 — `application_name` is a
-                    // session GUC; mirror it onto ConnState so
-                    // `spg_stat_activity.application_name` reflects
-                    // the live value. PG's own `application_name`
-                    // is session-scoped — `SET LOCAL` does NOT scope
-                    // it to a tx (its GUC context is U / S, not L),
-                    // so we don't special-case SET LOCAL here either.
-                    if name_lc == "application_name" {
-                        if let Ok(mut g) = conn_state.application_name.write() {
-                            *g = value.clone();
-                        }
-                    }
-                    let engine_affecting = matches!(
-                        name_lc.as_str(),
-                        "foreign_key_checks"
-                            | "session_replication_role"
-                            | "default_text_search_config"
-                    );
-                    // Detect multi-assignment from the LHS shape
-                    // (contains '@' anywhere) or comma in the value
-                    // portion (more than one assignment).
-                    let is_multi = name_lc.contains('@')
-                        || value.contains(',')
-                        || sql.to_ascii_lowercase().contains("foreign_key_checks=0")
-                        || sql.to_ascii_lowercase().contains("foreign_key_checks =")
-                        || sql.to_ascii_lowercase().contains("foreign_key_checks  ");
-                    if !engine_affecting && !is_multi {
-                        send_command_complete(&mut wbuf, "SET")?;
-                        send_ready_for_query(&mut wbuf, tx_state)?;
-                        stream.write_all(&wbuf)?;
-                        wbuf.clear();
-                        continue;
-                    }
-                    // engine-affecting or multi-assignment:
-                    // fall through to dispatch so the engine sees it.
-                }
-                // v4.19: SHOW name / SHOW ALL.
-                if let Some(name) = parse_show_statement(&sql) {
-                    let resp = render_show(&name, &settings);
-                    send_canned(&mut wbuf, &resp)?;
-                    send_ready_for_query(&mut wbuf, tx_state)?;
-                    stream.write_all(&wbuf)?;
-                    wbuf.clear();
-                    continue;
-                }
-                if let Some(copy) = parse_copy_intent(&sql) {
-                    // COPY mode handles its own protocol roundtrips —
-                    // flush any pending output so the COPY handler
-                    // starts from a clean wire state.
-                    if !wbuf.is_empty() {
-                        stream.write_all(&wbuf)?;
-                        wbuf.clear();
-                    }
-                    match copy {
-                        CopyIntent::From(table, opts) => {
-                            handle_copy_from_stdin(
-                                &mut stream,
-                                state,
-                                role,
-                                &table,
-                                &opts,
-                                &mut tx_state,
-                            )?;
-                        }
-                        CopyIntent::To(table) => {
-                            handle_copy_to_stdout(&mut stream, state, role, &table, &mut tx_state)?;
-                        }
-                    }
-                    send_ready_for_query(&mut wbuf, tx_state)?;
-                    stream.write_all(&wbuf)?;
-                    wbuf.clear();
-                    continue;
-                }
-                // psql sends startup probes like "SELECT version()" /
-                // "SHOW search_path". Stub the common ones with sane
-                // canned answers so the client doesn't error out.
-                if let Some(canned) = canned_response(&sql, state) {
-                    send_canned(&mut wbuf, &canned)?;
-                    send_ready_for_query(&mut wbuf, tx_state)?;
-                    stream.write_all(&wbuf)?;
-                    wbuf.clear();
-                    continue;
-                }
-                // v6.5.5 — wait_event = write_lock around the
-                // engine lock acquisition. Cleared in all paths
-                // below (success, error, panic via guard would be
-                // overkill — execute_with_role returns Result).
-                conn_state
-                    .wait_event
-                    .store(1, std::sync::atomic::Ordering::Relaxed);
-                // v7.17.0 Phase 2.3 — resolve per-statement deadline
-                // from the session `statement_timeout` GUC (default
-                // `0` → `CancelToken::none()`, hot path unchanged).
-                let cancel = statement_cancel(&settings);
-                let result = execute_with_role(state, &sql, role, cancel);
-                conn_state
-                    .wait_event
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                // v7.33 (A1) — persist the write (WAL/snapshot + audit)
-                // before acking it; a durability failure surfaces as a
-                // query error, never a false CommandComplete.
-                let result = match persist_wire_write(state, &sql, &result) {
-                    Ok(()) => result,
-                    Err(e) => Err(EngineError::Unsupported(format!(
-                        "durability append failed: {e}"
-                    ))),
-                };
-                match result {
-                    Ok(QueryResult::Rows { columns, rows }) => {
-                        send_row_description(&mut wbuf, &columns)?;
-                        let n = rows.len();
-                        for row in &rows {
-                            send_data_row(&mut wbuf, &columns, row)?;
-                        }
-                        send_command_complete(&mut wbuf, &format!("SELECT {n}"))?;
-                    }
-                    Ok(QueryResult::CommandOk { affected, .. }) => {
-                        let tag = command_tag(&sql, affected);
-                        send_command_complete(&mut wbuf, &tag)?;
-                        // Sync tx state from engine after writes.
-                        tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
-                            b'T'
-                        } else {
-                            b'I'
-                        };
-                    }
-                    Err(e) => {
-                        // v7.17.0 Phase 2.3 — map `Cancelled` to
-                        // SQLSTATE `57014` so PG client libraries
-                        // surface it as a statement-timeout, not a
-                        // generic `42000` syntax / access error.
-                        let (sqlstate, msg) = engine_error_to_wire(&e);
-                        send_error(&mut wbuf, sqlstate, &msg)?;
-                        // After an error inside a TX, PG goes to 'E'
-                        // and stays there until ROLLBACK. We track
-                        // best-effort: if engine still in TX, mark
-                        // 'E'; otherwise 'I'.
-                        tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
-                            b'E'
-                        } else {
-                            b'I'
-                        };
-                    }
-                    // v7.5.0 — QueryResult is #[non_exhaustive].
-                    Ok(_) => {
-                        send_error(&mut wbuf, "XX000", "unexpected QueryResult variant")?;
-                    }
-                }
-                send_ready_for_query(&mut wbuf, tx_state)?;
-                stream.write_all(&wbuf)?;
-                wbuf.clear();
-            }
+            b'Q' => handle_pg_simple_query(
+                &mut stream,
+                &body,
+                state,
+                &conn_state,
+                role,
+                &mut tx_state,
+                &mut settings,
+                &mut wbuf,
+            )?,
             b'X' => {
                 // Terminate. Flush any pending bytes before returning so
                 // a CommandComplete on the last simple query doesn't
