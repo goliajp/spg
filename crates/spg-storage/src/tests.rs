@@ -1,4 +1,8 @@
 use super::*;
+// NSW algorithms moved to `crate::nsw` (monster tier-3 cut 2); these
+// unit tests exercise its crate-internal distance kernels + search
+// directly. Glob keeps the aarch64 NEON variants cfg-correct.
+use crate::nsw::*;
 use alloc::string::ToString;
 use alloc::vec;
 
