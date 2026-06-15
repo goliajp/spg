@@ -127,3 +127,50 @@ fn upsert_with_where_skips_when_false() {
     let rows = select(&mut eng, "SELECT reason FROM suppression");
     assert_eq!(rows[0][0], Value::Text("bounce".into()));
 }
+
+#[test]
+fn upsert_excluded_inside_case_and_or() {
+    // mailrs 7.32.1 contact auto-capture: EXCLUDED refs nested inside a
+    // CASE expression and an OR. The CASE arm regressed with
+    // "unknown table qualifier: excluded" because substitute_excluded_refs
+    // didn't recurse into Case / IsNull / Cast / Like / InList.
+    let mut eng = engine_with(&[
+        "CREATE TABLE email_contacts (email TEXT NOT NULL, display_name TEXT NOT NULL DEFAULT '', \
+         is_mailing_list BOOL NOT NULL DEFAULT false)",
+        "CREATE UNIQUE INDEX ec_pk ON email_contacts (email)",
+        "INSERT INTO email_contacts VALUES ('a@x.com', 'Old Name', false)",
+    ]);
+    eng.execute(
+        "INSERT INTO email_contacts VALUES ('a@x.com', 'New Name', true) \
+         ON CONFLICT (email) DO UPDATE SET \
+            display_name = CASE WHEN EXCLUDED.display_name != '' \
+                THEN EXCLUDED.display_name ELSE email_contacts.display_name END, \
+            is_mailing_list = email_contacts.is_mailing_list OR EXCLUDED.is_mailing_list",
+    )
+    .unwrap();
+    let rows = select(
+        &mut eng,
+        "SELECT display_name, is_mailing_list FROM email_contacts",
+    );
+    assert_eq!(
+        rows[0][0],
+        Value::Text("New Name".into()),
+        "CASE picked EXCLUDED"
+    );
+    assert_eq!(rows[0][1], Value::Bool(true), "OR folded EXCLUDED");
+
+    // The empty-incoming branch keeps the existing name.
+    eng.execute(
+        "INSERT INTO email_contacts VALUES ('a@x.com', '', false) \
+         ON CONFLICT (email) DO UPDATE SET \
+            display_name = CASE WHEN EXCLUDED.display_name != '' \
+                THEN EXCLUDED.display_name ELSE email_contacts.display_name END",
+    )
+    .unwrap();
+    let rows = select(&mut eng, "SELECT display_name FROM email_contacts");
+    assert_eq!(
+        rows[0][0],
+        Value::Text("New Name".into()),
+        "CASE kept existing"
+    );
+}

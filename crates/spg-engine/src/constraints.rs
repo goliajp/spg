@@ -438,6 +438,64 @@ fn substitute_excluded_refs(expr: Expr, schema_cols: &[ColumnSchema], incoming: 
                 .map(|a| substitute_excluded_refs(a, schema_cols, incoming))
                 .collect(),
         },
+        // v7.33 (mailrs 7.32.1) — EXCLUDED refs nested inside these
+        // value-expression shapes were silently passed through unsubstituted
+        // by the old `other => other`, so `display_name = CASE WHEN
+        // EXCLUDED.x != '' THEN EXCLUDED.x ELSE … END` reached row eval as a
+        // live `excluded.` qualifier and errored. Recurse into every
+        // sub-expression an upsert SET RHS can carry.
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(substitute_excluded_refs(*expr, schema_cols, incoming)),
+            target,
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(substitute_excluded_refs(*expr, schema_cols, incoming)),
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => Expr::Like {
+            expr: Box::new(substitute_excluded_refs(*expr, schema_cols, incoming)),
+            pattern: Box::new(substitute_excluded_refs(*pattern, schema_cols, incoming)),
+            negated,
+            case_insensitive,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(substitute_excluded_refs(*expr, schema_cols, incoming)),
+            list: list
+                .into_iter()
+                .map(|e| substitute_excluded_refs(e, schema_cols, incoming))
+                .collect(),
+            negated,
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => Expr::Case {
+            operand: operand.map(|o| Box::new(substitute_excluded_refs(*o, schema_cols, incoming))),
+            branches: branches
+                .into_iter()
+                .map(|(w, t)| {
+                    (
+                        substitute_excluded_refs(w, schema_cols, incoming),
+                        substitute_excluded_refs(t, schema_cols, incoming),
+                    )
+                })
+                .collect(),
+            else_branch: else_branch
+                .map(|e| Box::new(substitute_excluded_refs(*e, schema_cols, incoming))),
+        },
+        // Leaves (Literal / Placeholder / non-excluded Column) and
+        // subquery-bearing nodes (a separate scope where `excluded` does not
+        // apply) pass through unchanged.
         other => other,
     }
 }
