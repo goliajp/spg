@@ -1751,6 +1751,15 @@ impl Engine {
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
+        // v7.33 (C1, ceiling-first/never-die) — charge each accumulated
+        // output row to the per-query byte budget as it is built, so a
+        // fat single-table scan / sort REJECTS with QueryBytesExceeded
+        // at ~the ceiling instead of materialising the whole table and
+        // only noticing at the final enforce_row_limit check. Without
+        // this, N concurrent fat scans peak at N×table and OOM the host.
+        // `max_query_bytes = None` (the embedded default) = no ceiling,
+        // so existing unbudgeted behaviour is byte-identical.
+        let mut budget = ByteBudget::new(self.max_query_bytes);
         // v6.2.6 — Memoize per-row WHERE eval shares one cache.
         let mut memo = memoize::MemoizeCache::new();
         // v7.32 (perf knife D) — subquery-free WHERE compiles once;
@@ -1800,7 +1809,9 @@ impl Engine {
                             values.push(eval::eval_expr(&p.expr, row, &ctx)?);
                         }
                     }
-                    tagged.push((order_keys.clone(), Row::new(values)));
+                    let out = Row::new(values);
+                    budget.charge(approx_row_bytes(&out))?;
+                    tagged.push((order_keys.clone(), out));
                 }
             } else {
                 let mut values = Vec::with_capacity(projection.len());
@@ -1808,7 +1819,9 @@ impl Engine {
                     // v7.24 (round-16 B) — correlated-aware.
                     values.push(self.eval_expr_with_correlated(&p.expr, row, &ctx, cancel, None)?);
                 }
-                tagged.push((order_keys, Row::new(values)));
+                let out = Row::new(values);
+                budget.charge(approx_row_bytes(&out))?;
+                tagged.push((order_keys, out));
             }
             Ok(())
         };
