@@ -112,27 +112,14 @@ impl Engine {
                 continue;
             };
             let resident: u64 = t.rows().iter().map(|r| approx_row_bytes(r) as u64).sum();
+            // v7.31 C2 — each index variant accounts for its own
+            // resident bytes by walking its real structure (NSW layer
+            // adjacency, GIN posting lists), replacing the old inline
+            // parametric estimate that mis-sized NSW and flat-tokened
+            // every GIN family index.
             let mut idx_bytes: u64 = 0;
             for idx in t.indices() {
-                idx_bytes += match &idx.kind {
-                    spg_storage::IndexKind::BTree(map) => {
-                        let mut b: u64 = 0;
-                        for (_, locs) in map.iter() {
-                            b += (core::mem::size_of::<spg_storage::IndexKey>()
-                                + 24
-                                + locs.len() * core::mem::size_of::<spg_storage::RowLocator>())
-                                as u64;
-                        }
-                        b
-                    }
-                    // Parametric estimate: per node, the dense
-                    // layer-0 neighbour list dominates.
-                    spg_storage::IndexKind::Nsw(g) => {
-                        (g.levels.len() * (g.m_max_0 * 8 + 16)) as u64
-                    }
-                    // BRIN is block-range metadata — flat token.
-                    _ => 1024,
-                };
+                idx_bytes += idx.kind.approx_resident_bytes();
             }
             total_enc += t.hot_bytes();
             total_res += resident;
@@ -153,6 +140,9 @@ impl Engine {
             total_approx_resident_bytes: total_res,
             total_approx_index_bytes: total_idx,
             max_query_bytes: self.max_query_bytes,
+            // Bucket D belongs to the durable host (embed / server),
+            // not the engine — filled in there (C2).
+            wal_bytes: None,
         }
     }
 

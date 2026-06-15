@@ -1688,7 +1688,15 @@ impl Database {
     /// `SELECT * FROM spg_memory_stats`.
     #[must_use]
     pub fn memory_stats(&self) -> spg_engine::MemoryStats {
-        self.engine.memory_stats()
+        let mut stats = self.engine.memory_stats();
+        // v7.31 C2 — fill in bucket D: the engine leaves `wal_bytes`
+        // None (it has no WAL); we report the live (uncheckpointed)
+        // WAL footprint via the same `written_len()` meter `metrics()`
+        // reads. In-memory databases have no persistence → stays None.
+        if let Some(p) = &self.persistence {
+            stats.wal_bytes = Some(p.wal.written_len());
+        }
+        stats
     }
 
     /// v7.1 — flush a fresh catalog snapshot to `db_path` and

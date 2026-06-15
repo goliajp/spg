@@ -1148,6 +1148,58 @@ pub enum IndexKind {
     GinFulltext(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
 }
 
+impl IndexKind {
+    /// v7.31 (memory campaign, C2) — bytes this index variant holds
+    /// resident in RAM, computed by walking its OWN structure rather
+    /// than a parametric guess made by the engine. Replaces the old
+    /// `spg_admin::memory_stats` inline match, which charged NSW with
+    /// a stale `m_max_0 * 8` per node (neighbour slots are `u32` = 4 B
+    /// since v6.1.x, and most nodes never fill `m_max_0`) and lumped
+    /// every GIN family index into a flat 1 KiB token — a gross
+    /// undercount for the text-heavy posting lists that dominate
+    /// mailrs' footprint. Per-entry container overhead uses the
+    /// 3-word (24 B on 64-bit) `Vec`/`String` header as the charge.
+    ///
+    /// O(index entries): operator/monitoring surface (`memory_stats` /
+    /// `spg_memory_stats`), not a query path.
+    #[must_use]
+    pub fn approx_resident_bytes(&self) -> u64 {
+        const HEADER: usize = 24; // Vec/String 3-word header on 64-bit.
+        let loc = core::mem::size_of::<RowLocator>();
+        match self {
+            IndexKind::BTree(map) => {
+                let key = core::mem::size_of::<IndexKey>();
+                map.iter()
+                    .map(|(_, locs)| (key + HEADER + locs.len() * loc) as u64)
+                    .sum()
+            }
+            IndexKind::Nsw(g) => {
+                // `levels` is one byte per node; each layer's adjacency
+                // is a `Vec<u32>` per node whose actual length we walk
+                // (the dense layer-0 list dominates, but upper layers
+                // are sparse — the old estimate ignored that).
+                let mut b = g.levels.len() as u64;
+                for layer in &g.layers {
+                    for nbrs in layer.iter() {
+                        b += (HEADER + nbrs.len() * core::mem::size_of::<u32>()) as u64;
+                    }
+                }
+                b
+            }
+            // BRIN carries NO in-memory key→locator map (the (min,max)
+            // summaries live in cold-segment sidecars on disk); the
+            // resident footprint is just the column-type token.
+            IndexKind::Brin { .. } => core::mem::size_of::<DataType>() as u64,
+            IndexKind::Gin(map) | IndexKind::GinTrgm(map) | IndexKind::GinFulltext(map) => map
+                .iter()
+                .map(|(word, postings)| {
+                    (word.len() + HEADER + HEADER + postings.len() * loc) as u64
+                })
+                .sum(),
+        }
+    }
+}
+
 /// Multi-layer HNSW graph (v2.13). Each node is assigned a `top_level`;
 /// it appears in layers `0..=top_level`. Higher layers are sparser, so
 /// search starts from the entry at the top layer, greedy-descends to

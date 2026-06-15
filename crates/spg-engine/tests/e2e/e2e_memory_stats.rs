@@ -55,6 +55,64 @@ fn memory_stats_reports_rows_and_grows_with_data() {
 }
 
 #[test]
+fn index_bytes_walks_gin_posting_lists_not_flat_token() {
+    // v7.31 C2 — the GIN family used to be charged a flat 1 KiB token
+    // regardless of posting-list size. Now `IndexKind::approx_resident_bytes`
+    // walks the real posting lists, so a trigram index over many text
+    // rows must report far more than the old token and scale with data.
+    let mut e = Engine::new();
+    ok(&mut e, "CREATE TABLE docs (id BIGINT, body TEXT)");
+    ok(
+        &mut e,
+        "CREATE INDEX docs_trgm ON docs USING gin (body gin_trgm_ops)",
+    );
+    for i in 0..200 {
+        ok(
+            &mut e,
+            &format!("INSERT INTO docs VALUES ({i}, 'the quick brown fox number {i}')"),
+        );
+    }
+    let small = e
+        .memory_stats()
+        .tables
+        .into_iter()
+        .find(|t| t.name == "docs")
+        .expect("docs bucket");
+    // Posting lists for 200 rows of multi-trigram text dwarf the old
+    // flat 1024-byte estimate.
+    assert!(
+        small.approx_index_bytes > 1024,
+        "GIN index bytes must reflect real posting lists, got {}",
+        small.approx_index_bytes
+    );
+    let before = small.approx_index_bytes;
+    for i in 200..400 {
+        ok(
+            &mut e,
+            &format!("INSERT INTO docs VALUES ({i}, 'the quick brown fox number {i}')"),
+        );
+    }
+    let bigger = e
+        .memory_stats()
+        .tables
+        .into_iter()
+        .find(|t| t.name == "docs")
+        .unwrap();
+    assert!(
+        bigger.approx_index_bytes > before,
+        "GIN index bytes must grow with data: {before} -> {}",
+        bigger.approx_index_bytes
+    );
+}
+
+#[test]
+fn memory_stats_wal_bucket_is_none_for_bare_engine() {
+    // Bucket D belongs to the durable host; the engine has no WAL.
+    let e = seeded();
+    assert_eq!(e.memory_stats().wal_bytes, None);
+}
+
+#[test]
 fn memory_stats_carries_the_query_budget() {
     let e = Engine::new().with_max_query_bytes(12345);
     assert_eq!(e.memory_stats().max_query_bytes, Some(12345));
