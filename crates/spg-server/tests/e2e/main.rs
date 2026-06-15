@@ -381,6 +381,8 @@ mod e2e_ping;
 #[allow(clippy::uninlined_format_args)]
 mod e2e_prefetch;
 #[allow(unused_mut, unused_variables, clippy::uninlined_format_args)]
+mod e2e_prepared_wal_durability;
+#[allow(unused_mut, unused_variables, clippy::uninlined_format_args)]
 mod e2e_publication_ddl;
 mod e2e_query;
 #[allow(unused_mut, unused_variables)]
