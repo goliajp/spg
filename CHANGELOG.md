@@ -8,6 +8,32 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.32.1] — 2026-06-15 (durability hotfix — server wire writes now reach the WAL)
+
+A database that loses acknowledged writes is broken. Every non-native
+wire protocol was non-durable: the **pgwire** path (simple `Q` and the
+extended Parse/Bind/Execute path) and the **mysql-wire** path
+(`COM_QUERY` and `COM_STMT_EXECUTE`) executed against the engine but
+appended nothing to the WAL and took no snapshot, so a successful write
+from any psql / sqlx / prepared-statement / MySQL client was lost on
+crash. Only the native wire persisted. This was long-standing — 7.32.0
+and every earlier release are affected.
+
+All three wire protocols now route writes through one shared persister
+(`persist_wire_write`): on a successful write, append the statement to
+the WAL — bind-final SQL (placeholders substituted to literals, the
+same walk execute_prepared runs) on the prepared paths so replay
+reproduces the effect — or snapshot in no-WAL mode, plus audit, BEFORE
+the client is told the command completed. A durability failure now
+surfaces as a wire error, never a false CommandComplete. Two
+crash-recovery e2e tests cover pgwire and mysql-wire writes surviving
+a `kill -9` + restart via WAL replay.
+
+Also: `substitute_placeholders` walks `INSERT … SELECT`'s select_source,
+so a prepared `INSERT INTO t SELECT … WHERE x = $1` binds its inner
+placeholders. And the release publish train (`release.sh`) now lists
+spg-sqlx — it shipped 11/12 crates in 7.32.0.
+
 ## [7.32.0] — 2026-06-15
 
 Executor architecture v2 + the perf campaign's structural knives,
