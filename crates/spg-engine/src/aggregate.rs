@@ -20,6 +20,7 @@
 //! `count(*)`, which counts rows). `sum(int)` widens to `BigInt`;
 //! `avg(int|bigint)` returns `Float`.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -530,6 +531,26 @@ fn accumulate_groups(
         .iter()
         .map(|spec| spec.arg.as_ref().and_then(|e| col_pos(e)))
         .collect();
+    // v7.33 (array_agg perf) — bound positions for each spec's internal
+    // ORDER BY keys, so an ordered aggregate (`array_agg(x ORDER BY y)`)
+    // reads the sort key by reference (RowRef::get) instead of
+    // materialising the whole combined join row per input row just to
+    // eval one bound column. Mirrors arg_pos. On the inbox shape this
+    // turned 24k full-row (~1 KB each) clones into 24k single-cell reads.
+    let order_pos: Vec<Vec<Option<usize>>> = agg_specs
+        .iter()
+        .map(|spec| spec.order_by.iter().map(|o| col_pos(&o.expr)).collect())
+        .collect();
+    // Does any spec need the fully-materialised row in the bound fast
+    // path — a FILTER, a non-bound value arg, a second arg, or a non-bound
+    // ORDER key? When false (every aggregate arg/key is a bound column —
+    // the inbox shape) the bound fast path never materialises a row.
+    let needs_mat = agg_specs.iter().enumerate().any(|(i, s)| {
+        s.filter.is_some()
+            || (s.arg.is_some() && arg_pos[i].is_none())
+            || s.arg2.is_some()
+            || order_pos[i].iter().any(Option::is_none)
+    });
     let ci_positions: Vec<usize> = group_exprs
         .iter()
         .enumerate()
@@ -601,12 +622,23 @@ fn accumulate_groups(
                 }
             };
             let entry = &mut order[idx];
+            // v7.33 (array_agg perf) — materialise the combined row AT
+            // MOST once per input row, and only when a spec actually
+            // needs the eval path (FILTER / non-bound arg / arg2 / non-
+            // bound ORDER key). Bound args and bound ORDER keys read
+            // cells by reference below, so the inbox shape (all bound)
+            // never materialises — killing the per-row ~1 KB clone that
+            // dominated the ordered-aggregate cost.
+            let mat: Option<Cow<'_, Row>> = if needs_mat { Some(row.as_row()) } else { None };
             for (i, spec) in agg_specs.iter().enumerate() {
                 // v7.32 (round-29) — FILTER (WHERE cond): exclude rows
                 // where cond is not TRUE before they reach this
                 // aggregate's accumulator (and before DISTINCT dedup).
                 if let Some(f) = &spec.filter
-                    && !matches!(eval_arg(f, &row.as_row(), &ctx)?, Value::Bool(true))
+                    && !matches!(
+                        eval_arg(f, mat.as_deref().expect("needs_mat for FILTER"), &ctx)?,
+                        Value::Bool(true)
+                    )
                 {
                     continue;
                 }
@@ -618,20 +650,37 @@ fn accumulate_groups(
                         &arg_owned
                     }
                     (None, Some(e)) => {
-                        arg_owned = eval_arg(e, &row.as_row(), &ctx)?;
+                        arg_owned = eval_arg(
+                            e,
+                            mat.as_deref().expect("needs_mat for non-bound arg"),
+                            &ctx,
+                        )?;
                         &arg_owned
                     }
                 };
                 let arg2_val = match &spec.arg2 {
                     None => None,
-                    Some(e) => Some(eval_arg(e, &row.as_row(), &ctx)?),
+                    Some(e) => Some(eval_arg(
+                        e,
+                        mat.as_deref().expect("needs_mat for arg2"),
+                        &ctx,
+                    )?),
                 };
                 let order_keys = if spec.order_by.is_empty() {
                     None
                 } else {
                     let mut keys = Vec::with_capacity(spec.order_by.len());
-                    for o in &spec.order_by {
-                        keys.push(eval_arg(&o.expr, &row.as_row(), &ctx)?);
+                    for (k, o) in spec.order_by.iter().enumerate() {
+                        // Bound ORDER key → read the cell by reference; only
+                        // a non-bound key falls to the materialised eval path.
+                        keys.push(match order_pos[i][k] {
+                            Some(p) => row.get(p).cloned().unwrap_or(Value::Null),
+                            None => eval_arg(
+                                &o.expr,
+                                mat.as_deref().expect("needs_mat for non-bound ORDER key"),
+                                &ctx,
+                            )?,
+                        });
                     }
                     Some(keys)
                 };
