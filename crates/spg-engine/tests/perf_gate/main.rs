@@ -86,6 +86,7 @@ static PEAK_TRACKING_ALLOC: PeakTracker = PeakTracker;
 
 mod join_reorder;
 mod never_die;
+mod ordered_agg;
 mod plan_cache;
 mod proj_borrow;
 mod resident;
