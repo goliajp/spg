@@ -35,6 +35,7 @@ fn local_spawn(db: &Path, wal: &Path) -> (std::process::Child, common::ServerAdd
         .arg("-")
         .arg_path(wal)
         .with_pgwire()
+        .with_mysqlwire()
         .spawn()
 }
 
@@ -194,6 +195,91 @@ fn prepared_writes_survive_crash_via_wal() {
         count_rows(&mut s, "SELECT a, b FROM t"),
         3,
         "extended-protocol prepared writes must replay from the WAL after a crash"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── minimal MySQL-wire client ─────────────────────────────────────
+
+fn my_read_packet(s: &mut TcpStream) -> Vec<u8> {
+    let mut hdr = [0u8; 4];
+    s.read_exact(&mut hdr).expect("my header");
+    let len = u32::from(hdr[0]) | (u32::from(hdr[1]) << 8) | (u32::from(hdr[2]) << 16);
+    let mut payload = vec![0u8; len as usize];
+    s.read_exact(&mut payload).expect("my payload");
+    payload
+}
+
+fn my_write_packet(s: &mut TcpStream, seqno: u8, payload: &[u8]) {
+    let len = payload.len() as u32;
+    s.write_all(&[len as u8, (len >> 8) as u8, (len >> 16) as u8, seqno])
+        .unwrap();
+    s.write_all(payload).unwrap();
+}
+
+fn my_auth(addr: &str) -> TcpStream {
+    let mut s = common::connect_to(addr);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let _greeting = my_read_packet(&mut s);
+    // open-mode handshake response (empty auth_response accepted).
+    let caps: u32 = 0x0000_0200 | 0x0000_8000 | 0x0008_0000;
+    let mut p = Vec::new();
+    p.extend_from_slice(&caps.to_le_bytes());
+    p.extend_from_slice(&16_777_215u32.to_le_bytes());
+    p.push(0xff);
+    p.extend_from_slice(&[0u8; 23]);
+    p.extend_from_slice(b"anyone\0");
+    p.push(0);
+    p.extend_from_slice(b"mysql_native_password\0");
+    my_write_packet(&mut s, 1, &p);
+    let ok = my_read_packet(&mut s);
+    assert_eq!(ok[0], 0x00, "mysql auth: expected OK, got {:#x}", ok[0]);
+    s
+}
+
+// COM_QUERY a write; the response is a single OK packet (0x00). A
+// durability failure would come back as an ERR packet (0xff).
+fn my_write(s: &mut TcpStream, sql: &str) {
+    let mut payload = Vec::with_capacity(1 + sql.len());
+    payload.push(0x03); // COM_QUERY
+    payload.extend_from_slice(sql.as_bytes());
+    my_write_packet(s, 0, &payload);
+    let resp = my_read_packet(s);
+    assert_eq!(
+        resp[0], 0x00,
+        "mysql COM_QUERY {sql:?}: expected OK (write durable), got {:#x}",
+        resp[0]
+    );
+}
+
+#[test]
+fn mysqlwire_writes_survive_crash_via_wal() {
+    let dir = unique_tmpdir();
+    let db = dir.join("spg.db");
+    let wal = dir.join("wal.log");
+
+    // Phase 1: writes over the MySQL wire (COM_QUERY); kill the daemon.
+    {
+        let (raw, addrs) = local_spawn(&db, &wal);
+        let _g = common::ChildGuard(raw);
+        let my = addrs.mysqlwire.clone().expect("mysqlwire enabled");
+        let mut s = my_auth(&my);
+        my_write(&mut s, "CREATE TABLE m (a TEXT)");
+        my_write(&mut s, "INSERT INTO m VALUES ('one')");
+        my_write(&mut s, "INSERT INTO m VALUES ('two')");
+        // _g drops here → kill -9, no graceful shutdown.
+    }
+
+    // Phase 2: fresh daemon replays the WAL; verify over the PG wire
+    // (same engine state — any protocol sees the replayed rows).
+    let (raw, addrs) = local_spawn(&db, &wal);
+    let _g = common::ChildGuard(raw);
+    let mut s = connect_pg(&addrs);
+    assert_eq!(
+        count_rows(&mut s, "SELECT a FROM m"),
+        2,
+        "mysql-wire writes must replay from the WAL after a crash"
     );
 
     std::fs::remove_dir_all(&dir).ok();

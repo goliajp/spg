@@ -379,7 +379,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 // v7.33 (A1) — persist the write (WAL/snapshot + audit)
                 // before acking it; a durability failure surfaces as a
                 // query error, never a false CommandComplete.
-                let result = match persist_pgwire_write(state, &sql, &result) {
+                let result = match persist_wire_write(state, &sql, &result) {
                     Ok(()) => result,
                     Err(e) => Err(EngineError::Unsupported(format!(
                         "durability append failed: {e}"
@@ -673,13 +673,14 @@ fn execute_with_role(
 /// surface (WAL, else the no-WAL snapshot) and audit, BEFORE the client
 /// is told the command completed. Both pgwire entry points — the
 /// simple-query path (`execute_with_role`) and the extended-query path
-/// (`execute_prepared`) — route every write through here so one path
-/// can't silently skip durability. Pre-7.33 NEITHER persisted: server-
-/// mode pgwire writes (psql, sqlx, every prepared driver) were lost on
-/// crash. `sql` is the statement text to replay — bind-final (params
-/// substituted to literals) on the extended path so replay reproduces
-/// the effect.
-fn persist_pgwire_write(
+/// (`execute_prepared`) — plus the mysql-wire `COM_QUERY` /
+/// `COM_STMT_EXECUTE` handlers — route every write through here so one
+/// path can't silently skip durability. Pre-7.33 NONE of the pgwire /
+/// mysql-wire paths persisted (only native-wire did): server-mode
+/// writes from psql / sqlx / mysql clients were lost on crash. `sql` is
+/// the statement text to replay — bind-final (params substituted to
+/// literals) on the prepared paths so replay reproduces the effect.
+pub(crate) fn persist_wire_write(
     state: &Arc<ServerState>,
     sql: &str,
     result: &Result<QueryResult, EngineError>,
@@ -1593,7 +1594,7 @@ fn handle_execute(
         let mut bind_ast = stmt.ast.clone();
         spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
             .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
-        persist_pgwire_write(state, &bind_ast.to_string(), &result)
+        persist_wire_write(state, &bind_ast.to_string(), &result)
             .map_err(|e| proto(format!("Execute: durability append failed: {e}")))?;
     }
     match result {
