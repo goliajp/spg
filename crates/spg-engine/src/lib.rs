@@ -882,10 +882,11 @@ pub struct TableMemoryStats {
     pub hot_encoded_bytes: u64,
     pub approx_resident_bytes: u64,
     pub index_count: u64,
-    /// BTree indices are walked entry-by-entry (operator surface,
-    /// not a hot path); NSW graphs and BRIN are parametric
-    /// ESTIMATES until spg-storage carries its own byte meters
-    /// (7.31.x follow-up in the design doc).
+    /// v7.31 C2 — sum of `IndexKind::approx_resident_bytes()` over the
+    /// table's indices: every variant (BTree / NSW / BRIN / GIN family)
+    /// walks its own structure, so the GIN posting lists and NSW layer
+    /// adjacency that dominate text/vector tables are counted honestly
+    /// instead of the old flat-token estimate.
     pub approx_index_bytes: u64,
 }
 
@@ -903,6 +904,12 @@ pub struct MemoryStats {
     /// The active per-query materialisation budget (bucket A), so a
     /// monitoring host sees ceiling and usage through one call.
     pub max_query_bytes: Option<usize>,
+    /// v7.31 C2 — bucket D: live WAL bytes (active chunk + buffered,
+    /// uncheckpointed). `None` from the engine itself — it has no WAL;
+    /// the durable hosts (embed `Database`, server) fill it in from
+    /// their own WAL accounting. `Some(0)` means "host has a WAL and
+    /// it is empty"; `None` means "no WAL on this path" (in-memory).
+    pub wal_bytes: Option<u64>,
 }
 
 /// v6.2.0 — true for engine-managed catalog tables that the bare

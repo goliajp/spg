@@ -55,6 +55,38 @@ fn metrics_persistent_flag_set_on_open_path() {
 }
 
 #[test]
+fn memory_stats_wal_bucket_none_in_memory_some_on_disk() {
+    // v7.31 C2 — bucket D: the embed layer fills `MemoryStats.wal_bytes`
+    // from its WAL meter. In-memory has no WAL → None; a persistent db
+    // reports the live (uncheckpointed) WAL footprint.
+    let mem = Database::open_in_memory();
+    assert_eq!(mem.memory_stats().wal_bytes, None);
+
+    let mut p = std::env::temp_dir();
+    let nanos: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    p.push(format!(
+        "spg-embedded-walbucket-{nanos}-{}.db",
+        std::process::id()
+    ));
+    let mut db = Database::open_path(&p).unwrap();
+    db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    let w = db.memory_stats().wal_bytes;
+    assert!(
+        matches!(w, Some(n) if n > 0),
+        "persistent db must report a non-empty WAL bucket, got {w:?}"
+    );
+    drop(db);
+    let mut wal = p.clone();
+    wal.set_extension("db.wal");
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(&wal);
+}
+
+#[test]
 fn metrics_cold_segments_after_freeze() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
