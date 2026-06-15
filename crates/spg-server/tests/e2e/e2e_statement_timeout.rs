@@ -184,11 +184,20 @@ fn statement_timeout_quick_query_under_budget_succeeds() {
 
 #[test]
 fn statement_timeout_fires_57014_on_long_update() {
-    // Seed a moderately big table, then `SET statement_timeout
-    // = '1ms'` and UPDATE every row. UPDATE checks the cancel
-    // token every 256 rows (see `exec_update_cancel` in
-    // spg-engine), so on any non-trivial row count the 1ms
-    // budget will trip mid-scan.
+    // Seed a big table, then `SET statement_timeout = '1ms'` and
+    // UPDATE every row. UPDATE checks the cancel token every 256
+    // rows (dml.rs), so the 1ms budget trips mid-scan and the
+    // statement is canceled at ~1ms — the test stays fast.
+    //
+    // Determinism note: the failure mode this guards against is the
+    // UPDATE *completing* before the 1ms deadline. That is a race
+    // only when the work ≈ the timeout. 1ms is the smallest non-zero
+    // statement_timeout (PG takes integer ms), so the margin has to
+    // come from the workload: 100k single-int updates run ~20ms
+    // uninterrupted on a current M-series, a 20x margin over 1ms that
+    // no plausible machine-speed or scheduling jitter closes. (The
+    // old 5000-row seed took ~1ms — exactly the timeout — so a fast
+    // host finished before the deadline and the cancel never fired.)
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     let (raw, addrs) = local_spawn(&db);
@@ -198,19 +207,22 @@ fn statement_timeout_fires_57014_on_long_update() {
     send_query(&mut s, "CREATE TABLE big (n INT)");
     let _ = drain_until_ready(&mut s);
 
-    // Build a single multi-row VALUES insert. 5000 rows is well
-    // past the 256-row checkpoint without being slow to set up.
-    let mut sql = String::from("INSERT INTO big VALUES ");
-    for i in 0..5000 {
-        if i > 0 {
-            sql.push(',');
+    // 100k rows, inserted in 1000-row batches so no single statement
+    // is pathologically large for the parser. Seeding runs before the
+    // timeout is set, so its cost doesn't enter the measured window.
+    for batch in 0..100 {
+        let mut sql = String::from("INSERT INTO big VALUES ");
+        for j in 0..1000 {
+            if j > 0 {
+                sql.push(',');
+            }
+            sql.push('(');
+            sql.push_str(&(batch * 1000 + j).to_string());
+            sql.push(')');
         }
-        sql.push('(');
-        sql.push_str(&i.to_string());
-        sql.push(')');
+        send_query(&mut s, &sql);
+        let _ = drain_until_ready(&mut s);
     }
-    send_query(&mut s, &sql);
-    let _ = drain_until_ready(&mut s);
 
     send_query(&mut s, "SET statement_timeout = '1ms'");
     let _ = drain_until_ready(&mut s);
