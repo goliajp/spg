@@ -56,6 +56,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+// v7.33 (P4 increment 3) — allocation *count* (not bytes), so the
+// proj_borrow gate can assert the projection borrow channel doesn't
+// regress back to per-cell + intermediate-Row cloning. A third relaxed
+// atomic per alloc, same negligible-noise rationale as the byte meters.
+static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 struct PeakTracker;
 
@@ -63,6 +68,7 @@ unsafe impl GlobalAlloc for PeakTracker {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
+            ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
             let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
         }
@@ -80,6 +86,7 @@ static PEAK_TRACKING_ALLOC: PeakTracker = PeakTracker;
 
 mod join_reorder;
 mod plan_cache;
+mod proj_borrow;
 mod round26_mem;
 mod select_where;
 mod stages_knn;
