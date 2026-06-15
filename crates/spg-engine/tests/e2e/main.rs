@@ -8,6 +8,7 @@
 
 mod e2e;
 mod e2e_alter_add_column;
+mod e2e_array_agg_argmax;
 mod e2e_array_ops;
 mod e2e_as_of_segment;
 mod e2e_audit_n6_remainder;

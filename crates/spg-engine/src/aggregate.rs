@@ -260,6 +260,12 @@ struct AggState {
     /// v7.32 (round-29) — second value stream for `json_object_agg`
     /// (`items` holds the keys, `aux_items` the values).
     aux_items: Vec<Value>,
+    /// v7.33 (array_agg argmax) — for a `first_ordered` spec
+    /// (`(array_agg(x ORDER BY y))[1]`), the running first-by-order
+    /// (sort-key tuple, value). Replaced only when a new row's key sorts
+    /// strictly before the current best (ties keep the earliest row, =
+    /// the stable-sort `[1]`). No items/item_keys array is built.
+    first_best: Option<(Vec<Value>, Value)>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +299,13 @@ struct AggSpec {
     /// PG requires it constant, so it is evaluated once. `None` for
     /// `mode()` and for every non-ordered-set aggregate.
     direct_arg: Option<Expr>,
+    /// v7.33 (array_agg argmax) — set when this spec came from
+    /// `(array_agg(x ORDER BY y))[1]`: accumulate only the first-by-order
+    /// element (a running argmax/argmin) and finalise to that scalar
+    /// value, instead of collecting + sorting + materialising the whole
+    /// per-group array just to take element 1. Returns the element type,
+    /// not the array type.
+    first_ordered: bool,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -684,6 +697,26 @@ fn accumulate_groups(
                     }
                     Some(keys)
                 };
+                // v7.33 (array_agg argmax) — first_ordered: keep only the
+                // running first-by-order element (strict-less replacement
+                // = ties keep the earliest row, matching the stable-sort
+                // `[1]`), no array build.
+                if spec.first_ordered {
+                    if let Some(keys) = order_keys {
+                        let st = &mut entry.1[i];
+                        let better = match &st.first_best {
+                            None => true,
+                            Some((bk, _)) => {
+                                cmp_order_keys(&spec.order_by, &keys, bk)
+                                    == core::cmp::Ordering::Less
+                            }
+                        };
+                        if better {
+                            st.first_best = Some((keys, arg_ref.clone()));
+                        }
+                    }
+                    continue;
+                }
                 if spec.distinct {
                     encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
                     if entry.1[i].seen.contains(dkeybuf.as_str()) {
@@ -770,6 +803,23 @@ fn accumulate_groups(
                 }
                 Some(keys)
             };
+            // v7.33 (array_agg argmax) — first_ordered: keep the running
+            // first-by-order element only (mirrors the bound fast path).
+            if spec.first_ordered {
+                if let Some(keys) = order_keys {
+                    let st = &mut entry.1[i];
+                    let better = match &st.first_best {
+                        None => true,
+                        Some((bk, _)) => {
+                            cmp_order_keys(&spec.order_by, &keys, bk) == core::cmp::Ordering::Less
+                        }
+                    };
+                    if better {
+                        st.first_best = Some((keys, arg_val.clone()));
+                    }
+                }
+                continue;
+            }
             // v7.25 (round-17) — DISTINCT: drop repeated inputs
             // before they reach the accumulator. NULLs flow through
             // (each aggregate's own NULL rule applies; PG also
@@ -835,6 +885,25 @@ fn build_synth_schema(
 /// (2b) Materialise one synthetic row per group (insertion order):
 /// apply each aggregate's internal ORDER BY, then finalise the running
 /// state into the group + aggregate cells.
+/// v7.33 — compare two aggregate-internal ORDER BY key tuples under the
+/// per-key DESC / NULLS directives. This is the exact comparator the
+/// finalize sort uses, factored out so the `first_ordered` argmax
+/// accumulator's "keep first" decision is provably identical to taking
+/// element `[1]` of the fully-sorted array.
+fn cmp_order_keys(
+    order_by: &[spg_sql::ast::OrderBy],
+    a: &[Value],
+    b: &[Value],
+) -> core::cmp::Ordering {
+    for (k, o) in order_by.iter().enumerate() {
+        let cmp = crate::order_by_value_cmp(o.desc, o.nulls_first, &a[k], &b[k]);
+        if cmp != core::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
 fn finalize_synth_rows(
     order: &[(Vec<Value>, Vec<AggState>)],
     agg_specs: &[AggSpec],
@@ -860,6 +929,16 @@ fn finalize_synth_rows(
         let mut values: Vec<Value> = Vec::with_capacity(synth_schema.len());
         values.extend(gvals.iter().cloned());
         for (i, st) in states.iter().enumerate() {
+            // v7.33 (array_agg argmax) — first_ordered: the running
+            // first-by-order value IS the result; no array build/sort.
+            if agg_specs[i].first_ordered {
+                values.push(
+                    st.first_best
+                        .as_ref()
+                        .map_or(Value::Null, |(_, v)| v.clone()),
+                );
+                continue;
+            }
             // v7.24 (round-16 A) — order the collected items per the
             // aggregate-internal ORDER BY before finalize consumes
             // them.
@@ -868,20 +947,7 @@ fn finalize_synth_rows(
                 if !agg_specs[i].order_by.is_empty() && st.item_keys.len() == st.items.len() {
                     let mut idx: Vec<usize> = (0..st.items.len()).collect();
                     let ob = &agg_specs[i].order_by;
-                    idx.sort_by(|&x, &y| {
-                        for (k, o) in ob.iter().enumerate() {
-                            let cmp = crate::order_by_value_cmp(
-                                o.desc,
-                                o.nulls_first,
-                                &st.item_keys[x][k],
-                                &st.item_keys[y][k],
-                            );
-                            if cmp != core::cmp::Ordering::Equal {
-                                return cmp;
-                            }
-                        }
-                        core::cmp::Ordering::Equal
-                    });
+                    idx.sort_by(|&x, &y| cmp_order_keys(ob, &st.item_keys[x], &st.item_keys[y]));
                     let mut sorted = st.clone();
                     sorted.items = idx.iter().map(|&j| st.items[j].clone()).collect();
                     st_sorted = sorted;
@@ -1193,6 +1259,45 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
     Ok(())
 }
 
+/// v7.33 (array_agg argmax) — recognise `(array_agg(x ORDER BY y))[1]`,
+/// the argmax/argmin idiom: a non-DISTINCT ordered `array_agg`
+/// subscripted by the constant 1. Returns `(value_arg, order_by,
+/// filter)` on a match. When matched, the whole per-group array build +
+/// sort + materialise is replaced by a running first-by-order scalar
+/// accumulator and the subscript node is consumed (replaced by the
+/// synthetic column). collect_aggregates and rewrite_expr share this one
+/// matcher so their `__agg_<i>` assignment stays in lockstep.
+fn first_ordered_array_agg(e: &Expr) -> Option<(&Expr, &[spg_sql::ast::OrderBy], Option<&Expr>)> {
+    let Expr::ArraySubscript { target, index } = e else {
+        return None;
+    };
+    if !matches!(
+        index.as_ref(),
+        Expr::Literal(spg_sql::ast::Literal::Integer(1))
+    ) {
+        return None;
+    }
+    let Expr::AggregateOrdered {
+        call,
+        order_by,
+        distinct,
+        filter,
+    } = target.as_ref()
+    else {
+        return None;
+    };
+    if *distinct || order_by.is_empty() {
+        return None;
+    }
+    let Expr::FunctionCall { name, args } = call.as_ref() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("array_agg") || args.len() != 1 {
+        return None;
+    }
+    Some((&args[0], order_by, filter.as_deref()))
+}
+
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
         // v7.24 (round-16 A) — ordered aggregate: register the inner
@@ -1236,6 +1341,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         order_by: order_by.clone(),
                         filter: filter.as_deref().cloned(),
                         direct_arg,
+                        first_ordered: false,
                     };
                     if !out.iter().any(|s| {
                         s.name == spec.name
@@ -1245,6 +1351,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                             && s.order_by == spec.order_by
                             && s.filter == spec.filter
                             && s.direct_arg == spec.direct_arg
+                            && s.first_ordered == spec.first_ordered
                     }) {
                         out.push(spec);
                     }
@@ -1288,6 +1395,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     order_by: Vec::new(),
                     filter: None,
                     direct_arg: None,
+                    first_ordered: false,
                 };
                 if !out.iter().any(|s| {
                     s.name == spec.name
@@ -1296,6 +1404,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         && !s.distinct
                         && s.order_by == spec.order_by
                         && s.filter.is_none()
+                        && !s.first_ordered
                 }) {
                     out.push(spec);
                 }
@@ -1342,6 +1451,32 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             }
         }
         Expr::ArraySubscript { target, index } => {
+            // v7.33 (array_agg argmax) — `(array_agg(x ORDER BY y))[1]`
+            // collects as a first_ordered spec; the subscript is consumed
+            // here (do NOT recurse into the array_agg, or it would also
+            // register a plain full-array spec).
+            if let Some((arg, order_by, filter)) = first_ordered_array_agg(e) {
+                let spec = AggSpec {
+                    name: "array_agg".to_string(),
+                    arg: Some(arg.clone()),
+                    arg2: None,
+                    distinct: false,
+                    order_by: order_by.to_vec(),
+                    filter: filter.cloned(),
+                    direct_arg: None,
+                    first_ordered: true,
+                };
+                if !out.iter().any(|s| {
+                    s.name == spec.name
+                        && s.arg == spec.arg
+                        && s.order_by == spec.order_by
+                        && s.filter == spec.filter
+                        && s.first_ordered
+                }) {
+                    out.push(spec);
+                }
+                return;
+            }
             collect_aggregates(target, out);
             collect_aggregates(index, out);
         }
@@ -1958,6 +2093,11 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         .as_ref()
         .and_then(|a| crate::describe::describe_expr(a, schema_cols))
         .map(|shape| shape.ty);
+    // v7.33 (array_agg argmax) — `(array_agg(x ORDER BY y))[1]` yields the
+    // ELEMENT type (x), not the array type.
+    if spec.first_ordered {
+        return arg_ty.unwrap_or(DataType::Text);
+    }
     match spec.name.as_str() {
         "count" | "count_star" => DataType::BigInt,
         "sum" => match arg_ty {
@@ -2014,6 +2154,28 @@ fn agg_or_group_type(e: &Expr, synth: &[ColumnSchema]) -> DataType {
 }
 
 fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
+    // v7.33 (array_agg argmax) — `(array_agg(x ORDER BY y))[1]` rewrites
+    // to its first_ordered synth column, consuming the subscript. Checked
+    // before the AggregateOrdered/recursion arms (which would otherwise
+    // rewrite the inner array_agg and leave the subscript). Same matcher
+    // as collect_aggregates, so the spec it finds is the one collected.
+    if let Some((arg, order_by, filter)) = first_ordered_array_agg(e) {
+        let arg_owned = Some(arg.clone());
+        let filter_owned = filter.cloned();
+        for (i, spec) in aggs.iter().enumerate() {
+            if spec.first_ordered
+                && spec.name == "array_agg"
+                && spec.arg == arg_owned
+                && spec.order_by == *order_by
+                && spec.filter == filter_owned
+            {
+                return Expr::Column(spg_sql::ast::ColumnName {
+                    qualifier: None,
+                    name: format!("__agg_{i}"),
+                });
+            }
+        }
+    }
     // v7.24 (round-16 A) — ordered aggregate: match on the inner
     // call PLUS the ordering keys.
     if let Expr::AggregateOrdered {

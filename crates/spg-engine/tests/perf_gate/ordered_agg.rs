@@ -69,7 +69,7 @@ fn ordered_aggregate_reads_sort_key_by_reference() {
     // array_agg with an internal ORDER BY over a JOIN — the ordered-
     // aggregate path on RowRef::Tuple. `body` is NOT referenced, so a
     // correct borrow path never clones it.
-    let sql = "SELECT t.g, (array_agg(t.label ORDER BY t.rank DESC))[1] \
+    let sql = "SELECT t.g, array_agg(t.label ORDER BY t.rank DESC) \
                FROM t JOIN d ON t.dim = d.id GROUP BY t.g";
     eng.execute(sql).unwrap(); // warm
 
