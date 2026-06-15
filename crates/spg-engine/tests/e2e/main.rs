@@ -25,6 +25,7 @@ mod e2e_compaction;
 mod e2e_compiled_expr;
 mod e2e_concat;
 mod e2e_concat_ws;
+mod e2e_correlated_subquery_batch;
 mod e2e_create_extension;
 mod e2e_deferrable;
 mod e2e_delimiter;
