@@ -226,6 +226,46 @@ impl Engine {
                 *e = value_to_literal_expr(value)?;
             }
             Expr::Exists { subquery, negated } => {
+                // v7.34 (mailrs conn-pool P0) — semi/anti-join batch path
+                // first: a correlated `[NOT] EXISTS` of the
+                // `inner.k = outer.col [AND inner-preds]` shape builds its
+                // inner key-set ONCE (keyed by repr in the per-query memo);
+                // per-row resolution becomes a membership test. 24k per-row
+                // inner executions became one scan + 24k lookups.
+                if memo.is_some() {
+                    let repr = alloc::format!("{}", **subquery);
+                    let known = memo
+                        .as_ref()
+                        .is_some_and(|m| m.exists_sets.contains_key(&repr));
+                    if !known {
+                        let built = self
+                            .try_batch_correlated_exists(subquery, cancel)?
+                            .map(alloc::rc::Rc::new);
+                        if let Some(m) = memo.as_deref_mut() {
+                            m.exists_sets.insert(repr.clone(), built);
+                        }
+                    }
+                    if let Some(m) = memo.as_deref_mut()
+                        && let Some(Some(es)) = m.exists_sets.get(&repr)
+                    {
+                        let (outer_cols, set) = es.as_ref();
+                        let mut key_vals: Vec<Value> = Vec::with_capacity(outer_cols.len());
+                        let mut any_null = false;
+                        for oc in outer_cols {
+                            let v = eval::eval_expr(&Expr::Column(oc.clone()), row, ctx)
+                                .map_err(EngineError::Eval)?;
+                            if matches!(v, Value::Null) {
+                                any_null = true;
+                            }
+                            key_vals.push(v);
+                        }
+                        // NULL key component → never matches → not present.
+                        let present = !any_null && set.contains(&aggregate::encode_key(&key_vals));
+                        let bit = if *negated { !present } else { present };
+                        *e = Expr::Literal(Literal::Bool(bit));
+                        return Ok(());
+                    }
+                }
                 let mut s = (**subquery).clone();
                 substitute_outer_columns(&mut s, row, ctx);
                 let r = self.exec_select_cancel(&s, cancel)?;
@@ -779,6 +819,168 @@ impl Engine {
         }
         let map = best.into_iter().map(|(k, (_, v))| (k, v)).collect();
         Ok(Some((outer_col, map)))
+    }
+}
+
+impl Engine {
+    /// v7.34 (mailrs conn-pool-exhaustion P0) — decorrelate a correlated
+    /// `[NOT] EXISTS` into a hash semi/anti-join. Recognise
+    ///   EXISTS (SELECT … FROM t [joins]
+    ///           WHERE k1 = o1 AND … AND kN = oN AND <inner-preds>)
+    /// run the inner ONCE without the correlation, collect the set of
+    /// inner key-tuples `(k1,…,kN)` that satisfy the inner-preds; an outer
+    /// row's EXISTS then reduces to a membership test on `(o1,…,oN)`. The
+    /// reported `count_unseen` ran two correlated `NOT EXISTS` per ~24k
+    /// join survivors (~48k inner executions, 98.7% of a 1.4 s query);
+    /// this turns each into one scan + 24k lookups.
+    ///
+    /// Multi-column correlation is supported (the prod `snoozed` anti-join
+    /// correlates on both `thread_id` and `account_address`). NULL is
+    /// exact: an outer key with any NULL component is never present
+    /// (`NULL = k` is never true), so EXISTS=false / NOT EXISTS=true,
+    /// identical to the per-row resolver. Returns None when the shape
+    /// doesn't qualify — the caller falls back to per-row execution, so
+    /// there is no regression.
+    pub(crate) fn try_batch_correlated_exists(
+        &self,
+        inner: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<memoize::ExistsSet>, EngineError> {
+        use spg_sql::ast::SelectItem as SI;
+        if !inner.ctes.is_empty()
+            || !inner.unions.is_empty()
+            || inner.group_by.is_some()
+            || inner.having.is_some()
+            || inner.distinct
+        {
+            return Ok(None);
+        }
+        let Some(from) = &inner.from else {
+            return Ok(None);
+        };
+        if from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.as_of_segment.is_some()
+        {
+            return Ok(None);
+        }
+        let mut inner_aliases: Vec<String> = Vec::new();
+        inner_aliases.push(
+            from.primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone()),
+        );
+        for j in &from.joins {
+            if j.table.lateral_subquery.is_some() || j.table.unnest_expr.is_some() {
+                return Ok(None);
+            }
+            inner_aliases.push(
+                j.table
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| j.table.name.clone()),
+            );
+        }
+        let is_inner = |c: &spg_sql::ast::ColumnName| -> bool {
+            match &c.qualifier {
+                Some(q) => inner_aliases.iter().any(|a| a.eq_ignore_ascii_case(q)),
+                None => false,
+            }
+        };
+        let is_outer = |c: &spg_sql::ast::ColumnName| -> bool {
+            match &c.qualifier {
+                Some(q) => !inner_aliases.iter().any(|a| a.eq_ignore_ascii_case(q)),
+                None => c.name.starts_with("__grp_") || c.name.starts_with("__agg_"),
+            }
+        };
+        let all_inner = |e: &Expr| -> bool {
+            let mut cols: Vec<spg_sql::ast::ColumnName> = Vec::new();
+            let mut subs: Vec<&SelectStatement> = Vec::new();
+            visit_expr_columns_and_subqueries(e, &mut |c| cols.push(c.clone()), &mut |sub| {
+                subs.push(sub)
+            });
+            subs.is_empty() && cols.iter().all(|c| is_inner(c) && !c.name.is_empty())
+        };
+        let Some(w) = &inner.where_ else {
+            return Ok(None);
+        };
+        let conjuncts = reorder::split_and_conjunctions(w);
+        let mut inner_keys: Vec<spg_sql::ast::ColumnName> = Vec::new();
+        let mut outer_cols: Vec<spg_sql::ast::ColumnName> = Vec::new();
+        let mut rest: Vec<&Expr> = Vec::new();
+        for c in conjuncts {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::Eq,
+                rhs,
+            } = c
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let pair = if is_inner(a) && is_outer(b) {
+                    Some((a.clone(), b.clone()))
+                } else if is_inner(b) && is_outer(a) {
+                    Some((b.clone(), a.clone()))
+                } else {
+                    None
+                };
+                if let Some((ic, oc)) = pair {
+                    inner_keys.push(ic);
+                    outer_cols.push(oc);
+                    continue;
+                }
+            }
+            // A non-correlation conjunct must be purely inner (carried
+            // into the build scan). Anything else (outer-only filter,
+            // mixed expression) is beyond this rewrite.
+            if !all_inner(c) {
+                return Ok(None);
+            }
+            rest.push(c);
+        }
+        if inner_keys.is_empty() {
+            return Ok(None); // uncorrelated — materialised elsewhere
+        }
+        // Build: SELECT k1,…,kN FROM <inner from> WHERE <rest> — no
+        // correlation, no order/limit. The inner relation may be a join;
+        // exec handles it.
+        let mut batch = inner.clone();
+        batch.limit = None;
+        batch.offset = None;
+        batch.order_by = Vec::new();
+        batch.distinct = false;
+        batch.where_ = rest
+            .iter()
+            .map(|e| (*e).clone())
+            .reduce(|a, b| Expr::Binary {
+                lhs: alloc::boxed::Box::new(a),
+                op: BinOp::And,
+                rhs: alloc::boxed::Box::new(b),
+            });
+        batch.items = inner_keys
+            .iter()
+            .map(|c| SI::Expr {
+                expr: Expr::Column(c.clone()),
+                alias: None,
+            })
+            .collect();
+        let r = self.exec_select_cancel(&batch, cancel)?;
+        let QueryResult::Rows { rows, .. } = r else {
+            return Ok(None);
+        };
+        let n = inner_keys.len();
+        let mut set: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+        for row in rows {
+            let keys = row.values.get(..n).unwrap_or(&row.values);
+            // A NULL key component can never satisfy `k = outer`, so the
+            // tuple matches no outer row — drop it from the set.
+            if keys.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            set.insert(aggregate::encode_key(keys));
+        }
+        Ok(Some((outer_cols, set)))
     }
 }
 

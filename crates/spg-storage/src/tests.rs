@@ -6,6 +6,223 @@ use crate::nsw::*;
 use alloc::string::ToString;
 use alloc::vec;
 
+/// v7.34 (crash-recovery P0 #2) — row-level physical redo apply (S4
+/// core) must reproduce a catalog built by direct mutations,
+/// byte-for-byte. Build C1 by direct `Table` ops, an equivalent
+/// `RowChange` log, and C2 by applying that log; identical `serialize()`
+/// is the differential the redo replay relies on (position-based replay
+/// ≡ the original mutation sequence from the same baseline).
+#[test]
+fn redo_apply_matches_direct_position_ops() {
+    fn fresh() -> Catalog {
+        let mut c = Catalog::new();
+        c.create_table(TableSchema::new(
+            "t",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("v", DataType::Text, true),
+            ],
+        ))
+        .unwrap();
+        c
+    }
+    let rows = [
+        Row::new(alloc::vec![Value::BigInt(1), Value::Text("a".to_string())]),
+        Row::new(alloc::vec![Value::BigInt(2), Value::Text("b".to_string())]),
+        Row::new(alloc::vec![Value::BigInt(3), Value::Text("c".to_string())]),
+        Row::new(alloc::vec![Value::BigInt(4), Value::Text("d".to_string())]),
+    ];
+    let upd = alloc::vec![Value::BigInt(2), Value::Text("B".to_string())];
+
+    // C1 — direct storage ops.
+    let mut c1 = fresh();
+    {
+        let t = c1.get_mut("t").unwrap();
+        for r in &rows {
+            t.insert(r.clone()).unwrap();
+        }
+        t.update_row(1, upd.clone()).unwrap(); // id=2 → "B"
+        t.delete_rows(&[0, 2]); // drop positions 0 (id=1) and 2 (id=3)
+    }
+
+    // Equivalent redo log: the same physical ops, same order.
+    let mut log = alloc::vec::Vec::new();
+    for r in &rows {
+        log.push(RowChange::Insert {
+            table: "t".to_string(),
+            row: r.clone(),
+        });
+    }
+    log.push(RowChange::Update {
+        table: "t".to_string(),
+        pos: 1,
+        new_row: upd,
+    });
+    log.push(RowChange::Delete {
+        table: "t".to_string(),
+        positions: vec![0, 2],
+    });
+
+    // C2 — apply the log to a fresh catalog.
+    let mut c2 = fresh();
+    c2.apply_redo(&log).unwrap();
+
+    assert_eq!(
+        c1.serialize(),
+        c2.serialize(),
+        "redo apply diverged from direct position ops"
+    );
+
+    // A redo log naming an absent table is corrupt, not a silent skip.
+    let mut c3 = fresh();
+    assert!(
+        c3.apply_redo(&[RowChange::Insert {
+            table: "nope".to_string(),
+            row: rows[0].clone(),
+        }])
+        .is_err()
+    );
+}
+
+/// v7.34 (crash-recovery P0 #2) — the REAL capture≡execute differential:
+/// capture the redo emitted by live mutations, replay it onto a fresh
+/// catalog, and require byte-identical state. This is what row-level WAL
+/// recovery does (replay the captured log instead of re-running the SQL).
+#[test]
+fn redo_capture_replays_to_identical_state() {
+    fn fresh() -> Catalog {
+        let mut c = Catalog::new();
+        c.create_table(TableSchema::new(
+            "t",
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("v", DataType::Text, true),
+            ],
+        ))
+        .unwrap();
+        c
+    }
+    let mk =
+        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::Text(v.to_string())]);
+
+    let mut c1 = fresh();
+    {
+        let t = c1.get_mut("t").unwrap();
+        t.enable_redo();
+        t.insert(mk(1, "a")).unwrap();
+        t.insert(mk(2, "b")).unwrap();
+        t.insert(mk(3, "c")).unwrap();
+        t.update_row(
+            1,
+            alloc::vec![Value::BigInt(2), Value::Text("B".to_string())],
+        )
+        .unwrap();
+        t.delete_rows(&[0]); // drop id=1
+        t.delete_rows(&[99]); // out of range → no-op → must NOT be captured
+    }
+    let log = c1.get_mut("t").unwrap().take_redo();
+    // insert×3 + update×1 + delete×1 (the no-op delete is not captured).
+    assert_eq!(log.len(), 5, "captured log: {log:?}");
+
+    let mut c2 = fresh();
+    c2.apply_redo(&log).unwrap();
+    assert_eq!(
+        c1.serialize(),
+        c2.serialize(),
+        "replayed capture diverged from execution"
+    );
+
+    // take_redo drains + stops capturing.
+    assert!(c1.get_mut("t").unwrap().take_redo().is_empty());
+}
+
+/// v7.34 (crash-recovery P0 #2) — the catalog-level redo orchestration
+/// the engine uses: `enable_redo_all` before a statement, mutate any
+/// tables, `drain_redo` after — the drained log replays across ALL
+/// touched tables onto a fresh catalog identically.
+#[test]
+fn catalog_drain_redo_replays_multi_table() {
+    fn fresh() -> Catalog {
+        let mut c = Catalog::new();
+        for name in ["a", "b"] {
+            c.create_table(TableSchema::new(
+                name,
+                vec![
+                    ColumnSchema::new("id", DataType::BigInt, false),
+                    ColumnSchema::new("v", DataType::Text, true),
+                ],
+            ))
+            .unwrap();
+        }
+        c
+    }
+    let mk =
+        |id: i64, v: &str| Row::new(alloc::vec![Value::BigInt(id), Value::Text(v.to_string())]);
+
+    let mut c1 = fresh();
+    c1.enable_redo_all();
+    c1.get_mut("a").unwrap().insert(mk(1, "a1")).unwrap();
+    c1.get_mut("b").unwrap().insert(mk(2, "b1")).unwrap();
+    c1.get_mut("a").unwrap().insert(mk(3, "a2")).unwrap();
+    c1.get_mut("a")
+        .unwrap()
+        .update_row(
+            0,
+            alloc::vec![Value::BigInt(1), Value::Text("A1".to_string())],
+        )
+        .unwrap();
+    c1.get_mut("b").unwrap().delete_rows(&[0]);
+    let log = c1.drain_redo();
+
+    let mut c2 = fresh();
+    c2.apply_redo(&log).unwrap();
+    assert_eq!(c1.serialize(), c2.serialize(), "multi-table redo diverged");
+
+    // drain stopped capture: a second drain is empty.
+    assert!(c1.drain_redo().is_empty());
+}
+
+/// v7.34 (crash-recovery P0 #2) — the row-level redo WAL codec (S2):
+/// encode/decode round-trips every `RowChange` variant + value family,
+/// and a truncated/empty buffer is a hard error (not a partial decode).
+#[test]
+fn redo_log_codec_round_trips() {
+    let changes = vec![
+        RowChange::Insert {
+            table: "t".to_string(),
+            row: Row::new(alloc::vec![
+                Value::BigInt(1),
+                Value::Text("a".to_string()),
+                Value::Null,
+                Value::Bool(true),
+            ]),
+        },
+        RowChange::Update {
+            table: "users".to_string(),
+            pos: 42,
+            new_row: alloc::vec![Value::Int(7), Value::Bytes(alloc::vec![1, 2, 3])],
+        },
+        RowChange::Delete {
+            table: "t".to_string(),
+            positions: alloc::vec![0, 5, 99],
+        },
+        RowChange::Delete {
+            table: "empty".to_string(),
+            positions: alloc::vec![],
+        },
+    ];
+    let bytes = encode_redo_log(&changes);
+    assert_eq!(decode_redo_log(&bytes).unwrap(), changes);
+
+    // Empty log round-trips.
+    let empty = encode_redo_log(&[]);
+    assert_eq!(decode_redo_log(&empty).unwrap(), Vec::<RowChange>::new());
+
+    // Truncated / empty buffer is corruption, not a partial decode.
+    assert!(decode_redo_log(&bytes[..bytes.len() / 2]).is_err());
+    assert!(decode_redo_log(&[]).is_err());
+}
+
 /// v7.27 (mailrs round-21) — the remaining u16 cells take the
 /// escape: a > 64 KiB BYTEA cell and a > 64 KiB TEXT[] element
 /// round-trip through snapshot serialise/deserialise (the BYTEA

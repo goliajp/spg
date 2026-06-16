@@ -1514,6 +1514,142 @@ impl Index {
 /// freezer thread wakes. v5.2.1 ships measurement only; the freezer
 /// itself lands in v5.2.2. Stored as `u64` so a single field clone in
 /// `Catalog::clone` stays at the O(1) invariant v4.39 built.
+/// v7.34 (crash-recovery P0 #2) — one row-level physical redo record.
+/// Row-level redo replaces statement-based WAL replay (which re-executes
+/// each SQL through the full engine — O(records × catalog_rows), the
+/// superlinear recovery hang root-caused on the mailrs crash-recovery
+/// P0). A `RowChange` is the exact storage mutation the engine applied
+/// (`Table::insert` / `update_row` / `delete_rows`); replaying it on a
+/// catalog restored from the matching checkpoint reproduces the state
+/// WITHOUT re-validating uniqueness/FK/parse/plan — O(changed rows).
+///
+/// Positions are physical, not key-based: `serialize`/`deserialize`
+/// preserve row order exactly (rows written + read back in `self.rows`
+/// order) and the mutation ops are deterministic, so the same op sequence
+/// replayed from the same checkpoint reproduces the same positions. This
+/// matches PostgreSQL's physical redo and supports tables with no primary
+/// key. (Caveat handled at replay integration: a post-checkpoint cold-tier
+/// freeze shifts hot positions and must itself be logged or fenced by a
+/// checkpoint — see `row-level-redo-design`.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowChange {
+    /// Append `row` to `table`.
+    Insert { table: String, row: Row },
+    /// Replace the row at physical `pos` in `table` with `new_row`.
+    Update {
+        table: String,
+        pos: usize,
+        new_row: Vec<Value>,
+    },
+    /// Remove the rows at the given physical `positions` from `table`.
+    Delete {
+        table: String,
+        positions: Vec<usize>,
+    },
+}
+
+/// v7.34 (crash-recovery P0 #2) — encode a row-level redo log to bytes for
+/// a WAL record. Self-describing: the writer's `FILE_VERSION` leads so a
+/// later spg can decode it via the version-gated value codec. Layout:
+/// `[u8 version][u32 count]` then per change `[u8 op][str table]` and,
+/// per op, `Insert [u32 n][value×n]`, `Update [u32 pos][u32 n][value×n]`,
+/// `Delete [u32 n][u32 pos×n]`. Positions are physical (u32 ≤ 4 G rows).
+#[must_use]
+pub fn encode_redo_log(changes: &[RowChange]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(FILE_VERSION);
+    codec::write_u32(&mut out, changes.len() as u32);
+    let write_values = |out: &mut Vec<u8>, vals: &[Value]| {
+        codec::write_u32(out, vals.len() as u32);
+        for v in vals {
+            codec::write_value(out, v);
+        }
+    };
+    for change in changes {
+        match change {
+            RowChange::Insert { table, row } => {
+                out.push(0);
+                codec::write_str(&mut out, table);
+                write_values(&mut out, &row.values);
+            }
+            RowChange::Update {
+                table,
+                pos,
+                new_row,
+            } => {
+                out.push(1);
+                codec::write_str(&mut out, table);
+                codec::write_u32(&mut out, *pos as u32);
+                write_values(&mut out, new_row);
+            }
+            RowChange::Delete { table, positions } => {
+                out.push(2);
+                codec::write_str(&mut out, table);
+                codec::write_u32(&mut out, positions.len() as u32);
+                for p in positions {
+                    codec::write_u32(&mut out, *p as u32);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// v7.34 — decode a row-level redo log written by [`encode_redo_log`].
+/// A truncated / corrupt buffer is a hard error (the embedding layer
+/// frames each record with its own length + CRC; a frame that decodes
+/// short is corruption, not a torn tail).
+pub fn decode_redo_log(bytes: &[u8]) -> Result<Vec<RowChange>, StorageError> {
+    let version = *bytes
+        .first()
+        .ok_or_else(|| StorageError::Corrupt("redo log: empty".into()))?;
+    let mut cur = codec::Cursor::new(bytes).with_codec_version(version);
+    let _version = cur.read_u8()?;
+    let count = cur.read_u32()? as usize;
+    let mut read_values = |cur: &mut codec::Cursor<'_>| -> Result<Vec<Value>, StorageError> {
+        let n = cur.read_u32()? as usize;
+        let mut vals = Vec::with_capacity(n);
+        for _ in 0..n {
+            vals.push(cur.read_value()?);
+        }
+        Ok(vals)
+    };
+    let mut changes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let op = cur.read_u8()?;
+        let table = cur.read_str()?;
+        let change = match op {
+            0 => RowChange::Insert {
+                table,
+                row: Row::new(read_values(&mut cur)?),
+            },
+            1 => {
+                let pos = cur.read_u32()? as usize;
+                RowChange::Update {
+                    table,
+                    pos,
+                    new_row: read_values(&mut cur)?,
+                }
+            }
+            2 => {
+                let n = cur.read_u32()? as usize;
+                let mut positions = Vec::with_capacity(n);
+                for _ in 0..n {
+                    positions.push(cur.read_u32()? as usize);
+                }
+                RowChange::Delete { table, positions }
+            }
+            other => {
+                return Err(StorageError::Corrupt(alloc::format!(
+                    "redo log: unknown op {other}"
+                )));
+            }
+        };
+        changes.push(change);
+    }
+    Ok(changes)
+}
+
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
@@ -1539,6 +1675,15 @@ pub struct Table {
     /// ANALYZE. The virtual-table surface reports the cached value
     /// regardless (operators run ANALYZE to refresh).
     cold_row_count_stale: bool,
+    /// v7.34 (crash-recovery P0 #2) — row-level redo capture buffer.
+    /// `None` (default, in-memory mode) captures nothing — zero overhead.
+    /// `Some` (set by the engine when persistence is on, before a
+    /// mutating call) makes `insert` / `update_row` / `delete_rows`
+    /// record the physical [`RowChange`] they applied, which the engine
+    /// drains after the statement and writes to the WAL in place of the
+    /// SQL text. Transient: never serialized; a `Catalog::clone` between
+    /// enable and drain copies it (cheap — empty in the steady state).
+    redo_log: Option<Vec<RowChange>>,
 }
 
 /// Catalog: insertion-ordered `Vec<Table>` for stable iter / serialize,
@@ -2379,6 +2524,66 @@ impl Catalog {
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Table> {
         let idx = *self.by_name.get(name)?;
         self.tables.get_mut(idx)
+    }
+
+    /// v7.34 (crash-recovery P0 #2) — replay a row-level redo log onto
+    /// this catalog (the [`RowChange`] physical-redo apply primitive that
+    /// row-level WAL recovery will use in place of statement re-execution).
+    /// Applies each change in order via the same `Table` mutators the
+    /// engine used — no uniqueness/FK/parse/plan: the original execution
+    /// already validated, replay trusts and applies. Positions are
+    /// physical and only valid when replayed from the matching checkpoint
+    /// baseline in original order (see [`RowChange`] docs).
+    ///
+    /// A change naming an absent table, or whose position is out of range,
+    /// is a corrupt/misaligned log and surfaces as an error rather than a
+    /// silent skip.
+    pub fn apply_redo(&mut self, changes: &[RowChange]) -> Result<(), StorageError> {
+        for change in changes {
+            match change {
+                RowChange::Insert { table, row } => {
+                    self.table_for_redo(table)?.insert(row.clone())?;
+                }
+                RowChange::Update {
+                    table,
+                    pos,
+                    new_row,
+                } => {
+                    self.table_for_redo(table)?
+                        .update_row(*pos, new_row.clone())?;
+                }
+                RowChange::Delete { table, positions } => {
+                    self.table_for_redo(table)?.delete_rows(positions);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn table_for_redo(&mut self, name: &str) -> Result<&mut Table, StorageError> {
+        self.get_mut(name)
+            .ok_or_else(|| StorageError::Corrupt(alloc::format!("redo: unknown table {name:?}")))
+    }
+
+    /// v7.34 (crash-recovery P0 #2) — enable row-level redo capture on
+    /// every table (the engine calls this before a mutating statement
+    /// when persistence is on; idempotent, keeps any in-flight capture).
+    pub fn enable_redo_all(&mut self) {
+        for t in &mut self.tables {
+            t.enable_redo();
+        }
+    }
+
+    /// v7.34 — drain the row-level redo captured across all tables, in
+    /// table order then per-table apply order, and stop capturing. The
+    /// engine calls this after a successful mutating statement and writes
+    /// the returned [`RowChange`]s to the WAL in place of the SQL text.
+    pub fn drain_redo(&mut self) -> Vec<RowChange> {
+        let mut all = Vec::new();
+        for t in &mut self.tables {
+            all.extend(t.take_redo());
+        }
+        all
     }
 
     pub fn table_count(&self) -> usize {

@@ -95,6 +95,50 @@ fn stale_lock_without_owner_is_reclaimed() {
     let _db = Database::open_path(&p).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn reused_pid_lock_is_reclaimed_via_start_time() {
+    // v7.34 (crash-recovery P0 #2) — the container pid-1 restart: the
+    // dead owner was pid 1, the restarted process reuses pid 1, and
+    // `ps -p 1` always succeeds — so a bare pid probe self-deadlocks.
+    // The recorded start-time settles it: the lock carries the OLD
+    // pid-1's start-time, which can't match the live pid's current
+    // start-time, so the lock is stale and open reclaims it WITHOUT any
+    // manual force_unlock (a SIGKILL'd mail server must self-recover).
+    let p = tmpdb("reused-pid");
+    let mut lock_path = p.clone();
+    let name = lock_path.file_name().unwrap().to_os_string();
+    let mut s = name.clone();
+    s.push(".lock");
+    lock_path.set_file_name(s);
+    std::fs::create_dir_all(&lock_path).unwrap();
+    // owner = our (live) pid, but a start-time that cannot match ours
+    // (our real start-time is jiffies-since-boot, never "1"). Empty
+    // host/boot keep the legacy same-host assumption.
+    std::fs::write(
+        lock_path.join("pid"),
+        format!("{}\n\n\n1\n", std::process::id()),
+    )
+    .unwrap();
+    // Reclaimed → clean open succeeds, no force_unlock.
+    let _db = Database::open_path(&p).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_self_lock_with_matching_start_time_is_held() {
+    // The dual of the above: a lock owned by our pid WITH our real
+    // start-time is a genuine live holder (e.g. an accidental
+    // double-open of the same path in one process) and must be REFUSED,
+    // not reclaimed — otherwise a second writer could steal a live lock.
+    let p = tmpdb("self-held");
+    let _db = Database::open_path(&p).unwrap(); // writes pid + real start-time
+    match Database::open_path(&p) {
+        Err(EngineError::Unsupported(msg)) => assert!(msg.contains("locked"), "got: {msg}"),
+        other => panic!("expected lock error (live self-held), got {other:?}"),
+    }
+}
+
 #[test]
 fn force_unlock_on_missing_lock_is_noop() {
     let p = tmpdb("noop");

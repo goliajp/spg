@@ -18,6 +18,35 @@ impl Table {
             hot_bytes: 0,
             cold_row_count: 0,
             cold_row_count_stale: false,
+            redo_log: None,
+        }
+    }
+
+    /// v7.34 (crash-recovery P0 #2) — start capturing row-level redo into
+    /// this table (engine call before a mutating statement when
+    /// persistence is on). Idempotent; existing captured changes are kept.
+    pub fn enable_redo(&mut self) {
+        if self.redo_log.is_none() {
+            self.redo_log = Some(Vec::new());
+        }
+    }
+
+    /// v7.34 — drain the captured redo changes and stop capturing.
+    /// Returns the physical [`RowChange`]s applied since `enable_redo`,
+    /// in apply order (empty when capture was off or nothing changed).
+    pub fn take_redo(&mut self) -> Vec<RowChange> {
+        self.redo_log.take().unwrap_or_default()
+    }
+
+    /// Record one captured change when redo capture is on. The table name
+    /// rides on the change (taken from the schema) so a drained log is
+    /// self-describing against the whole catalog.
+    fn record_redo(&mut self, make: impl FnOnce(String) -> RowChange) {
+        if self.redo_log.is_some() {
+            let change = make(self.schema.name.clone());
+            if let Some(log) = self.redo_log.as_mut() {
+                log.push(change);
+            }
         }
     }
 
@@ -306,6 +335,11 @@ impl Table {
         self.hot_bytes = self
             .hot_bytes
             .saturating_add(row_body_encoded_len(&row, &self.schema) as u64);
+        // v7.34 — capture the row-level redo before the row is moved in.
+        self.record_redo(|table| RowChange::Insert {
+            table,
+            row: row.clone(),
+        });
         // v4.39.1: push_mut keeps streaming inserts at Vec::push speed when
         // the table is uniquely owned (the spg-embedded path); inside a TX
         // wrap where a Catalog snapshot exists, push_mut path-copies the
@@ -1031,6 +1065,15 @@ impl Table {
         self.rows = new_rows;
         self.hot_bytes = self.hot_bytes.saturating_sub(removed_bytes);
         self.rebuild_indices();
+        // v7.34 — capture row-level redo. Record the input positions
+        // (replay's `delete_rows` dedups + bounds-filters identically);
+        // skip a no-op delete so the log stays minimal.
+        if removed > 0 {
+            self.record_redo(|table| RowChange::Delete {
+                table,
+                positions: positions.to_vec(),
+            });
+        }
         removed
     }
 
@@ -1160,6 +1203,21 @@ impl Table {
             .hot_bytes
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
+        // v7.34 — capture row-level redo (after the row is in place; the
+        // immutable read of the new values is dropped before record_redo's
+        // mutable borrow, and gated so capture-off pays nothing).
+        if self.redo_log.is_some() {
+            let new_row = self
+                .rows
+                .get(position)
+                .map(|r| r.values.clone())
+                .unwrap_or_default();
+            self.record_redo(|table| RowChange::Update {
+                table,
+                pos: position,
+                new_row,
+            });
+        }
         for fix in fixes {
             match fix {
                 IdxFix::FullRebuild => {

@@ -84,6 +84,7 @@ unsafe impl GlobalAlloc for PeakTracker {
 #[global_allocator]
 static PEAK_TRACKING_ALLOC: PeakTracker = PeakTracker;
 
+mod count_unseen;
 mod join_reorder;
 mod never_die;
 mod ordered_agg;
