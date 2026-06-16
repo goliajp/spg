@@ -95,7 +95,7 @@ use core::fmt;
 // spg-sql for the prepare/bind handle.
 pub use spg_sql::ast::Statement as ParsedStatement;
 use spg_sql::parser::ParseError;
-use spg_storage::{Catalog, ColumnSchema, Row, StorageError};
+use spg_storage::{Catalog, ColumnSchema, Row, RowChange, StorageError};
 
 use crate::eval::EvalError;
 
@@ -295,6 +295,10 @@ pub struct CatalogSnapshot {
     max_query_rows: Option<usize>,
 }
 
+// The engine carries several independent session/capture flags (dialect,
+// FK-checks, meta-view materialisation, redo capture); they're orthogonal
+// switches, not a state enum begging to be modelled.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct Engine {
     /// Committed catalog — what survives `Engine::snapshot()` and what
@@ -425,6 +429,16 @@ pub struct Engine {
     /// `select_references_meta_view`.
     meta_views_materialised: bool,
     pending_foreign_keys: Vec<(alloc::string::String, spg_sql::ast::ForeignKeyConstraint)>,
+    /// v7.34 (crash-recovery P0 #2) — row-level redo capture. When the
+    /// embedding layer turns this on (persistence enabled), each mutating
+    /// `execute` records the physical [`RowChange`]s it applied; the
+    /// engine drains them into `last_redo` on success, and the embedded
+    /// layer reads them via [`Engine::take_redo`] to write the WAL in
+    /// place of the SQL text. Off (default) = zero capture overhead.
+    redo_capture: bool,
+    /// Redo captured by the most recent successful mutating `execute`,
+    /// awaiting drain by the embedding layer. Cleared on each capture.
+    last_redo: Vec<RowChange>,
 }
 
 /// v7.12.7 — hard cap on nested trigger-emitted embedded SQL
@@ -505,6 +519,8 @@ impl Engine {
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
+            redo_capture: false,
+            last_redo: Vec::new(),
         }
     }
 
@@ -555,6 +571,8 @@ impl Engine {
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
+            redo_capture: false,
+            last_redo: Vec::new(),
         }
     }
 
@@ -620,6 +638,8 @@ impl Engine {
                     foreign_key_checks: true,
                     meta_views_materialised: false,
                     pending_foreign_keys: Vec::new(),
+                    redo_capture: false,
+                    last_redo: Vec::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -825,6 +845,32 @@ impl Engine {
             },
             None => &mut self.catalog,
         }
+    }
+
+    /// v7.34 (crash-recovery P0 #2) — turn row-level redo capture on/off.
+    /// The embedding layer enables it when persistence is on so each
+    /// mutating `execute` records the physical [`RowChange`]s it applied
+    /// (drained via [`Engine::take_redo`]). Off = zero capture overhead.
+    pub fn set_redo_capture(&mut self, on: bool) {
+        self.redo_capture = on;
+    }
+
+    /// v7.34 — take the redo captured by the most recent successful
+    /// mutating `execute` (empty when capture is off, the statement was a
+    /// read, or it changed nothing). The embedding layer writes these to
+    /// the WAL in place of the SQL text.
+    pub fn take_redo(&mut self) -> Vec<RowChange> {
+        core::mem::take(&mut self.last_redo)
+    }
+
+    /// v7.34 (crash-recovery P0 #2) — replay a row-level redo log onto the
+    /// committed catalog (the row-level WAL recovery primitive: apply the
+    /// captured physical changes from a checkpoint baseline, in place of
+    /// re-executing the SQL). Trusts the log — no uniqueness/FK/parse.
+    pub fn apply_redo(&mut self, changes: &[RowChange]) -> Result<(), EngineError> {
+        self.catalog
+            .apply_redo(changes)
+            .map_err(EngineError::Storage)
     }
 
     /// Read-only execute path. Succeeds for `SELECT` / `SHOW TABLES`

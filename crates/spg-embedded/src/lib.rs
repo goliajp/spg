@@ -195,10 +195,30 @@ const WAL_V4_TYPE_CHECKPOINT_MARKER: u8 = 0x11;
 /// (no graceful Drop checkpoint) lost the transaction.
 const WAL_V4_TYPE_TX_COMMIT_SQL: u8 = 0x12;
 
+/// v7.34 (crash-recovery P0 #2) — row-level physical redo record. Same v4
+/// envelope (lsn + ts + payload + CRC) but the payload is `encode_redo_log`
+/// bytes, not SQL. Replay applies the physical [`RowChange`]s via
+/// `Engine::apply_redo` instead of re-executing — O(changed rows), not the
+/// O(records × catalog_rows) statement-replay that hung the mailrs P0.
+const WAL_V5_TYPE_ROW_REDO: u8 = 0x13;
+
 /// v7.1 — auto-checkpoint threshold. Once the WAL grows past
 /// this many bytes, the next successful `execute()` call ends
 /// with a `checkpoint()` so the WAL stays bounded. Tunable via
 /// `SPG_EMBEDDED_CHECKPOINT_BYTES` env.
+/// v7.34 (crash-recovery P0 #2) — opt-in row-level redo WAL records.
+/// Default OFF during bringup; `SPG_WAL_ROW_REDO=1` makes mutating
+/// statements log physical changes (0x13) instead of SQL, so crash
+/// recovery applies them in O(changed rows) rather than re-executing in
+/// O(records × catalog_rows) (the superlinear replay hang root-caused on
+/// the mailrs P0). DDL still logs as SQL (hybrid log). When this returns
+/// true, `open_path` arms the engine's redo capture.
+fn row_redo_enabled() -> bool {
+    std::env::var("SPG_WAL_ROW_REDO")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn default_checkpoint_threshold_bytes() -> u64 {
     std::env::var("SPG_EMBEDDED_CHECKPOINT_BYTES")
         .ok()
@@ -312,6 +332,31 @@ pub struct WalTicket {
     seq: u64,
 }
 
+/// v7.34 (crash-recovery P0 #2) — RAII reset for the WalGroup leader
+/// flag. Electing a leader sets `leader_active = true` and releases the
+/// state lock for the sleep+IO window; if a panic unwinds through that
+/// window the flag would stay true and every follower would park forever
+/// on the condvar — no one left to flush or wake them, the same
+/// total-write hang an unclean stop causes, but self-inflicted. This
+/// guard clears the flag and wakes the followers (so one re-elects) on
+/// ANY drop, including a panic unwind; the normal path disarms it after
+/// resetting the flag itself.
+struct LeaderGuard<'a> {
+    group: &'a WalGroup,
+    armed: bool,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut g = self.group.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.leader_active = false;
+            drop(g);
+            self.group.cond.notify_all();
+        }
+    }
+}
+
 impl WalGroup {
     fn new(file: File, initial_len: u64) -> Self {
         Self {
@@ -332,7 +377,7 @@ impl WalGroup {
     /// caller must wait on. Called under the engine write lock —
     /// keep it O(memcpy).
     fn enqueue(&self, record: &[u8]) -> u64 {
-        let mut g = self.state.lock().expect("wal state poisoned");
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.buf.extend_from_slice(record);
         g.enqueued_seq += 1;
         g.enqueued_seq
@@ -341,7 +386,7 @@ impl WalGroup {
     /// Block until `seq` is durable. Leader-follower: the first
     /// arriving waiter flushes for everyone.
     fn wait_flushed(&self, seq: u64) -> Result<(), EngineError> {
-        let mut g = self.state.lock().expect("wal state poisoned");
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(e) = &g.failed {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -355,6 +400,14 @@ impl WalGroup {
                 // Elect self leader.
                 g.leader_active = true;
                 drop(g);
+                // v7.34 — panic-safety: if anything below unwinds before
+                // `leader_active` is reset, this guard releases it +
+                // wakes a follower to re-elect (else all writers park
+                // forever). Disarmed on the normal path after the reset.
+                let mut leader_guard = LeaderGuard {
+                    group: self,
+                    armed: true,
+                };
                 // v7.20 — commit_delay (PG's same-named knob):
                 // before taking the batch, give in-flight
                 // writers a short window to enqueue so the
@@ -367,16 +420,17 @@ impl WalGroup {
                     std::thread::sleep(std::time::Duration::from_micros(delay));
                 }
                 let (batch, flush_to) = {
-                    let mut g2 = self.state.lock().expect("wal state poisoned");
+                    let mut g2 = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     (core::mem::take(&mut g2.buf), g2.enqueued_seq)
                 };
                 let io_result: std::io::Result<()> = (|| {
-                    let mut f = self.file.lock().expect("wal file poisoned");
+                    let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
                     f.write_all(&batch)?;
                     f.sync_data()
                 })();
-                g = self.state.lock().expect("wal state poisoned");
+                g = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 g.leader_active = false;
+                leader_guard.armed = false; // normal completion — disarm
                 match io_result {
                     Ok(()) => {
                         g.flushed_seq = flush_to;
@@ -394,7 +448,7 @@ impl WalGroup {
                 // or the error branch surfaces.
                 continue;
             }
-            g = self.cond.wait(g).expect("wal condvar poisoned");
+            g = self.cond.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -403,7 +457,7 @@ impl WalGroup {
     /// engine exclusively). Used before rotation so the marker
     /// lands in the right chunk.
     fn flush_now(&self) -> Result<(), EngineError> {
-        let mut g = self.state.lock().expect("wal state poisoned");
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = &g.failed {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                 format!("WAL poisoned: {e}"),
@@ -416,11 +470,11 @@ impl WalGroup {
         }
         drop(g);
         let io: std::io::Result<()> = (|| {
-            let mut f = self.file.lock().expect("wal file poisoned");
+            let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
             f.write_all(&batch)?;
             f.sync_data()
         })();
-        let mut g = self.state.lock().expect("wal state poisoned");
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match io {
             Ok(()) => {
                 g.flushed_seq = flush_to;
@@ -439,14 +493,14 @@ impl WalGroup {
     /// Swap the active chunk handle (rotation). Caller flushes
     /// first; both locks taken in canonical order.
     fn rotate_file(&self, new_file: File) {
-        let mut g = self.state.lock().expect("wal state poisoned");
-        let mut f = self.file.lock().expect("wal file poisoned");
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
         *f = new_file;
         g.written_len = 0;
     }
 
     fn written_len(&self) -> u64 {
-        let g = self.state.lock().expect("wal state poisoned");
+        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.written_len + g.buf.len() as u64
     }
 }
@@ -669,12 +723,29 @@ fn replay_wal_filtered(
         }
         // v4 SQL records carry an LSN. Apply iff strictly above
         // the snapshot floor.
-        if r.type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL || r.type_byte == WAL_V4_TYPE_TX_COMMIT_SQL {
+        if r.type_byte == WAL_V4_TYPE_AUTO_COMMIT_SQL
+            || r.type_byte == WAL_V4_TYPE_TX_COMMIT_SQL
+            || r.type_byte == WAL_V5_TYPE_ROW_REDO
+        {
             if let Some(lsn) = r.commit_lsn {
                 if lsn <= floor_lsn {
                     continue;
                 }
             }
+        }
+        // v7.34 (crash-recovery P0 #2) — row-level redo record: apply the
+        // physical changes directly (O(changed rows)) instead of
+        // re-executing SQL (the O(records × rows) statement-replay that
+        // hung the mailrs P0). The payload is `encode_redo_log` bytes, not
+        // SQL, so it never enters the from_utf8 / split_statements path.
+        if r.type_byte == WAL_V5_TYPE_ROW_REDO {
+            let changes = spg_storage::decode_redo_log(r.sql)
+                .map_err(|e| format!("redo decode at offset {}: {e:?}", r.offset))?;
+            engine
+                .apply_redo(&changes)
+                .map_err(|e| format!("redo apply at offset {}: {e:?}", r.offset))?;
+            applied += 1;
+            continue;
         }
         // v3 records (type 0x01, no LSN) always apply — the
         // legacy migration path is the only place they appear,
@@ -726,6 +797,18 @@ fn format_quarantine_line(q: &QuarantinedStmt) -> String {
 /// hex on both parts so default lexicographic sort matches
 /// numeric order, with the unix_us prefix coming first so
 /// the on-disk listing is chronological too.
+/// v7.34 (crash-recovery P0 #2) — fsync a directory so a newly created
+/// file's entry is durable. `sync_data` on a chunk file persists its
+/// bytes but NOT the parent directory entry that names it; a power loss
+/// after creating a fresh WAL chunk could lose that entry and make the
+/// chunk (and the committed records in it) unreachable on restart.
+/// Best-effort — a platform that rejects directory fsync is no worse off.
+fn fsync_dir(dir: &Path) {
+    if let Ok(f) = File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
 fn chunk_filename(unix_us: i64, leading_lsn: u64) -> String {
     // Negative timestamps shouldn't happen in practice (we sit
     // post-1970), but clamp to 0 so the zero-padded
@@ -822,22 +905,39 @@ fn encode_v4_checkpoint_marker(
 /// readable by the same loop with their original 9-byte header
 /// arithmetic.
 fn encode_v4_auto_commit(sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
-    encode_v4_sql_record(WAL_V4_TYPE_AUTO_COMMIT_SQL, sql, commit_lsn, commit_unix_us)
-}
-
-/// v7.21 — same envelope, `WAL_V4_TYPE_TX_COMMIT_SQL` type byte.
-/// `script` = the transaction's statements joined with `";\n"`.
-fn encode_v4_tx_commit(script: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
-    encode_v4_sql_record(
-        WAL_V4_TYPE_TX_COMMIT_SQL,
-        script,
+    encode_v4_framed(
+        WAL_V4_TYPE_AUTO_COMMIT_SQL,
+        sql.as_bytes(),
         commit_lsn,
         commit_unix_us,
     )
 }
 
-fn encode_v4_sql_record(type_byte: u8, sql: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
-    let payload = sql.as_bytes();
+/// v7.21 — same envelope, `WAL_V4_TYPE_TX_COMMIT_SQL` type byte.
+/// `script` = the transaction's statements joined with `";\n"`.
+fn encode_v4_tx_commit(script: &str, commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    encode_v4_framed(
+        WAL_V4_TYPE_TX_COMMIT_SQL,
+        script.as_bytes(),
+        commit_lsn,
+        commit_unix_us,
+    )
+}
+
+/// v7.34 (crash-recovery P0 #2) — encode one row-level redo record. Same
+/// v4 envelope + CRC, type byte 0x13; the payload is the
+/// `encode_redo_log` bytes (physical changes) instead of SQL text, so
+/// replay applies them in place of re-executing the statement.
+fn encode_v5_row_redo(redo_bytes: &[u8], commit_lsn: u64, commit_unix_us: i64) -> Vec<u8> {
+    encode_v4_framed(WAL_V5_TYPE_ROW_REDO, redo_bytes, commit_lsn, commit_unix_us)
+}
+
+fn encode_v4_framed(
+    type_byte: u8,
+    payload: &[u8],
+    commit_lsn: u64,
+    commit_unix_us: i64,
+) -> Vec<u8> {
     let mut crc_buf = Vec::with_capacity(1 + WAL_V4_EXTRA_HEADER + payload.len());
     crc_buf.push(type_byte);
     crc_buf.extend_from_slice(&commit_lsn.to_le_bytes());
@@ -1088,7 +1188,7 @@ pub fn parse_wal_records(wal_bytes: &[u8]) -> Result<Vec<WalRecord<'_>>, String>
                 });
                 cur += header_len + rec_len;
             }
-            WAL_V4_TYPE_AUTO_COMMIT_SQL | WAL_V4_TYPE_TX_COMMIT_SQL => {
+            WAL_V4_TYPE_AUTO_COMMIT_SQL | WAL_V4_TYPE_TX_COMMIT_SQL | WAL_V5_TYPE_ROW_REDO => {
                 let v4_total = header_len + WAL_V4_EXTRA_HEADER + rec_len;
                 if wal_bytes.len() - cur < v4_total {
                     break;
@@ -1566,6 +1666,8 @@ impl Database {
             .read(true)
             .open(&current_chunk_path)
             .map_err(io_err)?;
+        // Persist the (possibly freshly created) chunk's directory entry.
+        fsync_dir(&wal_dir);
         let wal_len = wal_file.metadata().map_err(io_err)?.len();
         let wal = Arc::new(WalGroup::new(wal_file, wal_len));
         // v7.19 P3 — spawn retention sweep thread when the
@@ -1619,6 +1721,12 @@ impl Database {
                 .map_err(io_err)?;
             (Some(shutdown), Some(handle))
         };
+        // v7.34 (crash-recovery P0 #2) — arm row-level redo capture for
+        // subsequent writes (AFTER replay, so re-executed SQL records
+        // don't capture; 0x13 records replay via apply_redo and never do).
+        if row_redo_enabled() {
+            engine.set_redo_capture(true);
+        }
         Ok(Self {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
@@ -1798,6 +1906,8 @@ impl Database {
             .read(true)
             .open(&new_chunk_path)
             .map_err(io_err)?;
+        // Persist the new chunk's directory entry before writing into it.
+        fsync_dir(&p.wal_dir);
         p.current_chunk_path = new_chunk_path;
         p.wal.rotate_file(new_handle);
         Ok(())
@@ -1964,7 +2074,27 @@ impl Database {
                     }
                 } else if modified_catalog && !sql_is_read_only(canonical) {
                     let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-                    record = Some(encode_v4_auto_commit(canonical, lsn, wall_clock_micros()));
+                    // v7.34 (crash-recovery P0 #2) — hybrid log: when
+                    // row-level redo is on and this statement produced row
+                    // changes (DML), write a physical 0x13 redo record so
+                    // replay applies it directly. A statement with no row
+                    // changes (DDL: CREATE/ALTER, never goes through
+                    // Table::insert/update/delete) drains an empty redo and
+                    // keeps the SQL record so the schema still replays.
+                    let redo = if row_redo_enabled() {
+                        self.engine.take_redo()
+                    } else {
+                        Vec::new()
+                    };
+                    record = Some(if redo.is_empty() {
+                        encode_v4_auto_commit(canonical, lsn, wall_clock_micros())
+                    } else {
+                        encode_v5_row_redo(
+                            &spg_storage::encode_redo_log(&redo),
+                            lsn,
+                            wall_clock_micros(),
+                        )
+                    });
                 }
             }
         }
@@ -3219,6 +3349,32 @@ fn host_identity() -> (String, String) {
     (hostname, boot_id)
 }
 
+/// v7.34 (crash-recovery P0 #2) — process start-time, to tell a reused
+/// pid apart from a genuinely-held lock. In a container the holder is
+/// always pid 1; `docker start` reuses the container so the NEW process
+/// is pid 1 too, on the same host+boot id — a bare `pid_alive(1)` probe
+/// (`ps -p 1` always succeeds) reads a dead owner's lock as live and the
+/// engine self-deadlocks on its own catalog. The `(pid, start-time)`
+/// pair is unique per live process within a boot: a reused pid carries a
+/// LATER start-time, so a mismatch means the recorded owner is gone.
+/// Linux reads `/proc/<pid>/stat` field 22 (clock ticks since boot);
+/// `comm` (field 2) is parenthesised and may contain spaces, so fields
+/// are taken after the LAST ')'. Other platforms return None and the
+/// liveness check falls back to pid-alive + the self-pid reclaim. Pure
+/// std — no libc.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')').map(|(_, rest)| rest)?;
+    // After comm: state(1) ppid(2) … starttime is the 20th token.
+    after.split_whitespace().nth(19).map(str::to_string)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_time(_pid: u32) -> Option<String> {
+    None
+}
+
 fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
     for attempt in 0..2 {
         match std::fs::create_dir(lock_path) {
@@ -3229,11 +3385,14 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
                 // v7.27 — lines 2+3 record the owner's environment
                 // identity (hostname, boot id) so a prober in a
                 // different namespace refuses instead of misreading
-                // the pid.
+                // the pid. v7.34 — line 4 records the owner's process
+                // start-time so a reused pid (container pid-1 restart)
+                // is distinguishable from a live holder.
                 let (host, boot) = host_identity();
+                let start = process_start_time(std::process::id()).unwrap_or_default();
                 let _ = std::fs::write(
                     lock_path.join("pid"),
-                    format!("{}\n{host}\n{boot}\n", std::process::id()),
+                    format!("{}\n{host}\n{boot}\n{start}\n", std::process::id()),
                 );
                 return Ok(());
             }
@@ -3243,6 +3402,7 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
                 let owner = lines.next().and_then(|s| s.trim().parse::<u32>().ok());
                 let lock_host = lines.next().unwrap_or("").trim().to_string();
                 let lock_boot = lines.next().unwrap_or("").trim().to_string();
+                let lock_start = lines.next().unwrap_or("").trim().to_string();
                 // v7.27 — identity check BEFORE the pid probe. A pid
                 // recorded in another namespace is undecidable both
                 // ways (a stale lock can look held, a held lock can
@@ -3266,7 +3426,28 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
                         )));
                     }
                 }
-                let owner_alive = owner.is_some_and(pid_alive);
+                // v7.34 (crash-recovery P0 #2) — pid-reuse-safe liveness.
+                // A bare `pid_alive` self-deadlocks in a container: the
+                // dead owner was pid 1, `docker start` reuses the container
+                // so the prober is pid 1 too, and `ps -p 1` always succeeds.
+                // The recorded (pid, start-time) pair settles it — the
+                // owner is alive ONLY if its pid is alive AND its CURRENT
+                // start-time still matches the recorded one:
+                //  - container restart: pid 1 alive, but the new pid-1's
+                //    start-time differs from the dead owner's → stale.
+                //  - genuine double-open (same live process): start-time
+                //    matches (it wrote it) → held — correctly refused, so a
+                //    second writer can't steal a live lock.
+                // An empty/uncomparable start-time (old-format lock or a
+                // non-Linux owner with no /proc) falls back to the
+                // pid-alive answer (the pre-v7.34 behaviour).
+                let owner_alive = owner.is_some_and(|p| {
+                    pid_alive(p)
+                        && match process_start_time(p) {
+                            Some(now) if !lock_start.is_empty() => now == lock_start,
+                            _ => true,
+                        }
+                });
                 if owner_alive {
                     return Err(EngineError::Unsupported(format!(
                         "database is locked by another process (pid {}): {}; \
@@ -3275,9 +3456,9 @@ fn acquire_path_lock(lock_path: &Path) -> Result<(), EngineError> {
                         lock_path.display()
                     )));
                 }
-                // Stale — owner pid dead or unrecorded. Reclaim.
+                // Stale — owner pid dead, reused, or unrecorded. Reclaim.
                 eprintln!(
-                    "spg-embedded: reclaiming stale lock {} (owner pid {:?} not alive)",
+                    "spg-embedded: reclaiming stale lock {} (owner pid {:?} not a live holder)",
                     lock_path.display(),
                     owner
                 );

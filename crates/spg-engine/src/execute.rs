@@ -63,7 +63,21 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let saved = self.current_tx;
         self.current_tx = Some(tx_id);
+        // v7.34 (crash-recovery P0 #2) — row-level redo capture. Arm the
+        // active catalog before dispatch; on success drain the physical
+        // changes into `last_redo` for the embedding layer's WAL, on
+        // failure discard them (a failed statement leaves no redo; the
+        // drain clears the tables' capture buffers either way).
+        if self.redo_capture {
+            self.active_catalog_mut().enable_redo_all();
+        }
         let result = self.execute_inner_with_cancel(sql, cancel);
+        if self.redo_capture {
+            let drained = self.active_catalog_mut().drain_redo();
+            if result.is_ok() {
+                self.last_redo = drained;
+            }
+        }
         self.current_tx = saved;
         result
     }

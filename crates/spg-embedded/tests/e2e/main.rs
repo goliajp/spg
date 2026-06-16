@@ -13,6 +13,7 @@ mod e2e_open_path;
 mod e2e_persistence;
 mod e2e_pitr_retention;
 mod e2e_prepare_bind;
+mod e2e_replay_perf_probe;
 mod e2e_revert;
 mod e2e_typed_query;
 mod e2e_vector;

@@ -77,6 +77,17 @@ pub type ExprPlan = (
     spg_sql::ast::Expr,
 );
 
+/// v7.34 (mailrs conn-pool-exhaustion P0) - decorrelated `[NOT] EXISTS`
+/// semi/anti-join: the outer correlation columns (in key order) and the
+/// set of encoded inner key-tuples that have >=1 matching inner row,
+/// built in ONE scan. An outer row's EXISTS reduces to a membership
+/// test, turning O(outer x inner-exec) per-row work into O(scan + outer
+/// lookups) - PG's Hash Semi/Anti Join.
+pub type ExistsSet = (
+    alloc::vec::Vec<spg_sql::ast::ColumnName>,
+    alloc::collections::BTreeSet<String>,
+);
+
 /// v7.30.2 (mailrs round-25) - canonicalised membership set for a
 /// large all-literal `IN` list. Integer literals canonicalise to
 /// i64 (cross-width `Int = BigInt` stays correct); string literals
@@ -109,6 +120,10 @@ pub struct MemoizeCache {
     /// (so we don't re-analyse it per row). Turns 23.5k per-group
     /// executions into one grouped scan + 23.5k lookups.
     pub group_maps: alloc::collections::BTreeMap<String, Option<alloc::rc::Rc<GroupMap>>>,
+    /// v7.34 (mailrs conn-pool P0) - decorrelated `[NOT] EXISTS`: subquery
+    /// repr -> Some(semi/anti-join key-set) or None when the shape can't
+    /// decorrelate (don't re-analyse per row). Parallel to `group_maps`.
+    pub exists_sets: alloc::collections::BTreeMap<String, Option<alloc::rc::Rc<ExistsSet>>>,
     /// v7.29 (3c) - host-expression ptr -> (subquery count, plan).
     pub expr_plans: alloc::collections::BTreeMap<usize, ExprPlan>,
     /// v7.30.2 (mailrs round-25) - InList node ptr -> membership set
@@ -144,6 +159,7 @@ impl MemoizeCache {
             hit_count: 0,
             miss_count: 0,
             group_maps: alloc::collections::BTreeMap::new(),
+            exists_sets: alloc::collections::BTreeMap::new(),
             expr_plans: alloc::collections::BTreeMap::new(),
             in_sets: alloc::collections::BTreeMap::new(),
             has_subquery: alloc::collections::BTreeMap::new(),

@@ -33,6 +33,7 @@ mod e2e_delimiter;
 mod e2e_do_block;
 mod e2e_domain_type;
 mod e2e_enum_type;
+mod e2e_exists_decorrelation;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_precision_loss,
@@ -141,6 +142,7 @@ mod e2e_plan_cache;
 mod e2e_plan_cache_invalidation;
 mod e2e_power;
 mod e2e_random;
+mod e2e_redo_capture;
 mod e2e_regexp_family;
 mod e2e_repeat;
 mod e2e_replace;
