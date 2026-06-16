@@ -132,7 +132,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -503,6 +503,252 @@ impl WalGroup {
         let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.written_len + g.buf.len() as u64
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CoW-2 (v7.34) — background-checkpoint worker.
+//
+// Splits checkpoint into two halves so the front-end pays only the cheap one:
+//   • Capture (`Database::snapshot_checkpoint_job`) — under &mut self,
+//     Arc-bump the catalog + cheap trailer/cold-segment clones + atomic
+//     commit_lsn load. Front returns to caller in microseconds.
+//   • Execute (`execute_checkpoint_job`, on the worker thread) — serialize
+//     the snapshot, tmp+rename the db / manifest files (each fsynced via
+//     the rename + dir-fsync), enqueue the v4 marker through the WalGroup
+//     (which is already thread-safe so live commits interleave fine),
+//     then rotate the chunk file.
+//
+// Replay floor is the marker LSN captured at front-end time. A crash any
+// time during the worker's sequence is safe: nothing past the previous
+// checkpoint's marker can have been forgotten until the new marker hits
+// the WAL, and live writes between the two go into the same chunk under
+// the old marker — replay re-applies them after restoring the (older)
+// snapshot. snapshot+manifest atomicity (D10) is unchanged from the sync
+// path — CoW-4 tightens it later.
+//
+// Single-instance: a state machine of {pending, inflight} so a new
+// trigger fires only when the worker is fully idle. Any sticky error
+// surfaces on the next `wait()`.
+
+#[derive(Debug)]
+struct CheckpointJob {
+    snapshot: spg_engine::EngineSnapshot,
+    marker_lsn: u64,
+    db_path: PathBuf,
+    wal_dir: PathBuf,
+    wal: Arc<WalGroup>,
+    /// Snapshot-time view of the cold-tier segment set. Carried into the
+    /// worker so any concurrent `freeze_oldest_to_cold` after the trigger
+    /// rides the *next* checkpoint's manifest — same staleness window
+    /// the sync path already had.
+    cold_segments: Vec<(u32, PathBuf)>,
+    /// Shared with `PersistenceCtx` so the worker's chunk rotation is
+    /// visible to subsequent diag / Drop introspection.
+    current_chunk_path: Arc<Mutex<PathBuf>>,
+}
+
+#[derive(Debug, Default)]
+struct CheckpointState {
+    /// Set by the front when it has a job ready; cleared when the worker
+    /// picks it up.
+    pending: Option<CheckpointJob>,
+    /// True while the worker is mid-execute. `pending.is_some() || inflight`
+    /// defines "busy" for the trigger / wait predicate.
+    inflight: bool,
+    /// Sticky error from the worker's last failure. Cleared when surfaced
+    /// to a `wait()` caller.
+    last_error: Option<EngineError>,
+    /// Drop signal — worker exits after the current job (or immediately if
+    /// idle and no pending).
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct CheckpointWorker {
+    state: Arc<(Mutex<CheckpointState>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CheckpointWorker {
+    fn spawn() -> Self {
+        let state: Arc<(Mutex<CheckpointState>, Condvar)> =
+            Arc::new((Mutex::new(CheckpointState::default()), Condvar::new()));
+        let state_for_thread = Arc::clone(&state);
+        let handle = thread::Builder::new()
+            .name("spg-checkpoint".into())
+            .spawn(move || checkpoint_worker_loop(&state_for_thread))
+            .expect("spawn checkpoint worker");
+        Self {
+            state,
+            handle: Some(handle),
+        }
+    }
+
+    /// Try to enqueue a job. Returns `Ok(true)` if the worker accepted it,
+    /// `Ok(false)` if a job was already pending or in flight (skip — the
+    /// next trigger will pick up newer state). Surfaces any sticky error
+    /// from a previous run before considering the new job, so async paths
+    /// can't lose a failure indefinitely.
+    fn try_enqueue(&self, job: CheckpointJob) -> Result<bool, EngineError> {
+        let (lock, cond) = &*self.state;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.last_error.take() {
+            return Err(e);
+        }
+        if g.pending.is_some() || g.inflight {
+            return Ok(false);
+        }
+        g.pending = Some(job);
+        cond.notify_one();
+        Ok(true)
+    }
+
+    /// Block until the worker is idle (no pending, not in flight). Returns
+    /// any sticky error from the last run; clears it on the way out.
+    fn wait(&self) -> Result<(), EngineError> {
+        let (lock, cond) = &*self.state;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while g.pending.is_some() || g.inflight {
+            g = cond.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        match g.last_error.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for CheckpointWorker {
+    fn drop(&mut self) {
+        {
+            let (lock, cond) = &*self.state;
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            g.shutdown = true;
+            cond.notify_one();
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn checkpoint_worker_loop(state: &Arc<(Mutex<CheckpointState>, Condvar)>) {
+    let (lock, cond) = &**state;
+    loop {
+        let job = {
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while g.pending.is_none() && !g.shutdown {
+                g = cond.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            if g.pending.is_none() {
+                // shutdown with no pending → exit cleanly.
+                return;
+            }
+            // Even on shutdown, drain the pending job first so the Drop-time
+            // final checkpoint is durable before exit.
+            let job = g.pending.take().expect("loop invariant");
+            g.inflight = true;
+            job
+        };
+        let result = execute_checkpoint_job(job);
+        {
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            g.inflight = false;
+            if let Err(e) = result {
+                g.last_error = Some(e);
+            }
+            cond.notify_all();
+        }
+    }
+}
+
+fn execute_checkpoint_job(job: CheckpointJob) -> Result<(), EngineError> {
+    // 1. Serialize the captured snapshot. Heavy; this is the whole point
+    //    of CoW — it runs off the engine borrow.
+    let snapshot = job.snapshot.serialize();
+    // 2. Snapshot tmp+rename. Atomic on POSIX; rename implicitly fsyncs
+    //    the data the next directory walk sees.
+    let tmp = {
+        let mut t = job.db_path.clone();
+        let mut name = t
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(".tmp");
+        t.set_file_name(name);
+        t
+    };
+    std::fs::write(&tmp, &snapshot).map_err(io_err)?;
+    std::fs::rename(&tmp, &job.db_path).map_err(io_err)?;
+    // 3. Manifest tmp+rename (cold tier present).
+    if !job.cold_segments.is_empty() {
+        let snap_crc = spg_crypto::crc32::crc32(&snapshot);
+        let entries: Vec<ColdSegmentEntry> = job
+            .cold_segments
+            .iter()
+            .filter_map(|(segment_id, path)| {
+                let bytes = std::fs::read(path).ok()?;
+                Some(ColdSegmentEntry {
+                    segment_id: *segment_id,
+                    path: path.clone(),
+                    crc32: spg_crypto::crc32::crc32(&bytes),
+                })
+            })
+            .collect();
+        let manifest = CatalogManifest {
+            catalog_crc32: snap_crc,
+            cold_segments: entries,
+            wal_baseline_offset: 0,
+        };
+        let m_bytes = manifest.serialize();
+        let m_path = spg_manifest_path(&job.db_path);
+        if let Some(dir) = m_path.parent() {
+            std::fs::create_dir_all(dir).map_err(io_err)?;
+        }
+        let m_tmp = {
+            let mut t = m_path.clone();
+            let mut name = t
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            name.push(".tmp");
+            t.set_file_name(name);
+            t
+        };
+        std::fs::write(&m_tmp, &m_bytes).map_err(io_err)?;
+        std::fs::rename(&m_tmp, &m_path).map_err(io_err)?;
+    }
+    // 4. Enqueue the v4 checkpoint marker carrying the captured LSN. The
+    //    WalGroup is thread-safe so a live commit can interleave — the
+    //    marker's LSN, not its position in the chunk, anchors replay.
+    let marker_ts = wall_clock_micros();
+    let marker = encode_v4_checkpoint_marker(job.marker_lsn, marker_ts, &job.db_path);
+    job.wal.enqueue(&marker);
+    job.wal.flush_now()?;
+    // 5. Rotate the active chunk. New commits land in the fresh chunk;
+    //    pre-marker history stays addressable in the old chunk for PITR /
+    //    retention. The shared `current_chunk_path` is updated under its
+    //    own lock before the WalGroup swap so diag readers never see a
+    //    handle that no longer matches the recorded path.
+    let new_chunk_path = job
+        .wal_dir
+        .join(chunk_filename(marker_ts, job.marker_lsn + 1));
+    let new_handle = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(&new_chunk_path)
+        .map_err(io_err)?;
+    fsync_dir(&job.wal_dir);
+    {
+        let mut p = job
+            .current_chunk_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *p = new_chunk_path;
+    }
+    job.wal.rotate_file(new_handle);
+    Ok(())
 }
 
 impl WalTicket {
@@ -1354,8 +1600,11 @@ struct PersistenceCtx {
     wal_dir: PathBuf,
     /// Path of the currently-open chunk file inside `wal_dir`.
     /// Rotated at checkpoint and whenever the chunk crosses
-    /// `checkpoint_threshold_bytes`.
-    current_chunk_path: PathBuf,
+    /// `checkpoint_threshold_bytes`. CoW-2 (v7.34) wraps it in
+    /// `Arc<Mutex<…>>` because the background-checkpoint worker
+    /// performs the rotation; this struct keeps a clone so Drop /
+    /// diag introspection still see the live path.
+    current_chunk_path: Arc<Mutex<PathBuf>>,
     /// v7.19 P3 — retention sweeper handle. `Some` when
     /// `SPG_PITR_RETENTION_HOURS > 0` at open_path time; `None`
     /// when retention is disabled (the default; v7.18 behaviour
@@ -1399,6 +1648,13 @@ struct PersistenceCtx {
     /// without a libc dep, which would violate spg-embedded's
     /// zero-deps charter.
     lock_path: PathBuf,
+    /// CoW-2 (v7.34) — background-checkpoint worker. `None` only
+    /// transiently inside `Drop` after the worker has been signalled
+    /// and joined. The worker carries Arc clones of `wal` and
+    /// `current_chunk_path`, so it can rotate the active chunk and
+    /// reflect the new path back here even after the front-end has
+    /// returned to the caller.
+    checkpoint_worker: Option<CheckpointWorker>,
 }
 
 impl Database {
@@ -1734,7 +1990,7 @@ impl Database {
             persistence: Some(PersistenceCtx {
                 db_path,
                 wal_dir,
-                current_chunk_path,
+                current_chunk_path: Arc::new(Mutex::new(current_chunk_path)),
                 wal,
                 checkpoint_threshold_bytes: default_checkpoint_threshold_bytes(),
                 cold_segments_dir,
@@ -1744,6 +2000,7 @@ impl Database {
                 retention_thread,
                 flusher_shutdown,
                 flusher_thread,
+                checkpoint_worker: Some(CheckpointWorker::spawn()),
             }),
         })
     }
@@ -1808,114 +2065,112 @@ impl Database {
     }
 
     /// v7.1 — flush a fresh catalog snapshot to `db_path` and
-    /// truncate the WAL. Idempotent; cheap when nothing has
-    /// happened since the last checkpoint. No-op when the
-    /// database is in-memory (no `db_path` configured).
+    /// rotate the WAL. Idempotent; cheap when nothing has happened
+    /// since the last checkpoint. No-op when the database is in-memory.
+    ///
+    /// CoW-2 (v7.34): the heavy half (serialize + tmp+rename + fsync +
+    /// marker enqueue + chunk rotation) runs on a dedicated worker thread
+    /// so the caller's engine borrow is released after the cheap capture
+    /// step. This entry point keeps the **synchronous** contract — it
+    /// waits for the worker to finish before returning — so existing
+    /// callers, tests, and operator scripts see no behaviour change;
+    /// they just pay one extra hop. The non-blocking variant lives at
+    /// `trigger_checkpoint`, used by the auto-checkpoint hot path so
+    /// the write that crossed `SPG_EMBEDDED_CHECKPOINT_BYTES` doesn't
+    /// stall on disk IO.
     ///
     /// Called automatically when:
-    /// - the WAL grows past
-    ///   `SPG_EMBEDDED_CHECKPOINT_BYTES` (default 4 MiB) at the
-    ///   end of an `execute()`, and
-    /// - `Drop` runs (best-effort; checkpoint failure on drop is
-    ///   logged to stderr).
+    /// - the WAL grows past `SPG_EMBEDDED_CHECKPOINT_BYTES` (default
+    ///   4 MiB) at the end of an `execute()` (via `trigger_checkpoint`,
+    ///   non-blocking), and
+    /// - `Drop` runs (synchronous; best-effort, failures logged).
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
-        // CoW-1 seam: capture committed state under &mut self (Arc bump +
-        // cheap trailer clones), then serialize off the engine borrow.
-        // CoW-2 will hand `snap_data` to a background worker so the
-        // serialize/write/fsync below runs without blocking writers.
-        let snap_data = self.engine.snapshot_data();
-        let snapshot = snap_data.serialize();
-        let Some(p) = &mut self.persistence else {
+        if self.persistence.is_none() {
+            return Ok(());
+        }
+        // Drain any prior async checkpoint first so our snapshot reflects
+        // post-it state (and so a sticky error from it surfaces here, not
+        // smeared across the next two `wait`s).
+        self.wait_checkpoint()?;
+        let Some(job) = self.snapshot_checkpoint_job() else {
             return Ok(());
         };
-        // Snapshot first (atomic via tmp+rename), then WAL
-        // truncate. Same order as `spg-server`'s CHECKPOINT —
-        // a crash between the two leaves the WAL holding
-        // already-snapshotted ops, which replay cleanly on the
-        // next boot (idempotent for SPG's standard DDL/DML
-        // mutations).
-        let tmp = {
-            let mut t = p.db_path.clone();
-            let mut name = t
-                .file_name()
-                .map(std::ffi::OsStr::to_os_string)
-                .unwrap_or_default();
-            name.push(".tmp");
-            t.set_file_name(name);
-            t
+        let Some(worker) = self
+            .persistence
+            .as_ref()
+            .and_then(|p| p.checkpoint_worker.as_ref())
+        else {
+            return Ok(());
         };
-        std::fs::write(&tmp, &snapshot).map_err(io_err)?;
-        std::fs::rename(&tmp, &p.db_path).map_err(io_err)?;
-        // v7.1.4 — refresh the manifest so the next boot can
-        // reload cold segments alongside the snapshot. Bytes
-        // come from the freshly-written snapshot file (= the
-        // canonical CRC source).
-        if !p.cold_segment_paths.is_empty() {
-            let snap_crc = spg_crypto::crc32::crc32(&snapshot);
-            let entries: Vec<ColdSegmentEntry> = p
+        // `wait_checkpoint` above guaranteed idle; `try_enqueue` only
+        // returns Ok(false) when busy, so we expect Ok(true) here. The
+        // bool is dropped — we wait unconditionally to honour the sync
+        // contract.
+        let _ = worker.try_enqueue(job)?;
+        self.wait_checkpoint()
+    }
+
+    /// CoW-2 (v7.34) — non-blocking checkpoint trigger used by the
+    /// auto-checkpoint hot path (`wal_after_ok` over the threshold).
+    /// Captures the engine state under `&mut self` then signals the
+    /// background worker and returns; the serialize / fsync / rotate
+    /// sequence runs on the worker thread. If a checkpoint is already
+    /// pending or in flight, the new trigger is silently dropped —
+    /// the next threshold crossing picks up the newer state.
+    ///
+    /// Sticky errors from a prior async run surface here (via
+    /// `try_enqueue`), so a failed background checkpoint still reaches
+    /// the caller eventually rather than vanishing.
+    fn trigger_checkpoint(&mut self) -> Result<(), EngineError> {
+        if self.persistence.is_none() {
+            return Ok(());
+        }
+        let Some(job) = self.snapshot_checkpoint_job() else {
+            return Ok(());
+        };
+        let Some(worker) = self
+            .persistence
+            .as_ref()
+            .and_then(|p| p.checkpoint_worker.as_ref())
+        else {
+            return Ok(());
+        };
+        let _accepted = worker.try_enqueue(job)?;
+        Ok(())
+    }
+
+    /// CoW-2 (v7.34) — block until the background checkpoint worker is
+    /// idle. Used by sync `checkpoint()` and by Drop to ensure the final
+    /// snapshot is durable before the process exits.
+    fn wait_checkpoint(&self) -> Result<(), EngineError> {
+        match self
+            .persistence
+            .as_ref()
+            .and_then(|p| p.checkpoint_worker.as_ref())
+        {
+            Some(w) => w.wait(),
+            None => Ok(()),
+        }
+    }
+
+    /// CoW-2 (v7.34) — capture a checkpoint job under `&mut self` (or
+    /// `&self`, since reading from atomics + cheap clones don't mutate).
+    /// Returns `None` if the database is in-memory.
+    fn snapshot_checkpoint_job(&self) -> Option<CheckpointJob> {
+        let p = self.persistence.as_ref()?;
+        Some(CheckpointJob {
+            snapshot: self.engine.snapshot_data(),
+            marker_lsn: self.commit_lsn.load(Ordering::SeqCst),
+            db_path: p.db_path.clone(),
+            wal_dir: p.wal_dir.clone(),
+            wal: Arc::clone(&p.wal),
+            cold_segments: p
                 .cold_segment_paths
                 .iter()
-                .filter_map(|(&segment_id, path)| {
-                    let bytes = std::fs::read(path).ok()?;
-                    Some(ColdSegmentEntry {
-                        segment_id,
-                        path: path.clone(),
-                        crc32: spg_crypto::crc32::crc32(&bytes),
-                    })
-                })
-                .collect();
-            let manifest = CatalogManifest {
-                catalog_crc32: snap_crc,
-                cold_segments: entries,
-                wal_baseline_offset: 0,
-            };
-            let m_bytes = manifest.serialize();
-            let m_path = spg_manifest_path(&p.db_path);
-            if let Some(dir) = m_path.parent() {
-                std::fs::create_dir_all(dir).map_err(io_err)?;
-            }
-            let m_tmp = {
-                let mut t = m_path.clone();
-                let mut name = t
-                    .file_name()
-                    .map(std::ffi::OsStr::to_os_string)
-                    .unwrap_or_default();
-                name.push(".tmp");
-                t.set_file_name(name);
-                t
-            };
-            std::fs::write(&m_tmp, &m_bytes).map_err(io_err)?;
-            std::fs::rename(&m_tmp, &m_path).map_err(io_err)?;
-        }
-        // v7.19 — append a checkpoint marker to the current chunk
-        // (anchors restore-to-time backups), then rotate to a
-        // fresh chunk file. Old chunks stay on disk and become
-        // input to the retention thread (P3) + spgctl backup-pitr
-        // (P6). The single-file `set_len(0)` truncate the v7.18
-        // path used is gone — that path silently discarded WAL
-        // history between checkpoint and the operator's next cron
-        // run, which is exactly what PITR was meant to fix.
-        let marker_lsn = self.commit_lsn.load(Ordering::SeqCst);
-        let marker_ts = wall_clock_micros();
-        let marker = encode_v4_checkpoint_marker(marker_lsn, marker_ts, &p.db_path);
-        // v7.20 P2 — checkpoint holds &mut self (engine
-        // exclusive), so there are no concurrent enqueues: drain
-        // the pending batch, append the marker, flush, then
-        // rotate the chunk handle inside the group.
-        p.wal.enqueue(&marker);
-        p.wal.flush_now()?;
-        let new_chunk_path = p.wal_dir.join(chunk_filename(marker_ts, marker_lsn + 1));
-        let new_handle = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&new_chunk_path)
-            .map_err(io_err)?;
-        // Persist the new chunk's directory entry before writing into it.
-        fsync_dir(&p.wal_dir);
-        p.current_chunk_path = new_chunk_path;
-        p.wal.rotate_file(new_handle);
-        Ok(())
+                .map(|(&id, path)| (id, path.clone()))
+                .collect(),
+            current_chunk_path: Arc::clone(&p.current_chunk_path),
+        })
     }
 
     /// Restore a database from a previously-captured catalog
@@ -2112,7 +2367,12 @@ impl Database {
                 seq,
             });
             if p.wal.written_len() >= p.checkpoint_threshold_bytes {
-                self.checkpoint()?;
+                // CoW-2 (v7.34): hot path — fire-and-forget. The worker
+                // serializes off this thread so the commit that just
+                // crossed the threshold doesn't stall on a multi-hundred-ms
+                // snapshot write. Any sticky error from a prior async
+                // checkpoint surfaces here.
+                self.trigger_checkpoint()?;
             }
         }
         Ok(ticket)
@@ -3048,6 +3308,12 @@ impl Drop for Database {
             if let Some(handle) = ctx.flusher_thread.take() {
                 let _ = handle.join();
             }
+            // CoW-2 (v7.34) — final checkpoint above left the worker
+            // idle; explicitly drop it here so its shutdown signal +
+            // thread join happens with a deterministic ordering (before
+            // the lock release / persistence drop), not whenever Rust
+            // happens to drop the PersistenceCtx fields.
+            ctx.checkpoint_worker = None;
         }
         // v7.17.0 Phase 6.2 — release the cross-process lock on
         // clean shutdown. Failure is logged but never panics;
