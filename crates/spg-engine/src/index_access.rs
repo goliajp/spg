@@ -230,6 +230,13 @@ pub(crate) fn try_index_seek<'a>(
         }
         return try_index_seek(rhs, schema_cols, catalog, table, table_alias);
     }
+    // v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` seeks each literal
+    // and unions the rows (PG's bitmap index scan) instead of a full scan
+    // + per-row membership test. The single-table path otherwise tested a
+    // 60-element list against every row (24k × 60 string compares ~66 ms).
+    if let Some(rows) = try_inlist_seek(where_expr, schema_cols, catalog, table, table_alias) {
+        return Some(rows);
+    }
     let Expr::Binary {
         lhs,
         op: BinOp::Eq,
@@ -262,6 +269,70 @@ pub(crate) fn try_index_seek<'a>(
             spg_storage::RowLocator::Cold { segment_id, .. } => {
                 if let Some(row) = catalog.resolve_cold_locator(table_name, segment_id, &key) {
                     out.push(Cow::Owned(row));
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` candidate seek.
+/// Returns the union of per-literal index lookups when `where_expr` is a
+/// non-negated IN-list whose LHS is an indexed column (qualified to this
+/// table or bare) and whose elements are all literals; None otherwise, so
+/// the caller falls through to its Eq seek / full scan. The caller
+/// re-applies the full WHERE per row, so the exact per-literal seek set is
+/// correct (duplicate keys just revisit a row, which the re-eval dedups by
+/// truth, not identity — harmless for a candidate set).
+fn try_inlist_seek<'a>(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    catalog: &'a Catalog,
+    table: &'a Table,
+    table_alias: &str,
+) -> Option<Vec<Cow<'a, Row>>> {
+    let Expr::InList {
+        expr,
+        list,
+        negated: false,
+    } = where_expr
+    else {
+        return None;
+    };
+    let Expr::Column(c) = expr.as_ref() else {
+        return None;
+    };
+    if !c
+        .qualifier
+        .as_deref()
+        .is_none_or(|q| q.eq_ignore_ascii_case(table_alias))
+    {
+        return None;
+    }
+    let col_pos = schema_cols.iter().position(|s| s.name == c.name)?;
+    let idx = table.index_on(col_pos)?;
+    // Every element must be a literal; bail (full scan) otherwise.
+    let mut keys: Vec<IndexKey> = Vec::with_capacity(list.len());
+    for e in list {
+        let Expr::Literal(l) = e else {
+            return None;
+        };
+        keys.push(IndexKey::from_value(&eval::literal_to_value(l))?);
+    }
+    let table_name = table.schema().name.as_str();
+    let mut out: Vec<Cow<'a, Row>> = Vec::new();
+    for key in &keys {
+        for loc in idx.lookup_eq(key) {
+            match *loc {
+                spg_storage::RowLocator::Hot(i) => {
+                    if let Some(row) = table.rows().get(i) {
+                        out.push(Cow::Borrowed(row));
+                    }
+                }
+                spg_storage::RowLocator::Cold { segment_id, .. } => {
+                    if let Some(row) = catalog.resolve_cold_locator(table_name, segment_id, key) {
+                        out.push(Cow::Owned(row));
+                    }
                 }
             }
         }

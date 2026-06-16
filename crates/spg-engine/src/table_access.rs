@@ -213,43 +213,88 @@ impl Engine {
         }
         let cols = &table.schema().columns;
         let mut seeded: Option<Vec<usize>> = None;
-        for p in preds {
-            if let Expr::Binary {
-                lhs,
-                op: spg_sql::ast::BinOp::Eq,
-                rhs,
-            } = p
+        // Resolve an indexed column reference (qualified to this alias or
+        // bare) to its `(position, index)`.
+        let indexed_col = |c: &spg_sql::ast::ColumnName| {
+            if !c
+                .qualifier
+                .as_deref()
+                .is_none_or(|q| q.eq_ignore_ascii_case(alias))
             {
-                let pair = match (lhs.as_ref(), rhs.as_ref()) {
-                    (Expr::Column(c), Expr::Literal(l)) | (Expr::Literal(l), Expr::Column(c)) => {
-                        Some((c, l))
+                return None;
+            }
+            let pos = cols.iter().position(|s| s.name == c.name)?;
+            table.index_on(pos).map(|idx| (pos, idx))
+        };
+        // Seek every literal key through the index, collecting hot row
+        // indices. Returns None when any key lands a cold locator (the
+        // caller then falls back to the full scan rather than miss rows).
+        let seek_keys = |idx: &spg_storage::Index, lits: &[&spg_sql::ast::Literal]| {
+            let mut ids = Vec::new();
+            for l in lits {
+                let key = spg_storage::IndexKey::from_value(&eval::literal_to_value(l))?;
+                for loc in idx.lookup_eq(&key) {
+                    match *loc {
+                        spg_storage::RowLocator::Hot(i) => ids.push(i),
+                        spg_storage::RowLocator::Cold { .. } => return None,
                     }
-                    _ => None,
-                };
-                if let Some((c, l)) = pair
-                    && c.qualifier
-                        .as_deref()
-                        .is_none_or(|q| q.eq_ignore_ascii_case(alias))
-                    && let Some(pos) = cols.iter().position(|s| s.name == c.name)
-                    && let Some(idx) = table.index_on(pos)
-                    && let Some(key) = spg_storage::IndexKey::from_value(&eval::literal_to_value(l))
-                {
-                    let mut ids = Vec::new();
-                    let mut all_hot = true;
-                    for loc in idx.lookup_eq(&key) {
-                        match *loc {
-                            spg_storage::RowLocator::Hot(i) => ids.push(i),
-                            spg_storage::RowLocator::Cold { .. } => {
-                                all_hot = false;
-                                break;
-                            }
-                        }
-                    }
-                    if all_hot {
+                }
+            }
+            // Union order is per-literal; sort+dedup so the filtered set
+            // stays in table order (matches the full-scan path, and keeps
+            // any order-sensitive downstream deterministic).
+            ids.sort_unstable();
+            ids.dedup();
+            Some(ids)
+        };
+        for p in preds {
+            match p {
+                Expr::Binary {
+                    lhs,
+                    op: spg_sql::ast::BinOp::Eq,
+                    rhs,
+                } => {
+                    let pair = match (lhs.as_ref(), rhs.as_ref()) {
+                        (Expr::Column(c), Expr::Literal(l))
+                        | (Expr::Literal(l), Expr::Column(c)) => Some((c, l)),
+                        _ => None,
+                    };
+                    if let Some((c, l)) = pair
+                        && let Some((_, idx)) = indexed_col(c)
+                        && let Some(ids) = seek_keys(idx, &[l])
+                    {
                         seeded = Some(ids);
                         break;
                     }
                 }
+                // v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` seeds
+                // the index with one seek per literal instead of a full
+                // scan + per-row membership test (PG's bitmap index scan).
+                // The mailrs conversation search filters `thread_id IN
+                // (60 ids)`: 60 seeks (~one thread each) vs scanning 24k
+                // messages. NOT NULL keys only; a bare/qualified column on
+                // the LHS and an all-literal list.
+                Expr::InList {
+                    expr,
+                    list,
+                    negated: false,
+                } => {
+                    if let Expr::Column(c) = expr.as_ref()
+                        && let Some((_, idx)) = indexed_col(c)
+                        && let Some(lits) = list
+                            .iter()
+                            .map(|e| match e {
+                                Expr::Literal(l) => Some(l),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()
+                        && let Some(ids) = seek_keys(idx, &lits)
+                    {
+                        seeded = Some(ids);
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
         let ctx = EvalContext::new(cols, Some(alias));
