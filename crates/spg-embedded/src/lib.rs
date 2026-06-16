@@ -1819,7 +1819,12 @@ impl Database {
     /// - `Drop` runs (best-effort; checkpoint failure on drop is
     ///   logged to stderr).
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
-        let snapshot = self.engine.snapshot();
+        // CoW-1 seam: capture committed state under &mut self (Arc bump +
+        // cheap trailer clones), then serialize off the engine borrow.
+        // CoW-2 will hand `snap_data` to a background worker so the
+        // serialize/write/fsync below runs without blocking writers.
+        let snap_data = self.engine.snapshot_data();
+        let snapshot = snap_data.serialize();
         let Some(p) = &mut self.persistence else {
             return Ok(());
         };
