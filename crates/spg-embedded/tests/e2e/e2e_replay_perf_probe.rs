@@ -115,3 +115,38 @@ fn replay_cost_decomposition() {
     eprintln!("== fat rows (2KB body) base=10000 append=2000 ==");
     replay_time("fat", 10_000, 2_000, true);
 }
+
+/// v7.34 — quantify the synchronous full-serialize `checkpoint()` cost
+/// (the hot-path stall + whole-catalog block that checkpoint CoW /
+/// background moves off the foreground). Time ∝ hot-tier size: every
+/// checkpoint re-serialises all hot rows while holding the engine, so a
+/// big catalog blocks every concurrent query for this long. This is the
+/// baseline the CoW optimisation must drive to ~0 on the hot path.
+#[test]
+#[ignore = "perf probe; run with --ignored --nocapture"]
+fn checkpoint_cost_by_size() {
+    eprintln!("== checkpoint() blocking cost by hot-tier size ==");
+    for base in [0usize, 5_000, 10_000, 20_000] {
+        let dir = unique_tmpdir(&format!("ckpt-{base}"));
+        let db_path = dir.join("spg.db");
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        let mut i = 0usize;
+        while i < base {
+            let end = (i + 500).min(base);
+            let vals: Vec<String> = (i..end)
+                .map(|k| format!("({k}, 'row {k} body text padding xxxxxxxx')"))
+                .collect();
+            db.execute(&format!("INSERT INTO t VALUES {}", vals.join(",")))
+                .unwrap();
+            i = end;
+        }
+        let t = Instant::now();
+        db.checkpoint().unwrap();
+        let elapsed = t.elapsed();
+        eprintln!("checkpoint base={base:>6} → {elapsed:>9.2?}  (blocks all queries this long)");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
