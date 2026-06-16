@@ -99,6 +99,106 @@ fn explicit_checkpoint_is_durable_on_return() {
 }
 
 #[test]
+fn cold_segments_reload_when_manifest_is_deleted() {
+    // CoW-4 — D10 fallback: the snapshot+manifest pair is two
+    // tmp+rename steps. A crash between them leaves the new snapshot
+    // on disk with a stale manifest whose `catalog_crc32` no longer
+    // matches. The pre-CoW-4 boot silently skipped every cold segment
+    // in that case, orphaning the data on disk. The fix is a
+    // segments-dir scan that trusts each segment's own magic + CRC.
+    //
+    // We simulate the worst case (no manifest at all — the rename
+    // never happened) by deleting the manifest file after a clean
+    // checkpoint. The cold segments must still load and resolve.
+    let dir = unique_tmpdir("no-manifest");
+    let db_path = dir.join("spg.db");
+    {
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+        db.execute("CREATE INDEX by_id ON t (id)").unwrap();
+        for id in 0..10i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({id}, 'r-{id}')"))
+                .unwrap();
+        }
+        db.freeze_oldest_to_cold("t", "by_id", 6).unwrap();
+        db.checkpoint().unwrap();
+    }
+    // Simulate the D10 crash window: snapshot was rewritten, manifest
+    // wasn't.
+    let manifest = dir.join("spg.spg/manifest.v10");
+    assert!(manifest.exists(), "preconditions: manifest is there");
+    std::fs::remove_file(&manifest).unwrap();
+    // Reopen: scan picks up the segment file and reattaches it.
+    let mut db = Database::open_path(&db_path).unwrap();
+    for id in 0..10i64 {
+        let got = db
+            .query(&format!("SELECT id FROM t WHERE id = {id}"))
+            .unwrap();
+        assert_eq!(got.len(), 1, "PK {id} lost when manifest absent");
+    }
+    assert_eq!(
+        db.engine().catalog().cold_segment_count(),
+        1,
+        "scan must reattach the cold segment with no manifest present",
+    );
+}
+
+#[test]
+fn cold_segments_reload_when_manifest_crc_is_stale() {
+    // CoW-4 — same D10 hazard, the "subtle" version: manifest file
+    // exists but its `catalog_crc32` belongs to an older snapshot. The
+    // pre-CoW-4 boot's `snap_crc == m.catalog_crc32` gate silently
+    // skipped every entry. Simulate by overwriting the snapshot bytes
+    // (changes the CRC) without rewriting the manifest.
+    let dir = unique_tmpdir("stale-manifest");
+    let db_path = dir.join("spg.db");
+    {
+        let mut db = Database::open_path(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+        db.execute("CREATE INDEX by_id ON t (id)").unwrap();
+        for id in 0..10i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({id}, 'r-{id}')"))
+                .unwrap();
+        }
+        db.freeze_oldest_to_cold("t", "by_id", 6).unwrap();
+        db.checkpoint().unwrap();
+        // Mutate something so a subsequent checkpoint changes the
+        // snapshot CRC, then trigger the second checkpoint. With CoW-2
+        // the worker carries the latest manifest forward, so to model
+        // a stale manifest deterministically we *also* roll the
+        // manifest file back to its first-checkpoint contents below.
+        let manifest = dir.join("spg.spg/manifest.v10");
+        let stale = std::fs::read(&manifest).unwrap();
+        db.execute("INSERT INTO t VALUES (99, 'late')").unwrap();
+        db.checkpoint().unwrap();
+        // Replace the up-to-date manifest with the pre-late-insert
+        // copy. The snapshot file is now ahead of the manifest's
+        // `catalog_crc32` — exactly the D10 window's state.
+        std::fs::write(&manifest, &stale).unwrap();
+    }
+    let mut db = Database::open_path(&db_path).unwrap();
+    for id in 0..10i64 {
+        let got = db
+            .query(&format!("SELECT id FROM t WHERE id = {id}"))
+            .unwrap();
+        assert_eq!(got.len(), 1, "PK {id} lost when manifest CRC went stale");
+    }
+    let got = db.query("SELECT id FROM t WHERE id = 99").unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "late insert lost across stale-manifest reopen"
+    );
+    assert_eq!(
+        db.engine().catalog().cold_segment_count(),
+        1,
+        "scan must reattach the cold segment despite stale manifest CRC",
+    );
+}
+
+#[test]
 fn writes_after_async_trigger_are_recoverable() {
     // The hot-path trigger captures a snapshot at marker-LSN time and
     // returns. Subsequent writes (still within the same session) ride

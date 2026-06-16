@@ -1071,6 +1071,89 @@ fn legacy_chunk_filename() -> String {
     chunk_filename(0, 0)
 }
 
+/// CoW-4 (v7.34) — D10 fallback: read one cold-segment file and
+/// hand its bytes to the catalog. The segment binary is self-validating
+/// (magic + internal CRC32 via `OwnedSegment::from_bytes`), so we don't
+/// need the manifest's `segment_crc32` to trust it. Returns `true` on a
+/// successful attach (caller bumps `cold_segment_paths`), `false` on a
+/// per-segment failure that is logged but doesn't abort boot.
+fn attach_segment_from_disk(engine: &mut Engine, segment_id: u32, path: &Path) -> bool {
+    if engine.catalog().cold_segment(segment_id).is_some() {
+        return true;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "spg-embedded: cold-segment scan skip {}: read failed: {e}",
+                path.display()
+            );
+            return false;
+        }
+    };
+    let mut new_cat = engine.catalog().clone();
+    if let Err(e) = new_cat.load_segment_bytes_at(segment_id, bytes) {
+        eprintln!(
+            "spg-embedded: cold-segment scan skip {}: parse/load failed: {e}",
+            path.display()
+        );
+        return false;
+    }
+    engine.replace_catalog(new_cat);
+    true
+}
+
+/// CoW-4 (v7.34) — D10 + missing-manifest fallback: scan
+/// `<db>.spg/segments/` for `seg_<id>.spg` files and attach any that
+/// aren't already in `cold_segment_paths`. Closes the window where a
+/// crash between snapshot rename and manifest rename leaves
+/// post-checkpoint cold segments orphaned on disk (the snapshot's CRC
+/// no longer matches the stale manifest, so the manifest path
+/// silently dropped them). The segment parser self-verifies, so a
+/// torn write surfaces as a per-segment skip, never silent corruption.
+fn scan_cold_segments_dir(
+    segments_dir: &Path,
+    engine: &mut Engine,
+    cold_segment_paths: &mut BTreeMap<u32, PathBuf>,
+) {
+    let read_dir = match std::fs::read_dir(segments_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "spg-embedded: cold-segment scan: cannot read {}: {e}",
+                segments_dir.display()
+            );
+            return;
+        }
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        // Only the canonical `seg_<id>.spg` form. `.tmp` half-renames
+        // and unknown extensions are skipped — the segment writer's
+        // tmp+rename pattern guarantees `.spg` files are either fully
+        // written or absent.
+        if path.extension().and_then(|s| s.to_str()) != Some("spg") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(id_str) = stem.strip_prefix("seg_") else {
+            continue;
+        };
+        let Ok(segment_id) = id_str.parse::<u32>() else {
+            continue;
+        };
+        if cold_segment_paths.contains_key(&segment_id) {
+            continue;
+        }
+        if attach_segment_from_disk(engine, segment_id, &path) {
+            cold_segment_paths.insert(segment_id, path);
+        }
+    }
+}
+
 /// v7.19 — list every `.wal` file in `wal_dir` in
 /// lexicographic order (which doubles as chunk-creation
 /// order thanks to the zero-padded filename format).
@@ -1801,6 +1884,14 @@ impl Database {
                 }
             }
         }
+        // CoW-4 (v7.34) — D10 + missing-manifest fallback. Walk
+        // `<db>.spg/segments/` and attach any `seg_<id>.spg` file that
+        // the manifest didn't already cover (manifest absent / CRC
+        // mismatched / a fresher freeze landed after the last
+        // checkpoint wrote its manifest). The segment binary's own
+        // magic + CRC32 guards integrity — no need to trust a stale
+        // manifest entry to trust the file.
+        scan_cold_segments_dir(&cold_segments_dir, &mut engine, &mut cold_segment_paths);
         // v7.19 — chunked WAL on-disk layout.
         //
         // Three cases handled here:
