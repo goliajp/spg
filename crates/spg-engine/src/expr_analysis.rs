@@ -229,6 +229,17 @@ pub(crate) fn collect_column_qualifiers<'e>(
                 collect_column_qualifiers(a, out, all_qualified);
             }
         }
+        // v7.33 (mailrs 7.33.0) — `col IN (…)` is attributable to its
+        // operands' tables (a literal list adds none), so analyze_join_
+        // pushdown can push a single-table `indexed_col IN (lits)` to the
+        // primary filter for an index seed instead of leaving it in the
+        // residual WHERE as a full scan.
+        Expr::InList { expr, list, .. } => {
+            collect_column_qualifiers(expr, out, all_qualified);
+            for e in list {
+                collect_column_qualifiers(e, out, all_qualified);
+            }
+        }
         Expr::Literal(_) | Expr::Placeholder(_) => {}
         // Anything exotic (CASE, subquery, window, arrays…):
         // conservatively mark unattributable.

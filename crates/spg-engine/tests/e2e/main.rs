@@ -67,6 +67,7 @@ mod e2e_greatest_least;
 mod e2e_group_by_all;
 mod e2e_hnsw_opclass;
 mod e2e_in_list_depth;
+mod e2e_in_list_index_seek;
 mod e2e_include;
 mod e2e_index_advisor;
 mod e2e_inet_contains;
