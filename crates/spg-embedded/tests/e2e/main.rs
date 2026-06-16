@@ -5,6 +5,7 @@
 mod e2e_auto_compact;
 mod e2e_background_freezer;
 mod e2e_chaos;
+mod e2e_checkpoint_cow;
 mod e2e_cold_tier_manifest;
 mod e2e_file_lock;
 mod e2e_freeze_visible;
