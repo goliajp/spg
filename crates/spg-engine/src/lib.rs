@@ -295,6 +295,43 @@ pub struct CatalogSnapshot {
     max_query_rows: Option<usize>,
 }
 
+/// CoW-1 (v7.34) — frozen view of the *persisted* committed engine
+/// state. Carries every field the `snapshot()` envelope serializes;
+/// `Clone` is O(1) on the catalog (Arc bump) and cheap typed-clones
+/// on the trailers. Decouples "capture state" from "serialize bytes"
+/// so the background-checkpoint worker can hold the snapshot and
+/// produce bytes off the engine write lock.
+#[derive(Debug, Clone)]
+pub struct EngineSnapshot {
+    catalog: Catalog,
+    users: UserStore,
+    publications: publications::Publications,
+    subscriptions: subscriptions::Subscriptions,
+    statistics: statistics::Statistics,
+}
+
+impl EngineSnapshot {
+    /// Same envelope rules as `Engine::snapshot()`: bare catalog when
+    /// every trailer is empty, full envelope otherwise.
+    pub fn serialize(&self) -> Vec<u8> {
+        if self.users.is_empty()
+            && self.publications.is_empty()
+            && self.subscriptions.is_empty()
+            && self.statistics.is_empty()
+        {
+            self.catalog.serialize()
+        } else {
+            build_envelope(
+                &self.catalog.serialize(),
+                &users::serialize_users(&self.users),
+                &self.publications.serialize(),
+                &self.subscriptions.serialize(),
+                &self.statistics.serialize(),
+            )
+        }
+    }
+}
+
 // The engine carries several independent session/capture flags (dialect,
 // FK-checks, meta-view materialisation, redo capture); they're orthogonal
 // switches, not a state enum begging to be modelled.
@@ -704,6 +741,20 @@ impl Engine {
         &self.catalog
     }
 
+    /// Capture a frozen view of the committed engine state. Catalog
+    /// is O(1) Arc bump; trailers are cheap clones. Decouples "capture"
+    /// (needs &Engine) from "serialize" (CPU, no engine access) — the
+    /// seam the background-checkpoint worker rides in CoW-2.
+    pub fn snapshot_data(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            catalog: self.catalog.clone(),
+            users: self.users.clone(),
+            publications: self.publications.clone(),
+            subscriptions: self.subscriptions.clone(),
+            statistics: self.statistics.clone(),
+        }
+    }
+
     /// Serialize the *committed* catalog to bytes. v0.6 was full-snapshot; v0.9
     /// adds the rule that an open TX's shadow is never snapshotted — only the
     /// post-COMMIT state is persisted. v4.1 wraps the catalog in an envelope
@@ -712,21 +763,7 @@ impl Engine {
     /// adds publications to the envelope condition: either non-empty
     /// users OR non-empty publications now triggers the envelope path.
     pub fn snapshot(&self) -> Vec<u8> {
-        if self.users.is_empty()
-            && self.publications.is_empty()
-            && self.subscriptions.is_empty()
-            && self.statistics.is_empty()
-        {
-            self.catalog.serialize()
-        } else {
-            build_envelope(
-                &self.catalog.serialize(),
-                &users::serialize_users(&self.users),
-                &self.publications.serialize(),
-                &self.subscriptions.serialize(),
-                &self.statistics.serialize(),
-            )
-        }
+        self.snapshot_data().serialize()
     }
 
     /// True when at least one TX slot is in flight. v4.41.1 runtime
