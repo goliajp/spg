@@ -2134,12 +2134,37 @@ impl Engine {
         };
         let proj_pos: Vec<Option<usize>> = projection.iter().map(|p| bound_pos(&p.expr)).collect();
         let all_proj_bound = proj_pos.iter().all(Option::is_some);
+        // v7.36 (perf — mailrs Phase 1, PROJ SPGS 8.93 → ?) —
+        // pre-decompose each bound projection position into
+        // `(source_k, col_in_source)` so the per-row column read
+        // skips the per-cell `tuple_value` partition_point + slice
+        // walk. For PROJ_25k (5 cols × 25k rows = 125k tuple_value
+        // calls) that walk dominated; this version reaches into
+        // `pipe.sources[k].get(tuple[k])?.values[col]` directly.
+        let proj_decomposed: Vec<Option<(usize, usize)>> = proj_pos
+            .iter()
+            .map(|p| {
+                p.and_then(|abs| {
+                    let k = deferred
+                        .offsets
+                        .partition_point(|&o| o <= abs)
+                        .checked_sub(1)?;
+                    Some((k, abs - deferred.offsets[k]))
+                })
+            })
+            .collect();
         // ORDER BY (when present) still evaluates against a materialised
         // Row — keep the order-key encoder correct rather than fork it.
         let need_eval_row = !all_proj_bound || !stmt.order_by.is_empty();
         let mut tagged: Vec<(Vec<f64>, Row)> = Vec::new();
         let mut proj_memo = memoize::MemoizeCache::default();
-        for row in &refs {
+        let sources_ref = &deferred.sources;
+        let stride = deferred.stride;
+        let survivors_ref = &deferred.survivors;
+        let n_surv = survivors_ref.len() / stride.max(1);
+        for surv_i in 0..n_surv {
+            let tuple = &survivors_ref[surv_i * stride..(surv_i + 1) * stride];
+            let row = &refs[surv_i];
             let materialised: Option<Cow<'_, Row>> = if need_eval_row {
                 Some(row.as_row())
             } else {
@@ -2147,8 +2172,24 @@ impl Engine {
             };
             let mut values = Vec::with_capacity(projection.len());
             for (i, p) in projection.iter().enumerate() {
-                if let Some(pos) = proj_pos[i] {
-                    // Bound qualified column — borrow the source cell.
+                if let Some((k, col_in_src)) = proj_decomposed[i] {
+                    // v7.36 — direct (source_k, col) lookup, no
+                    // partition_point. tuple[k] is the row index in
+                    // sources[k]; LEFT-NULL slots are `usize::MAX`.
+                    let ri = tuple[k];
+                    let v = if ri == usize::MAX {
+                        Value::Null
+                    } else {
+                        sources_ref[k]
+                            .get(ri)
+                            .and_then(|r| r.values.get(col_in_src))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    };
+                    values.push(v);
+                } else if let Some(pos) = proj_pos[i] {
+                    // Bound but couldn't decompose (shouldn't normally
+                    // happen — keep as a safe path).
                     values.push(row.get(pos).cloned().unwrap_or(Value::Null));
                 } else {
                     // Eval path — `materialised` is Some whenever any
