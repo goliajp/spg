@@ -722,18 +722,105 @@ fn accumulate_groups(
             _ => eval::eval_expr(e, r, c),
         }
     };
+    // v7.36 (perf — mailrs Phase 1, post u64-hash) — single
+    // anonymous group fast path. When the query has no GROUP BY
+    // (`SELECT SUM(LENGTH(col)) FROM ...`, COUNT, AVG, etc.) the
+    // whole input collapses into one group. The fast path below
+    // still pays one `groups.get("")` hash probe per row plus
+    // `entry = &mut order[0]` reindex even when the empty-key
+    // path encodes nothing — measured ~50 ns/row across 25 k rows
+    // = ~1.25 ms of pure bookkeeping on the user_storage_usage
+    // baseline.
+    //
+    // Bypass: lift `entry` outside the loop and feed every row
+    // straight into it. Same `update_state` machinery, zero
+    // per-row hash work, zero per-row index lookup.
+    let single_anon_group = group_exprs.is_empty() && !rows.is_empty();
+    if single_anon_group {
+        // Seed the single group at idx 0 once.
+        let init: Vec<AggState> = (0..agg_specs.len()).map(|_| AggState::default()).collect();
+        order.clear();
+        order.push((Vec::new(), init));
+    }
     for row in rows {
+        if single_anon_group {
+            let entry = &mut order[0];
+            let mat: Option<Cow<'_, Row>> = if needs_mat { Some(row.as_row()) } else { None };
+            for (i, spec) in agg_specs.iter().enumerate() {
+                if let Some(f) = &spec.filter
+                    && !matches!(
+                        eval_arg(f, mat.as_deref().expect("needs_mat for FILTER"), &ctx)?,
+                        Value::Bool(true)
+                    )
+                {
+                    continue;
+                }
+                let arg_owned: Value;
+                let arg_ref: &Value = match (&arg_pos[i], &arg_compiled[i], &spec.arg) {
+                    (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
+                    (None, _, None) => {
+                        arg_owned = Value::Bool(true);
+                        &arg_owned
+                    }
+                    (None, Some(c), _) => {
+                        arg_owned = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
+                        &arg_owned
+                    }
+                    (None, None, Some(e)) => {
+                        arg_owned = eval_arg(
+                            e,
+                            mat.as_deref().expect("needs_mat for non-bound arg"),
+                            &ctx,
+                        )?;
+                        &arg_owned
+                    }
+                };
+                let arg2_val = match &spec.arg2 {
+                    None => None,
+                    Some(e) => Some(eval_arg(
+                        e,
+                        mat.as_deref().expect("needs_mat for arg2"),
+                        &ctx,
+                    )?),
+                };
+                let order_keys = if spec.order_by.is_empty() {
+                    None
+                } else {
+                    let mut keys = Vec::with_capacity(spec.order_by.len());
+                    for (k, o) in spec.order_by.iter().enumerate() {
+                        let v = if let Some(p) = order_pos[i][k] {
+                            row.get(p).cloned().unwrap_or(Value::Null)
+                        } else {
+                            eval_arg(
+                                &o.expr,
+                                mat.as_deref().expect("needs_mat for ORDER key"),
+                                &ctx,
+                            )?
+                        };
+                        keys.push(v);
+                    }
+                    Some(keys)
+                };
+                if spec.distinct {
+                    encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
+                    if entry.1[i].seen.contains(dkeybuf.as_str()) {
+                        continue;
+                    }
+                    entry.1[i].seen.insert(dkeybuf.clone());
+                }
+                update_state(
+                    &mut entry.1[i],
+                    &spec.name,
+                    arg_ref,
+                    arg2_val.as_ref(),
+                    order_keys,
+                )?;
+            }
+            continue;
+        }
         // Fast key: bound positions + no ci folding -> encode
         // straight from borrowed cells; group_vals materialise
         // only when the group is NEW.
-        // v7.36 — drop the `!group_exprs.is_empty()` gate. With no
-        // GROUP BY the answer is always a single anonymous group at
-        // idx 0 (seeded in the empty-rows branch above; reseeded
-        // here on the first row if rows wasn't empty), so the fast
-        // path skips key encoding entirely. Previously this case
-        // fell through to the slow path which materialises a
-        // Cow<Row> per input row — the 18 ms `SUM(LENGTH(text_body))`
-        // mailrs Ask 1 baseline was exactly this shape.
         if all_groups_bound && ci_positions.is_empty() {
             refs.clear();
             refs.extend(
