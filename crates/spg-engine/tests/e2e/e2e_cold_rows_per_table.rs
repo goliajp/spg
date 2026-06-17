@@ -665,6 +665,64 @@ fn merge_into_target_blocks_when_target_has_cold_rows() {
     );
 }
 
+/// v7.36 — UPDATE with a non-PK WHERE on a cold-bearing table.
+/// Pre-7.36 only PK-eq WHERE promoted the matching cold row to
+/// hot before the SET loop; predicate WHEREs silently dropped
+/// cold matches. Now any matching cold rows are pre-promoted so
+/// the regular hot walk picks them up.
+#[test]
+fn update_non_pk_where_promotes_cold_matches() {
+    let mut eng = Engine::new();
+    eng.execute(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, status TEXT NOT NULL, val BIGINT NOT NULL)",
+    )
+    .unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO t VALUES ({i}, 'pending', {i})"))
+            .unwrap();
+    }
+    eng.freeze_oldest_to_cold("t", "t_pkey", 5).expect("freeze");
+    // Non-PK WHERE updating status of every row.
+    eng.execute("UPDATE t SET status = 'done' WHERE val > 0")
+        .expect("non-PK UPDATE must succeed across both tiers");
+    // COUNT(status='done') should be all 10.
+    let rows = rows_of(
+        eng.execute("SELECT COUNT(*) FROM t WHERE status = 'done'")
+            .unwrap(),
+    );
+    assert_eq!(
+        rows[0][0],
+        Value::BigInt(10),
+        "non-PK UPDATE must reach cold-tier rows too"
+    );
+}
+
+/// v7.36 — DELETE with a non-PK WHERE on a cold-bearing table.
+/// Same shape as UPDATE: pre-7.36 only PK-eq WHERE shadowed the
+/// matching cold-tier locator. Now predicate WHEREs walk cold
+/// rows, eval, and shadow each match.
+#[test]
+fn delete_non_pk_where_shadows_cold_matches() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        .unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    eng.freeze_oldest_to_cold("t", "t_pkey", 5).expect("freeze");
+    // Non-PK WHERE deleting rows with val ≤ 3 — hits ids 1, 2, 3
+    // which are all in the cold tier.
+    eng.execute("DELETE FROM t WHERE val <= 3")
+        .expect("non-PK DELETE must reach cold rows");
+    let rows = rows_of(eng.execute("SELECT COUNT(*) FROM t").unwrap());
+    assert_eq!(
+        rows[0][0],
+        Value::BigInt(7),
+        "non-PK DELETE must shadow cold-tier matches"
+    );
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();

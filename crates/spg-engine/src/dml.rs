@@ -91,6 +91,47 @@ impl Engine {
                 let _ = self
                     .active_catalog_mut()
                     .promote_cold_row(&stmt.table, &idx_name, &key);
+            } else {
+                // v7.36 (cold-tier coverage) — UPDATE with a non-PK
+                // WHERE on a cold-bearing table previously missed
+                // cold-tier matching rows because the candidate walk
+                // only iterates `(0..table.row_count())` (hot). Walk
+                // each cold row, eval WHERE against it, and promote
+                // every match to the hot tier so the regular SET
+                // loop below picks it up. Costs one segment-page
+                // read + decode per cold row scanned — bounded by
+                // the table's cold-row count.
+                let pre_promote_keys: Vec<spg_storage::IndexKey> = {
+                    let mut keys = Vec::new();
+                    if let Some(t) = self.active_catalog().get(&stmt.table)
+                        && t.count_cold_locators() > 0
+                    {
+                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+                        for (key, row) in
+                            crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
+                        {
+                            let cond = eval::eval_expr(w, &row, &ctx).map_err(EngineError::Eval)?;
+                            if matches!(cond, Value::Bool(true)) {
+                                keys.push(key);
+                            }
+                        }
+                    }
+                    keys
+                };
+                if !pre_promote_keys.is_empty()
+                    && let Some(idx_name) = self
+                        .active_catalog()
+                        .get(&stmt.table)
+                        .and_then(crate::constraints::pk_btree_index_name)
+                {
+                    for key in pre_promote_keys {
+                        let _ = self.active_catalog_mut().promote_cold_row(
+                            &stmt.table,
+                            &idx_name,
+                            &key,
+                        );
+                    }
+                }
             }
         }
 
@@ -712,6 +753,44 @@ impl Engine {
                     .active_catalog_mut()
                     .shadow_cold_row(&stmt.table, &idx_name, &key)
                     .unwrap_or(0);
+            } else {
+                // v7.36 (cold-tier coverage) — DELETE with a non-PK
+                // WHERE on a cold-bearing table previously missed
+                // cold-tier matching rows. Walk each cold row, eval
+                // WHERE against it, and shadow the matching PK keys
+                // (retiring the cold-tier index entries; the row
+                // body becomes shadowed garbage that compaction
+                // reclaims).
+                let pre_shadow_keys: Vec<spg_storage::IndexKey> = {
+                    let mut keys = Vec::new();
+                    if let Some(t) = self.active_catalog().get(&stmt.table)
+                        && t.count_cold_locators() > 0
+                    {
+                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+                        for (key, row) in
+                            crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
+                        {
+                            let cond = eval::eval_expr(w, &row, &ctx).map_err(EngineError::Eval)?;
+                            if matches!(cond, Value::Bool(true)) {
+                                keys.push(key);
+                            }
+                        }
+                    }
+                    keys
+                };
+                if !pre_shadow_keys.is_empty()
+                    && let Some(idx_name) = self
+                        .active_catalog()
+                        .get(&stmt.table)
+                        .and_then(crate::constraints::pk_btree_index_name)
+                {
+                    for key in pre_shadow_keys {
+                        cold_shadow_count += self
+                            .active_catalog_mut()
+                            .shadow_cold_row(&stmt.table, &idx_name, &key)
+                            .unwrap_or(0);
+                    }
+                }
             }
         }
 

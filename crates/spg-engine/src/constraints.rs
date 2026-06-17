@@ -973,6 +973,63 @@ pub(crate) fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::
     out
 }
 
+/// v7.36 — companion to `iter_cold_rows_of_parent` that also
+/// surfaces the PK key alongside each cold-tier row. Used by
+/// UPDATE / DELETE non-PK WHERE paths to promote / shadow each
+/// matching cold-tier row by its PK key (the only key
+/// `Catalog::promote_cold_row` and `shadow_cold_row` accept).
+pub(crate) fn iter_cold_rows_with_pk_key(
+    catalog: &Catalog,
+    table: &spg_storage::Table,
+) -> Vec<(spg_storage::IndexKey, Row)> {
+    let schema = table.schema();
+    let Some(pk_col_pos) = schema
+        .uniqueness_constraints
+        .iter()
+        .find(|u| u.is_primary_key && u.columns.len() == 1)
+        .map(|u| u.columns[0])
+    else {
+        return Vec::new();
+    };
+    let Some(idx) = table.indices().iter().find(|i| {
+        i.column_position == pk_col_pos && matches!(i.kind, spg_storage::IndexKind::BTree(_))
+    }) else {
+        return Vec::new();
+    };
+    let table_name = schema.name.as_str();
+    let mut out = Vec::new();
+    for (key, locators) in idx.iter_asc() {
+        for loc in locators {
+            if let spg_storage::RowLocator::Cold { segment_id, .. } = loc
+                && let Some(row) = catalog.resolve_cold_locator(table_name, *segment_id, key)
+            {
+                out.push((key.clone(), row));
+            }
+        }
+    }
+    out
+}
+
+/// v7.36 — name of the PK BTree index on `table` if there's a
+/// single-column PRIMARY KEY. Used by UPDATE / DELETE cold-tier
+/// fixup paths to thread the PK index name into
+/// `Catalog::promote_cold_row` / `shadow_cold_row`.
+pub(crate) fn pk_btree_index_name(table: &spg_storage::Table) -> Option<String> {
+    let schema = table.schema();
+    let pk_col_pos = schema
+        .uniqueness_constraints
+        .iter()
+        .find(|u| u.is_primary_key && u.columns.len() == 1)
+        .map(|u| u.columns[0])?;
+    table.indices().iter().find_map(|i| {
+        if i.column_position == pk_col_pos && matches!(i.kind, spg_storage::IndexKind::BTree(_)) {
+            Some(i.name.clone())
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn enforce_fk_inserts(
     catalog: &Catalog,
     child_table: &str,
