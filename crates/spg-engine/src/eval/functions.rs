@@ -11,12 +11,33 @@ use super::*;
 
 /// Dispatch on lowercased function name. v1.4 implements only a handful of
 /// scalar functions; aggregates land in v1.5 alongside GROUP BY.
+/// v7.36 (perf) — Step VM entry. Caller has already lowercased
+/// the function name at compile time (`Step::Function { name_lower
+/// }`), so dispatch skips the per-call `to_ascii_lowercase()`
+/// allocation. Equivalent to `apply_function` for any already-
+/// lowercase input.
+pub(super) fn apply_function_lower(
+    name_lower: &str,
+    args: &[Value],
+    ctx: &EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    apply_function_dispatch(name_lower, args, ctx)
+}
+
 pub(super) fn apply_function(
     name: &str,
     args: &[Value],
     ctx: &EvalContext<'_>,
 ) -> Result<Value, EvalError> {
-    match name.to_ascii_lowercase().as_str() {
+    apply_function_dispatch(&name.to_ascii_lowercase(), args, ctx)
+}
+
+fn apply_function_dispatch(
+    name: &str,
+    args: &[Value],
+    ctx: &EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    match name {
         // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
         "nextval" => {
             if args.len() != 1 {
@@ -142,7 +163,17 @@ pub(super) fn apply_function(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => {
-                    let n = i32::try_from(s.chars().count()).unwrap_or(i32::MAX);
+                    // v7.36 (perf — mailrs Ask 1) — ASCII fast path.
+                    // `s.is_ascii()` is SIMD-vectorised; for the 1 KB
+                    // ASCII bodies in the storage / contact baselines
+                    // it's ~50 ns vs the 1 µs `s.chars().count()`
+                    // walk. PG `length(text)` returns character count,
+                    // which equals byte count when ASCII.
+                    let n = if s.is_ascii() {
+                        i32::try_from(s.len()).unwrap_or(i32::MAX)
+                    } else {
+                        i32::try_from(s.chars().count()).unwrap_or(i32::MAX)
+                    };
                     Ok(Value::Int(n))
                 }
                 // v7.10.4 — PG semantics: length(bytea) returns

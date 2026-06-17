@@ -70,9 +70,28 @@ pub(crate) enum Step {
     /// `fully_compilable` whitelist (PURE scalars — no NOW / RANDOM
     /// / sequence accessors) is emitted; everything else stays on
     /// `Step::Subtree`.
+    /// `name_lower` is pre-lowercased at compile time so the per-
+    /// row dispatch in `apply_function` skips an allocation on
+    /// every input row.
     Function {
-        name: alloc::string::String,
+        name_lower: alloc::string::String,
         n_args: usize,
+    },
+    /// v7.36 (perf — mailrs Ask 1 SUM(LENGTH(text_body)) zero-copy)
+    /// — `LENGTH(<column>)` / `CHAR_LENGTH(<column>)` /
+    /// `CHARACTER_LENGTH(<column>)` over a bound column. Reads the
+    /// cell by reference, computes the char length WITHOUT cloning
+    /// the underlying `String` — the 1 KB text bodies in
+    /// `user_storage_usage` otherwise pay 25 k × 1 KB heap allocs
+    /// per query just to push a `Value::Text` onto the stack so the
+    /// next Step pops it and asks `s.len()`.
+    ColumnLength {
+        pos: usize,
+    },
+    /// v7.36 — `OCTET_LENGTH(<column>)` — byte count, regardless of
+    /// encoding. Even simpler than `ColumnLength` (no ASCII probe).
+    ColumnOctetLength {
+        pos: usize,
     },
     /// v7.36 — `CAST(<expr> AS <ty>)` over an already-pushed value.
     /// Pure / context-free conversion goes through the same
@@ -217,11 +236,34 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
         // gates the whitelist + recurses into args, so this branch
         // only fires when the entire subtree is compilable.
         Expr::FunctionCall { name, args } if is_pure_scalar_function(name) => {
+            // v7.36 — specialise `LENGTH(<column>)` /
+            // `OCTET_LENGTH(<column>)` so the column's `Value::Text`
+            // isn't cloned just to read its length. The general
+            // `Step::Function` path goes through `apply_function`,
+            // which can't borrow off the stack — it copies.
+            let lower = name.to_ascii_lowercase();
+            if args.len() == 1 {
+                if let Expr::Column(c) = &args[0]
+                    && let Some(pos) = compile_column_pos(c, ctx)
+                {
+                    match lower.as_str() {
+                        "length" | "char_length" | "character_length" => {
+                            steps.push(Step::ColumnLength { pos });
+                            return;
+                        }
+                        "octet_length" => {
+                            steps.push(Step::ColumnOctetLength { pos });
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             for a in args {
                 compile_into(a, ctx, steps);
             }
             steps.push(Step::Function {
-                name: name.clone(),
+                name_lower: lower,
                 n_args: args.len(),
             });
         }
@@ -478,13 +520,60 @@ pub(crate) fn eval_compiled_ref(
                     }
                 }
             }
-            Step::Function { name, n_args } => {
+            Step::ColumnLength { pos } => {
+                // v7.36 — zero-copy LENGTH on a column. Read the
+                // cell by reference; compute char count without
+                // cloning the underlying `String`. Saves 25 k ×
+                // ~1 KB heap clones on the user_storage_usage shape.
+                let v = row.get(*pos).unwrap_or(&Value::Null);
+                let pushed = match v {
+                    Value::Null => Value::Null,
+                    Value::Text(s) => {
+                        let n = if s.is_ascii() {
+                            i32::try_from(s.len()).unwrap_or(i32::MAX)
+                        } else {
+                            i32::try_from(s.chars().count()).unwrap_or(i32::MAX)
+                        };
+                        Value::Int(n)
+                    }
+                    Value::Bytes(b) => Value::Int(i32::try_from(b.len()).unwrap_or(i32::MAX)),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "length() needs text or bytea, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                stack.push(pushed);
+            }
+            Step::ColumnOctetLength { pos } => {
+                let v = row.get(*pos).unwrap_or(&Value::Null);
+                let pushed = match v {
+                    Value::Null => Value::Null,
+                    Value::Text(s) => Value::Int(i32::try_from(s.len()).unwrap_or(i32::MAX)),
+                    Value::Bytes(b) => Value::Int(i32::try_from(b.len()).unwrap_or(i32::MAX)),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "octet_length() needs text or bytea, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                stack.push(pushed);
+            }
+            Step::Function { name_lower, n_args } => {
                 let start = stack.len().saturating_sub(*n_args);
                 // `apply_function` borrows the trailing `n_args`
                 // values off the stack; we then truncate + push the
-                // result. Zero allocations beyond what the function
-                // itself does.
-                let result = super::functions::apply_function(name, &stack[start..], ctx)?;
+                // result. `name_lower` is pre-lowercased at compile
+                // time, so dispatch skips the per-row
+                // `to_ascii_lowercase()` allocation.
+                let result =
+                    super::functions::apply_function_lower(name_lower, &stack[start..], ctx)?;
                 stack.truncate(start);
                 stack.push(result);
             }
