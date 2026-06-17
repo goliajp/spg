@@ -135,8 +135,7 @@ pub struct MemoizeCache {
     /// row — the dominant cost of the 7.34.0 EXISTS-FILTER baseline.
     /// `None` slot = couldn't decorrelate that particular EXISTS; the
     /// dispatcher falls back to the legacy per-row resolver for it.
-    pub exists_plans:
-        alloc::collections::BTreeMap<usize, Vec<Option<alloc::rc::Rc<ExistsSet>>>>,
+    pub exists_plans: alloc::collections::BTreeMap<usize, Vec<Option<alloc::rc::Rc<ExistsSet>>>>,
     /// v7.29 (3c) - host-expression ptr -> (subquery count, plan).
     pub expr_plans: alloc::collections::BTreeMap<usize, ExprPlan>,
     /// v7.30.2 (mailrs round-25) - InList node ptr -> membership set

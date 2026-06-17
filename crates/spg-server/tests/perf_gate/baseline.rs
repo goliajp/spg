@@ -244,6 +244,31 @@ fn baseline_exists_filter_three_forms() {
     }
 }
 
+// Shape 5b: NOT-EXISTS-FILTER — mailrs prod content_worker hot-path
+// (`spg-7.34-prod-load-conn-pool-still-degraded-2026-06-17.md`). The
+// 7.34.0 EXISTS decorrelation work didn't fire for this NOT EXISTS
+// shape and prod stayed `status=degraded` an hour after cutover. After
+// the v7.34.2 `pull_up_exists_sublinks` plan-time pass this should
+// collapse into a LEFT JOIN + IS NULL semi-anti-join (the same
+// `convert_EXISTS_sublink_to_join` rewrite PG does).
+#[test]
+fn baseline_not_exists_filter() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT m.id, m.sender FROM messages m \
+            JOIN mailboxes mb ON m.mailbox_id = mb.id \
+            WHERE mb.user_address = 'u@x' \
+              AND NOT EXISTS (SELECT 1 FROM email_analysis ea WHERE ea.message_id = m.id) \
+            ORDER BY m.id DESC LIMIT 200",
+        10,
+        "not_exists_filter",
+        500.0,
+    );
+}
+
 // Shape 6: GET-CONVERSATIONS-IN(60) — the mailrs prod hot path 169ef66
 // fixed (snippet subquery JOIN, IN-list of 60 thread ids). Picks 60
 // stable thread ids from the seed deterministically.
