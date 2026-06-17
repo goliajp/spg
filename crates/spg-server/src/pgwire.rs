@@ -461,7 +461,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
         match msg_type {
             b'Q' => handle_pg_simple_query(
                 &mut stream,
-                &body,
+                body,
                 state,
                 &conn_state,
                 role,
@@ -483,7 +483,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             // statement; reply ParseComplete (no ReadyForQuery — that
             // waits for Sync).
             b'P' => {
-                if let Err(msg) = handle_parse(&body, &mut prepared, state) {
+                if let Err(msg) = handle_parse(body, &mut prepared, state) {
                     send_error(&mut wbuf, "42601", &msg)?;
                 } else {
                     send_msg(&mut wbuf, b'1', &[])?;
@@ -492,7 +492,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             // Bind (B): create a portal with parameter values
             // substituted into the prepared statement's SQL.
             b'B' => {
-                match handle_bind(&body, &prepared) {
+                match handle_bind(body, &prepared) {
                     Ok(portal) => {
                         portals.insert(portal.0.clone(), portal.1);
                         send_msg(&mut wbuf, b'2', &[])?; // BindComplete
@@ -508,7 +508,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             b'D' => {
                 if !body.is_empty() {
                     let kind = body[0];
-                    let name = cstring_at(&body, 1).unwrap_or_default();
+                    let name = cstring_at(body, 1).unwrap_or_default();
                     // v6.3.3 — real Describe. Statement (S) returns
                     // ParameterDescription + RowDescription | NoData.
                     // Portal (P) returns RowDescription | NoData
@@ -563,7 +563,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             // Execute (E): portal name + max-rows (0 = all).
             b'E' => {
                 if let Err((sqlstate, msg)) = handle_execute(
-                    &body,
+                    body,
                     &portals,
                     &prepared,
                     &settings,
@@ -580,7 +580,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             b'C' => {
                 if body.len() >= 2 {
                     let kind = body[0];
-                    let name = cstring_at(&body, 1).unwrap_or_default();
+                    let name = cstring_at(body, 1).unwrap_or_default();
                     if kind == b'S' {
                         prepared.remove(&name);
                     } else if kind == b'P' {
