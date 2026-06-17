@@ -742,6 +742,49 @@ fn accumulate_groups(
         order.clear();
         order.push((Vec::new(), init));
     }
+    // v7.36 (perf — mailrs Phase 1, count_messages 2.58 → ?) —
+    // `COUNT(*)` short-circuit. For a single-anon-group `COUNT(*)`
+    // with no FILTER / DISTINCT, every survivor counts once — the
+    // answer IS `rows.len()`. Skips the 25 k iterations of
+    // `update_state("count_star", …)` on the mailrs count_messages
+    // shape; the JOIN already produced exactly the set of rows
+    // that must be counted.
+    if single_anon_group
+        && agg_specs.len() == 1
+        && agg_specs[0].name == "count_star"
+        && agg_specs[0].filter.is_none()
+        && agg_specs[0].arg.is_none()
+        && agg_specs[0].arg2.is_none()
+        && agg_specs[0].order_by.is_empty()
+        && !agg_specs[0].distinct
+    {
+        let state = &mut order[0].1[0];
+        state.count = rows.len() as i64;
+        return Ok(order);
+    }
+    // v7.36 (perf — mailrs Phase 1) — `COUNT(<bound col>)` (non-`*`)
+    // collapses to: read the cell, increment when not NULL. Skips
+    // the per-row spec dispatch + `update_state("count", …)`.
+    if single_anon_group
+        && agg_specs.len() == 1
+        && agg_specs[0].name == "count"
+        && agg_specs[0].filter.is_none()
+        && agg_specs[0].arg2.is_none()
+        && agg_specs[0].order_by.is_empty()
+        && !agg_specs[0].distinct
+        && arg_pos[0].is_some()
+    {
+        let p = arg_pos[0].unwrap();
+        let mut count: i64 = 0;
+        for row in rows {
+            if !matches!(row.get(p), Some(Value::Null) | None) {
+                count += 1;
+            }
+        }
+        let state = &mut order[0].1[0];
+        state.count = count;
+        return Ok(order);
+    }
     // v7.36 (perf — mailrs Phase 1, user_storage_usage 7.5 → ?) —
     // single-aggregate streaming accumulator. For
     // `SUM(<compiled-expr>)` / `SUM(<bound col>)` with no GROUP BY,
