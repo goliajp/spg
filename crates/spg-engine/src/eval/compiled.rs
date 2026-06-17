@@ -107,6 +107,23 @@ pub(crate) struct CompiledExpr {
     steps: Vec<Step>,
 }
 
+impl CompiledExpr {
+    /// v7.36 (perf — mailrs Phase 1, user_storage_usage hot loop) —
+    /// shape inspector for the aggregate's tight inner. Returns
+    /// `Some(pos)` iff this compiled expression is exactly the
+    /// single step `ColumnLength { pos }` — i.e. `LENGTH(<column>)`
+    /// on a bound text column with no surrounding work.
+    pub(crate) fn as_single_column_length(&self) -> Option<usize> {
+        if self.steps.len() == 1
+            && let Step::ColumnLength { pos } = &self.steps[0]
+        {
+            Some(*pos)
+        } else {
+            None
+        }
+    }
+}
+
 /// Column-position resolution at compile time. Mirrors the happy
 /// layers of `resolve_column`; ANY case that would reach an error
 /// path, an ambiguity, or a miss returns None so the node falls
