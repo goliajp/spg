@@ -696,7 +696,7 @@ impl Engine {
                 // when ANY cold-tier row exists; the fallback rides
                 // `materialise_table_ref_filtered` which already
                 // covers both tiers (v7.35.1).
-                t.count_cold_locators() == 0)
+                !t.has_cold_rows_fast())
         } else {
             None
         };
@@ -891,7 +891,7 @@ impl Engine {
         // non-PK JOINs on a cold-bearing peer, bail out so the
         // caller falls through to hash-join (which iterates the
         // peer via `Mixed` without needing locator-to-PK mapping).
-        let cold_count = table.count_cold_locators();
+        let has_cold = table.has_cold_rows_fast();
         let pk_col_pos = table
             .schema()
             .uniqueness_constraints
@@ -899,11 +899,10 @@ impl Engine {
             .find(|u| u.is_primary_key && u.columns.len() == 1)
             .map(|u| u.columns[0]);
         let join_col_is_pk = pk_col_pos == Some(idx.column_position);
-        if cold_count > 0 && !join_col_is_pk {
+        if has_cold && !join_col_is_pk {
             return Ok(false);
         }
-        let (cold_rows, cold_pk_map): (Vec<Row>, hashbrown::HashMap<i64, usize>) = if cold_count > 0
-        {
+        let (cold_rows, cold_pk_map): (Vec<Row>, hashbrown::HashMap<i64, usize>) = if has_cold {
             crate::constraints::iter_cold_rows_with_locator_map(self.active_catalog(), table)
         } else {
             (Vec::new(), hashbrown::HashMap::new())
@@ -1054,7 +1053,7 @@ impl Engine {
                 // `len()/get()` and indexes each row by its
                 // eq_pairs values — works correctly for ANY join
                 // column (PK or secondary). No PK constraint.
-                Some(t) if t.count_cold_locators() > 0 => {
+                Some(t) if t.has_cold_rows_fast() => {
                     let (cold, map) = crate::constraints::iter_cold_rows_with_locator_map(
                         self.active_catalog(),
                         t,
@@ -1182,7 +1181,7 @@ impl Engine {
             // back stays correct after the force-eager-when-cold
             // guard was lifted in `build_join_peers`.
             if let Some(t) = self.active_catalog().get(tname)
-                && t.count_cold_locators() > 0
+                && t.has_cold_rows_fast()
             {
                 rows.extend(crate::constraints::iter_cold_rows_of_parent(
                     self.active_catalog(),

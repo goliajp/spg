@@ -553,6 +553,39 @@ fn baseline_mailrs_prod_not_exists_real_schema() {
     );
 }
 
+// Shape 7: GET-CONTACTS — mailrs `spg-7.35.0-perf-asks-2026-06-18.md`
+// Ask 1's "cleanest signal" 3.21× ratio (315 ms spg / 98 ms PG, no
+// cache effect on either side). The SQL is the exact source from
+// `crates/mailbox/src/pg/search_ops.rs:search_contacts`:
+//
+//   SELECT sender FROM messages m
+//   JOIN mailboxes mb ON m.mailbox_id = mb.id
+//   WHERE mb.user_address = $1 AND sender ILIKE $2 AND sender != ''
+//   GROUP BY sender
+//   ORDER BY MAX(internal_date) DESC LIMIT $3
+//
+// Bound params in the benchmark: $1 = 'u@x', $2 = '%%' (empty-query
+// default — ILIKE always true), $3 = 20. PG's measured plan on the
+// 24k-row catalog: Seq Scan 33ms → Hash Join 7ms → Sort 25ms →
+// GroupAggregate 4ms → top-N 0ms = 70ms.
+#[test]
+fn baseline_get_contacts() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT m.sender FROM messages m \
+         JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE mb.user_address = 'u@x' AND m.sender ILIKE '%%' AND m.sender != '' \
+         GROUP BY m.sender \
+         ORDER BY MAX(m.internal_date) DESC LIMIT 20",
+        10,
+        "get_contacts",
+        500.0,
+    );
+}
+
 // Shape 6: GET-CONVERSATIONS-IN(60) — the mailrs prod hot path 169ef66
 // fixed (snippet subquery JOIN, IN-list of 60 thread ids). Picks 60
 // stable thread ids from the seed deterministically.
