@@ -578,6 +578,62 @@ fn join_primary_with_cold_rows_uses_materialise_fallback() {
     assert_eq!(ids, expected);
 }
 
+/// v7.36 — ALTER COLUMN TYPE can't rewrite cold-tier segments
+/// in place; the storage layer would carry rows encoded against
+/// the old type while the schema declares the new type. PG /
+/// MariaDB never half-apply a schema change; we surface the
+/// architectural gap explicitly with a clear COMPACT-then-retry
+/// message instead of silently corrupting cold segments.
+#[test]
+fn alter_column_type_blocks_when_cold_rows_present() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, payload TEXT NOT NULL)")
+        .unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO t VALUES ({i}, '{i}')"))
+            .unwrap();
+    }
+    eng.freeze_oldest_to_cold("t", "t_pkey", 5).expect("freeze");
+    let err = eng
+        .execute("ALTER TABLE t ALTER COLUMN payload TYPE BIGINT USING CAST(payload AS BIGINT)")
+        .expect_err("ALTER on cold-bearing table must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cold-tier"),
+        "expected cold-tier error from ALTER, got: {msg}"
+    );
+}
+
+/// v7.36 — CREATE UNIQUE INDEX must detect duplicates that live
+/// in cold segments. Pre-7.36 the duplicate check walked
+/// `table.rows()` only, so a cold-tier duplicate slipped through
+/// and the new constraint was declared on top of stale invalid
+/// data — later INSERTs surfaced phantom violations.
+#[test]
+fn create_unique_index_catches_cold_tier_duplicate() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, email TEXT NOT NULL)")
+        .unwrap();
+    // Two rows with the same email — one ultimately cold, one hot.
+    eng.execute("INSERT INTO t VALUES (1, 'dup@x')").unwrap();
+    eng.execute("INSERT INTO t VALUES (2, 'unique-1@x')")
+        .unwrap();
+    eng.execute("INSERT INTO t VALUES (3, 'unique-2@x')")
+        .unwrap();
+    eng.execute("INSERT INTO t VALUES (4, 'dup@x')").unwrap();
+    eng.execute("INSERT INTO t VALUES (5, 'unique-3@x')")
+        .unwrap();
+    // Freeze id=1 (dup row) to cold.
+    eng.freeze_oldest_to_cold("t", "t_pkey", 1)
+        .expect("freeze dup");
+    // CREATE UNIQUE INDEX must catch the (cold dup, hot dup) collision.
+    let res = eng.execute("CREATE UNIQUE INDEX uq_email ON t (email)");
+    assert!(
+        res.is_err(),
+        "CREATE UNIQUE INDEX must detect cold-tier duplicate"
+    );
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();

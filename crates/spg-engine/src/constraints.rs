@@ -944,7 +944,7 @@ pub(crate) fn enforce_check_constraints(
 /// Same shape: PK-backed BTree iteration + `resolve_cold_locator`
 /// per cold locator, no dedup state because the PK uniqueness
 /// contract gives per-row uniqueness.
-fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::Table) -> Vec<Row> {
+pub(crate) fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::Table) -> Vec<Row> {
     let schema = parent.schema();
     let Some(pk_col_pos) = schema
         .uniqueness_constraints
