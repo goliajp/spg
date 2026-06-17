@@ -433,6 +433,50 @@ fn composite_fk_check_sees_cold_parent_rows() {
     assert!(res.is_err(), "missing parent reference must still error");
 }
 
+/// v7.36 — composite ON CONFLICT key existence check must see
+/// cold-tier rows. Pre-7.36 a `(a, b)` UNIQUE conflict whose
+/// existing row was cold went undetected, so ON CONFLICT DO
+/// NOTHING wrote a duplicate. Test seeds 10 rows under a composite
+/// UNIQUE, freezes the oldest 5, then INSERT … ON CONFLICT DO
+/// NOTHING against a cold-tier conflict key. The INSERT must be
+/// skipped (no duplicate row written).
+#[test]
+fn composite_on_conflict_key_check_sees_cold_rows() {
+    let mut eng = Engine::new();
+    eng.execute(
+        "CREATE TABLE t (\
+            id BIGINT NOT NULL PRIMARY KEY, \
+            tenant_id BIGINT NOT NULL, \
+            entity_id BIGINT NOT NULL, \
+            UNIQUE(tenant_id, entity_id))",
+    )
+    .unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO t VALUES ({i}, 1, {i})"))
+            .unwrap();
+    }
+    let report = eng.freeze_oldest_to_cold("t", "t_pkey", 5).expect("freeze");
+    assert_eq!(report.frozen_rows, 5);
+    let before_cnt = match eng.execute("SELECT COUNT(*) FROM t").unwrap() {
+        QueryResult::Rows { rows, .. } => rows[0].values[0].clone(),
+        _ => panic!("expected Rows"),
+    };
+    assert_eq!(before_cnt, Value::BigInt(10));
+    // Conflict against cold (tenant_id=1, entity_id=2) — must be
+    // detected, ON CONFLICT DO NOTHING short-circuits.
+    eng.execute("INSERT INTO t VALUES (100, 1, 2) ON CONFLICT (tenant_id, entity_id) DO NOTHING")
+        .expect("ON CONFLICT DO NOTHING must not error");
+    let after_cnt = match eng.execute("SELECT COUNT(*) FROM t").unwrap() {
+        QueryResult::Rows { rows, .. } => rows[0].values[0].clone(),
+        _ => panic!("expected Rows"),
+    };
+    assert_eq!(
+        after_cnt,
+        Value::BigInt(10),
+        "ON CONFLICT DO NOTHING must skip when conflict is cold"
+    );
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();
