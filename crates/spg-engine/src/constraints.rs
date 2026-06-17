@@ -978,6 +978,58 @@ pub(crate) fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::
 /// UPDATE / DELETE non-PK WHERE paths to promote / shadow each
 /// matching cold-tier row by its PK key (the only key
 /// `Catalog::promote_cold_row` and `shadow_cold_row` accept).
+/// v7.36 — companion to `iter_cold_rows_of_parent` that also
+/// builds a `(segment_id, page_offset) → cold_offset` map for the
+/// INL probe. Walking the PK BTree yields one cold row per
+/// uniquely-identified locator (the PK uniqueness contract gives
+/// per-row dedup), so the offset assigned during materialisation
+/// is the row's index in the returned Vec. The map is then used
+/// by `JoinSrc::Mixed::cold_locator_offset` to translate a Cold
+/// locator coming from ANY index on the same table — locators
+/// across indices share the same `(segment_id, page_offset)` for
+/// the same row.
+pub(crate) fn iter_cold_rows_with_locator_map(
+    catalog: &Catalog,
+    table: &spg_storage::Table,
+) -> (Vec<Row>, hashbrown::HashMap<i64, usize>) {
+    let schema = table.schema();
+    let Some(pk_col_pos) = schema
+        .uniqueness_constraints
+        .iter()
+        .find(|u| u.is_primary_key && u.columns.len() == 1)
+        .map(|u| u.columns[0])
+    else {
+        return (Vec::new(), hashbrown::HashMap::new());
+    };
+    let Some(idx) = table.indices().iter().find(|i| {
+        i.column_position == pk_col_pos && matches!(i.kind, spg_storage::IndexKind::BTree(_))
+    }) else {
+        return (Vec::new(), hashbrown::HashMap::new());
+    };
+    let table_name = schema.name.as_str();
+    let mut rows = Vec::new();
+    let mut map: hashbrown::HashMap<i64, usize> = hashbrown::HashMap::new();
+    for (key, locators) in idx.iter_asc() {
+        // Keyed by the integer PK value — the cold-tier architecture
+        // already requires an integer PK (`index_key_as_u64` is what
+        // `resolve_cold_locator` calls), so locators whose
+        // `IndexKey` isn't `Int` never resolve and are skipped.
+        let spg_storage::IndexKey::Int(pk_value) = key else {
+            continue;
+        };
+        for loc in locators {
+            if let spg_storage::RowLocator::Cold { segment_id, .. } = loc
+                && let Some(row) = catalog.resolve_cold_locator(table_name, *segment_id, key)
+            {
+                let offset = rows.len();
+                rows.push(row);
+                map.insert(*pk_value, offset);
+            }
+        }
+    }
+    (rows, map)
+}
+
 pub(crate) fn iter_cold_rows_with_pk_key(
     catalog: &Catalog,
     table: &spg_storage::Table,
