@@ -112,7 +112,14 @@ fn handle_pg_simple_query(
         wbuf.clear();
         return Ok(());
     };
-    let sql = sql_str.trim_end_matches(';').trim().to_string();
+    // v7.34.3 — keep the trimmed SQL as a &str slice into the
+    // incoming buffer. The previous `to_string()` paid a heap
+    // allocation on EVERY query just so the downstream `&sql`
+    // borrows would outlive the let. Downstream consumers
+    // (`parse_set/show/copy_intent`, `canned_response`,
+    // `execute_with_role`, `persist_wire_write`) all take `&str`,
+    // so the slice form is drop-in.
+    let sql: &str = sql_str.trim_end_matches(';').trim();
     // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
     // multi-frame protocol; intercept before the regular
     // execute path tries to parse them.
@@ -132,7 +139,7 @@ fn handle_pg_simple_query(
     //   2. All other SETs (search_path / client_encoding /
     //      timezone / …) stay intercepted to keep the
     //      engine RWLock contention low.
-    if let Some((name, value)) = parse_set_statement(&sql) {
+    if let Some((name, value)) = parse_set_statement(sql) {
         let name_lc = name.to_ascii_lowercase();
         settings.insert(name_lc.clone(), value.clone());
         // v7.17 Phase 2.4 — `application_name` is a
@@ -170,7 +177,7 @@ fn handle_pg_simple_query(
         // fall through to dispatch so the engine sees it.
     }
     // v4.19: SHOW name / SHOW ALL.
-    if let Some(name) = parse_show_statement(&sql) {
+    if let Some(name) = parse_show_statement(sql) {
         let resp = render_show(&name, settings);
         send_canned(wbuf, &resp)?;
         send_ready_for_query(wbuf, *tx_state)?;
@@ -178,7 +185,7 @@ fn handle_pg_simple_query(
         wbuf.clear();
         return Ok(());
     }
-    if let Some(copy) = parse_copy_intent(&sql) {
+    if let Some(copy) = parse_copy_intent(sql) {
         // COPY mode handles its own protocol roundtrips —
         // flush any pending output so the COPY handler
         // starts from a clean wire state.
@@ -202,7 +209,7 @@ fn handle_pg_simple_query(
     // psql sends startup probes like "SELECT version()" /
     // "SHOW search_path". Stub the common ones with sane
     // canned answers so the client doesn't error out.
-    if let Some(canned) = canned_response(&sql, state) {
+    if let Some(canned) = canned_response(sql, state) {
         send_canned(wbuf, &canned)?;
         send_ready_for_query(wbuf, *tx_state)?;
         stream.write_all(wbuf)?;
@@ -220,14 +227,14 @@ fn handle_pg_simple_query(
     // from the session `statement_timeout` GUC (default
     // `0` → `CancelToken::none()`, hot path unchanged).
     let cancel = statement_cancel(settings);
-    let result = execute_with_role(state, &sql, role, cancel);
+    let result = execute_with_role(state, sql, role, cancel);
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
     // v7.33 (A1) — persist the write (WAL/snapshot + audit)
     // before acking it; a durability failure surfaces as a
     // query error, never a false CommandComplete.
-    let result = match persist_wire_write(state, &sql, &result) {
+    let result = match persist_wire_write(state, sql, &result) {
         Ok(()) => result,
         Err(e) => Err(EngineError::Unsupported(format!(
             "durability append failed: {e}"
@@ -247,7 +254,7 @@ fn handle_pg_simple_query(
             send_command_complete(wbuf, &format!("SELECT {n}"))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
-            let tag = command_tag(&sql, affected);
+            let tag = command_tag(sql, affected);
             send_command_complete(wbuf, &tag)?;
             // Sync tx state from engine after writes.
             *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
@@ -759,57 +766,74 @@ fn command_tag(sql: &str, affected: usize) -> String {
 /// matches; anything stranger drops through to the engine, which
 /// will reject pg_catalog table names with a clear "not found"
 /// error.
+/// v7.34.3 (select_1 SPGS hot-path) — case-insensitive byte-level
+/// `starts_with`. Replaces the previous `sql.trim().to_ascii_lowercase()`
+/// allocations that each non-canned query paid through every
+/// `parse_set_statement` / `parse_show_statement` / `parse_copy_intent`
+/// / `canned_response` probe in `handle_pg_simple_query`. Four String
+/// allocations + four full-string lowercase walks per query cost ~5-10 µs
+/// before the simple-query dispatch ever reached the engine — the
+/// dominant contributor to the SPGS `SELECT 1` 113 µs vs PG18 44 µs gap.
+fn ci_starts_with(b: &[u8], prefix: &[u8]) -> bool {
+    b.len() >= prefix.len() && b[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+fn ci_eq(b: &[u8], target: &[u8]) -> bool {
+    b.eq_ignore_ascii_case(target)
+}
+
 fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse> {
-    let lower = sql.trim().to_ascii_lowercase();
-    if lower.starts_with("select version()") || lower == "select version()" {
+    let trimmed = sql.trim();
+    let b = trimmed.as_bytes();
+    if ci_starts_with(b, b"select version()") || ci_eq(b, b"select version()") {
         return Some(CannedResponse::single_text("version", "spg 4.6"));
     }
-    if lower.starts_with("show transaction_isolation")
-        || lower.starts_with("show transaction isolation level")
+    if ci_starts_with(b, b"show transaction_isolation")
+        || ci_starts_with(b, b"show transaction isolation level")
     {
         return Some(CannedResponse::single_text(
             "transaction_isolation",
             "read committed",
         ));
     }
-    if lower.starts_with("show search_path") || lower == "show search_path" {
+    if ci_starts_with(b, b"show search_path") || ci_eq(b, b"show search_path") {
         return Some(CannedResponse::single_text(
             "search_path",
             "\"$user\", public",
         ));
     }
-    if lower.starts_with("show standard_conforming_strings") {
+    if ci_starts_with(b, b"show standard_conforming_strings") {
         return Some(CannedResponse::single_text(
             "standard_conforming_strings",
             "on",
         ));
     }
-    if lower.starts_with("select current_database()") || lower == "select current_database()" {
+    if ci_starts_with(b, b"select current_database()") || ci_eq(b, b"select current_database()") {
         return Some(CannedResponse::single_text("current_database", "spg"));
     }
-    if lower.starts_with("select current_schema()")
-        || lower == "select current_schema()"
-        || lower == "select current_schema"
+    if ci_starts_with(b, b"select current_schema()")
+        || ci_eq(b, b"select current_schema()")
+        || ci_eq(b, b"select current_schema")
     {
         return Some(CannedResponse::single_text("current_schema", "public"));
     }
-    if lower == "select current_user" || lower == "select user" {
+    if ci_eq(b, b"select current_user") || ci_eq(b, b"select user") {
         return Some(CannedResponse::single_text("current_user", "admin"));
     }
     // ---- v4.15 pgbouncer compat: connection-reset statements ----
     // pgbouncer issues these between pooled client sessions to
     // wipe per-connection state. SPG doesn't have per-connection
     // settings worth wiping, so all are no-ops.
-    if lower.starts_with("discard all") {
+    if ci_starts_with(b, b"discard all") {
         return Some(CannedResponse::Tag("DISCARD ALL"));
     }
-    if lower.starts_with("discard temp")
-        || lower.starts_with("discard sequences")
-        || lower.starts_with("discard plans")
+    if ci_starts_with(b, b"discard temp")
+        || ci_starts_with(b, b"discard sequences")
+        || ci_starts_with(b, b"discard plans")
     {
         return Some(CannedResponse::Tag("DISCARD"));
     }
-    if lower == "reset all" || lower.starts_with("reset ") {
+    if ci_eq(b, b"reset all") || ci_starts_with(b, b"reset ") {
         return Some(CannedResponse::Tag("RESET"));
     }
     // v4.18: VACUUM / ANALYZE / CLUSTER / REINDEX — BI clients
@@ -817,16 +841,16 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     // changes. SPG has no vacuum or analyze concept (rows are
     // dense; no MVCC dead tuples; index stats aren't sampled),
     // so they're all no-ops.
-    if lower.starts_with("vacuum") {
+    if ci_starts_with(b, b"vacuum") {
         return Some(CannedResponse::Tag("VACUUM"));
     }
-    if lower.starts_with("analyze") {
+    if ci_starts_with(b, b"analyze") {
         return Some(CannedResponse::Tag("ANALYZE"));
     }
-    if lower.starts_with("cluster") {
+    if ci_starts_with(b, b"cluster") {
         return Some(CannedResponse::Tag("CLUSTER"));
     }
-    if lower.starts_with("reindex") {
+    if ci_starts_with(b, b"reindex") {
         return Some(CannedResponse::Tag("REINDEX"));
     }
     // BEGIN ISOLATION LEVEL READ COMMITTED / SERIALIZABLE etc. —
@@ -835,51 +859,89 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     // variants without disturbing the engine. Real BEGIN dispatch
     // happens through the normal engine path when it's a bare
     // BEGIN / START TRANSACTION (no isolation specifier).
-    if lower.starts_with("begin isolation level")
-        || lower.starts_with("begin transaction isolation level")
-        || lower.starts_with("start transaction isolation level")
-        || lower.starts_with("set transaction isolation level")
-        || lower.starts_with("set transaction read")
-        || lower.starts_with("set transaction snapshot")
+    if ci_starts_with(b, b"begin isolation level")
+        || ci_starts_with(b, b"begin transaction isolation level")
+        || ci_starts_with(b, b"start transaction isolation level")
+        || ci_starts_with(b, b"set transaction isolation level")
+        || ci_starts_with(b, b"set transaction read")
+        || ci_starts_with(b, b"set transaction snapshot")
     {
         // BEGIN-ish variants need to actually open a TX in the
         // engine. Fall through to the regular path by returning
         // None; the engine ignores trailing modifiers in BEGIN.
         // SET TRANSACTION is purely informational — no-op tag.
-        if lower.starts_with("set transaction") {
+        if ci_starts_with(b, b"set transaction") {
             return Some(CannedResponse::Tag("SET"));
         }
     }
     // ---- v4.6 pg_catalog subset ----
-    if mentions_pg_table(&lower, "pg_class") {
+    // BI clients (Metabase, DBeaver, …) issue pg_catalog probes only
+    // on schema scans, not on hot mailrs queries, so the O(b·n) CI
+    // substring search here is acceptable in exchange for skipping
+    // a per-query whole-SQL lowercase allocation.
+    if mentions_pg_table(b, b"pg_class") {
         return Some(pg_class_response(state));
     }
-    if mentions_pg_table(&lower, "pg_namespace") {
+    if mentions_pg_table(b, b"pg_namespace") {
         return Some(pg_namespace_response());
     }
-    if mentions_pg_table(&lower, "pg_database") {
+    if mentions_pg_table(b, b"pg_database") {
         return Some(pg_database_response());
     }
-    if mentions_pg_table(&lower, "pg_user") || mentions_pg_table(&lower, "pg_roles") {
+    if mentions_pg_table(b, b"pg_user") || mentions_pg_table(b, b"pg_roles") {
         return Some(pg_user_response(state));
     }
-    if mentions_pg_table(&lower, "pg_tables") {
+    if mentions_pg_table(b, b"pg_tables") {
         // The convenience view PG ships; columns: schemaname, tablename, tableowner.
         return Some(pg_tables_response(state));
     }
     None
 }
 
-/// True when `sql_lower` references the given pg_catalog table name,
+fn ci_contains(b: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if b.len() < needle.len() {
+        return false;
+    }
+    let n = needle.len();
+    for i in 0..=b.len() - n {
+        if b[i..i + n].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `sql_bytes` references the given pg_catalog table name,
 /// either bare (`pg_class`) or schema-qualified (`pg_catalog.pg_class`).
 /// Used to dispatch the canned synthesizer; intentionally permissive —
 /// any false-positive just gets a synthesized response with all rows,
 /// and the client filters client-side.
-fn mentions_pg_table(sql_lower: &str, table: &str) -> bool {
-    sql_lower.contains(&format!("from {table}"))
-        || sql_lower.contains(&format!("from pg_catalog.{table}"))
-        || sql_lower.contains(&format!("join {table}"))
-        || sql_lower.contains(&format!("join pg_catalog.{table}"))
+fn mentions_pg_table(sql_bytes: &[u8], table: &[u8]) -> bool {
+    let mut from_bare = Vec::with_capacity(5 + table.len());
+    from_bare.extend_from_slice(b"from ");
+    from_bare.extend_from_slice(table);
+    if ci_contains(sql_bytes, &from_bare) {
+        return true;
+    }
+    let mut from_qual = Vec::with_capacity(17 + table.len());
+    from_qual.extend_from_slice(b"from pg_catalog.");
+    from_qual.extend_from_slice(table);
+    if ci_contains(sql_bytes, &from_qual) {
+        return true;
+    }
+    let mut join_bare = Vec::with_capacity(5 + table.len());
+    join_bare.extend_from_slice(b"join ");
+    join_bare.extend_from_slice(table);
+    if ci_contains(sql_bytes, &join_bare) {
+        return true;
+    }
+    let mut join_qual = Vec::with_capacity(17 + table.len());
+    join_qual.extend_from_slice(b"join pg_catalog.");
+    join_qual.extend_from_slice(table);
+    ci_contains(sql_bytes, &join_qual)
 }
 
 enum CannedResponse {
@@ -1695,6 +1757,12 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
 /// or None if the SQL isn't a SET we handle.
 fn parse_set_statement(sql: &str) -> Option<(String, String)> {
     let trimmed = sql.trim();
+    // v7.34.3 — prefix-gate WITHOUT lowercasing the whole SQL. Most
+    // queries are not SET statements; bail on the cheap byte-CI check
+    // before paying a `to_ascii_lowercase()` String allocation.
+    if !ci_starts_with(trimmed.as_bytes(), b"set ") {
+        return None;
+    }
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("set ")?;
     // Strip optional SESSION / LOCAL.
@@ -1721,7 +1789,11 @@ fn parse_set_statement(sql: &str) -> Option<(String, String)> {
 /// Parse `SHOW name` / `SHOW ALL` / `SHOW SESSION AUTHORIZATION`.
 /// Returns the requested name, lowercased, or None.
 fn parse_show_statement(sql: &str) -> Option<String> {
-    let lower = sql.trim().to_ascii_lowercase();
+    let trimmed = sql.trim();
+    if !ci_starts_with(trimmed.as_bytes(), b"show ") {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("show ")?;
     let name = rest.split_ascii_whitespace().next()?.to_string();
     Some(name)
@@ -1920,6 +1992,9 @@ struct CopyOptions {
 /// error.
 fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
     let trimmed = sql.trim();
+    if !ci_starts_with(trimmed.as_bytes(), b"copy ") {
+        return None;
+    }
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("copy ")?;
     // Walk the prefix manually so we can skip an optional
