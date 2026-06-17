@@ -2877,18 +2877,62 @@ fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> st
     let mut body = Vec::with_capacity(2 + row.values.len() * 8);
     body.extend_from_slice(&n.to_be_bytes());
     for (i, v) in row.values.iter().enumerate() {
-        let text = value_to_pg_text(v, cols.get(i).map(|c| c.ty));
-        match text {
-            None => body.extend_from_slice(&(-1i32).to_be_bytes()), // NULL
-            Some(s) => {
-                let len = i32::try_from(s.len())
-                    .map_err(|_| std::io::Error::other("cell value too large"))?;
-                body.extend_from_slice(&len.to_be_bytes());
-                body.extend_from_slice(s.as_bytes());
-            }
-        }
+        encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty))?;
     }
     send_msg(stream, b'D', &body)
+}
+
+/// v7.34 (B5 ledger) — type-dispatched text-mode cell encoder for the
+/// hot projection types. The legacy `value_to_pg_text` always returns
+/// an owned `String` (per-cell `to_string()` + `s.clone()`), which on
+/// a 25 k-row × 5-column projection burns 125 k heap allocations + 125 k
+/// `Vec::extend_from_slice` copies. The fast paths below write straight
+/// into the DataRow body with no intermediate `String`:
+///   * BIGINT/INT/SMALLINT — std `Display` on a 24-byte stack buffer.
+///   * BOOL — fixed `t`/`f` byte slice.
+///   * TEXT/JSON — borrow the existing buffer (no clone).
+/// Less common types (Float / Numeric / Timestamp / Vector / Uuid /
+/// arrays / hstore / range) fall back to `value_to_pg_text`; they're
+/// rare on row-projection-heavy workloads.
+fn encode_pg_text_cell(out: &mut Vec<u8>, v: &Value, ty: Option<DataType>) -> std::io::Result<()> {
+    match v {
+        Value::Null => {
+            out.extend_from_slice(&(-1i32).to_be_bytes());
+            return Ok(());
+        }
+        Value::Bool(b) => return write_cell_bytes(out, if *b { b"t" } else { b"f" }),
+        Value::SmallInt(n) => return write_cell_int(out, i64::from(*n)),
+        Value::Int(n) => return write_cell_int(out, i64::from(*n)),
+        Value::BigInt(n) => return write_cell_int(out, *n),
+        Value::Text(s) | Value::Json(s) => return write_cell_bytes(out, s.as_bytes()),
+        _ => {}
+    }
+    match value_to_pg_text(v, ty) {
+        None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+        Some(s) => write_cell_bytes(out, s.as_bytes())?,
+    }
+    Ok(())
+}
+
+fn write_cell_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> std::io::Result<()> {
+    let len =
+        i32::try_from(bytes.len()).map_err(|_| std::io::Error::other("cell value too large"))?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_cell_int(out: &mut Vec<u8>, n: i64) -> std::io::Result<()> {
+    // i64::MIN is "-9223372036854775808" — 20 chars; 24-byte stack
+    // buffer leaves room without ever spilling.
+    let mut buf = [0u8; 24];
+    let written = {
+        let mut tail: &mut [u8] = &mut buf;
+        use std::io::Write as _;
+        write!(tail, "{n}")?;
+        24 - tail.len()
+    };
+    write_cell_bytes(out, &buf[..written])
 }
 
 // ---- Type mapping ----
