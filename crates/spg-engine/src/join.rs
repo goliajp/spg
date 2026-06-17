@@ -535,6 +535,45 @@ impl Engine {
                 // full WHERE to survivors.
                 let plain = j.table.unnest_expr.is_none() && j.table.as_of_segment.is_none();
                 if plain && let Some(t) = self.active_catalog().get(&j.table.name) {
+                    // v7.34 (B5 ledger) — cost guard for 169ef66's INL
+                    // pushdown: when the peer table is tiny AND a WHERE
+                    // conjunct pushes onto it, the v7.28 eager path
+                    // (scan + filter once, O(peer.rows + driver.rows))
+                    // always beats INL (one peer-index seek + filter per
+                    // driver row, O(driver.rows × log peer.rows + matched
+                    // pair filter)). 169ef66 fixed mailrs's
+                    // get_conversations IN(60) snippet subquery (peer
+                    // 6k email_analysis, driver 25k messages — INL wins
+                    // 13.7×), but regressed INBOX's outer mailboxes JOIN
+                    // (peer = 30, driver = 25k — eager wins ~+4ms p50).
+                    // SMALL_PEER_EAGER_ROWS at 256 keeps the IN(60) win
+                    // (6k > 256 stays INL) while clawing back the
+                    // small-peer case (30 ≤ 256 goes eager).
+                    const SMALL_PEER_EAGER_ROWS: usize = 256;
+                    let has_pushdown = !peer_preds[pidx].is_empty();
+                    let peer_total = t
+                        .rows()
+                        .len()
+                        .saturating_add(t.count_cold_locators() as usize);
+                    if has_pushdown && peer_total <= SMALL_PEER_EAGER_ROWS {
+                        let (mut rows, cols) =
+                            self.materialise_table_ref_filtered(&j.table, &peer_preds[pidx])?;
+                        if let Some(needed) = needed {
+                            Self::null_out_unreferenced(&mut rows, &cols, &a, needed);
+                        }
+                        budget.charge(approx_rows_bytes(&rows))?;
+                        joined.push(JoinedPeer {
+                            eager_rows: Some(rows),
+                            cols,
+                            alias: a,
+                            kind: j.kind,
+                            on: j.on.as_ref(),
+                            lateral: None,
+                            join_table: Some(j.table.name.clone()),
+                            where_preds: Vec::new(),
+                        });
+                        continue;
+                    }
                     joined.push(JoinedPeer {
                         eager_rows: None,
                         cols: t.schema().columns.clone(),
