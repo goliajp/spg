@@ -85,17 +85,29 @@ impl Engine {
             // computation that follows.
             let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
             let mut owned: Vec<Row> = Vec::new();
-            for (i, row) in table.rows().iter().enumerate() {
+            let mut emit = |row: &Row, i: usize| -> Result<(), EngineError> {
                 if i.is_multiple_of(256) {
                     cancel.check()?;
                 }
                 if let Some(w) = &stmt.where_ {
                     let cond = eval::eval_expr(w, row, &ctx)?;
                     if !matches!(cond, Value::Bool(true)) {
-                        continue;
+                        return Ok(());
                     }
                 }
                 owned.push(row.clone());
+                Ok(())
+            };
+            for (i, row) in table.rows().iter().enumerate() {
+                emit(row, i)?;
+            }
+            // v7.36 (cold-tier coverage) — window single-table path
+            // mirrors `run_single_table_scan`: hot iter then cold iter,
+            // both routed through the same `emit` so WHERE / clone /
+            // cancel-poll semantics stay byte-identical.
+            let hot_len = table.row_count();
+            for (offset, row) in self.iter_cold_rows_of_table(table).iter().enumerate() {
+                emit(row, hot_len + offset)?;
             }
             filtered = owned;
         } else {
@@ -1716,9 +1728,36 @@ impl Engine {
                 }
                 filtered.push(row);
             }
+        }
+        // v7.36 (cold-tier coverage) — single-table aggregate's
+        // non-indexed full scan was hot-only and silently lost cold
+        // rows on COUNT/SUM/etc. Materialise cold rows once into
+        // `cold_rows_storage` (Vec<Row>) so the `filtered: Vec<&Row>`
+        // shape stays unchanged; the cold rows live until the end of
+        // the aggregate run.
+        let cold_rows_storage = if indexed_rows.is_none() {
+            self.iter_cold_rows_of_table(table)
         } else {
+            Vec::new()
+        };
+        if indexed_rows.is_none() {
             for i in 0..table.row_count() {
                 let row = &table.rows()[i];
+                if let Some(where_expr) = &stmt.where_ {
+                    let cond = self.eval_expr_with_correlated(
+                        where_expr,
+                        row,
+                        &ctx,
+                        cancel,
+                        Some(&mut memo),
+                    )?;
+                    if !matches!(cond, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                filtered.push(row);
+            }
+            for row in &cold_rows_storage {
                 if let Some(where_expr) = &stmt.where_ {
                     let cond = self.eval_expr_with_correlated(
                         where_expr,
