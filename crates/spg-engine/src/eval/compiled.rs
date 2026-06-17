@@ -60,6 +60,26 @@ pub(crate) enum Step {
         negated: bool,
         case_insensitive: bool,
     },
+    /// v7.36 (perf — mailrs Ask 1) — pure scalar function call
+    /// (LENGTH, COALESCE, UPPER, etc.) on already-pushed args.
+    /// Pops `n_args` values, calls `apply_function(name, args, ctx)`,
+    /// pushes the result. Replaces the Subtree fallback for the
+    /// "function over bound columns" shape that aggregate arg paths
+    /// like `SUM(LENGTH(text_body))` and `MAX(COALESCE(col, ''))`
+    /// otherwise force the row-materialise eval path. Only the
+    /// `fully_compilable` whitelist (PURE scalars — no NOW / RANDOM
+    /// / sequence accessors) is emitted; everything else stays on
+    /// `Step::Subtree`.
+    Function {
+        name: alloc::string::String,
+        n_args: usize,
+    },
+    /// v7.36 — `CAST(<expr> AS <ty>)` over an already-pushed value.
+    /// Pure / context-free conversion goes through the same
+    /// `cast_value` dispatcher the interpreter uses.
+    Cast {
+        target: spg_sql::ast::CastTarget,
+    },
     /// Fallback: interpret this subtree with eval_expr.
     Subtree(Expr),
 }
@@ -192,6 +212,25 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             }
             _ => steps.push(Step::Subtree(e.clone())),
         },
+        // v7.36 — PURE scalar function call: emit args then a
+        // single Function step that pops them. `fully_compilable`
+        // gates the whitelist + recurses into args, so this branch
+        // only fires when the entire subtree is compilable.
+        Expr::FunctionCall { name, args } if is_pure_scalar_function(name) => {
+            for a in args {
+                compile_into(a, ctx, steps);
+            }
+            steps.push(Step::Function {
+                name: name.clone(),
+                n_args: args.len(),
+            });
+        }
+        Expr::Cast { expr, target } => {
+            compile_into(expr, ctx, steps);
+            steps.push(Step::Cast {
+                target: target.clone(),
+            });
+        }
         other => steps.push(Step::Subtree(other.clone())),
     }
 }
@@ -226,8 +265,86 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         Expr::Like { expr, pattern, .. } => {
             fully_compilable(expr) && literal_text_pattern(pattern).is_some()
         }
+        // v7.36 (perf — mailrs Ask 1) — PURE scalar functions over
+        // compilable args go to `Step::Function`. The whitelist
+        // covers the high-traffic / non-volatile cases; anything
+        // outside (NOW, RANDOM, sequence accessors, EXTRACT-with-
+        // context-dependent fields, etc.) stays on Subtree where
+        // the interpreter has the full ctx.
+        Expr::FunctionCall { name, args } => {
+            is_pure_scalar_function(name) && args.iter().all(fully_compilable)
+        }
+        // v7.36 — CAST over a compilable expression. `cast_value`
+        // is pure / context-free for the scalar targets we care
+        // about (text, ints, floats, bool, dates).
+        Expr::Cast { expr, .. } => fully_compilable(expr),
         _ => false,
     }
+}
+
+/// v7.36 — PURE scalar function whitelist for `Step::Function`.
+/// "Pure" means: deterministic, context-independent, no side
+/// effects. Aggregate names (sum / count / max / …) are filtered
+/// upstream by the caller — they never reach the compiler. NOW /
+/// RANDOM / sequence accessors are excluded because they need the
+/// `EvalContext`'s clock / sequence resolver and aren't
+/// deterministic. EXTRACT is excluded because the field kind is
+/// parsed off the Expr tree, not an arg.
+fn is_pure_scalar_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        // string length + slicing
+        "length"
+            | "char_length"
+            | "character_length"
+            | "octet_length"
+            | "upper"
+            | "lower"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "btrim"
+            | "left"
+            | "right"
+            | "substring"
+            | "substr"
+            | "replace"
+            | "position"
+            | "strpos"
+            | "concat"
+            | "concat_ws"
+            | "reverse"
+            | "repeat"
+            | "lpad"
+            | "rpad"
+            | "split_part"
+            // null/conditional
+            | "coalesce"
+            | "nullif"
+            | "greatest"
+            | "least"
+            | "ifnull"
+            | "isnull"
+            | "nvl"
+            // numeric
+            | "abs"
+            | "ceil"
+            | "ceiling"
+            | "floor"
+            | "round"
+            | "trunc"
+            | "sqrt"
+            | "power"
+            | "pow"
+            | "mod"
+            | "sign"
+            | "log"
+            | "log10"
+            | "exp"
+            | "ln"
+            // boolean / cast helpers
+            | "cast"
+    )
 }
 
 pub(crate) fn compile_expr(e: &Expr, ctx: &EvalContext<'_>) -> CompiledExpr {
@@ -360,6 +477,20 @@ pub(crate) fn eval_compiled_ref(
                         });
                     }
                 }
+            }
+            Step::Function { name, n_args } => {
+                let start = stack.len().saturating_sub(*n_args);
+                // `apply_function` borrows the trailing `n_args`
+                // values off the stack; we then truncate + push the
+                // result. Zero allocations beyond what the function
+                // itself does.
+                let result = super::functions::apply_function(name, &stack[start..], ctx)?;
+                stack.truncate(start);
+                stack.push(result);
+            }
+            Step::Cast { target } => {
+                let v = stack.pop().unwrap_or(Value::Null);
+                stack.push(super::cast::cast_value(v, target.clone())?);
             }
             Step::Subtree(e) => stack.push(eval_expr(e, &row.as_row(), ctx)?),
         }
