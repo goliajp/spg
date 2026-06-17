@@ -173,6 +173,17 @@ impl<K: Ord, V> PersistentBTreeMap<K, V> {
         stack.push((&self.root, 0));
         Iter { stack }
     }
+
+    /// v7.34.4 — descending-order iterator. Mirrors `iter()` but the
+    /// per-node walk visits child-then-entry pairs right-to-left.
+    /// Used by the ORDER BY `<indexed col>` DESC + LIMIT N executor
+    /// path to walk only the first N matches off the rightmost leaf
+    /// instead of materialising every row + partial-sorting.
+    pub fn iter_rev(&self) -> IterRev<'_, K, V> {
+        let mut stack: Vec<(&Arc<BNode<K, V>>, usize)> = Vec::with_capacity(8);
+        stack.push((&self.root, 1));
+        IterRev { stack }
+    }
 }
 
 impl<K: Ord + Clone, V: Clone> PersistentBTreeMap<K, V> {
@@ -456,6 +467,62 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     }
 }
 
+/// v7.34.4 — descending-order `(K, V)` iterator. Mirrors `Iter` but each
+/// node's child-then-entry walk runs right-to-left so the first yielded
+/// pair is the maximum key in the map. Used by the ORDER BY `<indexed
+/// col>` DESC + LIMIT N executor path to walk only the first N matches
+/// off the rightmost leaf instead of materialising every row + partial-
+/// sorting; the existing forward `Iter` stays untouched so unrelated
+/// callers (catalog deserialisation, PartialEq) are unaffected.
+#[derive(Debug)]
+pub struct IterRev<'a, K, V> {
+    // (node, next_pos) where next_pos counts the remaining reverse
+    // step within the node, starting at 1. A pos > step_count means
+    // the node is exhausted (pop). For a Leaf with E entries the
+    // step count is E (emit entries right-to-left). For an Internal
+    // node with E entries / E+1 children the step count is 2E+1: odd
+    // positions descend into a child, even positions emit an entry,
+    // both walking right-to-left.
+    stack: Vec<(&'a Arc<BNode<K, V>>, usize)>,
+}
+
+impl<'a, K, V> Iterator for IterRev<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    fn next(&mut self) -> Option<(&'a K, &'a V)> {
+        loop {
+            let (node, pos) = *self.stack.last()?;
+            match &**node {
+                BNode::Leaf { entries } => {
+                    if pos <= entries.len() {
+                        let i = entries.len() - pos;
+                        self.stack.last_mut().unwrap().1 = pos + 1;
+                        let (k, v) = &entries[i];
+                        return Some((k, v));
+                    }
+                    self.stack.pop();
+                }
+                BNode::Internal { entries, children } => {
+                    let n_steps = 2 * entries.len() + 1;
+                    if pos <= n_steps {
+                        self.stack.last_mut().unwrap().1 = pos + 1;
+                        if pos % 2 == 1 {
+                            // Odd: descend into `children[E - (pos-1)/2]`.
+                            let child_idx = entries.len() - (pos - 1) / 2;
+                            self.stack.push((&children[child_idx], 1));
+                            continue;
+                        }
+                        // Even: emit `entries[E - pos/2]`.
+                        let entry_idx = entries.len() - pos / 2;
+                        let (k, v) = &entries[entry_idx];
+                        return Some((k, v));
+                    }
+                    self.stack.pop();
+                }
+            }
+        }
+    }
+}
+
 impl<'a, K: Ord, V> IntoIterator for &'a PersistentBTreeMap<K, V> {
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, K, V>;
@@ -479,6 +546,7 @@ impl<'a, K: Ord, V> IntoIterator for &'a PersistentBTreeMap<K, V> {
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
+    use alloc::vec;
 
     #[test]
     fn empty_map_is_empty() {
@@ -573,6 +641,46 @@ mod tests {
         let collected: Vec<i64> = pb.iter().map(|(k, _)| *k).collect();
         let expected: Vec<i64> = (0..500).collect();
         assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_rev_yields_descending() {
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for &k in &[7_i64, 3, 11, 1, 9, 5, 14, 2, 8, 12, 4, 6, 10, 13] {
+            pb = pb.insert(k, k * 2).0;
+        }
+        let collected: Vec<(i64, i64)> = pb.iter_rev().map(|(k, v)| (*k, *v)).collect();
+        let expected: Vec<(i64, i64)> = (1..=14).rev().map(|k| (k, k * 2)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_rev_handles_taller_tree() {
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..500_i64 {
+            pb = pb.insert(i, i).0;
+        }
+        let collected: Vec<i64> = pb.iter_rev().map(|(k, _)| *k).collect();
+        let expected: Vec<i64> = (0..500).rev().collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_rev_empty_map_returns_nothing() {
+        let pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        assert_eq!(pb.iter_rev().count(), 0);
+    }
+
+    #[test]
+    fn iter_rev_lazy_stops_at_take() {
+        // Critical for the ORDER BY DESC + LIMIT N executor path: only
+        // the first N entries are touched, not the full N-entry walk.
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..10000_i64 {
+            pb = pb.insert(i, i).0;
+        }
+        let top5: Vec<i64> = pb.iter_rev().take(5).map(|(k, _)| *k).collect();
+        assert_eq!(top5, vec![9999, 9998, 9997, 9996, 9995]);
     }
 
     /// SplitMix-style PRNG so the fuzz oracle is reproducible.

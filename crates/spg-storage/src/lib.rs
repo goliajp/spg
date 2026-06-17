@@ -1400,6 +1400,44 @@ impl Index {
         }
     }
 
+    /// v7.34.4 — descending-order iterator over `(IndexKey, locators)`
+    /// pairs for a BTree index, with O(log N) descent to the rightmost
+    /// leaf and lazy emission thereafter. Returns an empty iterator
+    /// for non-BTree index kinds — callers handle both uniformly.
+    /// Used by the ORDER BY `<indexed col>` DESC + LIMIT N executor
+    /// path: walking only the first N matches off the rightmost leaf
+    /// avoids the per-row materialisation + partial-sort cost on
+    /// large tables (mailrs `content_worker` at 250 k rows).
+    pub fn iter_desc(
+        &self,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (&IndexKey, &alloc::vec::Vec<RowLocator>)> + '_>
+    {
+        match &self.kind {
+            IndexKind::BTree(m) => alloc::boxed::Box::new(m.iter_rev()),
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => alloc::boxed::Box::new(core::iter::empty()),
+        }
+    }
+
+    /// v7.34.4 — ascending-order iterator over `(IndexKey, locators)`
+    /// pairs. Mirror of `iter_desc` for ORDER BY ... ASC + LIMIT N.
+    pub fn iter_asc(
+        &self,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (&IndexKey, &alloc::vec::Vec<RowLocator>)> + '_>
+    {
+        match &self.kind {
+            IndexKind::BTree(m) => alloc::boxed::Box::new(m.iter()),
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_) => alloc::boxed::Box::new(core::iter::empty()),
+        }
+    }
+
     /// Look up the locators stored under `key` (B-tree only). Returns
     /// an empty slice when the key is absent or the index isn't a
     /// BTree — callers can treat both cases uniformly.
