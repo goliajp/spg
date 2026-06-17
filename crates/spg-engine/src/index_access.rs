@@ -128,12 +128,13 @@ const NSW_OVER_FETCH_FLOOR: usize = 32;
 ///   * Cold-tier locators short-circuit to `None` so the walker
 ///     never crosses a tier boundary mid-scan; the legacy path
 ///     handles cold rows.
-pub(crate) fn try_pk_walk_top_n(
+pub(crate) fn try_pk_walk_top_n<'a>(
     stmt: &SelectStatement,
-    table: &Table,
+    catalog: &'a spg_storage::Catalog,
+    table: &'a Table,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
-) -> Option<Vec<usize>> {
+) -> Option<Vec<Cow<'a, Row>>> {
     if stmt.distinct || stmt.limit_with_ties {
         return None;
     }
@@ -178,7 +179,8 @@ pub(crate) fn try_pk_walk_top_n(
     }
     let where_expr = stmt.where_.as_ref();
     let ctx = EvalContext::new(schema_cols, Some(table_alias));
-    let mut kept: Vec<usize> = Vec::with_capacity(want);
+    let table_name = table.schema().name.as_str();
+    let mut kept: Vec<Cow<'a, Row>> = Vec::with_capacity(want);
     // The walker yields `(IndexKey, &Vec<RowLocator>)` ordered by key
     // in the requested direction; per-key locator order within the
     // map preserves insertion order, which matches the legacy stable-
@@ -189,30 +191,36 @@ pub(crate) fn try_pk_walk_top_n(
         } else {
             Box::new(index.iter_asc())
         };
-    for (_key, locators) in walker {
+    for (key, locators) in walker {
         for loc in locators {
-            match *loc {
-                spg_storage::RowLocator::Hot(row_idx) => {
-                    let Some(row) = table.rows().get(row_idx) else {
-                        continue;
-                    };
-                    if let Some(w) = where_expr {
-                        let cond = eval::eval_expr(w, row, &ctx).ok()?;
-                        if !matches!(cond, Value::Bool(true)) {
-                            continue;
-                        }
-                    }
-                    kept.push(row_idx);
-                    if kept.len() >= want {
-                        return Some(kept);
+            // v7.34.7 (mailrs prod #6 follow-up) — single-table walker
+            // gains the same hot/cold dispatch the JOIN walker got in
+            // 7.34.6. `mailrs_prod_plain_limit` (`SELECT ... FROM
+            // messages WHERE ... ORDER BY id DESC LIMIT N`) was the
+            // remaining shape that bailed on the first cold locator
+            // and fell back to the legacy materialise + partial-sort
+            // path on the 803 MB prod catalog.
+            let row_cow: Cow<'a, Row> = match *loc {
+                spg_storage::RowLocator::Hot(row_idx) => match table.rows().get(row_idx) {
+                    Some(r) => Cow::Borrowed(r),
+                    None => continue,
+                },
+                spg_storage::RowLocator::Cold { segment_id, .. } => {
+                    match catalog.resolve_cold_locator(table_name, segment_id, key) {
+                        Some(r) => Cow::Owned(r),
+                        None => continue,
                     }
                 }
-                spg_storage::RowLocator::Cold { .. } => {
-                    // Cold-tier indices need a full segment fetch
-                    // path that this walker doesn't drive; bail out
-                    // and let the legacy scan handle the table.
-                    return None;
+            };
+            if let Some(w) = where_expr {
+                let cond = eval::eval_expr(w, row_cow.as_ref(), &ctx).ok()?;
+                if !matches!(cond, Value::Bool(true)) {
+                    continue;
                 }
+            }
+            kept.push(row_cow);
+            if kept.len() >= want {
+                return Some(kept);
             }
         }
     }
@@ -234,16 +242,15 @@ pub(crate) fn literal_to_vector(e: &Expr) -> Option<Vec<f32>> {
 /// equivalent block in `exec_bare_select`.
 pub(crate) fn materialise_in_order(
     stmt: &SelectStatement,
-    table: &Table,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
-    ordered_rows: &[usize],
+    ordered_rows: &[Cow<'_, Row>],
 ) -> Result<QueryResult, EngineError> {
     let ctx = EvalContext::new(schema_cols, Some(table_alias));
     let projection = build_projection(&stmt.items, schema_cols, table_alias)?;
     let mut output_rows: Vec<Row> = Vec::with_capacity(ordered_rows.len());
-    for &i in ordered_rows {
-        let row = &table.rows()[i];
+    for row_cow in ordered_rows {
+        let row = row_cow.as_ref();
         let mut values = Vec::with_capacity(projection.len());
         for p in &projection {
             values.push(eval::eval_expr(&p.expr, row, &ctx)?);

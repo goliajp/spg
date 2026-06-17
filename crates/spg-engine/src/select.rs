@@ -1591,7 +1591,15 @@ impl Engine {
         // walk returns rows already in ascending-distance order, so
         // ORDER BY / LIMIT are honoured implicitly.
         if let Some(nsw_rows) = try_nsw_knn(stmt, table, schema_cols, alias) {
-            return materialise_in_order(stmt, table, schema_cols, alias, &nsw_rows);
+            // NSW kNN dispatches against the hot-tier vector index only
+            // (vector cells aren't promoted to cold segments), so wrap
+            // the returned row indices as `Cow::Borrowed` for the
+            // unified `materialise_in_order` shape.
+            let ordered: Vec<Cow<'_, Row>> = nsw_rows
+                .into_iter()
+                .filter_map(|i| table.rows().get(i).map(Cow::Borrowed))
+                .collect();
+            return materialise_in_order(stmt, schema_cols, alias, &ordered);
         }
 
         // v7.34.5 — ORDER BY <indexed col> [DESC|ASC] LIMIT N drives
@@ -1602,8 +1610,10 @@ impl Engine {
         // row + partial-sort tail entirely. Walker output is already
         // in ORDER BY order so `materialise_in_order` (no extra sort)
         // is the natural sink.
-        if let Some(walked) = try_pk_walk_top_n(stmt, table, schema_cols, alias) {
-            return materialise_in_order(stmt, table, schema_cols, alias, &walked);
+        if let Some(walked) =
+            try_pk_walk_top_n(stmt, self.active_catalog(), table, schema_cols, alias)
+        {
+            return materialise_in_order(stmt, schema_cols, alias, &walked);
         }
 
         // Index seek: if WHERE is `col = literal` (or commuted) and the

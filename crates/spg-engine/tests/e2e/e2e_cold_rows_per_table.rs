@@ -203,6 +203,61 @@ fn join_walker_spans_hot_cold_tier_on_order_by_limit() {
     );
 }
 
+/// v7.34.7 (mailrs prod #6 follow-up) — single-table walker's
+/// hot/cold dispatch (the JOIN walker's counterpart from
+/// `join_walker_spans_hot_cold_tier_on_order_by_limit`). The
+/// `try_pk_walk_top_n` path drives `SELECT … FROM t WHERE …
+/// ORDER BY <indexed col> LIMIT N` shapes — `mailrs_prod_plain_limit`
+/// being the load-bearing prod example. Pre-7.34.7 bailed on the
+/// first cold-tier RowLocator (`Vec<usize>` return ties it to hot
+/// row indices); 7.34.7 returns `Vec<Cow<Row>>` and resolves cold
+/// locators through `Catalog::resolve_cold_locator` inline.
+#[test]
+fn single_table_walker_spans_hot_cold_tier_on_order_by_limit() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, payload TEXT NOT NULL)")
+        .unwrap();
+    for i in 1..=100 {
+        eng.execute(&format!("INSERT INTO t VALUES ({i}, 'row-{i}')"))
+            .unwrap();
+    }
+    // Freeze the oldest 50 to cold; the newest 50 stay hot.
+    let report = eng
+        .freeze_oldest_to_cold("t", "t_pkey", 50)
+        .expect("freeze cold");
+    assert_eq!(report.frozen_rows, 50);
+    // ASC LIMIT 10 must walk cold locators inline and return rows 1..=10.
+    let asc = rows_of(
+        eng.execute("SELECT id FROM t WHERE id > 0 ORDER BY id ASC LIMIT 10")
+            .unwrap(),
+    );
+    let ids_asc: Vec<i64> = asc
+        .iter()
+        .map(|r| match r[0] {
+            Value::BigInt(n) => n,
+            _ => panic!("expected BigInt id"),
+        })
+        .collect();
+    assert_eq!(
+        ids_asc,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "single-table ASC walker must traverse cold-tier rows"
+    );
+    // DESC LIMIT 10 stays in the hot tier (newest 50 are hot).
+    let desc = rows_of(
+        eng.execute("SELECT id FROM t WHERE id > 0 ORDER BY id DESC LIMIT 10")
+            .unwrap(),
+    );
+    let ids_desc: Vec<i64> = desc
+        .iter()
+        .map(|r| match r[0] {
+            Value::BigInt(n) => n,
+            _ => panic!("expected BigInt id"),
+        })
+        .collect();
+    assert_eq!(ids_desc, vec![100, 99, 98, 97, 96, 95, 94, 93, 92, 91]);
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();
