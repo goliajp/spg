@@ -129,3 +129,39 @@ fn join_limit_on_25k_rows_stays_under_budget() {
         "JOIN … LIMIT 5 took {elapsed:?} on the 25k dataset (budget 1 s)"
     );
 }
+
+/// v7.34 (SPGS/SPGE perf bar) — SPGE-side PROJ p50 probe. Mirrors the
+/// SPGS-side `scripts/wire-latency-probe.sh` PROJ shape (25 k-row
+/// non-aggregate JOIN projection, 5 cells per row) but runs straight
+/// through `Engine::execute` so the eprintln below carries the wire-
+/// free baseline. Pair this with the wire-probe SPGS number to decide
+/// whether (SPGS - SPGE) gap is wire-side encode/framing or whether
+/// SPGE itself is already on the same plateau — the latter would mean
+/// "SPGE > PG18" is just TCP arbitrage, not real internal speed.
+#[test]
+fn proj_query_on_25k_rows_embed_p50() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed(&mut db);
+    const PROJ: &str = "SELECT m.id, m.subject, m.sender, m.internal_date, mb.user_address \
+        FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+        WHERE mb.user_address = 'u@x'";
+    db.execute(PROJ).unwrap();
+    let mut samples = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let t = Instant::now();
+        let r = db.execute(PROJ).unwrap();
+        let elapsed = t.elapsed();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 25_000),
+            other => panic!("{other:?}"),
+        }
+        samples.push(elapsed.as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = samples[samples.len() / 2];
+    let min = samples[0];
+    let max = *samples.last().unwrap();
+    eprintln!("proj_25k SPGE: p50={p50:.1}ms min={min:.1}ms max={max:.1}ms (n=10)");
+    assert!(p50 < 1000.0, "PROJ SPGE p50={p50}ms (budget 1 s)");
+}
