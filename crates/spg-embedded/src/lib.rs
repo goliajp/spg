@@ -1116,6 +1116,18 @@ fn scan_cold_segments_dir(
     engine: &mut Engine,
     cold_segment_paths: &mut BTreeMap<u32, PathBuf>,
 ) {
+    // v7.34.1 (mailrs prod report bug A): single-file catalogs (e.g.
+    // `/data/spg/mailrs.spg` is a regular file, not the `<db>/<db>.spg`
+    // layout this scan assumes) make the computed `<db>.spg/segments`
+    // path traverse a file inode, which surfaces as ENOTDIR (`Not a
+    // directory`, errno 20). Treat any non-directory state — absent,
+    // file-in-the-way, stat-blocked — as "no segments to scan" and
+    // silently return. The eprintln below only fires for the genuine
+    // mid-walk read errors (permission flip, IO failure) that operators
+    // need to see.
+    if !segments_dir.is_dir() {
+        return;
+    }
     let read_dir = match std::fs::read_dir(segments_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
