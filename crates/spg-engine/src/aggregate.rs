@@ -352,6 +352,47 @@ struct Projection {
     order_rewritten: Vec<Expr>,
 }
 
+/// v7.35.0 — detect the `SELECT COUNT(*) FROM … [WHERE …]` shape
+/// (single item, no GROUP BY / HAVING / ORDER BY / DISTINCT /
+/// LIMIT WITH TIES / FILTER / window). For this shape the answer
+/// is exactly `rows.len()` as `BigInt`, no group state needed.
+/// Returns `None` for any deviation so the caller's full pipeline
+/// runs verbatim.
+fn try_pure_count_star_short_circuit(
+    stmt: &SelectStatement,
+    rows: &[RowRef<'_>],
+) -> Option<AggResult> {
+    if stmt.distinct
+        || stmt.limit_with_ties
+        || stmt.group_by.is_some()
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+    {
+        return None;
+    }
+    if stmt.items.len() != 1 {
+        return None;
+    }
+    let SelectItem::Expr { expr, alias } = &stmt.items[0] else {
+        return None;
+    };
+    let Expr::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
+        return None;
+    }
+    let col_name = alias.clone().unwrap_or_else(|| "count".to_string());
+    let count = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    Some(AggResult {
+        columns: alloc::vec![ColumnSchema::new(col_name, DataType::BigInt, false)],
+        rows: alloc::vec![Row::new(alloc::vec![Value::BigInt(count)])],
+        deferred: Vec::new(),
+        synth_rows: Vec::new(),
+        synth_schema: Vec::new(),
+    })
+}
+
 pub(crate) fn run(
     stmt: &SelectStatement,
     rows: &[RowRef<'_>],
@@ -359,6 +400,20 @@ pub(crate) fn run(
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
 ) -> Result<AggResult, EvalError> {
+    // v7.35.0 — pure `SELECT COUNT(*) FROM … WHERE …` short-circuit.
+    // The caller already filtered rows by WHERE (we run on the
+    // post-WHERE survivor set), so for the canonical pure-COUNT(*)
+    // shape (no GROUP BY / HAVING / ORDER BY / DISTINCT / FILTER /
+    // window) the answer is simply `rows.len()`. The four-stage
+    // aggregate pipeline below (accumulate_groups → build_synth_schema
+    // → finalize_synth_rows → project_groups) collapses to a single
+    // BigInt cell when there's a single group, but each stage still
+    // pays its own allocation tax — group state map, synth schema
+    // vec, finalize loop. `exists_in_60` (mailrs prod #4 baseline)
+    // is exactly this shape on a 25 k-row JOIN.
+    if let Some(short) = try_pure_count_star_short_circuit(stmt, rows) {
+        return Ok(short);
+    }
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
 
     // Collect aggregate sub-expressions across items + order_by.
