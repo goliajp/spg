@@ -928,6 +928,41 @@ pub(crate) fn enforce_check_constraints(
     Ok(())
 }
 
+/// v7.36 — enumerate cold-tier rows of `parent` for FK / UNIQUE
+/// validation paths that can't reach `Engine::iter_cold_rows_of_table`
+/// (free-function callers with a `&Catalog` instead of `&Engine`).
+/// Same shape: PK-backed BTree iteration + `resolve_cold_locator`
+/// per cold locator, no dedup state because the PK uniqueness
+/// contract gives per-row uniqueness.
+fn iter_cold_rows_of_parent(catalog: &Catalog, parent: &spg_storage::Table) -> Vec<Row> {
+    let schema = parent.schema();
+    let Some(pk_col_pos) = schema
+        .uniqueness_constraints
+        .iter()
+        .find(|u| u.is_primary_key && u.columns.len() == 1)
+        .map(|u| u.columns[0])
+    else {
+        return Vec::new();
+    };
+    let Some(idx) = parent.indices().iter().find(|i| {
+        i.column_position == pk_col_pos && matches!(i.kind, spg_storage::IndexKind::BTree(_))
+    }) else {
+        return Vec::new();
+    };
+    let table_name = schema.name.as_str();
+    let mut out = Vec::new();
+    for (key, locators) in idx.iter_asc() {
+        for loc in locators {
+            if let spg_storage::RowLocator::Cold { segment_id, .. } = loc
+                && let Some(row) = catalog.resolve_cold_locator(table_name, *segment_id, key)
+            {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn enforce_fk_inserts(
     catalog: &Catalog,
     child_table: &str,
@@ -950,6 +985,19 @@ pub(crate) fn enforce_fk_inserts(
                     name: fk.parent_table.clone(),
                 })
             })?
+        };
+        // v7.36 (cold-tier coverage) — composite FK check walks
+        // `parent.rows().iter()` looking for a tuple match. That
+        // skipped cold-tier parent rows, so a child INSERT whose
+        // matching parent had been frozen to cold raised
+        // `FOREIGN KEY violation: no parent row` falsely. Materialise
+        // the cold parent rows ONCE per FK (the composite path only
+        // — single-column FKs already ride `idx.lookup_eq` which
+        // surfaces both tiers).
+        let cold_parent_rows: alloc::vec::Vec<Row> = if fk.local_columns.len() == 1 {
+            Vec::new()
+        } else {
+            iter_cold_rows_of_parent(catalog, parent)
         };
         for (batch_idx, row_values) in rows.iter().enumerate() {
             // Single-column FK fast path: try the parent's BTree
@@ -1004,12 +1052,14 @@ pub(crate) fn enforce_fk_inserts(
                     continue;
                 }
                 let local: Vec<&Value> = fk.local_columns.iter().map(|&i| &row_values[i]).collect();
-                let parent_match_committed = parent.rows().iter().any(|prow| {
+                let matches_parent_row = |prow: &Row| {
                     fk.parent_columns
                         .iter()
                         .enumerate()
                         .all(|(i, &pi)| prow.values.get(pi) == Some(local[i]))
-                });
+                };
+                let parent_match_committed = parent.rows().iter().any(&matches_parent_row)
+                    || cold_parent_rows.iter().any(&matches_parent_row);
                 let parent_match_in_batch = parent_is_self
                     && rows[..batch_idx].iter().any(|earlier| {
                         fk.parent_columns

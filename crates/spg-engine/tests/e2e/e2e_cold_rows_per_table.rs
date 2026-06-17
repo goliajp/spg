@@ -387,6 +387,52 @@ fn streamed_topn_join_primary_spans_hot_cold_tier() {
     );
 }
 
+/// v7.36 — composite FK validation must see cold-tier parent rows.
+/// Pre-7.36 `enforce_fk_inserts` walked `parent.rows().iter()` only,
+/// so a child INSERT whose matching parent had been frozen to cold
+/// raised `FOREIGN KEY violation: no parent row` falsely.
+#[test]
+fn composite_fk_check_sees_cold_parent_rows() {
+    let mut eng = Engine::new();
+    eng.execute(
+        "CREATE TABLE parent (\
+            tenant_id BIGINT NOT NULL, \
+            entity_id BIGINT NOT NULL, \
+            name TEXT NOT NULL, \
+            id BIGINT NOT NULL PRIMARY KEY, \
+            UNIQUE(tenant_id, entity_id))",
+    )
+    .unwrap();
+    eng.execute(
+        "CREATE TABLE child (\
+            id BIGINT NOT NULL PRIMARY KEY, \
+            tenant_id BIGINT NOT NULL, \
+            entity_id BIGINT NOT NULL, \
+            FOREIGN KEY (tenant_id, entity_id) REFERENCES parent (tenant_id, entity_id))",
+    )
+    .unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO parent VALUES (1, {i}, 'p-{i}', {i})"))
+            .unwrap();
+    }
+    // Freeze the oldest 5 parents — ids 1..=5 cold, 6..=10 hot.
+    let report = eng
+        .freeze_oldest_to_cold("parent", "parent_pkey", 5)
+        .expect("freeze parent");
+    assert_eq!(report.frozen_rows, 5);
+    // INSERT into child referencing a HOT parent should pass.
+    eng.execute("INSERT INTO child VALUES (100, 1, 7)")
+        .expect("hot parent reference must pass");
+    // INSERT into child referencing a COLD parent — pre-7.36 raised
+    // FOREIGN KEY violation. Post-7.36 must pass.
+    eng.execute("INSERT INTO child VALUES (101, 1, 2)")
+        .expect("cold parent reference must pass");
+    // INSERT into child referencing a missing parent must still
+    // raise; cold visibility doesn't paper over a genuine miss.
+    let res = eng.execute("INSERT INTO child VALUES (102, 1, 999)");
+    assert!(res.is_err(), "missing parent reference must still error");
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();
