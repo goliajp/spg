@@ -553,7 +553,100 @@ fn baseline_mailrs_prod_not_exists_real_schema() {
     );
 }
 
-// Shape 7: GET-CONTACTS — mailrs `spg-7.35.0-perf-asks-2026-06-18.md`
+// Shape 7a — mailrs `count_messages` SQL verbatim
+// (`crates/mailbox/src/pg/message_ops/read.rs:178`). The simplest
+// "stats" sub-query — JOIN messages × mailboxes, COUNT(*). PG p50
+// from the staging side-by-side was ~5-10 ms; the 5/5 mailrs
+// endpoints all add up via spg-sqlx + handler overhead but each
+// sub-query's SPGE p50 is the real ceiling for the wrapped wall-clock.
+#[test]
+fn baseline_count_messages() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT COUNT(*) FROM messages m \
+         JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE mb.user_address = 'u@x'",
+        10,
+        "count_messages",
+        100.0,
+    );
+}
+
+// Shape 7b — mailrs `user_storage_usage`
+// (`crates/mailbox/src/pg/usage_ops.rs:6`). SUM size over the
+// user's messages. seed_inbox_25k doesn't have a `size` column —
+// substitute LENGTH(text_body) to match the work shape (still a
+// per-row materialisation + integer accumulator).
+#[test]
+fn baseline_user_storage_usage() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT COALESCE(SUM(LENGTH(m.text_body)), 0) FROM messages m \
+         JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE mb.user_address = 'u@x'",
+        10,
+        "user_storage_usage",
+        100.0,
+    );
+}
+
+// Shape 7c — mailrs `list_conversation_categories`
+// (`crates/mailbox/src/pg/search_ops.rs:176`). 3-way JOIN +
+// GROUP BY category + COUNT DISTINCT thread_id + ORDER BY count
+// DESC. Hot on the stats dashboard.
+#[test]
+fn baseline_list_categories() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT ea.category, COUNT(DISTINCT m.thread_id) \
+         FROM email_analysis ea \
+         JOIN messages m ON ea.message_id = m.id \
+         JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE mb.user_address = 'u@x' AND m.thread_id != '' \
+         GROUP BY ea.category \
+         ORDER BY COUNT(DISTINCT m.thread_id) DESC",
+        10,
+        "list_categories",
+        500.0,
+    );
+}
+
+// Shape 7d — mailrs `list_thread_messages` simplified
+// (`crates/mailbox/src/pg/thread_ops/mod.rs:43`). Single-thread
+// fetch by (user, thread_id). Production form has a MIN(id)
+// SubPlan for dedup; we test the simpler shape because the
+// SubPlan dedup is mailrs-specific deduplication semantics, not
+// a perf-bottleneck shape. PG side this is a textbook indexed
+// thread-id seek + JOIN — 5-15 ms wall-clock.
+#[test]
+fn baseline_list_thread_messages() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT m.id, m.mailbox_id, m.sender, m.subject, m.internal_date, \
+                m.flags, m.message_id, m.thread_id, mb.user_address, \
+                COALESCE(m.importance_level, 'normal'), COALESCE(m.importance_score, 0.0) \
+         FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE mb.user_address = 'u@x' AND m.thread_id = 'th-1000' \
+         ORDER BY m.internal_date ASC",
+        10,
+        "list_thread_messages",
+        100.0,
+    );
+}
+
+// Shape 7 — GET-CONTACTS — mailrs `spg-7.35.0-perf-asks-2026-06-18.md`
 // Ask 1's "cleanest signal" 3.21× ratio (315 ms spg / 98 ms PG, no
 // cache effect on either side). The SQL is the exact source from
 // `crates/mailbox/src/pg/search_ops.rs:search_contacts`:
