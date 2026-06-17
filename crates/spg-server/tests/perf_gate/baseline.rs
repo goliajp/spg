@@ -454,6 +454,105 @@ fn baseline_mailrs_prod_not_exists_shape() {
     );
 }
 
+// Shape 5b: mailrs PROD-SHAPE NOT EXISTS — matches
+// `mailrs/scripts/init-schema.sql:217-235` EXACTLY:
+//   attachment_content (
+//     id BIGSERIAL PRIMARY KEY,
+//     message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+//     ...
+//     UNIQUE(message_id, attachment_index)
+//   )
+// vs Shape 5 which seeded `message_id BIGINT PRIMARY KEY` — that's a
+// different shape (single-col PK on message_id vs composite UNIQUE).
+// `spg-7.34.5-order-by-limit-walker-not-firing-2026-06-17.md` reports
+// 7.34.5 walker did NOT fire on prod — this baseline is the smoking
+// gun to either reproduce the miss or rule schema shape out.
+#[test]
+#[ignore = "250k-row seed runs ~40 s; run via `cargo test ... -- --ignored`"]
+fn baseline_mailrs_prod_not_exists_real_schema() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    db.execute("CREATE TABLE mailboxes (id BIGSERIAL PRIMARY KEY, name TEXT, user_address TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, mailbox_id BIGINT, sender TEXT, \
+            maildir_id TEXT, size BIGINT, internal_date BIGINT)",
+    )
+    .unwrap();
+    // The prod-shape attachment_content: surrogate `id` PK + `message_id`
+    // NOT NULL FK + composite UNIQUE on `(message_id, attachment_index)`.
+    db.execute(
+        "CREATE TABLE attachment_content (\
+            id BIGSERIAL PRIMARY KEY, \
+            message_id BIGINT NOT NULL, \
+            attachment_index SMALLINT NOT NULL, \
+            content_type TEXT NOT NULL, \
+            extracted_text TEXT, \
+            UNIQUE(message_id, attachment_index))",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_attachment_content_message ON attachment_content(message_id)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_messages_size ON messages(size)")
+        .unwrap();
+    for i in 0..25 {
+        db.execute(&format!(
+            "INSERT INTO mailboxes (name, user_address) VALUES ('mb{i}', 'u@x')"
+        ))
+        .unwrap();
+    }
+    for batch in 0..500 {
+        let mut vals = Vec::new();
+        for j in 0..500 {
+            let i = batch * 500 + j;
+            vals.push(format!(
+                "({}, 's{}@x', 'md-{i}', {}, {})",
+                (i % 25) + 1,
+                i % 100,
+                if i % 17 == 0 { 0 } else { 1024 },
+                1_700_000_000 + i,
+            ));
+        }
+        db.execute(&format!(
+            "INSERT INTO messages (mailbox_id, sender, maildir_id, size, internal_date) VALUES {}",
+            vals.join(",")
+        ))
+        .unwrap();
+    }
+    let mut vals = Vec::new();
+    let mut n = 0;
+    for i in (1..=250_000).step_by(17) {
+        vals.push(format!("({i}, 0, 'text/plain', 'payload-{i}')"));
+        n += 1;
+        if n % 500 == 0 {
+            db.execute(&format!(
+                "INSERT INTO attachment_content (message_id, attachment_index, content_type, extracted_text) VALUES {}",
+                vals.join(",")
+            ))
+            .unwrap();
+            vals.clear();
+        }
+    }
+    if !vals.is_empty() {
+        db.execute(&format!(
+            "INSERT INTO attachment_content (message_id, attachment_index, content_type, extracted_text) VALUES {}",
+            vals.join(",")
+        ))
+        .unwrap();
+    }
+    time_query(
+        &mut db,
+        "SELECT m.id, m.sender, m.maildir_id, mb.user_address \
+         FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE m.size > 0 \
+           AND NOT EXISTS (SELECT 1 FROM attachment_content ac WHERE ac.message_id = m.id) \
+         ORDER BY m.id DESC LIMIT 200",
+        10,
+        "mailrs_prod_real_schema_not_exists",
+        500.0,
+    );
+}
+
 // Shape 6: GET-CONVERSATIONS-IN(60) — the mailrs prod hot path 169ef66
 // fixed (snippet subquery JOIN, IN-list of 60 thread ids). Picks 60
 // stable thread ids from the seed deterministically.
