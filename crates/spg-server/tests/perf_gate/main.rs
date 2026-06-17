@@ -47,6 +47,7 @@ fn perf_lock() -> MutexGuard<'static, ()> {
     guard
 }
 
+mod baseline;
 #[allow(clippy::uninlined_format_args, unsafe_code)]
 mod concurrency;
 #[path = "inbox_25k.rs"]
