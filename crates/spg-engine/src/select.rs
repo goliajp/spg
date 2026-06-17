@@ -1019,6 +1019,10 @@ impl Engine {
             // subplan. Runs before the per-row/batch resolver, which then
             // only sees the subqueries the pull-up left behind.
             self.pull_up_unique_correlated_agg_subqueries(&mut stmt_owned);
+            // v7.34.2 (mailrs prod NOT EXISTS) — plan-time `[NOT] EXISTS`
+            // sublink pull-up to semi/anti-join, before the resolver gets
+            // a chance to walk per-row.
+            self.pull_up_exists_sublinks(&mut stmt_owned);
             self.resolve_select_subqueries(&mut stmt_owned, cancel)?;
             &stmt_owned
         } else {

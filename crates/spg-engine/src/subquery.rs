@@ -160,9 +160,7 @@ impl Engine {
                     let mut idx = 0usize;
                     all_ok &= splice_planned_subqueries(&mut e, plan, &mut idx, row, ctx)?;
                 }
-                if all_ok
-                    && let Some(plan) = &exists_plan
-                {
+                if all_ok && let Some(plan) = &exists_plan {
                     let mut idx = 0usize;
                     all_ok &= splice_planned_exists(&mut e, plan, &mut idx, row, ctx)?;
                 }
@@ -1317,6 +1315,231 @@ impl Engine {
             name: out_col.name.clone(),
         };
         Some((join, repl))
+    }
+
+    /// v7.34.2 (mailrs prod NOT EXISTS hot-path) — plan-time EXISTS /
+    /// NOT EXISTS sublink pull-up to semi/anti-join. PostgreSQL's
+    /// `convert_EXISTS_sublink_to_join`-flavoured rewrite: a correlated
+    /// `[NOT] EXISTS (SELECT … FROM t WHERE t.k = outer.col [AND inner])`
+    /// in the WHERE-AND spine collapses to a real JOIN against `t`. The
+    /// per-row dispatch (clone host expr × 25 k + splice + eval) goes
+    /// away entirely — the executor streams one tight join loop the
+    /// same way it would for a hand-written JOIN.
+    ///
+    /// Shape rules:
+    ///   * NOT EXISTS  → LEFT JOIN t AS __exsj_N ON t.k = outer.col [AND …]
+    ///                   AND a survivor `__exsj_N.k IS NULL` conjunct
+    ///                   stays in WHERE. Safe regardless of uniqueness:
+    ///                   IS-NULL only fires on the LEFT-JOIN pad row,
+    ///                   so duplicate inner matches collapse cleanly
+    ///                   (any match drops the outer row; only no-match
+    ///                   outer rows survive).
+    ///   * EXISTS      → INNER JOIN. Safe only when inner.k is single-
+    ///                   column UNIQUE / PRIMARY KEY (otherwise INNER
+    ///                   would multiply outer rows). Gated by
+    ///                   `column_is_single_unique`. No survivor needed
+    ///                   in WHERE — the join itself encodes EXISTS=true.
+    ///
+    /// Eligible inner: single plain-table FROM, no nested JOIN / CTE /
+    /// UNION / GROUP / HAVING / DISTINCT / ORDER / LIMIT / OFFSET, and
+    /// WHERE = exactly one `inner.k = outer.col` correlation plus
+    /// optional all-inner predicates that ride into the ON clause.
+    /// Anything else is left for the per-row resolver.
+    ///
+    /// Returns true when at least one conjunct was pulled up.
+    pub(crate) fn pull_up_exists_sublinks(&self, stmt: &mut SelectStatement) -> bool {
+        if stmt.from.is_none() {
+            return false;
+        }
+        let Some(where_expr) = stmt.where_.take() else {
+            return false;
+        };
+        let outer_aliases: alloc::collections::BTreeSet<String> = {
+            let from = stmt.from.as_ref().expect("from present");
+            let mut s = alloc::collections::BTreeSet::new();
+            let push = |s: &mut alloc::collections::BTreeSet<String>, t: &TableRef| {
+                s.insert(
+                    t.alias
+                        .clone()
+                        .unwrap_or_else(|| t.name.clone())
+                        .to_ascii_lowercase(),
+                );
+            };
+            push(&mut s, &from.primary);
+            for j in &from.joins {
+                push(&mut s, &j.table);
+            }
+            s
+        };
+        let conjuncts = reorder::split_and_conjunctions(&where_expr);
+        let mut survivors: Vec<Expr> = Vec::new();
+        let mut new_joins: Vec<FromJoin> = Vec::new();
+        for c in conjuncts {
+            if let Expr::Exists { subquery, negated } = c
+                && let Some((join, residual)) = self.try_pull_up_exists_sublink(
+                    subquery,
+                    *negated,
+                    &outer_aliases,
+                    new_joins.len(),
+                )
+            {
+                new_joins.push(join);
+                if let Some(r) = residual {
+                    survivors.push(r);
+                }
+                continue;
+            }
+            survivors.push(c.clone());
+        }
+        if new_joins.is_empty() {
+            stmt.where_ = Some(where_expr);
+            return false;
+        }
+        stmt.from
+            .as_mut()
+            .expect("from present")
+            .joins
+            .extend(new_joins);
+        stmt.where_ = survivors.into_iter().reduce(|a, b| Expr::Binary {
+            lhs: alloc::boxed::Box::new(a),
+            op: BinOp::And,
+            rhs: alloc::boxed::Box::new(b),
+        });
+        true
+    }
+
+    fn try_pull_up_exists_sublink(
+        &self,
+        inner: &SelectStatement,
+        negated: bool,
+        outer_aliases: &alloc::collections::BTreeSet<String>,
+        alias_n: usize,
+    ) -> Option<(FromJoin, Option<Expr>)> {
+        if !inner.ctes.is_empty()
+            || !inner.unions.is_empty()
+            || inner.group_by.is_some()
+            || inner.having.is_some()
+            || inner.distinct
+            || !inner.order_by.is_empty()
+            || inner.limit.is_some()
+            || inner.offset.is_some()
+        {
+            return None;
+        }
+        let from = inner.from.as_ref()?;
+        if !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.as_of_segment.is_some()
+        {
+            return None;
+        }
+        let inner_table = from.primary.name.clone();
+        let inner_alias = from
+            .primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| inner_table.clone());
+        let is_inner = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(&inner_alias))
+        };
+        let is_outer = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| outer_aliases.contains(&q.to_ascii_lowercase()))
+        };
+        let w = inner.where_.as_ref()?;
+        let mut corr: Option<(String, ColumnName)> = None;
+        let mut rest: Vec<Expr> = Vec::new();
+        for c in reorder::split_and_conjunctions(w) {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::Eq,
+                rhs,
+            } = c
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let pair = if is_inner(a) && is_outer(b) {
+                    Some((a.name.clone(), b.clone()))
+                } else if is_inner(b) && is_outer(a) {
+                    Some((b.name.clone(), a.clone()))
+                } else {
+                    None
+                };
+                if let Some(p) = pair {
+                    if corr.is_some() {
+                        return None;
+                    }
+                    corr = Some(p);
+                    continue;
+                }
+            }
+            if !expr_is_all_inner(c, &inner_alias) {
+                return None;
+            }
+            rest.push(c.clone());
+        }
+        let (inner_key, outer_col) = corr?;
+        // EXISTS (semi-join) requires uniqueness so the INNER JOIN can't
+        // multiply outer rows. NOT EXISTS (anti-join) uses LEFT + IS NULL
+        // and is safe regardless.
+        if !negated && !self.column_is_single_unique(&inner_table, &inner_key) {
+            return None;
+        }
+        let fresh = alloc::format!("__exsj_{alias_n}");
+        let key_eq = Expr::Binary {
+            lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
+                qualifier: Some(fresh.clone()),
+                name: inner_key.clone(),
+            })),
+            op: BinOp::Eq,
+            rhs: alloc::boxed::Box::new(Expr::Column(outer_col)),
+        };
+        let on = rest
+            .into_iter()
+            .map(|mut e| {
+                rename_qualifier(&mut e, &inner_alias, &fresh);
+                e
+            })
+            .fold(key_eq, |acc, pred| Expr::Binary {
+                lhs: alloc::boxed::Box::new(acc),
+                op: BinOp::And,
+                rhs: alloc::boxed::Box::new(pred),
+            });
+        let join = FromJoin {
+            kind: if negated {
+                JoinKind::Left
+            } else {
+                JoinKind::Inner
+            },
+            table: TableRef {
+                name: inner_table,
+                alias: Some(fresh.clone()),
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                generate_series_args: None,
+                lateral_subquery: None,
+            },
+            on: Some(on),
+        };
+        let residual = if negated {
+            // anti-join: keep only outer rows whose LEFT-JOIN extension
+            // was a NULL pad — i.e. no match in the inner table.
+            Some(Expr::IsNull {
+                expr: alloc::boxed::Box::new(Expr::Column(ColumnName {
+                    qualifier: Some(fresh),
+                    name: inner_key,
+                })),
+                negated: false,
+            })
+        } else {
+            None
+        };
+        Some((join, residual))
     }
 
     /// True when `col` on `table` is covered by a single-column UNIQUE or
