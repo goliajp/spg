@@ -477,6 +477,53 @@ fn composite_on_conflict_key_check_sees_cold_rows() {
     );
 }
 
+/// v7.36 — DELETE cascade FK planner must surface cold-tier child
+/// references explicitly instead of silently skipping them. Pre-7.36
+/// the cold child was invisible to RESTRICT (lost integrity check)
+/// and to Cascade/SetNull/SetDefault (orphaned cold child). PG and
+/// MariaDB never let an FK violation become silent — we keep that
+/// invariant by erroring with a clear "cold-tier mutation" message
+/// pointing at COMPACT / promote-then-retry as the operator path.
+#[test]
+fn delete_cascade_with_cold_child_surfaces_explicit_error() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    eng.execute(
+        "CREATE TABLE child (\
+            id BIGINT NOT NULL PRIMARY KEY, \
+            parent_id BIGINT NOT NULL, \
+            FOREIGN KEY (parent_id) REFERENCES parent (id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO parent VALUES ({i})"))
+            .unwrap();
+    }
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO child VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    // Freeze the oldest 5 children — ids 1..=5 cold.
+    let report = eng
+        .freeze_oldest_to_cold("child", "child_pkey", 5)
+        .expect("freeze child");
+    assert_eq!(report.frozen_rows, 5);
+    // DELETE a parent whose child is cold — must raise explicit
+    // cold-tier error (NOT silently leave the cold child orphaned).
+    let res = eng.execute("DELETE FROM parent WHERE id = 3");
+    let err = res.expect_err("cold child cascade must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cold-tier"),
+        "expected cold-tier error, got: {msg}"
+    );
+    // DELETE a parent whose child is HOT — must succeed cleanly,
+    // hot cascade still works.
+    eng.execute("DELETE FROM parent WHERE id = 8")
+        .expect("hot child cascade must still work");
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();

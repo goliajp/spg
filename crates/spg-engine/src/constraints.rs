@@ -1173,6 +1173,29 @@ pub(crate) fn plan_fk_parent_deletions(
                 if parent_key.iter().any(|v| matches!(v, Value::Null)) {
                     continue;
                 }
+                // v7.36 (cold-tier coverage) — DELETE-cascade FK
+                // planner walked `child.rows()` only. Any cold-tier
+                // child referencing the doomed parent was silently
+                // skipped: with RESTRICT/NoAction the violation went
+                // undetected (lost integrity); with Cascade/SetNull/
+                // SetDefault the child row was orphaned (cold rows
+                // can't be mutated in-place by this planner). Raise
+                // explicitly when a cold child reference exists so
+                // the operator sees the architectural gap rather than
+                // silent corruption.
+                if iter_cold_rows_of_parent(catalog, child).iter().any(|crow| {
+                    fk.local_columns
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &li)| crow.values.get(li) == Some(parent_key[i]))
+                }) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "DELETE on {cur_parent:?}: cold-tier child row in {child_name:?} \
+                         references the doomed parent key; cold-tier mutation by this \
+                         FK action is a v7.37 candidate. Run COMPACT or move the cold \
+                         rows back to the hot tier and retry."
+                    )));
+                }
                 for (child_row_idx, child_row) in child.rows().iter().enumerate() {
                     if child_name == cur_parent
                         && visited.contains(&(child_name.clone(), child_row_idx))
@@ -1355,6 +1378,24 @@ pub(crate) fn plan_fk_parent_updates(
                 }
                 let new_key: Vec<&Value> =
                     fk.parent_columns.iter().map(|&pi| &new_row[pi]).collect();
+                // v7.36 (cold-tier coverage) — UPDATE-cascade FK
+                // planner mirrors DELETE: any cold child referencing
+                // the OLD parent key would be silently skipped, so
+                // RESTRICT misses violations and Cascade/SetNull/
+                // SetDefault orphans the cold child. Raise explicitly.
+                if iter_cold_rows_of_parent(catalog, child).iter().any(|crow| {
+                    fk.local_columns
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &li)| crow.values.get(li) == Some(old_key[i]))
+                }) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "UPDATE on {parent_table_name:?}: cold-tier child row in \
+                         {child_name:?} references the changing parent key; cold-tier \
+                         mutation by this FK action is a v7.37 candidate. Run COMPACT \
+                         or move the cold rows back to the hot tier and retry."
+                    )));
+                }
                 for (child_row_idx, child_row) in child.rows().iter().enumerate() {
                     // Self-ref same-row updates: a row updating its
                     // own PK doesn't restrict itself.
