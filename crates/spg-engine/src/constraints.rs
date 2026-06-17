@@ -328,12 +328,22 @@ pub(crate) fn on_conflict_keys_exist(
     let Some(table) = catalog.get(table_name) else {
         return false;
     };
-    table.rows().iter().any(|r| {
+    let matches = |r: &Row| {
         column_positions
             .iter()
             .enumerate()
             .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
-    })
+    };
+    if table.rows().iter().any(&matches) {
+        return true;
+    }
+    // v7.36 (cold-tier coverage) — composite ON CONFLICT key
+    // existence check must also see cold-tier rows; otherwise an
+    // INSERT whose unique-key tuple lives only in the cold tier
+    // silently bypasses ON CONFLICT and writes a duplicate.
+    iter_cold_rows_of_parent(catalog, table)
+        .iter()
+        .any(&matches)
 }
 
 /// v7.9.9 — apply ON CONFLICT DO UPDATE SET assignments to an
