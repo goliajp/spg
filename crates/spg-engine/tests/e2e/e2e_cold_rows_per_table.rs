@@ -123,10 +123,8 @@ fn spg_stat_segment_resolves_table_name() {
 #[test]
 fn join_walker_spans_hot_cold_tier_on_order_by_limit() {
     let mut eng = Engine::new();
-    eng.execute(
-        "CREATE TABLE mailboxes (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
-    )
-    .unwrap();
+    eng.execute("CREATE TABLE mailboxes (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
     eng.execute(
         "CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, mailbox_id BIGINT NOT NULL, \
             size BIGINT NOT NULL)",
