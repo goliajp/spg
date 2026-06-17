@@ -3017,6 +3017,22 @@ fn encode_pg_text_cell(out: &mut Vec<u8>, v: &Value, ty: Option<DataType>) -> st
         Value::Int(n) => return write_cell_int(out, i64::from(*n)),
         Value::BigInt(n) => return write_cell_int(out, *n),
         Value::Text(s) | Value::Json(s) => return write_cell_bytes(out, s.as_bytes()),
+        // v7.34.6 — Timestamp / Date / Timestamptz fast paths. The
+        // mailrs `proj_25k` baseline emits one `internal_date`
+        // Timestamp per row × 25 k rows = 25 k `format_timestamp`
+        // calls, each going through `format!()` → owned `String` →
+        // `write_cell_bytes` copy. `write_cell_timestamp` below
+        // writes the ISO-8601 chars (with optional `+00` suffix for
+        // Timestamptz) straight into the DataRow body via a 32-byte
+        // stack scratch, with no intermediate `String`. Output
+        // matches `spg_engine::eval::format_timestamp` byte-for-byte
+        // (incl. the `frac` trailing-zero trim) — see
+        // `write_cell_timestamp_matches_engine_format` below.
+        Value::Timestamp(micros) => {
+            let with_tz = matches!(ty, Some(DataType::Timestamptz));
+            return write_cell_timestamp(out, *micros, with_tz);
+        }
+        Value::Date(days) => return write_cell_date(out, *days),
         _ => {}
     }
     match value_to_pg_text(v, ty) {
@@ -3032,6 +3048,116 @@ fn write_cell_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> std::io::Result<()> {
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())
+}
+
+#[inline]
+fn write_pad2(buf: &mut [u8], p: &mut usize, n: u32) {
+    buf[*p] = b'0' + ((n / 10) % 10) as u8;
+    buf[*p + 1] = b'0' + (n % 10) as u8;
+    *p += 2;
+}
+
+#[inline]
+fn write_pad4(buf: &mut [u8], p: &mut usize, n: u32) {
+    buf[*p] = b'0' + ((n / 1000) % 10) as u8;
+    buf[*p + 1] = b'0' + ((n / 100) % 10) as u8;
+    buf[*p + 2] = b'0' + ((n / 10) % 10) as u8;
+    buf[*p + 3] = b'0' + (n % 10) as u8;
+    *p += 4;
+}
+
+#[inline]
+fn write_pad6(buf: &mut [u8], p: &mut usize, n: u32) {
+    buf[*p] = b'0' + ((n / 100_000) % 10) as u8;
+    buf[*p + 1] = b'0' + ((n / 10_000) % 10) as u8;
+    buf[*p + 2] = b'0' + ((n / 1_000) % 10) as u8;
+    buf[*p + 3] = b'0' + ((n / 100) % 10) as u8;
+    buf[*p + 4] = b'0' + ((n / 10) % 10) as u8;
+    buf[*p + 5] = b'0' + (n % 10) as u8;
+    *p += 6;
+}
+
+// v7.34.6 — direct-into-`Vec` Timestamp encoder, matching
+// `spg_engine::eval::format_timestamp` byte-for-byte (including the
+// trailing-zero trim on the fractional component). Bails to the
+// engine formatter for out-of-range years (< 0 or > 9999) — those
+// hit pg_dump regression corpora, not the per-row PROJ hot path,
+// so the slow path is fine there.
+fn write_cell_timestamp(out: &mut Vec<u8>, micros: i64, with_tz: bool) -> std::io::Result<()> {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let day_micros = micros.rem_euclid(MICROS_PER_DAY);
+    let secs = day_micros / 1_000_000;
+    let frac = (day_micros % 1_000_000) as u32;
+    let (y, m, d, _, _, _) = secs_to_ymdhms(days * 86_400);
+    if !(0..=9999).contains(&y) {
+        let s = if with_tz {
+            spg_engine::eval::format_timestamptz(micros)
+        } else {
+            spg_engine::eval::format_timestamp(micros)
+        };
+        return write_cell_bytes(out, s.as_bytes());
+    }
+    let hh = (secs / 3600) as u32;
+    let mm = ((secs / 60) % 60) as u32;
+    let ss = (secs % 60) as u32;
+    let mut buf = [0u8; 32];
+    let mut p = 0;
+    write_pad4(&mut buf, &mut p, y as u32);
+    buf[p] = b'-';
+    p += 1;
+    write_pad2(&mut buf, &mut p, m);
+    buf[p] = b'-';
+    p += 1;
+    write_pad2(&mut buf, &mut p, d);
+    buf[p] = b' ';
+    p += 1;
+    write_pad2(&mut buf, &mut p, hh);
+    buf[p] = b':';
+    p += 1;
+    write_pad2(&mut buf, &mut p, mm);
+    buf[p] = b':';
+    p += 1;
+    write_pad2(&mut buf, &mut p, ss);
+    if frac != 0 {
+        buf[p] = b'.';
+        p += 1;
+        let frac_start = p;
+        write_pad6(&mut buf, &mut p, frac);
+        // Match eval::format_timestamp's trailing-zero trim.
+        while p > frac_start && buf[p - 1] == b'0' {
+            p -= 1;
+        }
+    }
+    if with_tz {
+        buf[p] = b'+';
+        p += 1;
+        buf[p] = b'0';
+        p += 1;
+        buf[p] = b'0';
+        p += 1;
+    }
+    write_cell_bytes(out, &buf[..p])
+}
+
+// v7.34.6 — direct-into-`Vec` Date encoder, matching the
+// `format_date` helper below byte-for-byte.
+fn write_cell_date(out: &mut Vec<u8>, days: i32) -> std::io::Result<()> {
+    let secs = i64::from(days) * 86_400;
+    let (y, m, d, _, _, _) = secs_to_ymdhms(secs);
+    if !(0..=9999).contains(&y) {
+        return write_cell_bytes(out, format_date(days).as_bytes());
+    }
+    let mut buf = [0u8; 10];
+    let mut p = 0;
+    write_pad4(&mut buf, &mut p, y as u32);
+    buf[p] = b'-';
+    p += 1;
+    write_pad2(&mut buf, &mut p, m);
+    buf[p] = b'-';
+    p += 1;
+    write_pad2(&mut buf, &mut p, d);
+    write_cell_bytes(out, &buf[..p])
 }
 
 fn write_cell_int(out: &mut Vec<u8>, n: i64) -> std::io::Result<()> {
@@ -3295,6 +3421,65 @@ fn format_numeric(scaled: i128, scale: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_cell(buf: &[u8]) -> &[u8] {
+        let len = i32::from_be_bytes(buf[..4].try_into().unwrap());
+        assert!(len >= 0, "negative cell length");
+        let len = len as usize;
+        &buf[4..4 + len]
+    }
+
+    /// v7.34.6 — `write_cell_timestamp` must match
+    /// `spg_engine::eval::format_timestamp` byte-for-byte on the
+    /// in-range path (year 0..=9999), since the PROJ DataRow output
+    /// flows back into clients that already see the engine
+    /// formatter's output via other paths.
+    #[test]
+    fn write_cell_timestamp_matches_engine_format() {
+        let cases: &[i64] = &[
+            0,                       // 1970-01-01 00:00:00
+            1_700_000_000_000_000,   // 2023-11-14 22:13:20
+            1_700_000_000_123_456,   // …+frac
+            1_700_000_000_123_000,   // …+frac trailing zero trim
+            1_700_000_000_100_000,   // …+frac more trailing zero trim
+            -1_000_000_000_000,      // 1969-12-20 10:13:20 (pre-epoch)
+            253_402_300_799_000_000, // 9999-12-31 23:59:59
+            1_577_836_800_000_000,   // 2020-01-01 00:00:00
+        ];
+        for &micros in cases {
+            let expected = spg_engine::eval::format_timestamp(micros);
+            let mut buf = Vec::new();
+            write_cell_timestamp(&mut buf, micros, false).unwrap();
+            let got = std::str::from_utf8(read_cell(&buf)).unwrap();
+            assert_eq!(got, expected, "timestamp mismatch @ micros={micros}");
+
+            let expected_tz = spg_engine::eval::format_timestamptz(micros);
+            let mut buf_tz = Vec::new();
+            write_cell_timestamp(&mut buf_tz, micros, true).unwrap();
+            let got_tz = std::str::from_utf8(read_cell(&buf_tz)).unwrap();
+            assert_eq!(
+                got_tz, expected_tz,
+                "timestamptz mismatch @ micros={micros}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_cell_date_matches_pgwire_format() {
+        let cases: &[i32] = &[
+            0,         // 1970-01-01
+            19_723,    // 2024-01-01
+            -10_957,   // 1940-01-02
+            2_932_896, // 9999-12-31
+        ];
+        for &days in cases {
+            let expected = format_date(days);
+            let mut buf = Vec::new();
+            write_cell_date(&mut buf, days).unwrap();
+            let got = std::str::from_utf8(read_cell(&buf)).unwrap();
+            assert_eq!(got, expected, "date mismatch @ days={days}");
+        }
+    }
 
     /// v7.15.0 — pg_dump's default output emits `COPY t (col, col)
     /// FROM stdin;` for every table with data. The old whitespace-
