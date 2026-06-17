@@ -332,6 +332,128 @@ fn baseline_not_exists_filter() {
     );
 }
 
+// v7.34.3 (mailrs prod report #5,
+// stables/mailrs/.../spg-7.34.2-not-exists-pullup-not-firing-2026-06-17.md)
+// — reproduce the EXACT mailrs prod content_worker SQL shape so we can
+// see whether `pull_up_exists_sublinks` actually fires on it.
+// mailrs:
+//   SELECT m.id, m.sender, m.maildir_id, mb.user_address
+//     FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id
+//    WHERE m.size > 0
+//      AND NOT EXISTS (SELECT 1 FROM attachment_content ac WHERE ac.message_id = m.id)
+//    ORDER BY m.id DESC LIMIT $1
+#[test]
+#[ignore = "250k-row seed runs ~40 s; run via `cargo test ... -- --ignored`"]
+fn baseline_mailrs_prod_not_exists_shape() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    // Seed prod-like shape: messages table has a `size` column.
+    // attachment_content is sparse (~6 % of messages have an attachment).
+    db.execute("CREATE TABLE mailboxes (id BIGSERIAL PRIMARY KEY, name TEXT, user_address TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, mailbox_id BIGINT, sender TEXT, \
+            maildir_id TEXT, size BIGINT, internal_date BIGINT)",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE attachment_content (message_id BIGINT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_messages_size ON messages(size)")
+        .unwrap();
+    for i in 0..25 {
+        db.execute(&format!(
+            "INSERT INTO mailboxes (name, user_address) VALUES ('mb{i}', 'u@x')"
+        ))
+        .unwrap();
+    }
+    // 250 000 messages — matches mailrs prod scale exactly. If the
+    // pull-up fires + the resulting plan is efficient (ORDER BY id
+    // DESC + LIMIT walk), we should see <25 ms (the mailrs sqlx
+    // inline budget). Slow here = the gap mailrs prod #5 hit.
+    for batch in 0..500 {
+        let mut vals = Vec::new();
+        for j in 0..500 {
+            let i = batch * 500 + j;
+            vals.push(format!(
+                "({}, 's{}@x', 'md-{i}', {}, {})",
+                (i % 25) + 1,
+                i % 100,
+                if i % 17 == 0 { 0 } else { 1024 },
+                1_700_000_000 + i,
+            ));
+        }
+        db.execute(&format!(
+            "INSERT INTO messages (mailbox_id, sender, maildir_id, size, internal_date) VALUES {}",
+            vals.join(",")
+        ))
+        .unwrap();
+    }
+    // attachment_content covers ~6 % of message ids (every 17th).
+    let mut vals = Vec::new();
+    let mut n = 0;
+    for i in (1..=250_000).step_by(17) {
+        vals.push(format!("({}, 'payload-{i}')", i));
+        n += 1;
+        if n % 500 == 0 {
+            db.execute(&format!(
+                "INSERT INTO attachment_content (message_id, payload) VALUES {}",
+                vals.join(",")
+            ))
+            .unwrap();
+            vals.clear();
+        }
+    }
+    if !vals.is_empty() {
+        db.execute(&format!(
+            "INSERT INTO attachment_content (message_id, payload) VALUES {}",
+            vals.join(",")
+        ))
+        .unwrap();
+    }
+    // The NOT EXISTS path: v7.34.2 pulled up via LEFT JOIN + IS NULL
+    // but at this scale the LEFT JOIN materialised the whole outer
+    // rel; v7.34.3 prefers the NOT IN form (InSet via
+    // subquery_replacement) which runs at the same plateau as the
+    // plain ORDER BY + LIMIT walk.
+    time_query(
+        &mut db,
+        "SELECT m.id, m.sender, m.maildir_id, mb.user_address \
+         FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE m.size > 0 \
+           AND NOT EXISTS (SELECT 1 FROM attachment_content ac WHERE ac.message_id = m.id) \
+         ORDER BY m.id DESC LIMIT 200",
+        10,
+        "mailrs_prod_not_exists",
+        500.0,
+    );
+    // Equivalent NOT IN — should route through SPG's existing uncorrelated
+    // IN-list materialise + InSet membership path. If MUCH faster than
+    // NOT EXISTS, the gap is the per-row dispatch the pull-up tries to
+    // remove but the resulting LEFT JOIN + IS NULL plan still costs.
+    time_query(
+        &mut db,
+        "SELECT m.id, m.sender, m.maildir_id, mb.user_address \
+         FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+         WHERE m.size > 0 \
+           AND m.id NOT IN (SELECT message_id FROM attachment_content) \
+         ORDER BY m.id DESC LIMIT 200",
+        10,
+        "mailrs_prod_not_in",
+        500.0,
+    );
+    // Plain primary-table walk with NO subquery — what we'd expect
+    // if the executor can early-stop on ORDER BY id DESC + LIMIT.
+    time_query(
+        &mut db,
+        "SELECT m.id, m.sender, m.maildir_id FROM messages m \
+         WHERE m.size > 0 \
+         ORDER BY m.id DESC LIMIT 200",
+        10,
+        "mailrs_prod_plain_limit",
+        500.0,
+    );
+}
+
 // Shape 6: GET-CONVERSATIONS-IN(60) — the mailrs prod hot path 169ef66
 // fixed (snippet subquery JOIN, IN-list of 60 thread ids). Picks 60
 // stable thread ids from the seed deterministically.
