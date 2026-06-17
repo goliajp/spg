@@ -88,6 +88,23 @@ impl Table {
         self.cold_row_count_stale
     }
 
+    /// v7.36 — O(1) "could this table possibly have cold rows?"
+    /// predicate, intended for perf-critical executor hot paths
+    /// that just need to skip the cold-tier branch when there's
+    /// definitely nothing there. Reads the cached `cold_row_count`:
+    ///   - cache fresh + cache == 0 → return false (fast path)
+    ///   - cache stale → return true (conservative; the executor
+    ///     pays the cold-aware path's `iter_cold_rows_*` cost but
+    ///     stays correct)
+    ///   - cache fresh + cache > 0 → return true
+    /// `count_cold_locators` remains the right call for the EXACT
+    /// count (ANALYZE etc.) — its O(N) walk is unsuitable per join
+    /// stage.
+    #[must_use]
+    pub const fn has_cold_rows_fast(&self) -> bool {
+        self.cold_row_count_stale || self.cold_row_count > 0
+    }
+
     /// v6.7.0 — walk every BTree index and count `RowLocator::Cold`
     /// entries; return the MAX across indices. The freeze path
     /// (`freeze_oldest_to_cold`) writes cold locators to ONE
