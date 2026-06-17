@@ -142,6 +142,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// `NOW()` / `CURRENT_TIMESTAMP` / `CURRENT_DATE` rewrite layer
 /// so PG-idiomatic time queries work without the caller wiring
 /// their own clock.
+/// v7.36 (mailrs ask #4) — flatten an `EXPLAIN` QueryResult into
+/// the QUERY PLAN string lines. `EXPLAIN` always returns a single-
+/// column TEXT table; anything else is treated as no plan output.
+fn extract_query_plan_lines(result: QueryResult) -> Vec<String> {
+    match result {
+        QueryResult::Rows { rows, .. } => rows
+            .into_iter()
+            .filter_map(|r| {
+                r.values.into_iter().next().and_then(|v| match v {
+                    Value::Text(s) => Some(s),
+                    _ => None,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn wall_clock_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2301,17 +2319,32 @@ impl Database {
         self.engine.snapshot()
     }
 
-    /// Execute a SQL statement and return the engine's
-    /// `QueryResult` verbatim. Pass-through for callers that
-    /// want to keep PG-flavoured column/row metadata.
+    /// v7.36 (mailrs ask #4) — programmatic `EXPLAIN` over `sql`,
+    /// returning each line of the QUERY PLAN as an owned `String`.
+    /// Skips the WAL (`EXPLAIN` is read-only) and runs against the
+    /// engine's live catalog. Dogfood callers can attach the plan
+    /// to a report or assert on its shape from a test without
+    /// having to parse a tabular result themselves.
     ///
-    /// v7.1 — when the database was opened via `open_path`,
-    /// successful mutations are appended to the WAL + fsynced
-    /// before the call returns. A subsequent process crash will
-    /// recover state up to the last successful return from
-    /// `execute()`. Read-only statements (SELECT / SHOW /
-    /// EXPLAIN / BEGIN-COMMIT-ROLLBACK / CHECKPOINT / COMPACT
-    /// etc.) skip the WAL entirely.
+    /// `sql` is the inner SELECT (no `EXPLAIN` prefix); the helper
+    /// adds it. For SQL with `$N` placeholders, substitute them
+    /// into the SQL string before calling — programmatic
+    /// placeholder-aware EXPLAIN is on the v7.37 plan.
+    ///
+    /// # Errors
+    /// Propagates parse errors on `sql`, plus any engine error the
+    /// `EXPLAIN` itself raises (table not found, column not found).
+    pub fn explain(&self, sql: &str) -> Result<Vec<String>, EngineError> {
+        let full = format!("EXPLAIN {sql}");
+        let result = self.engine.execute_readonly(&full)?;
+        Ok(extract_query_plan_lines(result))
+    }
+
+    /// Write-side single-statement execute. Runs the SQL through
+    /// the buffered group-commit pipeline and blocks until the
+    /// resulting batch's WAL fsync returns. Read-only statements
+    /// (SELECT / SHOW / EXPLAIN / BEGIN-COMMIT-ROLLBACK /
+    /// CHECKPOINT / COMPACT etc.) skip the WAL entirely.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, EngineError> {
         // v7.20 P2 — single-caller convenience over the buffered
         // path: enqueue + immediately wait. Batch size is 1 here,
