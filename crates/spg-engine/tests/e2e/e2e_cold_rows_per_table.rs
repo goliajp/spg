@@ -258,6 +258,66 @@ fn single_table_walker_spans_hot_cold_tier_on_order_by_limit() {
     assert_eq!(ids_desc, vec![100, 99, 98, 97, 96, 95, 94, 93, 92, 91]);
 }
 
+/// v7.35.1 — `materialise_table_ref_filtered` cold-tier dispatch
+/// for the peer table side of a JOIN. Pre-7.35.1 the helper only
+/// walked `Table::rows()` (= hot tier), so any cold-tier row on
+/// the peer side was silently dropped from the join result —
+/// queries returned wrong row counts without erroring. Test seeds
+/// 100 mailboxes + 100 messages (1:1 on `mailbox_id`), freezes
+/// the oldest 50 mailboxes to a cold segment, then runs a
+/// `messages JOIN mailboxes` count + value check. The full join
+/// MUST still resolve every survivor.
+#[test]
+fn peer_table_cold_tier_rows_visible_to_join() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE mailboxes (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    eng.execute(
+        "CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, mailbox_id BIGINT NOT NULL)",
+    )
+    .unwrap();
+    for i in 1..=100 {
+        eng.execute(&format!("INSERT INTO mailboxes VALUES ({i}, 'mb-{i}')"))
+            .unwrap();
+        eng.execute(&format!("INSERT INTO messages VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    // Freeze the oldest 50 mailboxes to cold; mailbox ids 1..=50
+    // now live in a cold segment, ids 51..=100 stay hot.
+    let report = eng
+        .freeze_oldest_to_cold("mailboxes", "mailboxes_pkey", 50)
+        .expect("freeze cold");
+    assert_eq!(report.frozen_rows, 50);
+    // Sanity 1: SELECT * FROM mailboxes — must see all 100 rows
+    // (50 hot + 50 cold). If this fails, the cold-tier lift never
+    // surfaces, and the join below has no chance.
+    let mb_all = rows_of(eng.execute("SELECT id FROM mailboxes").unwrap());
+    assert_eq!(mb_all.len(), 100, "SELECT * lost cold-tier rows");
+    // COUNT(*) — every message has a mailbox; the join survivor
+    // count MUST be 100 even though half the mailboxes are cold.
+    let rows = rows_of(
+        eng.execute("SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id")
+            .unwrap(),
+    );
+    assert_eq!(
+        rows[0][0],
+        Value::BigInt(100),
+        "join lost cold-tier peer rows"
+    );
+    // Value check: pick a known cold-tier id (mailbox 5) and confirm
+    // its name flows through the join. Pre-7.35.1 this projection
+    // returned 0 rows because mb.name was unreachable.
+    let by_id = rows_of(
+        eng.execute(
+            "SELECT mb.name FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+             WHERE m.id = 5",
+        )
+        .unwrap(),
+    );
+    assert_eq!(by_id.len(), 1);
+    assert_eq!(by_id[0][0], Value::Text("mb-5".to_string()));
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();

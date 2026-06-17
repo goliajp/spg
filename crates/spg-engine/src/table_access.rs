@@ -96,7 +96,13 @@ impl Engine {
                 .ok_or_else(|| StorageError::TableNotFound {
                     name: tref.name.clone(),
                 })?;
-        let rows: Vec<Row> = table.rows().iter().cloned().collect();
+        let mut rows: Vec<Row> = table.rows().iter().cloned().collect();
+        // v7.35.1 (mailrs prod #6 follow-up) — same fix as the
+        // filtered variant: append every cold-tier row (one pass over
+        // a unique BTree picks each row exactly once) so non-indexed
+        // / no-predicate materialisations don't silently shed half
+        // the table when the freezer has promoted older rows.
+        rows.extend(self.iter_cold_rows_of_table(table));
         let cols = table.schema().columns.clone();
         Ok((rows, cols))
     }
@@ -192,9 +198,60 @@ impl Engine {
                 for row in table.rows().iter() {
                     push_if(row, &mut out)?;
                 }
+                // v7.35.1 (mailrs prod #6 follow-up) — cold-tier rows
+                // were silently dropped from peer / non-indexed
+                // materialised paths because `Table::rows()` only
+                // surfaces the hot tier. Walk the table's unique
+                // BTree(s) (each cold row appears exactly once per
+                // such index — dedup-free) to lift every cold-tier
+                // row through `Catalog::resolve_cold_locator` and
+                // re-apply the same predicates.
+                for row in self.iter_cold_rows_of_table(table) {
+                    push_if(&row, &mut out)?;
+                }
             }
         }
         Ok((out, cols))
+    }
+
+    /// v7.35.1 — yield every cold-tier row of `table` exactly once
+    /// by walking the BTree index that covers the table's PRIMARY
+    /// KEY. The PK uniqueness contract gives per-row dedup without
+    /// a separate visited-set. Returns an empty Vec when the table
+    /// has no PK-backed BTree (pre-PK tables / ad-hoc heaps stay
+    /// hot-tier-only, so this is harmless on those shapes).
+    pub(crate) fn iter_cold_rows_of_table(&self, table: &Table) -> Vec<Row> {
+        let schema = table.schema();
+        // PK column position(s) — single-column PK only for now;
+        // composite PKs would require composite-key resolution
+        // through resolve_cold_locator that the current API
+        // doesn't expose.
+        let Some(pk_col_pos) = schema
+            .uniqueness_constraints
+            .iter()
+            .find(|u| u.is_primary_key && u.columns.len() == 1)
+            .map(|u| u.columns[0])
+        else {
+            return Vec::new();
+        };
+        let Some(idx) = table.indices().iter().find(|i| {
+            i.column_position == pk_col_pos && matches!(i.kind, spg_storage::IndexKind::BTree(_))
+        }) else {
+            return Vec::new();
+        };
+        let table_name = schema.name.as_str();
+        let catalog = self.active_catalog();
+        let mut out = Vec::new();
+        for (key, locators) in idx.iter_asc() {
+            for loc in locators {
+                if let spg_storage::RowLocator::Cold { segment_id, .. } = loc
+                    && let Some(row) = catalog.resolve_cold_locator(table_name, *segment_id, key)
+                {
+                    out.push(row);
+                }
+            }
+        }
+        out
     }
 
     /// v7.31 (perf campaign) — `materialise_table_ref_filtered` for

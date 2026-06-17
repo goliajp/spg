@@ -1867,6 +1867,16 @@ impl Engine {
             for i in 0..table.row_count() {
                 process_row(&table.rows()[i], i)?;
             }
+            // v7.35.1 (mailrs prod #6 follow-up) — fold cold-tier
+            // rows into the same loop. The full-scan path here is the
+            // load-bearing single-table SELECT executor, and pre-
+            // 7.35.1 it only walked `table.rows()` (hot), so any
+            // `SELECT … FROM t` against a table with cold segments
+            // silently returned a subset.
+            let cold_rows = self.iter_cold_rows_of_table(table);
+            for (offset, row) in cold_rows.iter().enumerate() {
+                process_row(row, table.row_count() + offset)?;
+            }
         }
 
         if !stmt.order_by.is_empty() {
