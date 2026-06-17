@@ -649,7 +649,16 @@ impl Engine {
             && from.primary.lateral_subquery.is_none()
             && from.primary.as_of_segment.is_none()
         {
-            self.active_catalog().get(&from.primary.name)
+            self.active_catalog().get(&from.primary.name).filter(|t|
+                // v7.36 (cold-tier coverage) — the deferred-index
+                // primary path threads `Vec<usize>` row indices into
+                // `JoinSrc::Stored(t.rows())` (hot-tier only), so a
+                // primary with cold-tier rows silently dropped them
+                // from the join. Force the materialising fallback
+                // when ANY cold-tier row exists; the fallback rides
+                // `materialise_table_ref_filtered` which already
+                // covers both tiers (v7.35.1).
+                t.count_cold_locators() == 0)
         } else {
             None
         };
