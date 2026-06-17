@@ -660,11 +660,16 @@ fn execute_with_role(
     // can't fire — drop the read fast-path when those calls
     // are present so the write path runs them in
     // pre_resolve_sequence_calls_in_statement.
+    // v7.34.5 — byte-level case-insensitive substring probe instead
+    // of `sql.to_ascii_lowercase()` + three `.contains()` walks.
+    // Every SELECT on the hot path paid one whole-SQL String alloc
+    // + four full-length scans for a clause virtually no SPG
+    // workload uses (sequence mutators inside SELECT only show up
+    // in `pg_dump` restores). The byte probes short-circuit on the
+    // first non-match without ever building the lowercase copy.
     if is_read {
-        let lower_sql = sql.to_ascii_lowercase();
-        if lower_sql.contains("setval(")
-            || lower_sql.contains("nextval(")
-            || lower_sql.contains("currval(")
+        let b = sql.as_bytes();
+        if ci_contains(b, b"setval(") || ci_contains(b, b"nextval(") || ci_contains(b, b"currval(")
         {
             is_read = false;
         }
