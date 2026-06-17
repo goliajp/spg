@@ -358,9 +358,19 @@ struct Projection {
 /// is exactly `rows.len()` as `BigInt`, no group state needed.
 /// Returns `None` for any deviation so the caller's full pipeline
 /// runs verbatim.
+///
+/// v7.35.2 — also short-circuit `COUNT(<literal>)` (e.g.
+/// `COUNT(1)`) and `COUNT(<column>)` when the column is declared
+/// NOT NULL on the input schema. PG handles both cases as
+/// `COUNT(*)` (the non-null filter is a no-op), so doing the same
+/// here keeps every `count this thing` shape on the same fast path
+/// instead of routing the literal / non-null-col variants through
+/// the four-stage aggregate pipeline.
 fn try_pure_count_star_short_circuit(
     stmt: &SelectStatement,
     rows: &[RowRef<'_>],
+    schema_cols: &[ColumnSchema],
+    table_alias: Option<&str>,
 ) -> Option<AggResult> {
     if stmt.distinct
         || stmt.limit_with_ties
@@ -379,7 +389,34 @@ fn try_pure_count_star_short_circuit(
     let Expr::FunctionCall { name, args } = expr else {
         return None;
     };
-    if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
+    if !name.eq_ignore_ascii_case("count") && !name.eq_ignore_ascii_case("count_star") {
+        return None;
+    }
+    let count_star_shape = match args.as_slice() {
+        // `COUNT(*)` parses to `count_star` with no args.
+        [] if name.eq_ignore_ascii_case("count_star") => true,
+        // `COUNT(<literal>)` — the per-row test is "is this literal
+        // non-null?" which is constant, so it's COUNT(*) when the
+        // literal is non-null.
+        [Expr::Literal(lit)] => !matches!(lit, spg_sql::ast::Literal::Null),
+        // `COUNT(<column>)` — same answer as COUNT(*) when the
+        // column is statically declared NOT NULL on the input
+        // schema. Resolve through the alias if one is set.
+        [Expr::Column(c)] => {
+            if let Some(q) = c.qualifier.as_deref()
+                && let Some(alias) = table_alias
+                && !q.eq_ignore_ascii_case(alias)
+            {
+                return None;
+            }
+            schema_cols
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&c.name))
+                .is_some_and(|s| !s.nullable)
+        }
+        _ => return None,
+    };
+    if !count_star_shape {
         return None;
     }
     let col_name = alias.clone().unwrap_or_else(|| "count".to_string());
@@ -411,7 +448,7 @@ pub(crate) fn run(
     // pays its own allocation tax — group state map, synth schema
     // vec, finalize loop. `exists_in_60` (mailrs prod #4 baseline)
     // is exactly this shape on a 25 k-row JOIN.
-    if let Some(short) = try_pure_count_star_short_circuit(stmt, rows) {
+    if let Some(short) = try_pure_count_star_short_circuit(stmt, rows, schema_cols, table_alias) {
         return Ok(short);
     }
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
