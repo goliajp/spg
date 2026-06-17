@@ -82,9 +82,14 @@ impl Engine {
             // The memo is per-query and host expressions outlive it,
             // so an address that hit once stays valid.
             let plan_hit = m.expr_plans.contains_key(&key);
+            let exists_plan_hit = m.exists_plans.contains_key(&key);
             let mut subs: Vec<&SelectStatement> = Vec::new();
+            let mut exists_subs: Vec<&SelectStatement> = Vec::new();
             if !plan_hit {
                 collect_scalar_subqueries(expr, &mut subs);
+            }
+            if !exists_plan_hit {
+                collect_exists_subqueries(expr, &mut exists_subs);
             }
             if !plan_hit && !subs.is_empty() {
                 let mut plan: Vec<Option<alloc::rc::Rc<memoize::GroupMap>>> =
@@ -103,21 +108,65 @@ impl Engine {
                 hollow_scalar_subqueries(&mut template);
                 m.expr_plans.insert(key, (subs.len(), plan, template));
             }
-            if let Some((_, plan, template)) = m.expr_plans.get(&key)
-                && !plan.is_empty()
-                && plan.iter().all(|p| p.is_some())
-            {
-                // Fast path: every scalar subquery resolves via its
-                // map; clone the HOLLOW template (subquery bodies
-                // emptied at plan time - cloning full subquery ASTs
-                // per row was the dominant malloc load), splice map
-                // values, eval. Exists/IN subqueries (if any) still
-                // drop to the resolver.
-                let plan = plan.clone();
-                let mut e = template.clone();
-                let mut idx = 0usize;
-                let ok = splice_planned_subqueries(&mut e, &plan, &mut idx, row, ctx)?;
-                if ok {
+            // v7.34.2 — parallel EXISTS plan. Walk host ONCE in pre-order,
+            // build a decorrelated key-set for each EXISTS subquery via
+            // `try_batch_correlated_exists`, and cache the vec by host_ptr.
+            // Per-row dispatch below uses `splice_planned_exists` which
+            // increments an ordinal cursor — no `alloc::format!` per row.
+            if !exists_plan_hit && !exists_subs.is_empty() {
+                let mut eplan: Vec<Option<alloc::rc::Rc<memoize::ExistsSet>>> =
+                    Vec::with_capacity(exists_subs.len());
+                for sub in &exists_subs {
+                    let built = self
+                        .try_batch_correlated_exists(sub, cancel)?
+                        .map(alloc::rc::Rc::new);
+                    eplan.push(built);
+                }
+                m.exists_plans.insert(key, eplan);
+            }
+            // Fast-path gate: take it if we have a planned scalar set, a
+            // planned EXISTS set, or both — anything that lets us skip
+            // the per-row `expr.clone()` + `resolve_correlated_in_expr`
+            // dispatch for the corresponding subquery class.
+            let scalar_ready = m
+                .expr_plans
+                .get(&key)
+                .map(|(_, plan, _)| !plan.is_empty() && plan.iter().all(|p| p.is_some()))
+                .unwrap_or(false);
+            let exists_ready = m
+                .exists_plans
+                .get(&key)
+                .map(|plan| !plan.is_empty() && plan.iter().all(|p| p.is_some()))
+                .unwrap_or(false);
+            if scalar_ready || exists_ready {
+                // Fast path: every planned subquery resolves via its
+                // map; clone the (hollowed-where-scalar) template,
+                // splice map values, eval. EXISTS bodies are NOT
+                // hollowed (we don't traverse into them during splice —
+                // `splice_planned_exists` consumes the EXISTS node
+                // wholesale), so cloning the original `expr` works for
+                // the EXISTS-only path.
+                let scalar_plan = m
+                    .expr_plans
+                    .get(&key)
+                    .map(|(_, plan, template)| (plan.clone(), template.clone()));
+                let exists_plan = m.exists_plans.get(&key).cloned();
+                let mut e = match &scalar_plan {
+                    Some((_, template)) => template.clone(),
+                    None => expr.clone(),
+                };
+                let mut all_ok = true;
+                if let Some((plan, _)) = &scalar_plan {
+                    let mut idx = 0usize;
+                    all_ok &= splice_planned_subqueries(&mut e, plan, &mut idx, row, ctx)?;
+                }
+                if all_ok
+                    && let Some(plan) = &exists_plan
+                {
+                    let mut idx = 0usize;
+                    all_ok &= splice_planned_exists(&mut e, plan, &mut idx, row, ctx)?;
+                }
+                if all_ok {
                     if expr_has_subquery(&e) {
                         self.resolve_correlated_in_expr(&mut e, row, ctx, cancel, memo)?;
                     }
@@ -1706,6 +1755,174 @@ fn splice_planned_subqueries(
             }
             for item in list.iter_mut() {
                 if !splice_planned_subqueries(item, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
+/// v7.34.2 (EXISTS-FILTER baseline) — pre-order collect for EXISTS
+/// subqueries. Mirrors `collect_scalar_subqueries` so the per-row
+/// splice walker can re-traverse in the same order and pick the
+/// matching planned set by ordinal index — no string repr, no
+/// BTreeMap probe per row. ScalarSubquery / InSubquery nodes are
+/// skipped here (they ride their own planners).
+pub(crate) fn collect_exists_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
+    match e {
+        Expr::Exists { subquery, .. } => out.push(subquery.as_ref()),
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_exists_subqueries(lhs, out);
+            collect_exists_subqueries(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_exists_subqueries(expr, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_exists_subqueries(expr, out);
+            collect_exists_subqueries(pattern, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_exists_subqueries(a, out);
+            }
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            collect_exists_subqueries(call, out);
+            for o in order_by {
+                collect_exists_subqueries(&o.expr, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                collect_exists_subqueries(op, out);
+            }
+            for (w, t) in branches {
+                collect_exists_subqueries(w, out);
+                collect_exists_subqueries(t, out);
+            }
+            if let Some(eb) = else_branch {
+                collect_exists_subqueries(eb, out);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            collect_exists_subqueries(target, out);
+            collect_exists_subqueries(index, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_exists_subqueries(expr, out);
+            for item in list {
+                collect_exists_subqueries(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// v7.34.2 — per-row splice for the planned EXISTS sets. Walks the
+/// (cloned) host expression in the SAME pre-order as
+/// `collect_exists_subqueries`, increments `idx` past each EXISTS
+/// node, and replaces it in place with `Bool(true/false)` derived
+/// from the planned key-set + outer-row column values. Returns
+/// `Ok(false)` when any encountered EXISTS lacks a planned set; the
+/// caller falls back to the legacy per-row resolver path.
+fn splice_planned_exists(
+    e: &mut Expr,
+    plan: &[Option<alloc::rc::Rc<memoize::ExistsSet>>],
+    idx: &mut usize,
+    row: &Row,
+    ctx: &EvalContext<'_>,
+) -> Result<bool, EngineError> {
+    match e {
+        Expr::Exists { negated, .. } => {
+            let Some(Some(es)) = plan.get(*idx) else {
+                return Ok(false);
+            };
+            *idx += 1;
+            let (outer_cols, set) = es.as_ref();
+            let mut key_vals: Vec<Value> = Vec::with_capacity(outer_cols.len());
+            let mut any_null = false;
+            for oc in outer_cols {
+                let v = eval::eval_expr(&Expr::Column(oc.clone()), row, ctx)
+                    .map_err(EngineError::Eval)?;
+                if matches!(v, Value::Null) {
+                    any_null = true;
+                }
+                key_vals.push(v);
+            }
+            let present = !any_null && set.contains(&aggregate::encode_key(&key_vals));
+            let bit = if *negated { !present } else { present };
+            *e = Expr::Literal(Literal::Bool(bit));
+            Ok(true)
+        }
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => Ok(true),
+        Expr::Binary { lhs, rhs, .. } => Ok(splice_planned_exists(lhs, plan, idx, row, ctx)?
+            && splice_planned_exists(rhs, plan, idx, row, ctx)?),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            splice_planned_exists(expr, plan, idx, row, ctx)
+        }
+        Expr::Like { expr, pattern, .. } => Ok(splice_planned_exists(expr, plan, idx, row, ctx)?
+            && splice_planned_exists(pattern, plan, idx, row, ctx)?),
+        Expr::FunctionCall { args, .. } => {
+            for a in args.iter_mut() {
+                if !splice_planned_exists(a, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            if !splice_planned_exists(call, plan, idx, row, ctx)? {
+                return Ok(false);
+            }
+            for o in order_by.iter_mut() {
+                if !splice_planned_exists(&mut o.expr, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                if !splice_planned_exists(op, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            for (w, t) in branches.iter_mut() {
+                if !splice_planned_exists(w, plan, idx, row, ctx)?
+                    || !splice_planned_exists(t, plan, idx, row, ctx)?
+                {
+                    return Ok(false);
+                }
+            }
+            if let Some(eb) = else_branch {
+                if !splice_planned_exists(eb, plan, idx, row, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expr::ArraySubscript { target, index } => {
+            Ok(splice_planned_exists(target, plan, idx, row, ctx)?
+                && splice_planned_exists(index, plan, idx, row, ctx)?)
+        }
+        Expr::InList { expr, list, .. } => {
+            if !splice_planned_exists(expr, plan, idx, row, ctx)? {
+                return Ok(false);
+            }
+            for item in list.iter_mut() {
+                if !splice_planned_exists(item, plan, idx, row, ctx)? {
                     return Ok(false);
                 }
             }

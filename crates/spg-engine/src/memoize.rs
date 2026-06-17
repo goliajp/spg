@@ -124,6 +124,19 @@ pub struct MemoizeCache {
     /// repr -> Some(semi/anti-join key-set) or None when the shape can't
     /// decorrelate (don't re-analyse per row). Parallel to `group_maps`.
     pub exists_sets: alloc::collections::BTreeMap<String, Option<alloc::rc::Rc<ExistsSet>>>,
+    /// v7.34.2 (EXISTS-FILTER baseline finding) — host-expression-ptr
+    /// indexed plan: walk the WHERE expr ONCE, collect every EXISTS
+    /// subquery in pre-order, build a decorrelated set for each, and
+    /// store them as a `Vec` indexed by pre-order position. Per-row
+    /// dispatch then walks the (cloned) expression in the same
+    /// pre-order, increments an ordinal cursor, and reads the matching
+    /// set out of this plan instead of re-running
+    /// `alloc::format!("{subquery}")` and a fresh BTreeMap probe per
+    /// row — the dominant cost of the 7.34.0 EXISTS-FILTER baseline.
+    /// `None` slot = couldn't decorrelate that particular EXISTS; the
+    /// dispatcher falls back to the legacy per-row resolver for it.
+    pub exists_plans:
+        alloc::collections::BTreeMap<usize, Vec<Option<alloc::rc::Rc<ExistsSet>>>>,
     /// v7.29 (3c) - host-expression ptr -> (subquery count, plan).
     pub expr_plans: alloc::collections::BTreeMap<usize, ExprPlan>,
     /// v7.30.2 (mailrs round-25) - InList node ptr -> membership set
@@ -160,6 +173,7 @@ impl MemoizeCache {
             miss_count: 0,
             group_maps: alloc::collections::BTreeMap::new(),
             exists_sets: alloc::collections::BTreeMap::new(),
+            exists_plans: alloc::collections::BTreeMap::new(),
             expr_plans: alloc::collections::BTreeMap::new(),
             in_sets: alloc::collections::BTreeMap::new(),
             has_subquery: alloc::collections::BTreeMap::new(),

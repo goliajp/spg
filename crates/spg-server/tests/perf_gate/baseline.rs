@@ -207,6 +207,43 @@ fn baseline_exists_in_60() {
     );
 }
 
+// Diagnostic: three equivalent shapes for the EXISTS-FILTER baseline,
+// to isolate whether the 48 ms SPGE cost is the EXISTS decorr not
+// firing or whether a deeper semi-join plan is missing. PG handles all
+// three identically (hash semi-join under the covers).
+#[test]
+fn baseline_exists_filter_three_forms() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    let forms: &[(&str, &str)] = &[
+        (
+            "exists_subquery",
+            "SELECT COUNT(*) FROM messages m \
+                JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                WHERE mb.user_address = 'u@x' \
+                  AND EXISTS (SELECT 1 FROM email_analysis ea WHERE ea.message_id = m.id)",
+        ),
+        (
+            "in_subquery",
+            "SELECT COUNT(*) FROM messages m \
+                JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                WHERE mb.user_address = 'u@x' \
+                  AND m.id IN (SELECT message_id FROM email_analysis)",
+        ),
+        (
+            "manual_join",
+            "SELECT COUNT(*) FROM messages m \
+                JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                JOIN email_analysis ea ON ea.message_id = m.id \
+                WHERE mb.user_address = 'u@x'",
+        ),
+    ];
+    for (label, sql) in forms {
+        time_query(&mut db, sql, 10, label, 1000.0);
+    }
+}
+
 // Shape 6: GET-CONVERSATIONS-IN(60) — the mailrs prod hot path 169ef66
 // fixed (snippet subquery JOIN, IN-list of 60 thread ids). Picks 60
 // stable thread ids from the seed deterministically.
