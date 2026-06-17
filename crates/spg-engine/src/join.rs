@@ -1072,8 +1072,35 @@ impl Engine {
         // v7.29 - hashbrown over BTreeMap: the ordered map paid
         // O(log n) string comparisons per insert/probe (24k-row build
         // sides spent ~100 ms in it).
+        // v7.36 (perf — mailrs Phase 1) — type-specialised i64 hash
+        // table when the join keys are a single integer column on
+        // both sides (the overwhelming case: FK to PK joins, ID
+        // lookups). Skips the `encode_one` → String round-trip
+        // entirely; the hash key is the i64 itself. For count_messages
+        // / inbox / contacts / list_categories the eq_pair is
+        // `(messages.mailbox_id, mailboxes.id)` both BigInt.
+        let int_keyed = eq_pairs.len() == 1
+            && matches!(
+                combined_schema[eq_pairs[0].0].ty,
+                spg_storage::DataType::BigInt
+                    | spg_storage::DataType::Int
+                    | spg_storage::DataType::SmallInt
+            )
+            && {
+                let peer_col_ty = peer.cols.get(eq_pairs[0].1).map(|c| c.ty);
+                matches!(
+                    peer_col_ty,
+                    Some(
+                        spg_storage::DataType::BigInt
+                            | spg_storage::DataType::Int
+                            | spg_storage::DataType::SmallInt
+                    )
+                )
+            };
         let mut table: hashbrown::HashMap<String, Vec<usize>> =
-            hashbrown::HashMap::with_capacity(n_rights);
+            hashbrown::HashMap::with_capacity(if int_keyed { 0 } else { n_rights });
+        let mut int_table: hashbrown::HashMap<i64, Vec<usize>> =
+            hashbrown::HashMap::with_capacity(if int_keyed { n_rights } else { 0 });
         let mut keybuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
         // v7.31 (perf 3e) — scratch key buffer: build inserts allocate
         // only on vacant, probes never allocate.
@@ -1082,6 +1109,17 @@ impl Engine {
             let Some(right) = rights_src.get(ri) else {
                 continue;
             };
+            if int_keyed {
+                let rpos = eq_pairs[0].1;
+                let key = match right.values.get(rpos) {
+                    Some(Value::BigInt(n)) => *n,
+                    Some(Value::Int(n)) => i64::from(*n),
+                    Some(Value::SmallInt(n)) => i64::from(*n),
+                    _ => continue 'build,
+                };
+                int_table.entry(key).or_default().push(ri);
+                continue;
+            }
             keybuf.clear();
             for (_, rpos) in eq_pairs {
                 match right.values.get(*rpos) {
@@ -1097,21 +1135,42 @@ impl Engine {
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;
             let mut left_matched = false;
-            probebuf.clear();
             let mut left_has_null = false;
-            for (lpos, _) in eq_pairs {
-                match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
-                    Some(v) if !matches!(v, Value::Null) => probebuf.push(v),
+            let int_probe_key: Option<i64> = if int_keyed {
+                let lpos = eq_pairs[0].0;
+                match tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos) {
+                    Some(Value::BigInt(n)) => Some(*n),
+                    Some(Value::Int(n)) => Some(i64::from(*n)),
+                    Some(Value::SmallInt(n)) => Some(i64::from(*n)),
                     _ => {
                         left_has_null = true;
-                        break;
+                        None
                     }
                 }
-            }
-            if !left_has_null {
-                aggregate::encode_key_refs_into(&probebuf, &mut keystr);
-            }
-            if !left_has_null && let Some(cands) = table.get(keystr.as_str()) {
+            } else {
+                probebuf.clear();
+                for (lpos, _) in eq_pairs {
+                    match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
+                        Some(v) if !matches!(v, Value::Null) => probebuf.push(v),
+                        _ => {
+                            left_has_null = true;
+                            break;
+                        }
+                    }
+                }
+                if !left_has_null {
+                    aggregate::encode_key_refs_into(&probebuf, &mut keystr);
+                }
+                None
+            };
+            let cands_opt: Option<&Vec<usize>> = if left_has_null {
+                None
+            } else if int_keyed {
+                int_table.get(&int_probe_key.unwrap())
+            } else {
+                table.get(keystr.as_str())
+            };
+            if let Some(cands) = cands_opt {
                 for &ri in cands {
                     let keep = if residual.is_empty() {
                         true
