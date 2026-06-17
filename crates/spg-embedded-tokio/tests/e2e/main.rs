@@ -5,3 +5,4 @@
 mod async_db;
 mod prepare_bind;
 mod read_handle;
+mod shutdown_cancel;

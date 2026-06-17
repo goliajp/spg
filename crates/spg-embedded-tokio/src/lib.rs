@@ -39,6 +39,57 @@ pub use spg_embedded::{
 pub use spg_engine::CatalogSnapshot;
 
 use tokio::sync::RwLock;
+use tokio::task::JoinError;
+
+/// v7.34.1 (mailrs prod report bug B): drop the previous
+/// `.expect("spawn_blocking join")` shape that panicked on
+/// `JoinError::Cancelled` during runtime shutdown — a SIGKILL with any
+/// readonly call in flight reliably reproduced it. Cancelled is the
+/// expected state when the tokio runtime is being dropped; map it to
+/// `EngineError::Cancelled` so the caller's `?` propagates a clean
+/// "shutting down" error instead of a panic. A real panic inside the
+/// blocking closure still surfaces — `resume_unwind` re-throws the
+/// original payload so backtraces and any `catch_unwind` machinery
+/// keeps its semantics.
+trait FlattenBlockingExt<T> {
+    /// Result-returning closures: flatten `JoinHandle`'s outer error
+    /// into `EngineError`; an in-flight cancellation becomes
+    /// `Err(EngineError::Cancelled)`, panics propagate verbatim.
+    fn flatten_blocking(self) -> Result<T, EngineError>;
+}
+
+impl<T> FlattenBlockingExt<T> for Result<Result<T, EngineError>, JoinError> {
+    fn flatten_blocking(self) -> Result<T, EngineError> {
+        match self {
+            Ok(inner) => inner,
+            Err(je) if je.is_cancelled() => Err(EngineError::Cancelled),
+            Err(je) => std::panic::resume_unwind(je.into_panic()),
+        }
+    }
+}
+
+/// Same idea for `spawn_blocking` closures whose return type is a bare
+/// `T` (not a `Result`). Used by `read_handle` / `refresh` where the
+/// historical signature is `-> T`. Cancellation here surfaces as a
+/// panic with an honest message rather than the misleading
+/// "spawn_blocking join" string the old expect produced — a
+/// Result-returning rework of those two methods is the API-break that
+/// follow-up work would carry.
+trait UnwrapBlockingExt<T> {
+    fn unwrap_blocking(self) -> T;
+}
+
+impl<T> UnwrapBlockingExt<T> for Result<T, JoinError> {
+    fn unwrap_blocking(self) -> T {
+        match self {
+            Ok(v) => v,
+            Err(je) if je.is_cancelled() => {
+                panic!("spg-embedded-tokio: snapshot helper cancelled during runtime shutdown")
+            }
+            Err(je) => std::panic::resume_unwind(je.into_panic()),
+        }
+    }
+}
 
 /// Tokio-friendly handle to an embedded SPG database. Clone-cheap
 /// (`Arc` inside); every clone shares the same underlying engine.
@@ -106,7 +157,7 @@ impl AsyncDatabase {
         let path = path.as_ref().to_path_buf();
         let db = tokio::task::spawn_blocking(move || Database::open_path(path))
             .await
-            .expect("spawn_blocking join")?;
+            .flatten_blocking()?;
         Ok(Self {
             inner: Arc::new(RwLock::new(db)),
         })
@@ -140,7 +191,7 @@ impl AsyncDatabase {
             Ok(result)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.21 — run a multi-statement script with PG simple-query
@@ -161,7 +212,7 @@ impl AsyncDatabase {
             guard.execute_script(&sql)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// Run a SELECT and return rows as `Vec<Vec<Value>>`. Same
@@ -177,7 +228,7 @@ impl AsyncDatabase {
             guard.query(&sql)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.16.0 — parse + plan a SQL string once. Returns an
@@ -200,7 +251,7 @@ impl AsyncDatabase {
             })
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.17.0 Phase 3.P0-66 — async wrapper for
@@ -224,7 +275,7 @@ impl AsyncDatabase {
             guard.describe(&sql)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.16.0 — execute a prepared statement with bound params.
@@ -256,7 +307,7 @@ impl AsyncDatabase {
             Ok(result)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.16.0 — run a prepared SELECT with bound params and
@@ -278,7 +329,7 @@ impl AsyncDatabase {
             guard.query_prepared(&stmt_inner, &params)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.16.0 — column-aware variant of `query`. Returns the
@@ -300,7 +351,7 @@ impl AsyncDatabase {
             guard.query_with_columns(&sql)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.16.0 — column-aware variant of `query_prepared`. Same
@@ -322,7 +373,7 @@ impl AsyncDatabase {
             guard.query_prepared_with_columns(&stmt_inner, &params)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// Run a checkpoint (flush WAL into the catalog snapshot +
@@ -338,7 +389,7 @@ impl AsyncDatabase {
             guard.checkpoint()
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.20 P3 — inline snapshot clone for the read fan-out hot
@@ -374,7 +425,7 @@ impl AsyncDatabase {
             guard.engine().clone_snapshot()
         })
         .await
-        .expect("spawn_blocking join");
+        .unwrap_blocking();
         AsyncReadHandle {
             db: Arc::clone(&self.inner),
             snapshot,
@@ -413,7 +464,7 @@ impl AsyncReadHandle {
             spg_engine::Engine::execute_readonly_on_snapshot(&snapshot, &sql)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.18 — parse + plan a SQL string against this handle's
@@ -436,7 +487,7 @@ impl AsyncReadHandle {
             })
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.18 — execute a prepared statement against this handle's
@@ -460,7 +511,7 @@ impl AsyncReadHandle {
             Database::execute_prepared_on_snapshot(&snapshot, &stmt_inner, &params)
         })
         .await
-        .expect("spawn_blocking join")
+        .flatten_blocking()
     }
 
     /// v7.18 — describe a prepared SQL string against this
@@ -481,7 +532,7 @@ impl AsyncReadHandle {
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || Database::describe_on_snapshot(&snapshot, &sql))
             .await
-            .expect("spawn_blocking join")
+            .flatten_blocking()
     }
 
     /// Re-snapshot the underlying engine. Briefly takes the
@@ -494,7 +545,7 @@ impl AsyncReadHandle {
             guard.engine().clone_snapshot()
         })
         .await
-        .expect("spawn_blocking join");
+        .unwrap_blocking();
         self.snapshot = new_snapshot;
     }
 }
