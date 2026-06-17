@@ -400,6 +400,7 @@ async fn run_one(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(25);
+        let started = std::time::Instant::now();
         let inline = spg_embedded::Database::execute_prepared_on_snapshot_with_budget(
             &snap,
             &c.stmt,
@@ -409,17 +410,10 @@ async fn run_one(
         match inline {
             Ok(r) => r,
             Err(spg_embedded::EngineError::Cancelled) => {
-                // The embed-side slow-query signal: one line per
-                // escape, mirroring the server's slow_query_log.
-                eprintln!(
-                    "spg-sqlx: readonly query exceeded the {budget_ms} ms inline budget; \
-                     continuing on the blocking pool: {}",
-                    &sql[..sql.len().min(120)]
-                );
                 let stmt = c.stmt.clone();
                 let params_owned: Vec<spg_embedded::Value> =
                     params.as_deref().unwrap_or(&[]).to_vec();
-                tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     spg_embedded::Database::execute_prepared_on_snapshot(
                         &snap,
                         &stmt,
@@ -428,7 +422,21 @@ async fn run_one(
                 })
                 .await
                 .map_err(|e| Error::Protocol(format!("blocking-pool join: {e}")))?
-                .map_err(engine_to_sqlx)?
+                .map_err(engine_to_sqlx)?;
+                // v7.35.0 (mailrs ask #2, 3 reports running) — embed
+                // the total elapsed time in the budget-exceeded log
+                // line so the consumer can distinguish e.g. an 82 ms
+                // NOT-IN form from a 200 ms correlated scan. mailrs
+                // greps for "exceeded … inline budget" — the prefix
+                // is unchanged, the `elapsed_ms=N` suffix is purely
+                // additive.
+                let elapsed_ms = started.elapsed().as_millis();
+                eprintln!(
+                    "spg-sqlx: readonly query exceeded the {budget_ms} ms inline budget; \
+                     continuing on the blocking pool: elapsed_ms={elapsed_ms} sql={}",
+                    &sql[..sql.len().min(120)]
+                );
+                result
             }
             Err(e) => return Err(engine_to_sqlx(e)),
         }
