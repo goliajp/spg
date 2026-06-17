@@ -1484,18 +1484,38 @@ impl Engine {
         } else {
             alloc::boxed::Box::new(order_index.iter_asc())
         };
-        'walk: for (_key, locators) in walker {
+        let primary_table_name = primary_table.schema().name.clone();
+        'walk: for (key, locators) in walker {
             cancel.check()?;
             for loc in locators {
-                let row_idx = match *loc {
-                    spg_storage::RowLocator::Hot(i) => i,
-                    // Cold-tier rows belong to the legacy path so the
-                    // walker never crosses a tier boundary.
-                    spg_storage::RowLocator::Cold { .. } => return Ok(None),
+                // v7.34.6 (mailrs prod #6) — cold-tier dispatch on the
+                // walker. Pre-v7.34.6 bailed the whole walker on the
+                // first cold locator, which is exactly the prod-803MB
+                // shape: messages at scale has older rows promoted to
+                // cold segments, so the ORDER BY id DESC walk hits a
+                // cold locator on the very first batch and the entire
+                // plan falls back to the 82ms NOT-IN scan-and-sort.
+                // `Catalog::resolve_cold_locator` reads one cold
+                // segment page + decodes the dense row body, which
+                // ports the walker's early-stop across the tier
+                // boundary at ~µs per row.
+                let left_cow: Cow<'_, Row> = match *loc {
+                    spg_storage::RowLocator::Hot(i) => match primary_table.rows().get(i) {
+                        Some(r) => Cow::Borrowed(r),
+                        None => continue,
+                    },
+                    spg_storage::RowLocator::Cold { segment_id, .. } => {
+                        match self.active_catalog().resolve_cold_locator(
+                            &primary_table_name,
+                            segment_id,
+                            key,
+                        ) {
+                            Some(r) => Cow::Owned(r),
+                            None => continue,
+                        }
+                    }
                 };
-                let Some(left) = primary_table.rows().get(row_idx) else {
-                    continue;
-                };
+                let left: &Row = left_cow.as_ref();
                 keybuf.clear();
                 let mut left_has_null = false;
                 for (lpos, _) in &eq_pairs {
