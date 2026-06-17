@@ -234,6 +234,20 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             case_insensitive,
         } => match literal_text_pattern(pattern) {
             Some(pat) if fully_compilable(expr) => {
+                // v7.36 (perf — mailrs Phase 1, get_contacts hot
+                // inner) — trivial all-`%` pattern (`%`, `%%`, …)
+                // matches every non-NULL text. Collapse the LIKE
+                // into a `lhs IS NOT NULL` check: emit the operand
+                // then `IsNull { negated: !*negated }`. For ILIKE
+                // `%%` on 25 k rows the per-row `like_match_inner`
+                // → 2-char walk (~30 ns each) becomes a tag check
+                // (~3 ns); the operand still gets evaluated for the
+                // NULL semantics that SQL `LIKE` requires.
+                if !pat.is_empty() && pat.chars().all(|c| c == '%') {
+                    compile_into(expr, ctx, steps);
+                    steps.push(Step::IsNull { negated: !*negated });
+                    return;
+                }
                 compile_into(expr, ctx, steps);
                 let chars: alloc::vec::Vec<char> = if *case_insensitive {
                     pat.to_lowercase().chars().collect()
