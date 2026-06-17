@@ -83,22 +83,30 @@ fn inbox_query_on_25k_rows_stays_under_budget() {
     let _g = crate::perf_lock();
     let mut db = Engine::new();
     seed(&mut db);
-    // Warm-up once (plan cache, allocator), then measure.
+    // Warm-up once (plan cache, allocator), then 10 measured iterations
+    // so the eprintln below carries a stable median for the mailrs perf
+    // ledger — single-shot timing pingponged ±20 % between runs.
     db.execute(INBOX).unwrap();
-    let t = Instant::now();
-    let r = db.execute(INBOX).unwrap();
-    let elapsed = t.elapsed();
-    match r {
-        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 50),
-        other => panic!("{other:?}"),
+    let mut samples = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let t = Instant::now();
+        let r = db.execute(INBOX).unwrap();
+        let elapsed = t.elapsed();
+        match r {
+            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 50),
+            other => panic!("{other:?}"),
+        }
+        samples.push(elapsed.as_secs_f64() * 1000.0);
     }
-    // Measured ~1.1 s on an M-series laptop (release); 4 s budget
-    // gives shared-runner headroom while still failing the
-    // pre-round-22 executor (which never returned at all).
-    assert!(
-        elapsed.as_secs_f64() < 4.0,
-        "inbox query took {elapsed:?} on the 25k dataset (budget 4 s)"
-    );
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = samples[samples.len() / 2];
+    let min = samples[0];
+    let max = *samples.last().unwrap();
+    eprintln!("inbox_25k embed: p50={p50:.1}ms min={min:.1}ms max={max:.1}ms (n=10)");
+    // Measured ~38 ms on a cold M-series laptop (release) post-7.32
+    // P4/argmax; 4 s budget gives shared-runner headroom while still
+    // failing the pre-round-22 executor (which never returned at all).
+    assert!(p50 < 4000.0, "inbox query p50={p50}ms (budget 4 s)");
 }
 
 #[test]
