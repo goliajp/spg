@@ -3045,8 +3045,28 @@ fn encode_pg_text_cell(out: &mut Vec<u8>, v: &Value, ty: Option<DataType>) -> st
 fn write_cell_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> std::io::Result<()> {
     let len =
         i32::try_from(bytes.len()).map_err(|_| std::io::Error::other("cell value too large"))?;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(bytes);
+    // v7.35.0 — single `reserve` + single `copy_from_nonoverlapping`
+    // burst, replacing the two `extend_from_slice` calls. Each
+    // `extend_from_slice` runs its own capacity check + `memmove`
+    // dispatch, so a 25 k-row × 5-cell PROJ paid 250 k extra
+    // capacity branches + 125 k extra memmove invocations vs the
+    // contiguous layout below. `reserve` makes the bound check
+    // exact-once; the manual ptr writes copy length-prefix + payload
+    // back-to-back; `set_len` advances the head past both.
+    let total = 4usize + bytes.len();
+    out.reserve(total);
+    let len_be = len.to_be_bytes();
+    // SAFETY: `reserve` above guarantees `out.capacity() >=
+    // out.len() + total`; the writes stay within `[head, head+total)`
+    // which is in bounds and uninitialised. `set_len` after both
+    // writes finalises the new length.
+    #[allow(unsafe_code)]
+    unsafe {
+        let head = out.as_mut_ptr().add(out.len());
+        core::ptr::copy_nonoverlapping(len_be.as_ptr(), head, 4);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), head.add(4), bytes.len());
+        out.set_len(out.len() + total);
+    }
     Ok(())
 }
 
@@ -3478,6 +3498,36 @@ mod tests {
             write_cell_date(&mut buf, days).unwrap();
             let got = std::str::from_utf8(read_cell(&buf)).unwrap();
             assert_eq!(got, expected, "date mismatch @ days={days}");
+        }
+    }
+
+    /// v7.35.0 — `write_cell_bytes` byte-level equivalence vs the
+    /// pre-7.35 `extend_from_slice` form. The new path uses a
+    /// single `reserve` + two `copy_nonoverlapping` writes inside
+    /// an `unsafe` block; this test pins the output byte-for-byte
+    /// across empty / single-byte / mid-size / large payloads, so
+    /// any regression on the `unsafe` accounting fails loudly.
+    #[test]
+    fn write_cell_bytes_matches_extend_form() {
+        fn extend_form(out: &mut Vec<u8>, bytes: &[u8]) {
+            let len = i32::try_from(bytes.len()).unwrap();
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+        let cases: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"hello",
+            b"abcdefghij" as &[u8],
+            &[0u8; 256],
+            &[0xffu8; 1024],
+        ];
+        for bytes in cases {
+            let mut got = Vec::new();
+            write_cell_bytes(&mut got, bytes).unwrap();
+            let mut want = Vec::new();
+            extend_form(&mut want, bytes);
+            assert_eq!(got, want, "len={}", bytes.len());
         }
     }
 
