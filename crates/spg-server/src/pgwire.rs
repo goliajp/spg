@@ -237,8 +237,12 @@ fn handle_pg_simple_query(
         Ok(QueryResult::Rows { columns, rows }) => {
             send_row_description(wbuf, &columns)?;
             let n = rows.len();
+            // Pre-reserve roughly one DataRow frame's worth per row so
+            // the inner `out.push`/`extend_from_slice` calls don't keep
+            // re-growing the response buffer for a 25 k-row PROJ.
+            wbuf.reserve(n.saturating_mul(64));
             for row in &rows {
-                send_data_row(wbuf, &columns, row)?;
+                encode_data_row(wbuf, &columns, row)?;
             }
             send_command_complete(wbuf, &format!("SELECT {n}"))?;
         }
@@ -2882,6 +2886,34 @@ fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> st
     send_msg(stream, b'D', &body)
 }
 
+/// v7.34 (SPGS perf bar) — direct-into-`Vec` DataRow encoder, used by
+/// the simple-query Q hot path. `send_data_row` above always built two
+/// intermediate `Vec`s per row (one for the body, one stitched together
+/// inside `send_msg`) and copied between them, so a 25 k-row PROJ
+/// burned 50 k `Vec::with_capacity` calls + 25 k body→frame copies
+/// before the bytes even reached `wbuf`. This variant writes the
+/// `b'D'` frame straight into the simple-query response buffer with a
+/// backpatched length prefix — zero intermediate allocations per row.
+/// `send_data_row` is kept around for canned responses and the
+/// extended-protocol path (line 1625), which see at most a handful of
+/// rows per call and don't justify the same buffer-handle threading.
+fn encode_data_row(out: &mut Vec<u8>, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
+    let n = u16::try_from(row.values.len())
+        .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
+    let frame_start = out.len();
+    out.push(b'D');
+    out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
+    out.extend_from_slice(&n.to_be_bytes());
+    for (i, v) in row.values.iter().enumerate() {
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty))?;
+    }
+    let body_plus_len_field = out.len() - frame_start - 1;
+    let len = u32::try_from(body_plus_len_field)
+        .map_err(|_| std::io::Error::other("PG message body too large"))?;
+    out[frame_start + 1..frame_start + 5].copy_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
 /// v7.34 (B5 ledger) — type-dispatched text-mode cell encoder for the
 /// hot projection types. The legacy `value_to_pg_text` always returns
 /// an owned `String` (per-cell `to_string()` + `s.clone()`), which on
@@ -2923,16 +2955,34 @@ fn write_cell_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn write_cell_int(out: &mut Vec<u8>, n: i64) -> std::io::Result<()> {
-    // i64::MIN is "-9223372036854775808" — 20 chars; 24-byte stack
-    // buffer leaves room without ever spilling.
+    // i64::MIN is "-9223372036854775808" — 20 chars + sign. The buffer
+    // below leaves headroom so the loop's `pos -= 1` never underflows
+    // even on the worst case.
     let mut buf = [0u8; 24];
-    let written = {
-        let mut tail: &mut [u8] = &mut buf;
-        use std::io::Write as _;
-        write!(tail, "{n}")?;
-        24 - tail.len()
+    let mut pos = buf.len();
+    let (mut x, negative) = if n < 0 {
+        // Negate via u64 so i64::MIN doesn't overflow.
+        ((n as i128).unsigned_abs() as u64, true)
+    } else {
+        (n as u64, false)
     };
-    write_cell_bytes(out, &buf[..written])
+    // ASCII decimal, least-significant digit first into the tail of the
+    // buffer; std::fmt::Write's Display machinery costs measurably more
+    // per call (state machine + formatter setup) than a tight loop
+    // here, and at 50 k BigInt cells per 25 k-row PROJ that adds up.
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    if negative {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    write_cell_bytes(out, &buf[pos..])
 }
 
 // ---- Type mapping ----
