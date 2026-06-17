@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 
 use spg_sql::ast::{
     BinOp, ColumnName, Expr, FromJoin, JoinKind, Literal, SelectItem, SelectStatement, TableRef,
+    UnOp,
 };
 use spg_storage::{Row, Value};
 
@@ -1374,38 +1375,189 @@ impl Engine {
         let conjuncts = reorder::split_and_conjunctions(&where_expr);
         let mut survivors: Vec<Expr> = Vec::new();
         let mut new_joins: Vec<FromJoin> = Vec::new();
+        let mut rewrote_any = false;
         for c in conjuncts {
-            if let Expr::Exists { subquery, negated } = c
-                && let Some((join, residual)) = self.try_pull_up_exists_sublink(
-                    subquery,
-                    *negated,
-                    &outer_aliases,
-                    new_joins.len(),
-                )
-            {
-                new_joins.push(join);
-                if let Some(r) = residual {
-                    survivors.push(r);
+            // v7.34.3 — the parser emits `NOT EXISTS(...)` as
+            // `Expr::Unary{Not, Exists{negated:false, …}}`, NOT as
+            // `Exists{negated:true}`. Match both shapes so the
+            // pull-up handles both `EXISTS` and `NOT EXISTS`.
+            let parsed: Option<(&SelectStatement, bool)> = match c {
+                Expr::Exists { subquery, negated } => Some((subquery.as_ref(), *negated)),
+                Expr::Unary {
+                    op: UnOp::Not,
+                    expr,
+                } => match expr.as_ref() {
+                    Expr::Exists { subquery, negated } => Some((subquery.as_ref(), !*negated)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((subquery, neg)) = parsed {
+                // Try the `[NOT] IN (SELECT k FROM t)` rewrite FIRST.
+                // The InSet path already gives the executor an O(outer)
+                // per-row membership probe over an O(inner) build, ride
+                // the existing `subquery_replacement` materialise +
+                // 7.34.3 `filter_table_indices` seed-dedup; the prod
+                // `mailrs_prod_not_exists` 250 k probe drops 178 ms
+                // (LEFT JOIN + IS NULL form) → 74 ms (NOT IN form).
+                // Fall back to the LEFT JOIN + IS NULL injection only
+                // when NOT IN would be unsafe (negated case + nullable
+                // inner.k — NOT IN's three-valued logic treats a NULL
+                // probe element as "unknown for every outer row").
+                if let Some(rewritten) =
+                    self.try_pull_up_exists_as_in(subquery, neg, &outer_aliases)
+                {
+                    survivors.push(rewritten);
+                    rewrote_any = true;
+                    continue;
                 }
-                continue;
+                if let Some((join, residual)) =
+                    self.try_pull_up_exists_sublink(subquery, neg, &outer_aliases, new_joins.len())
+                {
+                    new_joins.push(join);
+                    if let Some(r) = residual {
+                        survivors.push(r);
+                    }
+                    rewrote_any = true;
+                    continue;
+                }
             }
             survivors.push(c.clone());
         }
-        if new_joins.is_empty() {
+        if !rewrote_any {
             stmt.where_ = Some(where_expr);
             return false;
         }
-        stmt.from
-            .as_mut()
-            .expect("from present")
-            .joins
-            .extend(new_joins);
+        if !new_joins.is_empty() {
+            stmt.from
+                .as_mut()
+                .expect("from present")
+                .joins
+                .extend(new_joins);
+        }
         stmt.where_ = survivors.into_iter().reduce(|a, b| Expr::Binary {
             lhs: alloc::boxed::Box::new(a),
             op: BinOp::And,
             rhs: alloc::boxed::Box::new(b),
         });
         true
+    }
+
+    /// v7.34.3 — emit the EXISTS conjunct as `outer.col IN (SELECT
+    /// inner.k FROM inner.table)` (or its negated form). Eligibility
+    /// mirrors `try_pull_up_exists_sublink` — single plain-table FROM,
+    /// no shape-breaking clauses, exactly one `inner.k = outer.col`
+    /// correlation plus optional all-inner predicates — except no
+    /// uniqueness check is needed (IN handles duplicate inner.k
+    /// fine). For the NEGATED case we ALSO require inner.k to be
+    /// declared NOT NULL: `outer.col NOT IN (set with NULL)` returns
+    /// UNKNOWN for every outer row in SQL three-valued logic, which
+    /// differs from NOT EXISTS semantics. None on ineligible →
+    /// caller falls back to the LEFT JOIN + IS NULL injection or
+    /// the legacy per-row resolver.
+    fn try_pull_up_exists_as_in(
+        &self,
+        inner: &SelectStatement,
+        negated: bool,
+        outer_aliases: &alloc::collections::BTreeSet<String>,
+    ) -> Option<Expr> {
+        if !inner.ctes.is_empty()
+            || !inner.unions.is_empty()
+            || inner.group_by.is_some()
+            || inner.having.is_some()
+            || inner.distinct
+            || !inner.order_by.is_empty()
+            || inner.limit.is_some()
+            || inner.offset.is_some()
+        {
+            return None;
+        }
+        let from = inner.from.as_ref()?;
+        if !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.as_of_segment.is_some()
+        {
+            return None;
+        }
+        let inner_table = from.primary.name.clone();
+        let inner_alias = from
+            .primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| inner_table.clone());
+        let is_inner = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(&inner_alias))
+        };
+        let is_outer = |c: &ColumnName| -> bool {
+            c.qualifier
+                .as_deref()
+                .is_some_and(|q| outer_aliases.contains(&q.to_ascii_lowercase()))
+        };
+        let w = inner.where_.as_ref()?;
+        let mut corr: Option<(String, ColumnName)> = None;
+        let mut rest: Vec<Expr> = Vec::new();
+        for c in reorder::split_and_conjunctions(w) {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::Eq,
+                rhs,
+            } = c
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let pair = if is_inner(a) && is_outer(b) {
+                    Some((a.name.clone(), b.clone()))
+                } else if is_inner(b) && is_outer(a) {
+                    Some((b.name.clone(), a.clone()))
+                } else {
+                    None
+                };
+                if let Some(p) = pair {
+                    if corr.is_some() {
+                        return None;
+                    }
+                    corr = Some(p);
+                    continue;
+                }
+            }
+            if !expr_is_all_inner(c, &inner_alias) {
+                return None;
+            }
+            rest.push(c.clone());
+        }
+        let (inner_key, outer_col) = corr?;
+        if negated && !self.column_is_not_null(&inner_table, &inner_key) {
+            return None;
+        }
+        // Build the rewritten inner SELECT: `SELECT inner.k FROM
+        // inner.table [WHERE rest]`. The correlation conjunct is
+        // dropped — IN-subquery handles equality membership. All-inner
+        // residual predicates ride into the new WHERE.
+        let mut rewritten = inner.clone();
+        rewritten.limit = None;
+        rewritten.offset = None;
+        rewritten.order_by = Vec::new();
+        rewritten.distinct = false;
+        rewritten.where_ = rest.into_iter().reduce(|a, b| Expr::Binary {
+            lhs: alloc::boxed::Box::new(a),
+            op: BinOp::And,
+            rhs: alloc::boxed::Box::new(b),
+        });
+        rewritten.items = alloc::vec![SelectItem::Expr {
+            expr: Expr::Column(ColumnName {
+                qualifier: Some(inner_alias),
+                name: inner_key,
+            }),
+            alias: None,
+        }];
+        Some(Expr::InSubquery {
+            expr: alloc::boxed::Box::new(Expr::Column(outer_col)),
+            subquery: alloc::boxed::Box::new(rewritten),
+            negated,
+        })
     }
 
     fn try_pull_up_exists_sublink(
@@ -1540,6 +1692,44 @@ impl Engine {
             None
         };
         Some((join, residual))
+    }
+
+    /// v7.34.3 — true when `col` on `table` is declared NOT NULL (the
+    /// `ColumnSchema.nullable` flag is `false`). Used to gate the
+    /// `NOT EXISTS → NOT IN` rewrite, since SQL three-valued logic
+    /// turns `outer.col NOT IN (set with NULL)` into UNKNOWN for every
+    /// outer row, which would differ from the NOT EXISTS semantics.
+    fn column_is_not_null(&self, table: &str, col: &str) -> bool {
+        let Some(t) = self.active_catalog().get(table) else {
+            return false;
+        };
+        let sch = t.schema();
+        // Direct flag — cheap path. Covers explicit NOT NULL columns
+        // and table-level PK constraints (ddl.rs line 1252).
+        if sch
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(col))
+            .is_some_and(|c| !c.nullable)
+        {
+            return true;
+        }
+        // v7.34.3 — inline `PRIMARY KEY` on a column definition
+        // (e.g. `id BIGSERIAL PRIMARY KEY`) does NOT currently flip
+        // `ColumnSchema.nullable` to false in ddl.rs (only the
+        // table-level `CONSTRAINT … PRIMARY KEY (col)` shape does).
+        // PK semantically implies NOT NULL, so cross-check the
+        // installed uniqueness constraints' `is_primary_key` flag too.
+        let Some(pos) = sch
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col))
+        else {
+            return false;
+        };
+        sch.uniqueness_constraints
+            .iter()
+            .any(|u| u.is_primary_key && u.columns.as_slice() == [pos])
     }
 
     /// True when `col` on `table` is covered by a single-column UNIQUE or
