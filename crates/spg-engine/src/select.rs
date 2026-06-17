@@ -31,8 +31,8 @@ use crate::{
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
     synth_pg_roles, synth_pg_settings, synth_pg_trigger, synth_pg_type, synth_pg_views,
-    try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n, try_trgm_seek,
-    value_is_integer, value_to_i64,
+    try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n, try_trgm_seek, value_is_integer,
+    value_to_i64,
 };
 
 impl Engine {
@@ -1991,6 +1991,15 @@ impl Engine {
         from: &FromClause,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.34.5 (mailrs prod #5) — walker-driven join + early stop.
+        // When ORDER BY is on an indexed primary column, walking the
+        // btree in the requested direction lets the streamer break
+        // after `LIMIT + OFFSET` survivors without ever materialising
+        // the rest of the join — the 80 ms `mailrs_prod_not_exists`
+        // plateau is exactly this shape.
+        if let Some(out) = self.try_streamed_inner_join_walk_topn(stmt, from, cancel)? {
+            return Ok(out);
+        }
         // v7.30.3 (mailrs round-26) — the bounded single-join path
         // first; peak memory scales with LIMIT instead of the table.
         if let Some(out) = self.try_streamed_inner_join_topn(stmt, from, cancel)? {

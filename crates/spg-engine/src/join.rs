@@ -1298,6 +1298,291 @@ impl Engine {
     /// with the answer, not the table. Returns Ok(None) when the shape
     /// doesn't qualify; the caller falls through to the general path,
     /// which the byte budget guards.
+    /// v7.34.5 (mailrs prod #5 / `content_worker` 250 k) — walker-
+    /// driven sibling of `try_streamed_inner_join_topn`. When the
+    /// outer ORDER BY is on an indexed primary column, drive the
+    /// primary scan via the BTree iterator in the requested
+    /// direction so rows arrive already in ORDER BY order; the join
+    /// + WHERE filter + early-stop run unchanged afterwards, BUT
+    /// the heap-based top-N (which still walks every primary row)
+    /// becomes a plain `Vec` that breaks after `LIMIT + OFFSET`
+    /// survivors. Mirrors the single-table `try_pk_walk_top_n`
+    /// eligibility gates plus the `try_streamed_inner_join_topn`
+    /// join-shape gates. Returns `None` on any miss → the legacy
+    /// heap streamer + general path handle it.
+    pub(crate) fn try_streamed_inner_join_walk_topn(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        let Some(limit) = stmt.limit_literal() else {
+            return Ok(None);
+        };
+        if stmt.offset.is_some() && stmt.offset_literal().is_none() {
+            return Ok(None);
+        }
+        if stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || aggregate::uses_aggregate(stmt)
+        {
+            return Ok(None);
+        }
+        if from.joins.len() != 1 {
+            return Ok(None);
+        }
+        let j = &from.joins[0];
+        if !matches!(j.kind, JoinKind::Inner) {
+            return Ok(None);
+        }
+        let plain = |t: &TableRef| {
+            t.unnest_expr.is_none() && t.lateral_subquery.is_none() && t.as_of_segment.is_none()
+        };
+        if !plain(&from.primary) || !plain(&j.table) {
+            return Ok(None);
+        }
+        let Some(on_expr) = j.on.as_ref() else {
+            return Ok(None);
+        };
+        let Some(primary_table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        if self.active_catalog().get(&j.table.name).is_none() {
+            return Ok(None);
+        }
+        let primary_alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str())
+            .to_string();
+        // Walker eligibility — single-key ORDER BY on a btree-indexed
+        // primary column.
+        if stmt.order_by.len() != 1 {
+            return Ok(None);
+        }
+        let order = &stmt.order_by[0];
+        let Expr::Column(order_col) = &order.expr else {
+            return Ok(None);
+        };
+        if let Some(q) = &order_col.qualifier
+            && !q.eq_ignore_ascii_case(&primary_alias)
+        {
+            return Ok(None);
+        }
+        let primary_cols = primary_table.schema().columns.clone();
+        let Some(order_col_pos) = primary_cols
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&order_col.name))
+        else {
+            return Ok(None);
+        };
+        let Some(order_index) = primary_table.index_on(order_col_pos) else {
+            return Ok(None);
+        };
+        if !matches!(order_index.kind, spg_storage::IndexKind::BTree(_)) {
+            return Ok(None);
+        }
+        // Peer side: same materialise + prune as the heap streamer.
+        let peer_alias = j
+            .table
+            .alias
+            .as_deref()
+            .unwrap_or(j.table.name.as_str())
+            .to_string();
+        let mut needed = alloc::collections::BTreeSet::new();
+        let prunable = collect_qualified_refs(stmt, &mut needed).is_some();
+        let mut budget = ByteBudget::new(self.max_query_bytes);
+        let (mut peer_rows, peer_cols) = self.materialise_table_ref_filtered(&j.table, &[])?;
+        if prunable {
+            Self::null_out_unreferenced(&mut peer_rows, &peer_cols, &peer_alias, &needed);
+        }
+        budget.charge(approx_rows_bytes(&peer_rows))?;
+        let mut combined_schema: Vec<ColumnSchema> = Vec::new();
+        for col in &primary_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{primary_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        for col in &peer_cols {
+            combined_schema.push(ColumnSchema::new(
+                alloc::format!("{peer_alias}.{}", col.name),
+                col.ty,
+                col.nullable,
+            ));
+        }
+        let ctx = EvalContext::new(&combined_schema, None);
+        let left_arity = primary_cols.len();
+        let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut residual: Vec<&Expr> = Vec::new();
+        for sub in reorder::split_and_conjunctions(on_expr) {
+            let mut matched = None;
+            if let Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::Eq,
+                rhs,
+            } = sub
+                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
+            {
+                let left_slice = &combined_schema[..left_arity];
+                if let (Some(l), Some(r)) = (
+                    Self::composite_col_pos(left_slice, a),
+                    Self::peer_col_pos(&peer_alias, &peer_cols, b),
+                ) {
+                    matched = Some((l, r));
+                } else if let (Some(l), Some(r)) = (
+                    Self::composite_col_pos(left_slice, b),
+                    Self::peer_col_pos(&peer_alias, &peer_cols, a),
+                ) {
+                    matched = Some((l, r));
+                }
+            }
+            match matched {
+                Some(pair) => eq_pairs.push(pair),
+                None => residual.push(sub),
+            }
+        }
+        if eq_pairs.is_empty() {
+            return Ok(None);
+        }
+        // Hash the peer on the equality key (same as the heap streamer).
+        let mut htable: hashbrown::HashMap<String, Vec<usize>> =
+            hashbrown::HashMap::with_capacity(peer_rows.len());
+        let mut keybuf: Vec<Value> = Vec::with_capacity(eq_pairs.len());
+        'build: for (ri, right) in peer_rows.iter().enumerate() {
+            keybuf.clear();
+            for (_, rpos) in &eq_pairs {
+                let v = right.values.get(*rpos).cloned().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    continue 'build;
+                }
+                keybuf.push(v);
+            }
+            htable
+                .entry(aggregate::encode_key(&keybuf))
+                .or_default()
+                .push(ri);
+        }
+        let keep_mask: Vec<bool> = primary_cols
+            .iter()
+            .map(|c| !prunable || needed.contains(&(primary_alias.clone(), c.name.clone())))
+            .collect();
+        let keep = (limit as usize).saturating_add(stmt.offset_literal().map_or(0, |o| o as usize));
+        let mut where_memo = memoize::MemoizeCache::default();
+        let mut plain_sink: Vec<Row> = Vec::with_capacity(keep.min(1024));
+        // Walker drive: walk primary via btree index in ORDER BY
+        // direction. Rows arrive already sorted; plain_sink + early
+        // stop replaces the heap.
+        let walker: alloc::boxed::Box<
+            dyn Iterator<Item = (&spg_storage::IndexKey, &Vec<spg_storage::RowLocator>)>,
+        > = if order.desc {
+            alloc::boxed::Box::new(order_index.iter_desc())
+        } else {
+            alloc::boxed::Box::new(order_index.iter_asc())
+        };
+        'walk: for (_key, locators) in walker {
+            cancel.check()?;
+            for loc in locators {
+                let row_idx = match *loc {
+                    spg_storage::RowLocator::Hot(i) => i,
+                    // Cold-tier rows belong to the legacy path so the
+                    // walker never crosses a tier boundary.
+                    spg_storage::RowLocator::Cold { .. } => return Ok(None),
+                };
+                let Some(left) = primary_table.rows().get(row_idx) else {
+                    continue;
+                };
+                keybuf.clear();
+                let mut left_has_null = false;
+                for (lpos, _) in &eq_pairs {
+                    let v = left.values.get(*lpos).cloned().unwrap_or(Value::Null);
+                    if matches!(v, Value::Null) {
+                        left_has_null = true;
+                        break;
+                    }
+                    keybuf.push(v);
+                }
+                if left_has_null {
+                    continue;
+                }
+                let Some(cands) = htable.get(&aggregate::encode_key(&keybuf)) else {
+                    continue;
+                };
+                for &ri in cands {
+                    let right = &peer_rows[ri];
+                    let mut combined_vals: Vec<Value> =
+                        Vec::with_capacity(left_arity + peer_cols.len());
+                    for (i, v) in left.values.iter().enumerate() {
+                        combined_vals.push(if keep_mask.get(i).copied().unwrap_or(true) {
+                            v.clone()
+                        } else {
+                            Value::Null
+                        });
+                    }
+                    combined_vals.extend(right.values.iter().cloned());
+                    let combined = Row::new(combined_vals);
+                    let mut ok = true;
+                    for r in &residual {
+                        let cond =
+                            self.eval_expr_with_correlated(r, &combined, &ctx, cancel, None)?;
+                        if !matches!(cond, Value::Bool(true)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    if let Some(w) = stmt.where_.as_ref() {
+                        let cond = self.eval_expr_with_correlated(
+                            w,
+                            &combined,
+                            &ctx,
+                            cancel,
+                            Some(&mut where_memo),
+                        )?;
+                        if !matches!(cond, Value::Bool(true)) {
+                            continue;
+                        }
+                    }
+                    budget.charge(approx_row_bytes(&combined))?;
+                    plain_sink.push(combined);
+                    if plain_sink.len() >= keep {
+                        break 'walk;
+                    }
+                }
+            }
+        }
+        // Already in ORDER BY order from the walk.
+        let mut output = plain_sink;
+        apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
+        let projection = build_projection(&stmt.items, &combined_schema, "")?;
+        let mut proj_memo = memoize::MemoizeCache::default();
+        let mut rows: Vec<Row> = Vec::with_capacity(output.len());
+        for row in &output {
+            let mut values = Vec::with_capacity(projection.len());
+            for p in &projection {
+                values.push(self.eval_expr_with_correlated(
+                    &p.expr,
+                    row,
+                    &ctx,
+                    cancel,
+                    Some(&mut proj_memo),
+                )?);
+            }
+            rows.push(Row::new(values));
+        }
+        let columns: Vec<ColumnSchema> = projection
+            .into_iter()
+            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .collect();
+        Ok(Some(QueryResult::Rows { columns, rows }))
+    }
+
     pub(crate) fn try_streamed_inner_join_topn(
         &self,
         stmt: &SelectStatement,
