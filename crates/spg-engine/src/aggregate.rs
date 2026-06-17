@@ -2562,27 +2562,27 @@ fn rewrite_group_keys_in_select(
 /// Canonical string key for a tuple of group values. Used as map key.
 /// Per-value group-key encoding (shared by owned and borrowed paths).
 fn encode_one(out: &mut String, v: &Value) {
+    use core::fmt::Write;
     match v {
         Value::Null => out.push_str("N|"),
+        // v7.36 (perf — mailrs Phase 1) — switch the integer / float
+        // encoders to `write!`. `n.to_string()` allocates a fresh
+        // `String` per cell just to push its bytes into the
+        // (already-cleared) reuse buffer — for the 25 k-row JOIN
+        // probe in `count_messages` that's 25 k heap allocs per
+        // query. `write!(&mut String, ...)` formats straight into
+        // the buffer; no intermediate alloc.
         Value::SmallInt(n) => {
-            out.push('s');
-            out.push_str(&n.to_string());
-            out.push('|');
+            let _ = write!(out, "s{n}|");
         }
         Value::Int(n) => {
-            out.push('I');
-            out.push_str(&n.to_string());
-            out.push('|');
+            let _ = write!(out, "I{n}|");
         }
         Value::BigInt(n) => {
-            out.push('B');
-            out.push_str(&n.to_string());
-            out.push('|');
+            let _ = write!(out, "B{n}|");
         }
         Value::Float(x) => {
-            out.push('F');
-            out.push_str(&x.to_string());
-            out.push('|');
+            let _ = write!(out, "F{x}|");
         }
         Value::Bool(b) => {
             out.push(if *b { 'T' } else { 'f' });
