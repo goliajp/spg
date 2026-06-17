@@ -433,6 +433,13 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     // this brings the same property to high-latency networks.
     const PIPELINE_FLUSH_BYTES: usize = 4096;
     let mut wbuf: Vec<u8> = Vec::with_capacity(8192);
+    // v7.36 (perf — mailrs Phase 1 wire) — reusable inbound message
+    // buffer. Pre-7.36 every protocol message allocated a fresh
+    // `Vec<u8>` for the body (Bind / Execute / Sync = 3-4 fresh
+    // allocs per prepared query); now we grow once and reuse,
+    // resizing the buffer in place for each message. Same `&[u8]`
+    // borrow shape downstream — handlers don't notice.
+    let mut rbuf: Vec<u8> = Vec::with_capacity(8192);
     loop {
         let mut header = [0u8; 5];
         if let Err(e) = stream.read_exact(&mut header) {
@@ -445,10 +452,11 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         // PG length includes the 4 bytes of the length itself.
         let body_len = len.saturating_sub(4);
-        let mut body = vec![0u8; body_len];
+        rbuf.resize(body_len, 0);
         if body_len > 0 {
-            stream.read_exact(&mut body)?;
+            stream.read_exact(&mut rbuf)?;
         }
+        let body: &[u8] = &rbuf;
 
         match msg_type {
             b'Q' => handle_pg_simple_query(
