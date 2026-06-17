@@ -551,11 +551,19 @@ impl Engine {
                     // small-peer case (30 ≤ 256 goes eager).
                     const SMALL_PEER_EAGER_ROWS: usize = 256;
                     let has_pushdown = !peer_preds[pidx].is_empty();
-                    let peer_total = t
-                        .rows()
-                        .len()
-                        .saturating_add(t.count_cold_locators() as usize);
-                    if has_pushdown && peer_total <= SMALL_PEER_EAGER_ROWS {
+                    let cold_count = t.count_cold_locators();
+                    let peer_total = t.rows().len().saturating_add(cold_count as usize);
+                    // v7.35.1 (mailrs prod #6 follow-up) — the
+                    // deferred INL probe at `index_seek_peer` and the
+                    // deferred hash build both read `t.rows()` (hot
+                    // tier only), silently dropping cold-tier rows
+                    // when the peer is large enough to avoid the
+                    // small-peer eager path. Force eager
+                    // materialisation when the peer has ANY cold-tier
+                    // rows so `materialise_table_ref_filtered` lifts
+                    // them through `iter_cold_rows_of_table`; the
+                    // join then runs on a hot+cold-merged eager_rows.
+                    if (has_pushdown && peer_total <= SMALL_PEER_EAGER_ROWS) || cold_count > 0 {
                         let (mut rows, cols) =
                             self.materialise_table_ref_filtered(&j.table, &peer_preds[pidx])?;
                         if let Some(needed) = needed {
