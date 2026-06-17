@@ -57,6 +57,21 @@ pub(crate) enum JoinSrc<'a> {
     Eager(&'a [Row]),
     /// Index-nested-loop peer reading the stored table in place.
     Stored(&'a spg_storage::persistent::PersistentVec<Row>),
+    /// v7.36 — hot tier borrowed in place + cold tier owned. INL
+    /// probe consults `cold_locator_map` to translate a Cold
+    /// `RowLocator` (which only carries `(segment_id, page_offset)`
+    /// — that pair identifies the PAGE, not the row, so multiple
+    /// rows on one page collide) into a per-row offset via the
+    /// PK key (`IndexKey::Int(i64)`) instead. The cold-tier
+    /// architecture already requires an integer PK, so this is
+    /// the unique-per-row identifier the segment lookup already
+    /// uses internally. Indices `0..hot.len()` map to hot rows;
+    /// `hot.len()..` map to `cold[i - hot.len()]`.
+    Mixed {
+        hot: &'a spg_storage::persistent::PersistentVec<Row>,
+        cold: Vec<Row>,
+        cold_locator_map: hashbrown::HashMap<i64, usize>,
+    },
 }
 
 impl JoinSrc<'_> {
@@ -65,6 +80,13 @@ impl JoinSrc<'_> {
             Self::Owned(v) => v.get(i),
             Self::Eager(s) => s.get(i),
             Self::Stored(p) => p.get(i),
+            Self::Mixed { hot, cold, .. } => {
+                if i < hot.len() {
+                    hot.get(i)
+                } else {
+                    cold.get(i - hot.len())
+                }
+            }
         }
     }
 
@@ -73,6 +95,25 @@ impl JoinSrc<'_> {
             Self::Owned(v) => v.len(),
             Self::Eager(s) => s.len(),
             Self::Stored(p) => p.len(),
+            Self::Mixed { hot, cold, .. } => hot.len() + cold.len(),
+        }
+    }
+
+    /// v7.36 — translate a PK key (`i64` — the cold tier's
+    /// integer-only PK contract) into the corresponding row index
+    /// inside this `Mixed` source. Returns `None` for non-Mixed
+    /// sources or when the key has no cold-tier row registered.
+    pub(crate) fn cold_pk_offset(&self, pk_key: i64) -> Option<usize> {
+        match self {
+            Self::Mixed {
+                hot,
+                cold_locator_map,
+                ..
+            } => cold_locator_map
+                .get(&pk_key)
+                .copied()
+                .map(|off| hot.len() + off),
+            _ => None,
         }
     }
 }
@@ -551,19 +592,16 @@ impl Engine {
                     // small-peer case (30 ≤ 256 goes eager).
                     const SMALL_PEER_EAGER_ROWS: usize = 256;
                     let has_pushdown = !peer_preds[pidx].is_empty();
-                    let cold_count = t.count_cold_locators();
-                    let peer_total = t.rows().len().saturating_add(cold_count as usize);
-                    // v7.35.1 (mailrs prod #6 follow-up) — the
-                    // deferred INL probe at `index_seek_peer` and the
-                    // deferred hash build both read `t.rows()` (hot
-                    // tier only), silently dropping cold-tier rows
-                    // when the peer is large enough to avoid the
-                    // small-peer eager path. Force eager
-                    // materialisation when the peer has ANY cold-tier
-                    // rows so `materialise_table_ref_filtered` lifts
-                    // them through `iter_cold_rows_of_table`; the
-                    // join then runs on a hot+cold-merged eager_rows.
-                    if (has_pushdown && peer_total <= SMALL_PEER_EAGER_ROWS) || cold_count > 0 {
+                    // v7.36 — drop the 7.35.1 force-eager-when-cold
+                    // workaround. The downstream INL probe and hash
+                    // build now thread cold-tier rows through
+                    // `JoinSrc::Mixed` (PK-key map for INL;
+                    // hash-iter Mixed.get for hash build). The
+                    // nested-loop fallback's `lazy_rows` also
+                    // appends cold rows. Small-peer + pushdown
+                    // still takes the eager fast path.
+                    let peer_total = t.rows().len();
+                    if has_pushdown && peer_total <= SMALL_PEER_EAGER_ROWS {
                         let (mut rows, cols) =
                             self.materialise_table_ref_filtered(&j.table, &peer_preds[pidx])?;
                         if let Some(needed) = needed {
@@ -847,7 +885,31 @@ impl Engine {
         else {
             return Ok(false);
         };
+        // v7.36 — INL probe handles cold-tier locators only when the
+        // peer's JOIN column is its single-column integer PRIMARY
+        // KEY (the segment lookup is keyed by integer PK). For
+        // non-PK JOINs on a cold-bearing peer, bail out so the
+        // caller falls through to hash-join (which iterates the
+        // peer via `Mixed` without needing locator-to-PK mapping).
+        let cold_count = table.count_cold_locators();
+        let pk_col_pos = table
+            .schema()
+            .uniqueness_constraints
+            .iter()
+            .find(|u| u.is_primary_key && u.columns.len() == 1)
+            .map(|u| u.columns[0]);
+        let join_col_is_pk = pk_col_pos == Some(idx.column_position);
+        if cold_count > 0 && !join_col_is_pk {
+            return Ok(false);
+        }
+        let (cold_rows, cold_pk_map): (Vec<Row>, hashbrown::HashMap<i64, usize>) = if cold_count > 0
+        {
+            crate::constraints::iter_cold_rows_with_locator_map(self.active_catalog(), table)
+        } else {
+            (Vec::new(), hashbrown::HashMap::new())
+        };
         let stored = table.rows();
+        let hot_len = stored.len();
         let (lpos0, _) = eq_pairs[0];
         let mut next: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
@@ -860,9 +922,26 @@ impl Engine {
                 for loc in idx.lookup_eq(&key) {
                     let ri = match *loc {
                         spg_storage::RowLocator::Hot(i) => i,
-                        spg_storage::RowLocator::Cold { .. } => continue,
+                        spg_storage::RowLocator::Cold { .. } => {
+                            // Mixed-eligible branch (PK BTree
+                            // lookup). The locator's key equals the
+                            // PK key here; use it to find the row in
+                            // `cold_rows` via `cold_pk_map`.
+                            let spg_storage::IndexKey::Int(pk) = &key else {
+                                continue;
+                            };
+                            match cold_pk_map.get(pk) {
+                                Some(&off) => hot_len + off,
+                                None => continue,
+                            }
+                        }
                     };
-                    let right = match stored.get(ri) {
+                    let right_opt: Option<&Row> = if ri < hot_len {
+                        stored.get(ri)
+                    } else {
+                        cold_rows.get(ri - hot_len)
+                    };
+                    let right = match right_opt {
                         Some(r) => r,
                         None => continue,
                     };
@@ -923,12 +1002,16 @@ impl Engine {
                 next.push(usize::MAX);
             }
         }
-        pipe.advance(
-            next,
-            JoinSrc::Stored(stored),
-            peer_mask.clone(),
-            right_arity,
-        );
+        let src = if cold_rows.is_empty() {
+            JoinSrc::Stored(stored)
+        } else {
+            JoinSrc::Mixed {
+                hot: stored,
+                cold: cold_rows,
+                cold_locator_map: cold_pk_map,
+            }
+        };
+        pipe.advance(next, src, peer_mask.clone(), right_arity);
         Ok(true)
     }
 
@@ -965,6 +1048,23 @@ impl Engine {
                 .as_deref()
                 .and_then(|n| self.active_catalog().get(n))
             {
+                // v7.36 — cold-bearing peer hashes through `Mixed`.
+                // Unlike INL, hash build doesn't consume the
+                // locator's key; it iterates the source via
+                // `len()/get()` and indexes each row by its
+                // eq_pairs values — works correctly for ANY join
+                // column (PK or secondary). No PK constraint.
+                Some(t) if t.count_cold_locators() > 0 => {
+                    let (cold, map) = crate::constraints::iter_cold_rows_with_locator_map(
+                        self.active_catalog(),
+                        t,
+                    );
+                    JoinSrc::Mixed {
+                        hot: t.rows(),
+                        cold,
+                        cold_locator_map: map,
+                    }
+                }
                 Some(t) => JoinSrc::Stored(t.rows()),
                 None => JoinSrc::Owned(Vec::new()),
             },
@@ -1077,6 +1177,18 @@ impl Engine {
                 .get(tname)
                 .map(|t| t.rows().iter().cloned().collect())
                 .unwrap_or_default();
+            // v7.36 — nested-loop fallback materialises the peer
+            // into `lazy_rows`. Append cold-tier rows so the fall-
+            // back stays correct after the force-eager-when-cold
+            // guard was lifted in `build_join_peers`.
+            if let Some(t) = self.active_catalog().get(tname)
+                && t.count_cold_locators() > 0
+            {
+                rows.extend(crate::constraints::iter_cold_rows_of_parent(
+                    self.active_catalog(),
+                    t,
+                ));
+            }
             if let Some(needed) = needed {
                 Self::null_out_unreferenced(&mut rows, &peer.cols, &peer.alias, needed);
             }
