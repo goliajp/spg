@@ -5,6 +5,7 @@
 //! candidate row indices/locators or `None` to fall back to a scan.
 
 use alloc::borrow::Cow;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use spg_sql::ast::{BinOp, Expr, Literal, SelectStatement};
@@ -105,6 +106,118 @@ pub(crate) fn try_nsw_knn(
 /// for tiny `LIMIT 1` queries we keep enough candidates to absorb a
 /// few WHERE rejections.
 const NSW_OVER_FETCH_FLOOR: usize = 32;
+
+/// v7.34.5 — drive the row scan via a BTree index walk in the
+/// requested ORDER BY direction, emitting matched row indices lazily
+/// and stopping after `LIMIT + OFFSET` survive WHERE. Avoids the
+/// full-table materialise + partial-sort tail that the mailrs
+/// `content_worker` baseline pinned at 80 ms across 250 k rows.
+/// Returns `Some(row_indices)` in the order the caller's ORDER BY
+/// asked for so `materialise_in_order` can skip its own sort pass;
+/// `None` falls through to the existing scan + sort path.
+///
+/// Eligibility (any failure → `None`):
+///   * no `DISTINCT`, no `LIMIT WITH TIES` (both need a full sort).
+///   * `LIMIT N` literal present, `N > 0`.
+///   * `OFFSET` literal absent or small enough that scanning past it
+///     stays cheap (the walker collects `N + OFFSET` rows then trims).
+///   * `ORDER BY` is exactly one entry, the expression is a bare
+///     column on this table, and the column has a BTree index.
+///   * No GROUP BY / HAVING (those are aggregate-bound paths handled
+///     elsewhere; this helper sits on `exec_bare_select`'s primary).
+///   * Cold-tier locators short-circuit to `None` so the walker
+///     never crosses a tier boundary mid-scan; the legacy path
+///     handles cold rows.
+pub(crate) fn try_pk_walk_top_n(
+    stmt: &SelectStatement,
+    table: &Table,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<Vec<usize>> {
+    if stmt.distinct || stmt.limit_with_ties {
+        return None;
+    }
+    if stmt.group_by.is_some() || stmt.having.is_some() {
+        return None;
+    }
+    let limit = usize::try_from(stmt.limit_literal()?).ok()?;
+    if limit == 0 {
+        return None;
+    }
+    let offset = stmt
+        .offset_literal()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    // Cap absolute walk cost: if OFFSET is huge, the walker would emit
+    // `offset + limit` candidates before returning anything, which can
+    // exceed the partial-sort fast path's complexity. The legacy path
+    // already handles large-OFFSET sweeps with select_nth_unstable.
+    const WALKER_OFFSET_CAP: usize = 65_536;
+    if offset > WALKER_OFFSET_CAP {
+        return None;
+    }
+    let want = offset.checked_add(limit)?;
+    if stmt.order_by.len() != 1 {
+        return None;
+    }
+    let order = &stmt.order_by[0];
+    let Expr::Column(col) = &order.expr else {
+        return None;
+    };
+    if let Some(q) = &col.qualifier
+        && q != table_alias
+    {
+        return None;
+    }
+    let col_pos = schema_cols
+        .iter()
+        .position(|s| s.name.eq_ignore_ascii_case(&col.name))?;
+    let index = table.index_on(col_pos)?;
+    if !matches!(index.kind, spg_storage::IndexKind::BTree(_)) {
+        return None;
+    }
+    let where_expr = stmt.where_.as_ref();
+    let ctx = EvalContext::new(schema_cols, Some(table_alias));
+    let mut kept: Vec<usize> = Vec::with_capacity(want);
+    // The walker yields `(IndexKey, &Vec<RowLocator>)` ordered by key
+    // in the requested direction; per-key locator order within the
+    // map preserves insertion order, which matches the legacy stable-
+    // sort tie-break for equal keys.
+    let walker: Box<dyn Iterator<Item = (&spg_storage::IndexKey, &Vec<spg_storage::RowLocator>)>> =
+        if order.desc {
+            Box::new(index.iter_desc())
+        } else {
+            Box::new(index.iter_asc())
+        };
+    for (_key, locators) in walker {
+        for loc in locators {
+            match *loc {
+                spg_storage::RowLocator::Hot(row_idx) => {
+                    let Some(row) = table.rows().get(row_idx) else {
+                        continue;
+                    };
+                    if let Some(w) = where_expr {
+                        let cond = eval::eval_expr(w, row, &ctx).ok()?;
+                        if !matches!(cond, Value::Bool(true)) {
+                            continue;
+                        }
+                    }
+                    kept.push(row_idx);
+                    if kept.len() >= want {
+                        return Some(kept);
+                    }
+                }
+                spg_storage::RowLocator::Cold { .. } => {
+                    // Cold-tier indices need a full segment fetch
+                    // path that this walker doesn't drive; bail out
+                    // and let the legacy scan handle the table.
+                    return None;
+                }
+            }
+        }
+    }
+    Some(kept)
+}
 
 /// Pull a `Vec<f32>` out of a literal-or-cast expression. Returns
 /// `None` for anything we can't fold at plan time.
