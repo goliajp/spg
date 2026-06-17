@@ -634,6 +634,37 @@ fn create_unique_index_catches_cold_tier_duplicate() {
     );
 }
 
+/// v7.36 — MERGE INTO target must error when the target has
+/// cold-tier rows. MATCHED clauses would silently skip cold target
+/// rows otherwise — losing the upsert semantic. Source-side cold
+/// rows are read-only inputs and are folded in automatically.
+#[test]
+fn merge_into_target_blocks_when_target_has_cold_rows() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE target_t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        .unwrap();
+    eng.execute("CREATE TABLE source_t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)")
+        .unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO target_t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    eng.execute("INSERT INTO source_t VALUES (3, 333)").unwrap();
+    eng.freeze_oldest_to_cold("target_t", "target_t_pkey", 5)
+        .expect("freeze target");
+    let err = eng
+        .execute(
+            "MERGE INTO target_t t USING source_t s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET val = s.val",
+        )
+        .expect_err("MERGE on cold-bearing target must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cold-tier"),
+        "expected cold-tier MERGE error, got: {msg}"
+    );
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();

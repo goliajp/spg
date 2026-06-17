@@ -421,6 +421,22 @@ impl Engine {
             .source_alias
             .clone()
             .unwrap_or_else(|| stmt.source.clone());
+        // v7.36 (cold-tier coverage) — MERGE mutates target rows in
+        // place by hot row index. Cold-tier target rows can't be
+        // mutated by this path (cold-row mutation is a v7.37 item),
+        // so MATCHED clauses would silently skip them — losing the
+        // INSERT-or-update semantic. PG and MariaDB never half-apply
+        // a MERGE; surface the gap explicitly.
+        if let Some(t) = self.active_catalog().get(&stmt.target)
+            && t.count_cold_locators() > 0
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "MERGE INTO {:?}: cold-tier rows exist on target; \
+                 cold-tier mutation by MERGE is a v7.37 candidate. \
+                 Run COMPACT and retry.",
+                stmt.target
+            )));
+        }
         let (target_cols, target_rows_snapshot) = {
             let t = self.active_catalog().get(&stmt.target).ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
@@ -438,10 +454,16 @@ impl Engine {
                     name: stmt.source.clone(),
                 })
             })?;
-            (
-                s.schema().columns.clone(),
-                s.rows().iter().cloned().collect::<Vec<Row>>(),
-            )
+            // v7.36 — also fold cold-tier source rows into the merge
+            // input. Source rows are read-only inputs (we never
+            // mutate the source) so this is the same shape as
+            // `materialise_table_ref`'s v7.35.1 cold-aware lift.
+            let mut rows: Vec<Row> = s.rows().iter().cloned().collect();
+            rows.extend(crate::constraints::iter_cold_rows_of_parent(
+                self.active_catalog(),
+                s,
+            ));
+            (s.schema().columns.clone(), rows)
         };
         // Composite schema: target_alias.col ... source_alias.col ...
         let mut combined_schema: Vec<ColumnSchema> = Vec::new();
