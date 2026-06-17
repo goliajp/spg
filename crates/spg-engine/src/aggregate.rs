@@ -969,6 +969,28 @@ fn accumulate_groups(
                     }
                     Some(keys)
                 };
+                // v7.36 (perf — bugfix v7.36.1 candidate) — first_ordered
+                // was missing from the single_anon_group fast path,
+                // sending `(array_agg(x ORDER BY y))[1]` values into
+                // `update_state(array_agg, …)` whose finalize ignored
+                // the absent `first_best` and returned `[]`. The slow
+                // path below has the same branch — keep them aligned.
+                if spec.first_ordered {
+                    if let Some(keys) = order_keys {
+                        let st = &mut entry.1[i];
+                        let better = match &st.first_best {
+                            None => true,
+                            Some((bk, _)) => {
+                                cmp_order_keys(&spec.order_by, &keys, bk)
+                                    == core::cmp::Ordering::Less
+                            }
+                        };
+                        if better {
+                            st.first_best = Some((keys, arg_ref.clone()));
+                        }
+                    }
+                    continue;
+                }
                 if spec.distinct {
                     encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
                     if entry.1[i].seen.contains(dkeybuf.as_str()) {
