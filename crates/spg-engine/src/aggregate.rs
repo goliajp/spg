@@ -742,6 +742,131 @@ fn accumulate_groups(
         order.clear();
         order.push((Vec::new(), init));
     }
+    // v7.36 (perf — mailrs Phase 1, user_storage_usage 7.5 → ?) —
+    // single-aggregate streaming accumulator. For
+    // `SUM(<compiled-expr>)` / `SUM(<bound col>)` with no GROUP BY,
+    // no FILTER, no arg2, no ORDER BY, no DISTINCT, the whole
+    // per-row work collapses to: eval the arg, match the Value
+    // variant, accumulate. Skips the spec-dispatch loop +
+    // `update_state` per-row name match. On a 25 k-row JOIN
+    // (user_storage_usage `SUM(LENGTH(text_body))`) that's
+    // ~50-100 ns/row of pure spec-dispatch overhead removed.
+    if single_anon_group
+        && agg_specs.len() == 1
+        && agg_specs[0].filter.is_none()
+        && agg_specs[0].arg2.is_none()
+        && agg_specs[0].order_by.is_empty()
+        && !agg_specs[0].distinct
+        && (agg_specs[0].name == "sum" || agg_specs[0].name == "avg")
+        && (arg_pos[0].is_some() || arg_compiled[0].is_some())
+    {
+        let arg_pos0 = arg_pos[0];
+        let arg_c0 = &arg_compiled[0];
+        let mut sum_int: i64 = 0;
+        let mut sum_float: f64 = 0.0;
+        let mut use_float = false;
+        let mut count: i64 = 0;
+        // Borrow-aware fast inner: avoid the per-row clone when arg
+        // is a bound column position.
+        if let Some(p) = arg_pos0 {
+            for row in rows {
+                let v_ref = row.get(p).unwrap_or(&Value::Null);
+                match v_ref {
+                    Value::Null => continue,
+                    Value::SmallInt(n) => {
+                        sum_int += i64::from(*n);
+                        count += 1;
+                    }
+                    Value::Int(n) => {
+                        sum_int += i64::from(*n);
+                        count += 1;
+                    }
+                    Value::BigInt(n) => {
+                        sum_int += *n;
+                        count += 1;
+                    }
+                    Value::Float(x) => {
+                        sum_float += *x;
+                        use_float = true;
+                        count += 1;
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
+                        });
+                    }
+                }
+            }
+        } else if let Some(p) = arg_c0.as_ref().and_then(|c| c.as_single_column_length()) {
+            // v7.36 (perf — mailrs Phase 1, user_storage_usage hot
+            // inner) — `SUM(LENGTH(<text col>))` collapses to a
+            // straight scan: read the cell by ref, branch on the
+            // variant, do an ASCII probe + `len()` (or
+            // `chars().count()` on non-ASCII), accumulate. No Step
+            // VM, no stack push/pop, no `BigInt` boxing on the way
+            // out — pure i64 sum. The original Step VM path keeps
+            // running for everything outside this shape (`SUM(col)`,
+            // `SUM(expr)`, multi-step compiled args).
+            for row in rows {
+                let Some(v_ref) = row.get(p) else {
+                    continue;
+                };
+                let n = match v_ref {
+                    Value::Null => continue,
+                    Value::Text(s) => {
+                        if s.is_ascii() {
+                            s.len() as i64
+                        } else {
+                            s.chars().count() as i64
+                        }
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!("length() needs text, got {:?}", other.data_type()),
+                        });
+                    }
+                };
+                sum_int += n;
+                count += 1;
+            }
+        } else {
+            let c = arg_c0.as_ref().unwrap();
+            for row in rows {
+                let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
+                match v {
+                    Value::Null => continue,
+                    Value::SmallInt(n) => {
+                        sum_int += i64::from(n);
+                        count += 1;
+                    }
+                    Value::Int(n) => {
+                        sum_int += i64::from(n);
+                        count += 1;
+                    }
+                    Value::BigInt(n) => {
+                        sum_int += n;
+                        count += 1;
+                    }
+                    Value::Float(x) => {
+                        sum_float += x;
+                        use_float = true;
+                        count += 1;
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
+                        });
+                    }
+                }
+            }
+        }
+        let state = &mut order[0].1[0];
+        state.count = count;
+        state.sum_int = sum_int;
+        state.sum_float = sum_float;
+        state.use_float = use_float;
+        return Ok(order);
+    }
     for row in rows {
         if single_anon_group {
             let entry = &mut order[0];
