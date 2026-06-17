@@ -246,6 +246,20 @@ impl Engine {
                     tbl
                 ))
             })?;
+        // v7.36 (cold-tier coverage) — ALTER COLUMN TYPE rewrites
+        // every row's value to the new representation. Cold-tier
+        // rows live in segments encoded against the OLD type and
+        // can't be rewritten in-place from this path; doing the
+        // ALTER anyway would leave the segments unreadable under
+        // the new schema. Match PG / MariaDB's invariant of "never
+        // half-apply a schema change" by raising explicitly.
+        if table.count_cold_locators() > 0 {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "ALTER COLUMN TYPE on {tbl:?}: cold-tier rows exist for this table; \
+                 cold-tier schema rewrite is a v7.37 candidate. Run COMPACT to bring \
+                 the cold rows back to the hot tier and retry."
+            )));
+        }
         let schema_cols = table.schema().columns.clone();
         let ctx = eval::EvalContext::new(&schema_cols, None);
         let mut new_values: alloc::vec::Vec<Value> =
@@ -785,6 +799,17 @@ impl Engine {
         &mut self,
         stmt: CreateIndexStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.36 — collect cold-tier rows BEFORE taking the mutable
+        // borrow on the table (the duplicate-scan post-CREATE UNIQUE
+        // INDEX consumes them). `iter_cold_rows_of_parent` borrows
+        // the catalog immutably so it would conflict with the
+        // `active_catalog_mut` borrow below.
+        let cold_rows_for_unique_scan: alloc::vec::Vec<spg_storage::Row> =
+            if let Some(t) = self.active_catalog().get(&stmt.table) {
+                crate::constraints::iter_cold_rows_of_parent(self.active_catalog(), t)
+            } else {
+                alloc::vec::Vec::new()
+            };
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -980,8 +1005,17 @@ impl Engine {
             // new constraint — otherwise CREATE UNIQUE INDEX would
             // silently leave duplicates in place.
             let snapshot_indices = table.indices().to_vec();
-            let snapshot_rows: alloc::vec::Vec<spg_storage::Row> =
+            let mut snapshot_rows: alloc::vec::Vec<spg_storage::Row> =
                 table.rows().iter().cloned().collect();
+            // v7.36 (cold-tier coverage) — CREATE UNIQUE INDEX must
+            // detect a duplicate that would violate the new
+            // uniqueness contract even when the duplicate is in the
+            // cold tier; otherwise the constraint declaration
+            // succeeds but the on-disk segments carry stale
+            // duplicates and later INSERTs see phantom-conflict
+            // behaviour. Use the catalog-borrowing variant from
+            // `constraints` so we don't double-borrow `self` mut.
+            snapshot_rows.extend(cold_rows_for_unique_scan);
             let snapshot_schema = table.schema().clone();
             let idx_ref = snapshot_indices
                 .iter()
