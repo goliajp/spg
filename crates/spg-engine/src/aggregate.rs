@@ -636,6 +636,24 @@ fn accumulate_groups(
         .iter()
         .map(|spec| spec.arg.as_ref().and_then(|e| col_pos(e)))
         .collect();
+    // v7.36 (perf — mailrs Ask 1 SUM(LENGTH(text_body)) 18ms → ?) —
+    // pre-compile every aggregate arg that's a `fully_compilable`
+    // PURE expression over bound columns. Without this, `LENGTH(col)`
+    // / `COALESCE(col, '')` / `CAST(col AS BIGINT)` etc. ALL fell
+    // through to the `(None, Some(e)) => eval_arg(e, mat, ...)` slow
+    // path that materialises a Cow<Row> per input row — for a 25k-row
+    // JOIN that's 25k full-row clones for one column read. The Step
+    // VM (`eval_compiled_ref`) reads columns by RowRef::get and runs
+    // the same `apply_function` dispatcher with zero materialisation.
+    let arg_compiled: Vec<Option<eval::CompiledExpr>> = agg_specs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| match (&arg_pos[i], &spec.arg) {
+            (Some(_), _) => None,
+            (None, Some(e)) if eval::fully_compilable(e) => Some(eval::compile_expr(e, &ctx)),
+            _ => None,
+        })
+        .collect();
     // v7.33 (array_agg perf) — bound positions for each spec's internal
     // ORDER BY keys, so an ordered aggregate (`array_agg(x ORDER BY y)`)
     // reads the sort key by reference (RowRef::get) instead of
@@ -652,7 +670,7 @@ fn accumulate_groups(
     // the inbox shape) the bound fast path never materialises a row.
     let needs_mat = agg_specs.iter().enumerate().any(|(i, s)| {
         s.filter.is_some()
-            || (s.arg.is_some() && arg_pos[i].is_none())
+            || (s.arg.is_some() && arg_pos[i].is_none() && arg_compiled[i].is_none())
             || s.arg2.is_some()
             || order_pos[i].iter().any(Option::is_none)
     });
@@ -672,6 +690,8 @@ fn accumulate_groups(
     // to probe the group map; hits — the overwhelming case — now
     // touch the allocator zero times.
     let mut keybuf_s = String::new();
+    // v7.36 — reused Step VM eval stack for compiled aggregate args.
+    let mut eval_stack: Vec<Value> = Vec::new();
     let mut dkeybuf = String::new();
     let mut refs: Vec<&Value> = Vec::with_capacity(group_pos.len());
     // v7.32 (round-31) — an aggregate's argument / FILTER / second arg /
@@ -706,7 +726,15 @@ fn accumulate_groups(
         // Fast key: bound positions + no ci folding -> encode
         // straight from borrowed cells; group_vals materialise
         // only when the group is NEW.
-        if all_groups_bound && ci_positions.is_empty() && !group_exprs.is_empty() {
+        // v7.36 — drop the `!group_exprs.is_empty()` gate. With no
+        // GROUP BY the answer is always a single anonymous group at
+        // idx 0 (seeded in the empty-rows branch above; reseeded
+        // here on the first row if rows wasn't empty), so the fast
+        // path skips key encoding entirely. Previously this case
+        // fell through to the slow path which materialises a
+        // Cow<Row> per input row — the 18 ms `SUM(LENGTH(text_body))`
+        // mailrs Ask 1 baseline was exactly this shape.
+        if all_groups_bound && ci_positions.is_empty() {
             refs.clear();
             refs.extend(
                 group_pos
@@ -748,13 +776,20 @@ fn accumulate_groups(
                     continue;
                 }
                 let arg_owned: Value;
-                let arg_ref: &Value = match (&arg_pos[i], &spec.arg) {
-                    (Some(p), _) => row.get(*p).unwrap_or(&Value::Null),
-                    (None, None) => {
+                let arg_ref: &Value = match (&arg_pos[i], &arg_compiled[i], &spec.arg) {
+                    (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
+                    (None, _, None) => {
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
-                    (None, Some(e)) => {
+                    (None, Some(c), _) => {
+                        // v7.36 — compiled-arg fast path. `eval_stack`
+                        // is reused across rows; the Step VM never
+                        // materialises a row for column reads.
+                        arg_owned = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
+                        &arg_owned
+                    }
+                    (None, None, Some(e)) => {
                         arg_owned = eval_arg(
                             e,
                             mat.as_deref().expect("needs_mat for non-bound arg"),
