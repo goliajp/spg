@@ -112,6 +112,99 @@ fn spg_stat_segment_resolves_table_name() {
     }
 }
 
+/// v7.34.6 (mailrs prod #6) — the JOIN walker's hot/cold tier
+/// dispatch. Pre-7.34.6 the walker bailed entirely on the first
+/// cold-tier RowLocator it saw, which was the prod 803 MB silent
+/// fall-back to the 82 ms NOT-IN scan-and-sort. This test mimics
+/// the `content_worker` shape (`messages JOIN mailboxes ... ORDER
+/// BY m.id DESC LIMIT N`) on a table whose oldest rows have been
+/// promoted to cold; the walker MUST still return the correct N
+/// rows by walking the index across both tiers.
+#[test]
+fn join_walker_spans_hot_cold_tier_on_order_by_limit() {
+    let mut eng = Engine::new();
+    eng.execute(
+        "CREATE TABLE mailboxes (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
+    )
+    .unwrap();
+    eng.execute(
+        "CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, mailbox_id BIGINT NOT NULL, \
+            size BIGINT NOT NULL)",
+    )
+    .unwrap();
+    for i in 0..4 {
+        eng.execute(&format!("INSERT INTO mailboxes VALUES ({i}, 'mb{i}')"))
+            .unwrap();
+    }
+    for i in 1..=100 {
+        eng.execute(&format!(
+            "INSERT INTO messages VALUES ({i}, {}, {})",
+            i % 4,
+            if i % 17 == 0 { 0 } else { 1024 }
+        ))
+        .unwrap();
+    }
+    // Baseline result before any freeze — what the walker SHOULD
+    // return after we promote half the rows to cold.
+    let sql = "SELECT m.id, mb.name FROM messages m \
+               JOIN mailboxes mb ON m.mailbox_id = mb.id \
+               WHERE m.size > 0 \
+               ORDER BY m.id DESC LIMIT 10";
+    let baseline = rows_of(eng.execute(sql).unwrap());
+    assert_eq!(baseline.len(), 10);
+    // The newest 10 rows that pass size > 0 — none of m.id ∈ {17, 34,
+    // 51, 68, 85} since those are size=0, so expected = 100, 99, 98, 97,
+    // 96, 95, 94, 93, 92, 91.
+    let ids: Vec<i64> = baseline
+        .iter()
+        .map(|r| match r[0] {
+            Value::BigInt(n) => n,
+            _ => panic!("expected BigInt id"),
+        })
+        .collect();
+    assert_eq!(ids, vec![100, 99, 98, 97, 96, 95, 94, 93, 92, 91]);
+    // Freeze the oldest 50 rows to cold.
+    let report = eng
+        .freeze_oldest_to_cold("messages", "messages_pkey", 50)
+        .expect("freeze cold");
+    assert_eq!(report.frozen_rows, 50);
+    // The walker MUST still return the same 10 rows. The hot half
+    // holds 51..=100, so the first 10 keys touched by ORDER BY id
+    // DESC are all hot — no cold dispatch needed. This case just
+    // verifies the walker keeps working when cold segments exist
+    // for the table (the freeze itself doesn't re-route the plan).
+    let after_freeze_top = rows_of(eng.execute(sql).unwrap());
+    let ids_top: Vec<i64> = after_freeze_top
+        .iter()
+        .map(|r| match r[0] {
+            Value::BigInt(n) => n,
+            _ => panic!("expected BigInt id"),
+        })
+        .collect();
+    assert_eq!(ids_top, vec![100, 99, 98, 97, 96, 95, 94, 93, 92, 91]);
+    // Now request the OLDEST 10 surviving rows — the walker has to
+    // walk ASC across hot+cold, with the first hits coming from the
+    // cold segment (ids 1..=50, minus those with size=0). Expected =
+    // 1, 2, 3, ..., 10 (none of those have size=0).
+    let asc_sql = "SELECT m.id, mb.name FROM messages m \
+                   JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                   WHERE m.size > 0 \
+                   ORDER BY m.id ASC LIMIT 10";
+    let asc = rows_of(eng.execute(asc_sql).unwrap());
+    let ids_asc: Vec<i64> = asc
+        .iter()
+        .map(|r| match r[0] {
+            Value::BigInt(n) => n,
+            _ => panic!("expected BigInt id"),
+        })
+        .collect();
+    assert_eq!(
+        ids_asc,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "ASC walker must traverse cold-tier rows correctly"
+    );
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();
