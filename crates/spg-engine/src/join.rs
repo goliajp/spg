@@ -1760,7 +1760,13 @@ impl Engine {
             alloc::collections::BinaryHeap::new();
         let mut plain_sink: Vec<Row> = Vec::new();
         let mut seq: u64 = 0;
-        'scan: for left in primary_table.rows().iter() {
+        // v7.36 (cold-tier coverage) — extend the primary scan with
+        // the cold-tier rows so `ORDER BY <non-indexed> LIMIT N`
+        // doesn't lose half a freezer-promoted table when the walker
+        // shape isn't a match. Hot rows borrow from `PersistentVec`;
+        // cold rows are pre-materialised once and yielded in order.
+        let primary_cold = self.iter_cold_rows_of_table(primary_table);
+        'scan: for left in primary_table.rows().iter().chain(primary_cold.iter()) {
             cancel.check()?;
             if keep == 0 {
                 break 'scan;

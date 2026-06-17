@@ -318,6 +318,75 @@ fn peer_table_cold_tier_rows_visible_to_join() {
     assert_eq!(by_id[0][0], Value::Text("mb-5".to_string()));
 }
 
+/// v7.36 — primary-table cold-tier coverage for the legacy
+/// `try_streamed_inner_join_topn` path (`ORDER BY <non-indexed col>
+/// LIMIT N`). The 7.34.5 walker only handled `ORDER BY <indexed
+/// col>`; this older streamed-topN path was hot-only for the
+/// primary scan. Now both tiers are chained.
+#[test]
+fn streamed_topn_join_primary_spans_hot_cold_tier() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE mailboxes (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    eng.execute(
+        "CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, mailbox_id BIGINT NOT NULL, \
+            score BIGINT NOT NULL)",
+    )
+    .unwrap();
+    for i in 1..=4 {
+        eng.execute(&format!("INSERT INTO mailboxes VALUES ({i}, 'mb-{i}')"))
+            .unwrap();
+    }
+    for i in 1..=100 {
+        eng.execute(&format!(
+            "INSERT INTO messages VALUES ({i}, {}, {})",
+            (i % 4) + 1,
+            i
+        ))
+        .unwrap();
+    }
+    // Freeze the oldest 50 messages — ids 1..=50 cold, 51..=100 hot.
+    let report = eng
+        .freeze_oldest_to_cold("messages", "messages_pkey", 50)
+        .expect("freeze cold");
+    assert_eq!(report.frozen_rows, 50);
+    // Sanity 1: COUNT(*) without JOIN exercises the single-table
+    // cold loop. Must see all 100 rows.
+    let cnt = rows_of(eng.execute("SELECT COUNT(*) FROM messages").unwrap());
+    assert_eq!(
+        cnt[0][0],
+        Value::BigInt(100),
+        "SELECT COUNT(*) lost cold-tier rows"
+    );
+    // Sanity 2: bare SELECT — same path.
+    let all = rows_of(eng.execute("SELECT id FROM messages WHERE id > 0").unwrap());
+    assert_eq!(all.len(), 100, "bare SELECT lost cold-tier rows");
+    // ORDER BY score ASC LIMIT 10 — `score` has no index, so the
+    // walker shape doesn't match and we fall through to the legacy
+    // streamed-topN heap. The lowest 10 scores are 1..=10, all in
+    // the cold tier — pre-7.36 this returned the lowest 10 HOT
+    // scores instead (51..=60).
+    let rows = rows_of(
+        eng.execute(
+            "SELECT m.id, m.score FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id \
+             ORDER BY m.score ASC LIMIT 10",
+        )
+        .unwrap(),
+    );
+    let scores: Vec<i64> = rows
+        .iter()
+        .map(|r| match r[1] {
+            Value::BigInt(n) => n,
+            _ => panic!("expected BigInt score"),
+        })
+        .collect();
+    assert_eq!(
+        scores,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "streamed-topN primary scan must traverse cold-tier rows"
+    );
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();
