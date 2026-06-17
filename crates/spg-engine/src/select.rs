@@ -31,7 +31,8 @@ use crate::{
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
     synth_pg_roles, synth_pg_settings, synth_pg_trigger, synth_pg_type, synth_pg_views,
-    try_gin_seek, try_index_seek, try_nsw_knn, try_trgm_seek, value_is_integer, value_to_i64,
+    try_gin_seek, try_index_seek, try_nsw_knn, try_pk_walk_top_n, try_trgm_seek,
+    value_is_integer, value_to_i64,
 };
 
 impl Engine {
@@ -1591,6 +1592,18 @@ impl Engine {
         // ORDER BY / LIMIT are honoured implicitly.
         if let Some(nsw_rows) = try_nsw_knn(stmt, table, schema_cols, alias) {
             return materialise_in_order(stmt, table, schema_cols, alias, &nsw_rows);
+        }
+
+        // v7.34.5 — ORDER BY <indexed col> [DESC|ASC] LIMIT N drives
+        // the scan via the BTree iterator in the requested direction
+        // and stops after `OFFSET + LIMIT` candidates pass WHERE. The
+        // 80 ms `mailrs_prod_plain_limit` baseline at 250 k rows is
+        // the load-bearing consumer; this skips the materialise-every-
+        // row + partial-sort tail entirely. Walker output is already
+        // in ORDER BY order so `materialise_in_order` (no extra sort)
+        // is the natural sink.
+        if let Some(walked) = try_pk_walk_top_n(stmt, table, schema_cols, alias) {
+            return materialise_in_order(stmt, table, schema_cols, alias, &walked);
         }
 
         // Index seek: if WHERE is `col = literal` (or commuted) and the
