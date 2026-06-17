@@ -524,6 +524,60 @@ fn delete_cascade_with_cold_child_surfaces_explicit_error() {
         .expect("hot child cascade must still work");
 }
 
+/// v7.36 — `build_joined_filtered_rows` primary-index path threads
+/// hot row indices into `JoinSrc::Stored(t.rows())`, so a JOIN
+/// whose primary had cold-tier rows dropped them silently. Forced
+/// materialising fallback when cold rows exist routes through
+/// `materialise_table_ref_filtered` (v7.35.1, cold-aware) and
+/// recovers the full row set.
+#[test]
+fn join_primary_with_cold_rows_uses_materialise_fallback() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE mailboxes (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    eng.execute(
+        "CREATE TABLE messages (id BIGINT NOT NULL PRIMARY KEY, mailbox_id BIGINT NOT NULL)",
+    )
+    .unwrap();
+    for i in 1..=4 {
+        eng.execute(&format!("INSERT INTO mailboxes VALUES ({i}, 'mb-{i}')"))
+            .unwrap();
+    }
+    for i in 1..=100 {
+        eng.execute(&format!(
+            "INSERT INTO messages VALUES ({i}, {})",
+            (i % 4) + 1
+        ))
+        .unwrap();
+    }
+    let report = eng
+        .freeze_oldest_to_cold("messages", "messages_pkey", 50)
+        .expect("freeze messages");
+    assert_eq!(report.frozen_rows, 50);
+    // `SELECT m.id ... ORDER BY m.id LIMIT 200` exceeds the
+    // walker's small-cap and falls through to the deferred-index
+    // / materialising primary path. All 100 rows must show up.
+    let rows = rows_of(
+        eng.execute(
+            "SELECT m.id, mb.name FROM messages m \
+             JOIN mailboxes mb ON m.mailbox_id = mb.id \
+             ORDER BY m.id ASC LIMIT 200",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 100, "JOIN primary lost cold-tier rows");
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::BigInt(n) => n,
+            _ => panic!("expected BigInt id"),
+        })
+        .collect();
+    let mut expected = (1..=100i64).collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(ids, expected);
+}
+
 #[test]
 fn cold_row_count_zero_before_any_freeze() {
     let mut eng = Engine::new();
