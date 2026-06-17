@@ -244,6 +244,69 @@ fn baseline_exists_filter_three_forms() {
     }
 }
 
+// Diagnostic: equivalent IN forms — uncorrelated subquery vs literal
+// InList vs JOIN. If `IN (subquery)` is 50× slower than `IN (lit, …)`
+// of the same expansion, materialize-once is failing.
+#[test]
+fn baseline_in_subquery_three_forms() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    // Pre-fetch 6000 message_ids to build the literal InList probe.
+    let ids: Vec<i64> = match db
+        .execute("SELECT message_id FROM email_analysis ORDER BY message_id")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => rows
+            .into_iter()
+            .filter_map(|r| match r.values.into_iter().next() {
+                Some(spg_storage::Value::BigInt(n)) => Some(n),
+                Some(spg_storage::Value::Int(n)) => Some(i64::from(n)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let lit_in_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let forms: &[(&str, String)] = &[
+        (
+            "in_subquery_join",
+            "SELECT COUNT(*) FROM messages m \
+                JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                WHERE mb.user_address = 'u@x' \
+                  AND m.id IN (SELECT message_id FROM email_analysis)"
+                .into(),
+        ),
+        (
+            "in_literal_list_join",
+            format!(
+                "SELECT COUNT(*) FROM messages m \
+                    JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                    WHERE mb.user_address = 'u@x' AND m.id IN ({lit_in_list})"
+            ),
+        ),
+        (
+            // No JOIN — isolate the IN-list eval on a plain table scan.
+            "in_literal_list_no_join",
+            format!("SELECT COUNT(*) FROM messages WHERE id IN ({lit_in_list})"),
+        ),
+        (
+            // Non-aggregate JOIN + InList — isolates "is it the
+            // aggregate-with-JOIN path that loses InSet, or is it any
+            // JOIN with WHERE-InList?"
+            "in_literal_list_join_proj",
+            format!(
+                "SELECT m.id FROM messages m \
+                    JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                    WHERE mb.user_address = 'u@x' AND m.id IN ({lit_in_list})"
+            ),
+        ),
+    ];
+    for (label, sql) in forms {
+        time_query(&mut db, sql, 10, label, 1000.0);
+    }
+}
+
 // Shape 5b: NOT-EXISTS-FILTER — mailrs prod content_worker hot-path
 // (`spg-7.34-prod-load-conn-pool-still-degraded-2026-06-17.md`). The
 // 7.34.0 EXISTS decorrelation work didn't fire for this NOT EXISTS

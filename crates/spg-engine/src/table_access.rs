@@ -213,6 +213,16 @@ impl Engine {
         }
         let cols = &table.schema().columns;
         let mut seeded: Option<Vec<usize>> = None;
+        // v7.34.3 — record which predicate seeded the seek so the
+        // post-seed `keep` loop skips it. The seeded set already
+        // satisfies that predicate by construction (every id came back
+        // from an index lookup keyed on the same column/literal), and
+        // re-evaluating it per row pays the predicate's interpretive
+        // cost a second time. For a 6 000-element `IN` list that cost
+        // is O(list) per row → ~150 M wasted comparisons on a 25 k row
+        // table, which is exactly the SPGE 320 ms / PG 1 ms gap the
+        // 7.34.0 baseline pinned for `m.id IN (6000 lits)`.
+        let mut seeded_pred_idx: Option<usize> = None;
         // Resolve an indexed column reference (qualified to this alias or
         // bare) to its `(position, index)`.
         let indexed_col = |c: &spg_sql::ast::ColumnName| {
@@ -247,7 +257,7 @@ impl Engine {
             ids.dedup();
             Some(ids)
         };
-        for p in preds {
+        for (i, p) in preds.iter().enumerate() {
             match p {
                 Expr::Binary {
                     lhs,
@@ -264,6 +274,7 @@ impl Engine {
                         && let Some(ids) = seek_keys(idx, &[l])
                     {
                         seeded = Some(ids);
+                        seeded_pred_idx = Some(i);
                         break;
                     }
                 }
@@ -291,6 +302,7 @@ impl Engine {
                         && let Some(ids) = seek_keys(idx, &lits)
                     {
                         seeded = Some(ids);
+                        seeded_pred_idx = Some(i);
                         break;
                     }
                 }
@@ -299,7 +311,15 @@ impl Engine {
         }
         let ctx = EvalContext::new(cols, Some(alias));
         let keep = |row: &Row| -> Result<bool, EngineError> {
-            for p in preds {
+            for (i, p) in preds.iter().enumerate() {
+                // The pred that seeded the index seek is already proven
+                // true for every row in the seeded set; skip the
+                // redundant per-row re-eval. Critical for large `IN`
+                // lists, where re-evaluating the list interpretively per
+                // row is O(rows × list).
+                if Some(i) == seeded_pred_idx {
+                    continue;
+                }
                 let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
                 if !matches!(v, Value::Bool(true)) {
                     return Ok(false);
