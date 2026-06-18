@@ -138,11 +138,24 @@ pub fn reorder_joins(stmt: &mut SelectStatement, catalog: &Catalog, stats: &Stat
     if from.joins.is_empty() {
         return;
     }
-    if from
+    // v7.38 — the LEFT/CROSS "disable reorder" rule is too coarse.
+    // Only the *leading run* of INNER joins is reorderable; LEFT /
+    // CROSS joins must stay at their original positions (their
+    // outer side is the prefix produced so far, so promoting a
+    // later table across them would change semantics). The leading
+    // INNERs can swap freely since the trailing LEFT/CROSS ON
+    // predicates resolve by alias, not position. Split the chain
+    // at the first non-Inner join; reorder only the leading prefix;
+    // re-append the preserved trailing joins after rewrite.
+    let split = from
         .joins
         .iter()
-        .any(|j| !matches!(j.kind, JoinKind::Inner))
-    {
+        .position(|j| !matches!(j.kind, JoinKind::Inner))
+        .unwrap_or(from.joins.len());
+    if split == 0 {
+        // First join is LEFT/CROSS — `from.primary` is its outer
+        // side, swapping would change semantics. v6.2.3 conservative
+        // bail still applies.
         return;
     }
     // v6.2.3 — reorder is gated on having statistics. PG's
@@ -155,12 +168,12 @@ pub fn reorder_joins(stmt: &mut SelectStatement, catalog: &Catalog, stats: &Stat
     if stats.is_empty() {
         return;
     }
-    // Build the table list (primary first; each join contributes
-    // one table). The reorder only swaps indices; ON predicates
-    // travel with their edges.
-    let mut tables: Vec<TableRef> = Vec::with_capacity(1 + from.joins.len());
+    // Build the table list for the LEADING INNER CHAIN ONLY.
+    // primary first + leading INNER joins. Trailing LEFT/CROSS joins
+    // are preserved verbatim by `rewrite_from_with_trailing`.
+    let mut tables: Vec<TableRef> = Vec::with_capacity(1 + split);
     tables.push(from.primary.clone());
-    for j in &from.joins {
+    for j in &from.joins[..split] {
         tables.push(j.table.clone());
     }
     let n = tables.len();
@@ -177,11 +190,9 @@ pub fn reorder_joins(stmt: &mut SelectStatement, catalog: &Catalog, stats: &Stat
             alias_to_idx.entry(t.name.clone()).or_insert(i);
         }
     }
-    // Extract edges from each join's ON predicate. Every join in
-    // `from.joins` carries one ON; predicate's referenced
-    // table-set determines which tables are endpoints.
+    // Extract edges from each LEADING INNER join's ON predicate.
     let mut edges: Vec<Edge> = Vec::new();
-    for j in &from.joins {
+    for j in &from.joins[..split] {
         let Some(on) = j.on.as_ref() else {
             // INNER without ON is a CROSS in v4.x parser — bail
             // (we'd lose the user's intent).
@@ -221,7 +232,7 @@ pub fn reorder_joins(stmt: &mut SelectStatement, catalog: &Catalog, stats: &Stat
     if order.iter().enumerate().all(|(i, &j)| i == j) {
         return;
     }
-    rewrite_from(from, &tables, &edges, &order);
+    rewrite_from_with_trailing(from, &tables, &edges, &order, split);
 }
 
 struct Edge {
@@ -455,6 +466,23 @@ fn plan_cost(order: &[usize], sizes: &[u64], edges: &[Edge]) -> f64 {
 }
 
 fn rewrite_from(from: &mut FromClause, tables: &[TableRef], edges: &[Edge], order: &[usize]) {
+    rewrite_from_with_trailing(from, tables, edges, order, from.joins.len());
+}
+
+/// v7.38 — `rewrite_from` variant aware of trailing LEFT/CROSS joins
+/// that must be preserved verbatim. `split` is the index where the
+/// trailing (non-reorderable) joins begin in the *original* `from.joins`.
+/// The leading INNER chain (primary + `joins[0..split]`) is rewritten
+/// per `order`; `joins[split..]` is re-appended at the end so LEFT /
+/// CROSS semantics are preserved.
+fn rewrite_from_with_trailing(
+    from: &mut FromClause,
+    tables: &[TableRef],
+    edges: &[Edge],
+    order: &[usize],
+    split: usize,
+) {
+    let trailing: alloc::vec::Vec<FromJoin> = from.joins[split..].to_vec();
     from.primary = tables[order[0]].clone();
     from.joins.clear();
     let mut in_prefix: Vec<bool> = alloc::vec![false; tables.len()];
@@ -493,6 +521,8 @@ fn rewrite_from(from: &mut FromClause, tables: &[TableRef], edges: &[Edge], orde
             on: Some(on),
         });
     }
+    // v7.38 — re-append preserved trailing LEFT/CROSS joins.
+    from.joins.extend(trailing);
 }
 
 /// v7.32 (architecture v2 P3) — force a specific table to drive an
