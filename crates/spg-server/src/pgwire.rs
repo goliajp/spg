@@ -1712,7 +1712,19 @@ fn handle_execute(
         if needs_write && matches!(role, Role::ReadOnly) {
             return Err(proto("permission denied: readonly role".to_string()));
         }
-        eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel)
+        // v7.37 (SPGS small-query bar) — borrow-based fast path for
+        // SELECT prepared statements with no bound parameters. Skips
+        // the AST clone (~2 µs for a small SELECT) + the no-op
+        // `substitute_placeholders` walk. The wire-probe
+        // `select_1` shape and similar no-param queries (catalog
+        // probes, version() checks, sqlx pool warm-ups) all land
+        // here.
+        match (&stmt.ast, portal.params.is_empty()) {
+            (spg_sql::ast::Statement::Select(s), true) => {
+                eng.execute_prepared_select_no_params(s, cancel)
+            }
+            _ => eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel),
+        }
     };
     // v7.33 (A1) — persist the write to the WAL (or the no-WAL snapshot)
     // BEFORE acking it. Pre-7.33 `handle_execute` persisted nothing, so

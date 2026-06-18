@@ -180,6 +180,25 @@ impl Engine {
         self.execute_prepared_with_cancel(stmt, params, CancelToken::none())
     }
 
+    /// v7.37 (SPGS small-query bar) — borrow-based SELECT entry for
+    /// the pgwire `Execute` hot path when the portal has no bound
+    /// parameters. Skips both the AST clone the prepared path used
+    /// to do at the pgwire call site AND the `substitute_
+    /// placeholders` walk (a no-op when params are empty). Caller
+    /// must already hold the engine write lock — read would be
+    /// cleaner, but `current_tx` mutation keeps it `&mut`.
+    pub fn execute_prepared_select_no_params(
+        &mut self,
+        stmt: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let saved = self.current_tx;
+        self.current_tx = Some(IMPLICIT_TX);
+        let result = self.exec_select_cancel(stmt, cancel);
+        self.current_tx = saved;
+        result
+    }
+
     /// v7.17.0 Phase 2.3 — prepared-statement entry that honors a
     /// caller-supplied `CancelToken`. Mirrors `execute_prepared`'s
     /// `current_tx` save/restore so the extended-query path stays
