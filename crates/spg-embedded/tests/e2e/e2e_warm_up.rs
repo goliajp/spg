@@ -42,8 +42,8 @@ fn warm_up_plan_cache_populates_the_engine_plan_cache() {
 fn warm_up_plan_cache_skips_invalid_sql_silently() {
     let mut db = Database::open_in_memory();
     let warmed = db.warm_up_plan_cache(&[
-        "SELECT 1",                         // OK
-        "this is not valid SQL at all",     // parse error
+        "SELECT 1",                        // OK
+        "this is not valid SQL at all",    // parse error
         "SELECT * FROM nonexistent_table", // parse OK, planning OK (table check at exec)
     ]);
     // Two SQL strings parse cleanly; the third (1-token gibberish)

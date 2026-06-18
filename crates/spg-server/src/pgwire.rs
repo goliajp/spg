@@ -1720,8 +1720,8 @@ fn handle_execute(
             let _ = needs_write;
         }
         let mut cols_storage: Vec<ColumnSchema> = Vec::new();
-        let stream_emit_result = eng.execute_prepared_select_streaming(s, cancel, |item| {
-            match item {
+        let stream_emit_result =
+            eng.execute_prepared_select_streaming(s, cancel, |item| match item {
                 spg_engine::StreamItem::Header(cols) => {
                     cols_storage.extend_from_slice(cols);
                     let io_res = if let Some(body) = cached_row_desc.as_deref() {
@@ -1729,17 +1729,13 @@ fn handle_execute(
                     } else {
                         send_row_description(stream, cols)
                     };
-                    io_res.map_err(|e| {
-                        spg_engine::EngineError::Unsupported(e.to_string())
-                    })
+                    io_res.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
                 spg_engine::StreamItem::Row(values) => {
-                    encode_data_row_from_refs(stream, &cols_storage, values).map_err(|e| {
-                        spg_engine::EngineError::Unsupported(e.to_string())
-                    })
+                    encode_data_row_from_refs(stream, &cols_storage, values)
+                        .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
-            }
-        });
+            });
         drop(eng);
         let row_count = match stream_emit_result {
             Ok(n) => n,
@@ -1785,8 +1781,7 @@ fn handle_execute(
             // from Parse-time describe; falls back to per-Execute
             // encode when describe wasn't able to infer columns.
             if let Some(body) = stmt.row_desc_body.as_deref() {
-                send_row_description_cached(stream, body)
-                    .map_err(|e| proto(e.to_string()))?;
+                send_row_description_cached(stream, body).map_err(|e| proto(e.to_string()))?;
             } else {
                 send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
             }

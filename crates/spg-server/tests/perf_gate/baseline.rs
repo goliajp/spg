@@ -814,11 +814,7 @@ fn seed_with_sender_cardinality_wide(
     }
 }
 
-fn seed_with_sender_cardinality(
-    db: &mut Engine,
-    n_messages: usize,
-    distinct_senders: usize,
-) {
+fn seed_with_sender_cardinality(db: &mut Engine, n_messages: usize, distinct_senders: usize) {
     db.execute("CREATE TABLE mailboxes (id BIGSERIAL PRIMARY KEY, name TEXT, user_address TEXT)")
         .unwrap();
     db.execute(
@@ -1021,11 +1017,14 @@ fn seed_mailrs_inbox(db: &mut Engine, n_messages: usize) {
     )
     .unwrap();
     // Match mailrs prod indexes that matter for this shape.
-    db.execute("CREATE INDEX idx_messages_thread ON messages(thread_id)").unwrap();
+    db.execute("CREATE INDEX idx_messages_thread ON messages(thread_id)")
+        .unwrap();
     db.execute("CREATE INDEX idx_messages_thread_date ON messages(thread_id, internal_date DESC)")
         .unwrap();
-    db.execute("CREATE INDEX idx_messages_mailbox ON messages(mailbox_id)").unwrap();
-    db.execute("CREATE INDEX idx_mailboxes_user ON mailboxes(user_address, name)").unwrap();
+    db.execute("CREATE INDEX idx_messages_mailbox ON messages(mailbox_id)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_mailboxes_user ON mailboxes(user_address, name)")
+        .unwrap();
     // mailrs prod /api/conversations references snoozed_conversations
     // via NOT EXISTS — schema needed even if rows are absent.
     db.execute(
@@ -1189,7 +1188,13 @@ fn baseline_mailrs_minimal_30k() {
     let mut db = Engine::new();
     seed_mailrs_inbox(&mut db, 30_000);
     dump_explain(&mut db, "mailrs_minimal_30k", MAILRS_MINIMAL_SQL);
-    time_query(&mut db, MAILRS_MINIMAL_SQL, 10, "mailrs_minimal_30k", 1500.0);
+    time_query(
+        &mut db,
+        MAILRS_MINIMAL_SQL,
+        10,
+        "mailrs_minimal_30k",
+        1500.0,
+    );
 }
 
 #[test]
@@ -1214,7 +1219,11 @@ fn baseline_mailrs_distinct_aggs_30k() {
     let _g = crate::perf_lock();
     let mut db = Engine::new();
     seed_mailrs_inbox(&mut db, 30_000);
-    dump_explain(&mut db, "mailrs_distinct_aggs_30k", MAILRS_DISTINCT_AGGS_SQL);
+    dump_explain(
+        &mut db,
+        "mailrs_distinct_aggs_30k",
+        MAILRS_DISTINCT_AGGS_SQL,
+    );
     time_query(
         &mut db,
         MAILRS_DISTINCT_AGGS_SQL,
@@ -1230,7 +1239,11 @@ fn baseline_mailrs_distinct_aggs_100k() {
     let _g = crate::perf_lock();
     let mut db = Engine::new();
     seed_mailrs_inbox(&mut db, 100_000);
-    dump_explain(&mut db, "mailrs_distinct_aggs_100k", MAILRS_DISTINCT_AGGS_SQL);
+    dump_explain(
+        &mut db,
+        "mailrs_distinct_aggs_100k",
+        MAILRS_DISTINCT_AGGS_SQL,
+    );
     time_query(
         &mut db,
         MAILRS_DISTINCT_AGGS_SQL,
@@ -1488,7 +1501,11 @@ fn baseline_mailrs_prod_no_leftjoin_100k() {
     let _g = crate::perf_lock();
     let mut db = Engine::new();
     seed_mailrs_inbox(&mut db, 100_000);
-    dump_explain(&mut db, "mailrs_prod_no_leftjoin_100k", MAILRS_PROD_NO_LEFTJOIN_SQL);
+    dump_explain(
+        &mut db,
+        "mailrs_prod_no_leftjoin_100k",
+        MAILRS_PROD_NO_LEFTJOIN_SQL,
+    );
     time_query(
         &mut db,
         MAILRS_PROD_NO_LEFTJOIN_SQL,
@@ -1504,7 +1521,11 @@ fn baseline_mailrs_prod_no_ordered_agg_100k() {
     let _g = crate::perf_lock();
     let mut db = Engine::new();
     seed_mailrs_inbox(&mut db, 100_000);
-    dump_explain(&mut db, "mailrs_prod_no_ordered_agg_100k", MAILRS_PROD_NO_ORDERED_AGG_SQL);
+    dump_explain(
+        &mut db,
+        "mailrs_prod_no_ordered_agg_100k",
+        MAILRS_PROD_NO_ORDERED_AGG_SQL,
+    );
     time_query(
         &mut db,
         MAILRS_PROD_NO_ORDERED_AGG_SQL,

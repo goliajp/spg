@@ -128,8 +128,7 @@ impl Engine {
                 continue;
             };
             let inner_alias = table_alias(&j.table);
-            let Some((outer_expr, inner_col_name)) =
-                analyse_on_eq(on, inner_alias, &alias_to_idx)
+            let Some((outer_expr, inner_col_name)) = analyse_on_eq(on, inner_alias, &alias_to_idx)
             else {
                 continue;
             };
@@ -389,9 +388,7 @@ where
             walk_expr(expr, f);
             walk_expr(pattern, f);
         }
-        Expr::InList {
-            expr: e2, list, ..
-        } => {
+        Expr::InList { expr: e2, list, .. } => {
             walk_expr(e2, f);
             for li in list {
                 walk_expr(li, f);
@@ -513,7 +510,13 @@ fn build_folded_from(from: &FromClause, drop_indices: &[usize]) -> FromClause {
         .joins
         .iter()
         .enumerate()
-        .filter_map(|(i, j)| if drop.contains(&i) { None } else { Some(j.clone()) })
+        .filter_map(|(i, j)| {
+            if drop.contains(&i) {
+                None
+            } else {
+                Some(j.clone())
+            }
+        })
         .collect();
     FromClause {
         primary: from.primary.clone(),

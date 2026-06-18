@@ -1742,8 +1742,7 @@ impl Engine {
                     Ok(matches!(cond, Value::Bool(true)))
                 }
                 (None, Some(w)) => {
-                    let cond = self
-                        .eval_expr_with_correlated(w, row, &ctx, cancel, Some(memo))?;
+                    let cond = self.eval_expr_with_correlated(w, row, &ctx, cancel, Some(memo))?;
                     Ok(matches!(cond, Value::Bool(true)))
                 }
                 (None, None) => Ok(true),

@@ -177,8 +177,7 @@ async fn seed(pool: &PgPool, n_messages: usize, label: &str) {
         let _ = write!(&mut vals, "({mid}, 'cat{}')", k % 5);
         count += 1;
         if count == 500 {
-            let sql =
-                format!("INSERT INTO email_analysis (message_id, category) VALUES {vals}");
+            let sql = format!("INSERT INTO email_analysis (message_id, category) VALUES {vals}");
             pool.execute(sql.as_str()).await.unwrap();
             vals.clear();
             count = 0;
@@ -216,7 +215,10 @@ async fn measure(pool: &PgPool, sql: &str, label: &str, iters: usize) {
     let p95 = samples[(samples.len() * 95) / 100];
     let min = samples[0];
     let max = *samples.last().unwrap();
-    eprintln!("[{label}] p50={p50:.2}ms  p95={p95:.2}ms  min={min:.2}ms  max={max:.2}ms  (n={})", samples.len());
+    eprintln!(
+        "[{label}] p50={p50:.2}ms  p95={p95:.2}ms  min={min:.2}ms  max={max:.2}ms  (n={})",
+        samples.len()
+    );
 }
 
 fn seed_n() -> usize {
