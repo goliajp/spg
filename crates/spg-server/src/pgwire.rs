@@ -1641,15 +1641,14 @@ fn handle_execute(
     let proto = |m: String| ("42000", m);
     let mut cur = 0;
     let portal_name = read_cstring(body, &mut cur)
-        .ok_or_else(|| proto("Execute: portal name not UTF-8".to_string()))?
-        .to_string();
+        .ok_or_else(|| proto("Execute: portal name not UTF-8".to_string()))?;
     // Max-rows (i32, 0 = unlimited). We always return everything;
     // partial-cursor support is future work.
     if cur + 4 > body.len() {
         return Err(proto("Execute: missing max-rows".to_string()));
     }
     let portal = portals
-        .get(&portal_name)
+        .get(portal_name)
         .ok_or_else(|| proto(format!("Execute: portal {portal_name:?} not found")))?;
     let stmt = prepared.get(&portal.stmt_name).ok_or_else(|| {
         proto(format!(
