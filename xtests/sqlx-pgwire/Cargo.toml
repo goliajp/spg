@@ -2,7 +2,6 @@
 name         = "spg-sqlx-pgwire"
 version      = { workspace = true }
 edition      = { workspace = true }
-rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "sqlx 0.8 ↔ spg-server PG-wire integration tests. In-tree only; never published."
