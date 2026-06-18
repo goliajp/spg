@@ -1700,6 +1700,58 @@ fn handle_execute(
     // PREPAREs `SELECT version()` doesn't need the canned path
     // because the engine itself will satisfy it).
     let needs_write = !matches!(&stmt.ast, spg_sql::ast::Statement::Select(_));
+    // v7.37 (SPGS PROJ wire encode tax) — streaming SELECT path for
+    // SELECT prepared statements with no bound parameters. Skips the
+    // intermediate `Vec<Row>` and emits DataRow frames straight into
+    // `stream` as the engine produces each surviving row. For
+    // streamable shapes (joined non-aggregate projection) the engine
+    // also skips the per-cell `.cloned()` and emits cell references
+    // straight out of the source tables.
+    let cached_row_desc = stmt.row_desc_body.clone();
+    if let (spg_sql::ast::Statement::Select(s), true) = (&stmt.ast, portal.params.is_empty()) {
+        let mut eng = state
+            .engine
+            .write()
+            .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
+        if matches!(role, Role::ReadOnly) {
+            // SELECT is always read-allowed; the role check stays
+            // here for symmetry with the non-streaming branch's
+            // `needs_write` arm.
+            let _ = needs_write;
+        }
+        let mut cols_storage: Vec<ColumnSchema> = Vec::new();
+        let stream_emit_result = eng.execute_prepared_select_streaming(s, cancel, |item| {
+            match item {
+                spg_engine::StreamItem::Header(cols) => {
+                    cols_storage.extend_from_slice(cols);
+                    let io_res = if let Some(body) = cached_row_desc.as_deref() {
+                        send_row_description_cached(stream, body)
+                    } else {
+                        send_row_description(stream, cols)
+                    };
+                    io_res.map_err(|e| {
+                        spg_engine::EngineError::Unsupported(e.to_string())
+                    })
+                }
+                spg_engine::StreamItem::Row(values) => {
+                    encode_data_row_from_refs(stream, &cols_storage, values).map_err(|e| {
+                        spg_engine::EngineError::Unsupported(e.to_string())
+                    })
+                }
+            }
+        });
+        drop(eng);
+        let row_count = match stream_emit_result {
+            Ok(n) => n,
+            Err(e) => {
+                let (sqlstate, msg) = engine_error_to_wire(&e);
+                return Err((sqlstate, msg));
+            }
+        };
+        send_command_complete(stream, &format!("SELECT {row_count}"))
+            .map_err(|e| proto(e.to_string()))?;
+        return Ok(());
+    }
     let result = {
         // execute_prepared takes &mut self for symmetry with the
         // simple-query path, so both read and write hold the write
@@ -1712,19 +1764,7 @@ fn handle_execute(
         if needs_write && matches!(role, Role::ReadOnly) {
             return Err(proto("permission denied: readonly role".to_string()));
         }
-        // v7.37 (SPGS small-query bar) — borrow-based fast path for
-        // SELECT prepared statements with no bound parameters. Skips
-        // the AST clone (~2 µs for a small SELECT) + the no-op
-        // `substitute_placeholders` walk. The wire-probe
-        // `select_1` shape and similar no-param queries (catalog
-        // probes, version() checks, sqlx pool warm-ups) all land
-        // here.
-        match (&stmt.ast, portal.params.is_empty()) {
-            (spg_sql::ast::Statement::Select(s), true) => {
-                eng.execute_prepared_select_no_params(s, cancel)
-            }
-            _ => eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel),
-        }
+        eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel)
     };
     // v7.33 (A1) — persist the write to the WAL (or the no-WAL snapshot)
     // BEFORE acking it. Pre-7.33 `handle_execute` persisted nothing, so
@@ -3035,6 +3075,32 @@ fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> st
         encode_pg_text_cell(&mut body, v, cols.get(i).map(|c| c.ty))?;
     }
     send_msg(stream, b'D', &body)
+}
+
+/// v7.37 — borrowed-cells variant of `encode_data_row`. Same wire
+/// format, but the row is presented as `&[&Value]` (cell references
+/// out of the source rows) instead of a fully owned `&Row`. The
+/// streaming SELECT path uses this to skip the per-row `.cloned()`
+/// the materialising path pays before reaching the wire.
+fn encode_data_row_from_refs(
+    out: &mut Vec<u8>,
+    cols: &[ColumnSchema],
+    values: &[&spg_storage::Value],
+) -> std::io::Result<()> {
+    let n = u16::try_from(values.len())
+        .map_err(|_| std::io::Error::other("DataRow: too many cells"))?;
+    let frame_start = out.len();
+    out.push(b'D');
+    out.extend_from_slice(&[0u8; 4]); // length placeholder, backpatched below
+    out.extend_from_slice(&n.to_be_bytes());
+    for (i, v) in values.iter().enumerate() {
+        encode_pg_text_cell(out, v, cols.get(i).map(|c| c.ty))?;
+    }
+    let body_plus_len_field = out.len() - frame_start - 1;
+    let len = u32::try_from(body_plus_len_field)
+        .map_err(|_| std::io::Error::other("PG message body too large"))?;
+    out[frame_start + 1..frame_start + 5].copy_from_slice(&len.to_be_bytes());
+    Ok(())
 }
 
 /// v7.34 (SPGS perf bar) — direct-into-`Vec` DataRow encoder, used by
