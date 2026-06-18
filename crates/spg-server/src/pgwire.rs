@@ -1151,6 +1151,15 @@ struct PreparedStmt {
     /// text". Used to dispatch binary-format Bind values to the
     /// right decoder.
     param_type_oids: Vec<u32>,
+    /// v7.37 (SPGS small-query bar) — the wire-encoded
+    /// `RowDescription` body bytes (NOT including the `b'T'` type
+    /// byte + length prefix). Computed at Parse time from the
+    /// describe-prepared column list and reused verbatim on every
+    /// Execute. Skips per-Execute column reconstruction +
+    /// `pg_type_oid` / `pg_type_len` dispatch + Vec growth.
+    /// `None` when the prepared statement isn't a SELECT (or
+    /// describe_prepared couldn't infer columns).
+    row_desc_body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1231,7 +1240,18 @@ fn handle_parse(
     let ast = eng
         .prepare_cached(&sql)
         .map_err(|e| format!("Parse: {e}"))?;
+    // v7.37 (SPGS small-query bar) — describe at Parse time and
+    // cache the wire-format RowDescription body. For repeated
+    // executions of the same prepared statement (the sqlx hot
+    // shape) every Execute now skips re-deriving the column shape
+    // and re-encoding the protocol body.
+    let (_, columns) = eng.describe_prepared(&ast);
     drop(eng);
+    let row_desc_body: Option<Vec<u8>> = if columns.is_empty() {
+        None
+    } else {
+        Some(encode_row_description_body(&columns))
+    };
     let placeholder_count = count_placeholders(&sql);
     prepared.insert(
         name,
@@ -1239,6 +1259,7 @@ fn handle_parse(
             ast,
             placeholder_count,
             param_type_oids,
+            row_desc_body,
         },
     );
     Ok(())
@@ -1708,7 +1729,15 @@ fn handle_execute(
     }
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
-            send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
+            // v7.37 (SPGS small-query bar) — cached RowDescription
+            // from Parse-time describe; falls back to per-Execute
+            // encode when describe wasn't able to infer columns.
+            if let Some(body) = stmt.row_desc_body.as_deref() {
+                send_row_description_cached(stream, body)
+                    .map_err(|e| proto(e.to_string()))?;
+            } else {
+                send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
+            }
             let n = rows.len();
             for row in &rows {
                 encode_data_row(stream, &columns, row).map_err(|e| proto(e.to_string()))?;
@@ -2956,8 +2985,20 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
 }
 
 fn send_row_description(stream: &mut dyn Write, cols: &[ColumnSchema]) -> std::io::Result<()> {
-    let n = u16::try_from(cols.len())
-        .map_err(|_| std::io::Error::other("RowDescription: too many columns"))?;
+    let body = encode_row_description_body(cols);
+    send_msg(stream, b'T', &body)
+}
+
+/// v7.37 — write `b'T'` + length + body straight into `out` from
+/// pre-encoded RowDescription bytes cached on `PreparedStmt`.
+/// Used by the extended-query Execute path; skips the per-Execute
+/// `encode_row_description_body` round.
+fn send_row_description_cached(out: &mut Vec<u8>, body: &[u8]) -> std::io::Result<()> {
+    send_msg(out, b'T', body)
+}
+
+fn encode_row_description_body(cols: &[ColumnSchema]) -> Vec<u8> {
+    let n = u16::try_from(cols.len()).unwrap_or(u16::MAX);
     let mut body = Vec::with_capacity(2 + cols.len() * 24);
     body.extend_from_slice(&n.to_be_bytes());
     for c in cols {
@@ -2970,7 +3011,7 @@ fn send_row_description(stream: &mut dyn Write, cols: &[ColumnSchema]) -> std::i
         body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
         body.extend_from_slice(&0u16.to_be_bytes()); // format = text
     }
-    send_msg(stream, b'T', &body)
+    body
 }
 
 fn send_data_row(stream: &mut dyn Write, cols: &[ColumnSchema], row: &Row) -> std::io::Result<()> {
