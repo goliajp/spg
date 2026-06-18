@@ -1630,11 +1630,22 @@ fn handle_execute(
     portals: &std::collections::HashMap<String, Portal>,
     prepared: &std::collections::HashMap<String, PreparedStmt>,
     settings: &std::collections::HashMap<String, String>,
-    stream: &mut dyn Write,
+    out: &mut Vec<u8>,
     state: &Arc<ServerState>,
     role: Role,
     tx_state: &mut u8,
 ) -> Result<(), (&'static str, String)> {
+    // v7.37 (SPGS proj_25k bar) — `out` was `&mut dyn Write`
+    // pre-7.37; the simple-query Q path already wrote DataRow
+    // frames into the response buffer via `encode_data_row`'s
+    // single-Vec layout, but the extended-protocol path went
+    // through `send_data_row`'s per-row body Vec + `send_msg`
+    // body→frame copy. Threading `&mut Vec<u8>` lets the hot
+    // SELECT loop below take the same fast path. The handful of
+    // upstream calls (`send_row_description`, `send_command_complete`,
+    // `send_msg`) already accept `impl Write`, which Vec<u8>
+    // satisfies.
+    let stream: &mut Vec<u8> = out;
     // v7.17.0 Phase 2.3 — protocol-level errors keep SQLSTATE
     // `42000` to match prior behavior; only `EngineError::Cancelled`
     // promotes to `57014` via `engine_error_to_wire`.
@@ -1700,7 +1711,7 @@ fn handle_execute(
             send_row_description(stream, &columns).map_err(|e| proto(e.to_string()))?;
             let n = rows.len();
             for row in &rows {
-                send_data_row(stream, &columns, row).map_err(|e| proto(e.to_string()))?;
+                encode_data_row(stream, &columns, row).map_err(|e| proto(e.to_string()))?;
             }
             send_command_complete(stream, &format!("SELECT {n}"))
                 .map_err(|e| proto(e.to_string()))?;
