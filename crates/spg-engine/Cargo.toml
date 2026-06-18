@@ -2,7 +2,6 @@
 name         = "spg-engine"
 version      = { workspace = true }
 edition      = { workspace = true }
-rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "Execution engine for SPG: glues spg-sql parsing to spg-storage. Foreign keys, joins, vectors, cold tier."
