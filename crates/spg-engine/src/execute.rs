@@ -328,7 +328,6 @@ pub enum StreamItem<'a> {
 }
 
 impl Engine {
-
     /// v7.17.0 Phase 2.3 — prepared-statement entry that honors a
     /// caller-supplied `CancelToken`. Mirrors `execute_prepared`'s
     /// `current_tx` save/restore so the extended-query path stays

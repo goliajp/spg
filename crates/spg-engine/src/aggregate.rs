@@ -608,17 +608,15 @@ pub(crate) fn run(
     // statically here), no DISTINCT (would need post-dedup, can't
     // truncate during sort), no LIMIT WITH TIES (which extends past
     // the literal k by run-time tie-key comparison).
-    let keep_n: Option<usize> = if !stmt.order_by.is_empty()
-        && !stmt.distinct
-        && !stmt.limit_with_ties
-    {
-        stmt.limit_literal().map(|l| {
-            let off = stmt.offset_literal().unwrap_or(0) as usize;
-            (l as usize).saturating_add(off)
-        })
-    } else {
-        None
-    };
+    let keep_n: Option<usize> =
+        if !stmt.order_by.is_empty() && !stmt.distinct && !stmt.limit_with_ties {
+            stmt.limit_literal().map(|l| {
+                let off = stmt.offset_literal().unwrap_or(0) as usize;
+                (l as usize).saturating_add(off)
+            })
+        } else {
+            None
+        };
     if !stmt.order_by.is_empty() {
         let (sorted_synth, sorted_out) = sort_synth_by_order_by(
             &synth_schema,
@@ -791,12 +789,9 @@ fn accumulate_groups(
             continue;
         }
         let src = spec.arg.as_ref().expect("arg_compiled => spec.arg is Some");
-        let pos = arg_unique_idx.iter().position(|&j| {
-            agg_specs[j]
-                .arg
-                .as_ref()
-                .is_some_and(|other| other == src)
-        });
+        let pos = arg_unique_idx
+            .iter()
+            .position(|&j| agg_specs[j].arg.as_ref().is_some_and(|other| other == src));
         arg_slot[i] = Some(match pos {
             Some(p) => p,
             None => {
@@ -1096,9 +1091,7 @@ fn accumulate_groups(
                             let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                             row_eval_cache[s] = Some(v);
                         }
-                        row_eval_cache[s]
-                            .as_ref()
-                            .expect("just filled above")
+                        row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
                         arg_owned = eval_arg(
@@ -1240,9 +1233,7 @@ fn accumulate_groups(
                             let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                             row_eval_cache[s] = Some(v);
                         }
-                        row_eval_cache[s]
-                            .as_ref()
-                            .expect("just filled above")
+                        row_eval_cache[s].as_ref().expect("just filled above")
                     }
                     (None, None, Some(e)) => {
                         arg_owned = eval_arg(
