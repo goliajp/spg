@@ -73,4 +73,5 @@ mod prefetch;
     unused_variables
 )]
 mod prepared_vs_simple;
+mod proj_streaming;
 mod sq8;
