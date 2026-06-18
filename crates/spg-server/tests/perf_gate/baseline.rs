@@ -596,6 +596,89 @@ fn baseline_user_storage_usage() {
     );
 }
 
+// v7.37 probe — same shape as user_storage_usage but with the JOIN
+// folded to a direct mailbox_id filter. Measures the structural
+// ceiling: how fast is the SUM(LENGTH(text_body)) path WITHOUT the
+// JOIN executor walk? If this lands at ~PG18 (2.3 ms), the gap is
+// purely the JOIN walk; if it's still well above, the bottleneck
+// is per-row PV indirection + Value enum.
+#[test]
+fn baseline_user_storage_usage_fold_probe() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT COALESCE(SUM(LENGTH(text_body)), 0) FROM messages \
+         WHERE mailbox_id = 1",
+        10,
+        "user_storage_usage_fold_probe",
+        100.0,
+    );
+}
+
+// v7.37 — does qualifying the column slow the path?
+#[test]
+fn baseline_count_messages_fold_eq_qualified() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT COUNT(*) FROM messages m WHERE m.mailbox_id = 1",
+        10,
+        "fold_eq_qualified",
+        100.0,
+    );
+}
+
+// v7.37 — does IN-list (size 1) match `=`?
+#[test]
+fn baseline_count_messages_fold_in1() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT COUNT(*) FROM messages m WHERE m.mailbox_id IN (1)",
+        10,
+        "fold_in1",
+        100.0,
+    );
+}
+
+// v7.37 — same shape my fold actually produces: 25 mailbox ids
+// in the IN list.
+#[test]
+fn baseline_count_messages_fold_in25() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT COUNT(*) FROM messages m WHERE m.mailbox_id IN \
+         (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25)",
+        10,
+        "fold_in25",
+        100.0,
+    );
+}
+
+// v7.37 probe — same as count_messages but with the JOIN folded.
+#[test]
+fn baseline_count_messages_fold_probe() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_inbox_25k(&mut db);
+    time_query(
+        &mut db,
+        "SELECT COUNT(*) FROM messages WHERE mailbox_id = 1",
+        10,
+        "count_messages_fold_probe",
+        100.0,
+    );
+}
+
 // Shape 7c — mailrs `list_conversation_categories`
 // (`crates/mailbox/src/pg/search_ops.rs:176`). 3-way JOIN +
 // GROUP BY category + COUNT DISTINCT thread_id + ORDER BY count
