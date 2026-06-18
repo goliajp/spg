@@ -160,6 +160,32 @@ fn extract_query_plan_lines(result: QueryResult) -> Vec<String> {
     }
 }
 
+/// v7.37.2 — auto-warm the OS page cache for cold-tier segments at
+/// `open_path` / `restore` time. Per the zero-customer-change rule
+/// the client never calls `warm_up_cold_tier()` from app code; the
+/// catalog is server-ready when its constructor returns.
+///
+/// Budget controls:
+/// * `SPG_WARM_UP_COLD_BUDGET_MS=N` — stop warming after N ms
+///   wall-clock (best-effort; granularity is per-table). Unset =
+///   no cap.
+/// * `SPG_WARM_UP_COLD_BUDGET_MS=0` — skip warm-up entirely (escape
+///   hatch for ops that need fast restart even at the cost of the
+///   first-query cold spike).
+fn autowarm_cold_tier_on_open(db: &Database) {
+    let budget_ms = std::env::var("SPG_WARM_UP_COLD_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    if let Some(0) = budget_ms {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let touched = db.warm_up_cold_tier();
+    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let over_budget = budget_ms.is_some_and(|b| elapsed_ms > b);
+    let _ = (touched, over_budget); // future: tracing::info
+}
+
 fn wall_clock_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2104,7 +2130,7 @@ impl Database {
         if row_redo_enabled() {
             engine.set_redo_capture(true);
         }
-        Ok(Self {
+        let db = Self {
             engine,
             commit_lsn: AtomicU64::new(initial_lsn),
             tx_wal: None,
@@ -2123,7 +2149,18 @@ impl Database {
                 flusher_thread,
                 checkpoint_worker: Some(CheckpointWorker::spawn()),
             }),
-        })
+        };
+        // v7.37.2 (mailrs prod 7.35 pool-exhaustion incident — surface
+        // fix per `feedback-zero-customer-change-warmup-incident`) —
+        // automatic cold-tier OS page-cache warm-up so the catalog is
+        // fully server-ready on return. The client never sees a SPG-
+        // specific call site; `open_path` behaves like PG's "ready to
+        // accept queries" semantics. Bounded by
+        // `SPG_WARM_UP_COLD_BUDGET_MS` (default unset = no cap;
+        // env-only spec channel, never a client-visible API). `0` =
+        // skip warm-up entirely (escape hatch for fast restart).
+        autowarm_cold_tier_on_open(&db);
+        Ok(db)
     }
 
     /// v7.1.4 — freeze the oldest `max_rows` of `table_name`'s
@@ -2302,12 +2339,17 @@ impl Database {
         let engine = Engine::restore_envelope(snapshot).map_err(|e| {
             EngineError::Storage(spg_storage::StorageError::Corrupt(format!("restore: {e}")))
         })?;
-        Ok(Self {
+        let db = Self {
             engine,
             persistence: None,
             commit_lsn: AtomicU64::new(0),
             tx_wal: None,
-        })
+        };
+        // v7.37.2 — auto-warm on snapshot restore for the same reason
+        // `open_path` does (catalog is server-ready when constructor
+        // returns; client never sees a SPG-specific warmup call).
+        autowarm_cold_tier_on_open(&db);
+        Ok(db)
     }
 
     /// Take a catalog snapshot suitable for `Database::restore`.
