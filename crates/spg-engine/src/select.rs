@@ -1567,6 +1567,9 @@ impl Engine {
         // nested-loop join executor. Single-table FROM stays on the
         // existing scan + index-seek path.
         if !from.joins.is_empty() {
+            if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
+                return self.exec_bare_select_cancel(&folded, cancel);
+            }
             return self.exec_joined_select(stmt, from, cancel);
         }
         // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>`. Synthesise a
@@ -1711,20 +1714,46 @@ impl Engine {
         // scalar subqueries. Fresh per row-loop entry so each
         // SELECT execution gets an isolated cache.
         let mut memo = memoize::MemoizeCache::new();
+        // v7.37 (perf) — single-table aggregate's WHERE filter
+        // pre-7.37 ran the slow tree-walker (`eval_expr_with_
+        // correlated`) per row, even for subquery-free WHEREs that
+        // the single-table SCAN path has compiled since v7.32
+        // (perf knife D). The asymmetry meant a fold-to-filter
+        // rewrite (joinfold) that swapped a JOIN for a single-table
+        // aggregate over a compiled WHERE saw the tree-walker
+        // instead — 25 k rows × `m.mailbox_id IN (25 lits)` cost
+        // ~9 ms via the walker, vs ~1 ms via the compiled InSet
+        // step. Compile once if eligible; fall back to the walker
+        // for subquery-bearing or non-compilable WHEREs.
+        let compiled_where: Option<eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| eval::fully_compilable(w))
+            .map(|w| eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value> = Vec::new();
+        let mut row_passes_where = |row: &Row,
+                                    eval_stack: &mut Vec<Value>,
+                                    memo: &mut memoize::MemoizeCache|
+         -> Result<bool, EngineError> {
+            match (&compiled_where, &stmt.where_) {
+                (Some(cw), _) => {
+                    let cond = eval::eval_compiled(cw, row, &ctx, eval_stack)
+                        .map_err(EngineError::Eval)?;
+                    Ok(matches!(cond, Value::Bool(true)))
+                }
+                (None, Some(w)) => {
+                    let cond = self
+                        .eval_expr_with_correlated(w, row, &ctx, cancel, Some(memo))?;
+                    Ok(matches!(cond, Value::Bool(true)))
+                }
+                (None, None) => Ok(true),
+            }
+        };
         if let Some(rows) = &indexed_rows {
             for cow in rows {
                 let row = cow.as_ref();
-                if let Some(where_expr) = &stmt.where_ {
-                    let cond = self.eval_expr_with_correlated(
-                        where_expr,
-                        row,
-                        &ctx,
-                        cancel,
-                        Some(&mut memo),
-                    )?;
-                    if !matches!(cond, Value::Bool(true)) {
-                        continue;
-                    }
+                if !row_passes_where(row, &mut eval_stack, &mut memo)? {
+                    continue;
                 }
                 filtered.push(row);
             }
@@ -1743,32 +1772,14 @@ impl Engine {
         if indexed_rows.is_none() {
             for i in 0..table.row_count() {
                 let row = &table.rows()[i];
-                if let Some(where_expr) = &stmt.where_ {
-                    let cond = self.eval_expr_with_correlated(
-                        where_expr,
-                        row,
-                        &ctx,
-                        cancel,
-                        Some(&mut memo),
-                    )?;
-                    if !matches!(cond, Value::Bool(true)) {
-                        continue;
-                    }
+                if !row_passes_where(row, &mut eval_stack, &mut memo)? {
+                    continue;
                 }
                 filtered.push(row);
             }
             for row in &cold_rows_storage {
-                if let Some(where_expr) = &stmt.where_ {
-                    let cond = self.eval_expr_with_correlated(
-                        where_expr,
-                        row,
-                        &ctx,
-                        cancel,
-                        Some(&mut memo),
-                    )?;
-                    if !matches!(cond, Value::Bool(true)) {
-                        continue;
-                    }
+                if !row_passes_where(row, &mut eval_stack, &mut memo)? {
+                    continue;
                 }
                 filtered.push(row);
             }

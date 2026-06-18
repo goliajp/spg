@@ -24,6 +24,7 @@ mod expr_analysis;
 pub mod fts;
 mod index_access;
 mod join;
+mod joinfold;
 pub mod json;
 mod maintenance;
 pub mod memoize;
