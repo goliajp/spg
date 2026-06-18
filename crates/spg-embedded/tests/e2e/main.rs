@@ -21,6 +21,7 @@ mod e2e_revert;
 mod e2e_typed_query;
 mod e2e_vector;
 mod e2e_wal_v4_pitr;
+mod e2e_warm_up;
 mod e2e_with_transaction;
 mod mailrs_round13;
 mod mailrs_round14;
