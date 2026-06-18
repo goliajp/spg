@@ -990,3 +990,558 @@ fn baseline_get_conversations_in_60() {
     );
     time_query(&mut db, &sql, 10, "get_conversations_in_60", 1000.0);
 }
+
+// --- v7.38 P0 reproducer: mailrs prod /api/conversations?limit=50 ---
+//
+// Source: mailrs note `spg-7.37.3-prod-conversations-still-2.5s-user-
+// visible-2026-06-18.md`. Staging 29k msgs warm p50 = 46 ms; prod 80–100k
+// msgs warm = 2.5–2.7 s = ~50× regression at ~3× row count. Strongly
+// suggests plan-shape switch past a catalog-size threshold (no stats /
+// correlated subquery not decorrelated / DISTINCT agg cost blowup /
+// 7.37.3 top-K LIMIT path silently disabled by this shape).
+//
+// The SQL below is verbatim from the prod note. Seed mimics mailrs's
+// realistic distribution: 10 mailboxes per user, ~5 messages per thread
+// (so thread_id GROUP BY has real cardinality, not the trivial 1-row-
+// per-group `seed_inbox_25k` shape). Three cardinalities so we can see
+// the switch point in plan choice.
+fn seed_mailrs_inbox(db: &mut Engine, n_messages: usize) {
+    db.execute("CREATE TABLE mailboxes (id BIGSERIAL PRIMARY KEY, name TEXT, user_address TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, mailbox_id BIGINT, thread_id TEXT, \
+         subject TEXT, sender TEXT, internal_date BIGINT, flags BIGINT, pinned BOOLEAN, \
+         archived BOOLEAN, importance_level TEXT, importance_score REAL, message_id TEXT, \
+         text_body TEXT)",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE email_analysis (message_id BIGINT PRIMARY KEY, category TEXT, \
+         summary TEXT, requires_action BOOLEAN)",
+    )
+    .unwrap();
+    // Match mailrs prod indexes that matter for this shape.
+    db.execute("CREATE INDEX idx_messages_thread ON messages(thread_id)").unwrap();
+    db.execute("CREATE INDEX idx_messages_thread_date ON messages(thread_id, internal_date DESC)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_messages_mailbox ON messages(mailbox_id)").unwrap();
+    db.execute("CREATE INDEX idx_mailboxes_user ON mailboxes(user_address, name)").unwrap();
+    // mailrs prod /api/conversations references snoozed_conversations
+    // via NOT EXISTS — schema needed even if rows are absent.
+    db.execute(
+        "CREATE TABLE snoozed_conversations (\
+         thread_id TEXT NOT NULL, account_address TEXT NOT NULL, \
+         snoozed_until BIGINT NOT NULL, \
+         PRIMARY KEY (thread_id, account_address))",
+    )
+    .unwrap();
+
+    // 10 mailboxes (Inbox, Sent, Archive, …), single user.
+    for i in 0..10 {
+        db.execute(&format!(
+            "INSERT INTO mailboxes (name, user_address) VALUES ('mb{i}', 'lihao@golia.jp')"
+        ))
+        .unwrap();
+    }
+
+    // ~5 msgs per thread → n_messages/5 threads. ~600 distinct senders.
+    let msgs_per_thread: usize = 5;
+    let n_senders: usize = 600;
+    let body = "lorem ipsum dolor sit amet ".repeat(20);
+    let batch_size: usize = 500;
+    let mut vals = String::new();
+    let mut count = 0usize;
+    for i in 0..n_messages {
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        use std::fmt::Write;
+        let mailbox_id = (i % 10) + 1;
+        let thread_idx = i / msgs_per_thread;
+        let sender_idx = i % n_senders;
+        // Roughly half of messages have a non-empty message_id (RFC822
+        // Message-ID coverage in real corpora is ~70–90 %; pick 80 % to
+        // exercise the CASE-WHEN-message_id branch in the SQL below).
+        let mid = if i % 5 == 0 {
+            String::new()
+        } else {
+            format!("mid-{i}")
+        };
+        // flags: roughly 30 % unread (bit 0 = 0).
+        let flags = if i % 10 < 3 { 0 } else { 1 };
+        let _ = write!(
+            vals,
+            "({}, 'th-{}', 'subj{i}', 'sender{}@example.com', {}, {}, false, false, 'normal', 0.5, '{}', '{body} {i}')",
+            mailbox_id,
+            thread_idx,
+            sender_idx,
+            1_700_000_000_i64 + i as i64,
+            flags,
+            mid
+        );
+        count += 1;
+        if count == batch_size {
+            db.execute(&format!(
+                "INSERT INTO messages (mailbox_id, thread_id, subject, sender, internal_date, flags, pinned, archived, importance_level, importance_score, message_id, text_body) VALUES {vals}"
+            )).unwrap();
+            vals.clear();
+            count = 0;
+        }
+    }
+    if !vals.is_empty() {
+        db.execute(&format!(
+            "INSERT INTO messages (mailbox_id, thread_id, subject, sender, internal_date, flags, pinned, archived, importance_level, importance_score, message_id, text_body) VALUES {vals}"
+        )).unwrap();
+    }
+
+    // email_analysis populated for ~25 % of messages (matches mailrs's
+    // background analysis coverage rate).
+    let ea_rows = n_messages / 4;
+    let mut vals = String::new();
+    let mut count = 0usize;
+    for k in 0..ea_rows {
+        let mid = (k * 4 + 1) as i64; // every 4th message id
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        use std::fmt::Write;
+        let _ = write!(
+            vals,
+            "({mid}, 'cat{}', 'summary {k}', {})",
+            k % 5,
+            k % 2 == 0
+        );
+        count += 1;
+        if count == 500 {
+            db.execute(&format!(
+                "INSERT INTO email_analysis (message_id, category, summary, requires_action) VALUES {vals}"
+            )).unwrap();
+            vals.clear();
+            count = 0;
+        }
+    }
+    if !vals.is_empty() {
+        db.execute(&format!(
+            "INSERT INTO email_analysis (message_id, category, summary, requires_action) VALUES {vals}"
+        )).unwrap();
+    }
+    // v7.38 — run ANALYZE so the reorder pass has statistics. The
+    // mailrs prod path triggers this fix via the LEFT-JOIN split-
+    // point change; without ANALYZE, the secondary stats gate in
+    // reorder_joins still bails. Mirrors what we ask customers to
+    // do after a bulk import.
+    db.execute("ANALYZE").unwrap();
+}
+
+// Stripped-down "minimal" shape: GROUP BY thread_id + MAX(internal_date)
+// + ORDER BY MAX LIMIT 50. No DISTINCT aggs, no correlated subquery.
+// Tests whether the 7.37.3 top-K LIMIT path triggers for this shape on
+// a real grouping cardinality, and whether the join order picks mailboxes
+// as driving table when the user_address filter is small.
+const MAILRS_MINIMAL_SQL: &str = "\
+SELECT m.thread_id, MAX(m.internal_date) \
+  FROM messages m \
+  JOIN mailboxes mb ON m.mailbox_id = mb.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+ GROUP BY m.thread_id \
+ ORDER BY MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+// + DISTINCT aggs from the prod SQL (string_agg DISTINCT + 2 COUNT DISTINCT
+// with nested CASE). No correlated subquery yet (SPGE binder rejects
+// outer `MAX(m.id)` reference; that variant runs via SPGS only).
+const MAILRS_DISTINCT_AGGS_SQL: &str = "\
+SELECT m.thread_id, \
+       MAX(m.subject), \
+       string_agg(DISTINCT m.sender, ','), \
+       COUNT(DISTINCT CASE WHEN m.message_id != '' \
+                           THEN m.message_id \
+                           ELSE CAST(m.id AS TEXT) END), \
+       COUNT(DISTINCT CASE WHEN (m.flags & 1) = 0 \
+                           THEN CASE WHEN m.message_id != '' \
+                                     THEN m.message_id \
+                                     ELSE CAST(m.id AS TEXT) END \
+                           END), \
+       MAX(m.internal_date) \
+  FROM messages m \
+  JOIN mailboxes mb ON m.mailbox_id = mb.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+ GROUP BY m.thread_id \
+ ORDER BY MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+fn dump_explain(db: &mut Engine, label: &str, sql: &str) {
+    if let Ok(QueryResult::Rows { rows, .. }) = db.execute(&format!("EXPLAIN {sql}")) {
+        eprintln!("--- EXPLAIN {label} ---");
+        for row in rows {
+            for cell in &row.values {
+                eprintln!("{cell:?}");
+            }
+        }
+        eprintln!("--- end EXPLAIN ---");
+    }
+}
+
+#[test]
+#[ignore = "P0 mailrs-shape reproducer; --include-ignored to run"]
+fn baseline_mailrs_minimal_30k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 30_000);
+    dump_explain(&mut db, "mailrs_minimal_30k", MAILRS_MINIMAL_SQL);
+    time_query(&mut db, MAILRS_MINIMAL_SQL, 10, "mailrs_minimal_30k", 1500.0);
+}
+
+#[test]
+#[ignore = "P0 mailrs-shape reproducer; --include-ignored to run"]
+fn baseline_mailrs_minimal_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    dump_explain(&mut db, "mailrs_minimal_100k", MAILRS_MINIMAL_SQL);
+    time_query(
+        &mut db,
+        MAILRS_MINIMAL_SQL,
+        10,
+        "mailrs_minimal_100k",
+        10_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs-shape reproducer; --include-ignored to run"]
+fn baseline_mailrs_distinct_aggs_30k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 30_000);
+    dump_explain(&mut db, "mailrs_distinct_aggs_30k", MAILRS_DISTINCT_AGGS_SQL);
+    time_query(
+        &mut db,
+        MAILRS_DISTINCT_AGGS_SQL,
+        10,
+        "mailrs_distinct_aggs_30k",
+        2_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs-shape reproducer; --include-ignored to run"]
+fn baseline_mailrs_distinct_aggs_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    dump_explain(&mut db, "mailrs_distinct_aggs_100k", MAILRS_DISTINCT_AGGS_SQL);
+    time_query(
+        &mut db,
+        MAILRS_DISTINCT_AGGS_SQL,
+        10,
+        "mailrs_distinct_aggs_100k",
+        20_000.0,
+    );
+}
+
+// === mailrs prod /api/conversations?limit=50 verbatim SQL ===
+//
+// Source: `mailrs/crates/mailbox/src/pg/thread_ops/query.rs:135–165`
+// `PgMailboxStore::list_conversations` — confirmed via
+// `mailrs/.claude/notes/spg-7.37.3-prod-conversations-real-sql-2026-06-18.md`.
+//
+// Client stack is `spg-sqlx::SpgPool` (in-process) when mailrs is built
+// with `--features spg` (prod docker image). That = SPG `Engine::execute`
+// = this perf_gate's path. Reproduces the prod path bit-for-bit.
+//
+// Only divergence from prod: `sc.snoozed_until > NOW()` replaced with
+// `> 0` (the snoozed_conversations table is empty in seed, so NOT EXISTS
+// short-circuits without entering the inner WHERE, but SPG still type-
+// checks the predicate — and seeding TIMESTAMPTZ + NOW() adds
+// non-determinism unrelated to the perf shape we're chasing). Semantics
+// preserved on empty table.
+const MAILRS_PROD_REAL_SQL: &str = "\
+SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), \
+       COUNT(DISTINCT CASE WHEN m.message_id != '' \
+                           THEN m.message_id \
+                           ELSE CAST(m.id AS TEXT) END), \
+       COUNT(DISTINCT CASE WHEN (m.flags & 1) = 0 \
+                           THEN CASE WHEN m.message_id != '' \
+                                     THEN m.message_id \
+                                     ELSE CAST(m.id AS TEXT) END \
+                           END), \
+       MAX(m.internal_date), \
+       COALESCE((SELECT ea.category FROM email_analysis ea \
+                   JOIN messages m2 ON ea.message_id = m2.id \
+                  WHERE m2.thread_id = m.thread_id \
+                  ORDER BY m2.internal_date DESC LIMIT 1), \
+                'general'), \
+       BOOL_OR((m.flags & 4) != 0), \
+       COALESCE( \
+         (SELECT LEFT(ea_snip.summary, 80) FROM email_analysis ea_snip \
+            JOIN messages m_snip ON ea_snip.message_id = m_snip.id \
+           WHERE m_snip.thread_id = m.thread_id \
+             AND ea_snip.summary IS NOT NULL \
+             AND ea_snip.summary != '' \
+           ORDER BY m_snip.internal_date DESC LIMIT 1), \
+         (SELECT LEFT(m3.text_body, 80) FROM messages m3 \
+           WHERE m3.thread_id = m.thread_id \
+             AND m3.text_body IS NOT NULL \
+             AND m3.text_body != '' \
+           ORDER BY m3.internal_date DESC LIMIT 1), \
+         ''), \
+       BOOL_OR(m.pinned), \
+       BOOL_OR(m.archived), \
+       COALESCE((array_agg(m.importance_level \
+                           ORDER BY m.importance_score DESC NULLS LAST))[1], \
+                'normal'), \
+       COALESCE(MAX(m.importance_score), 0.0), \
+       COALESCE(BOOL_OR(ea.requires_action), false), \
+       COALESCE((array_agg(m.sender ORDER BY m.internal_date DESC))[1], ''), \
+       COUNT(DISTINCT CASE WHEN mb.name = 'Sent' AND m.message_id != '' \
+                           THEN m.message_id \
+                           WHEN mb.name = 'Sent' \
+                           THEN CAST(m.id AS TEXT) END) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+   AND thread_id != '' \
+   AND NOT EXISTS (SELECT 1 FROM snoozed_conversations sc \
+                    WHERE sc.thread_id = m.thread_id \
+                      AND sc.account_address = mb.user_address \
+                      AND sc.snoozed_until > 0) \
+ GROUP BY m.thread_id \
+ HAVING BOOL_OR(m.archived) = false \
+    AND BOOL_OR(mb.name != 'Sent') = true \
+ ORDER BY BOOL_OR(m.pinned) DESC, MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+#[test]
+#[ignore = "P0 mailrs prod-real reproducer; --include-ignored to run"]
+fn baseline_mailrs_prod_real_30k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 30_000);
+    dump_explain(&mut db, "mailrs_prod_real_30k", MAILRS_PROD_REAL_SQL);
+    time_query(
+        &mut db,
+        MAILRS_PROD_REAL_SQL,
+        10,
+        "mailrs_prod_real_30k",
+        5_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs prod-real reproducer; --include-ignored to run"]
+fn baseline_mailrs_prod_real_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    dump_explain(&mut db, "mailrs_prod_real_100k", MAILRS_PROD_REAL_SQL);
+    // Loose budget — reproducing the prod 1.6 s engine time is the
+    // signal we're after. If it lands at ~1.6 s, root-cause hunt
+    // moves to operator-level profiling.
+    time_query(
+        &mut db,
+        MAILRS_PROD_REAL_SQL,
+        10,
+        "mailrs_prod_real_100k",
+        20_000.0,
+    );
+}
+
+// Ablation: same as MAILRS_PROD_REAL_SQL but the 3 correlated subqueries
+// (category / summary / text_body snippet) replaced with constants.
+// Delta to MAILRS_PROD_REAL_SQL on the same N isolates the subqueries'
+// share of the prod cost. If big = SPG planner not using
+// idx_messages_thread_date on the inner LIMIT-1 lookups.
+const MAILRS_PROD_NO_SUBQ_SQL: &str = "\
+SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), \
+       COUNT(DISTINCT CASE WHEN m.message_id != '' \
+                           THEN m.message_id \
+                           ELSE CAST(m.id AS TEXT) END), \
+       COUNT(DISTINCT CASE WHEN (m.flags & 1) = 0 \
+                           THEN CASE WHEN m.message_id != '' \
+                                     THEN m.message_id \
+                                     ELSE CAST(m.id AS TEXT) END \
+                           END), \
+       MAX(m.internal_date), \
+       'general' AS category_stub, \
+       BOOL_OR((m.flags & 4) != 0), \
+       '' AS snippet_stub, \
+       BOOL_OR(m.pinned), \
+       BOOL_OR(m.archived), \
+       COALESCE((array_agg(m.importance_level \
+                           ORDER BY m.importance_score DESC NULLS LAST))[1], \
+                'normal'), \
+       COALESCE(MAX(m.importance_score), 0.0), \
+       COALESCE(BOOL_OR(ea.requires_action), false), \
+       COALESCE((array_agg(m.sender ORDER BY m.internal_date DESC))[1], ''), \
+       COUNT(DISTINCT CASE WHEN mb.name = 'Sent' AND m.message_id != '' \
+                           THEN m.message_id \
+                           WHEN mb.name = 'Sent' \
+                           THEN CAST(m.id AS TEXT) END) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+   AND thread_id != '' \
+   AND NOT EXISTS (SELECT 1 FROM snoozed_conversations sc \
+                    WHERE sc.thread_id = m.thread_id \
+                      AND sc.account_address = mb.user_address \
+                      AND sc.snoozed_until > 0) \
+ GROUP BY m.thread_id \
+ HAVING BOOL_OR(m.archived) = false \
+    AND BOOL_OR(mb.name != 'Sent') = true \
+ ORDER BY BOOL_OR(m.pinned) DESC, MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+// Ablation 2: same as PROD_REAL but drop LEFT JOIN ea entirely + the
+// outer ea.requires_action ref. Isolates the LEFT-JOIN-by-PK cost.
+const MAILRS_PROD_NO_LEFTJOIN_SQL: &str = "\
+SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), \
+       COUNT(DISTINCT CASE WHEN m.message_id != '' \
+                           THEN m.message_id \
+                           ELSE CAST(m.id AS TEXT) END), \
+       COUNT(DISTINCT CASE WHEN (m.flags & 1) = 0 \
+                           THEN CASE WHEN m.message_id != '' \
+                                     THEN m.message_id \
+                                     ELSE CAST(m.id AS TEXT) END \
+                           END), \
+       MAX(m.internal_date), \
+       COALESCE((SELECT ea.category FROM email_analysis ea \
+                   JOIN messages m2 ON ea.message_id = m2.id \
+                  WHERE m2.thread_id = m.thread_id \
+                  ORDER BY m2.internal_date DESC LIMIT 1), \
+                'general'), \
+       BOOL_OR((m.flags & 4) != 0), \
+       '' AS snippet_stub, \
+       BOOL_OR(m.pinned), \
+       BOOL_OR(m.archived), \
+       COALESCE((array_agg(m.importance_level \
+                           ORDER BY m.importance_score DESC NULLS LAST))[1], \
+                'normal'), \
+       COALESCE(MAX(m.importance_score), 0.0), \
+       false AS requires_action_stub, \
+       COALESCE((array_agg(m.sender ORDER BY m.internal_date DESC))[1], ''), \
+       COUNT(DISTINCT CASE WHEN mb.name = 'Sent' AND m.message_id != '' \
+                           THEN m.message_id \
+                           WHEN mb.name = 'Sent' \
+                           THEN CAST(m.id AS TEXT) END) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+   AND thread_id != '' \
+   AND NOT EXISTS (SELECT 1 FROM snoozed_conversations sc \
+                    WHERE sc.thread_id = m.thread_id \
+                      AND sc.account_address = mb.user_address \
+                      AND sc.snoozed_until > 0) \
+ GROUP BY m.thread_id \
+ HAVING BOOL_OR(m.archived) = false \
+    AND BOOL_OR(mb.name != 'Sent') = true \
+ ORDER BY BOOL_OR(m.pinned) DESC, MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+// Ablation 3: same as PROD_REAL but drop the 2 (array_agg ORDER BY...)[1]
+// ordered-aggregates (replace with constants). Isolates the ordered-agg
+// per-group sort cost.
+const MAILRS_PROD_NO_ORDERED_AGG_SQL: &str = "\
+SELECT m.thread_id, MAX(m.subject), string_agg(DISTINCT m.sender, ','), \
+       COUNT(DISTINCT CASE WHEN m.message_id != '' \
+                           THEN m.message_id \
+                           ELSE CAST(m.id AS TEXT) END), \
+       COUNT(DISTINCT CASE WHEN (m.flags & 1) = 0 \
+                           THEN CASE WHEN m.message_id != '' \
+                                     THEN m.message_id \
+                                     ELSE CAST(m.id AS TEXT) END \
+                           END), \
+       MAX(m.internal_date), \
+       'general' AS category_stub, \
+       BOOL_OR((m.flags & 4) != 0), \
+       '' AS snippet_stub, \
+       BOOL_OR(m.pinned), \
+       BOOL_OR(m.archived), \
+       'normal' AS importance_stub, \
+       COALESCE(MAX(m.importance_score), 0.0), \
+       COALESCE(BOOL_OR(ea.requires_action), false), \
+       '' AS sender_stub, \
+       COUNT(DISTINCT CASE WHEN mb.name = 'Sent' AND m.message_id != '' \
+                           THEN m.message_id \
+                           WHEN mb.name = 'Sent' \
+                           THEN CAST(m.id AS TEXT) END) \
+  FROM messages m \
+       JOIN mailboxes mb ON m.mailbox_id = mb.id \
+       LEFT JOIN email_analysis ea ON ea.message_id = m.id \
+ WHERE mb.user_address = 'lihao@golia.jp' \
+   AND thread_id != '' \
+   AND NOT EXISTS (SELECT 1 FROM snoozed_conversations sc \
+                    WHERE sc.thread_id = m.thread_id \
+                      AND sc.account_address = mb.user_address \
+                      AND sc.snoozed_until > 0) \
+ GROUP BY m.thread_id \
+ HAVING BOOL_OR(m.archived) = false \
+    AND BOOL_OR(mb.name != 'Sent') = true \
+ ORDER BY BOOL_OR(m.pinned) DESC, MAX(m.internal_date) DESC \
+ LIMIT 50";
+
+#[test]
+#[ignore = "P0 mailrs ablation: no LEFT JOIN ea; --include-ignored"]
+fn baseline_mailrs_prod_no_leftjoin_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    dump_explain(&mut db, "mailrs_prod_no_leftjoin_100k", MAILRS_PROD_NO_LEFTJOIN_SQL);
+    time_query(
+        &mut db,
+        MAILRS_PROD_NO_LEFTJOIN_SQL,
+        10,
+        "mailrs_prod_no_leftjoin_100k",
+        10_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs ablation: no ordered_agg; --include-ignored"]
+fn baseline_mailrs_prod_no_ordered_agg_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    dump_explain(&mut db, "mailrs_prod_no_ordered_agg_100k", MAILRS_PROD_NO_ORDERED_AGG_SQL);
+    time_query(
+        &mut db,
+        MAILRS_PROD_NO_ORDERED_AGG_SQL,
+        10,
+        "mailrs_prod_no_ordered_agg_100k",
+        10_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs prod-real ablation; --include-ignored to run"]
+fn baseline_mailrs_prod_no_subq_100k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 100_000);
+    dump_explain(&mut db, "mailrs_prod_no_subq_100k", MAILRS_PROD_NO_SUBQ_SQL);
+    time_query(
+        &mut db,
+        MAILRS_PROD_NO_SUBQ_SQL,
+        10,
+        "mailrs_prod_no_subq_100k",
+        10_000.0,
+    );
+}
+
+#[test]
+#[ignore = "P0 mailrs prod-real reproducer; --include-ignored to run"]
+fn baseline_mailrs_prod_real_300k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_mailrs_inbox(&mut db, 300_000);
+    dump_explain(&mut db, "mailrs_prod_real_300k", MAILRS_PROD_REAL_SQL);
+    time_query(
+        &mut db,
+        MAILRS_PROD_REAL_SQL,
+        10,
+        "mailrs_prod_real_300k",
+        120_000.0,
+    );
+}

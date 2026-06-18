@@ -32,5 +32,10 @@ name = "smoke"
 path = "tests/smoke.rs"
 harness = true
 
+[[test]]
+name = "p0_mailrs_prod"
+path = "tests/p0_mailrs_prod.rs"
+harness = true
+
 [lints]
 workspace = true
