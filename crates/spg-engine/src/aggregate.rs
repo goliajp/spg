@@ -208,6 +208,73 @@ pub fn is_within_group_name(name: &str) -> bool {
     is_ordered_set_name(name) || is_hypothetical_set_name(name)
 }
 
+/// v7.37.4 (R34) — pre-computed aggregate kind. Replaces per-row
+/// string matches in `update_state` with a single `match` on a
+/// `Copy` enum (compiles to a jump table). For the mailrs prod
+/// `/api/conversations` shape (14 aggregates × 100 k rows = 1.4 M
+/// inner-loop iterations) this is the dominant per-row cost.
+///
+/// Lowered from `AggSpec::name` at spec build time via
+/// [`classify_agg_name`]; populated by the three `AggSpec`
+/// construction sites (window+ORDER, plain, `first_ordered`
+/// `array_agg`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum AggKind {
+    CountStar,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    StringAgg,
+    ArrayAgg,
+    BoolAnd,
+    BoolOr,
+    /// stddev / stddev_samp / stddev_pop / variance / var_samp / var_pop.
+    StddevFamily,
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// ordered-set (`percentile_cont/disc`, `mode`) +
+    /// hypothetical-set (`rank`/`dense_rank`/etc.) aggregates that
+    /// share the WITHIN-GROUP collection path.
+    WithinGroup,
+    /// covar_samp / covar_pop / corr / regr_*.
+    Regression,
+    JsonAgg,
+    JsonObjectAgg,
+}
+
+/// v7.37.4 (R34) — name → kind, called once per spec at build time.
+/// Hot path (`update_state_kind`) only sees the enum; the canonical
+/// string still travels with the spec so `finalize` and errors can
+/// quote it.
+fn classify_agg_name(name: &str) -> AggKind {
+    match name {
+        "count_star" => AggKind::CountStar,
+        "count" => AggKind::Count,
+        "sum" => AggKind::Sum,
+        "avg" => AggKind::Avg,
+        "min" => AggKind::Min,
+        "max" => AggKind::Max,
+        "string_agg" => AggKind::StringAgg,
+        "array_agg" => AggKind::ArrayAgg,
+        "bool_and" => AggKind::BoolAnd,
+        "bool_or" => AggKind::BoolOr,
+        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+            AggKind::StddevFamily
+        }
+        "bit_and" => AggKind::BitAnd,
+        "bit_or" => AggKind::BitOr,
+        "bit_xor" => AggKind::BitXor,
+        "json_agg" | "jsonb_agg" => AggKind::JsonAgg,
+        "json_object_agg" | "jsonb_object_agg" => AggKind::JsonObjectAgg,
+        n if is_within_group_name(n) => AggKind::WithinGroup,
+        n if is_regression_name(n) => AggKind::Regression,
+        other => panic!("classify_agg_name: unknown aggregate {other}"),
+    }
+}
+
 /// Per-aggregate running state.
 #[derive(Debug, Default, Clone)]
 struct AggState {
@@ -226,6 +293,11 @@ struct AggState {
     /// v7.25 (round-17) — per-group dedupe set for DISTINCT
     /// aggregates (encoded values; NULLs never reach it because
     /// the caller's skip runs after the per-aggregate NULL rules).
+    /// v7.37.4 measured `hashbrown::HashSet` as worse at this
+    /// shape — the per-(group × distinct-spec) hash table alloc
+    /// overhead beats the lookup-speed gain when each set is
+    /// small. Sticking with `BTreeSet`; the dispatch-side enum
+    /// fix in `update_state` is the R34 win.
     seen: BTreeSet<String>,
     /// v7.24 (round-16 A) — per-item ORDER BY key tuples, parallel
     /// to `items` (pushed under the same skip/keep conditions).
@@ -306,6 +378,11 @@ struct AggSpec {
     /// per-group array just to take element 1. Returns the element type,
     /// not the array type.
     first_ordered: bool,
+    /// v7.37.4 (R34) — derived from `name` at spec build time so the
+    /// per-row inner loop dispatches via a `match` on `Copy` enum
+    /// instead of a string compare for every (row × aggregate)
+    /// iteration.
+    kind: AggKind,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -1030,6 +1107,7 @@ fn accumulate_groups(
                 }
                 update_state(
                     &mut entry.1[i],
+                    spec.kind,
                     &spec.name,
                     arg_ref,
                     arg2_val.as_ref(),
@@ -1152,6 +1230,14 @@ fn accumulate_groups(
                     continue;
                 }
                 if spec.distinct {
+                    // v7.37.4 (R34 follow-on) — single `insert` call
+                    // covers the "is new?" check and the insertion in
+                    // one hash probe. Clone only when truly inserting
+                    // (`get` first, allocate on miss). The dominant
+                    // mailrs DISTINCT-on-text case sees a hit
+                    // ~ 80 % of the time at this catalog size, so
+                    // skipping the clone on the hit path is real
+                    // savings.
                     encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
                     if entry.1[i].seen.contains(dkeybuf.as_str()) {
                         continue;
@@ -1160,6 +1246,7 @@ fn accumulate_groups(
                 }
                 update_state(
                     &mut entry.1[i],
+                    spec.kind,
                     &spec.name,
                     arg_ref,
                     arg2_val.as_ref(),
@@ -1266,6 +1353,7 @@ fn accumulate_groups(
             }
             update_state(
                 &mut entry.1[i],
+                spec.kind,
                 &spec.name,
                 &arg_val,
                 arg2_val.as_ref(),
@@ -1783,6 +1871,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         (args.first().cloned(), None)
                     };
                     let spec = AggSpec {
+                        kind: classify_agg_name(&canonical),
                         name: canonical.clone(),
                         arg,
                         arg2: if agg_uses_second_arg(&canonical) {
@@ -1841,6 +1930,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     lower
                 };
                 let spec = AggSpec {
+                    kind: classify_agg_name(&canonical),
                     name: canonical,
                     arg: arg.clone(),
                     arg2: arg2.clone(),
@@ -1910,6 +2000,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             // register a plain full-array spec).
             if let Some((arg, order_by, filter)) = first_ordered_array_agg(e) {
                 let spec = AggSpec {
+                    kind: AggKind::ArrayAgg,
                     name: "array_agg".to_string(),
                     arg: Some(arg.clone()),
                     arg2: None,
@@ -1958,20 +2049,28 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
 
 fn update_state(
     st: &mut AggState,
+    kind: AggKind,
     name: &str,
     v: &Value,
     arg2: Option<&Value>,
     order_keys: Option<Vec<Value>>,
 ) -> Result<(), EvalError> {
     let is_null = matches!(v, Value::Null);
-    match name {
-        "count_star" => st.count += 1,
-        "count" => {
+    // v7.37.4 (R34) — dispatch by pre-classified `kind` (`Copy`
+    // enum), not by per-row string match. Hot inner loop on
+    // multi-aggregate queries (mailrs `/api/conversations`: 14
+    // aggregates × 100 k rows = 1.4 M dispatches) sees an enum
+    // jump table instead of a sequence of `eq_str` checks. `name`
+    // is still threaded through for error messages so the user-
+    // facing wording is unchanged.
+    match kind {
+        AggKind::CountStar => st.count += 1,
+        AggKind::Count => {
             if !is_null {
                 st.count += 1;
             }
         }
-        "sum" | "avg" => {
+        AggKind::Sum | AggKind::Avg => {
             if is_null {
                 return Ok(());
             }
@@ -1990,7 +2089,7 @@ fn update_state(
                 }
             }
         }
-        "min" => {
+        AggKind::Min => {
             if is_null {
                 return Ok(());
             }
@@ -2003,7 +2102,7 @@ fn update_state(
                 }
             }
         }
-        "max" => {
+        AggKind::Max => {
             if is_null {
                 return Ok(());
             }
@@ -2023,7 +2122,7 @@ fn update_state(
         // the last value at finalize time (in practice it's
         // constant). count is bumped so we can distinguish "empty
         // group → NULL" from "all-NULL group → NULL".
-        "string_agg" => {
+        AggKind::StringAgg => {
             if let Some(sep) = arg2
                 && let Value::Text(s) = sep
             {
@@ -2049,7 +2148,7 @@ fn update_state(
         // result is NULL only when ZERO rows fed in. Element type
         // is locked from the first row's value type; subsequent
         // rows must match (PG also rejects mixed-type array_agg).
-        "array_agg" => {
+        AggKind::ArrayAgg => {
             st.items.push(v.clone());
             if let Some(k) = order_keys {
                 st.item_keys.push(k);
@@ -2059,7 +2158,7 @@ fn update_state(
         // v7.17.0 — bool_and(p): TRUE iff every non-NULL input is
         // TRUE. NULL skipped; running accumulator stays at TRUE
         // until the first non-NULL FALSE.
-        "bool_and" => {
+        AggKind::BoolAnd => {
             if is_null {
                 return Ok(());
             }
@@ -2075,7 +2174,7 @@ fn update_state(
         }
         // v7.17.0 — bool_or(p): TRUE iff any non-NULL input is
         // TRUE. NULL skipped.
-        "bool_or" => {
+        AggKind::BoolOr => {
             if is_null {
                 return Ok(());
             }
@@ -2092,7 +2191,7 @@ fn update_state(
         // v7.32 (round-29) — variance / stddev family. Accumulate the
         // running sum (sum_float) and sum of squares (sum_sq) over the
         // non-NULL numeric inputs; finalize divides by n or n-1.
-        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+        AggKind::StddevFamily => {
             if is_null {
                 return Ok(());
             }
@@ -2112,7 +2211,7 @@ fn update_state(
             st.sum_sq += x * x;
         }
         // v7.32 (round-29) — bitwise aggregates over integer inputs.
-        "bit_and" | "bit_or" | "bit_xor" => {
+        AggKind::BitAnd | AggKind::BitOr | AggKind::BitXor => {
             if is_null {
                 return Ok(());
             }
@@ -2126,18 +2225,18 @@ fn update_state(
                     });
                 }
             };
-            st.bit_acc = Some(match (st.bit_acc, name) {
+            st.bit_acc = Some(match (st.bit_acc, kind) {
                 (None, _) => n,
-                (Some(acc), "bit_and") => acc & n,
-                (Some(acc), "bit_or") => acc | n,
-                (Some(acc), _) => acc ^ n, // bit_xor
+                (Some(acc), AggKind::BitAnd) => acc & n,
+                (Some(acc), AggKind::BitOr) => acc | n,
+                (Some(acc), _) => acc ^ n, // BitXor
             });
         }
         // v7.32 (round-29) — WITHIN GROUP aggregates (ordered-set +
         // hypothetical-set) collect the sort value (NULLs ignored, per
         // PG) into `items`, sorted at finalize by the parallel
         // `item_keys`.
-        n if is_within_group_name(n) => {
+        AggKind::WithinGroup => {
             if is_null {
                 return Ok(());
             }
@@ -2150,7 +2249,7 @@ fn update_state(
         // v7.32 (round-29) — regression family f(Y, X). Only rows with
         // BOTH inputs non-NULL contribute (PG semantics). `v` is Y,
         // `arg2` is X.
-        n if is_regression_name(n) => {
+        AggKind::Regression => {
             let (Some(y), Some(x)) = (agg_value_to_f64(v), arg2.and_then(agg_value_to_f64)) else {
                 return Ok(()); // NULL (or non-numeric) in either input
             };
@@ -2163,14 +2262,14 @@ fn update_state(
         }
         // v7.32 (round-29) — json_agg / jsonb_agg collect every input
         // (NULL becomes JSON null, per PG) in row order.
-        "json_agg" | "jsonb_agg" => {
+        AggKind::JsonAgg => {
             st.items.push(v.clone());
             st.count += 1;
         }
         // v7.32 (round-29) — json_object_agg(key, value): keys in
         // `items`, values in `aux_items`. A NULL key is skipped (PG
         // raises; we drop it rather than abort the whole query).
-        "json_object_agg" | "jsonb_object_agg" => {
+        AggKind::JsonObjectAgg => {
             if is_null {
                 return Ok(());
             }
@@ -2178,7 +2277,6 @@ fn update_state(
             st.aux_items.push(arg2.cloned().unwrap_or(Value::Null));
             st.count += 1;
         }
-        _ => unreachable!("non-aggregate {name} in update_state"),
     }
     Ok(())
 }
