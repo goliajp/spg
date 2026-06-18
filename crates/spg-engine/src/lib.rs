@@ -55,6 +55,7 @@ mod window;
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 pub use cancel::{CancelToken, MonotonicNowFn};
+pub use execute::StreamItem;
 
 use bytebudget::*;
 pub(crate) use clock::{rewrite_clock_calls, value_to_literal};

@@ -199,6 +199,89 @@ impl Engine {
         result
     }
 
+    /// v7.37 — streaming SELECT for the pgwire `Execute` hot path.
+    /// Emits one `StreamItem::Header(cols)` then one
+    /// `StreamItem::Row(&[&Value])` per surviving row. Returns the
+    /// total row count for the `CommandComplete` tag.
+    ///
+    /// For shapes where the engine can stream directly (non-aggregate
+    /// join projection of bound columns, no ORDER BY / DISTINCT / etc.)
+    /// no `Vec<Row>` is materialised — cell references come straight
+    /// out of the source tables. For non-streamable shapes the engine
+    /// runs the full `exec_select_cancel`, then walks the materialised
+    /// `Vec<Row>` driving the same emit callback (no engine-side win,
+    /// but pgwire dispatches every Execute through one path).
+    pub fn execute_prepared_select_streaming<F>(
+        &mut self,
+        stmt: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+        mut emit: F,
+    ) -> Result<usize, EngineError>
+    where
+        F: FnMut(StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        let saved = self.current_tx;
+        self.current_tx = Some(IMPLICIT_TX);
+        let inner = self.exec_select_streaming(stmt, cancel, &mut emit);
+        self.current_tx = saved;
+        inner
+    }
+
+    /// v7.37 — internal streaming dispatcher. Phase 1: fall-back path
+    /// only — runs the materialising `exec_select_cancel`, then drives
+    /// the emit callback from the resulting `Vec<Row>`. Phase 2 will
+    /// add a true streaming path for the joined-projection shape.
+    fn exec_select_streaming<F>(
+        &mut self,
+        stmt: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+        emit: &mut F,
+    ) -> Result<usize, EngineError>
+    where
+        F: FnMut(StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        // v7.37 — true-streaming fast path for joined-non-aggregate
+        // projection of bound columns. Skips `Vec<Row>` + per-cell
+        // `.cloned()` (about 4 ms saved on the 25 k-row PROJ shape).
+        // Unresolved subqueries / pull-up shapes / non-streamable
+        // structure (ORDER BY, DISTINCT, …) fall through to the
+        // materialising path.
+        if !crate::subquery::expr_tree_has_subquery(stmt) {
+            if let Some(n) = self.try_exec_joined_streaming(stmt, cancel, emit)? {
+                return Ok(n);
+            }
+        }
+        // Fall-back: materialise then iterate.
+        let QueryResult::Rows { columns, rows } = self.exec_select_cancel(stmt, cancel)? else {
+            return Err(EngineError::Unsupported(alloc::string::String::from(
+                "streaming SELECT got a non-Rows result",
+            )));
+        };
+        emit(StreamItem::Header(&columns))?;
+        let mut cell_refs: Vec<&Value> = Vec::with_capacity(columns.len());
+        for row in &rows {
+            cell_refs.clear();
+            for v in &row.values {
+                cell_refs.push(v);
+            }
+            emit(StreamItem::Row(&cell_refs))?;
+        }
+        Ok(rows.len())
+    }
+}
+
+/// v7.37 — one item in the streaming SELECT emit channel. The
+/// engine yields exactly one `Header` (before any row) then zero
+/// or more `Row`s. Pgwire (or any other consumer) decides how to
+/// turn those into wire bytes.
+#[derive(Debug)]
+pub enum StreamItem<'a> {
+    Header(&'a [ColumnSchema]),
+    Row(&'a [&'a Value]),
+}
+
+impl Engine {
+
     /// v7.17.0 Phase 2.3 — prepared-statement entry that honors a
     /// caller-supplied `CancelToken`. Mirrors `execute_prepared`'s
     /// `current_tx` save/restore so the extended-query path stays

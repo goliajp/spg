@@ -2055,6 +2055,143 @@ impl Engine {
         })
     }
 
+    /// v7.37 — streaming projection for the joined-non-aggregate
+    /// shape (multi-table FROM, all projection items bound, no
+    /// ORDER BY / DISTINCT / GROUP BY / HAVING / LIMIT / OFFSET /
+    /// UNION). Walks the deferred join survivors and emits
+    /// `&[&Value]` borrowed straight out of the source tables — no
+    /// `.cloned()`, no `Vec<Row>`. Skips the 25 k × 3-TEXT clone tax
+    /// on the mailrs `PROJ` shape (about 4 ms saved).
+    ///
+    /// Returns `Ok(None)` when the shape doesn't qualify; the caller
+    /// then falls back to the materialising path.
+    pub(crate) fn try_exec_joined_streaming<F>(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+        emit: &mut F,
+    ) -> Result<Option<usize>, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        // Shape gates — keep the streamable surface narrow on
+        // purpose. The fall-back path still handles everything else.
+        let Some(from) = &stmt.from else {
+            return Ok(None);
+        };
+        if from.joins.is_empty() {
+            return Ok(None);
+        }
+        if !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.having.is_some()
+            || stmt.group_by.is_some()
+            || stmt.distinct
+            || !stmt.unions.is_empty()
+            || stmt.limit_with_ties
+        {
+            return Ok(None);
+        }
+        if aggregate::uses_aggregate(stmt) {
+            return Ok(None);
+        }
+        // No window / SRF on the streaming path.
+        if select_has_window(stmt) {
+            return Ok(None);
+        }
+        if stmt
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
+        {
+            return Ok(None);
+        }
+        // Build the deferred join under the regular byte budget.
+        let mut budget = ByteBudget::new(self.max_query_bytes);
+        let deferred = {
+            let mut needed = alloc::collections::BTreeSet::new();
+            let prunable = collect_qualified_refs(stmt, &mut needed).is_some();
+            self.build_joined_filtered_rows(
+                from,
+                stmt.where_.as_ref(),
+                cancel,
+                if prunable { Some(&needed) } else { None },
+                &mut budget,
+            )?
+        };
+        let combined_schema = &deferred.combined_schema;
+        let ctx = EvalContext::new(combined_schema, None);
+        let projection = build_projection(&stmt.items, combined_schema, "")?;
+        // Every projection item must be a bound qualified column —
+        // anything that needs `eval_expr_with_correlated` keeps the
+        // materialising path.
+        let bound_pos = |e: &Expr| -> Option<usize> {
+            match e {
+                Expr::Column(c) if c.qualifier.is_some() => eval::find_column_pos(c, &ctx),
+                _ => None,
+            }
+        };
+        let proj_decomposed: Vec<(usize, usize)> = {
+            let mut out = Vec::with_capacity(projection.len());
+            for p in &projection {
+                let Some(abs) = bound_pos(&p.expr) else {
+                    return Ok(None);
+                };
+                let Some(k) = deferred
+                    .offsets
+                    .partition_point(|&o| o <= abs)
+                    .checked_sub(1)
+                else {
+                    return Ok(None);
+                };
+                out.push((k, abs - deferred.offsets[k]));
+            }
+            out
+        };
+        // Emit columns once.
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+        emit(crate::StreamItem::Header(&columns))?;
+        let sources_ref = &deferred.sources;
+        let stride = deferred.stride;
+        let survivors_ref = &deferred.survivors;
+        let n_surv = if stride == 0 {
+            0
+        } else {
+            survivors_ref.len() / stride
+        };
+        // Reused per-row cell-ref scratch — pushes are zero-alloc
+        // after the first row.
+        let null_value = Value::Null;
+        let mut cell_refs: Vec<&Value> = Vec::with_capacity(projection.len());
+        let mut count: usize = 0;
+        for surv_i in 0..n_surv {
+            if surv_i.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            let tuple = &survivors_ref[surv_i * stride..(surv_i + 1) * stride];
+            cell_refs.clear();
+            for &(k, col_in_src) in &proj_decomposed {
+                let ri = tuple[k];
+                let v: &Value = if ri == usize::MAX {
+                    &null_value
+                } else {
+                    sources_ref[k]
+                        .get(ri)
+                        .and_then(|r| r.values.get(col_in_src))
+                        .unwrap_or(&null_value)
+                };
+                cell_refs.push(v);
+            }
+            emit(crate::StreamItem::Row(&cell_refs))?;
+            count += 1;
+        }
+        Ok(Some(count))
+    }
+
     fn exec_joined_select(
         &self,
         stmt: &SelectStatement,
