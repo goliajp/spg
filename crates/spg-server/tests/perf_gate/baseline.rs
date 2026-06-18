@@ -744,6 +744,208 @@ fn baseline_list_thread_messages() {
 // default — ILIKE always true), $3 = 20. PG's measured plan on the
 // 24k-row catalog: Seq Scan 33ms → Hash Join 7ms → Sort 25ms →
 // GroupAggregate 4ms → top-N 0ms = 70ms.
+// v7.37.3 — general SPG perf bar covering the inbox-listing UI
+// canonical shape: `GROUP BY <text column> + per-group aggregate +
+// ORDER BY <aggregate> [DESC] LIMIT k`. Hit by every "show top N by
+// recent activity" surface across all SPG clients, not just mailrs.
+// Three cardinalities so the regression isn't masked by a single
+// distinct-group count: 100 / 1 000 / 5 000 distinct senders over
+// the same 25 k-row seed (sender pool is `sender{i % N}@example`,
+// so high-cardinality cases are more groups per same input). LIMIT
+// fixed at 20 (typical "top contacts" UI). Tests the structural
+// top-K LIMIT path inside `aggregate::sort_synth_by_order_by`.
+// v7.37.3 — same as `seed_with_sender_cardinality` but text_body is a
+// `body_len`-byte ASCII payload (random-ish per message). Probes
+// SPG's row-major storage sensitivity to row width — the contacts /
+// list_conversations SQL doesn't SELECT text_body, but PV<Row> still
+// pulls the whole row's bytes into cache when iterating, so wide
+// rows can cost much more than narrow ones.
+fn seed_with_sender_cardinality_wide(
+    db: &mut Engine,
+    n_messages: usize,
+    distinct_senders: usize,
+    body_len: usize,
+) {
+    db.execute("CREATE TABLE mailboxes (id BIGSERIAL PRIMARY KEY, name TEXT, user_address TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, mailbox_id BIGINT, thread_id TEXT, \
+         subject TEXT, sender TEXT, internal_date BIGINT, flags BIGINT, pinned BOOLEAN, \
+         archived BOOLEAN, importance_level TEXT, importance_score REAL, message_id TEXT, \
+         text_body TEXT)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO mailboxes (name, user_address) VALUES ('default', 'u@x')")
+        .unwrap();
+    // Deterministic ASCII body so the seed is stable across runs.
+    let body_template: String = (0..body_len)
+        .map(|i| char::from((b'a' + (i % 26) as u8) as u8))
+        .collect();
+    let body_sql_safe = body_template.replace('\'', "''");
+    let mut vals = String::new();
+    let mut count = 0;
+    for i in 0..n_messages {
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        use std::fmt::Write;
+        let sender_idx = i % distinct_senders;
+        let _ = write!(
+            vals,
+            "(1, 'thr{}', 'subj{i}', 'sender{sender_idx}@example.com', {}, 0, false, false, 'normal', 0.5, 'm{i}', '{body_sql_safe}')",
+            i % 1000,
+            1_700_000_000_i64 + i as i64
+        );
+        count += 1;
+        if count == 100 {
+            let sql = format!(
+                "INSERT INTO messages (mailbox_id, thread_id, subject, sender, internal_date, flags, pinned, archived, importance_level, importance_score, message_id, text_body) VALUES {vals}"
+            );
+            db.execute(&sql).unwrap();
+            vals.clear();
+            count = 0;
+        }
+    }
+    if !vals.is_empty() {
+        let sql = format!(
+            "INSERT INTO messages (mailbox_id, thread_id, subject, sender, internal_date, flags, pinned, archived, importance_level, importance_score, message_id, text_body) VALUES {vals}"
+        );
+        db.execute(&sql).unwrap();
+    }
+}
+
+fn seed_with_sender_cardinality(
+    db: &mut Engine,
+    n_messages: usize,
+    distinct_senders: usize,
+) {
+    db.execute("CREATE TABLE mailboxes (id BIGSERIAL PRIMARY KEY, name TEXT, user_address TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE messages (id BIGSERIAL PRIMARY KEY, mailbox_id BIGINT, thread_id TEXT, \
+         subject TEXT, sender TEXT, internal_date BIGINT, flags BIGINT, pinned BOOLEAN, \
+         archived BOOLEAN, importance_level TEXT, importance_score REAL, message_id TEXT, \
+         text_body TEXT)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO mailboxes (name, user_address) VALUES ('default', 'u@x')")
+        .unwrap();
+    let mut vals = String::new();
+    let mut count = 0;
+    for i in 0..n_messages {
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        use std::fmt::Write;
+        let sender_idx = i % distinct_senders;
+        let _ = write!(
+            vals,
+            "(1, 'thr{}', 'subj{i}', 'sender{sender_idx}@example.com', {}, 0, false, false, 'normal', 0.5, 'm{i}', 'body {i}')",
+            i % 1000,
+            1_700_000_000_i64 + i as i64
+        );
+        count += 1;
+        if count == 500 {
+            let sql = format!(
+                "INSERT INTO messages (mailbox_id, thread_id, subject, sender, internal_date, flags, pinned, archived, importance_level, importance_score, message_id, text_body) VALUES {vals}"
+            );
+            db.execute(&sql).unwrap();
+            vals.clear();
+            count = 0;
+        }
+    }
+    if !vals.is_empty() {
+        let sql = format!(
+            "INSERT INTO messages (mailbox_id, thread_id, subject, sender, internal_date, flags, pinned, archived, importance_level, importance_score, message_id, text_body) VALUES {vals}"
+        );
+        db.execute(&sql).unwrap();
+    }
+}
+
+const CONTACTS_TOPN_SQL: &str = "SELECT m.sender FROM messages m \
+                                 JOIN mailboxes mb ON m.mailbox_id = mb.id \
+                                 WHERE mb.user_address = 'u@x' AND m.sender ILIKE '%%' \
+                                 AND m.sender != '' \
+                                 GROUP BY m.sender \
+                                 ORDER BY MAX(m.internal_date) DESC LIMIT 20";
+
+#[test]
+fn baseline_grouped_textkey_topn_100() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_with_sender_cardinality(&mut db, 25_000, 100);
+    time_query(
+        &mut db,
+        CONTACTS_TOPN_SQL,
+        10,
+        "grouped_textkey_topn_100",
+        500.0,
+    );
+}
+
+#[test]
+fn baseline_grouped_textkey_topn_1k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_with_sender_cardinality(&mut db, 25_000, 1_000);
+    time_query(
+        &mut db,
+        CONTACTS_TOPN_SQL,
+        10,
+        "grouped_textkey_topn_1k",
+        500.0,
+    );
+}
+
+#[test]
+fn baseline_grouped_textkey_topn_5k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_with_sender_cardinality(&mut db, 25_000, 5_000);
+    time_query(
+        &mut db,
+        CONTACTS_TOPN_SQL,
+        10,
+        "grouped_textkey_topn_5k",
+        500.0,
+    );
+}
+
+// v7.37.3 — row-width sensitivity probe for the inbox-listing shape.
+// Same SQL + cardinality as `grouped_textkey_topn_5k`, but with a
+// realistic ~ 1 KiB / 5 KiB `text_body` per message (real emails sit
+// in that range). Tests SPG's PV<Row> sequential-scan cost as a
+// function of row width — every row read pulls the full Row into
+// cache, so wide rows hurt even when the SQL doesn't SELECT the wide
+// column.
+#[test]
+fn baseline_grouped_textkey_topn_5k_body1k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_with_sender_cardinality_wide(&mut db, 25_000, 5_000, 1024);
+    time_query(
+        &mut db,
+        CONTACTS_TOPN_SQL,
+        10,
+        "grouped_textkey_topn_5k_body1k",
+        1500.0,
+    );
+}
+
+#[test]
+fn baseline_grouped_textkey_topn_5k_body5k() {
+    let _g = crate::perf_lock();
+    let mut db = Engine::new();
+    seed_with_sender_cardinality_wide(&mut db, 25_000, 5_000, 5120);
+    time_query(
+        &mut db,
+        CONTACTS_TOPN_SQL,
+        10,
+        "grouped_textkey_topn_5k_body5k",
+        2000.0,
+    );
+}
+
 #[test]
 fn baseline_get_contacts() {
     let _g = crate::perf_lock();

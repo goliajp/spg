@@ -513,6 +513,35 @@ pub(crate) fn run(
     )?;
 
     // (4) ORDER BY on the aggregated output (the caller applies LIMIT).
+    //
+    // v7.37.3 (mailrs prod /api/contacts 3.21× regression — and the
+    // general inbox-listing-shape SPG-vs-PG gap) — top-K sink for
+    // `ORDER BY <agg> [DESC] LIMIT k`. Pre-7.37.3 this stage ran a
+    // full O(N log N) sort over every surviving group, then the
+    // caller truncated to `k`. With high-cardinality GROUP BY (a
+    // sender column with hundreds-thousands of distinct values) the
+    // truncated set is a tiny fraction of `N` — keep an O(k) top-K
+    // sink and never sort the discarded majority. Matches PG /
+    // MySQL / MariaDB's standard "LIMIT k under ORDER BY agg"
+    // optimisation; SPG previously implemented it only on the
+    // streamed inner-join path (`try_streamed_inner_join_topn`)
+    // and not on the aggregate output.
+    //
+    // Gate: needs a literal LIMIT (placeholder LIMIT we can't bound
+    // statically here), no DISTINCT (would need post-dedup, can't
+    // truncate during sort), no LIMIT WITH TIES (which extends past
+    // the literal k by run-time tie-key comparison).
+    let keep_n: Option<usize> = if !stmt.order_by.is_empty()
+        && !stmt.distinct
+        && !stmt.limit_with_ties
+    {
+        stmt.limit_literal().map(|l| {
+            let off = stmt.offset_literal().unwrap_or(0) as usize;
+            (l as usize).saturating_add(off)
+        })
+    } else {
+        None
+    };
     if !stmt.order_by.is_empty() {
         let (sorted_synth, sorted_out) = sort_synth_by_order_by(
             &synth_schema,
@@ -521,6 +550,7 @@ pub(crate) fn run(
             kept_synth,
             out_rows,
             correlated_eval,
+            keep_n,
         )?;
         kept_synth = sorted_synth;
         out_rows = sorted_out;
@@ -1540,6 +1570,7 @@ fn sort_synth_by_order_by(
     mut kept_synth: Vec<Row>,
     mut out_rows: Vec<Row>,
     correlated_eval: Option<CorrelatedEval<'_>>,
+    keep_n: Option<usize>,
 ) -> Result<(Vec<Row>, Vec<Row>), EvalError> {
     let synth_ctx = EvalContext::new(synth_schema, None);
     // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
@@ -1577,17 +1608,35 @@ fn sort_synth_by_order_by(
         }
         tagged.push((keys, s, o));
     }
-    tagged.sort_by(|a, b| {
+    let cmp = |a: &(Vec<Value>, Row, Row), b: &(Vec<Value>, Row, Row)| {
         use core::cmp::Ordering;
         for (i, (ka, kb)) in a.0.iter().zip(b.0.iter()).enumerate() {
             let (desc, nf) = keys_meta[i];
-            let cmp = crate::order_by_value_cmp(desc, nf, ka, kb);
-            if cmp != Ordering::Equal {
-                return cmp;
+            let c = crate::order_by_value_cmp(desc, nf, ka, kb);
+            if c != Ordering::Equal {
+                return c;
             }
         }
         Ordering::Equal
-    });
+    };
+    // v7.37.3 — top-K partial sort when `keep_n` is small enough to
+    // matter (`Some(k)` with `k < tagged.len()` and `k > 0`).
+    // `select_nth_unstable_by` partitions in O(N), then we sort the
+    // surviving prefix in O(K log K). Total = O(N + K log K) vs
+    // O(N log N) the full sort would pay — matches the inbox-listing
+    // shape PG uses.
+    //
+    match keep_n {
+        Some(k) if k < tagged.len() && k > 0 => {
+            let pivot = k - 1;
+            tagged.select_nth_unstable_by(pivot, cmp);
+            tagged[..k].sort_by(cmp);
+            tagged.truncate(k);
+        }
+        _ => {
+            tagged.sort_by(cmp);
+        }
+    }
     kept_synth = Vec::with_capacity(tagged.len());
     out_rows = Vec::with_capacity(tagged.len());
     for (_, s, o) in tagged {
