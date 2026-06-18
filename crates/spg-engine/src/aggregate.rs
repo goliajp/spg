@@ -761,6 +761,52 @@ fn accumulate_groups(
             _ => None,
         })
         .collect();
+    // v7.37.4 (L1 — executor-time CSE / mailrs P0) — dedupe
+    // compiled aggregate-arg expressions across specs. mailrs's
+    // `/api/conversations` SQL has 14 aggregates whose compiled
+    // CASE/CAST arg expressions overlap heavily (`m.message_id != ''`
+    // re-appears 4×, the inner `CASE WHEN m.message_id != '' THEN
+    // m.message_id ELSE CAST(m.id AS TEXT) END` re-appears 3×). Each
+    // dup currently costs one Step-VM walk per row — 100k rows ×
+    // ~3-4 redundant evals = ~300-400k wasted Step-VM runs.
+    //
+    // Dedupe key = source `Expr` (PartialEq). `CompiledExpr` itself
+    // is not `Hash` / `Eq`, but n_specs is small (≤ ~20 in practice);
+    // O(n²) PartialEq probe cost = ~196 cmp per query, vs millions
+    // of saved per-row evals. `fully_compilable` requires PURE
+    // scalars (no NOW / RANDOM / sequence accessors), so an earlier
+    // eval has identical observable semantics to the original.
+    //
+    // `arg_slot[i] = Some(s)` means spec `i`'s compiled arg lives in
+    // slot `s` of `arg_unique_idx` (which points back into
+    // `arg_compiled` for the canonical owner). Per-row cache fills
+    // LAZILY — preserves the current FILTER semantics where an arg
+    // whose spec is filtered out is never evaluated (and never
+    // surfaces a type error). Reset to `None` at the top of each row.
+    let mut arg_unique_idx: Vec<usize> = Vec::new();
+    let mut arg_slot: Vec<Option<usize>> = Vec::with_capacity(agg_specs.len());
+    arg_slot.resize(agg_specs.len(), None);
+    for (i, spec) in agg_specs.iter().enumerate() {
+        if arg_pos[i].is_some() || arg_compiled[i].is_none() {
+            continue;
+        }
+        let src = spec.arg.as_ref().expect("arg_compiled => spec.arg is Some");
+        let pos = arg_unique_idx.iter().position(|&j| {
+            agg_specs[j]
+                .arg
+                .as_ref()
+                .is_some_and(|other| other == src)
+        });
+        arg_slot[i] = Some(match pos {
+            Some(p) => p,
+            None => {
+                arg_unique_idx.push(i);
+                arg_unique_idx.len() - 1
+            }
+        });
+    }
+    let mut row_eval_cache: Vec<Option<Value>> = Vec::with_capacity(arg_unique_idx.len());
+    row_eval_cache.resize(arg_unique_idx.len(), None);
     // v7.33 (array_agg perf) — bound positions for each spec's internal
     // ORDER BY keys, so an ordered aggregate (`array_agg(x ORDER BY y)`)
     // reads the sort key by reference (RowRef::get) instead of
@@ -1018,6 +1064,11 @@ fn accumulate_groups(
         return Ok(order);
     }
     for row in rows {
+        // v7.37.4 (L1 CSE) — reset per-row cache for shared compiled
+        // aggregate-arg evals. No-op when no dedupe (empty vec).
+        for slot in row_eval_cache.iter_mut() {
+            *slot = None;
+        }
         if single_anon_group {
             let entry = &mut order[0];
             let mat: Option<Cow<'_, Row>> = if needs_mat { Some(row.as_row()) } else { None };
@@ -1031,15 +1082,23 @@ fn accumulate_groups(
                     continue;
                 }
                 let arg_owned: Value;
-                let arg_ref: &Value = match (&arg_pos[i], &arg_compiled[i], &spec.arg) {
+                let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
                     (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
-                    (None, _, None) => {
+                    (None, None, None) => {
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
-                    (None, Some(c), _) => {
-                        arg_owned = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
-                        &arg_owned
+                    (None, Some(s), _) => {
+                        if row_eval_cache[s].is_none() {
+                            let c = arg_compiled[arg_unique_idx[s]]
+                                .as_ref()
+                                .expect("arg_unique_idx points at a compiled spec");
+                            let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
+                            row_eval_cache[s] = Some(v);
+                        }
+                        row_eval_cache[s]
+                            .as_ref()
+                            .expect("just filled above")
                     }
                     (None, None, Some(e)) => {
                         arg_owned = eval_arg(
@@ -1161,18 +1220,29 @@ fn accumulate_groups(
                     continue;
                 }
                 let arg_owned: Value;
-                let arg_ref: &Value = match (&arg_pos[i], &arg_compiled[i], &spec.arg) {
+                let arg_ref: &Value = match (&arg_pos[i], arg_slot[i], &spec.arg) {
                     (Some(p), _, _) => row.get(*p).unwrap_or(&Value::Null),
-                    (None, _, None) => {
+                    (None, None, None) => {
                         arg_owned = Value::Bool(true);
                         &arg_owned
                     }
-                    (None, Some(c), _) => {
-                        // v7.36 — compiled-arg fast path. `eval_stack`
-                        // is reused across rows; the Step VM never
-                        // materialises a row for column reads.
-                        arg_owned = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
-                        &arg_owned
+                    (None, Some(s), _) => {
+                        // v7.37.4 (L1 CSE) — shared compiled-arg slot.
+                        // First spec that needs slot `s` this row pays
+                        // the Step-VM eval; siblings reading the same
+                        // slot get the cached Value for free. Preserves
+                        // FILTER semantics: a spec filtered out above
+                        // never reaches here, so its arg stays unevaled.
+                        if row_eval_cache[s].is_none() {
+                            let c = arg_compiled[arg_unique_idx[s]]
+                                .as_ref()
+                                .expect("arg_unique_idx points at a compiled spec");
+                            let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
+                            row_eval_cache[s] = Some(v);
+                        }
+                        row_eval_cache[s]
+                            .as_ref()
+                            .expect("just filled above")
                     }
                     (None, None, Some(e)) => {
                         arg_owned = eval_arg(
