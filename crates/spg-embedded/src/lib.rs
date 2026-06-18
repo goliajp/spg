@@ -2601,6 +2601,26 @@ impl Database {
         &mut self.engine
     }
 
+    /// v7.38 (mailrs prod 7.35 pool-exhaustion incident) — boot-time
+    /// plan-IR cache warm-up. Pre-prepares the listed SQL shapes so
+    /// the first user-facing request doesn't pay the 2-3 s
+    /// first-fire parse + JOIN-reorder cost on the readonly-blocking
+    /// pool. Recommended call site: `Database::new` immediately after
+    /// catalog restore, before serving any traffic. Returns the
+    /// number of statements successfully cached.
+    pub fn warm_up_plan_cache(&mut self, sqls: &[&str]) -> usize {
+        self.engine.warm_up_plan_cache(sqls)
+    }
+
+    /// v7.38 (mailrs prod 7.35 pool-exhaustion incident) — boot-time
+    /// cold-tier OS page-cache warm-up. Touches every cold segment
+    /// file in the active catalog so the kernel page cache loads
+    /// them before user traffic arrives. On a hot-only catalog the
+    /// call is a near-no-op. Returns the total cold rows touched.
+    pub fn warm_up_cold_tier(&self) -> usize {
+        self.engine.warm_up_cold_tier()
+    }
+
     /// v7.16.0 — parse + plan a SQL string ONCE so subsequent
     /// `execute_prepared` / `query_prepared` calls can re-bind
     /// parameters without re-parsing. The returned [`Statement`]
