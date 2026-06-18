@@ -149,6 +149,53 @@ impl Engine {
         &self.plan_cache
     }
 
+    /// v7.38 (mailrs prod 7.35 pool-exhaustion incident) — boot-time
+    /// plan-IR cache warm-up. Walks `sqls`, calls `prepare_cached`
+    /// on each one. Each successful prepare leaves the parsed +
+    /// reordered + clock-rewritten `Statement` in the engine-wide
+    /// plan cache; subsequent `Engine::execute` / `execute_prepared`
+    /// for the same SQL skips parse + JOIN reorder. Returns the
+    /// count of successfully cached statements.
+    ///
+    /// The mailrs `Database::new` boot path is the expected caller:
+    /// pre-warm the top-N query shapes (inbox listing, contacts
+    /// search, stats) so the first user-facing request doesn't
+    /// pay the 2-3 s first-fire cost on the readonly-blocking
+    /// sqlx pool — which (under prod concurrency) exhausts the
+    /// pool and stalls the whole UI.
+    pub fn warm_up_plan_cache(&mut self, sqls: &[&str]) -> usize {
+        let mut warmed = 0;
+        for sql in sqls {
+            if self.prepare_cached(sql).is_ok() {
+                warmed += 1;
+            }
+        }
+        warmed
+    }
+
+    /// v7.38 (mailrs prod 7.35 pool-exhaustion incident) — boot-time
+    /// cold-tier OS page-cache warm-up. Walks every table in the
+    /// active catalog, iterates the cold rows via the existing
+    /// BTree-driven `iter_cold_rows_of_table`, drops the rows on
+    /// the floor. The walk's side effect is that every cold
+    /// segment file gets mmap-read once — the OS page cache then
+    /// serves subsequent queries without disk I/O.
+    ///
+    /// Returns the total cold rows touched across all tables.
+    /// On a hot-only catalog (no `cold_segments` populated) the
+    /// call is a near-no-op.
+    pub fn warm_up_cold_tier(&self) -> usize {
+        let catalog = self.active_catalog();
+        let mut total = 0;
+        for name in catalog.table_names() {
+            if let Some(table) = catalog.get(&name) {
+                let rows = self.iter_cold_rows_of_table(table);
+                total += rows.len();
+            }
+        }
+        total
+    }
+
     /// v6.3.0 — mutable accessor for v6.3.1 invalidation hooks.
     pub fn plan_cache_mut(&mut self) -> &mut plan_cache::PlanCache {
         &mut self.plan_cache
