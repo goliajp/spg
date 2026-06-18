@@ -54,6 +54,45 @@ fn warm_up_plan_cache_skips_invalid_sql_silently() {
 }
 
 #[test]
+fn open_path_returns_a_server_ready_catalog_without_client_warmup() {
+    // v7.37.2 (zero-customer-change rule per
+    // feedback-zero-customer-change-warmup-incident) — the client
+    // does not call any `warm_up_*` method. `Database::open_path`
+    // is responsible for returning a catalog that's fully ready to
+    // serve. This test pins that contract: open + immediate query
+    // succeeds and the cold-tier auto-warm path runs without panic
+    // even on an empty catalog.
+    let tmp = std::env::temp_dir().join(format!(
+        "spg-warm-open-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let db_path = tmp.join("auto.spg");
+    {
+        let mut db = Database::open_path(&db_path).expect("open empty");
+        db.execute("CREATE TABLE t (id BIGSERIAL PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            db.execute(&format!("INSERT INTO t (v) VALUES ('row{i}')"))
+                .unwrap();
+        }
+    }
+    // Re-open. Auto-warm fires inside open_path. Client doesn't see
+    // any warm-up call site.
+    let mut reopened = Database::open_path(&db_path).expect("reopen");
+    let r = reopened.execute("SELECT COUNT(*) FROM t").unwrap();
+    if let spg_embedded::QueryResult::Rows { rows, .. } = r {
+        if let spg_storage::Value::BigInt(n) = rows[0].values[0] {
+            assert_eq!(n, 50);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn warm_up_cold_tier_returns_zero_on_hot_only_catalog() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE t (id BIGSERIAL PRIMARY KEY, v TEXT)")
