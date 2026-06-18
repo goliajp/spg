@@ -396,10 +396,26 @@ async fn run_one(
         // completion on the blocking pool, off the async workers.
         let snap = conn.inner.clone_snapshot_inline().await;
         let params = arguments.map(crate::SpgArguments::into_engine_values);
+        // v7.37.3 (mailrs prod /api/contacts 3.21× wall-clock gap) —
+        // default inline budget raised from 25 ms → 1000 ms. The
+        // v7.28 25 ms default was set to catch a runaway 60 s query
+        // family that saturated mailrs's tokio worker pool; the
+        // side-effect was that any query > 25 ms (including every
+        // inbox-listing-shape query: contacts, /api/conversations,
+        // /api/mail/stats — all 30-400 ms range in prod) burned the
+        // 25 ms inline budget, then cancelled, then re-executed
+        // from scratch on `tokio::spawn_blocking`. That's a
+        // structural double-execute the spg-sqlx adapter ate on
+        // every slow query. 1000 ms covers mailrs's reported worst
+        // p99 (~ 374 ms contacts) with 2.5× headroom and still
+        // catches the genuine catastrophic 10s+ runaway shapes the
+        // v7.28 protection was originally aimed at. SPG-side
+        // env-only knob — clients keep writing `sqlx::query!()`
+        // exactly the same as against `sqlx-postgres`.
         let budget_ms: u64 = std::env::var("SPG_SQLX_INLINE_BUDGET_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(25);
+            .unwrap_or(1000);
         let started = std::time::Instant::now();
         let inline = spg_embedded::Database::execute_prepared_on_snapshot_with_budget(
             &snap,
