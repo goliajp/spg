@@ -132,7 +132,7 @@ async fn seed(pool: &PgPool, n_messages: usize, label: &str) {
         } else {
             format!("mid-{i}")
         };
-        let flags = if i % 10 < 3 { 0 } else { 1 };
+        let flags = i32::from(i % 10 >= 3);
         let _ = write!(
             vals,
             "({}, 'th-{}', 'subj{i}', 'sender{}@example.com', {}, {}, '{}')",
