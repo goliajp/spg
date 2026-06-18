@@ -2,7 +2,6 @@
 name         = "spg-audit"
 version      = { workspace = true }
 edition      = { workspace = true }
-rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "Append-only audit log with BLAKE3 hash-chain for SPG (compliance)."

@@ -2,7 +2,6 @@
 name         = "spg-bench-competitor"
 version      = { workspace = true }
 edition      = { workspace = true }
-rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "Side-by-side benchmark harness: SPG vs Postgres / MySQL / MariaDB."

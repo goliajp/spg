@@ -2,7 +2,6 @@
 name         = "spg-manifest"
 version      = { workspace = true }
 edition      = { workspace = true }
-rust-version = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 description  = "SPGMAN01 v10 catalog manifest format. Frozen wire/disk surface shared by spg-server and spg-embedded."
