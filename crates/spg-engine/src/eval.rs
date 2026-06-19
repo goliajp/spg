@@ -50,7 +50,8 @@ use datetime::{
 use encoding::{decode_text, encode_text};
 pub use format::{
     days_from_civil, format_bigint_array, format_bytea_hex, format_date, format_int_array,
-    format_interval, format_money, format_numeric, format_text_array, format_time,
+    format_interval, format_interval_array, format_money, format_numeric, format_text_array,
+    format_time,
     format_timestamp, format_timestamptz, format_timetz, parse_date_literal,
     parse_timestamp_literal,
 };

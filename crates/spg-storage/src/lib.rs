@@ -177,6 +177,13 @@ pub enum DataType {
     /// v7.11.12: `BIGINT[]` — single-dimension i64 array. PG
     /// wire OID 1016 (_int8). Catalog FILE_VERSION 19+.
     BigIntArray,
+    /// v7.37.5 β-P4 — `INTERVAL[]` — single-dimension array of
+    /// `IntervalSpan { months, days, micros }`. PG wire OID 1187
+    /// (`_interval`). Catalog tag 35 + per-cell body
+    /// `[u16 count][per elem: u8 null + (if non-null) 16-byte
+    /// interval body in LE PG-byte-equal field order]`.
+    /// FILE_VERSION 48+.
+    IntervalArray,
     /// v7.12.0: PG `tsvector` — ordered, deduplicated set of
     /// `(lexeme, positions, weight)` tuples. PG wire OID 3614.
     /// Catalog FILE_VERSION 20+. Storage shape is row-codec
@@ -347,6 +354,7 @@ impl fmt::Display for DataType {
             Self::TextArray => f.write_str("TEXT[]"),
             Self::IntArray => f.write_str("INT[]"),
             Self::BigIntArray => f.write_str("BIGINT[]"),
+            Self::IntervalArray => f.write_str("INTERVAL[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
             Self::Uuid => f.write_str("UUID"),
@@ -469,6 +477,13 @@ pub enum Value {
     /// v7.11.12 `BIGINT[]` — single-dimension i64 array with optional
     /// NULL elements.
     BigIntArray(Vec<Option<i64>>),
+    /// v7.37.5 β-P4 `INTERVAL[]` — single-dimension array of
+    /// `IntervalSpan { months, days, micros }` with optional NULL
+    /// elements. PG external form quotes each non-NULL element
+    /// (`{"1 day","24:00:00",NULL}`) because interval text contains
+    /// spaces and colons. Storage codec follows the BigIntArray
+    /// shape with a 16-byte per-element body.
+    IntervalArray(Vec<Option<IntervalSpan>>),
     /// v7.12.0 `tsvector` — sorted-by-word, deduped lexeme set with
     /// positions + weights. The engine enforces sort/dedup on
     /// construction; consumers can rely on `lexemes.windows(2)`
@@ -536,6 +551,20 @@ pub enum Value {
     Null,
 }
 
+/// v7.37.5 β-P4 — element type for `Value::IntervalArray`. Mirrors
+/// the `{months, days, micros}` shape of scalar `Value::Interval`,
+/// broken out as a named struct so `IntervalArray`'s element type
+/// is concrete (24 bytes, packed) instead of an enum-boxed Value.
+/// All three dimensions are independent — `IntervalSpan { days: 1,
+/// .. }` is distinct from `IntervalSpan { micros: 86_400_000_000,
+/// .. }` per PG byte-equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntervalSpan {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
+}
+
 impl Value {
     /// Type tag, or `None` for `NULL` (unknown at value level).
     pub fn data_type(&self) -> Option<DataType> {
@@ -576,6 +605,7 @@ impl Value {
             Self::TextArray(_) => Some(DataType::TextArray),
             Self::IntArray(_) => Some(DataType::IntArray),
             Self::BigIntArray(_) => Some(DataType::BigIntArray),
+            Self::IntervalArray(_) => Some(DataType::IntervalArray),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
             Self::Uuid(_) => Some(DataType::Uuid),
@@ -932,6 +962,10 @@ impl IndexKey {
             Value::Hstore(_) => None,
             // v7.17.0 Phase 3.P0-40: 2D arrays aren't indexable.
             Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => None,
+            // v7.37.5 β-P4: INTERVAL[] isn't indexable (PG uses
+            // GIN/intarray for array-contains queries; SPG plans
+            // that as a separate axis under v7.37.8 GIN-on-jsonb).
+            Value::IntervalArray(_) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this

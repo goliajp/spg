@@ -377,5 +377,6 @@ fn render_data_type(ty: DataType) -> String {
         DataType::IntArray2D => "INT[][]".into(),
         DataType::BigIntArray2D => "BIGINT[][]".into(),
         DataType::TextArray2D => "TEXT[][]".into(),
+        DataType::IntervalArray => "INTERVAL[]".into(),
     }
 }

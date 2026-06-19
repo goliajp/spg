@@ -656,6 +656,8 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // i32 months) carried by `write_value_body`. Catalog
         // FILE_VERSION 48+.
         DataType::Interval => out.push(34),
+        // v7.37.5 β-P4: tag 35 — INTERVAL[]. Catalog FILE_VERSION 48+.
+        DataType::IntervalArray => out.push(35),
         DataType::Json => out.push(13),
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
@@ -792,6 +794,8 @@ impl Cursor<'_> {
             33 => Ok(DataType::TextArray2D),
             // v7.37.5 β-P2: tag 34 — INTERVAL. Catalog FILE_VERSION 48+.
             34 => Ok(DataType::Interval),
+            // v7.37.5 β-P4: tag 35 — INTERVAL[]. Catalog FILE_VERSION 48+.
+            35 => Ok(DataType::IntervalArray),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -889,6 +893,14 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
             2 + items
                 .iter()
                 .map(|x| if x.is_some() { 9 } else { 1 })
+                .sum::<usize>()
+        }
+        // v7.37.5 β-P4: INTERVAL[] — [u16 count][per elem: u8 null +
+        // (when non-null) 16-byte interval body].
+        Value::IntervalArray(items) => {
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 17 } else { 1 })
                 .sum::<usize>()
         }
         // v7.12.0: tsvector dense body — [u16 lexeme_count][per
@@ -1183,6 +1195,27 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 }
             }
         }
+        // v7.37.5 β-P4: INTERVAL[] schema-aware dense body —
+        // [u16 count][per elem: u8 null + (when non-null) i64 LE
+        // micros + i32 LE days + i32 LE months]. Field order
+        // mirrors the scalar `Value::Interval` codec arm above
+        // so a future binary array BIND path can splat both with
+        // the same byte layout.
+        (Value::IntervalArray(items), DataType::IntervalArray) => {
+            let count = u16::try_from(items.len()).expect("INTERVAL[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(span) => {
+                        out.push(0);
+                        out.extend_from_slice(&span.micros.to_le_bytes());
+                        out.extend_from_slice(&span.days.to_le_bytes());
+                        out.extend_from_slice(&span.months.to_le_bytes());
+                    }
+                }
+            }
+        }
         // v7.12.0: tsvector dense body — see `value_body_encoded_len`
         // for layout. Lexemes are written in their already-sorted order.
         (Value::TsVector(lexs), DataType::TsVector) => write_tsvector_body(out, lexs),
@@ -1464,6 +1497,27 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
                     Some(n) => {
                         out.push(0);
                         out.extend_from_slice(&n.to_le_bytes());
+                    }
+                }
+            }
+        }
+        // v7.37.5 β-P4: INTERVAL[] schema-less — tag 31. Same
+        // body shape as the schema-aware arm. Schema-less tags
+        // 28/29 already taken by 2D arrays' read path on the
+        // schema-aware DataType side (28/29 are read_value
+        // arms below); 31 is the next free schema-less slot.
+        Value::IntervalArray(items) => {
+            out.push(31);
+            let count = u16::try_from(items.len()).expect("INTERVAL[] ≤ 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(span) => {
+                        out.push(0);
+                        out.extend_from_slice(&span.micros.to_le_bytes());
+                        out.extend_from_slice(&span.days.to_le_bytes());
+                        out.extend_from_slice(&span.months.to_le_bytes());
                     }
                 }
             }
@@ -2079,6 +2133,34 @@ impl<'a> Cursor<'a> {
                 }
                 Ok(Value::BigIntArray(items))
             }
+            // v7.37.5 β-P4: INTERVAL[] dense body —
+            // [u16 count][per elem: u8 null + (non-null) i64 LE
+            // micros + i32 LE days + i32 LE months].
+            DataType::IntervalArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<IntervalSpan>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let micros = self.read_i64()?;
+                            let days = self.read_i32()?;
+                            let months = self.read_i32()?;
+                            items.push(Some(IntervalSpan {
+                                months,
+                                days,
+                                micros,
+                            }));
+                        }
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "INTERVAL[] null flag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::IntervalArray(items))
+            }
             // v7.12.0: tsvector dense body — [u16 lex_count]
             // [per lex: u16 word_len + utf-8 word + u16 pos_count
             // + (u16 LE * pos_count) + u8 weight].
@@ -2448,6 +2530,33 @@ impl<'a> Cursor<'a> {
                     days,
                     micros,
                 })
+            }
+            // v7.37.5 β-P4: tag 31 — INTERVAL[] (schema-less). Body
+            // mirrors the schema-aware DataType::IntervalArray read.
+            31 => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<IntervalSpan>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let micros = self.read_i64()?;
+                            let days = self.read_i32()?;
+                            let months = self.read_i32()?;
+                            items.push(Some(IntervalSpan {
+                                months,
+                                days,
+                                micros,
+                            }));
+                        }
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "INTERVAL[] null flag in value tag: unknown byte {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::IntervalArray(items))
             }
             // v7.17.0 Phase 3.P0-38: tag 25 — Range.
             // [u8 RangeKind tag][u8 flags][opt lower][opt upper].

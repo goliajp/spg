@@ -435,6 +435,32 @@ pub fn format_bigint_array(items: &[Option<i64>]) -> String {
     out
 }
 
+/// v7.37.5 β-P4 — render an INTERVAL[] in PG's external array form.
+/// Each non-NULL element is double-quoted because interval text
+/// contains spaces (`1 day`) and colons (`24:00:00`) that would
+/// confuse the comma-separated parse: `{"1 day","24:00:00",NULL}`.
+/// Inner `"` doesn't occur in interval text so no escaping is
+/// needed; backslashes likewise can't appear.
+pub fn format_interval_array(items: &[Option<spg_storage::IntervalSpan>]) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 12);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(span) => {
+                out.push('"');
+                out.push_str(&format_interval(span.months, span.days, span.micros));
+                out.push('"');
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// v7.10.4 — render a BYTEA payload in PG's hex output format
 /// (`\x` prefix, lowercase hex pairs). Public so the wire layer
 /// can emit the canonical bytea-as-text representation.

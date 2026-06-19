@@ -1489,6 +1489,12 @@ pub enum ColumnTypeName {
     /// β-P2 `INTERVAL` was runtime-only — literal in expression
     /// position but rejected at CREATE TABLE.
     Interval,
+    /// v7.37.5 β-P4 — `INTERVAL[]` — single-dimension array of
+    /// INTERVAL. Wire OID 1187 (`_interval`). Catalog tag 35.
+    /// PG external form quotes each non-NULL element because
+    /// interval text contains spaces / colons
+    /// (`{"1 day","24:00:00",NULL}`).
+    IntervalArray,
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1553,6 +1559,7 @@ impl fmt::Display for ColumnTypeName {
             }),
             Self::Hstore => f.write_str("HSTORE"),
             Self::Interval => f.write_str("INTERVAL"),
+            Self::IntervalArray => f.write_str("INTERVAL[]"),
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),
