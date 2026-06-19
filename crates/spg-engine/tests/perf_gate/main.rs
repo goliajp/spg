@@ -93,4 +93,5 @@ mod proj_borrow;
 mod resident;
 mod round26_mem;
 mod select_where;
+mod sentori_epic7_throughput;
 mod stages_knn;
