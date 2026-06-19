@@ -6157,15 +6157,10 @@ impl Parser {
             // time so the lexer stays untouched.
             "bytea" | "bytes" => ColumnTypeName::Bytes,
             // v7.17.0 Phase 7 — PG network address types
-            // (`inet`, `cidr`, `macaddr`). pg_dump / Django ORM
-            // emit these for IP-address columns; pre-7 SPG
-            // errored with "unknown type", breaking schema
-            // restores. Accept as Text-backed (no new storage
-            // shape): the customer's data round-trips, and the
-            // host() / network() helpers added in the same
-            // phase work textually. Containment operators
-            // `<<=` / `>>=` are out of v7.17 scope.
-            "inet" | "cidr" | "macaddr" => ColumnTypeName::Text,
+            // v7.17.0 had a Text-backed fallback here for
+            // `inet` / `cidr` / `macaddr`. v7.37.5 ζ-A promoted
+            // each to a first-class type; the keywords are
+            // bound below in the ζ-A block.
             // v7.12.0 — PG full-text search types. mailrs G-CRIT-3.
             // The actual `to_tsvector` / `@@` / `ts_rank` surface
             // arrives in v7.12.1+; the type itself loads here so
@@ -6215,6 +6210,14 @@ impl Parser {
             "polygon" => ColumnTypeName::Polygon,
             "line" => ColumnTypeName::Line,
             "circle" => ColumnTypeName::Circle,
+            // v7.37.5 ζ-A — network / bit / xml / "char" keywords.
+            "inet" => ColumnTypeName::Inet,
+            "cidr" => ColumnTypeName::Cidr,
+            "macaddr" => ColumnTypeName::Macaddr,
+            "macaddr8" => ColumnTypeName::Macaddr8,
+            "bit" => ColumnTypeName::Bit,
+            "varbit" => ColumnTypeName::BitVarying,
+            "xml" => ColumnTypeName::Xml,
             // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
             "hstore" => ColumnTypeName::Hstore,
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM

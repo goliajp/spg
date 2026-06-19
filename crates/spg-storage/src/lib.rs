@@ -234,6 +234,39 @@ pub enum DataType {
     Polygon,
     Line,
     Circle,
+    /// v7.37.5 ζ-A — PG network address family. Body shapes (LE):
+    ///   Inet     = 18 B fixed (u8 family + u8 bits + 16 B addr)  OID 869
+    ///   Cidr     = 18 B fixed (same shape as Inet; CIDR rejects
+    ///                          host bits at parse / coerce)       OID 650
+    ///   Macaddr  = 6 B fixed                                      OID 829
+    ///   Macaddr8 = 8 B fixed (EUI-64)                             OID 774
+    /// Catalog tags 57-60. FILE_VERSION 48+. `family = 4` is IPv4
+    /// (uses the first 4 bytes of the 16-B addr slot, rest 0);
+    /// `family = 6` is IPv6 (full 16 B).
+    Inet,
+    Cidr,
+    Macaddr,
+    Macaddr8,
+    /// v7.37.5 ζ-A — PG bit string. Body = `[u32 nbits][ceil(nbits/8) bytes]`,
+    /// big-endian within each byte (matches PG binary).
+    ///   Bit         OID 1560 (fixed-length, but SPG carries the
+    ///                         length per cell — column declaration
+    ///                         `BIT(n)` constrains at coerce time)
+    ///   BitVarying  OID 1562 (variable-length, declared as `VARBIT`)
+    /// Catalog tags 61-62.
+    Bit,
+    BitVarying,
+    /// v7.37.5 ζ-A — PG `xml`. Body identical to TEXT (storage is
+    /// the verbatim XML string; no parse-time validation). Only
+    /// the wire OID (142) differs. Catalog tag 63.
+    Xml,
+    /// v7.37.5 ζ-A — PG `"char"` (the internal single-byte type,
+    /// distinct from `CHAR(n)` / `BPCHAR`). Body = 1 byte raw.
+    /// OID 18. Catalog tag 64.
+    Char1,
+    /// v7.37.5 ζ-A — `MONEY[]`. Body = `[u16 count][per elem: u8 null
+    /// + (non-null) i64 LE cents]`. OID 791. Catalog tag 65.
+    MoneyArray,
     /// v7.12.0: PG `tsvector` — ordered, deduplicated set of
     /// `(lexeme, positions, weight)` tuples. PG wire OID 3614.
     /// Catalog FILE_VERSION 20+. Storage shape is row-codec
@@ -433,6 +466,15 @@ impl fmt::Display for DataType {
             Self::Polygon => f.write_str("POLYGON"),
             Self::Line => f.write_str("LINE"),
             Self::Circle => f.write_str("CIRCLE"),
+            Self::Inet => f.write_str("INET"),
+            Self::Cidr => f.write_str("CIDR"),
+            Self::Macaddr => f.write_str("MACADDR"),
+            Self::Macaddr8 => f.write_str("MACADDR8"),
+            Self::Bit => f.write_str("BIT"),
+            Self::BitVarying => f.write_str("VARBIT"),
+            Self::Xml => f.write_str("XML"),
+            Self::Char1 => f.write_str("\"char\""),
+            Self::MoneyArray => f.write_str("MONEY[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
             Self::Uuid => f.write_str("UUID"),
@@ -626,6 +668,42 @@ pub enum Value {
         center: Point2D,
         radius: f64,
     },
+    /// v7.37.5 ζ-A — PG `inet`. `family = 4` (IPv4) or `6` (IPv6).
+    /// `bits` is the netmask bit count (0..=32 for IPv4, 0..=128
+    /// for IPv6). `addr` is right-padded with zeros when family=4
+    /// (first 4 bytes are the address).
+    Inet {
+        family: u8,
+        bits: u8,
+        addr: [u8; 16],
+    },
+    /// v7.37.5 ζ-A — PG `cidr`. Same shape as Inet; CIDR's
+    /// invariant (host bits zero) is enforced at parse / coerce.
+    Cidr {
+        family: u8,
+        bits: u8,
+        addr: [u8; 16],
+    },
+    /// v7.37.5 ζ-A — PG `macaddr`. 6 bytes (XX:XX:XX:XX:XX:XX).
+    Macaddr([u8; 6]),
+    /// v7.37.5 ζ-A — PG `macaddr8`. 8 bytes (EUI-64).
+    Macaddr8([u8; 8]),
+    /// v7.37.5 ζ-A — PG `bit` / `bit varying`. `nbits` is the
+    /// actual bit count; `bytes` is the packed representation
+    /// (big-endian within each byte; final byte right-padded
+    /// with 0s if `nbits % 8 != 0`).
+    BitString {
+        nbits: u32,
+        bytes: Vec<u8>,
+    },
+    /// v7.37.5 ζ-A — PG `xml`. Stored verbatim as a string; no
+    /// parse-time validation (matches the SPG JSON convention).
+    Xml(String),
+    /// v7.37.5 ζ-A — PG `"char"` (internal single-byte type,
+    /// distinct from CHAR(n)).
+    Char1(u8),
+    /// v7.37.5 ζ-A — PG `money[]`.
+    MoneyArray(Vec<Option<i64>>),
     /// v7.12.0 `tsvector` — sorted-by-word, deduped lexeme set with
     /// positions + weights. The engine enforces sort/dedup on
     /// construction; consumers can rely on `lexemes.windows(2)`
@@ -795,6 +873,18 @@ impl Value {
             Self::Polygon(_) => Some(DataType::Polygon),
             Self::Line { .. } => Some(DataType::Line),
             Self::Circle { .. } => Some(DataType::Circle),
+            Self::Inet { .. } => Some(DataType::Inet),
+            Self::Cidr { .. } => Some(DataType::Cidr),
+            Self::Macaddr(_) => Some(DataType::Macaddr),
+            Self::Macaddr8(_) => Some(DataType::Macaddr8),
+            // BitString could be either Bit or BitVarying; column
+            // schema decides. Default to BitVarying when called
+            // schema-less (rare; storage path is always
+            // schema-aware so this only matters for diagnostics).
+            Self::BitString { .. } => Some(DataType::BitVarying),
+            Self::Xml(_) => Some(DataType::Xml),
+            Self::Char1(_) => Some(DataType::Char1),
+            Self::MoneyArray(_) => Some(DataType::MoneyArray),
             Self::TsVector(_) => Some(DataType::TsVector),
             Self::TsQuery(_) => Some(DataType::TsQuery),
             Self::Uuid(_) => Some(DataType::Uuid),
@@ -1185,7 +1275,20 @@ impl IndexKey {
             | Value::PgBox(_, _)
             | Value::Polygon(_)
             | Value::Line { .. }
-            | Value::Circle { .. } => None,
+            | Value::Circle { .. }
+            // v7.37.5 ζ-A — network / bit / xml / "char" / money[].
+            // INET / CIDR / MACADDR / MACADDR8 could be B-tree
+            // indexable (PG does this), but the byte-wise compare
+            // family-blind would mis-order IPv4 vs IPv6; left as
+            // a follow-up under v7.37.8 GIN window.
+            | Value::Inet { .. }
+            | Value::Cidr { .. }
+            | Value::Macaddr(_)
+            | Value::Macaddr8(_)
+            | Value::BitString { .. }
+            | Value::Xml(_)
+            | Value::Char1(_)
+            | Value::MoneyArray(_) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this

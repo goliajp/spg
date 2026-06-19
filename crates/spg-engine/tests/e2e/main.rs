@@ -81,6 +81,7 @@ mod e2e_inline_pk;
 mod e2e_insert_select;
 mod e2e_array_family;
 mod e2e_geometry;
+mod e2e_network_bit_xml;
 mod e2e_int_array;
 mod e2e_interval_array;
 mod e2e_interval_cast;

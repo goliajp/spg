@@ -3467,6 +3467,16 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::Polygon => 604,
         DataType::Line => 628,
         DataType::Circle => 718,
+        // v7.37.5 ζ-A — network / bit / xml / "char" / money[].
+        DataType::Inet => 869,
+        DataType::Cidr => 650,
+        DataType::Macaddr => 829,
+        DataType::Macaddr8 => 774,
+        DataType::Bit => 1560,
+        DataType::BitVarying => 1562,
+        DataType::Xml => 142,
+        DataType::Char1 => 18,
+        DataType::MoneyArray => 791,
         // v7.37.5 δ — PG 14+ multirange OIDs (pg_type.dat).
         DataType::Multirange(k) => match k {
             spg_storage::RangeKind::Int4 => 4451,
