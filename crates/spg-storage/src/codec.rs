@@ -54,6 +54,7 @@ pub(crate) fn deserialize_table(
             is_unsigned: false,
             inline_enum_variants: None,
             inline_set_variants: None,
+            generated_stored_expr: None,
         });
     }
     let n_cols = cols.len();
@@ -286,6 +287,20 @@ pub(crate) fn deserialize_table(
     if version >= 49 {
         let role = read_partition_role(cur)?;
         t.schema_mut().partition_role = role;
+    }
+    // v7.37.7 — per-table generated_stored_expr appendix
+    // (FILE_VERSION 50+). Sparse — populates any column whose entry
+    // appears here; v49-and-below catalogs default every column to
+    // generated_stored_expr = None.
+    if version >= 50 {
+        let binding_count = cur.read_u16()? as usize;
+        for _ in 0..binding_count {
+            let col_pos = cur.read_u16()? as usize;
+            let src = cur.read_str()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.generated_stored_expr = Some(src);
+            }
+        }
     }
     let _ = table_name;
     Ok(())

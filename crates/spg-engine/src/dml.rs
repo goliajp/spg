@@ -264,6 +264,20 @@ impl Engine {
         // assuming ascending row order, which the full-scan path
         // guaranteed implicitly.
         planned.sort_by_key(|(i, _)| *i);
+        // v7.37.7(sentori Epic 3 P1)— recompute stored generated
+        // columns against each post-UPDATE candidate row, BEFORE
+        // FK / CHECK / trigger passes so guards reason about the
+        // computed value the same way they would for a literal cell.
+        {
+            let mut staged: Vec<Vec<Value>> = planned
+                .iter()
+                .map(|(_pos, new_vals)| new_vals.clone())
+                .collect();
+            apply_generated_stored_columns(&schema_cols, &mut staged)?;
+            for ((_pos, new_vals), recomputed) in planned.iter_mut().zip(staged) {
+                *new_vals = recomputed;
+            }
+        }
         // v7.6.6 — capture pre-update row values for the FK
         // enforcement passes below. `planned` carries new values
         // only; pair them with the old row.
@@ -1187,6 +1201,12 @@ impl Engine {
         // parent-table lookup runs before any row is committed.
         let uniqueness = table.schema().uniqueness_constraints.clone();
         let _ = table;
+        // v7.37.7(sentori Epic 3 P1)— stored generated-column
+        // evaluation runs AFTER ordinary INSERT values are coerced
+        // (so the expression sees the materialised row)but BEFORE
+        // FK / CHECK / UNIQUE so those guards reason about the
+        // computed value the way they would for any literal column.
+        apply_generated_stored_columns(&column_meta, &mut all_values)?;
         if !fks.is_empty() {
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
         }
@@ -1627,6 +1647,78 @@ fn build_tuple_pos(
         }
     };
     Ok(tuple_pos)
+}
+
+/// v7.37.7(sentori Epic 3 P1)— for every column with a stored
+/// `generated_stored_expr`, parse the cached Display-form source,
+/// evaluate it against each candidate row, coerce to the column
+/// type, and overwrite whatever the caller passed in that slot.
+/// Mirrors PG's "GENERATED ALWAYS AS … STORED" semantics — the
+/// user has no say in the cell's value, the expression always wins.
+///
+/// Called from the INSERT and UPDATE row-assembly paths after the
+/// regular column-value coercion runs, so the expression sees
+/// fully-typed sibling cells.
+pub(crate) fn apply_generated_stored_columns(
+    column_meta: &[ColumnSchema],
+    rows: &mut [Vec<Value>],
+) -> Result<(), EngineError> {
+    use spg_engine_no_alias::ParsedExpr;
+    let mut parsed: Vec<Option<ParsedExpr>> = Vec::with_capacity(column_meta.len());
+    for col in column_meta {
+        if let Some(src) = &col.generated_stored_expr {
+            let expr = spg_sql::parser::parse_expression(src).map_err(EngineError::Parse)?;
+            parsed.push(Some(ParsedExpr {
+                expr,
+                ty: col.ty,
+                col_name: col.name.clone(),
+            }));
+        } else {
+            parsed.push(None);
+        }
+    }
+    if parsed.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    // Empty params slice + no sequence resolver — a stored generated
+    // expression is row-local and can't reference $N or sequences.
+    let no_params: [spg_storage::Value; 0] = [];
+    for row_values in rows.iter_mut() {
+        let row = spg_storage::Row::new(row_values.clone());
+        for (idx, slot) in parsed.iter().enumerate() {
+            let Some(pe) = slot else {
+                continue;
+            };
+            let ctx = crate::eval::EvalContext {
+                columns: column_meta,
+                table_alias: None,
+                params: &no_params,
+                default_text_search_config: None,
+                sequence_resolver: None,
+            };
+            let value = crate::eval::eval_expr(&pe.expr, &row, &ctx).map_err(EngineError::Eval)?;
+            let coerced = crate::coerce_value(value, pe.ty, &pe.col_name, idx)?;
+            row_values[idx] = coerced;
+        }
+    }
+    Ok(())
+}
+
+/// Module alias to keep the parser-form on hand while we walk many
+/// rows; the `mod` boundary is only here to dodge an "Expr too
+/// large for the borrow checker" complaint about reusing a parsed
+/// expression across the per-row loop above without cloning each
+/// iteration(Expr is `Clone` and we already pay one clone per
+/// `apply` call to materialise the row view; the per-row inner
+/// loop borrows the parsed Expr).
+mod spg_engine_no_alias {
+    use spg_sql::ast::Expr;
+    use spg_storage::DataType;
+    pub(crate) struct ParsedExpr {
+        pub expr: Expr,
+        pub ty: DataType,
+        pub col_name: alloc::string::String,
+    }
 }
 
 /// Stage 1 — parse every INSERT tuple into a coerced row of `Value`s:

@@ -6737,6 +6737,7 @@ impl Parser {
         let mut is_unique = false;
         let mut check: Option<Expr> = None;
         let mut on_update_runtime: Option<Expr> = None;
+        let mut generated_stored_expr: Option<Box<Expr>> = None;
         loop {
             // v7.22 (mailrs round-13 gap 3) — PG 18 catalogs
             // not-null constraints by name and pg_dump emits them
@@ -6787,12 +6788,48 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                // v7.37.7(sentori Epic 3 P1)— `GENERATED ALWAYS AS
+                // ( <expr> ) STORED` stored computed-column. The
+                // expression is captured for the engine to recompute
+                // on every INSERT / UPDATE. v7.37.7 accepts the
+                // STORED keyword only; PG also has VIRTUAL, which
+                // v7.37.7 carves out (sentori only uses STORED).
                 if matches!(self.peek(), Token::LParen) {
-                    return Err(self.err(
-                        "generated expression columns (GENERATED … AS (expr) STORED) \
-                         are not supported"
-                            .into(),
-                    ));
+                    self.advance();
+                    let expr = self.parse_expr(0)?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected ')' after GENERATED ALWAYS AS (<expr>), got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let stored = match self.peek() {
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("stored") =>
+                        {
+                            self.advance();
+                            true
+                        }
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("virtual") =>
+                        {
+                            return Err(self.err(
+                                "GENERATED ALWAYS AS (expr) VIRTUAL is not supported \
+                                 at v7.37.7; use STORED"
+                                    .into(),
+                            ));
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected STORED after GENERATED ALWAYS AS (<expr>), \
+                                 got {other:?}"
+                            )));
+                        }
+                    };
+                    let _ = stored; // currently STORED-only; flag reserved for VIRTUAL.
+                    generated_stored_expr = Some(Box::new(expr));
+                    continue;
                 }
                 self.expect_keyword_ident("identity")?;
                 // Optional `(START WITH 1 INCREMENT BY 1 …)` —
@@ -7018,6 +7055,7 @@ impl Parser {
             is_unsigned,
             inline_enum_variants,
             inline_set_variants,
+            generated_stored_expr,
         })
     }
 

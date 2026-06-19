@@ -195,11 +195,18 @@ fn t2_inline_identity_column() {
     db.execute("INSERT INTO t (x) VALUES ('b')").unwrap();
     let rows = db.query("SELECT id FROM t ORDER BY id").unwrap();
     assert_eq!(rows[1][0], spg_storage::Value::BigInt(2));
-    // Generated EXPRESSION columns reject loudly.
-    let err = db
-        .execute("CREATE TABLE g (a int, b int GENERATED ALWAYS AS (a * 2) STORED)")
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("not supported"));
+    // v7.22 round-13: GENERATED EXPRESSION columns used to reject
+    // loudly. v7.37.7 (sentori Epic 3 P1) accepts them — the engine
+    // recomputes the cell from sibling columns on every INSERT /
+    // UPDATE. Stored generated-column acceptance lives in
+    // `e2e_generated_stored` (spg-engine). Here we just confirm the
+    // CREATE succeeds without surfacing the old "not supported"
+    // sentinel that callers used to gate on.
+    db.execute("CREATE TABLE g (a int, b int GENERATED ALWAYS AS (a * 2) STORED)")
+        .expect("v7.37.7: stored generated column accepted");
+    db.execute("INSERT INTO g (a) VALUES (5)").unwrap();
+    let rows = db.query("SELECT b FROM g WHERE a = 5").unwrap();
+    assert_eq!(rows[0][0], spg_storage::Value::Int(10));
 }
 
 #[test]

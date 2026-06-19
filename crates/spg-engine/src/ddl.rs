@@ -2734,6 +2734,12 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     // INSERT canonicalisation (de-dup + sort by definition order)
     // lives in the exec_insert path next to the ENUM check.
     schema.inline_set_variants = c.inline_set_variants;
+    // v7.37.7(sentori Epic 3 P1)— stored generated-column
+    // expression. Carry the Display-form source to storage; the
+    // engine re-parses and re-evaluates on every INSERT / UPDATE.
+    if let Some(gen_expr) = c.generated_stored_expr {
+        schema.generated_stored_expr = Some(alloc::format!("{gen_expr}"));
+    }
     if let Some(default_expr) = c.default {
         // v7.9.21 — distinguish literal defaults (evaluated once
         // at CREATE TABLE) from expression defaults (deferred to
