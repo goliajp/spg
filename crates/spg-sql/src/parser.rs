@@ -6200,6 +6200,13 @@ impl Parser {
             "tsrange" => ColumnTypeName::Range(RangeKindAst::Ts),
             "tstzrange" => ColumnTypeName::Range(RangeKindAst::TsTz),
             "daterange" => ColumnTypeName::Range(RangeKindAst::Date),
+            // v7.37.5 δ — PG 14+ multirange keywords.
+            "int4multirange" => ColumnTypeName::Multirange(RangeKindAst::Int4),
+            "int8multirange" => ColumnTypeName::Multirange(RangeKindAst::Int8),
+            "nummultirange" => ColumnTypeName::Multirange(RangeKindAst::Num),
+            "tsmultirange" => ColumnTypeName::Multirange(RangeKindAst::Ts),
+            "tstzmultirange" => ColumnTypeName::Multirange(RangeKindAst::TsTz),
+            "datemultirange" => ColumnTypeName::Multirange(RangeKindAst::Date),
             // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
             "hstore" => ColumnTypeName::Hstore,
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM

@@ -1510,6 +1510,11 @@ pub enum ColumnTypeName {
     BytesArray,
     VarcharArray,
     CharArray,
+    /// v7.37.5 δ — PG 14+ multirange types. Same wrapper pattern
+    /// as `Range(RangeKindAst)` — one column type variant covers
+    /// all six builtin multiranges, kind pins the element type.
+    /// Wire OIDs in pgwire.
+    Multirange(RangeKindAst),
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1588,6 +1593,14 @@ impl fmt::Display for ColumnTypeName {
             Self::BytesArray => f.write_str("BYTEA[]"),
             Self::VarcharArray => f.write_str("VARCHAR[]"),
             Self::CharArray => f.write_str("CHAR[]"),
+            Self::Multirange(k) => f.write_str(match k {
+                RangeKindAst::Int4 => "INT4MULTIRANGE",
+                RangeKindAst::Int8 => "INT8MULTIRANGE",
+                RangeKindAst::Num => "NUMMULTIRANGE",
+                RangeKindAst::Ts => "TSMULTIRANGE",
+                RangeKindAst::TsTz => "TSTZMULTIRANGE",
+                RangeKindAst::Date => "DATEMULTIRANGE",
+            }),
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),

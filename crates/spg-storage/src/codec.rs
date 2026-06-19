@@ -675,6 +675,12 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::BytesArray => out.push(46),
         DataType::VarcharArray => out.push(47),
         DataType::CharArray => out.push(48),
+        // v7.37.5 δ: tag 49 + 1-byte RangeKind — multirange.
+        // Catalog FILE_VERSION 48+.
+        DataType::Multirange(k) => {
+            out.push(49);
+            out.push(k.tag());
+        }
         DataType::Json => out.push(13),
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
@@ -827,6 +833,14 @@ impl Cursor<'_> {
             46 => Ok(DataType::BytesArray),
             47 => Ok(DataType::VarcharArray),
             48 => Ok(DataType::CharArray),
+            // v7.37.5 δ: tag 49 + 1-byte RangeKind — multirange.
+            49 => {
+                let kt = self.read_u8()?;
+                let k = RangeKind::from_tag(kt).ok_or_else(|| {
+                    StorageError::Corrupt(format!("unknown RangeKind tag in multirange: {kt}"))
+                })?;
+                Ok(DataType::Multirange(k))
+            }
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -981,6 +995,26 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
                 n += 1;
                 if let Some(b) = it {
                     n += if b.len() >= u16::MAX as usize { 2 + 4 } else { 2 } + b.len();
+                }
+            }
+            n
+        }
+        // v7.37.5 δ — Multirange: [u16 count][per range: u8 flags
+        // + (opt) lower body + (opt) upper body]. Bound bodies
+        // recurse through `value_body_encoded_len` against the
+        // element type of the range's kind. Rough estimate uses
+        // 16 B per non-empty bound (covers i64/f64/i128 scalars);
+        // the freezer's hot-bytes budget tolerates a moderate
+        // overcount on this rarely-used type.
+        Value::Multirange { ranges, .. } => {
+            let mut n = 2;
+            for r in ranges {
+                n += 1; // flags
+                if r.lower.is_some() {
+                    n += 16;
+                }
+                if r.upper.is_some() {
+                    n += 16;
                 }
             }
             n
@@ -1424,6 +1458,41 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 }
             }
         }
+        // v7.37.5 δ — Multirange dense body: [u16 count][per range:
+        // u8 flags + (if lower present) bound body + (if upper
+        // present) bound body]. Bound bodies recurse via
+        // write_value (schema-agnostic — bounds carry their own
+        // scalar tags). RangeKind is on the DataType slot, not
+        // repeated per range.
+        (Value::Multirange { kind: _, ranges }, DataType::Multirange(_)) => {
+            let count = u16::try_from(ranges.len()).expect("multirange ≤ 65k ranges");
+            out.extend_from_slice(&count.to_le_bytes());
+            for r in ranges {
+                let mut flags: u8 = 0;
+                if r.empty {
+                    flags |= 0b0000_0001;
+                }
+                if r.lower.is_some() {
+                    flags |= 0b0000_0010;
+                }
+                if r.upper.is_some() {
+                    flags |= 0b0000_0100;
+                }
+                if r.lower_inc {
+                    flags |= 0b0000_1000;
+                }
+                if r.upper_inc {
+                    flags |= 0b0001_0000;
+                }
+                out.push(flags);
+                if let Some(l) = &r.lower {
+                    write_value(out, l);
+                }
+                if let Some(u) = &r.upper {
+                    write_value(out, u);
+                }
+            }
+        }
         // v7.12.0: tsvector dense body — see `value_body_encoded_len`
         // for layout. Lexemes are written in their already-sorted order.
         (Value::TsVector(lexs), DataType::TsVector) => write_tsvector_body(out, lexs),
@@ -1751,6 +1820,13 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
         | Value::VarcharArray(_)
         | Value::CharArray(_) => unreachable!(
             "v7.37.5 γ array-of-scalar lacks a schema-less codec tag — \
+             use schema-aware write_value_body via the column's DataType"
+        ),
+        // v7.37.5 δ — Multirange is column-typed only (the RangeKind
+        // pin lives on the DataType slot). Schema-less path fences
+        // for the same reason as the γ array-of-scalar family.
+        Value::Multirange { .. } => unreachable!(
+            "v7.37.5 δ Multirange lacks a schema-less codec tag — \
              use schema-aware write_value_body via the column's DataType"
         ),
         // v7.12.0: tsvector — tag 18. Body shape matches
@@ -2540,6 +2616,40 @@ impl<'a> Cursor<'a> {
                     }
                 }
                 Ok(Value::BytesArray(items))
+            }
+            // v7.37.5 δ — Multirange dense body. Symmetric inverse
+            // of the schema-aware write arm: read u16 count, per
+            // range read u8 flags and optional bounds via
+            // read_value (schema-agnostic).
+            DataType::Multirange(kind) => {
+                let count = self.read_u16()? as usize;
+                let mut ranges: Vec<RangeSpan> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let flags = self.read_u8()?;
+                    let empty = flags & 0b0000_0001 != 0;
+                    let has_lower = flags & 0b0000_0010 != 0;
+                    let has_upper = flags & 0b0000_0100 != 0;
+                    let lower_inc = flags & 0b0000_1000 != 0;
+                    let upper_inc = flags & 0b0001_0000 != 0;
+                    let lower = if has_lower {
+                        Some(alloc::boxed::Box::new(self.read_value()?))
+                    } else {
+                        None
+                    };
+                    let upper = if has_upper {
+                        Some(alloc::boxed::Box::new(self.read_value()?))
+                    } else {
+                        None
+                    };
+                    ranges.push(RangeSpan {
+                        lower,
+                        upper,
+                        lower_inc,
+                        upper_inc,
+                        empty,
+                    });
+                }
+                Ok(Value::Multirange { kind, ranges })
             }
             // v7.12.0: tsvector dense body — [u16 lex_count]
             // [per lex: u16 word_len + utf-8 word + u16 pos_count

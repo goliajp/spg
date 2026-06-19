@@ -138,6 +138,11 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::BytesArray
         | DataType::VarcharArray
         | DataType::CharArray
+        // v7.37.5 δ — multirange collapses to PG external text
+        // form `{[a,b),[c,d)}` on the wire. RowDescription
+        // advertises 4451/4537/4536/4533/4534/4535 via
+        // pg_type_oid.
+        | DataType::Multirange(_)
         // v7.12.0 — tsvector / tsquery collapse to Text on the
         // wire; OIDs 3614 / 3615 advertised via `pg_type_oid`.
         | DataType::TsVector
@@ -289,6 +294,10 @@ fn value_to_wire(v: &Value) -> WireValue {
             WireValue::Text(spg_engine::eval::format_text_array(items))
         }
         Value::BytesArray(items) => WireValue::Text(spg_engine::eval::format_bytea_array(items)),
+        // v7.37.5 δ — Multirange external form.
+        Value::Multirange { kind: _, ranges } => {
+            WireValue::Text(spg_engine::format_multirange(ranges))
+        }
         // v7.12.0 — tsvector / tsquery on the wire as PG external
         // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
         Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),
