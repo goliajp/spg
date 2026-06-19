@@ -949,6 +949,7 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::IntArray2D => DataType::IntArray2D,
         ColumnTypeName::BigIntArray2D => DataType::BigIntArray2D,
         ColumnTypeName::TextArray2D => DataType::TextArray2D,
+        ColumnTypeName::Interval => DataType::Interval,
     }
 }
 

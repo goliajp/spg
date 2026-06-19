@@ -651,13 +651,11 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // UTC, identical to tag 12. Only the schema-side type tag
         // differs (for wire OID advertisement).
         DataType::Timestamptz => out.push(17),
-        // INTERVAL is runtime-only — CREATE TABLE never produces a
-        // column with this type, so write_data_type must not be called
-        // on it. (Disk-format codepoint reserved for a future v3 where
-        // INTERVAL becomes storable.)
-        DataType::Interval => {
-            unreachable!("DataType::Interval has no on-disk encoding in v2.11")
-        }
+        // v7.37.5 β-P2: tag 34 — INTERVAL. No body in the type slot;
+        // the per-cell body is 16 bytes (i64 micros + i32 days +
+        // i32 months) carried by `write_value_body`. Catalog
+        // FILE_VERSION 48+.
+        DataType::Interval => out.push(34),
         DataType::Json => out.push(13),
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
@@ -792,6 +790,8 @@ impl Cursor<'_> {
             31 => Ok(DataType::IntArray2D),
             32 => Ok(DataType::BigIntArray2D),
             33 => Ok(DataType::TextArray2D),
+            // v7.37.5 β-P2: tag 34 — INTERVAL. Catalog FILE_VERSION 48+.
+            34 => Ok(DataType::Interval),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -965,10 +965,10 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
         }
         // NULL is encoded only in the bitmap, never in the body.
         Value::Null => 0,
-        // INTERVAL has no on-disk encoding (see write_value_body).
-        Value::Interval { .. } => {
-            unreachable!("Value::Interval has no on-disk encoding")
-        }
+        // v7.37.5 β-P2 — INTERVAL is a 16-byte fixed body:
+        // 8 i64 micros + 4 i32 days + 4 i32 months. PG byte-equal
+        // layout (binary BIND/result uses the same field order).
+        Value::Interval { .. } => 16,
     }
 }
 
@@ -1109,6 +1109,24 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
         (Value::Date(d), DataType::Date) => out.extend_from_slice(&d.to_le_bytes()),
         (Value::Timestamp(t), DataType::Timestamp | DataType::Timestamptz) => {
             out.extend_from_slice(&t.to_le_bytes())
+        }
+        // v7.37.5 β-P2 — INTERVAL fixed 16-byte body: i64 micros +
+        // i32 days + i32 months. Field order mirrors PG's binary
+        // format (sqlx-postgres receives the same byte sequence).
+        // Stored little-endian per SPG's codec convention; the
+        // pgwire layer byte-swaps when emitting / consuming the
+        // big-endian wire form.
+        (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            DataType::Interval,
+        ) => {
+            out.extend_from_slice(&micros.to_le_bytes());
+            out.extend_from_slice(&days.to_le_bytes());
+            out.extend_from_slice(&months.to_le_bytes());
         }
         // v4.9: JSON stores as length-prefixed text; same shape as
         // Text — the type tag lives in the column schema, not the
@@ -1378,13 +1396,21 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
             out.push(10);
             out.extend_from_slice(&t.to_le_bytes());
         }
-        // Interval is a runtime-only value (no on-disk representation in
-        // v2.11). CREATE TABLE rejects `DataType::Interval` columns, so a
-        // Value::Interval here would mean the engine bypassed that gate.
-        Value::Interval { .. } => {
-            unreachable!(
-                "Value::Interval has no on-disk encoding; engine must reject it before write"
-            )
+        // v7.37.5 β-P2 — schema-less Interval: tag 30 + the same
+        // 16-byte body the schema-aware `write_value_body` emits
+        // (i64 micros + i32 days + i32 months, LE). Schema-less
+        // tag space is independent of the catalog DataType tag
+        // space (which uses 34 for INTERVAL); 30 was the next free
+        // schema-less slot.
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            out.push(30);
+            out.extend_from_slice(&micros.to_le_bytes());
+            out.extend_from_slice(&days.to_le_bytes());
+            out.extend_from_slice(&months.to_le_bytes());
         }
         // v7.10.4: BYTEA — [u8 tag=13_b][u16 len][bytes]. Tag
         // distinct from Text (4) so the schema-agnostic
@@ -1981,13 +2007,17 @@ impl<'a> Cursor<'a> {
             DataType::Timestamptz => Ok(Value::Timestamp(self.read_i64()?)),
             DataType::Jsonb => Ok(Value::Json(self.read_str()?)),
             DataType::Interval => {
-                // Defensive — schema gate (CREATE TABLE rejects Interval
-                // columns) means this branch can't be hit through normal
-                // flow; reject corrupt files explicitly rather than
-                // panic.
-                Err(StorageError::Corrupt(
-                    "INTERVAL column found on disk — runtime-only type, v3.0.2 rejects it".into(),
-                ))
+                // v7.37.5 β-P2 — INTERVAL column read: 16-byte body
+                // i64 micros + i32 days + i32 months (PG-byte-equal
+                // field order, SPG codec is LE).
+                let micros = self.read_i64()?;
+                let days = self.read_i32()?;
+                let months = self.read_i32()?;
+                Ok(Value::Interval {
+                    months,
+                    days,
+                    micros,
+                })
             }
             DataType::Json => Ok(Value::Json(self.read_str()?)),
             // v7.10.4: BYTEA on-disk is [u16 len][bytes]. Same wire
@@ -2406,6 +2436,19 @@ impl<'a> Cursor<'a> {
             27 => Ok(Value::IntArray2D(self.read_int_2d_body()?)),
             28 => Ok(Value::BigIntArray2D(self.read_bigint_2d_body()?)),
             29 => Ok(Value::TextArray2D(self.read_text_2d_body()?)),
+            // v7.37.5 β-P2: tag 30 — INTERVAL (schema-less). Body
+            // mirrors the schema-aware path: i64 LE micros + i32
+            // LE days + i32 LE months.
+            30 => {
+                let micros = self.read_i64()?;
+                let days = self.read_i32()?;
+                let months = self.read_i32()?;
+                Ok(Value::Interval {
+                    months,
+                    days,
+                    micros,
+                })
+            }
             // v7.17.0 Phase 3.P0-38: tag 25 — Range.
             // [u8 RangeKind tag][u8 flags][opt lower][opt upper].
             25 => {

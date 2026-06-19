@@ -4105,7 +4105,17 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 ///     gave short strings. Round-14 fixed TEXT and missed these;
 ///     round-21 fired the BYTEA twin during a production migration.
 ///     One-way upgrade, same posture as v46.
-const FILE_VERSION: u8 = 47;
+/// v48 introduces (v7.37.5 β-P2, sentori cutover window):
+///   * `INTERVAL` becomes a real column type. Catalog tag 34 in
+///     `write_data_type`; per-row body is a fixed 16 bytes
+///     (i64 micros + i32 days + i32 months, LE, PG-byte-equal
+///     field order). The runtime-only days collapse is gone —
+///     `'1 day'` and `'24 hours'` are stored distinctly. One-way
+///     upgrade: v47 catalogs without INTERVAL columns deserialise
+///     identically; v47 readers fed a v48 catalog that contains
+///     INTERVAL hit the explicit "unknown data type tag: 34"
+///     fence in `read_data_type`.
+const FILE_VERSION: u8 = 48;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
 /// v3.0.2 dense-row layout; pre-v8 catalogs require an offline migration.
 const MIN_SUPPORTED_FILE_VERSION: u8 = 8;

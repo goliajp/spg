@@ -1483,6 +1483,12 @@ pub enum ColumnTypeName {
     IntArray2D,
     BigIntArray2D,
     TextArray2D,
+    /// v7.37.5 β-P2 — `INTERVAL` as a column type. Storage is the
+    /// three-field {months, days, micros} struct (PG-byte-equal),
+    /// catalog tag 34, FILE_VERSION 48+. Wire OID 1186. Prior to
+    /// β-P2 `INTERVAL` was runtime-only — literal in expression
+    /// position but rejected at CREATE TABLE.
+    Interval,
 }
 
 /// v7.17.0 Phase 3.P0-38 — PG range element kind. Mirrors
@@ -1546,6 +1552,7 @@ impl fmt::Display for ColumnTypeName {
                 RangeKindAst::Date => "DATERANGE",
             }),
             Self::Hstore => f.write_str("HSTORE"),
+            Self::Interval => f.write_str("INTERVAL"),
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),
