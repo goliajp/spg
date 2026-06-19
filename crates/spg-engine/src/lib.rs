@@ -30,6 +30,7 @@ mod maintenance;
 pub mod memoize;
 mod numeric;
 mod orderby;
+mod partition;
 pub mod plan_cache;
 mod plpgsql;
 pub mod publications;

@@ -10,9 +10,12 @@ use alloc::vec::Vec;
 
 use spg_sql::ast::{
     ColumnDef, CreateIndexStatement, CreateTableStatement, CreateUserStatement, Expr, IndexMethod,
-    Statement, VecEncoding as SqlVecEncoding,
+    PartitionKindAst, PartitionOfBoundsAst, Statement, VecEncoding as SqlVecEncoding,
 };
-use spg_storage::{ColumnSchema, DataType, StorageError, TableSchema, Value, VecEncoding};
+use spg_storage::{
+    ColumnSchema, DataType, PartitionKind, PartitionRole, StorageError, TableSchema, Value,
+    VecEncoding,
+};
 
 use crate::{
     CancelToken, ClockFn, Engine, EngineError, QueryResult, check_existing_unique_violation,
@@ -799,6 +802,15 @@ impl Engine {
         &mut self,
         stmt: CreateIndexStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.37.6-B(sentori Epic 2 P0)— `CREATE INDEX … ON parent`
+        // when `parent` is a partition-parent fans out to every
+        // existing child and records the Display-form source so
+        // future children also build the same index at creation.
+        // Parent itself holds no rows, so the build is skipped on
+        // the parent table.
+        if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
+            return self.exec_create_index_on_partition_parent(stmt);
+        }
         // v7.36 — collect cold-tier rows BEFORE taking the mutable
         // borrow on the table (the duplicate-scan post-CREATE UNIQUE
         // INDEX consumes them). `iter_cold_rows_of_parent` borrows
@@ -1032,6 +1044,49 @@ impl Engine {
         })
     }
 
+    /// v7.37.6-B(sentori Epic 2 P0)— `CREATE INDEX … ON parent`
+    /// fans the index out to every existing child plus records
+    /// the Display-form source so future children build it too.
+    /// The parent itself stays index-less because it holds no rows.
+    fn exec_create_index_on_partition_parent(
+        &mut self,
+        stmt: CreateIndexStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let parent_name = stmt.table.clone();
+        // Display-form source (round-trips through fmt::Display)
+        // → store on parent's PartitionRole::Parent template list.
+        let template_source = alloc::format!("{stmt}");
+        let children = crate::partition::children_of_parent(self.active_catalog(), &parent_name);
+        // Append the template to the parent schema before fanning
+        // out, so a child whose CREATE FAILS halfway through still
+        // records the template the user asked for. Idempotency is
+        // handled at child-create time via `IF NOT EXISTS`.
+        {
+            let parent = self
+                .active_catalog_mut()
+                .get_mut(&parent_name)
+                .ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: parent_name.clone(),
+                    })
+                })?;
+            if let Some(PartitionRole::Parent {
+                index_template_sources,
+                ..
+            }) = parent.schema_mut().partition_role.as_mut()
+            {
+                index_template_sources.push(template_source.clone());
+            }
+        }
+        for child in children {
+            self.execute_partition_index_template(&child, &template_source)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     /// v7.13.3 — mailrs round-7 S9. SPG-specific reconciliation
     /// for `CREATE TABLE IF NOT EXISTS` when the table already
     /// exists. Adds missing columns + inline FKs from the new
@@ -1144,6 +1199,23 @@ impl Engine {
         if_exists: bool,
     ) -> Result<QueryResult, EngineError> {
         for name in names {
+            // v7.37.6-B(sentori Epic 2 P0)— refuse to DROP a
+            // partition parent that still has live children. PG
+            // requires explicit CASCADE for this; v7.37.6-B doesn't
+            // wire CASCADE through here yet, so surface a clear
+            // error instead of silently leaking orphans.
+            if crate::partition::is_partition_parent(self.active_catalog(), &name) {
+                let kids = crate::partition::children_of_parent(self.active_catalog(), &name);
+                if !kids.is_empty() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "DROP TABLE {name:?}: partition parent still has {} child \
+                         partition(s) (e.g. {:?}); drop the children first \
+                         (CASCADE is a v7.37.6 follow-up)",
+                        kids.len(),
+                        kids[0]
+                    )));
+                }
+            }
             let dropped = self.active_catalog_mut().drop_table(&name);
             if !dropped && !if_exists {
                 return Err(EngineError::Storage(StorageError::TableNotFound { name }));
@@ -1199,6 +1271,14 @@ impl Engine {
                 modified_catalog: false,
             });
         }
+        // v7.37.6-B(sentori Epic 2 P0)— `CREATE TABLE c PARTITION
+        // OF parent <bounds>`: the child inherits its column list
+        // from the parent and gets a `PartitionRole::Range` or
+        // `Default` tag. Parent-table bookkeeping (index template
+        // fan-out) runs in `register_partition_child`.
+        if stmt.partition_of.is_some() {
+            return self.exec_create_table_partition_of(stmt);
+        }
         let table_name = stmt.name.clone();
         // v7.9.13 — pluck the names of any columns marked
         // `PRIMARY KEY` inline so the post-create-table pass can
@@ -1209,19 +1289,221 @@ impl Engine {
             .filter(|c| c.is_primary_key)
             .map(|c| c.name.clone())
             .collect();
-        let schema = self.build_create_table_schema(
+        let mut schema = self.build_create_table_schema(
             &table_name,
             stmt.columns,
             &stmt.table_constraints,
             stmt.foreign_keys,
             &inline_pk_columns,
         )?;
+        // v7.37.6-B — `CREATE TABLE p (...) PARTITION BY RANGE (key)`:
+        // attach the parent role to the freshly-built schema before
+        // it lands in the catalog. Key column must be TIMESTAMPTZ
+        // at v7.37.6-B (the only sentori shape); other key types are
+        // a phase-2 carve-out.
+        if let Some(by) = stmt.partition_by {
+            let kind = match by.kind {
+                PartitionKindAst::Range => PartitionKind::Range,
+            };
+            let mut key_column_positions = Vec::with_capacity(by.key_columns.len());
+            for col_name in &by.key_columns {
+                let pos = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "PARTITION BY: key column {col_name:?} not in column list"
+                        ))
+                    })?;
+                if !matches!(schema.columns[pos].ty, DataType::Timestamptz) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "PARTITION BY: key column {col_name:?} must be TIMESTAMPTZ \
+                         at v7.37.6-B (got {:?})",
+                        schema.columns[pos].ty
+                    )));
+                }
+                key_column_positions.push(pos);
+            }
+            schema.partition_role = Some(PartitionRole::Parent {
+                kind,
+                key_column_positions,
+                index_template_sources: Vec::new(),
+            });
+        }
         self.active_catalog_mut().create_table(schema)?;
         self.install_implicit_indexes(&table_name, &inline_pk_columns, &stmt.table_constraints)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
         })
+    }
+
+    /// v7.37.6-B — child-table branch of `CREATE TABLE`. The parser
+    /// guarantees `stmt.partition_of.is_some()` + `stmt.columns`
+    /// is empty before we land here.
+    fn exec_create_table_partition_of(
+        &mut self,
+        stmt: CreateTableStatement,
+    ) -> Result<QueryResult, EngineError> {
+        let spec = stmt
+            .partition_of
+            .expect("caller checked partition_of.is_some()");
+        // Lift parent schema bits (columns + partition_role + index
+        // template list) so we don't trip the active_catalog_mut()
+        // borrow when we splice the child in.
+        let (parent_columns, parent_kind, index_template_sources) = {
+            let parent = self
+                .active_catalog()
+                .get(&spec.parent_name)
+                .ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: spec.parent_name.clone(),
+                    })
+                })?;
+            match &parent.schema().partition_role {
+                Some(PartitionRole::Parent {
+                    kind,
+                    index_template_sources,
+                    ..
+                }) => (
+                    parent.schema().columns.clone(),
+                    *kind,
+                    index_template_sources.clone(),
+                ),
+                _ => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "CREATE TABLE … PARTITION OF: table {:?} is not a \
+                         partitioned parent",
+                        spec.parent_name
+                    )));
+                }
+            }
+        };
+        // Resolve bounds before we mutate the catalog so a bad
+        // literal surfaces before any visible state changes.
+        let role = match spec.bounds {
+            PartitionOfBoundsAst::Default => PartitionRole::Default {
+                parent_name: spec.parent_name.clone(),
+            },
+            PartitionOfBoundsAst::Range { lower, upper } => {
+                let lower_b = crate::partition::evaluate_partition_bound(*lower)?;
+                let upper_b = crate::partition::evaluate_partition_bound(*upper)?;
+                // Half-open: lower must be < upper. Same-bound or
+                // inverted ranges accept no rows in PG; SPG raises
+                // because every sentori migration shapes intentional
+                // calendar windows.
+                if !crate::partition::ranges_overlap(&lower_b, &upper_b, &lower_b, &upper_b) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "PARTITION OF: FROM ({}) TO ({}) is empty (lower must be < upper)",
+                        crate::partition::bound_to_diag(&lower_b),
+                        crate::partition::bound_to_diag(&upper_b),
+                    )));
+                }
+                // Overlap check against every existing sibling Range
+                // child of the same parent. DEFAULT siblings don't
+                // participate(they're a catch-all, not a range).
+                let siblings =
+                    crate::partition::children_of_parent(self.active_catalog(), &spec.parent_name);
+                let mut default_count = 0usize;
+                for sib in &siblings {
+                    let Some(t) = self.active_catalog().get(sib) else {
+                        continue;
+                    };
+                    match &t.schema().partition_role {
+                        Some(PartitionRole::Range {
+                            lower: sl,
+                            upper: su,
+                            ..
+                        }) => {
+                            if crate::partition::ranges_overlap(&lower_b, &upper_b, sl, su) {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "PARTITION OF: range FROM ({}) TO ({}) overlaps existing \
+                                     child {sib:?} (FROM ({}) TO ({}))",
+                                    crate::partition::bound_to_diag(&lower_b),
+                                    crate::partition::bound_to_diag(&upper_b),
+                                    crate::partition::bound_to_diag(sl),
+                                    crate::partition::bound_to_diag(su),
+                                )));
+                            }
+                        }
+                        Some(PartitionRole::Default { .. }) => default_count += 1,
+                        _ => {}
+                    }
+                }
+                let _ = default_count;
+                PartitionRole::Range {
+                    parent_name: spec.parent_name.clone(),
+                    lower: lower_b,
+                    upper: upper_b,
+                }
+            }
+        };
+        // For DEFAULT children, reject when the parent already has
+        // one(PG semantics — exactly 0 or 1 DEFAULT per parent).
+        if matches!(role, PartitionRole::Default { .. }) {
+            for sib in
+                crate::partition::children_of_parent(self.active_catalog(), &spec.parent_name)
+            {
+                if let Some(t) = self.active_catalog().get(&sib)
+                    && matches!(
+                        t.schema().partition_role,
+                        Some(PartitionRole::Default { .. })
+                    )
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "PARTITION OF DEFAULT: parent {:?} already has a DEFAULT \
+                         partition ({sib:?})",
+                        spec.parent_name
+                    )));
+                }
+            }
+        }
+        let _ = parent_kind; // v7.37.6-B locks RANGE; future kinds key off this.
+        let mut schema = TableSchema::new(stmt.name.clone(), parent_columns);
+        schema.partition_role = Some(role);
+        self.active_catalog_mut().create_table(schema)?;
+        // Replay parent's CREATE INDEX templates against the new
+        // child so every parent-declared index materialises now.
+        for tmpl in &index_template_sources {
+            self.execute_partition_index_template(&stmt.name, tmpl)?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.37.6-B — parse a stored `CREATE INDEX ON parent (…)`
+    /// template and re-execute it against `child_name`(by rewriting
+    /// the table reference on the AST before dispatch). Used both
+    /// at child-create time and after `CREATE INDEX ON parent` for
+    /// existing children.
+    fn execute_partition_index_template(
+        &mut self,
+        child_name: &str,
+        template_source: &str,
+    ) -> Result<(), EngineError> {
+        let stmt = spg_sql::parser::parse_statement(template_source).map_err(EngineError::Parse)?;
+        let Statement::CreateIndex(mut ci) = stmt else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "PARTITION index template is not CREATE INDEX: {template_source:?}"
+            )));
+        };
+        ci.table = child_name.to_string();
+        // Name suffix per child so different children don't collide
+        // on the same `<idx_name>`. Skip when the original index has
+        // no explicit name(SPG auto-generates).
+        if !ci.name.is_empty() {
+            ci.name = alloc::format!("{}__{}", ci.name, child_name);
+        }
+        // IF NOT EXISTS to make replay idempotent — when this is
+        // called from the CREATE INDEX ON parent fan-out we want to
+        // tolerate the case where a child already has the index
+        // from an earlier CREATE INDEX run.
+        ci.if_not_exists = true;
+        self.exec_create_index(ci)?;
+        Ok(())
     }
 
     /// Build the `TableSchema` for a CREATE TABLE: column schemas with
