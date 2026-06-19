@@ -117,6 +117,10 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // OIDs 1007 / 1016 via `pg_type_oid`.
         | DataType::IntArray
         | DataType::BigIntArray
+        // v7.37.5 β-P4 — INTERVAL[] collapses to Text on the wire
+        // as PG external array form: `{"1 day","24:00:00",NULL}`.
+        // RowDescription advertises OID 1187 via `pg_type_oid`.
+        | DataType::IntervalArray
         // v7.12.0 — tsvector / tsquery collapse to Text on the
         // wire; OIDs 3614 / 3615 advertised via `pg_type_oid`.
         | DataType::TsVector
@@ -234,6 +238,10 @@ fn value_to_wire(v: &Value) -> WireValue {
         // RowDescription advertises OIDs 1007 / 1016.
         Value::IntArray(items) => WireValue::Text(spg_engine::eval::format_int_array(items)),
         Value::BigIntArray(items) => WireValue::Text(spg_engine::eval::format_bigint_array(items)),
+        // v7.37.5 β-P4 — INTERVAL[] external array form.
+        Value::IntervalArray(items) => {
+            WireValue::Text(spg_engine::eval::format_interval_array(items))
+        }
         // v7.12.0 — tsvector / tsquery on the wire as PG external
         // form. RowDescription OIDs 3614 / 3615 via `pg_type_oid`.
         Value::TsVector(lexs) => WireValue::Text(spg_engine::eval::format_tsvector(lexs)),

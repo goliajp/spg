@@ -6416,9 +6416,12 @@ impl Parser {
                 ColumnTypeName::Text => ColumnTypeName::TextArray,
                 ColumnTypeName::Int => ColumnTypeName::IntArray,
                 ColumnTypeName::BigInt => ColumnTypeName::BigIntArray,
+                // v7.37.5 β-P4 — INTERVAL[] via the same postfix
+                // `[]` grammar. Wire OID 1187.
+                ColumnTypeName::Interval => ColumnTypeName::IntervalArray,
                 other => {
                     return Err(self.err(alloc::format!(
-                        "v7.11 supports TEXT[] / INT[] / BIGINT[] only; got {other:?}[]"
+                        "supported base[]: TEXT / INT / BIGINT / INTERVAL; got {other:?}[]"
                     )));
                 }
             };

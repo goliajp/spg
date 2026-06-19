@@ -3443,6 +3443,8 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::IntArray2D => 1007,
         DataType::BigIntArray2D => 1016,
         DataType::TextArray2D => 1009,
+        // v7.37.5 β-P4 — PG `_interval` (INTERVAL[]) OID 1187.
+        DataType::IntervalArray => 1187,
     }
 }
 

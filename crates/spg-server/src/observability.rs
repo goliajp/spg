@@ -613,6 +613,9 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v7.17.0 Phase 3.P0-40 — 2D arrays avg ~96 bytes
                 // (4×3 matrix × per-element cost).
                 DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => 96,
+                // v7.37.5 β-P4 — INTERVAL[] sized like a small array
+                // (~4 elements × 17B body).
+                DataType::IntervalArray => 68,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),
