@@ -1091,6 +1091,16 @@ impl Engine {
                 self.resolve_sequence_calls_in_expr(cell)?;
             }
         }
+        // v7.37.6-B(sentori Epic 2 P0)— route INSERTs that target
+        // a partition parent down to the matching child(`Range`
+        // half-open hit, fall back to `Default`). Sequence-resolution
+        // and INSERT…SELECT desugar above run first so the per-tuple
+        // routing sees fully literal expressions.
+        if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table)
+            && stmt.select_source.is_none()
+        {
+            return self.exec_insert_route_partition_parent(stmt);
+        }
         // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
         // round-5 G4). Execute the inner SELECT first, then route
         // back through the regular VALUES code path with the
@@ -1348,6 +1358,189 @@ impl Engine {
             }
         }
         Ok((kept, pending_updates, skipped_count))
+    }
+
+    /// v7.37.6-B(sentori Epic 2 P0)— route an INSERT whose target
+    /// is a `PartitionRole::Parent` table down to the matching
+    /// children. Each tuple's partition-key value picks one child
+    /// (first hit on a `Range` child, else the `Default` child if
+    /// any). Tuples land in per-child buckets that are re-issued
+    /// through `exec_insert` against the child's name; the parent
+    /// table itself never receives rows. Returns the summed
+    /// `Modified { affected }` count across all children.
+    ///
+    /// v7.37.6-B contract caveats:
+    ///   * ON CONFLICT / RETURNING on a partition-parent insert are
+    ///     not supported(parser still allows them, but the engine
+    ///     surfaces `Unsupported` here). PG ≤ 11 had the same
+    ///     restriction; sentori doesn't rely on either against the
+    ///     `events_partitioned` / `spans` tables.
+    ///   * Column lists are honoured: the partition-key column must
+    ///     be present in the INSERT column list(or omitted via the
+    ///     "full schema order" form), otherwise routing has nothing
+    ///     to read.
+    pub(crate) fn exec_insert_route_partition_parent(
+        &mut self,
+        stmt: InsertStatement,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_storage::PartitionRole;
+        if stmt.on_conflict.is_some() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "INSERT INTO partition parent {:?} … ON CONFLICT: not supported \
+                 at v7.37.6-B(route through the child explicitly)",
+                stmt.table
+            )));
+        }
+        if stmt.returning.is_some() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "INSERT INTO partition parent {:?} … RETURNING: not supported \
+                 at v7.37.6-B(route through the child explicitly)",
+                stmt.table
+            )));
+        }
+        // Pull what we need from the parent + child catalog state
+        // before any mutating call(per-child exec_insert below
+        // takes &mut self).
+        let parent_name = stmt.table.clone();
+        let (parent_columns, key_position): (Vec<spg_storage::ColumnSchema>, usize) = {
+            let parent = self.active_catalog().get(&parent_name).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: parent_name.clone(),
+                })
+            })?;
+            let cols = parent.schema().columns.clone();
+            let key_position = match &parent.schema().partition_role {
+                Some(PartitionRole::Parent {
+                    key_column_positions,
+                    ..
+                }) => *key_column_positions.first().ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "partition parent {parent_name:?} has empty key column list"
+                    ))
+                })?,
+                _ => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "INSERT routing: {parent_name:?} is not a partition parent"
+                    )));
+                }
+            };
+            (cols, key_position)
+        };
+        // Map the user's INSERT column list back to a parent-schema
+        // position. Missing list means "every column in schema
+        // order" — common shape; sentori's
+        // INSERT INTO events_partitioned (project_id, received_at,
+        //   payload) VALUES (…) takes the explicit branch.
+        let tuple_key_index: usize = match &stmt.columns {
+            None => key_position,
+            Some(col_list) => {
+                let key_col_name = parent_columns[key_position].name.as_str();
+                col_list
+                    .iter()
+                    .position(|c| c.as_str().eq_ignore_ascii_case(key_col_name))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "INSERT INTO {parent_name:?}: partition key column \
+                             {key_col_name:?} is not in the INSERT column list, \
+                             so the engine cannot route the tuple to a child"
+                        ))
+                    })?
+            }
+        };
+        // Snapshot every child(name, role)so the per-row routing
+        // loop only touches an immutable view of the catalog.
+        let children = crate::partition::children_of_parent(self.active_catalog(), &parent_name);
+        let mut range_children: Vec<(
+            String,
+            spg_storage::PartitionBound,
+            spg_storage::PartitionBound,
+        )> = Vec::new();
+        let mut default_child: Option<String> = None;
+        for child_name in &children {
+            let Some(child) = self.active_catalog().get(child_name) else {
+                continue;
+            };
+            match &child.schema().partition_role {
+                Some(PartitionRole::Range { lower, upper, .. }) => {
+                    range_children.push((child_name.clone(), lower.clone(), upper.clone()));
+                }
+                Some(PartitionRole::Default { .. }) => {
+                    default_child = Some(child_name.clone());
+                }
+                _ => {}
+            }
+        }
+        // Bucket tuples by destination child; preserve original row
+        // order within each bucket so error messages reference the
+        // tuple the user actually wrote.
+        let mut buckets: alloc::collections::BTreeMap<String, Vec<Vec<Expr>>> =
+            alloc::collections::BTreeMap::new();
+        for tuple in stmt.rows {
+            if tuple.len() <= tuple_key_index {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "INSERT INTO {parent_name:?}: tuple has {} expressions, \
+                     partition key index is {tuple_key_index} — column list / \
+                     value list shape mismatch",
+                    tuple.len()
+                )));
+            }
+            let key_expr = tuple[tuple_key_index].clone();
+            let key_value = literal_expr_to_value(key_expr)?;
+            let key_micros: i64 = match key_value {
+                Value::Timestamp(m) => m,
+                Value::Date(days) => i64::from(days) * 86_400i64 * 1_000_000i64,
+                Value::Text(ref s) => crate::eval::parse_timestamp_literal(s).ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "INSERT INTO {parent_name:?}: partition key text \
+                         literal {s:?} is not a TIMESTAMPTZ"
+                    ))
+                })?,
+                Value::Null => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "INSERT INTO {parent_name:?}: partition key value is \
+                         NULL, but the partition key is NOT NULL"
+                    )));
+                }
+                other => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "INSERT INTO {parent_name:?}: partition key value \
+                         {other:?} is not a TIMESTAMPTZ"
+                    )));
+                }
+            };
+            let target = range_children
+                .iter()
+                .find(|(_, lo, hi)| crate::partition::value_in_range(key_micros, lo, hi))
+                .map(|(name, _, _)| name.clone())
+                .or_else(|| default_child.clone())
+                .ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "no partition of relation {parent_name:?} found for \
+                         row with partition key value(no Range child matches \
+                         and there is no DEFAULT partition)"
+                    ))
+                })?;
+            buckets.entry(target).or_default().push(tuple);
+        }
+        let mut total_affected: usize = 0;
+        for (child_name, rows) in buckets {
+            let child_stmt = InsertStatement {
+                table: child_name,
+                columns: stmt.columns.clone(),
+                rows,
+                select_source: None,
+                on_conflict: None,
+                returning: None,
+            };
+            let result = self.exec_insert(child_stmt)?;
+            if let QueryResult::CommandOk { affected, .. } = result {
+                total_affected += affected;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: total_affected,
+            modified_catalog: !self.in_transaction(),
+        })
     }
 }
 
