@@ -949,6 +949,14 @@ impl Engine {
                 return self.exec_select_cancel(&rewritten, cancel);
             }
         }
+        // v7.37.6-B(sentori Epic 2 P0)— `SELECT … FROM <partition-parent>`
+        // gets rewritten to a UNION-ALL over the children that overlap
+        // the WHERE-derived key range. Uses the same CTE-injection
+        // trick as VIEW expansion above so downstream resolution
+        // doesn't need a partition-aware code path.
+        if let Some(rewritten) = self.expand_partition_parents_in_select(stmt)? {
+            return self.exec_select_cancel(&rewritten, cancel);
+        }
         // v7.16.2 — information_schema / pg_catalog virtual
         // views (mailrs round-10 A.3). If the SELECT touches a
         // synthetic meta-table name (`__spg_info_*` /
@@ -3048,4 +3056,400 @@ impl Engine {
         out.ctes = new_ctes;
         Ok(Some(out))
     }
+
+    /// v7.37.6-B(sentori Epic 2 P0)— if `stmt`'s FROM-clause references
+    /// any partition-parent table, rewrite the SELECT so each parent
+    /// reference resolves to a CTE whose body is a `UNION ALL` over the
+    /// children that pass the WHERE-derived partition-key range. Returns
+    /// `None`(no rewrite needed)when no parent is referenced or all
+    /// references are shadowed by a same-name CTE.
+    ///
+    /// Pruning vocabulary at v7.37.6-B:
+    ///   * Flat `AND` chain over `<key> {>= | > | < | <= | =} literal`
+    ///     and `<key> BETWEEN literal AND literal`.
+    ///   * Anything outside that(OR / nested IN / function call on the
+    ///     key)defaults to "no pruning" — every child + DEFAULT lands
+    ///     in the UNION. Correctness is preserved; only the plan size
+    ///     widens.
+    fn expand_partition_parents_in_select(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<SelectStatement>, EngineError> {
+        let cat = self.active_catalog();
+        let Some(from) = &stmt.from else {
+            return Ok(None);
+        };
+        let mut parent_refs: Vec<String> = Vec::new();
+        collect_partition_parent_refs(&from.primary, cat, &mut parent_refs);
+        for j in &from.joins {
+            collect_partition_parent_refs(&j.table, cat, &mut parent_refs);
+        }
+        // Drop names shadowed by a CTE on the same SELECT(PG semantics
+        // — same as view expansion above).
+        parent_refs.retain(|n| !stmt.ctes.iter().any(|c| c.name.eq_ignore_ascii_case(n)));
+        if parent_refs.is_empty() {
+            return Ok(None);
+        }
+        let mut new_ctes: Vec<spg_sql::ast::Cte> = Vec::with_capacity(parent_refs.len());
+        for parent_name in &parent_refs {
+            let body = self.build_partition_parent_union_body(parent_name, stmt)?;
+            new_ctes.push(spg_sql::ast::Cte {
+                name: parent_name.clone(),
+                body,
+                recursive: false,
+                column_overrides: Vec::new(),
+            });
+        }
+        let mut out = stmt.clone();
+        new_ctes.extend(out.ctes);
+        out.ctes = new_ctes;
+        Ok(Some(out))
+    }
+
+    /// Build the `SELECT * FROM child1 UNION ALL …` body for one parent.
+    /// Children include every overlap-hit `Range` plus(always)the
+    /// `Default` child(if any). When no children exist or none survive
+    /// pruning + there is no DEFAULT, return a trivial empty SELECT so
+    /// the parent reference projects an empty result set the way a PG
+    /// "no partitions yet" plan would.
+    fn build_partition_parent_union_body(
+        &self,
+        parent_name: &str,
+        outer: &SelectStatement,
+    ) -> Result<SelectStatement, EngineError> {
+        use spg_storage::PartitionRole;
+        let cat = self.active_catalog();
+        let parent = cat.get(parent_name).ok_or_else(|| {
+            EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                "partition parent {parent_name:?} disappeared mid-expansion"
+            )))
+        })?;
+        let key_position = match &parent.schema().partition_role {
+            Some(PartitionRole::Parent {
+                key_column_positions,
+                ..
+            }) => *key_column_positions.first().unwrap_or(&0),
+            _ => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "partition expansion: {parent_name:?} is not a parent"
+                )));
+            }
+        };
+        let key_col_name = parent.schema().columns[key_position].name.clone();
+        // Extract the partition-key range from the WHERE clause. Bound
+        // `None` ⇒ open in that direction.
+        let (lo_bound, hi_bound) = match outer.where_.as_ref() {
+            Some(expr) => extract_key_range(expr, &key_col_name),
+            None => (None, None),
+        };
+        let children = crate::partition::children_of_parent(cat, parent_name);
+        let mut kept: Vec<String> = Vec::new();
+        let mut has_default = false;
+        for child_name in &children {
+            let Some(child) = cat.get(child_name) else {
+                continue;
+            };
+            match &child.schema().partition_role {
+                Some(PartitionRole::Range { lower, upper, .. }) => {
+                    if range_satisfies_filter(lower, upper, lo_bound.as_ref(), hi_bound.as_ref()) {
+                        kept.push(child_name.clone());
+                    }
+                }
+                Some(PartitionRole::Default { .. }) => {
+                    has_default = true;
+                    kept.push(child_name.clone());
+                }
+                _ => {}
+            }
+        }
+        let _ = has_default; // diagnostic only; pruning kept the DEFAULT unconditionally.
+        // Build the UNION ALL body text and re-parse — keeps the
+        // rewrite expressible in surface SQL so the engine's existing
+        // parser path handles the AST shape uniformly.
+        if kept.is_empty() {
+            // Synthesise an always-false SELECT shaped like the parent
+            // so the CTE's projection still matches.
+            return parse_select_or_corrupt(&alloc::format!(
+                "SELECT * FROM {} WHERE FALSE",
+                quote_ident_for_sql(parent_name)
+            ));
+        }
+        let mut body = alloc::string::String::new();
+        for (i, child_name) in kept.iter().enumerate() {
+            if i > 0 {
+                body.push_str(" UNION ALL ");
+            }
+            body.push_str("SELECT * FROM ");
+            body.push_str(&quote_ident_for_sql(child_name));
+        }
+        parse_select_or_corrupt(&body)
+    }
+}
+
+/// Walk a `TableRef` and push its `name` if it resolves to a partition
+/// parent in `cat`. Skips `lateral_subquery` / `unnest_expr` /
+/// `generate_series_args` references — those aren't catalog tables.
+fn collect_partition_parent_refs(
+    t: &spg_sql::ast::TableRef,
+    cat: &spg_storage::Catalog,
+    out: &mut Vec<alloc::string::String>,
+) {
+    if t.lateral_subquery.is_some() || t.unnest_expr.is_some() || t.generate_series_args.is_some() {
+        return;
+    }
+    if crate::partition::is_partition_parent(cat, &t.name) {
+        out.push(t.name.clone());
+    }
+}
+
+/// v7.37.6-B partition-key range derived from a WHERE expression.
+/// `i64` microseconds since epoch with the same sign convention as
+/// `Value::Timestamp`. Inclusive bool: `true` ⇒ inclusive(`>=` / `<=`
+/// / `=`),`false` ⇒ exclusive(`>` / `<`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartitionFilterBound {
+    pub micros: i64,
+    pub inclusive: bool,
+}
+
+/// Walk a flat AND chain looking for `<key> <op> <timestamptz-literal>`
+/// shapes; tighten the running lo / hi as we go. Anything outside that
+/// (OR / nested calls / non-key columns)is ignored — caller treats
+/// `None` as "no constraint on that side."
+fn extract_key_range(
+    expr: &spg_sql::ast::Expr,
+    key_col: &str,
+) -> (Option<PartitionFilterBound>, Option<PartitionFilterBound>) {
+    let mut lo: Option<PartitionFilterBound> = None;
+    let mut hi: Option<PartitionFilterBound> = None;
+    let mut stack: Vec<&spg_sql::ast::Expr> = alloc::vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            spg_sql::ast::Expr::Binary {
+                lhs,
+                op: spg_sql::ast::BinOp::And,
+                rhs,
+            } => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
+            // BETWEEN is desugared at parse time into `lhs >= low AND
+            // lhs <= high`, so it lands here as two regular Binary
+            // arms via the AND walker above.
+            spg_sql::ast::Expr::Binary { lhs, op, rhs } => {
+                let (col_ref, lit_side, swapped) = if is_column_ref(lhs, key_col) {
+                    (Some(lhs.as_ref()), rhs.as_ref(), false)
+                } else if is_column_ref(rhs, key_col) {
+                    (Some(rhs.as_ref()), lhs.as_ref(), true)
+                } else {
+                    (None, lhs.as_ref(), false)
+                };
+                if col_ref.is_none() {
+                    continue;
+                }
+                let Some(lit) = literal_to_micros(lit_side) else {
+                    continue;
+                };
+                use spg_sql::ast::BinOp::{Eq, Gt, GtEq, Lt, LtEq};
+                let effective_op = if swapped {
+                    match op {
+                        Lt => Gt,
+                        LtEq => GtEq,
+                        Gt => Lt,
+                        GtEq => LtEq,
+                        other => *other,
+                    }
+                } else {
+                    *op
+                };
+                match effective_op {
+                    Eq => {
+                        tighten_lo(
+                            &mut lo,
+                            PartitionFilterBound {
+                                micros: lit,
+                                inclusive: true,
+                            },
+                        );
+                        tighten_hi(
+                            &mut hi,
+                            PartitionFilterBound {
+                                micros: lit,
+                                inclusive: true,
+                            },
+                        );
+                    }
+                    GtEq => {
+                        tighten_lo(
+                            &mut lo,
+                            PartitionFilterBound {
+                                micros: lit,
+                                inclusive: true,
+                            },
+                        );
+                    }
+                    Gt => {
+                        tighten_lo(
+                            &mut lo,
+                            PartitionFilterBound {
+                                micros: lit,
+                                inclusive: false,
+                            },
+                        );
+                    }
+                    LtEq => {
+                        tighten_hi(
+                            &mut hi,
+                            PartitionFilterBound {
+                                micros: lit,
+                                inclusive: true,
+                            },
+                        );
+                    }
+                    Lt => {
+                        tighten_hi(
+                            &mut hi,
+                            PartitionFilterBound {
+                                micros: lit,
+                                inclusive: false,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    (lo, hi)
+}
+
+fn tighten_lo(slot: &mut Option<PartitionFilterBound>, new: PartitionFilterBound) {
+    match slot {
+        None => *slot = Some(new),
+        Some(cur) => {
+            if new.micros > cur.micros
+                || (new.micros == cur.micros && !new.inclusive && cur.inclusive)
+            {
+                *slot = Some(new);
+            }
+        }
+    }
+}
+
+fn tighten_hi(slot: &mut Option<PartitionFilterBound>, new: PartitionFilterBound) {
+    match slot {
+        None => *slot = Some(new),
+        Some(cur) => {
+            if new.micros < cur.micros
+                || (new.micros == cur.micros && !new.inclusive && cur.inclusive)
+            {
+                *slot = Some(new);
+            }
+        }
+    }
+}
+
+fn is_column_ref(e: &spg_sql::ast::Expr, key_col: &str) -> bool {
+    if let spg_sql::ast::Expr::Column(c) = e {
+        c.name.eq_ignore_ascii_case(key_col)
+    } else {
+        false
+    }
+}
+
+/// Coerce a literal Expr(after the parser folded sequence calls etc.)
+/// to i64 microseconds. Mirrors `evaluate_partition_bound`'s shape so
+/// pruning and routing agree on the literal vocabulary. Returns
+/// `None` when the literal isn't recognised(planner then skips
+/// pruning on that branch — correctness preserved).
+fn literal_to_micros(e: &spg_sql::ast::Expr) -> Option<i64> {
+    let cloned = e.clone();
+    let value = crate::conversions::literal_expr_to_value(cloned).ok()?;
+    match value {
+        spg_storage::Value::Timestamp(m) => Some(m),
+        spg_storage::Value::Date(days) => Some(i64::from(days) * 86_400i64 * 1_000_000i64),
+        spg_storage::Value::Text(s) => crate::eval::parse_timestamp_literal(&s),
+        _ => None,
+    }
+}
+
+/// `[range_lo, range_hi)` of a child is kept iff it can hold any row
+/// satisfying the WHERE-derived filter range. PG-style half-open:
+/// child upper exclusive. Filter inclusivity is honoured per-bound.
+fn range_satisfies_filter(
+    range_lo: &spg_storage::PartitionBound,
+    range_hi: &spg_storage::PartitionBound,
+    filter_lo: Option<&PartitionFilterBound>,
+    filter_hi: Option<&PartitionFilterBound>,
+) -> bool {
+    use spg_storage::PartitionBound;
+    // For each filter side, reject children that can't host any row
+    // matching the predicate.
+    if let Some(lo) = filter_lo {
+        // child upper bound vs filter lower:
+        //   if filter is x >= L, child rejects iff child.hi <= L
+        //   if filter is x  > L, child rejects iff child.hi <= L
+        //   (child.hi exclusive, so equality with L still rejects)
+        match range_hi {
+            PartitionBound::MinValue => return false,
+            PartitionBound::MaxValue => {}
+            PartitionBound::TimestampTz(hi) => {
+                if *hi <= lo.micros {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Some(hi) = filter_hi {
+        // child lower bound vs filter upper:
+        //   if filter is x <= U, child rejects iff child.lo > U
+        //   if filter is x  < U, child rejects iff child.lo >= U
+        match range_lo {
+            PartitionBound::MaxValue => return false,
+            PartitionBound::MinValue => {}
+            PartitionBound::TimestampTz(lo) => {
+                let rejects = if hi.inclusive {
+                    *lo > hi.micros
+                } else {
+                    *lo >= hi.micros
+                };
+                if rejects {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn quote_ident_for_sql(name: &str) -> alloc::string::String {
+    // Match spg-sql's quoting rule(unquoted when ASCII-lowercase
+    // identifier, otherwise quoted). Conservative: always quote so
+    // children with reserved names round-trip safely through the
+    // CTE-body parse.
+    let mut out = alloc::string::String::with_capacity(name.len() + 2);
+    out.push('"');
+    for c in name.chars() {
+        if c == '"' {
+            out.push('"');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+fn parse_select_or_corrupt(sql: &str) -> Result<SelectStatement, EngineError> {
+    let parsed = spg_sql::parser::parse_statement(sql).map_err(|e| {
+        EngineError::Unsupported(alloc::format!(
+            "partition expansion: generated SQL {sql:?} failed to re-parse: {e}"
+        ))
+    })?;
+    let Statement::Select(body) = parsed else {
+        return Err(EngineError::Unsupported(alloc::format!(
+            "partition expansion: generated SQL {sql:?} is not a SELECT"
+        )));
+    };
+    Ok(body)
 }
