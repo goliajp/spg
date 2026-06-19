@@ -260,6 +260,12 @@ impl Table {
                         | (DataType::Jsonb, DataType::Json)
                         | (DataType::Timestamp, DataType::Timestamptz)
                         | (DataType::Timestamptz, DataType::Timestamp)
+                        // v7.37.5 ship triage — BIT / VARBIT share the
+                        // BitString storage shape; INET / CIDR likewise.
+                        | (DataType::Bit, DataType::BitVarying)
+                        | (DataType::BitVarying, DataType::Bit)
+                        | (DataType::Inet, DataType::Cidr)
+                        | (DataType::Cidr, DataType::Inet)
                 )
                 || matches!(
                     (actual, col.ty),
@@ -1235,6 +1241,12 @@ impl Table {
                         | (DataType::Jsonb, DataType::Json)
                         | (DataType::Timestamp, DataType::Timestamptz)
                         | (DataType::Timestamptz, DataType::Timestamp)
+                        // v7.37.5 ship triage — BIT / VARBIT share the
+                        // BitString storage shape; INET / CIDR likewise.
+                        | (DataType::Bit, DataType::BitVarying)
+                        | (DataType::BitVarying, DataType::Bit)
+                        | (DataType::Inet, DataType::Cidr)
+                        | (DataType::Cidr, DataType::Inet)
                 )
                 || matches!(
                     (actual, col.ty),

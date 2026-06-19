@@ -96,6 +96,7 @@ enum UniformArrayKind {
     Uuid,
     Bytes,
     Interval,
+    Money,
 }
 
 impl UniformArrayKind {
@@ -189,6 +190,16 @@ impl UniformArrayKind {
                     })
                     .collect(),
             ),
+            Self::Money => Value::MoneyArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Money(c) => Some(c),
+                        _ => unreachable!("uniform Money"),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -207,6 +218,7 @@ fn widen_uniform_typed(items: &[Value]) -> Option<UniformArrayKind> {
             Value::Uuid(_) => UniformArrayKind::Uuid,
             Value::Bytes(_) => UniformArrayKind::Bytes,
             Value::Interval { .. } => UniformArrayKind::Interval,
+            Value::Money(_) => UniformArrayKind::Money,
             // Int / BigInt / Text / Json — defer to the legacy
             // Int/Text widen below so the existing IntArray /
             // BigIntArray / TextArray behaviour is unchanged.
@@ -233,6 +245,7 @@ fn discriminant_eq(a: UniformArrayKind, b: UniformArrayKind) -> bool {
             | (UniformArrayKind::Uuid, UniformArrayKind::Uuid)
             | (UniformArrayKind::Bytes, UniformArrayKind::Bytes)
             | (UniformArrayKind::Interval, UniformArrayKind::Interval)
+            | (UniformArrayKind::Money, UniformArrayKind::Money)
     )
 }
 
@@ -1250,17 +1263,44 @@ pub fn parse_inet_text(s: &str) -> Option<(u8, u8, [u8; 16])> {
         None => (s, None),
     };
     if addr_s.contains(':') {
-        // IPv6 — colon-separated 8 × u16 hex. `::` compression is
-        // a follow-up; we accept full 8-group form for now.
-        let parts: alloc::vec::Vec<&str> = addr_s.split(':').collect();
-        if parts.len() != 8 {
+        // IPv6 — colon-separated up to 8 × u16 hex with optional
+        // `::` zero-compression. v7.37.5 ship triage broadened the
+        // pre-7.37.10 8-group-only form to accept canonical PG
+        // IPv6 abbreviations like `2001:db8::/32`.
+        let (head, tail) = match addr_s.find("::") {
+            Some(idx) => (&addr_s[..idx], Some(&addr_s[idx + 2..])),
+            None => (addr_s, None),
+        };
+        let head_groups: alloc::vec::Vec<&str> = if head.is_empty() {
+            alloc::vec::Vec::new()
+        } else {
+            head.split(':').collect()
+        };
+        let tail_groups: alloc::vec::Vec<&str> = match tail {
+            Some(t) if !t.is_empty() => t.split(':').collect(),
+            _ => alloc::vec::Vec::new(),
+        };
+        let head_len = head_groups.len();
+        let tail_len = tail_groups.len();
+        if tail.is_none() {
+            if head_len != 8 {
+                return None;
+            }
+        } else if head_len + tail_len > 7 {
             return None;
         }
+        let mut words = [0u16; 8];
+        for (i, g) in head_groups.iter().enumerate() {
+            words[i] = u16::from_str_radix(g, 16).ok()?;
+        }
+        let tail_start = 8 - tail_len;
+        for (i, g) in tail_groups.iter().enumerate() {
+            words[tail_start + i] = u16::from_str_radix(g, 16).ok()?;
+        }
         let mut addr = [0u8; 16];
-        for (i, p) in parts.iter().enumerate() {
-            let word = u16::from_str_radix(p, 16).ok()?;
-            addr[i * 2] = (word >> 8) as u8;
-            addr[i * 2 + 1] = (word & 0xff) as u8;
+        for (i, w) in words.iter().enumerate() {
+            addr[i * 2] = (w >> 8) as u8;
+            addr[i * 2 + 1] = (w & 0xff) as u8;
         }
         let bits = match bits_s {
             Some(b) => b.parse::<u8>().ok().filter(|&n| n <= 128)?,
@@ -1554,6 +1594,39 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
 /// the existing "unsupported cast target" error.
 pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
     let n = name.trim().to_ascii_lowercase();
+    // v7.37.5 ship triage — `numeric(p,s)` precision/scale params:
+    // peel them off and route to a precision-bearing DataType.
+    if let Some((head, paren)) = n.split_once('(')
+        && let Some(args) = paren.strip_suffix(')')
+    {
+        let nums: alloc::vec::Vec<u8> = args
+            .split(',')
+            .map(|s| s.trim().parse::<u8>().unwrap_or(0))
+            .collect();
+        match head {
+            "numeric" | "decimal" => {
+                let precision = nums.first().copied().unwrap_or(0);
+                let scale = nums.get(1).copied().unwrap_or(0);
+                return Some(DataType::Numeric { precision, scale });
+            }
+            // `varchar(n)` / `char(n)` carry length caps; SPG stores
+            // these as DataType::Varchar / Char(n). v7.37.5 cast
+            // recognises both but the cast itself drops the cap
+            // (Text widening at value time honours the per-row
+            // length contract already in coerce_value).
+            "varchar" => {
+                return Some(DataType::Varchar(nums.first().copied().unwrap_or(0).into()));
+            }
+            "char" | "character" => {
+                return Some(DataType::Char(nums.first().copied().unwrap_or(0).into()));
+            }
+            // bit / varbit precision drops on cast — storage shape
+            // is the BitString regardless.
+            "bit" => return Some(DataType::Bit),
+            "varbit" => return Some(DataType::BitVarying),
+            _ => {}
+        }
+    }
     Some(match n.as_str() {
         "smallint" | "int2" => DataType::SmallInt,
         "numeric" | "decimal" => DataType::Numeric {
@@ -1740,9 +1813,7 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
                 let negated_inner = match *inner {
                     Expr::Literal(Literal::Integer(n)) => {
                         let neg = n.checked_neg().ok_or_else(|| {
-                            EngineError::Unsupported(
-                                "integer literal overflow on negation".into(),
-                            )
+                            EngineError::Unsupported("integer literal overflow on negation".into())
                         })?;
                         Expr::Literal(Literal::Integer(neg))
                     }
@@ -2183,6 +2254,15 @@ pub(crate) fn coerce_value(
                 }));
             }
         },
+        // v7.37.5 ship triage — `Value::BitString` self-reports as
+        // `DataType::BitVarying`(see `Value::data_type`), so an
+        // INSERT into a `BIT` column triggers a spurious type
+        // mismatch. Accept BitString into either Bit or BitVarying
+        // unchanged — the column-side fixed-length contract is a
+        // schema concern, not a value-shape one.
+        (Value::BitString { nbits, bytes }, DataType::Bit | DataType::BitVarying) => {
+            Some(Value::BitString { nbits, bytes })
+        }
         (Value::Text(s), DataType::Bit | DataType::BitVarying) => match parse_bit_string_text(&s) {
             Some((nbits, bytes)) => Some(Value::BitString { nbits, bytes }),
             None => {
@@ -2440,6 +2520,83 @@ pub(crate) fn coerce_value(
         // external array form (`{a,b,NULL}`). Lets a SELECT
         // pull an array column through any Text-side codepath.
         (Value::TextArray(items), DataType::Text) => Some(Value::Text(encode_text_array(&items))),
+        // v7.37.5 ship triage — empty `ARRAY[]` literal lands as
+        // `Value::TextArray(vec![])`. Allow widening to the typed
+        // array sibling so `ARRAY[]::BOOL[]` / `::FLOAT[]` etc.
+        // round-trip through INSERT into the typed column. Only
+        // empty contents go through silently — non-empty TextArray
+        // must round-trip via per-element parsing(handled by the
+        // existing element-specific coercion paths above).
+        (Value::TextArray(items), DataType::BoolArray) if items.is_empty() => {
+            Some(Value::BoolArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::SmallIntArray) if items.is_empty() => {
+            Some(Value::SmallIntArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::IntArray) if items.is_empty() => {
+            Some(Value::IntArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::BigIntArray) if items.is_empty() => {
+            Some(Value::BigIntArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::FloatArray) if items.is_empty() => {
+            Some(Value::FloatArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::NumericArray) if items.is_empty() => {
+            Some(Value::NumericArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::DateArray) if items.is_empty() => {
+            Some(Value::DateArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::TimestampArray) if items.is_empty() => {
+            Some(Value::TimestampArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::TimestamptzArray) if items.is_empty() => {
+            Some(Value::TimestamptzArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::UuidArray) if items.is_empty() => {
+            Some(Value::UuidArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::JsonArray) if items.is_empty() => {
+            Some(Value::JsonArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::JsonbArray) if items.is_empty() => {
+            Some(Value::JsonbArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::BytesArray) if items.is_empty() => {
+            Some(Value::BytesArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::IntervalArray) if items.is_empty() => {
+            Some(Value::IntervalArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::MoneyArray) if items.is_empty() => {
+            Some(Value::MoneyArray(alloc::vec::Vec::new()))
+        }
+        // v7.37.5 ship triage — IntArray(empty) widens to
+        // SmallIntArray for the `INSERT INTO t (xs) VALUES
+        // (ARRAY[1::smallint, …])` path where the array literal
+        // collected mixed int widths into IntArray.
+        (Value::IntArray(items), DataType::SmallIntArray) => {
+            let mut out = alloc::vec::Vec::with_capacity(items.len());
+            let mut ok = true;
+            for item in items {
+                match item {
+                    None => out.push(None),
+                    Some(n) => match i16::try_from(n) {
+                        Ok(x) => out.push(Some(x)),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if ok {
+                Some(Value::SmallIntArray(out))
+            } else {
+                None
+            }
+        }
         // v7.17.0 Phase 3.P0-68 — Text → VECTOR auto-coerce.
         // Matches the existing Text → TsVector arm and the
         // `::vector` cast: PG-canonical pgvector external form
