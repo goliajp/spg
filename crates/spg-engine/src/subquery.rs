@@ -50,6 +50,16 @@ pub static EXISTS_BATCH_FIRE_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static EXISTS_BATCH_FALL_THROUGH_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// v7.37.4 A'' — differential knob. When true, the multi-column
+/// branch of `try_pull_up_exists_sublink` rejects (falling back to
+/// the v7.34.2 batch resolver path); single-column EXISTS pullup
+/// still fires. Lets the differential e2e prove byte-equal results
+/// between the new pullup path and the legacy batch path. Default
+/// false — production never sets this.
+pub static EXISTS_PULLUP_MULTICOL_DISABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 use spg_storage::{Row, Value};
 
 use crate::eval::{self, EvalContext};
@@ -2378,6 +2388,14 @@ impl Engine {
             rest.push(c.clone());
         }
         if corr_pairs.is_empty() {
+            return None;
+        }
+        // Differential knob — refuse the multi-col case under test so
+        // the baseline path (batch resolver) runs and its result can
+        // be compared against the pullup-on path. Single-col stays on.
+        if corr_pairs.len() > 1
+            && EXISTS_PULLUP_MULTICOL_DISABLE.load(core::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
         // EXISTS (semi-join) requires uniqueness on EVERY inner key so
