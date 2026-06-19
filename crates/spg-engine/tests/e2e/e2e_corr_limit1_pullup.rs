@@ -5,8 +5,9 @@
 //! no-match NULLs, residual predicates, function projections, and
 //! refused shapes that fall back to the per-row path.
 
-use spg_engine::{Engine, QueryResult};
+use spg_engine::{Engine, PULLUP_LIMIT1_FIRE_COUNT, QueryResult};
 use spg_storage::Value;
+use std::sync::atomic::Ordering;
 
 fn rows_of(e: &mut Engine, sql: &str) -> Vec<spg_storage::Row> {
     match e.execute(sql).unwrap() {
@@ -194,6 +195,74 @@ fn pullup_declined_when_limit_is_not_1() {
     // first row — both behaviours mean pullup did NOT fire. The point
     // is that the gate refused, not which fallback message wins.
     let _ = err;
+}
+
+#[test]
+fn pullup_fires_on_mailrs_subq3_shape() {
+    // mailrs prod subq 3 shape (single-table m3 with two non-corr
+    // predicates + LEFT() projection over a TEXT column). The mini
+    // perf-gate baseline shows pullup didn't fire on the full prod
+    // SQL — pin the minimal repro here so we can see WHY in unit-test
+    // form rather than chasing a 100k bench.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE m (id BIGSERIAL PRIMARY KEY, thread_id TEXT)")
+        .unwrap();
+    e.execute(
+        "CREATE TABLE m3 (id BIGSERIAL PRIMARY KEY, thread_id TEXT, internal_date BIGINT, text_body TEXT)",
+    )
+    .unwrap();
+    e.execute("INSERT INTO m (thread_id) VALUES ('t1'), ('t2'), ('t3')")
+        .unwrap();
+    e.execute(
+        "INSERT INTO m3 (thread_id, internal_date, text_body) VALUES \
+         ('t1', 100, 'first'), ('t1', 200, 'latest-t1'), \
+         ('t2', 50, 'only-t2'), \
+         ('t3', 10, NULL), ('t3', 20, '')",
+    )
+    .unwrap();
+    // Phase 2 dormant (try_pull_up_limit_one short-circuits) —
+    // verify the pass DOES NOT fire while the existing per-row /
+    // batch resolver still produces the correct per-key latest result.
+    // The counter assertion catches accidental re-activation:
+    // re-enabling must come with a fresh mini perf bench because the
+    // dormant decision is driven by the +35 % 100 k regression.
+    let before = PULLUP_LIMIT1_FIRE_COUNT.load(Ordering::Relaxed);
+    let pulled = rows_of(
+        &mut e,
+        "SELECT m.thread_id, \
+                COALESCE((SELECT LEFT(m3.text_body, 80) FROM m3 \
+                            WHERE m3.thread_id = m.thread_id \
+                              AND m3.text_body IS NOT NULL \
+                              AND m3.text_body != '' \
+                            ORDER BY m3.internal_date DESC LIMIT 1), \
+                         '') \
+           FROM m \
+          ORDER BY m.thread_id",
+    );
+    let fired = PULLUP_LIMIT1_FIRE_COUNT.load(Ordering::Relaxed) - before;
+    assert_eq!(
+        fired, 0,
+        "phase 2 is dormant; counter must stay 0. Re-bench mini if you reactivate."
+    );
+    assert_eq!(pulled.len(), 3);
+    // t1 latest non-null/non-empty body = 'latest-t1' (200)
+    assert!(
+        matches!(&pulled[0].values[1], Value::Text(s) if s == "latest-t1"),
+        "t1 latest text_body, got {:?}",
+        pulled[0].values[1]
+    );
+    // t2 only one body
+    assert!(
+        matches!(&pulled[1].values[1], Value::Text(s) if s == "only-t2"),
+        "t2 only, got {:?}",
+        pulled[1].values[1]
+    );
+    // t3 all rows filtered (NULL or empty) → COALESCE default ''
+    assert!(
+        matches!(&pulled[2].values[1], Value::Text(s) if s.is_empty()),
+        "t3 filtered → empty, got {:?}",
+        pulled[2].values[1]
+    );
 }
 
 #[test]
