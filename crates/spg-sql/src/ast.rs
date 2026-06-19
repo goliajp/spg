@@ -2311,7 +2311,7 @@ impl fmt::Display for ExtractField {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CastTarget {
     Int,
     BigInt,
@@ -2360,6 +2360,16 @@ pub enum CastTarget {
     /// reverse-acceptance gap — anywhere a PG schema writes
     /// `expr::bytea`, SPG now matches.
     Bytea,
+    /// v7.37.5 ship triage — generic cast target for the long tail
+    /// of PG type names the parser meets in `expr::TYPE` shapes that
+    /// don't deserve their own enum variant. The engine routes these
+    /// through `column_type_to_data_type` + the existing typed
+    /// `coerce_value` dispatch, so adding a new PG type to SPG
+    /// implicitly adds its cast-target form too — no parser change
+    /// per type. The string carries the lowercase PG type ident
+    /// (e.g. `"point"`, `"int4multirange"`); the engine errors with
+    /// a clear message when the type isn't known.
+    Named(String),
 }
 
 impl fmt::Display for CastTarget {
@@ -2386,6 +2396,8 @@ impl fmt::Display for CastTarget {
             Self::TsQuery => "tsquery",
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
+            // v7.37.5 — `Self::Named` carries its own canonical name.
+            Self::Named(name) => return f.write_str(name),
         })
     }
 }

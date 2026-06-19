@@ -1546,6 +1546,76 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
     )
 }
 
+/// v7.37.5 ship triage — string-form PG type name → `DataType`
+/// lookup driving `CastTarget::Named` (the generic typed-cast
+/// escape). Covers the v7.37.5 γ/δ/ε/ζ-A type-completeness work
+/// that landed without per-type CastTarget variants. Returns
+/// `None` for genuinely-unknown idents so the caller can surface
+/// the existing "unsupported cast target" error.
+pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
+    let n = name.trim().to_ascii_lowercase();
+    Some(match n.as_str() {
+        "smallint" | "int2" => DataType::SmallInt,
+        "numeric" | "decimal" => DataType::Numeric {
+            precision: 0,
+            scale: 0,
+        },
+        // Network/MAC/bit/XML/"char" — all first-class since
+        // v7.37.5 ζ-A.
+        "inet" => DataType::Inet,
+        "cidr" => DataType::Cidr,
+        "macaddr" => DataType::Macaddr,
+        "macaddr8" => DataType::Macaddr8,
+        "bit" => DataType::Bit,
+        "varbit" | "bit varying" => DataType::BitVarying,
+        "xml" => DataType::Xml,
+        "money" => DataType::Money,
+        "char1" => DataType::Char1,
+        // Geometry (v7.37.5 ε).
+        "point" => DataType::Point,
+        "lseg" => DataType::Lseg,
+        "path" => DataType::Path,
+        "box" => DataType::PgBox,
+        "polygon" => DataType::Polygon,
+        "line" => DataType::Line,
+        "circle" => DataType::Circle,
+        // Multirange (v7.37.5 δ).
+        "int4multirange" => DataType::Multirange(spg_storage::RangeKind::Int4),
+        "int8multirange" => DataType::Multirange(spg_storage::RangeKind::Int8),
+        "nummultirange" => DataType::Multirange(spg_storage::RangeKind::Num),
+        "tsmultirange" => DataType::Multirange(spg_storage::RangeKind::Ts),
+        "tstzmultirange" => DataType::Multirange(spg_storage::RangeKind::TsTz),
+        "datemultirange" => DataType::Multirange(spg_storage::RangeKind::Date),
+        // Range scalars(scaffolded in v7.17, casts join here).
+        "int4range" => DataType::Range(spg_storage::RangeKind::Int4),
+        "int8range" => DataType::Range(spg_storage::RangeKind::Int8),
+        "numrange" => DataType::Range(spg_storage::RangeKind::Num),
+        "tsrange" => DataType::Range(spg_storage::RangeKind::Ts),
+        "tstzrange" => DataType::Range(spg_storage::RangeKind::TsTz),
+        "daterange" => DataType::Range(spg_storage::RangeKind::Date),
+        // Array forms — `::BOOL[]` etc. The parser canonicalises
+        // postfix `[]` into the `_array` suffix; mirror PG's
+        // builtin arrays so the cast lands on a typed array Value.
+        "bool_array" | "boolean_array" => DataType::BoolArray,
+        "smallint_array" | "int2_array" => DataType::SmallIntArray,
+        "int_array" | "integer_array" | "int4_array" => DataType::IntArray,
+        "bigint_array" | "int8_array" => DataType::BigIntArray,
+        "float_array" | "double_array" | "real_array" => DataType::FloatArray,
+        "numeric_array" | "decimal_array" => DataType::NumericArray,
+        "text_array" => DataType::TextArray,
+        "date_array" => DataType::DateArray,
+        "timestamp_array" => DataType::TimestampArray,
+        "timestamptz_array" => DataType::TimestamptzArray,
+        "uuid_array" => DataType::UuidArray,
+        "json_array" => DataType::JsonArray,
+        "jsonb_array" => DataType::JsonbArray,
+        "bytea_array" => DataType::BytesArray,
+        "interval_array" => DataType::IntervalArray,
+        "money_array" => DataType::MoneyArray,
+        _ => return None,
+    })
+}
+
 pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
     match t {
         ColumnTypeName::SmallInt => DataType::SmallInt,
@@ -1658,6 +1728,35 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value, EngineError> {
                 Ok(int_value_for(neg))
             }
             Expr::Literal(Literal::Float(x)) => Ok(Value::Float(-x)),
+            // v7.37.5 ship triage — fold the unary minus through a
+            // `Cast { Literal, target }` wrapper (`-2::smallint`,
+            // `-3.14::numeric(10,2)`). We negate the inner literal,
+            // re-wrap with the same cast, and re-enter the literal
+            // resolver — the cast path handles the typed result.
+            Expr::Cast {
+                expr: inner,
+                target,
+            } => {
+                let negated_inner = match *inner {
+                    Expr::Literal(Literal::Integer(n)) => {
+                        let neg = n.checked_neg().ok_or_else(|| {
+                            EngineError::Unsupported(
+                                "integer literal overflow on negation".into(),
+                            )
+                        })?;
+                        Expr::Literal(Literal::Integer(neg))
+                    }
+                    Expr::Literal(Literal::Float(x)) => Expr::Literal(Literal::Float(-x)),
+                    other => Expr::Unary {
+                        op: spg_sql::ast::UnOp::Neg,
+                        expr: alloc::boxed::Box::new(other),
+                    },
+                };
+                literal_expr_to_value(Expr::Cast {
+                    expr: alloc::boxed::Box::new(negated_inner),
+                    target,
+                })
+            }
             other => Err(EngineError::Unsupported(alloc::format!(
                 "unary minus over non-literal expression: {other:?}"
             ))),
