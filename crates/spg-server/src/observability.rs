@@ -632,6 +632,14 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v7.37.5 δ — multirange rough heuristic (~3
                 // ranges × 24 B bounds body).
                 DataType::Multirange(_) => 72,
+                // v7.37.5 ε — geometry. Fixed-width: Point=16,
+                // Lseg/Box=32, Line=24, Circle=24. Variable
+                // (Path/Polygon) estimated for ~4 points.
+                DataType::Point => 16,
+                DataType::Lseg | DataType::PgBox => 32,
+                DataType::Line | DataType::Circle => 24,
+                DataType::Path => 1 + 4 + 16 * 4,
+                DataType::Polygon => 4 + 16 * 4,
                 DataType::Numeric { .. } | DataType::Interval => 16,
                 // f32 per vector dimension.
                 DataType::Vector { dim, .. } => u64::from(dim).saturating_mul(4),

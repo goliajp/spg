@@ -681,6 +681,16 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             out.push(49);
             out.push(k.tag());
         }
+        // v7.37.5 ε: tags 50..56 — PG geometry scalar family.
+        // No type-slot body; per-cell body lives in
+        // write_value_body. Catalog FILE_VERSION 48+.
+        DataType::Point => out.push(50),
+        DataType::Lseg => out.push(51),
+        DataType::Path => out.push(52),
+        DataType::PgBox => out.push(53),
+        DataType::Polygon => out.push(54),
+        DataType::Line => out.push(55),
+        DataType::Circle => out.push(56),
         DataType::Json => out.push(13),
         // v7.9.0: tag 16 for `JSONB`. Same on-disk layout as
         // tag 13 — only the wire OID differs.
@@ -841,6 +851,14 @@ impl Cursor<'_> {
                 })?;
                 Ok(DataType::Multirange(k))
             }
+            // v7.37.5 ε: tags 50..56 — PG geometry scalar family.
+            50 => Ok(DataType::Point),
+            51 => Ok(DataType::Lseg),
+            52 => Ok(DataType::Path),
+            53 => Ok(DataType::PgBox),
+            54 => Ok(DataType::Polygon),
+            55 => Ok(DataType::Line),
+            56 => Ok(DataType::Circle),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -1019,6 +1037,15 @@ fn value_body_encoded_len(v: &Value, _ty: DataType) -> usize {
             }
             n
         }
+        // v7.37.5 ε — geometry fixed-width bodies.
+        Value::Point(_) => 16,                  // 2 × f64
+        Value::Lseg(_, _) | Value::PgBox(_, _) => 32, // 2 × Point2D
+        Value::Line { .. } => 24,               // 3 × f64
+        Value::Circle { .. } => 24,             // Point + f64
+        // v7.37.5 ε — Path: [u8 closed flag][u32 count][Point*n].
+        Value::Path { points, .. } => 1 + 4 + 16 * points.len(),
+        // v7.37.5 ε — Polygon: [u32 count][Point*n].
+        Value::Polygon(points) => 4 + 16 * points.len(),
         // v7.12.0: tsvector dense body — [u16 lexeme_count][per
         // lex: u16 word_len + utf-8 word + u16 pos_count + (u16
         // LE * pos_count) + u8 weight].
@@ -1458,6 +1485,55 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value, ty: DataType) {
                 }
             }
         }
+        // v7.37.5 ε — geometry fixed-width dense bodies. Field
+        // order is LE (matches the SPG storage convention) and
+        // mirrors PG's binary format for compatibility with a
+        // future binary BIND path.
+        (Value::Point(p), DataType::Point) => {
+            out.extend_from_slice(&p.x.to_le_bytes());
+            out.extend_from_slice(&p.y.to_le_bytes());
+        }
+        (Value::Lseg(p1, p2), DataType::Lseg) => {
+            out.extend_from_slice(&p1.x.to_le_bytes());
+            out.extend_from_slice(&p1.y.to_le_bytes());
+            out.extend_from_slice(&p2.x.to_le_bytes());
+            out.extend_from_slice(&p2.y.to_le_bytes());
+        }
+        (Value::PgBox(ur, ll), DataType::PgBox) => {
+            out.extend_from_slice(&ur.x.to_le_bytes());
+            out.extend_from_slice(&ur.y.to_le_bytes());
+            out.extend_from_slice(&ll.x.to_le_bytes());
+            out.extend_from_slice(&ll.y.to_le_bytes());
+        }
+        (Value::Line { a, b, c }, DataType::Line) => {
+            out.extend_from_slice(&a.to_le_bytes());
+            out.extend_from_slice(&b.to_le_bytes());
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        (Value::Circle { center, radius }, DataType::Circle) => {
+            out.extend_from_slice(&center.x.to_le_bytes());
+            out.extend_from_slice(&center.y.to_le_bytes());
+            out.extend_from_slice(&radius.to_le_bytes());
+        }
+        // v7.37.5 ε — Path: [u8 closed flag][u32 count][Point*n].
+        (Value::Path { points, closed }, DataType::Path) => {
+            out.push(if *closed { 1 } else { 0 });
+            let count = u32::try_from(points.len()).expect("PATH ≤ 4G points");
+            out.extend_from_slice(&count.to_le_bytes());
+            for p in points {
+                out.extend_from_slice(&p.x.to_le_bytes());
+                out.extend_from_slice(&p.y.to_le_bytes());
+            }
+        }
+        // v7.37.5 ε — Polygon: [u32 count][Point*n].
+        (Value::Polygon(points), DataType::Polygon) => {
+            let count = u32::try_from(points.len()).expect("POLYGON ≤ 4G points");
+            out.extend_from_slice(&count.to_le_bytes());
+            for p in points {
+                out.extend_from_slice(&p.x.to_le_bytes());
+                out.extend_from_slice(&p.y.to_le_bytes());
+            }
+        }
         // v7.37.5 δ — Multirange dense body: [u16 count][per range:
         // u8 flags + (if lower present) bound body + (if upper
         // present) bound body]. Bound bodies recurse via
@@ -1827,6 +1903,18 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value) {
         // for the same reason as the γ array-of-scalar family.
         Value::Multirange { .. } => unreachable!(
             "v7.37.5 δ Multirange lacks a schema-less codec tag — \
+             use schema-aware write_value_body via the column's DataType"
+        ),
+        // v7.37.5 ε — geometry scalars are column-typed only.
+        // Schema-less path fences for the same reason as γ / δ.
+        Value::Point(_)
+        | Value::Lseg(_, _)
+        | Value::Path { .. }
+        | Value::PgBox(_, _)
+        | Value::Polygon(_)
+        | Value::Line { .. }
+        | Value::Circle { .. } => unreachable!(
+            "v7.37.5 ε geometry scalar lacks a schema-less codec tag — \
              use schema-aware write_value_body via the column's DataType"
         ),
         // v7.12.0: tsvector — tag 18. Body shape matches
@@ -2616,6 +2704,69 @@ impl<'a> Cursor<'a> {
                     }
                 }
                 Ok(Value::BytesArray(items))
+            }
+            // v7.37.5 ε — geometry dense reads. Field order
+            // mirrors the schema-aware write arm (LE everywhere).
+            DataType::Point => {
+                let x = self.read_f64()?;
+                let y = self.read_f64()?;
+                Ok(Value::Point(Point2D { x, y }))
+            }
+            DataType::Lseg => {
+                let p1x = self.read_f64()?;
+                let p1y = self.read_f64()?;
+                let p2x = self.read_f64()?;
+                let p2y = self.read_f64()?;
+                Ok(Value::Lseg(
+                    Point2D { x: p1x, y: p1y },
+                    Point2D { x: p2x, y: p2y },
+                ))
+            }
+            DataType::PgBox => {
+                let urx = self.read_f64()?;
+                let ury = self.read_f64()?;
+                let llx = self.read_f64()?;
+                let lly = self.read_f64()?;
+                Ok(Value::PgBox(
+                    Point2D { x: urx, y: ury },
+                    Point2D { x: llx, y: lly },
+                ))
+            }
+            DataType::Line => {
+                let a = self.read_f64()?;
+                let b = self.read_f64()?;
+                let c = self.read_f64()?;
+                Ok(Value::Line { a, b, c })
+            }
+            DataType::Circle => {
+                let cx = self.read_f64()?;
+                let cy = self.read_f64()?;
+                let radius = self.read_f64()?;
+                Ok(Value::Circle {
+                    center: Point2D { x: cx, y: cy },
+                    radius,
+                })
+            }
+            DataType::Path => {
+                let closed = self.read_u8()? != 0;
+                let count = self.read_u32()? as usize;
+                let mut points = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let x = self.read_f64()?;
+                    let y = self.read_f64()?;
+                    points.push(Point2D { x, y });
+                }
+                Ok(Value::Path { points, closed })
+            }
+            DataType::Polygon => {
+                let count = self.read_u32()? as usize;
+                let mut points = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let x = self.read_f64()?;
+                    let y = self.read_f64()?;
+                    points.push(Point2D { x, y });
+                }
+                Ok(Value::Polygon(points))
             }
             // v7.37.5 δ — Multirange dense body. Symmetric inverse
             // of the schema-aware write arm: read u16 count, per
