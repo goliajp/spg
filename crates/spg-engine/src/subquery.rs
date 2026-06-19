@@ -2010,23 +2010,6 @@ impl Engine {
         // WHERE we just took out, look up each inner plain-table's
         // column set, and for every collision column that exists in
         // exactly one outer table, pre-qualify it to that owning alias.
-        let outer_aliases_lc: alloc::collections::BTreeSet<String> = {
-            let from = stmt.from.as_ref().expect("from present");
-            let mut s = alloc::collections::BTreeSet::new();
-            let push = |s: &mut alloc::collections::BTreeSet<String>, t: &TableRef| {
-                s.insert(
-                    t.alias
-                        .clone()
-                        .unwrap_or_else(|| t.name.clone())
-                        .to_ascii_lowercase(),
-                );
-            };
-            push(&mut s, &from.primary);
-            for j in &from.joins {
-                push(&mut s, &j.table);
-            }
-            s
-        };
         let mut collision_names: alloc::collections::BTreeSet<String> =
             alloc::collections::BTreeSet::new();
         for c in reorder::split_and_conjunctions(&where_expr) {
@@ -2089,8 +2072,8 @@ impl Engine {
                 }
             }
             if !owner.is_empty() {
-                disambiguate_stmt_unqualified_columns(stmt, &owner, &outer_aliases_lc);
-                disambiguate_expr_unqualified_columns(&mut where_expr, &owner, &outer_aliases_lc);
+                disambiguate_stmt_unqualified_columns(stmt, &owner);
+                disambiguate_expr_unqualified_columns(&mut where_expr, &owner);
             }
         }
         let outer_aliases: alloc::collections::BTreeSet<String> = {
@@ -2634,37 +2617,35 @@ fn proj_has_disqualifying_shape(
 fn disambiguate_stmt_unqualified_columns(
     stmt: &mut SelectStatement,
     owner: &alloc::collections::BTreeMap<String, String>,
-    outer_aliases_lc: &alloc::collections::BTreeSet<String>,
 ) {
     for item in &mut stmt.items {
         if let SelectItem::Expr { expr, .. } = item {
-            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(expr, owner);
         }
     }
     if let Some(from) = &mut stmt.from {
         for j in &mut from.joins {
             if let Some(on) = &mut j.on {
-                disambiguate_expr_unqualified_columns(on, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(on, owner);
             }
         }
     }
     if let Some(g) = &mut stmt.group_by {
         for e in g.iter_mut() {
-            disambiguate_expr_unqualified_columns(e, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(e, owner);
         }
     }
     if let Some(h) = &mut stmt.having {
-        disambiguate_expr_unqualified_columns(h, owner, outer_aliases_lc);
+        disambiguate_expr_unqualified_columns(h, owner);
     }
     for ob in &mut stmt.order_by {
-        disambiguate_expr_unqualified_columns(&mut ob.expr, owner, outer_aliases_lc);
+        disambiguate_expr_unqualified_columns(&mut ob.expr, owner);
     }
 }
 
 fn disambiguate_expr_unqualified_columns(
     e: &mut Expr,
     owner: &alloc::collections::BTreeMap<String, String>,
-    outer_aliases_lc: &alloc::collections::BTreeSet<String>,
 ) {
     match e {
         Expr::Column(c) => {
@@ -2675,15 +2656,15 @@ fn disambiguate_expr_unqualified_columns(
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            disambiguate_expr_unqualified_columns(lhs, owner, outer_aliases_lc);
-            disambiguate_expr_unqualified_columns(rhs, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(lhs, owner);
+            disambiguate_expr_unqualified_columns(rhs, owner);
         }
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(expr, owner);
         }
         Expr::FunctionCall { args, .. } => {
             for a in args.iter_mut() {
-                disambiguate_expr_unqualified_columns(a, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(a, owner);
             }
         }
         Expr::AggregateOrdered {
@@ -2692,22 +2673,22 @@ fn disambiguate_expr_unqualified_columns(
             filter,
             ..
         } => {
-            disambiguate_expr_unqualified_columns(call, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(call, owner);
             for ob in order_by.iter_mut() {
-                disambiguate_expr_unqualified_columns(&mut ob.expr, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(&mut ob.expr, owner);
             }
             if let Some(f) = filter {
-                disambiguate_expr_unqualified_columns(f, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(f, owner);
             }
         }
         Expr::Like { expr, pattern, .. } => {
-            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
-            disambiguate_expr_unqualified_columns(pattern, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(expr, owner);
+            disambiguate_expr_unqualified_columns(pattern, owner);
         }
         Expr::InList { expr, list, .. } => {
-            disambiguate_expr_unqualified_columns(expr, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(expr, owner);
             for it in list.iter_mut() {
-                disambiguate_expr_unqualified_columns(it, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(it, owner);
             }
         }
         Expr::Case {
@@ -2716,19 +2697,19 @@ fn disambiguate_expr_unqualified_columns(
             else_branch,
         } => {
             if let Some(o) = operand {
-                disambiguate_expr_unqualified_columns(o, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(o, owner);
             }
             for (w, t) in branches.iter_mut() {
-                disambiguate_expr_unqualified_columns(w, owner, outer_aliases_lc);
-                disambiguate_expr_unqualified_columns(t, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(w, owner);
+                disambiguate_expr_unqualified_columns(t, owner);
             }
             if let Some(eb) = else_branch {
-                disambiguate_expr_unqualified_columns(eb, owner, outer_aliases_lc);
+                disambiguate_expr_unqualified_columns(eb, owner);
             }
         }
         Expr::ArraySubscript { target, index } => {
-            disambiguate_expr_unqualified_columns(target, owner, outer_aliases_lc);
-            disambiguate_expr_unqualified_columns(index, owner, outer_aliases_lc);
+            disambiguate_expr_unqualified_columns(target, owner);
+            disambiguate_expr_unqualified_columns(index, owner);
         }
         // Subquery bodies own their own scope — leave untouched.
         _ => {}
